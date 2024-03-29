@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import pandas as pd
+import numpy as np
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -110,15 +111,22 @@ def update_optimal_sma_text(initial_investment):
     return f"Optimal SMA Combination: {optimal_sma_combination}, Maximum Account Balance: {max_account_balance:.2f}"
 
 def calculate_account_balance(sma1, sma2, initial_investment):
-    account_balance = [initial_investment]
-    for i in range(1, len(df)):
-        if pd.isna(df[f'SMA_{sma1}'].iloc[i]) or pd.isna(df[f'SMA_{sma2}'].iloc[i]):
-            account_balance.append(account_balance[-1])
-        elif df[f'SMA_{sma1}'].iloc[i-1] > df[f'SMA_{sma2}'].iloc[i-1]:
-            gain_loss = df['Close'].iloc[i] / df['Close'].iloc[i-1]
-            account_balance.append(account_balance[-1] * gain_loss)
+    close_prices = df['Close'].values
+    sma1_values = df[f'SMA_{sma1}'].values
+    sma2_values = df[f'SMA_{sma2}'].values
+
+    account_balance = np.zeros_like(close_prices)
+    account_balance[0] = initial_investment
+
+    for i in range(1, len(close_prices)):
+        if np.isnan(sma1_values[i]) or np.isnan(sma2_values[i]):
+            account_balance[i] = account_balance[i-1]
+        elif sma1_values[i-1] > sma2_values[i-1]:
+            gain_loss = close_prices[i] / close_prices[i-1]
+            account_balance[i] = account_balance[i-1] * gain_loss
         else:
-            account_balance.append(account_balance[-1])
+            account_balance[i] = account_balance[i-1]
+
     return account_balance[-1]
 
 def find_optimal_sma_combination(initial_investment):
