@@ -10,9 +10,10 @@ import webbrowser
 # Fetch data
 df = yf.download('^GSPC', start='1927-12-30')
 
-# Calculate SMAs for window sizes 1 to 200
+# Calculate SMAs for window sizes 1 to the total number of trading days
+total_trading_days = len(df)
 sma_columns = {}
-for window in range(1, 201):
+for window in range(1, total_trading_days + 1):
     column_name = f'SMA_{window}'
     sma_columns[column_name] = df['Close'].rolling(window=window).mean()
 
@@ -26,8 +27,8 @@ app = dash.Dash(__name__)
 app.layout = html.Div([
     dcc.Graph(id='chart'),
     html.Div([
-        html.Label('Enter SMA Day:'),
-        dcc.Input(id='sma-input', type='number', value=50, min=1, max=200, step=1)
+        html.Label(f'Enter SMA Day from 1 - {total_trading_days}:'),
+        dcc.Input(id='sma-input', type='number', value=50, min=1, max=total_trading_days, step=1)
     ])
 ])
 
