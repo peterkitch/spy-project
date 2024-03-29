@@ -1,41 +1,70 @@
 import yfinance as yf
 import plotly.graph_objects as go
+import dash
+from dash import dcc
+from dash import html
+from dash.dependencies import Input, Output
+import pandas as pd
+import webbrowser
 
 # Fetch data
 df = yf.download('^GSPC', start='1927-12-30')
 
-# Calculate SMAs
-df['SMA_50'] = df['Close'].rolling(window=50).mean()
-df['SMA_100'] = df['Close'].rolling(window=100).mean()
-df['SMA_200'] = df['Close'].rolling(window=200).mean()
+# Calculate SMAs for window sizes 1 to 200
+sma_columns = {}
+for window in range(1, 201):
+    column_name = f'SMA_{window}'
+    sma_columns[column_name] = df['Close'].rolling(window=window).mean()
 
-# Add S&P 500 closing prices trace
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='S&P 500 Close'))
+# Concatenate the SMA columns with the original DataFrame
+df = pd.concat([df, pd.DataFrame(sma_columns)], axis=1)
 
-# Add SMA traces
-fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='50-day SMA'))
-fig.add_trace(go.Scatter(x=df.index, y=df['SMA_100'], mode='lines', name='100-day SMA'))
-fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], mode='lines', name='200-day SMA'))
+# Initialize the Dash app
+app = dash.Dash(__name__)
 
-# Customize layout
-fig.update_layout(
-    title='S&P 500 Closing Prices and SMAs Over Time',
-    xaxis_title='Date',
-    yaxis_title='Price',
-    xaxis=dict(
-        tickformat='%m/%d/%Y',  # Set the date format for x-axis tick labels
-    ),
-    hovermode='x unified'  # Unified hover
-)
+# Define the app layout
+app.layout = html.Div([
+    dcc.Graph(id='chart'),
+    html.Div([
+        html.Label('Enter SMA Day:'),
+        dcc.Input(id='sma-input', type='number', value=50, min=1, max=200, step=1)
+    ])
+])
 
-# Customize hover template for better readability
-fig.update_traces(
-    hovertemplate='Date: %{x|%m/%d/%Y}<br>Price: %{y:.2f}'
-)
+# Callback function to update the chart based on user input
+@app.callback(Output('chart', 'figure'),
+              [Input('sma-input', 'value')])
+def update_chart(sma_day):
+    # Create the chart figure
+    fig = go.Figure()
 
-# Show figure
-fig.show()
+    # Add S&P 500 closing prices trace
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='S&P 500 Close'))
 
-# Save to HTML (Optional)
-fig.write_html('sp500_closing_prices_with_smas.html')
+    # Add the selected SMA trace
+    column_name = f'SMA_{sma_day}'
+    trace_name = f'{sma_day}-day SMA'
+    fig.add_trace(go.Scatter(x=df.index, y=df[column_name], mode='lines', name=trace_name))
+
+    # Customize layout
+    fig.update_layout(
+        title='S&P 500 Closing Prices and Selected SMA Over Time',
+        xaxis_title='Date',
+        yaxis_title='Price',
+        xaxis=dict(
+            tickformat='%m/%d/%Y',  # Set the date format for x-axis tick labels
+        ),
+        hovermode='x unified'  # Unified hover
+    )
+
+    # Customize hover template for better readability
+    fig.update_traces(
+        hovertemplate='Date: %{x|%m/%d/%Y}<br>Price: %{y:.2f}'
+    )
+
+    return fig
+
+# Run the app
+if __name__ == '__main__':
+    webbrowser.open_new('http://127.0.0.1:8050/')
+    app.run_server(debug=True)
