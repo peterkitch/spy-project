@@ -102,6 +102,13 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
 
     return fig, error_message, account_value_text
 
+# Callback function to update the optimal SMA combination text
+@app.callback(Output('optimal-sma-text', 'children'),
+              [Input('initial-investment', 'value')])
+def update_optimal_sma_text(initial_investment):
+    optimal_sma_combination, max_account_balance = find_optimal_sma_combination(initial_investment)
+    return f"Optimal SMA Combination: {optimal_sma_combination}, Maximum Account Balance: {max_account_balance:.2f}"
+
 def calculate_account_balance(sma1, sma2, initial_investment):
     account_balance = [initial_investment]
     for i in range(1, len(df)):
