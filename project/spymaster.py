@@ -26,19 +26,24 @@ app = Dash(__name__)
 app.layout = html.Div([
     dcc.Graph(id='chart'),
     html.Div([
-        html.Label(f'Enter SMA Day from 1 - {max_window_size}:'),
-        dcc.Input(id='sma-input', type='number', value=50, min=1, max=max_window_size, step=1),
-        html.Div(id='error-message', style={'color': 'red'})
-    ])
+        html.Label(f'Enter 1st SMA Day from 1 - {max_window_size}:'),
+        dcc.Input(id='sma-input-1', type='number', value=50, min=1, max=max_window_size, step=1),
+    ]),
+    html.Div([  # New input field for the second SMA
+        html.Label(f'Enter 2nd SMA Day from 1 - {max_window_size}:'),
+        dcc.Input(id='sma-input-2', type='number', value=200, min=1, max=max_window_size, step=1),
+    ]),
+    html.Div(id='error-message', style={'color': 'red'})
 ])
 
 # Callback function to update the chart based on user input
 @app.callback(
     [Output('chart', 'figure'),
      Output('error-message', 'children')],
-    [Input('sma-input', 'value')]
+    [Input('sma-input-1', 'value'),
+     Input('sma-input-2', 'value')]  # Add the second input as a callback dependency
 )
-def update_chart(sma_day):
+def update_chart(sma_day_1, sma_day_2):  # Function now accepts two SMA days
     error_message = ''
 
     # Create the chart figure
@@ -47,17 +52,25 @@ def update_chart(sma_day):
     # Add S&P 500 closing prices trace
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='S&P 500 Close'))
 
-    # Add the selected SMA trace if a valid SMA day is provided
-    if sma_day is not None and 1 <= sma_day <= max_window_size:
-        column_name = f'SMA_{sma_day}'
-        trace_name = f'{sma_day}-day SMA'
+    # Logic to add the first SMA trace
+    if sma_day_1 is not None and 1 <= sma_day_1 <= max_window_size:
+        column_name = f'SMA_{sma_day_1}'
+        trace_name = f'{sma_day_1}-day SMA'
         fig.add_trace(go.Scatter(x=df.index, y=df[column_name], mode='lines', name=trace_name))
-    elif sma_day is not None:
-        error_message = f'Please enter a valid SMA day between 1 and {max_window_size}.'
+    else:
+        error_message = f'Please enter a valid 1st SMA day between 1 and {max_window_size}.'
+
+    # Logic to add the second SMA trace
+    if sma_day_2 is not None and 1 <= sma_day_2 <= max_window_size:
+        column_name = f'SMA_{sma_day_2}'
+        trace_name = f'{sma_day_2}-day SMA'
+        fig.add_trace(go.Scatter(x=df.index, y=df[column_name], mode='lines', name=trace_name))
+    else:
+        error_message += f' Please enter a valid 2nd SMA day between 1 and {max_window_size}.'
 
     # Customize layout
     fig.update_layout(
-        title='S&P 500 Closing Prices and Selected SMA Over Time',
+        title='S&P 500 Closing Prices and Selected SMAs Over Time',
         xaxis_title='Date',
         yaxis_title='Price',
         xaxis=dict(
