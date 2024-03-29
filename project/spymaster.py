@@ -3,12 +3,14 @@ import plotly.graph_objects as go
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import pandas as pd
+from itertools import combinations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Fetch data
 df = yf.download('^GSPC', start='1927-12-30')
 
-# Set the maximum window size for SMAs to the total number of trading days
-max_window_size = len(df)
+# Set the maximum window size for SMAs
+max_window_size = 20
 
 # Calculate SMAs for window sizes 1 to the maximum window size
 sma_columns = {}
@@ -31,14 +33,15 @@ app.layout = html.Div([
     dcc.Graph(id='chart'),
     html.Div([
         html.Label(f'Enter 1st SMA Day from 1 - {max_window_size}:'),
-        dcc.Input(id='sma-input-1', type='number', value=50, min=1, max=max_window_size, step=1),
+        dcc.Input(id='sma-input-1', type='number', value=10, min=1, max=max_window_size, step=1),
     ]),
     html.Div([  # New input field for the second SMA
         html.Label(f'Enter 2nd SMA Day from 1 - {max_window_size}:'),
-        dcc.Input(id='sma-input-2', type='number', value=200, min=1, max=max_window_size, step=1),
+        dcc.Input(id='sma-input-2', type='number', value=20, min=1, max=max_window_size, step=1),
     ]),
     html.Div(id='error-message', style={'color': 'red'}),
-    html.Div(id='account-value-text')  # Div to display the account value
+    html.Div(id='account-value-text'),  # Div to display the account value
+    html.Div(id='optimal-sma-text')  # Div to display the optimal SMA combination
 ])
 
 # Callback function to update the chart based on user input
@@ -98,6 +101,50 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
     account_value_text = f"Account value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {account_balance[-1]:.2f}" if 'account_balance' in locals() else "Invalid SMA Days"
 
     return fig, error_message, account_value_text
+
+def calculate_account_balance(sma1, sma2, initial_investment):
+    account_balance = [initial_investment]
+    for i in range(1, len(df)):
+        if pd.isna(df[f'SMA_{sma1}'].iloc[i]) or pd.isna(df[f'SMA_{sma2}'].iloc[i]):
+            account_balance.append(account_balance[-1])
+        elif df[f'SMA_{sma1}'].iloc[i-1] > df[f'SMA_{sma2}'].iloc[i-1]:
+            gain_loss = df['Close'].iloc[i] / df['Close'].iloc[i-1]
+            account_balance.append(account_balance[-1] * gain_loss)
+        else:
+            account_balance.append(account_balance[-1])
+    return account_balance[-1]
+
+def find_optimal_sma_combination(initial_investment):
+    max_account_balance = 0
+    optimal_sma_combination = None
+    total_combinations = sum(1 for _ in combinations(range(1, max_window_size + 1), 2))
+    completed_combinations = 0
+
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for sma1, sma2 in combinations(range(1, max_window_size + 1), 2):
+            future = executor.submit(calculate_account_balance, sma1, sma2, initial_investment)
+            futures.append((future, sma1, sma2))
+
+        for future, sma1, sma2 in futures:
+            account_balance = future.result()
+            completed_combinations += 1
+            progress = completed_combinations / total_combinations * 100
+
+            if account_balance > max_account_balance:
+                max_account_balance = account_balance
+                optimal_sma_combination = (sma1, sma2)
+
+            print(f"Progress: {progress:.2f}%")
+            print(f"Current Optimal Combination: {optimal_sma_combination}")
+            print(f"Current Maximum Account Balance: {max_account_balance:.2f}")
+            print("------------------------")
+
+    print("Search completed.")
+    print(f"Optimal SMA Combination: {optimal_sma_combination}")
+    print(f"Maximum Account Balance: {max_account_balance:.2f}")
+
+    return optimal_sma_combination, max_account_balance
 
 # Run the app
 if __name__ == '__main__':
