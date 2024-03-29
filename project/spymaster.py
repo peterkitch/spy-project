@@ -63,7 +63,8 @@ def update_chart(sma_day):
         xaxis=dict(
             tickformat='%m/%d/%Y',  # Set the date format for x-axis tick labels
         ),
-        hovermode='x unified'  # Unified hover
+        hovermode='x unified',  # Unified hover
+        uirevision='static'  # Maintain zoom and scale on update
     )
 
     # Customize hover template for better readability
