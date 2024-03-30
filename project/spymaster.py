@@ -49,10 +49,8 @@ app.layout = html.Div([
 @app.callback(
     [Output('chart', 'figure'),
      Output('error-message', 'children'),
-     Output('account-value-text', 'children')],  # Outputs include account value text
     [Input('sma-input-1', 'value'),
      Input('sma-input-2', 'value'),
-     Input('initial-investment', 'value')]  # Inputs include initial investment
 )
 def update_chart(sma_day_1, sma_day_2, initial_investment):
     error_message = ''
@@ -103,9 +101,11 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
     )
 
     # Prepare the text for the most recent account value
-    account_value_text = f"Buy Account Value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {buy_account_balance[-1]:.2f}<br>" \
-                         f"Short Account Value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {short_account_balance[-1]:.2f}" \
-                         if 'buy_account_balance' in locals() and 'short_account_balance' in locals() else "Invalid SMA Days"
+    account_value_text = [
+        f"Buy Account Value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {buy_account_balance[-1]:.2f}",
+        html.Br(),
+        f"Short Account Value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {short_account_balance[-1]:.2f}"
+    ] if 'buy_account_balance' in locals() and 'short_account_balance' in locals() else "Invalid SMA Days"
 
     return fig, error_message, account_value_text
 
@@ -114,8 +114,11 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
               [Input('initial-investment', 'value')])
 def update_optimal_sma_text(initial_investment):
     optimal_buy_sma_combination, max_buy_account_balance, optimal_short_sma_combination, max_short_account_balance = find_optimal_sma_combination(initial_investment)
-    return f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}, Maximum Buy Account Balance: {max_buy_account_balance:.2f}<br>" \
-           f"Optimal Short SMA Combination: {optimal_short_sma_combination}, Maximum Short Account Balance: {max_short_account_balance:.2f}"
+    return [
+        f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}, Maximum Buy Account Balance: {max_buy_account_balance:.2f}",
+        html.Br(),
+        f"Optimal Short SMA Combination: {optimal_short_sma_combination}, Maximum Short Account Balance: {max_short_account_balance:.2f}"
+    ]
 
 def calculate_account_balance(sma1, sma2, initial_investment, short=False):
     close_prices = df['Close'].values
