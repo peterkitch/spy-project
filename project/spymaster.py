@@ -29,7 +29,7 @@ app = Dash(__name__)
 app.layout = html.Div([
     html.Div([  # Initial Investment Input
         html.Label('Enter Initial Investment:'),
-        dcc.Input(id='initial-investment', type='number', value=100, step=100),
+        dcc.Input(id='initial-investment', type='number', value=10000, step=100),
     ]),
     dcc.Graph(id='chart'),
     html.Div([
@@ -103,7 +103,9 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
     )
 
     # Prepare the text for the most recent account value
-    account_value_text = f"Account value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {account_balance[-1]:.2f}" if 'account_balance' in locals() else "Invalid SMA Days"
+    account_value_text = f"Buy Account Value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {buy_account_balance[-1]:.2f}<br>" \
+                         f"Short Account Value as of close on {df.index[-1].strftime('%Y-%m-%d')}: {short_account_balance[-1]:.2f}" \
+                         if 'buy_account_balance' in locals() and 'short_account_balance' in locals() else "Invalid SMA Days"
 
     return fig, error_message, account_value_text
 
@@ -111,8 +113,8 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
 @app.callback(Output('optimal-sma-text', 'children'),
               [Input('initial-investment', 'value')])
 def update_optimal_sma_text(initial_investment):
-    optimal_sma_combination, max_account_balance = find_optimal_sma_combination(initial_investment)
-    return f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}, Maximum Buy Account Balance: {max_buy_account_balance:.2f}\n" \
+    optimal_buy_sma_combination, max_buy_account_balance, optimal_short_sma_combination, max_short_account_balance = find_optimal_sma_combination(initial_investment)
+    return f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}, Maximum Buy Account Balance: {max_buy_account_balance:.2f}<br>" \
            f"Optimal Short SMA Combination: {optimal_short_sma_combination}, Maximum Short Account Balance: {max_short_account_balance:.2f}"
 
 def calculate_account_balance(sma1, sma2, initial_investment, short=False):
@@ -167,14 +169,9 @@ def find_optimal_sma_combination(initial_investment):
                 max_short_account_balance = short_account_balance
                 optimal_short_sma_combination = (sma1, sma2)
 
-            print(f"Progress: {progress:.2f}%")
-            print(f"Current Optimal Buy Combination: {optimal_buy_sma_combination}")
-            print(f"Current Maximum Buy Account Balance: {max_buy_account_balance:.2f}")
-            print(f"Current Optimal Short Combination: {optimal_short_sma_combination}")
-            print(f"Current Maximum Short Account Balance: {max_short_account_balance:.2f}")
-            print("------------------------")
+            print(f"\rProgress: {progress:.2f}%", end="", flush=True)
 
-    print("Search completed.")
+    print("\nSearch completed.")
     print(f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}")
     print(f"Maximum Buy Account Balance: {max_buy_account_balance:.2f}")
     print(f"Optimal Short SMA Combination: {optimal_short_sma_combination}")
