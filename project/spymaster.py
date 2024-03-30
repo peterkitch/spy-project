@@ -29,7 +29,7 @@ app = Dash(__name__)
 app.layout = html.Div([
     html.Div([  # Initial Investment Input
         html.Label('Enter Initial Investment:'),
-        dcc.Input(id='initial-investment', type='number', value=10000, step=100),
+        dcc.Input(id='initial-investment', type='number', value=100, step=100),
     ]),
     dcc.Graph(id='chart'),
     html.Div([
@@ -63,21 +63,25 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
     # Add S&P 500 closing prices trace
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='S&P 500 Close'))
 
-    # Calculate and Add Account Balance as a trace, if SMAs are valid
+    # Calculate and Add Buy Account Balance as a trace, if SMAs are valid
     if sma_day_1 is not None and sma_day_2 is not None and 1 <= sma_day_1 <= max_window_size and 1 <= sma_day_2 <= max_window_size:
-        account_balance = [initial_investment]
+        buy_account_balance = [initial_investment]
+        short_account_balance = [initial_investment]
         for i in range(1, len(df)):
             if pd.isna(df[f'SMA_{sma_day_1}'].iloc[i]) or pd.isna(df[f'SMA_{sma_day_2}'].iloc[i]):
-                account_balance.append(account_balance[-1])
+                buy_account_balance.append(buy_account_balance[-1])
+                short_account_balance.append(short_account_balance[-1])
             elif df[f'SMA_{sma_day_1}'].iloc[i-1] > df[f'SMA_{sma_day_2}'].iloc[i-1]:
-                # Calculate gain/loss percentage and update account balance
-                gain_loss = df['Close'].iloc[i] / df['Close'].iloc[i-1]
-                account_balance.append(account_balance[-1] * gain_loss)
+                gain_loss_buy = df['Close'].iloc[i] / df['Close'].iloc[i-1]
+                gain_loss_short = df['Close'].iloc[i] / df['Close'].iloc[i-1]
+                buy_account_balance.append(buy_account_balance[-1] * gain_loss_buy)
+                short_account_balance.append(short_account_balance[-1] / gain_loss_short)
             else:
-                # No change in account balance
-                account_balance.append(account_balance[-1])
+                buy_account_balance.append(buy_account_balance[-1])
+                short_account_balance.append(short_account_balance[-1])
 
-        fig.add_trace(go.Scatter(x=df.index, y=account_balance, mode='lines', name='Account Balance'))
+        fig.add_trace(go.Scatter(x=df.index, y=buy_account_balance, mode='lines', name='Buy Account Balance'))
+        fig.add_trace(go.Scatter(x=df.index, y=short_account_balance, mode='lines', name='Short Account Balance'))
     else:
         error_message = f'Please enter valid SMA days between 1 and {max_window_size}.'
 
@@ -108,9 +112,10 @@ def update_chart(sma_day_1, sma_day_2, initial_investment):
               [Input('initial-investment', 'value')])
 def update_optimal_sma_text(initial_investment):
     optimal_sma_combination, max_account_balance = find_optimal_sma_combination(initial_investment)
-    return f"Optimal SMA Combination: {optimal_sma_combination}, Maximum Account Balance: {max_account_balance:.2f}"
+    return f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}, Maximum Buy Account Balance: {max_buy_account_balance:.2f}\n" \
+           f"Optimal Short SMA Combination: {optimal_short_sma_combination}, Maximum Short Account Balance: {max_short_account_balance:.2f}"
 
-def calculate_account_balance(sma1, sma2, initial_investment):
+def calculate_account_balance(sma1, sma2, initial_investment, short=False):
     close_prices = df['Close'].values
     sma1_values = df[f'SMA_{sma1}'].values
     sma2_values = df[f'SMA_{sma2}'].values
@@ -122,44 +127,60 @@ def calculate_account_balance(sma1, sma2, initial_investment):
         if np.isnan(sma1_values[i]) or np.isnan(sma2_values[i]):
             account_balance[i] = account_balance[i-1]
         elif sma1_values[i-1] > sma2_values[i-1]:
-            gain_loss = close_prices[i] / close_prices[i-1]
-            account_balance[i] = account_balance[i-1] * gain_loss
+            if short:
+                gain_loss = close_prices[i] / close_prices[i-1]
+                account_balance[i] = account_balance[i-1] / gain_loss
+            else:
+                gain_loss = close_prices[i] / close_prices[i-1]
+                account_balance[i] = account_balance[i-1] * gain_loss
         else:
             account_balance[i] = account_balance[i-1]
 
     return account_balance[-1]
 
 def find_optimal_sma_combination(initial_investment):
-    max_account_balance = 0
-    optimal_sma_combination = None
+    max_buy_account_balance = 0
+    optimal_buy_sma_combination = None
+    max_short_account_balance = 0
+    optimal_short_sma_combination = None
     total_combinations = sum(1 for _ in combinations(range(1, max_window_size + 1), 2))
     completed_combinations = 0
 
     with ThreadPoolExecutor() as executor:
         futures = []
         for sma1, sma2 in combinations(range(1, max_window_size + 1), 2):
-            future = executor.submit(calculate_account_balance, sma1, sma2, initial_investment)
-            futures.append((future, sma1, sma2))
+            buy_future = executor.submit(calculate_account_balance, sma1, sma2, initial_investment, short=False)
+            short_future = executor.submit(calculate_account_balance, sma1, sma2, initial_investment, short=True)
+            futures.append((buy_future, short_future, sma1, sma2))
 
-        for future, sma1, sma2 in futures:
-            account_balance = future.result()
+        for buy_future, short_future, sma1, sma2 in futures:
+            buy_account_balance = buy_future.result()
+            short_account_balance = short_future.result()
             completed_combinations += 1
             progress = completed_combinations / total_combinations * 100
 
-            if account_balance > max_account_balance:
-                max_account_balance = account_balance
-                optimal_sma_combination = (sma1, sma2)
+            if buy_account_balance > max_buy_account_balance:
+                max_buy_account_balance = buy_account_balance
+                optimal_buy_sma_combination = (sma1, sma2)
+
+            if short_account_balance > max_short_account_balance:
+                max_short_account_balance = short_account_balance
+                optimal_short_sma_combination = (sma1, sma2)
 
             print(f"Progress: {progress:.2f}%")
-            print(f"Current Optimal Combination: {optimal_sma_combination}")
-            print(f"Current Maximum Account Balance: {max_account_balance:.2f}")
+            print(f"Current Optimal Buy Combination: {optimal_buy_sma_combination}")
+            print(f"Current Maximum Buy Account Balance: {max_buy_account_balance:.2f}")
+            print(f"Current Optimal Short Combination: {optimal_short_sma_combination}")
+            print(f"Current Maximum Short Account Balance: {max_short_account_balance:.2f}")
             print("------------------------")
 
     print("Search completed.")
-    print(f"Optimal SMA Combination: {optimal_sma_combination}")
-    print(f"Maximum Account Balance: {max_account_balance:.2f}")
+    print(f"Optimal Buy SMA Combination: {optimal_buy_sma_combination}")
+    print(f"Maximum Buy Account Balance: {max_buy_account_balance:.2f}")
+    print(f"Optimal Short SMA Combination: {optimal_short_sma_combination}")
+    print(f"Maximum Short Account Balance: {max_short_account_balance:.2f}")
 
-    return optimal_sma_combination, max_account_balance
+    return optimal_buy_sma_combination, max_buy_account_balance, optimal_short_sma_combination, max_short_account_balance
 
 # Run the app
 if __name__ == '__main__':
