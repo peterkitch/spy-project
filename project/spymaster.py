@@ -66,28 +66,25 @@ def update_chart(sma_day_1, sma_day_2):
     if sma_day_1 is None or sma_day_2 is None or sma_day_1 < 1 or sma_day_1 > max_window_size or sma_day_2 < 1 or sma_day_2 > max_window_size:
         # Show a default trace if SMAs are not valid
         fig.add_trace(go.Scatter(x=df.index, y=[0] * len(df), mode='lines', name='Default'))
-        total_capture_stats = ["No valid SMA days entered"]
+        total_capture_stats = "No valid SMA days entered"
     else:
         sma1 = df[f'SMA_{sma_day_1}'].values
         sma2 = df[f'SMA_{sma_day_2}'].values
         close_prices = df['Close'].values
 
-    # Calculate continuous Buy and Short signals
+        # Calculate continuous Buy and Short signals
         buy_signals = sma1 > sma2
         short_signals = sma1 < sma2
 
-    # Calculate daily returns
+        # Calculate daily returns
         daily_returns = close_prices[1:] / close_prices[:-1] - 1
 
-    # Calculate Buy and Short returns based on continuous signals
+        # Calculate Buy and Short returns based on continuous signals
         buy_returns = np.where(buy_signals[:-1], daily_returns, 0)
         short_returns = np.where(short_signals[:-1], 1 / (daily_returns + 1) - 1, 0)
 
-        total_buy_capture = np.zeros_like(close_prices)
-        total_short_capture = np.zeros_like(close_prices)
-
-        total_buy_capture[1:] = np.cumsum(buy_returns) * 100
-        total_short_capture[1:] = np.cumsum(short_returns) * 100
+        total_buy_capture = np.cumsum(buy_returns) * 100
+        total_short_capture = np.cumsum(short_returns) * 100
 
         # Add SMA traces
         fig.add_trace(go.Scatter(x=df.index, y=sma1, mode='lines', name=f'SMA {sma_day_1}'))
@@ -96,32 +93,31 @@ def update_chart(sma_day_1, sma_day_2):
         # Add Total Buy Capture and Total Short Capture traces
         fig.add_trace(go.Scatter(
             x=df.index[max(sma_day_1, sma_day_2):],
-            y=total_buy_capture[max(sma_day_1, sma_day_2):],
+            y=total_buy_capture[max(sma_day_1, sma_day_2)-1:],
             mode='lines',
             name='Total Buy Capture %'
         ))
         fig.add_trace(go.Scatter(
             x=df.index[max(sma_day_1, sma_day_2):],
-            y=total_short_capture[max(sma_day_1, sma_day_2):],
+            y=total_short_capture[max(sma_day_1, sma_day_2)-1:],
             mode='lines',
             name='Total Short Capture %'
         ))
 
         # Prepare the text for the total capture stats
-        total_capture_stats = [
-            f"Total Buy Capture %: {total_buy_capture[-1]:.2f}%",
-            html.Br(),
-            f"Total Short Capture %: {total_short_capture[-1]:.2f}%"
-        ]
+        total_capture_stats = html.Div([
+            html.P(f"Total Buy Capture %: {total_buy_capture[-1]:.2f}%"),
+            html.P(f"Total Short Capture %: {total_short_capture[-1]:.2f}%")
+        ])
 
-    # Customize layout
-    fig.update_layout(
-        title='S&P 500 Closing Prices, SMAs, and Total Capture Over Time',
-        xaxis_title='Trading Day',
-        yaxis_title='S&P 500 Closing Price',
-        hovermode=None,  # Disable mouse-over effects
-        uirevision='static'
-    )
+        # Customize layout
+        fig.update_layout(
+            title='S&P 500 Closing Prices, SMAs, and Total Capture Over Time',
+            xaxis_title='Trading Day',
+            yaxis_title='S&P 500 Closing Price',
+            hovermode=None,  # Disable mouse-over effects
+            uirevision='static'
+        )
 
     return fig, total_capture_stats
 
