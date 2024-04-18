@@ -127,7 +127,6 @@ app.layout = html.Div(
         )
     ]
 )
-
 # Callback to toggle the visibility of the Calculation Components section
 @app.callback(
     Output('calc-collapse', 'is_open'),
@@ -274,6 +273,7 @@ def update_dynamic_strategy(sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         trade_signal = f"Trade Signal for Next Day: Short if S&P 500 closes below {df['Close'][-1]:.2f}"
     else:
         trade_signal = "Trade Signal for Next Day: No trade"
+
     return (
         most_productive_buy_pair_text,
         most_productive_short_pair_text,
