@@ -127,7 +127,6 @@ app.layout = html.Div(
         )
     ]
 )
-
 # Callback to toggle the visibility of the Calculation Components section
 @app.callback(
     Output('calc-collapse', 'is_open'),
@@ -260,20 +259,21 @@ def update_dynamic_strategy(sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     # Calculate performance metrics
     most_productive_buy_pair_text = f"Most Productive Buy Pair: SMA {most_productive_buy_pair[0]} / SMA {most_productive_buy_pair[1]}"
     most_productive_short_pair_text = f"Most Productive Short Pair: SMA {most_productive_short_pair[0]} / SMA {most_productive_short_pair[1]}"
-    avg_capture_buy_leader = f"Avg. Capture % for Buy Leader: {buy_returns_leader.mean() * 100:.2f}%" if buy_returns_leader.size > 0 else "Avg. Capture % for Buy Leader: N/A"
-    total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_returns_leader.sum() * 100:.2f}%" if buy_returns_leader.size > 0 else "Total Capture for Buy Leader: N/A"
-    avg_capture_short_leader = f"Avg. Capture % for Short Leader: {short_returns_leader.mean() * 100:.2f}%" if short_returns_leader.size > 0 else "Avg. Capture % for Short Leader: N/A"
-    total_capture_short_leader = f"Total Capture for Short Leader: {short_returns_leader.sum() * 100:.2f}%" if short_returns_leader.size > 0 else "Total Capture for Short Leader: N/A"
-    performance_expectation = f"Performance Expectation: {active_leader_returns.mean() * 100:.2f}%" if active_leader_returns.size > 0 else "Performance Expectation: N/A"
-    confidence_percentage = f"Confidence Percentage: {(active_leader_returns > 0).mean() * 100:.2f}%" if active_leader_returns.size > 0 else "Confidence Percentage: N/A"
+    avg_capture_buy_leader = f"Avg. Capture % for Buy Leader: {buy_returns_leader.mean() * 100:.9f}%" if buy_returns_leader.size > 0 else "Avg. Capture % for Buy Leader: N/A"
+    total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_returns_leader.sum() * 100:.9f}%" if buy_returns_leader.size > 0 else "Total Capture for Buy Leader: N/A"
+    avg_capture_short_leader = f"Avg. Capture % for Short Leader: {short_returns_leader.mean() * 100:.9f}%" if short_returns_leader.size > 0 else "Avg. Capture % for Short Leader: N/A"
+    total_capture_short_leader = f"Total Capture for Short Leader: {short_returns_leader.sum() * 100:.9f}%" if short_returns_leader.size > 0 else "Total Capture for Short Leader: N/A"
+    performance_expectation = f"Performance Expectation: {active_leader_returns.mean() * 100:.9f}%" if active_leader_returns.size > 0 else "Performance Expectation: N/A"
+    confidence_percentage = f"Confidence Percentage: {(active_leader_returns > 0).mean() * 100:.9f}%" if active_leader_returns.size > 0 else "Confidence Percentage: N/A"
 
     # Generate trade signal
     if trading_direction == "Trading Direction: Buy":
-        trade_signal = f"Trade Signal for Next Day: Buy if S&P 500 closes above {df['Close'][-1]:.2f}"
+        trade_signal = f"Trade Signal for Next Day: Buy if S&P 500 closes above {df['Close'][-1]:.9f}"
     elif trading_direction == "Trading Direction: Short":
-        trade_signal = f"Trade Signal for Next Day: Short if S&P 500 closes below {df['Close'][-1]:.2f}"
+        trade_signal = f"Trade Signal for Next Day: Short if S&P 500 closes below {df['Close'][-1]:.9f}"
     else:
         trade_signal = "Trade Signal for Next Day: No trade"
+
     return (
         most_productive_buy_pair_text,
         most_productive_short_pair_text,
@@ -343,8 +343,8 @@ def update_chart(sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     short_returns = -daily_returns.copy()
     short_returns[~entry_signals_short] = 0
 
-    total_buy_capture = buy_returns.cumsum()
-    total_short_capture = short_returns.cumsum()
+    total_buy_capture = buy_returns[entry_signals_buy].sum()
+    total_short_capture = short_returns[entry_signals_short].sum()
 
     # Add SMA traces
     fig.add_trace(go.Scatter(x=df.index, y=sma1_buy, mode='lines', name=f'SMA {sma_day_1} (Buy)'))
@@ -353,8 +353,8 @@ def update_chart(sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     fig.add_trace(go.Scatter(x=df.index, y=sma2_short, mode='lines', name=f'SMA {sma_day_4} (Short)'))
 
     # Add Total Buy Capture and Total Short Capture traces
-    fig.add_trace(go.Scatter(x=df.index, y=total_buy_capture, mode='lines', name='Total Buy Capture'))
-    fig.add_trace(go.Scatter(x=df.index, y=total_short_capture, mode='lines', name='Total Short Capture'))
+    fig.add_trace(go.Scatter(x=df.index, y=[total_buy_capture]*len(df.index), mode='lines', name='Total Buy Capture'))
+    fig.add_trace(go.Scatter(x=df.index, y=[total_short_capture]*len(df.index), mode='lines', name='Total Short Capture'))
 
     # Customize layout
     fig.update_layout(
@@ -371,14 +371,14 @@ def update_chart(sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     trigger_days_short = f"Short Trigger Days: {entry_signals_short.sum()}"
 
     # Calculate win ratios for Buy and Short
-    win_ratio_buy = f"Buy Win Ratio: {(buy_returns > 0).mean() * 100:.2f}%" if entry_signals_buy.any() else "Buy Win Ratio: N/A"
-    win_ratio_short = f"Short Win Ratio: {(short_returns > 0).mean() * 100:.2f}%" if entry_signals_short.any() else "Short Win Ratio: N/A"
+    win_ratio_buy = f"Buy Win Ratio: {(buy_returns[entry_signals_buy] > 0).mean() * 100:.9f}%" if entry_signals_buy.sum() > 0 else "Buy Win Ratio: N/A"
+    win_ratio_short = f"Short Win Ratio: {(short_returns[entry_signals_short] > 0).mean() * 100:.9f}%" if entry_signals_short.sum() > 0 else "Short Win Ratio: N/A"
 
     # Calculate average daily capture and total capture for Buy and Short
-    avg_daily_capture_buy = f"Buy Avg. Daily Capture: {buy_returns[buy_returns != 0].mean() * 100:.2f}%" if (buy_returns != 0).any() else "Buy Avg. Daily Capture: N/A"
-    total_capture_buy = f"Buy Total Capture: {total_buy_capture[-1] * 100:.2f}%"
-    avg_daily_capture_short = f"Short Avg. Daily Capture: {short_returns[short_returns != 0].mean() * 100:.2f}%" if (short_returns != 0).any() else "Short Avg. Daily Capture: N/A"
-    total_capture_short = f"Short Total Capture: {total_short_capture[-1] * 100:.2f}%"
+    avg_daily_capture_buy = f"Buy Avg. Daily Capture: {buy_returns[entry_signals_buy].mean() * 100:.9f}%" if entry_signals_buy.sum() > 0 else "Buy Avg. Daily Capture: N/A"
+    total_capture_buy = f"Buy Total Capture: {total_buy_capture * 100:.9f}%"
+    avg_daily_capture_short = f"Short Avg. Daily Capture: {short_returns[entry_signals_short].mean() * 100:.9f}%" if entry_signals_short.sum() > 0 else "Short Avg. Daily Capture: N/A"
+    total_capture_short = f"Short Total Capture: {total_short_capture * 100:.9f}%"
 
     return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short
 
