@@ -100,7 +100,6 @@ def write_status(ticker, status):
 
 def precompute_results(ticker):
     print(f"Processing ticker: {ticker}")  # Print the ticker being processed
-
     pkl_file = f'{ticker}_precomputed_results.pkl'
     if os.path.exists(pkl_file):
         write_status(ticker, {"status": "complete", "progress": 100})
@@ -109,7 +108,6 @@ def precompute_results(ticker):
     try:
         df = fetch_data(ticker)
         print(f"Data fetched for {ticker}: {df}")  # Print the fetched data
-
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             write_status(ticker, {"status": "failed", "message": "No data"})
             return None
