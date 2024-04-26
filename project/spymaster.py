@@ -16,7 +16,7 @@ import json
 import time  # Used for simulating processing time
 import logging
 
-MAX_SMA_DAY = 300
+MAX_SMA_DAY = 20
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker, MAX_SMA_DAY):
@@ -86,6 +86,7 @@ def preprocess_data(df, MAX_SMA_DAY):
 
     return df, sma_combinations
 
+@lru_cache(maxsize=None)
 def compute_signals(df, sma1, sma2):
     # Align the indexes of sma1 and sma2
     sma1, sma2 = sma1.align(sma2)
@@ -111,6 +112,7 @@ def compute_signals(df, sma1, sma2):
 
     return {'buy_capture': buy_capture, 'short_capture': short_capture}
 
+@lru_cache(maxsize=None)
 def calculate_cumulative_returns(close_prices, signals):
     # Ensure signals is a Series
     if isinstance(signals, pd.DataFrame):
