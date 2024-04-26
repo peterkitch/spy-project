@@ -16,13 +16,21 @@ import json
 import time  # Used for simulating processing time
 import logging
 
-MAX_SMA_DAY = 3
+MAX_SMA_DAY = 300
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker, MAX_SMA_DAY):
     try:
         df = yf.download(ticker, period='max', interval='1d')
         df, _ = preprocess_data(df, MAX_SMA_DAY)
+        
+        # Check if the required columns exist in the DataFrame
+        if 'SMA_1' in df.columns and 'SMA_2' in df.columns:
+            print(f"Columns SMA_1 and SMA_2 found in DataFrame for {ticker}")
+        else:
+            print(f"Columns SMA_1 and/or SMA_2 not found in DataFrame for {ticker}")
+            return None
+
         return df
     except Exception as e:
         print(f"Failed to fetch data for {ticker}: {e}")
@@ -39,9 +47,18 @@ def fetch_data_for_tickers(tickers):
 
 def preprocess_data(df, MAX_SMA_DAY):
     print("Preprocessing data...")
+    print("DataFrame before SMA calculations:")
+    print(df.head())
+
     # Only add each SMA column once
     sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(1, MAX_SMA_DAY + 1)}
     df = pd.concat([df, pd.DataFrame(sma_columns)], axis=1)
+
+    # Remove duplicate SMA columns
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    print("DataFrame after SMA calculations:")
+    print(df.head())
 
     print("Calculating trading signals and captures...")
     # Calculate trading signals and captures
@@ -50,8 +67,17 @@ def preprocess_data(df, MAX_SMA_DAY):
         for j in range(i+1, MAX_SMA_DAY + 1):  # Loop through each SMA greater than the current one
             sma1 = df[f'SMA_{i}']
             sma2 = df[f'SMA_{j}']
-            sma_combinations[(i, j)] = compute_signals(df, sma1, sma2)
-    
+            print(f"SMA1 (SMA_{i}):")
+            print(sma1.head())
+            print(f"SMA2 (SMA_{j}):")
+            print(sma2.head())
+            try:
+                sma_combinations[(i, j)] = compute_signals(df, sma1, sma2)
+                print(f"Signals for SMA combination ({i}, {j}):")
+                print(sma_combinations[(i, j)])
+            except Exception as e:
+                print(f"An error occurred: {str(e)}")
+
     print("Preprocessing complete.")
     print("Preprocessed DataFrame:")
     print(df.head())
@@ -109,7 +135,6 @@ def write_status(ticker, status):
     with open(status_path, 'w') as f:
         json.dump(status, f)
 
-
 def precompute_results(ticker, MAX_SMA_DAY):
     print(f"Processing ticker: {ticker}")  # Print the ticker being processed
     pkl_file = f'{ticker}_precomputed_results.pkl'
@@ -147,7 +172,11 @@ def precompute_results(ticker, MAX_SMA_DAY):
                 buy_results = {}
                 short_results = {}
 
-                with tqdm(total=min(len(sma_combinations)), desc='Dynamic Trading Strategy', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                print(f"Type of sma_combinations: {type(sma_combinations)}")
+                print(f"Value of sma_combinations: {sma_combinations}")
+
+                with tqdm(total=len(sma_combinations), desc='Dynamic Trading Strategy', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                    print(f"SMA combinations keys: {list(sma_combinations.keys())}")
                     for pair, data in sma_combinations.items():
                         buy_capture = data['buy_capture']
                         short_capture = data['short_capture']
@@ -183,10 +212,12 @@ def precompute_results(ticker, MAX_SMA_DAY):
 
                         try:
                             print("Pair:", pair)
-                            print(f"Attempting to access columns: SMA_{pair[0]}, SMA_{pair[1]}")
+                            print(f"Attempting to access columns: SMA_{pair[0]}, SMA_{pair[1]}")  # Print the column access attempt
                             sma1 = df[f'SMA_{pair[0]}']
                             sma2 = df[f'SMA_{pair[1]}']
-    
+                            print(f"SMA1: {sma1.head()}")  # Print the first few values of sma1
+                            print(f"SMA2: {sma2.head()}")  # Print the first few values of sma2
+            
                             buy_signals = (sma1 > sma2).astype(int)
                             entry_signals = (buy_signals - buy_signals.shift(1)).astype(bool)
                             buy_returns = df['Close'].pct_change()
@@ -208,7 +239,7 @@ def precompute_results(ticker, MAX_SMA_DAY):
                         except Exception as e:
                             print(f"Error occurred for pair {pair}: {str(e)}")
                             # Handle other exceptions appropriately
-
+        
                         pbar.update(1)
 
                 top_buy_pair = max(buy_results, key=lambda x: x[1])[0]
