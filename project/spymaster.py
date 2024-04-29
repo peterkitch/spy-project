@@ -16,25 +16,37 @@ import json
 import time  # Used for simulating processing time
 import logging
 
-MAX_SMA_DAY = 20
+MAX_SMA_DAY = 30
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker, MAX_SMA_DAY):
     try:
         df = yf.download(ticker, period='max', interval='1d')
-        df, _ = preprocess_data(df, MAX_SMA_DAY)
-        
-        # Check if the required columns exist in the DataFrame
-        if 'SMA_1' in df.columns and 'SMA_2' in df.columns:
-            print(f"Columns SMA_1 and SMA_2 found in DataFrame for {ticker}")
-        else:
-            print(f"Columns SMA_1 and/or SMA_2 not found in DataFrame for {ticker}")
-            return None
-
         return df
     except Exception as e:
         print(f"Failed to fetch data for {ticker}: {e}")
         return None
+
+@lru_cache(maxsize=None)
+def get_data(ticker):
+    pkl_file = f'{ticker}_preprocessed_data.pkl'
+    if os.path.exists(pkl_file):
+        with open(pkl_file, 'rb') as file:
+            df, sma_combinations = pickle.load(file)
+            print(f"Loaded preprocessed data for {ticker} from {pkl_file}")
+            return df, sma_combinations
+    
+    df = fetch_data(ticker, MAX_SMA_DAY)
+    if df is not None and not df.empty:
+        df, sma_combinations = preprocess_data(df, MAX_SMA_DAY)
+        
+        with open(pkl_file, 'wb') as file:
+            pickle.dump((df, sma_combinations), file)
+            print(f"Saved preprocessed data for {ticker} to {pkl_file}")
+        
+        return df, sma_combinations
+    
+    return None, None
 
 def fetch_data_for_tickers(tickers):
     results = {}
@@ -47,8 +59,6 @@ def fetch_data_for_tickers(tickers):
 
 def preprocess_data(df, MAX_SMA_DAY):
     print("Preprocessing data...")
-    print("DataFrame before SMA calculations:")
-    print(df.head())
 
     # Only add each SMA column once
     sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(1, MAX_SMA_DAY + 1)}
@@ -57,37 +67,14 @@ def preprocess_data(df, MAX_SMA_DAY):
     # Remove duplicate SMA columns
     df = df.loc[:, ~df.columns.duplicated()]
 
-    print("DataFrame after SMA calculations:")
-    print(df.head())
-
-    print("Calculating trading signals and captures...")
-    # Calculate trading signals and captures
-    sma_combinations = {}
-    for i in range(1, MAX_SMA_DAY):  # Loop through each SMA
-        for j in range(i+1, MAX_SMA_DAY + 1):  # Loop through each SMA greater than the current one
-            sma1 = df[f'SMA_{i}']
-            sma2 = df[f'SMA_{j}']
-            print(f"SMA1 (SMA_{i}):")
-            print(sma1.head())
-            print(f"SMA2 (SMA_{j}):")
-            print(sma2.head())
-            try:
-                sma_combinations[(i, j)] = compute_signals(df, sma1, sma2)
-                print(f"Signals for SMA combination ({i}, {j}):")
-                print(sma_combinations[(i, j)])
-            except Exception as e:
-                print(f"An error occurred: {str(e)}")
-
     print("Preprocessing complete.")
     print("Preprocessed DataFrame:")
-    print(df.head())
-    print("SMA Combinations:")
-    print(sma_combinations)
 
-    return df, sma_combinations
+    return df, {}  # Return an empty dictionary for sma_combinations
 
 @lru_cache(maxsize=None)
 def compute_signals(df, sma1, sma2):
+
     # Align the indexes of sma1 and sma2
     sma1, sma2 = sma1.align(sma2)
 
@@ -112,26 +99,6 @@ def compute_signals(df, sma1, sma2):
 
     return {'buy_capture': buy_capture, 'short_capture': short_capture}
 
-@lru_cache(maxsize=None)
-def calculate_cumulative_returns(close_prices, signals):
-    # Ensure signals is a Series
-    if isinstance(signals, pd.DataFrame):
-        signals = signals.iloc[:, 0]  # Convert DataFrame to Series by selecting the first column
-    
-    # Align the indexes of signals and close_prices
-    signals = signals.reindex(close_prices.index, fill_value=False)
-    
-    # Calculate the returns only when the signals change from false to true
-    returns = close_prices.pct_change()[signals]
-    return returns.cumsum()
-
-def fetch_and_preprocess_data(ticker, df_store, sma_combinations_store):
-    df = fetch_data(ticker, MAX_SMA_DAY)
-    if df is not None and not df.empty:
-        df, sma_combinations = preprocess_data(df, MAX_SMA_DAY)
-        df_store['df'] = df
-        sma_combinations_store['sma_combinations'] = sma_combinations
-
 def write_status(ticker, status):
     status_path = f"{ticker}_status.json"
     with open(status_path, 'w') as f:
@@ -141,30 +108,26 @@ def precompute_results(ticker, MAX_SMA_DAY):
     print(f"Processing ticker: {ticker}")  # Print the ticker being processed
     pkl_file = f'{ticker}_precomputed_results.pkl'
     if os.path.exists(pkl_file):
+        print(f"Precomputed results already exist for {ticker}. Loading from {pkl_file}")
         write_status(ticker, {"status": "complete", "progress": 100})
         return  # PKL file already exists, no need to recompute
 
     try:
         print("Fetching data...")
-        df = fetch_data(ticker, MAX_SMA_DAY)
+        df, sma_combinations = get_data(ticker)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             write_status(ticker, {"status": "failed", "message": "No data"})
             return None
         else:
             print(f"Data fetched for {ticker}.")
-            print(df.head())
-            print(f"Columns in the DataFrame: {df.columns}")  # Print the DataFrame's columns
 
             # Perform preprocessing and calculations
             try:
-                print("Preprocessing data...")
                 processed_data = preprocess_data(df, MAX_SMA_DAY)
                 df = processed_data[0]
                 sma_combinations = processed_data[1]
-                print(df.head())
                 print("Preprocessing complete.")
                 print("Preprocessed DataFrame:")
-                print(df)  # Print the entire DataFrame
 
                 start_date = df.index.min().strftime('%Y-%m-%d')
                 print(f"Start date for {ticker}: {start_date}")  # Print the start date
@@ -174,9 +137,6 @@ def precompute_results(ticker, MAX_SMA_DAY):
                 buy_results = {}
                 short_results = {}
 
-                print(f"Type of sma_combinations: {type(sma_combinations)}")
-                print(f"Value of sma_combinations: {sma_combinations}")
-
                 with tqdm(total=len(sma_combinations), desc='Dynamic Trading Strategy', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
                     print(f"SMA combinations keys: {list(sma_combinations.keys())}")
                     for pair, data in sma_combinations.items():
@@ -184,19 +144,13 @@ def precompute_results(ticker, MAX_SMA_DAY):
                         short_capture = data['short_capture']
                         buy_results[pair] = buy_capture
                         short_results[pair] = short_capture
-                        print(f"Trading pair: {pair}, Buy Capture amount: {buy_capture.sum()}, Short Capture amount: {short_capture.sum()}")
                         pbar.update(1)
 
                 print("Dynamic trading strategy calculations complete.")
-                print(f"Buy results for {ticker}: {buy_results}")
-                print(f"Short results for {ticker}: {short_results}")
 
                 # Calculate final cumulative return for each pair
                 buy_final_returns = {pair: returns.iloc[-1] if not returns.empty else 0 for pair, returns in buy_results.items()}
                 short_final_returns = {pair: returns.iloc[-1] if not returns.empty else 0 for pair, returns in short_results.items()}
-
-                print(f"Buy final returns for {ticker}: {buy_final_returns}")
-                print(f"Short final returns for {ticker}: {short_final_returns}")
 
                 # Perform brute-force calculation to find the most productive buy and short pairs
                 buy_pairs = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(1, MAX_SMA_DAY + 1) if i != j]
@@ -207,18 +161,10 @@ def precompute_results(ticker, MAX_SMA_DAY):
 
                 with tqdm(total=len(buy_pairs), desc='Brute-Force Calculation', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
                     for pair in buy_pairs:
-                        print(f"Current pair: {pair}, Type: {type(pair)}")
-                        print(f"Processing pair: {pair}")  # Print the current pair being processed
-                        print(f"SMA columns: {df.columns}")  # Print the DataFrame's columns
-                        print(f"pair[0]: {pair[0]}, pair[1]: {pair[1]}")  # Print the values of pair[0] and pair[1]
 
                         try:
-                            print("Pair:", pair)
-                            print(f"Attempting to access columns: SMA_{pair[0]}, SMA_{pair[1]}")  # Print the column access attempt
                             sma1 = df[f'SMA_{pair[0]}']
                             sma2 = df[f'SMA_{pair[1]}']
-                            print(f"SMA1: {sma1.head()}")  # Print the first few values of sma1
-                            print(f"SMA2: {sma2.head()}")  # Print the first few values of sma2
             
                             buy_signals = (sma1 > sma2).astype(int)
                             entry_signals = (buy_signals - buy_signals.shift(1)).astype(bool)
@@ -291,7 +237,6 @@ def load_precomputed_results(ticker):
     if os.path.exists(pkl_file):
         with open(pkl_file, 'rb') as file:
             results = pickle.load(file)
-            print(f"Loaded precomputed results for {ticker}: {results}")
             return results
     else:
         return None
@@ -513,12 +458,7 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4):
 def validate_ticker_input(ticker):
     if not ticker:
         return ''
-    df = fetch_data(ticker, MAX_SMA_DAY)
-    print(df.head())
-    print(f"Data fetched for {ticker}:")
-    print(f"Shape of fetched data: {df.shape}")
-    print(f"Index of fetched data: {df.index}")
-    print(f"Columns of fetched data: {df.columns}")
+    df, _ = get_data(ticker)
     
     if df is None or df.empty:
         return go.Figure()
@@ -546,12 +486,10 @@ def update_dynamic_strategy_display(ticker):
         return ["Please enter a ticker symbol."] * 10
 
     results = load_precomputed_results(ticker)
-    print(f"Loaded precomputed results for {ticker}: {results}")  # Print the loaded results
+    print(f"Loaded precomputed results for {ticker}")  # Print the loaded results
     
     if results is None or 'status' in results and results['status'] == 'processing':
         return ["Data is currently being processed."] * 10
-    
-    print("Results:", results)  # Print the contents of the results
 
     if 'top_buy_pair' not in results or 'top_short_pair' not in results:
         print(f"Missing top pairs in precomputed results for {ticker}: {results}")
@@ -560,13 +498,11 @@ def update_dynamic_strategy_display(ticker):
     top_buy_pair = results['top_buy_pair']
     top_short_pair = results['top_short_pair']
 
-    print("Top buy pair:", top_buy_pair)
-    print("Top short pair:", top_short_pair)
+    print("Top Buy Pair:", top_buy_pair)
+    print("Top Short Pair:", top_short_pair)
 
-    # Calculate additional metrics based on the precomputed top pairs
-    df = fetch_data(ticker, MAX_SMA_DAY)
-
-    print("DataFrame columns:", df.columns)  # Print the columns of the DataFrame
+    # Use the cached data instead of fetching it again
+    df, _ = get_data(ticker)
 
     try:
         sma1_buy_leader = df.iloc[:, df.columns.get_loc(f'SMA_{top_buy_pair[0]}')]
@@ -613,10 +549,7 @@ def update_dynamic_strategy_display(ticker):
     confidence_percentage = f"Confidence Percentage: {(active_leader_returns > 0).mean() * 100:.9f}%" if active_leader_returns.size > 0 else "Confidence Percentage: N/A"
 
     # Generate trading recommendations based on the current leading SMA pairs
-    latest_close = df['Close'].iloc[-1]
-    buy_sma_fast = df[f'SMA_{top_buy_pair[1]}'].iloc[-1]
     buy_sma_slow = df[f'SMA_{top_buy_pair[0]}'].iloc[-1]
-    short_sma_fast = df[f'SMA_{top_short_pair[1]}'].iloc[-1]
     short_sma_slow = df[f'SMA_{top_short_pair[0]}'].iloc[-1]
 
     buy_threshold = buy_sma_slow
@@ -674,7 +607,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     if ticker is None or any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
         return go.Figure(), '', '', '', '', '', '', '', ''
 
-    df = fetch_data(ticker, MAX_SMA_DAY)
+    df, sma_combinations = get_data(ticker)
     if df is None or df.empty:
         return go.Figure(), '', '', '', '', '', '', '', ''
 
