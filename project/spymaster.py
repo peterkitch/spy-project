@@ -13,10 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 import os
 import json
-import time  # Used for simulating processing time
-import logging
 
-MAX_SMA_DAY = 30
+MAX_SMA_DAY = 300
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker, MAX_SMA_DAY):
@@ -29,21 +27,18 @@ def fetch_data(ticker, MAX_SMA_DAY):
 
 @lru_cache(maxsize=None)
 def get_data(ticker):
-    pkl_file = f'{ticker}_preprocessed_data.pkl'
+    pkl_file = f'{ticker}_precomputed_results.pkl'
     if os.path.exists(pkl_file):
         with open(pkl_file, 'rb') as file:
-            df, sma_combinations = pickle.load(file)
-            print(f"Loaded preprocessed data for {ticker} from {pkl_file}")
-            return df, sma_combinations
+            results = pickle.load(file)
+            df, sma_combinations = results.get('preprocessed_data', (None, None))
+            if df is not None and sma_combinations is not None:
+                print(f"Loaded preprocessed data for {ticker} from {pkl_file}")
+                return df, sma_combinations
     
     df = fetch_data(ticker, MAX_SMA_DAY)
     if df is not None and not df.empty:
         df, sma_combinations = preprocess_data(df, MAX_SMA_DAY)
-        
-        with open(pkl_file, 'wb') as file:
-            pickle.dump((df, sma_combinations), file)
-            print(f"Saved preprocessed data for {ticker} to {pkl_file}")
-        
         return df, sma_combinations
     
     return None, None
@@ -621,7 +616,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
 
     sma1_short = df[f'SMA_{sma_day_3}']
     sma2_short = df[f'SMA_{sma_day_4}']
-    short_signals = (sma1_short < sma2_short).astype(int)
+    short_signals = (sma1_short > sma2_short).astype(int)
     short_signals_shifted = short_signals.shift(1, fill_value=0)
     entry_signals_short = (short_signals - short_signals_shifted).astype(bool)
 
@@ -633,9 +628,12 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
 
     # Calculate cumulative capture for Buy and Short
     buy_capture = buy_returns.cumsum()
-    total_buy_capture = buy_capture[entry_signals_buy]
+    total_buy_capture = buy_capture.copy()
+    total_buy_capture.ffill(inplace=True)
+
     short_capture = short_returns.cumsum()
-    total_short_capture = short_capture[entry_signals_short]
+    total_short_capture = short_capture.copy()
+    total_short_capture.ffill(inplace=True)
 
     # Create the chart figure
     fig = go.Figure()
@@ -650,8 +648,8 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     fig.add_trace(go.Scatter(x=df.index, y=sma2_short, mode='lines', name=f'SMA {sma_day_4} (Short)'))
 
     # Add Total Buy Capture and Total Short Capture traces
-    fig.add_trace(go.Scatter(x=df.index[entry_signals_buy], y=total_buy_capture, mode='lines', name='Total Buy Capture'))
-    fig.add_trace(go.Scatter(x=df.index[entry_signals_short], y=total_short_capture, mode='lines', name='Total Short Capture'))
+    fig.add_trace(go.Scatter(x=df.index, y=total_buy_capture, mode='lines', name='Total Buy Capture'))
+    fig.add_trace(go.Scatter(x=df.index, y=total_short_capture, mode='lines', name='Total Short Capture'))
 
     # Customize layout
     fig.update_layout(
