@@ -14,7 +14,7 @@ from concurrent.futures import as_completed
 import os
 import json
 
-MAX_SMA_DAY = 300
+MAX_SMA_DAY = 3
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker, MAX_SMA_DAY):
@@ -26,7 +26,8 @@ def fetch_data(ticker, MAX_SMA_DAY):
         return None
 
 @lru_cache(maxsize=None)
-def get_data(ticker):
+def get_data(ticker, MAX_SMA_DAY):
+    print(f"get_data called for {ticker} with MAX_SMA_DAY {MAX_SMA_DAY}")
     pkl_file = f'{ticker}_precomputed_results.pkl'
     if os.path.exists(pkl_file):
         with open(pkl_file, 'rb') as file:
@@ -34,14 +35,43 @@ def get_data(ticker):
             df, sma_combinations = results.get('preprocessed_data', (None, None))
             if df is not None and sma_combinations is not None:
                 print(f"Loaded preprocessed data for {ticker} from {pkl_file}")
-                return df, sma_combinations
+                
+                # Check if MAX_SMA_DAY is greater than existing_max_sma_day
+                existing_max_sma_day = results.get('max_sma_day', 0)
+                if MAX_SMA_DAY > existing_max_sma_day:
+                    print(f"Updating preprocessed data for {ticker} with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
+                    
+                    # Compute new SMA columns
+                    new_sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(existing_max_sma_day + 1, MAX_SMA_DAY + 1)}
+                    print(f"New SMA columns: {list(new_sma_columns.keys())}")
+                    df = pd.concat([df, pd.DataFrame(new_sma_columns)], axis=1)
+                    
+                    # Remove duplicate SMA columns
+                    df = df.loc[:, ~df.columns.duplicated()]
+                    
+                    # Update sma_combinations
+                    sma_combinations = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(i + 1, MAX_SMA_DAY + 1)]
+                    print(f"Updated sma_combinations: {sma_combinations}")
+                    
+                    # Update preprocessed_data in the results dictionary
+                    results['preprocessed_data'] = (df, sma_combinations)
+                    results['max_sma_day'] = MAX_SMA_DAY
+                    
+                    # Save the updated results back to the pkl file
+                    with open(pkl_file, 'wb') as file:
+                        pickle.dump(results, file)
+                    
+                    print(f"Preprocessed data for {ticker} updated with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
+                
+                return df, sma_combinations, True  # Return True to indicate data loaded from pickle
     
+    print(f"No preprocessed data found for {ticker}. Fetching data and preprocessing...")
     df = fetch_data(ticker, MAX_SMA_DAY)
     if df is not None and not df.empty:
         df, sma_combinations = preprocess_data(df, MAX_SMA_DAY)
-        return df, sma_combinations
+        return df, sma_combinations, False  # Return False to indicate data not loaded from pickle
     
-    return None, None
+    return None, None, False
 
 def fetch_data_for_tickers(tickers):
     results = {}
@@ -62,10 +92,13 @@ def preprocess_data(df, MAX_SMA_DAY):
     # Remove duplicate SMA columns
     df = df.loc[:, ~df.columns.duplicated()]
 
+    # Compute sma_combinations
+    sma_combinations = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(i + 1, MAX_SMA_DAY + 1)]
+
     print("Preprocessing complete.")
     print("Preprocessed DataFrame:")
 
-    return df, {}  # Return an empty dictionary for sma_combinations
+    return df, sma_combinations
 
 @lru_cache(maxsize=None)
 def compute_signals(df, sma1, sma2):
@@ -102,127 +135,108 @@ def write_status(ticker, status):
 def precompute_results(ticker, MAX_SMA_DAY):
     print(f"Processing ticker: {ticker}")  # Print the ticker being processed
     pkl_file = f'{ticker}_precomputed_results.pkl'
+
+    # Load existing results
     if os.path.exists(pkl_file):
-        print(f"Precomputed results already exist for {ticker}. Loading from {pkl_file}")
-        write_status(ticker, {"status": "complete", "progress": 100})
-        return  # PKL file already exists, no need to recompute
+        with open(pkl_file, 'rb') as file:
+            existing_results = pickle.load(file)
+            existing_buy_results = existing_results.get('buy_results', {})
+            existing_short_results = existing_results.get('short_results', {})
+            existing_max_sma_day = existing_results.get('max_sma_day', 0)
+            print(f"Loaded existing results for {ticker}")
+            print(f"Existing top buy pair: {existing_results.get('top_buy_pair')}")
+            print(f"Existing top short pair: {existing_results.get('top_short_pair')}")
+    else:
+        existing_buy_results = {}
+        existing_short_results = {}
+        existing_max_sma_day = 0
+        print(f"No existing results found for {ticker}")
 
     try:
         print("Fetching data...")
-        df, sma_combinations = get_data(ticker)
-        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        df, sma_combinations, loaded_from_pickle = get_data(ticker, MAX_SMA_DAY)
+        if df is None or df.empty:
             write_status(ticker, {"status": "failed", "message": "No data"})
             return None
-        else:
-            print(f"Data fetched for {ticker}.")
+        print(f"Data fetched for {ticker}.")
 
-            # Perform preprocessing and calculations
+        start_date = df.index.min().strftime('%Y-%m-%d')
+        print(f"Start date for {ticker}: {start_date}")
+        print(f"End date: {df.index.max()}")
+
+        if not loaded_from_pickle or MAX_SMA_DAY > existing_max_sma_day:
+            print("Performing dynamic trading strategy calculations...")
+            buy_results = existing_buy_results
+            short_results = existing_short_results
+
+            sma_pairs = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(1, MAX_SMA_DAY + 1) if i != j]
+
+            print(f"Starting brute-force calculation for {ticker}")
+            with tqdm(total=len(sma_pairs), desc='Brute-Force Calculation', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                for pair in sma_pairs:
+                    try:
+                        sma1 = df[f'SMA_{pair[0]}']
+                        sma2 = df[f'SMA_{pair[1]}']
+
+                        # Calculate buy capture
+                        buy_signals = sma1 > sma2
+                        buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
+                        buy_capture = buy_returns.cumsum()
+                        buy_results[pair] = buy_capture.iloc[-1]
+
+                        # Calculate short capture (inverse logic for short)
+                        short_signals = sma1 < sma2
+                        short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
+                        short_capture = short_returns.cumsum()
+                        short_results[pair] = short_capture.iloc[-1]
+
+                    except KeyError as e:
+                        print(f"KeyError occurred for pair {pair}: {str(e)}")
+                    except Exception as e:
+                        print(f"Error occurred for pair {pair}: {str(e)}")
+
+                    pbar.update(1)
+
+            print(f"Finished brute-force calculation for {ticker}")
+            print(f"Buy Results for {ticker}: {buy_results}")
+            print(f"Short Results for {ticker}: {short_results}")
+
+            # Identify the top performing buy and the poorest performing buy as the top performing short -- inverted elsewhere in script
+            top_buy_pair = max(buy_results, key=buy_results.get)
+            top_short_pair = min(short_results, key=short_results.get)
+
+            print(f"Top Buy Pair for {ticker}: {top_buy_pair}")
+            print(f"Top Short Pair for {ticker}: {top_short_pair}")
+
+            results = {
+                'top_buy_pair': top_buy_pair,
+                'top_short_pair': top_short_pair,
+                'buy_results': buy_results,
+                'short_results': short_results,
+                'start_date': start_date,
+                'max_sma_day': MAX_SMA_DAY,
+                'preprocessed_data': (df, sma_combinations)  # Save the DataFrame and sma_combinations to the results
+            }
+
+            print(f"Results for {ticker}: {results}")
+            print(f"Saving results to {pkl_file}")
+
             try:
-                processed_data = preprocess_data(df, MAX_SMA_DAY)
-                df = processed_data[0]
-                sma_combinations = processed_data[1]
-                print("Preprocessing complete.")
-                print("Preprocessed DataFrame:")
-
-                start_date = df.index.min().strftime('%Y-%m-%d')
-                print(f"Start date for {ticker}: {start_date}")  # Print the start date
-                print(f"End date: {df.index.max()}")
-
-                print("Performing dynamic trading strategy calculations...")
-                buy_results = {}
-                short_results = {}
-
-                with tqdm(total=len(sma_combinations), desc='Dynamic Trading Strategy', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
-                    print(f"SMA combinations keys: {list(sma_combinations.keys())}")
-                    for pair, data in sma_combinations.items():
-                        buy_capture = data['buy_capture']
-                        short_capture = data['short_capture']
-                        buy_results[pair] = buy_capture
-                        short_results[pair] = short_capture
-                        pbar.update(1)
-
-                print("Dynamic trading strategy calculations complete.")
-
-                # Calculate final cumulative return for each pair
-                buy_final_returns = {pair: returns.iloc[-1] if not returns.empty else 0 for pair, returns in buy_results.items()}
-                short_final_returns = {pair: returns.iloc[-1] if not returns.empty else 0 for pair, returns in short_results.items()}
-
-                # Perform brute-force calculation to find the most productive buy and short pairs
-                buy_pairs = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(1, MAX_SMA_DAY + 1) if i != j]
-                short_pairs = buy_pairs
-
-                buy_results = []
-                short_results = []
-
-                with tqdm(total=len(buy_pairs), desc='Brute-Force Calculation', unit='pair', ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
-                    for pair in buy_pairs:
-
-                        try:
-                            sma1 = df[f'SMA_{pair[0]}']
-                            sma2 = df[f'SMA_{pair[1]}']
-            
-                            buy_signals = (sma1 > sma2).astype(int)
-                            entry_signals = (buy_signals - buy_signals.shift(1)).astype(bool)
-                            buy_returns = df['Close'].pct_change()
-                            buy_returns[~entry_signals] = 0
-                            buy_capture = buy_returns.cumsum()
-                            buy_results.append((pair, buy_capture.iloc[-1]))
-
-                            short_signals = (sma1 < sma2).astype(int)
-                            entry_signals = (short_signals - short_signals.shift(1)).astype(bool)
-                            short_returns = -df['Close'].pct_change()
-                            short_returns[~entry_signals] = 0
-                            short_capture = short_returns.cumsum()
-                            short_results.append((pair, short_capture.iloc[-1]))
-
-                        except KeyError as e:
-                            print(f"KeyError occurred for pair {pair}: {str(e)}")
-                            # Handle the KeyError appropriately (e.g., skip the pair or provide a default value)
-
-                        except Exception as e:
-                            print(f"Error occurred for pair {pair}: {str(e)}")
-                            # Handle other exceptions appropriately
-        
-                        pbar.update(1)
-
-                top_buy_pair = max(buy_results, key=lambda x: x[1])[0]
-                top_short_pair = max(short_results, key=lambda x: x[1])[0]
-
-                print(f"Top Buy Pair: {top_buy_pair}")
-                print(f"Top Short Pair: {top_short_pair}")
-
-                results = {
-                    'top_buy_pair': top_buy_pair,
-                    'top_short_pair': top_short_pair,
-                    'start_date': start_date
-                }
-
-                print(f"Results to be saved: {results}")
-                print(f"Saving results to {pkl_file}")
-
-                try:
-
-                    with open(pkl_file, 'wb') as file:
-                        pickle.dump(results, file)
-                    print("Results saved successfully.")
-                    write_status(ticker, {"status": "complete", "progress": 100})
-
-                except Exception as e:
-                    error_message = f"Error in precompute_results for {ticker}: {str(e)}"
-                    print(f"Error occurred while saving results to {pkl_file}: {str(e)}")
-                    print(error_message)
-                    write_status(ticker, {"status": "failed", "message": error_message})
+                with open(pkl_file, 'wb') as file:
+                    pickle.dump(results, file)
+                print("Results saved successfully.")
                 write_status(ticker, {"status": "complete", "progress": 100})
 
-    
             except Exception as e:
-                print(f"An error occurred: {str(e)}")
-                write_status(ticker, {"status": "failed", "message": str(e)})
+                error_message = f"Error in precompute_results for {ticker}: {str(e)}"
+                print(f"Error occurred while saving results to {pkl_file}: {str(e)}")
+                print(error_message)
+                write_status(ticker, {"status": "failed", "message": error_message})
+        else:
+            print(f"Data loaded from pickle file for {ticker}. Skipping brute-force calculation.")
 
     except Exception as e:
-        error_message = f"Error in precompute_results for {ticker}: {str(e)}"
-        print(error_message)
-        write_status(ticker, {"status": "failed", "message": error_message})
+        print(f"An error occurred: {str(e)}")
 
 precompute_results('^GSPC', MAX_SMA_DAY)  # Example ticker: S&P 500 index
 
@@ -394,6 +408,7 @@ def update_status(n_intervals, ticker):
         elif status['status'] == 'failed':
             return f"Failed to process {ticker}: {status.get('message', '')}"
     return "Enter a ticker and press submit to start processing."
+
 # Callback to toggle the visibility of the Calculation Components section
 @app.callback(
     Output('calc-collapse', 'is_open'),
@@ -453,14 +468,16 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4):
 def validate_ticker_input(ticker):
     if not ticker:
         return ''
-    df, _ = get_data(ticker)
+    df, _, loaded_from_pickle = get_data(ticker, MAX_SMA_DAY)
     
     if df is None or df.empty:
         return go.Figure()
 
-    # Trigger precomputation if the pickle file doesn't exist
     pkl_file = f'{ticker}_precomputed_results.pkl'
-    if not os.path.exists(pkl_file):
+    # Use pkl_file as needed...
+
+    # Trigger precomputation if the pickle file doesn't exist or if data was not loaded from pickle
+    if not loaded_from_pickle:
         precompute_results(ticker, MAX_SMA_DAY)
 
 @app.callback(
@@ -497,21 +514,19 @@ def update_dynamic_strategy_display(ticker):
     print("Top Short Pair:", top_short_pair)
 
     # Use the cached data instead of fetching it again
-    df, _ = get_data(ticker)
+    df, _, _ = get_data(ticker, MAX_SMA_DAY)
 
     try:
         sma1_buy_leader = df.iloc[:, df.columns.get_loc(f'SMA_{top_buy_pair[0]}')]
         sma2_buy_leader = df.iloc[:, df.columns.get_loc(f'SMA_{top_buy_pair[1]}')]
-        buy_signals_leader = (sma1_buy_leader > sma2_buy_leader).astype(int)
-        entry_signals_buy_leader = (buy_signals_leader - buy_signals_leader.shift(1)).astype(bool)
-        entry_signals_buy_leader = entry_signals_buy_leader.reindex(df['Close'].pct_change().index)
-        buy_returns_leader = df['Close'].pct_change()[entry_signals_buy_leader].dropna()
+        buy_signals_leader = sma1_buy_leader > sma2_buy_leader
+        buy_returns_leader = df['Close'].pct_change().where(buy_signals_leader.shift(1, fill_value=False), 0)
 
         sma1_short_leader = df.iloc[:, df.columns.get_loc(f'SMA_{top_short_pair[0]}')]
         sma2_short_leader = df.iloc[:, df.columns.get_loc(f'SMA_{top_short_pair[1]}')]
-        short_signals_leader = (sma1_short_leader < sma2_short_leader).astype(int)
-        entry_signals_short_leader = (short_signals_leader - short_signals_leader.shift(1)).astype(bool)
-        short_returns_leader = -df['Close'].pct_change()[entry_signals_short_leader].dropna()
+        short_signals_leader = sma1_short_leader > sma2_short_leader
+        short_returns_leader = df['Close'].pct_change().where(short_signals_leader.shift(1, fill_value=False), 0) * -1
+
     except KeyError:
         print(f"Required SMA columns not found in the DataFrame for {ticker}")
         return ["Data not available or processing not yet complete. Please wait..."] * 10
@@ -602,7 +617,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     if ticker is None or any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
         return go.Figure(), '', '', '', '', '', '', '', ''
 
-    df, sma_combinations = get_data(ticker)
+    df, sma_combinations, _ = get_data(ticker, MAX_SMA_DAY)
     if df is None or df.empty:
         return go.Figure(), '', '', '', '', '', '', '', ''
 
@@ -610,30 +625,19 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
 
     sma1_buy = df[f'SMA_{sma_day_1}']
     sma2_buy = df[f'SMA_{sma_day_2}']
-    buy_signals = (sma1_buy > sma2_buy).astype(int)
-    buy_signals_shifted = buy_signals.shift(1, fill_value=0)
-    entry_signals_buy = (buy_signals - buy_signals_shifted).astype(bool)
+    buy_signals = sma1_buy > sma2_buy
 
     sma1_short = df[f'SMA_{sma_day_3}']
     sma2_short = df[f'SMA_{sma_day_4}']
-    short_signals = (sma1_short > sma2_short).astype(int)
-    short_signals_shifted = short_signals.shift(1, fill_value=0)
-    entry_signals_short = (short_signals - short_signals_shifted).astype(bool)
+    short_signals = sma1_short > sma2_short
 
     daily_returns = df['Close'].pct_change()
-    buy_returns = daily_returns.copy()
-    buy_returns[~entry_signals_buy] = 0
-    short_returns = -daily_returns.copy()
-    short_returns[~entry_signals_short] = 0
+    buy_returns = daily_returns.where(buy_signals.shift(1, fill_value=False), 0)
+    short_returns = -daily_returns.where(short_signals.shift(1, fill_value=False), 0)
 
     # Calculate cumulative capture for Buy and Short
-    buy_capture = buy_returns.cumsum()
-    total_buy_capture = buy_capture.copy()
-    total_buy_capture.ffill(inplace=True)
-
-    short_capture = short_returns.cumsum()
-    total_short_capture = short_capture.copy()
-    total_short_capture.ffill(inplace=True)
+    total_buy_capture = buy_returns.cumsum()
+    total_short_capture = short_returns.cumsum()
 
     # Create the chart figure
     fig = go.Figure()
@@ -642,14 +646,14 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name=f'{ticker} Close'))
 
     # Add SMA traces
-    fig.add_trace(go.Scatter(x=df.index, y=sma1_buy, mode='lines', name=f'SMA {sma_day_1} (Buy)'))
-    fig.add_trace(go.Scatter(x=df.index, y=sma2_buy, mode='lines', name=f'SMA {sma_day_2} (Buy)'))
-    fig.add_trace(go.Scatter(x=df.index, y=sma1_short, mode='lines', name=f'SMA {sma_day_3} (Short)'))
-    fig.add_trace(go.Scatter(x=df.index, y=sma2_short, mode='lines', name=f'SMA {sma_day_4} (Short)'))
+    fig.add_trace(go.Scatter(x=df.index, y=sma1_buy, mode='lines', name=f'SMA {sma_day_1} (Buy)', visible=True))
+    fig.add_trace(go.Scatter(x=df.index, y=sma2_buy, mode='lines', name=f'SMA {sma_day_2} (Buy)', visible=True))
+    fig.add_trace(go.Scatter(x=df.index, y=sma1_short, mode='lines', name=f'SMA {sma_day_3} (Short)', visible=True))
+    fig.add_trace(go.Scatter(x=df.index, y=sma2_short, mode='lines', name=f'SMA {sma_day_4} (Short)', visible=True))
 
     # Add Total Buy Capture and Total Short Capture traces
-    fig.add_trace(go.Scatter(x=df.index, y=total_buy_capture, mode='lines', name='Total Buy Capture'))
-    fig.add_trace(go.Scatter(x=df.index, y=total_short_capture, mode='lines', name='Total Short Capture'))
+    fig.add_trace(go.Scatter(x=total_buy_capture.index, y=total_buy_capture * 100, mode='lines', name='Total Buy Capture'))
+    fig.add_trace(go.Scatter(x=total_short_capture.index, y=total_short_capture * 100, mode='lines', name='Total Short Capture'))
 
     # Customize layout
     fig.update_layout(
@@ -662,18 +666,22 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     )
 
     # Calculate trigger days for Buy and Short
-    trigger_days_buy = f"Buy Trigger Days: {entry_signals_buy.sum()}"
-    trigger_days_short = f"Short Trigger Days: {entry_signals_short.sum()}"
+    trigger_days_buy = f"Buy Trigger Days: {buy_signals.sum()}"
+    trigger_days_short = f"Short Trigger Days: {short_signals.sum()}"
 
     # Calculate win ratios for Buy and Short
-    win_ratio_buy = f"Buy Win Ratio: {(buy_returns[entry_signals_buy] > 0).mean() * 100:.9f}%" if entry_signals_buy.sum() > 0 else "Buy Win Ratio: N/A"
-    win_ratio_short = f"Short Win Ratio: {(short_returns[entry_signals_short] > 0).mean() * 100:.9f}%" if entry_signals_short.sum() > 0 else "Short Win Ratio: N/A"
+    buy_win_ratio = (buy_returns > 0).mean()
+    short_win_ratio = (short_returns > 0).mean()
+    win_ratio_buy = f"Buy Win Ratio: {buy_win_ratio * 100:.9f}%" if pd.notnull(buy_win_ratio) else "Buy Win Ratio: N/A"
+    win_ratio_short = f"Short Win Ratio: {short_win_ratio * 100:.9f}%" if pd.notnull(short_win_ratio) else "Short Win Ratio: N/A"
 
     # Calculate average daily capture and total capture for Buy and Short
-    avg_daily_capture_buy = f"Buy Avg. Daily Capture: {buy_returns[entry_signals_buy].mean() * 100:.9f}%" if entry_signals_buy.sum() > 0 else "Buy Avg. Daily Capture: N/A"
-    total_capture_buy = f"Buy Total Capture: {total_buy_capture.iloc[-1] * 100:.9f}%" if len(total_buy_capture) > 0 else "Buy Total Capture: N/A"
-    avg_daily_capture_short = f"Short Avg. Daily Capture: {short_returns[entry_signals_short].mean() * 100:.9f}%" if entry_signals_short.sum() > 0 else "Short Avg. Daily Capture: N/A"
-    total_capture_short = f"Short Total Capture: {total_short_capture.iloc[-1] * 100:.9f}%" if len(total_short_capture) > 0 else "Short Total Capture: N/A"
+    buy_avg_daily_capture = buy_returns.mean()
+    short_avg_daily_capture = short_returns.mean()
+    avg_daily_capture_buy = f"Buy Avg. Daily Capture: {buy_avg_daily_capture * 100:.9f}%" if pd.notnull(buy_avg_daily_capture) else "Buy Avg. Daily Capture: N/A"
+    avg_daily_capture_short = f"Short Avg. Daily Capture: {short_avg_daily_capture * 100:.9f}%" if pd.notnull(short_avg_daily_capture) else "Short Avg. Daily Capture: N/A"
+    total_capture_buy = f"Buy Total Capture: {total_buy_capture.iloc[-1] * 100:.9f}%" if len(total_buy_capture) > 0 and pd.notnull(total_buy_capture.iloc[-1]) else "Buy Total Capture: N/A"
+    total_capture_short = f"Short Total Capture: {total_short_capture.iloc[-1] * 100:.9f}%" if len(total_short_capture) > 0 and pd.notnull(total_short_capture.iloc[-1]) else "Short Total Capture: N/A"
 
     return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short
 
