@@ -14,7 +14,7 @@ from concurrent.futures import as_completed
 import os
 import json
 
-MAX_SMA_DAY = 1000
+MAX_SMA_DAY = 30
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker):
@@ -225,43 +225,41 @@ def precompute_results(ticker, MAX_SMA_DAY):
                 results['preprocessed_data'] = (df, sma_combinations)
                 results['max_sma_day'] = MAX_SMA_DAY
 
-                # Save the updated results back to the pkl file
-                with open(pkl_file, 'wb') as file:
-                    pickle.dump(results, file)
-
                 print(f"Preprocessed data for {ticker} updated with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
             
             if sma_pairs:
                 print(f"Starting brute-force calculation for {ticker} with new SMA pairs")
+                
+                with tqdm(total=len(sma_pairs), desc='Brute-Force Calculation', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                    for pair in sma_pairs:
+                        try:
+                            sma1 = df[f'SMA_{pair[0]}']
+                            sma2 = df[f'SMA_{pair[1]}']
+
+                            # Calculate buy capture
+                            buy_signals = sma1 > sma2
+                            buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
+                            buy_capture = buy_returns.cumsum()
+                            buy_results[pair] = buy_capture.iloc[-1]
+
+                            # Calculate short capture
+                            short_signals = sma1 < sma2
+                            short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
+                            short_capture = short_returns.cumsum()
+                            short_results[pair] = short_capture.iloc[-1]
+
+                        except KeyError as e:
+                            print(f"KeyError occurred for pair {pair}: {str(e)}")
+                        except Exception as e:
+                            print(f"Error occurred for pair {pair}: {str(e)}")
+
+                        pbar.update(1)
+                
+                print(f"Finished brute-force calculation for {ticker}")
             else:
                 print(f"No new SMA pairs to calculate for {ticker}")
-
-            with tqdm(total=len(sma_pairs), desc='Brute-Force Calculation', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
-                for pair in sma_pairs:
-                    try:
-                        sma1 = df[f'SMA_{pair[0]}']
-                        sma2 = df[f'SMA_{pair[1]}']
-
-                        # Calculate buy capture
-                        buy_signals = sma1 > sma2
-                        buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                        buy_capture = buy_returns.cumsum()
-                        buy_results[pair] = buy_capture.iloc[-1]
-
-                        # Calculate short capture
-                        short_signals = sma1 < sma2
-                        short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                        short_capture = short_returns.cumsum()
-                        short_results[pair] = short_capture.iloc[-1]
-
-                    except KeyError as e:
-                        print(f"KeyError occurred for pair {pair}: {str(e)}")
-                    except Exception as e:
-                        print(f"Error occurred for pair {pair}: {str(e)}")
-
-                    pbar.update(1)
-
-            print(f"Finished brute-force calculation for {ticker}")
+                buy_results = existing_buy_results
+                short_results = existing_short_results
 
             # Verify if results are available before attempting to find top pairs
             if buy_results and short_results:
@@ -291,19 +289,23 @@ def precompute_results(ticker, MAX_SMA_DAY):
                     'preprocessed_data': (df, sma_combinations)  # Save the DataFrame and sma_combinations to the results
                 }
 
-                print(f"Saving results to {pkl_file}")
+                if sma_pairs:
+                    print(f"Saving results to {pkl_file}")
 
-                try:
-                    with open(pkl_file, 'wb') as file:
-                        pickle.dump(results, file)
-                    print("Results saved successfully.")
+                    try:
+                        with open(pkl_file, 'wb') as file:
+                            pickle.dump(results, file)
+                        print("Results saved successfully.")
+                        write_status(ticker, {"status": "complete", "progress": 100})
+
+                    except Exception as e:
+                        error_message = f"Error in precompute_results for {ticker}: {str(e)}"
+                        print(f"Error occurred while saving results to {pkl_file}: {str(e)}")
+                        print(error_message)
+                        write_status(ticker, {"status": "failed", "message": error_message})
+                else:
+                    print(f"No new SMA pairs to calculate. Skipping saving results to {pkl_file}")
                     write_status(ticker, {"status": "complete", "progress": 100})
-
-                except Exception as e:
-                    error_message = f"Error in precompute_results for {ticker}: {str(e)}"
-                    print(f"Error occurred while saving results to {pkl_file}: {str(e)}")
-                    print(error_message)
-                    write_status(ticker, {"status": "failed", "message": error_message})
             else:
                 print("Insufficient data for calculating top buy and short pairs. Please check data integrity.")
 
@@ -349,7 +351,10 @@ def read_status(ticker):
     status_path = f"{ticker}_status.json"
     if os.path.exists(status_path):
         with open(status_path, 'r') as file:
-            return json.load(file)
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                print(f"Empty JSON file: {status_path}")
     return {"status": "not started", "progress": 0}
 
 # Update your Dash layout to include the status and interval component
@@ -383,12 +388,12 @@ app.layout = html.Div(
                     dbc.CardHeader('Buy Pair'),
                     dbc.CardBody([
                         html.Div([
-                            html.Label(f'Enter 1st SMA Day (1-{MAX_SMA_DAY}) for Buy Pair:', className='mb-1'),
+                            html.Label(id='sma-input-1-label', className='mb-1'),
                             dcc.Input(id='sma-input-1', type='number', min=1, max=MAX_SMA_DAY, step=1, className='form-control'),
                             html.Div(id='sma-input-1-error', className='text-danger')
                         ], className='mb-3'),
                         html.Div([
-                            html.Label(f'Enter 2nd SMA Day (1-{MAX_SMA_DAY}) for Buy Pair:', className='mb-1'),
+                            html.Label(id='sma-input-2-label', className='mb-1'),
                             dcc.Input(id='sma-input-2', type='number', min=1, max=MAX_SMA_DAY, step=1, className='form-control'),
                             html.Div(id='sma-input-2-error', className='text-danger')
                         ], className='mb-3')
@@ -398,12 +403,12 @@ app.layout = html.Div(
                     dbc.CardHeader('Short Pair'),
                     dbc.CardBody([
                         html.Div([
-                            html.Label(f'Enter 3rd SMA Day (1-{MAX_SMA_DAY}) for Short Pair:', className='mb-1'),
+                            html.Label(id='sma-input-3-label', className='mb-1'),
                             dcc.Input(id='sma-input-3', type='number', min=1, max=MAX_SMA_DAY, step=1, className='form-control'),
                             html.Div(id='sma-input-3-error', className='text-danger')
                         ], className='mb-3'),
                         html.Div([
-                            html.Label(f'Enter 4th SMA Day (1-{MAX_SMA_DAY}) for Short Pair:', className='mb-1'),
+                            html.Label(id='sma-input-4-label', className='mb-1'),
                             dcc.Input(id='sma-input-4', type='number', min=1, max=MAX_SMA_DAY, step=1, className='form-control'),
                             html.Div(id='sma-input-4-error', className='text-danger')
                         ], className='mb-3')
@@ -471,6 +476,38 @@ app.layout = html.Div(
     ]
 )
 
+# Callback to update the labels of the SMA day inputs
+@app.callback(
+    [Output('sma-input-1', 'max'),
+     Output('sma-input-2', 'max'),
+     Output('sma-input-3', 'max'),
+     Output('sma-input-4', 'max'),
+     Output('sma-input-1-label', 'children'),
+     Output('sma-input-2-label', 'children'),
+     Output('sma-input-3-label', 'children'),
+     Output('sma-input-4-label', 'children')],
+    [Input('ticker-input', 'value')]
+)
+def update_sma_labels(ticker):
+    if not ticker:
+        trading_days = 1
+    else:
+        df = fetch_data(ticker)
+        if df is None or df.empty:
+            trading_days = 1
+        else:
+            trading_days = len(df)
+
+    max_values = [trading_days] * 4
+    labels = [
+        f"Enter 1st SMA Day (1-{trading_days}) for Buy Pair:",
+        f"Enter 2nd SMA Day (1-{trading_days}) for Buy Pair:",
+        f"Enter 3rd SMA Day (1-{trading_days}) for Short Pair:",
+        f"Enter 4th SMA Day (1-{trading_days}) for Short Pair:"
+    ]
+
+    return max_values + labels
+
 # Ensure callback IDs match exactly what's in the layout and are correctly specified.
 # For instance:
 @app.callback(
@@ -510,7 +547,7 @@ def toggle_strategy_collapse(n_clicks, is_open):
         return not is_open
     return is_open
 
-# Callback to validate SMA input fields
+# validate_sma_inputs callback
 @app.callback(
     [Output('sma-input-1', 'className'),
      Output('sma-input-2', 'className'),
@@ -523,17 +560,27 @@ def toggle_strategy_collapse(n_clicks, is_open):
     [Input('sma-input-1', 'value'),
      Input('sma-input-2', 'value'),
      Input('sma-input-3', 'value'),
-     Input('sma-input-4', 'value')]
+     Input('sma-input-4', 'value'),
+     Input('ticker-input', 'value')]
 )
-def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4):
+def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, ticker):
     sma_inputs = [sma_input_1, sma_input_2, sma_input_3, sma_input_4]
     input_classes = []
     error_messages = []
 
+    if ticker:
+        df = fetch_data(ticker)
+        if df is None or df.empty:
+            trading_days = 1
+        else:
+            trading_days = len(df)
+    else:
+        trading_days = 1
+
     for sma_input in sma_inputs:
-        if sma_input is None or sma_input < 1 or sma_input > MAX_SMA_DAY:
+        if sma_input is None or sma_input < 1 or sma_input > trading_days:
             input_classes.append('form-control is-invalid')
-            error_messages.append('Please enter a valid SMA day (1-{MAX_SMA_DAY}).')
+            error_messages.append(f'Please enter a valid SMA day (1-{trading_days}).')
         else:
             input_classes.append('form-control')
             error_messages.append('')
@@ -584,6 +631,7 @@ def update_dynamic_strategy_display(ticker):
 
     top_buy_pair = results['top_buy_pair']
     top_short_pair = results['top_short_pair']
+
 
     # Use the cached data from the results
     df = results['preprocessed_data'][0]
@@ -667,8 +715,8 @@ def update_dynamic_strategy_display(ticker):
         performance_expectation,
         confidence_percentage,
         html.Div(trading_recommendations)
-    )
 
+)
 @app.callback(
     [Output('chart', 'figure'),
      Output('trigger-days-buy', 'children'),
@@ -689,27 +737,18 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     if ticker is None or any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
         return go.Figure(), '', '', '', '', '', '', '', ''
 
-    results = load_precomputed_results(ticker)
-    if results is None or 'preprocessed_data' not in results:
-        return go.Figure(), '', '', '', '', '', '', '', ''
-    
-    df = results['preprocessed_data'][0]
+    df = fetch_data(ticker)
     if df is None or df.empty:
-        return go.Figure(), '', '', '', '', '', '', '', ''
-
-    if f'SMA_{sma_day_1}' not in df.columns or f'SMA_{sma_day_2}' not in df.columns or \
-        f'SMA_{sma_day_3}' not in df.columns or f'SMA_{sma_day_4}' not in df.columns:
-        print(f"Required SMA columns not found in the DataFrame for {ticker}")
         return go.Figure(), '', '', '', '', '', '', '', ''
 
     start_date = df.index.min().strftime('%Y-%m-%d')
 
-    sma1_buy = df[f'SMA_{sma_day_1}']
-    sma2_buy = df[f'SMA_{sma_day_2}']
+    sma1_buy = df['Close'].rolling(window=sma_day_1).mean()
+    sma2_buy = df['Close'].rolling(window=sma_day_2).mean()
     buy_signals = sma1_buy > sma2_buy
 
-    sma1_short = df[f'SMA_{sma_day_3}']
-    sma2_short = df[f'SMA_{sma_day_4}']
+    sma1_short = df['Close'].rolling(window=sma_day_3).mean()
+    sma2_short = df['Close'].rolling(window=sma_day_4).mean()
     short_signals = sma1_short < sma2_short
 
     daily_returns = df['Close'].pct_change()
