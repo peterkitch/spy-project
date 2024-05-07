@@ -14,7 +14,7 @@ from concurrent.futures import as_completed
 import os
 import json
 
-MAX_SMA_DAY = 2
+MAX_SMA_DAY = 200
 
 @lru_cache(maxsize=None)
 def fetch_data(ticker):
@@ -82,30 +82,34 @@ def get_data(ticker, MAX_SMA_DAY):
             existing_max_sma_day = results.get('max_sma_day', 0)  # Get the existing max_sma_day value
             
             if df is not None and sma_combinations is not None:
-                # Check if MAX_SMA_DAY is greater than existing_max_sma_day
-                if MAX_SMA_DAY > existing_max_sma_day:
-                    print(f"Updating preprocessed data for {ticker} with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
-                    
-                    # Compute new SMA columns
-                    new_sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(existing_max_sma_day + 1, MAX_SMA_DAY + 1)}
-                    df = pd.concat([df, pd.DataFrame(new_sma_columns)], axis=1)
-                    
-                    # Remove duplicate SMA columns
-                    df = df.loc[:, ~df.columns.duplicated()]
-                    
-                    # Update sma_combinations
-                    sma_combinations = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(i + 1, MAX_SMA_DAY + 1)]
-                    
-                    # Update preprocessed_data in the results dictionary
-                    results['preprocessed_data'] = (df, sma_combinations)
-                    results['max_sma_day'] = MAX_SMA_DAY
-                    
-                    # Save the updated results back to the pkl file
-                    with open(pkl_file, 'wb') as file:
-                        pickle.dump(results, file)
-                    print(f"Preprocessed data for {ticker} updated with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
+                # Check if MAX_SMA_DAY is less than or equal to existing_max_sma_day
+                if MAX_SMA_DAY <= existing_max_sma_day:
+                    print(f"Using preprocessed data for {ticker} with existing MAX_SMA_DAY {existing_max_sma_day}")
+                    return df, sma_combinations, True, existing_max_sma_day  # Return True to indicate data loaded from pickle and the existing max_sma_day value
                 
-                return df, sma_combinations, True, existing_max_sma_day  # Return True to indicate data loaded from pickle and the existing max_sma_day value
+                # If MAX_SMA_DAY is greater than existing_max_sma_day, update the preprocessed data
+                print(f"Updating preprocessed data for {ticker} with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
+                
+                # Compute new SMA columns
+                new_sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(existing_max_sma_day + 1, MAX_SMA_DAY + 1)}
+                df = pd.concat([df, pd.DataFrame(new_sma_columns)], axis=1)
+                
+                # Remove duplicate SMA columns
+                df = df.loc[:, ~df.columns.duplicated()]
+                
+                # Update sma_combinations
+                sma_combinations = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(i + 1, MAX_SMA_DAY + 1)]
+                
+                # Update preprocessed_data in the results dictionary
+                results['preprocessed_data'] = (df, sma_combinations)
+                results['max_sma_day'] = MAX_SMA_DAY
+                
+                # Save the updated results back to the pkl file
+                with open(pkl_file, 'wb') as file:
+                    pickle.dump(results, file)
+                print(f"Preprocessed data for {ticker} updated with new SMA columns up to MAX_SMA_DAY {MAX_SMA_DAY}")
+                
+                return df, sma_combinations, True, MAX_SMA_DAY  # Return True to indicate data loaded from pickle and the updated max_sma_day value
     
     print(f"No preprocessed data found for {ticker}. Fetching data and preprocessing...")
     
@@ -204,12 +208,12 @@ def precompute_results(ticker, MAX_SMA_DAY):
             buy_results = existing_buy_results
             short_results = existing_short_results
 
-            # Generate new SMA pairs based on the actual number of trading days
-            sma_pairs = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(i + 1, MAX_SMA_DAY + 1) if (i, j) not in existing_buy_results and (i, j) not in existing_short_results]
+            # Generate new SMA pairs based on the actual number of trading days and MAX_SMA_DAY
+            sma_pairs = [(i, j) for i in range(1, min(len(df), MAX_SMA_DAY) + 1) for j in range(i + 1, min(len(df), MAX_SMA_DAY) + 1) if (i, j) not in existing_buy_results and (i, j) not in existing_short_results]
 
-            # Compute new SMA columns if MAX_SMA_DAY > existing_max_sma_day
-            if MAX_SMA_DAY > existing_max_sma_day:
-                new_sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(existing_max_sma_day + 1, len(df) + 1)}
+            # Compute new SMA columns if min(len(df), MAX_SMA_DAY) > existing_max_sma_day
+            if min(len(df), MAX_SMA_DAY) > existing_max_sma_day:
+                new_sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(existing_max_sma_day + 1, min(len(df), MAX_SMA_DAY) + 1)}
                 df = pd.concat([df, pd.DataFrame(new_sma_columns)], axis=1)
 
                 # Remove duplicate SMA columns
@@ -217,9 +221,9 @@ def precompute_results(ticker, MAX_SMA_DAY):
 
                 # Update preprocessed_data in the results dictionary
                 results['preprocessed_data'] = (df, sma_combinations)
-                results['max_sma_day'] = len(df)
+                results['max_sma_day'] = min(len(df), MAX_SMA_DAY)
 
-                print(f"Preprocessed data for {ticker} updated with new SMA columns up to {len(df)} trading days")
+                print(f"Preprocessed data for {ticker} updated with new SMA columns up to {min(len(df), MAX_SMA_DAY)} trading days")
             
             if sma_pairs:
                 print(f"Starting brute-force calculation for {ticker} with new SMA pairs")
@@ -279,7 +283,7 @@ def precompute_results(ticker, MAX_SMA_DAY):
                     'buy_results': buy_results,
                     'short_results': short_results,
                     'start_date': df.index.min().strftime('%Y-%m-%d'),
-                    'max_sma_day': len(df),
+                    'max_sma_day': min(len(df), MAX_SMA_DAY),
                     'preprocessed_data': (df, sma_combinations)  # Save the DataFrame and sma_combinations to the results
                 }
 
@@ -305,8 +309,6 @@ def precompute_results(ticker, MAX_SMA_DAY):
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
-
-precompute_results('^GSPC', MAX_SMA_DAY)  # Example ticker: S&P 500 index
 
 # Load the precomputed results
 def load_precomputed_results(ticker):
