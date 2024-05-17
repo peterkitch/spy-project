@@ -13,9 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 import os
 import json
+import time
+from pprint import pprint
 
 
-MAX_SMA_DAY = 3
+MAX_SMA_DAY = 200
 
 def fetch_data(ticker):
     try:
@@ -38,35 +40,39 @@ def identify_new_trading_days(df, existing_data):
             return new_trading_days
     return None
 
-def check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day):
+def check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days):
     print("Inside check_and_compute_missing_smas...")
     print(f"MAX_SMA_DAY: {MAX_SMA_DAY}")
     print(f"existing_max_sma_day: {existing_max_sma_day}")
-
+    print(f"total_trading_days: {total_trading_days}")
     print("DataFrame before modifications:")
     print(df)
 
-    # Identify any missing SMA columns based on the expected range
-    missing_columns = [f'SMA_{i}' for i in range(existing_max_sma_day + 1, MAX_SMA_DAY + 1) if f'SMA_{i}' not in df.columns]
-    
+    # Identify any missing SMA columns based on the expected range, limiting to the total trading days
+    missing_columns = [f'SMA_{i}' for i in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1) if f'SMA_{i}' not in df.columns]
+
     # Check if there are any missing SMA columns
     if missing_columns:
         print(f"Computing missing SMA columns: {missing_columns}")
-        
+
         # Create a new DataFrame for the missing SMA columns
         for column in missing_columns:
             window_size = int(column.split('_')[1])
-            df[column] = df['Close'].rolling(window=window_size, min_periods=1).mean()
-        
+            print(f"Computing {column} with window size {window_size}")
+            if total_trading_days >= window_size:
+                df[column] = df['Close'].rolling(window=window_size, min_periods=window_size).mean()
+            else:
+                df[column] = pd.Series(dtype=float)  # Create an empty Series with float data type
+            print(f"Finished computing {column}")
+
         # Remove duplicate columns
         df = df.loc[:, ~df.columns.duplicated()]
-    
+
     else:
         print("No missing SMA columns found.")
-    
+
     print("DataFrame after modifications:")
     print(df)
-    
     print("Finished check_and_compute_missing_smas.")
     return df
 
@@ -163,75 +169,47 @@ def get_data(ticker, MAX_SMA_DAY, existing_max_sma_day):
         try:
             with open(pkl_file, 'rb') as file:
                 results = pickle.load(file)
+                time.sleep(1)  # wait for 1 second
                 df, sma_combinations = results.get('preprocessed_data', (None, None))
                 existing_max_sma_day = results.get('existing_max_sma_day', 0)
                 print(f"Loaded existing_max_sma_day: {existing_max_sma_day}")
+                print(f"Keys in the loaded pickle file: {results.keys()}")
+
+                if df is not None:
+                    print(f"Columns in the loaded DataFrame: {df.columns}")  # Add this line
+                else:
+                    print("DataFrame is None")
+
+                print(f"SMA combinations: {sma_combinations}")  # Add this line
 
                 # Get the total trading days
-                total_trading_days = len(df)
+                total_trading_days = len(df) if df is not None else 0
                 print(f"Total trading days: {total_trading_days}")
 
-                # If MAX_SMA_DAY is greater than total_trading_days, set it to total_trading_days
-                MAX_SMA_DAY = min(MAX_SMA_DAY, total_trading_days)
-                print(f"MAX_SMA_DAY: {MAX_SMA_DAY}")
+                # If MAX_SMA_DAY is greater than existing_max_sma_day, compute the missing SMA columns
+                if MAX_SMA_DAY > existing_max_sma_day:
+                    print(f"MAX_SMA_DAY is greater than existing_max_sma_day. Computing missing SMA columns.")
+                    df = check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days)
 
-                if df is not None and sma_combinations is not None:
-                    # Check for new trading days
-                    latest_existing_date = df.index.max()
-                    latest_fetched_data = fetch_data(ticker)
-                    new_trading_days = latest_fetched_data.loc[latest_existing_date:].iloc[1:]
+                    # Update existing_max_sma_day
+                    existing_max_sma_day = MAX_SMA_DAY
 
-                    if not new_trading_days.empty:
-                        print(f"New trading days found for {ticker}.")
-                        df = pd.concat([df, new_trading_days])
-                    else:
-                        print(f"No new trading days found for {ticker}.")
+                    # Save the updated DataFrame and existing_max_sma_day back to the pickle file
+                    results['preprocessed_data'] = (df, sma_combinations)
+                    results['existing_max_sma_day'] = existing_max_sma_day
+                    with open(pkl_file, 'wb') as file:
+                        pickle.dump(results, file)
 
-                    # Update SMA columns for the new trading days
-                    for day in range(1, MAX_SMA_DAY + 1):
-                        column_name = f'SMA_{day}'
-                        if column_name in df.columns:
-                            df[column_name] = df['Close'].rolling(window=day).mean()
+                    print(f"Updated DataFrame with missing SMA columns and saved to pickle file.")
 
-                    return df, sma_combinations, True, MAX_SMA_DAY, existing_max_sma_day
-                
-                else:
-                    print(f"No preprocessed data found for {ticker}. Fetching data and preprocessing...")
-                    df = fetch_data(ticker)
-    
-                    if df is not None and not df.empty:
-                        # Preprocess the data
-                        total_trading_days = len(df)
-                        # Ensure MAX_SMA_DAY and existing_max_sma_day are less than or equal to total_trading_days
-                        MAX_SMA_DAY = min(MAX_SMA_DAY, total_trading_days)
-                        existing_max_sma_day = min(existing_max_sma_day, total_trading_days)
-                        print(f"MAX_SMA_DAY: {MAX_SMA_DAY}")
-                        print(f"existing_max_sma_day: {existing_max_sma_day}")
-                        df, sma_combinations = preprocess_data(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days)
-        
-                        # Save the precomputed results
-                        results = {
-                            'preprocessed_data': (df, sma_combinations),
-                            'existing_max_sma_day': MAX_SMA_DAY
-                        }
-        
-                        print(f"Keys in the results before saving: {results.keys()}")  # Debug print
-        
-                        with open(pkl_file, 'wb') as file:
-                            pickle.dump(results, file)
-        
-                        print(f"Precomputed results saved for {ticker}.")
-                        return df, sma_combinations, False, MAX_SMA_DAY, existing_max_sma_day
-                    
-                    else:
-                        print(f"Failed to fetch data for {ticker}. Skipping preprocessing.")
-                        return None, None, False, 0, 0
-                    
+                pprint(f"Columns in the DataFrame after updating SMA columns: {df.columns.tolist()}")
+                return df, sma_combinations, True, MAX_SMA_DAY, existing_max_sma_day
+
         except (pickle.UnpicklingError, EOFError) as e:
             print(f"Error loading precomputed results for {ticker}: {str(e)}")
             print(f"Fetching data and preprocessing for {ticker}...")
             df = fetch_data(ticker)
-            
+
             if df is not None and not df.empty:
                 # Preprocess the data
                 total_trading_days = len(df)
@@ -255,15 +233,15 @@ def get_data(ticker, MAX_SMA_DAY, existing_max_sma_day):
 
                 print(f"Precomputed results saved for {ticker}.")
                 return df, sma_combinations, False, MAX_SMA_DAY, existing_max_sma_day
-            
+
             else:
                 print(f"Failed to fetch data for {ticker}. Skipping preprocessing.")
                 return None, None, False, 0, 0
-    
+
     else:
         print(f"No preprocessed data found for {ticker}. Fetching data and preprocessing...")
         df = fetch_data(ticker)
-        
+
         if df is not None and not df.empty:
             # Preprocess the data
             total_trading_days = len(df)
@@ -273,7 +251,7 @@ def get_data(ticker, MAX_SMA_DAY, existing_max_sma_day):
             print(f"MAX_SMA_DAY: {MAX_SMA_DAY}")
             print(f"existing_max_sma_day: {existing_max_sma_day}")
             df, sma_combinations = preprocess_data(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days)
-            
+
             # Save the precomputed results
             results = {
                 'preprocessed_data': (df, sma_combinations),
@@ -281,10 +259,10 @@ def get_data(ticker, MAX_SMA_DAY, existing_max_sma_day):
             }
             with open(pkl_file, 'wb') as file:
                 pickle.dump(results, file)
-            
+
             print(f"Precomputed results saved for {ticker}.")
             return df, sma_combinations, False, MAX_SMA_DAY, existing_max_sma_day
-        
+
         else:
             print(f"Failed to fetch data for {ticker}. Skipping preprocessing.")
             return None, None, False, 0, 0
@@ -349,6 +327,9 @@ def precompute_results(ticker, MAX_SMA_DAY):
                 print(f"Loaded existing results for {ticker}")
                 print(f"Existing top buy pair: {top_buy_pair}")
                 print(f"Existing top short pair: {top_short_pair}")
+                print(f"Existing buy_results: {existing_results.get('buy_results')}")
+                print(f"Existing short_results: {existing_results.get('short_results')}")
+                print(f"Existing existing_max_sma_day: {existing_results.get('existing_max_sma_day')}")
     else:
         existing_results = None
         print(f"No existing results found for {ticker}")
@@ -360,9 +341,7 @@ def precompute_results(ticker, MAX_SMA_DAY):
             write_status(ticker, {"status": "failed", "message": "No data"})
             return None
         print(f"Data fetched and preprocessed for {ticker}.")
-        print(f"First 2 rows of the DataFrame:\n{df.head(2)}")
-        print(f"Last 2 rows of the DataFrame:\n{df.tail(2)}")
-        print(f"Columns in the DataFrame: {df.columns}")  # Add this line to check the columns
+        pprint(f"Columns in the DataFrame: {df.columns}")  # Add this line to check the columns
 
         min_date = df.index.min()
         start_date = min_date.strftime('%Y-%m-%d') if pd.notnull(min_date) else 'No date available'
@@ -390,44 +369,52 @@ def precompute_results(ticker, MAX_SMA_DAY):
         MAX_SMA_DAY = min(MAX_SMA_DAY, total_trading_days)
         print(f"Adjusted MAX_SMA_DAY: {MAX_SMA_DAY}")
 
-        # Perform brute-force calculations for additional SMA pairs
-        additional_sma_pairs = [(i, j) for i in range(1, MAX_SMA_DAY + 1) for j in range(i + 1, MAX_SMA_DAY + 1)]
+        if MAX_SMA_DAY > existing_max_sma_day:
+            print(f"MAX_SMA_DAY is greater than existing_max_sma_day. Performing brute-force calculation for new SMA pairs.")
+            # Perform brute-force calculations for the new SMA pairs
+            new_sma_pairs = [(i, j) for i in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1) for j in range(i + 1, min(MAX_SMA_DAY, total_trading_days) + 1)]
+            print(f"New SMA pairs: {new_sma_pairs}")  # Add this line
 
-        print(f"Starting brute-force calculation for {ticker} with additional SMA pairs")
-        with tqdm(total=len(additional_sma_pairs), desc='Brute-Force Calculation', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
-            for pair in additional_sma_pairs:
-                try:
-                    sma1 = df[f'SMA_{pair[0]}']
-                    sma2 = df[f'SMA_{pair[1]}']
+            print(f"Starting brute-force calculation for {ticker} with new SMA pairs")
+            with tqdm(total=len(new_sma_pairs), desc='Brute-Force Calculation', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                for pair in new_sma_pairs:
+                    print(f"Processing pair: {pair}")
+                    try:
+                        sma1 = df[f'SMA_{pair[0]}']
+                        sma2 = df[f'SMA_{pair[1]}']
+                        print(f"SMA_{pair[0]} values: {sma1}")
+                        print(f"SMA_{pair[1]} values: {sma2}")
 
-                    # Calculate buy capture
-                    buy_signals = sma1 > sma2
-                    buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                    buy_capture = buy_returns.sum()
-                    buy_results[pair] = buy_capture
+                        # Calculate buy capture
+                        buy_signals = sma1 > sma2
+                        print(f"Buy signals for pair {pair}: {buy_signals}")
+                        buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
+                        print(f"Buy returns for pair {pair}: {buy_returns}")
+                        buy_capture = buy_returns.sum()
+                        print(f"Buy capture for pair {pair}: {buy_capture}")
+                        buy_results[pair] = buy_capture
 
-                    # Calculate short capture
-                    short_signals = sma1 < sma2
-                    short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                    short_capture = short_returns.sum()
-                    short_results[pair] = short_capture
+                        # Calculate short capture
+                        short_signals = sma1 < sma2
+                        print(f"Short signals for pair {pair}: {short_signals}")
+                        short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
+                        print(f"Short returns for pair {pair}: {short_returns}")
+                        short_capture = short_returns.sum()
+                        print(f"Short capture for pair {pair}: {short_capture}")
+                        short_results[pair] = short_capture
 
-                except KeyError as e:
-                    print(f"KeyError occurred for pair {pair}: {str(e)}")
-                except Exception as e:
-                    print(f"Error occurred for pair {pair}: {str(e)}")
+                    except KeyError as e:
+                        print(f"KeyError occurred for pair {pair}: {str(e)}")
+                    except Exception as e:
+                        print(f"Error occurred for pair {pair}: {str(e)}")
 
-                pbar.update(1)
+                    pbar.update(1)
 
-        print(f"Finished brute-force calculation for {ticker} with additional SMA pairs")
-
-        # Update existing_max_sma_day after processing new SMA pairs
-        existing_max_sma_day = MAX_SMA_DAY
-        print(f"Updated existing_max_sma_day: {existing_max_sma_day}")
+            print(f"Finished brute-force calculation for {ticker} with new SMA pairs")
 
         # Print buy_results and short_results before identifying top pairs
-        print(f"buy_results: {buy_results}")
-        print(f"short_results: {short_results}")
+        print(f"Final buy_results: {buy_results}")
+        print(f"Final short_results: {short_results}")
 
         # Identify the top performing buy and short pairs
         top_buy_pair = max(buy_results, key=lambda x: buy_results[x]) if buy_results else None
@@ -449,10 +436,12 @@ def precompute_results(ticker, MAX_SMA_DAY):
             'buy_results': buy_results,
             'short_results': short_results,
             'start_date': df.index.min().strftime('%Y-%m-%d'),
-            'existing_max_sma_day': existing_max_sma_day,
-            'preprocessed_data': (df, sma_combinations)
+            'existing_max_sma_day': MAX_SMA_DAY,
+            'preprocessed_data': (df.head(2).append(df.tail(2)), sma_combinations)
         }
 
+        print("Results to be saved:")
+        pprint(results)
         print(f"Saving results to {pkl_file}")
 
         try:
@@ -537,6 +526,10 @@ def read_status(ticker):
             except json.JSONDecodeError:
                 print(f"Empty JSON file: {status_path}")
     return {"status": "not started", "progress": 0}
+
+# Call the function and print the status
+status = read_status('VIK')  # replace 'AAPL' with your ticker
+print(status)
 
 # Update your Dash layout to include the status and interval component
 app.layout = html.Div(
@@ -692,7 +685,8 @@ def update_sma_labels(ticker):
 @app.callback(
     Output('processing-status', 'children'),
     Input('update-interval', 'n_intervals'),
-    State('ticker-input', 'value'))
+    State('ticker-input', 'value')
+)
 def update_status(n_intervals, ticker):
     if ticker:
         status = read_status(ticker)
@@ -791,7 +785,7 @@ def validate_ticker_input(ticker):
     # Initialize existing_max_sma_day with a default value
     existing_max_sma_day = 0
     
-    df, _, loaded_from_pickle, max_sma_day, existing_max_sma_day = get_data(ticker, MAX_SMA_DAY, existing_max_sma_day)
+    df, _, loaded_from_pickle, _, existing_max_sma_day = get_data(ticker, MAX_SMA_DAY, existing_max_sma_day)
     
     if df is None or df.empty:
         return ''
@@ -799,10 +793,10 @@ def validate_ticker_input(ticker):
     # Calculate existing_max_sma_day from df after checking if df is None or empty
     existing_max_sma_day = get_existing_max_sma_day(df)
 
-    # Trigger precomputation if the pickle file doesn't exist or if data was not loaded from pickle
-    if not loaded_from_pickle:
+    # Trigger precomputation if MAX_SMA_DAY is increased or if data was not loaded from pickle
+    if MAX_SMA_DAY > existing_max_sma_day or not loaded_from_pickle:
         print(f"Triggering precomputation for {ticker}")  # Add this print statement
-        precompute_results(ticker, MAX_SMA_DAY)  # Removed existing_max_sma_day argument
+        precompute_results(ticker, MAX_SMA_DAY)
     
     return ''
 
@@ -828,7 +822,7 @@ def update_dynamic_strategy_display(ticker):
     if results is None:
         return ["Data not available. Please wait..."] * 10
 
-    print(f"Keys in the loaded pickle file: {results.keys()}")  # Debug print
+    pprint(f"Keys in the loaded pickle file: {results.keys()}")  # Debug print
     
     if 'status' in results:
         if results['status'] == 'processing':
@@ -850,11 +844,19 @@ def update_dynamic_strategy_display(ticker):
     if top_buy_pair is None or top_short_pair is None:
         return ["Top pairs not found. Please check data integrity."] * 10
 
+    # Wait for a short period to allow 'preprocessed_data' to be populated
+    time.sleep(1)  # wait for 1 second
+
+    # Check if 'preprocessed_data' is in results
+    if 'preprocessed_data' not in results:
+        print(f"'preprocessed_data' not found in results for {ticker}")
+        return ["Data not available or processing not yet complete. Please wait..."] * 10
+
     # Use the cached data from the results
     df = results['preprocessed_data'][0]
 
     if f'SMA_{top_buy_pair[0]}' not in df.columns or f'SMA_{top_buy_pair[1]}' not in df.columns or \
-       f'SMA_{top_short_pair[0]}' not in df.columns or f'SMA_{top_short_pair[1]}' not in df.columns:
+    f'SMA_{top_short_pair[0]}' not in df.columns or f'SMA_{top_short_pair[1]}' not in df.columns:
         print(f"Required SMA columns not found in the DataFrame for {ticker}")
         return ["Data not available or processing not yet complete. Please wait..."] * 10
 
