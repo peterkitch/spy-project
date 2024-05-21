@@ -16,7 +16,7 @@ import json
 import time
 from pprint import pprint
 
-MAX_SMA_DAY = 100
+MAX_SMA_DAY = 10
 
 def fetch_data(ticker):
     try:
@@ -45,34 +45,59 @@ def check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day, total_
     print(f"existing_max_sma_day: {existing_max_sma_day}")
     print(f"total_trading_days: {total_trading_days}")
     print("DataFrame before modifications:")
-    print(df)
+    print()
+    
+    # Select 'Close' column and last 5 columns
+    selected_df = pd.concat([df[['Close']], df.iloc[:, -5:]], axis=1)
+
+    # Round the numbers to 2 decimal places
+    selected_df = selected_df.round(2)
+
+    # Print the first 5 rows
+    print(selected_df.head(5))
+    print()
+
+    # Print the last 5 rows
+    print(selected_df.tail(5))
 
     # Identify any missing SMA columns based on the expected range, limiting to the total trading days
     missing_columns = [f'SMA_{i}' for i in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1) if f'SMA_{i}' not in df.columns]
 
     # Check if there are any missing SMA columns
     if missing_columns:
-        print(f"Computing missing SMA columns: {missing_columns}")
+        print()
+        print(f"Computing missing SMA columns: {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
 
         # Create a new DataFrame for the missing SMA columns
         for column in missing_columns:
             window_size = int(column.split('_')[1])
-            print(f"Computing {column} with window size {window_size}")
+
             if total_trading_days >= window_size:
                 df[column] = df['Close'].rolling(window=window_size, min_periods=window_size).mean()
             else:
                 df[column] = pd.Series(dtype=float)  # Create an empty Series with float data type
-            print(f"Finished computing {column}")
+
+        print(f"Finished computing {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
 
         # Remove duplicate columns
         df = df.loc[:, ~df.columns.duplicated()]
 
     else:
+        print()
         print("No missing SMA columns found.")
 
     print("DataFrame after modifications:")
-    print(df)
+    print()
+    
+    # Print the first 5 rows
+    print(selected_df.head(5))
+    print()
+
+    # Print the last 5 rows
+    print(selected_df.tail(5))
+    print()
     print("Finished check_and_compute_missing_smas.")
+    
     return df
 
 def update_sma_and_captures(existing_data, new_trading_days, MAX_SMA_DAY, sma_pairs, buy_results, short_results):
@@ -161,6 +186,8 @@ def preprocess_data(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days):
 
 @lru_cache(maxsize=None)
 def get_data(ticker, MAX_SMA_DAY):
+    print()
+    print()
     print(f"get_data called for {ticker} with MAX_SMA_DAY {MAX_SMA_DAY}")
     pkl_file = f'{ticker}_precomputed_results.pkl'
 
@@ -171,7 +198,6 @@ def get_data(ticker, MAX_SMA_DAY):
                 df, sma_combinations = results.get('preprocessed_data', (None, None))
                 existing_max_sma_day = results.get('existing_max_sma_day', 0)
                 print(f"Loaded existing_max_sma_day: {existing_max_sma_day}")
-                print(f"Keys in the loaded pickle file: {results.keys()}")
 
                 if df is not None:
                     print(f"Columns in the loaded DataFrame: {list(df.columns[:2])} ... {list(df.columns[-2:])}")  # Add this line
@@ -299,8 +325,6 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
                 print(f"Loaded existing results for {ticker}")
                 print(f"Existing top buy pair: {top_buy_pair}")
                 print(f"Existing top short pair: {top_short_pair}")
-                print(f"Existing buy_results: {existing_results.get('buy_results')}")
-                print(f"Existing short_results: {existing_results.get('short_results')}")
                 print(f"Existing existing_max_sma_day: {existing_results.get('existing_max_sma_day')}")
     else:
         existing_results = None
@@ -314,7 +338,6 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
             write_status(ticker, {"status": "failed", "message": "No data"})
             return None
         print(f"Data fetched and preprocessed for {ticker}.")
-        pprint(f"Columns in the DataFrame: {df.columns}")  # Add this line to check the columns
 
         min_date = df.index.min()
         start_date = min_date.strftime('%Y-%m-%d') if pd.notnull(min_date) else 'No date available'
@@ -351,35 +374,26 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
         else:
             print(f"No new SMA pairs to calculate for {ticker}")
 
-        print(f"New SMA pairs: {new_sma_pairs}")  # Add this line
+        print(f"New SMA pairs: {new_sma_pairs[:5]} ... {new_sma_pairs[-5:]}")
 
         if new_sma_pairs:
             print(f"Starting brute-force calculation for {ticker} with new SMA pairs")
             with tqdm(total=len(new_sma_pairs), desc='Brute-Force Calculation', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
                 for pair in new_sma_pairs:
-                    print(f"Processing pair: {pair}")
                     try:
                         sma1 = df[f'SMA_{pair[0]}']
                         sma2 = df[f'SMA_{pair[1]}']
-                        print(f"SMA_{pair[0]} values: {sma1}")
-                        print(f"SMA_{pair[1]} values: {sma2}")
 
                         # Calculate buy capture
                         buy_signals = sma1 > sma2
-                        print(f"Buy signals for pair {pair}: {buy_signals}")
                         buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                        print(f"Buy returns for pair {pair}: {buy_returns}")
                         buy_capture = buy_returns.sum()
-                        print(f"Buy capture for pair {pair}: {buy_capture}")
                         buy_results[pair] = buy_capture
 
                         # Calculate short capture
                         short_signals = sma1 < sma2
-                        print(f"Short signals for pair {pair}: {short_signals}")
                         short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                        print(f"Short returns for pair {pair}: {short_returns}")
                         short_capture = short_returns.sum()
-                        print(f"Short capture for pair {pair}: {short_capture}")
                         short_results[pair] = short_capture
 
                     except KeyError as e:
@@ -394,8 +408,9 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
         latest_existing_date = df.index.max()
         print(f"Date of last brute-force calculation up through SMA_{min(MAX_SMA_DAY, total_trading_days)}: {latest_existing_date}")
 
-        print(f"Updated buy_results Range: {dict(list(buy_results.items())[:5])}; {dict(list(buy_results.items())[-5:])}")
-        print(f"Updated short_results Range: {dict(list(short_results.items())[:5])}; {dict(list(short_results.items())[-5:])}")
+        print(f"Updated buy_results Range: {dict(list(buy_results.items())[:1])} ... {dict(list(buy_results.items())[-1:])}")
+        print(f"Updated short_results Range: {dict(list(short_results.items())[:1])} ... {dict(list(short_results.items())[-1:])}")
+        print()
 
         # Identify the top performing buy and short pairs
         top_buy_pair = max(buy_results, key=lambda x: buy_results[x]) if buy_results else None
@@ -406,6 +421,7 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
             print(f"Top Buy Pair for {ticker}: {top_buy_pair} with result {buy_results[top_buy_pair]}")
         if top_short_pair is not None:
             print(f"Top Short Pair for {ticker}: {top_short_pair} with result {short_results[top_short_pair]}")
+            print()
 
         # Save the results
         results = {
@@ -428,9 +444,7 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
             'existing_max_sma_day': MAX_SMA_DAY,
             'preprocessed_data': (pd.concat([df.head(2), df.tail(2)]), sma_combinations[:5] + sma_combinations[-5:])
         }
-
-        print("Results to be saved:")
-        pprint(display_data)
+        
         print(f"Saving results to {pkl_file}")
 
         try:
@@ -807,8 +821,6 @@ def update_dynamic_strategy_display(ticker):
     
     if results is None:
         return ["Data not available. Please wait..."] * 10
-
-    pprint(f"Keys in the loaded pickle file: {results.keys()}")  # Debug print
     
     if 'status' in results:
         if results['status'] == 'processing':
