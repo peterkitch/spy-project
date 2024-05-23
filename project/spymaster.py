@@ -16,7 +16,7 @@ import json
 import time
 from pprint import pprint
 
-MAX_SMA_DAY = 10
+MAX_SMA_DAY = 52
 
 def fetch_data(ticker):
     try:
@@ -412,15 +412,19 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
         print(f"Updated short_results Range: {dict(list(short_results.items())[:1])} ... {dict(list(short_results.items())[-1:])}")
         print()
 
-        # Identify the top performing buy and short pairs
-        top_buy_pair = max(buy_results, key=lambda x: buy_results[x]) if buy_results else None
-        top_short_pair = max(short_results, key=lambda x: short_results[x]) if short_results else None
+        # Create separate dictionaries for buy and short results, including the inverted pairs
+        buy_results_with_inverse = {**buy_results, **{(pair[1], pair[0]): -result for pair, result in short_results.items()}}
+        short_results_with_inverse = {**short_results, **{(pair[1], pair[0]): -result for pair, result in buy_results.items()}}
+
+        # Identify the top performing buy and short pairs from the respective dictionaries
+        top_buy_pair = max(buy_results_with_inverse, key=lambda x: buy_results_with_inverse[x]) if buy_results_with_inverse else None
+        top_short_pair = max(short_results_with_inverse, key=lambda x: short_results_with_inverse[x]) if short_results_with_inverse else None
 
         # Print the top pairs along with their results
         if top_buy_pair is not None:
-            print(f"Top Buy Pair for {ticker}: {top_buy_pair} with result {buy_results[top_buy_pair]}")
+            print(f"Top Buy Pair for {ticker}: {top_buy_pair} with result {buy_results_with_inverse[top_buy_pair]}")
         if top_short_pair is not None:
-            print(f"Top Short Pair for {ticker}: {top_short_pair} with result {short_results[top_short_pair]}")
+            print(f"Top Short Pair for {ticker}: {top_short_pair} with result {short_results_with_inverse[top_short_pair]}")
             print()
 
         # Save the results
@@ -444,7 +448,7 @@ def precompute_results(ticker, MAX_SMA_DAY, existing_max_sma_day):
             'existing_max_sma_day': MAX_SMA_DAY,
             'preprocessed_data': (pd.concat([df.head(2), df.tail(2)]), sma_combinations[:5] + sma_combinations[-5:])
         }
-        
+
         print(f"Saving results to {pkl_file}")
 
         try:
