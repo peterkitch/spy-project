@@ -16,7 +16,7 @@ import json
 import time
 from pprint import pprint
 
-MAX_SMA_DAY = 401
+MAX_SMA_DAY = 2
 
 def fetch_data(ticker):
     try:
