@@ -14,10 +14,8 @@ import time
 import json
 from pprint import pprint
 import shutil
-import warnings
-warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
-MAX_SMA_DAY = 80
+MAX_SMA_DAY = 300
 
 def fetch_data(ticker):
     try:
@@ -65,19 +63,20 @@ def check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day, total_
         print()
         print(f"Computing missing SMA columns: {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
 
-        # Create a new DataFrame for the missing SMA columns
-        for column in missing_columns:
-            window_size = int(column.split('_')[1])
+        # Compute all missing SMA columns at once
+        missing_sma_data = {
+            f'SMA_{window_size}': df['Close'].rolling(window=window_size, min_periods=window_size).mean()
+            for window_size in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1)
+            if total_trading_days >= window_size
+        }
 
-            if total_trading_days >= window_size:
-                df[column] = df['Close'].rolling(window=window_size, min_periods=window_size).mean()
-            else:
-                df[column] = pd.Series(dtype=float)  # Create an empty Series with float data type
+        # Concatenate the missing SMA columns with the original DataFrame
+        df = pd.concat([df, pd.DataFrame(missing_sma_data)], axis=1)
 
         print(f"Finished computing {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
 
-        # Remove duplicate columns
-        df = df.loc[:, ~df.columns.duplicated()]
+        # Create a copy of the DataFrame to get a defragmented frame
+        df = df.copy()
 
     else:
         print()
