@@ -10,12 +10,12 @@ from functools import lru_cache
 import pickle
 from tqdm import tqdm
 import os
-import time
 import json
 from pprint import pprint
 import shutil
+import time
 
-MAX_SMA_DAY = 300
+MAX_SMA_DAY = 3010
 
 def fetch_data(ticker):
     try:
@@ -187,10 +187,6 @@ def preprocess_data(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days):
     print("Preprocessing complete.")
     
     return df, sma_combinations
-
-from functools import lru_cache
-import os
-import time
 
 def get_last_modified_time(file_path):
     if os.path.exists(file_path):
@@ -366,8 +362,11 @@ def precompute_results(ticker, df, sma_combinations, MAX_SMA_DAY, existing_max_s
             shutil.copy(pkl_file, pkl_backup_file)
 
         min_date = df.index.min()
+        max_date = df.index.max()
         start_date = min_date.strftime('%Y-%m-%d') if pd.notnull(min_date) else 'No date available'
+        last_date = max_date.strftime('%Y-%m-%d') if pd.notnull(max_date) else 'No date available'
         print(f"Start date for {ticker}: {start_date}")
+        print(f"Last date for {ticker}: {last_date}")
 
         if existing_results:
             existing_buy_results = existing_results.get('buy_results', {})
@@ -408,7 +407,7 @@ def precompute_results(ticker, df, sma_combinations, MAX_SMA_DAY, existing_max_s
 
         if new_sma_pairs:
             print(f"Starting brute-force calculation for {ticker} with new SMA pairs")
-            with tqdm(total=len(new_sma_pairs), desc='Brute-Force Calculation', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+            with tqdm(total=len(new_sma_pairs), desc=f'Brute-Force Calculation for {ticker}', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]') as pbar:
                 for pair in new_sma_pairs:
                     try:
                         sma1 = df[f'SMA_{pair[0]}']
@@ -469,6 +468,7 @@ def precompute_results(ticker, df, sma_combinations, MAX_SMA_DAY, existing_max_s
             'buy_results': buy_results,
             'short_results': short_results,
             'start_date': df.index.min().strftime('%Y-%m-%d'),
+            'last_date': df.index.max().strftime('%Y-%m-%d'),
             'preprocessed_data': (df, sma_combinations),
             'total_trading_days': total_trading_days,
             'existing_max_sma_day': adjusted_max_sma_day  # Include existing_max_sma_day in the results dictionary
@@ -995,7 +995,9 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         return go.Figure(), '', '', '', '', '', '', '', ''
 
     min_date = df.index.min()
+    max_date = df.index.max()
     start_date = min_date.strftime('%Y-%m-%d') if pd.notnull(min_date) else 'No date available'
+    last_date = max_date.strftime('%Y-%m-%d') if pd.notnull(max_date) else 'No date available'
 
     sma1_buy = df['Close'].rolling(window=sma_day_1).mean()
     sma2_buy = df['Close'].rolling(window=sma_day_2).mean()
@@ -1031,7 +1033,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
 
     # Customize layout
     fig.update_layout(
-        title=f'{ticker} Closing Prices, SMAs, and Total Capture (Start Date: {start_date})',
+        title=f'{ticker} Closing Prices, SMAs, and Total Capture (Start Date: {start_date}, Last Date: {last_date})',
         xaxis_title='Trading Day',
         yaxis_title=f'{ticker} Closing Price',
         hovermode='x',
