@@ -15,7 +15,7 @@ from pprint import pprint
 import shutil
 import time
 
-MAX_SMA_DAY = 3010
+MAX_SMA_DAY = 30
 
 def fetch_data(ticker):
     try:
