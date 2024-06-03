@@ -703,7 +703,7 @@ app.layout = html.Div(
         'font-family': 'Courier New, monospace'
     },
     children=[
-        html.H1('SMA Trading Pair Analysis', className='text-center mt-3'),
+        html.H1('Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework', className='text-center mt-3'),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
