@@ -74,12 +74,18 @@ def check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day, total_
 
         print(f"Finished computing {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
 
-        # Create a copy of the DataFrame to get a defragmented frame -- It appears that in addressing the performance warning, we removed the ability to process new trading days. Need to confirm.
-        #pass df = df.copy()
-
     else:
         print()
         print("No missing SMA columns found.")
+
+    # Get the number of new days to process
+    new_days_to_process = total_trading_days - existing_max_sma_day
+
+    # Update existing SMA columns for the new days' data
+    existing_columns = [f'SMA_{i}' for i in range(1, existing_max_sma_day + 1) if f'SMA_{i}' in df.columns]
+    for column in existing_columns:
+        window_size = int(column.split('_')[1])
+        df.loc[df.index[-new_days_to_process:], column] = df['Close'].rolling(window=window_size, min_periods=window_size).mean().iloc[-new_days_to_process:]
 
     print("DataFrame after modifications:")
     print()
@@ -995,19 +1001,22 @@ def calculate_trading_signals(df, daily_top_buy_pairs, daily_top_short_pairs, bu
     return trading_signals
 
 
-def calculate_cumulative_combined_capture(df, buy_results, short_results, trading_signals):
+def calculate_cumulative_combined_capture(df, top_buy_pair, buy_results):
     cumulative_combined_captures = []
     current_position = None
 
-    for date, signal in trading_signals.items():
-        buy_capture = buy_results[signal[0]].loc[date] if signal[0] in buy_results else 0
-        short_capture = short_results[signal[1]].loc[date] if signal[1] in short_results else 0
+    for date in df.index:
+        buy_capture = buy_results[top_buy_pair].loc[date] if top_buy_pair in buy_results else 0
+        short_capture = -buy_capture  # Invert the buy_capture to get the short_capture
 
-        if signal[2] == 'buy':
+        buy_signal = df[f'SMA_{top_buy_pair[0]}'].loc[date] > df[f'SMA_{top_buy_pair[1]}'].loc[date] if top_buy_pair else False
+        short_signal = not buy_signal
+
+        if buy_signal and not short_signal:
             combined_capture = buy_capture
-        elif signal[2] == 'short':
+        elif short_signal and not buy_signal:
             combined_capture = short_capture
-        else:  # signal[2] == 'cash'
+        else:
             combined_capture = 0
 
         if current_position is None:
@@ -1018,7 +1027,7 @@ def calculate_cumulative_combined_capture(df, buy_results, short_results, tradin
         cumulative_combined_captures.append(cumulative_combined_capture)
         current_position = cumulative_combined_capture
 
-    return pd.Series(cumulative_combined_captures, index=trading_signals.keys())
+    return pd.Series(cumulative_combined_captures, index=df.index)
 
 
 @app.callback(
@@ -1036,14 +1045,13 @@ def update_combined_capture_chart(ticker):
     
     df = results['preprocessed_data'][0]
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
-    daily_top_short_pairs = results.get('daily_top_short_pairs', {})
     
     latest_date = df.index[-1]
     top_buy_pair = daily_top_buy_pairs.get(latest_date)
-    top_short_pair = daily_top_short_pairs.get(latest_date)
     
-    trading_signals = calculate_trading_signals(df, top_buy_pair, top_short_pair)
-    cumulative_combined_captures = calculate_cumulative_combined_capture(df, top_buy_pair, top_short_pair, trading_signals)
+    buy_results = results.get('buy_results', {})
+    
+    cumulative_combined_captures = calculate_cumulative_combined_capture(df, top_buy_pair, buy_results)
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=cumulative_combined_captures.index, y=cumulative_combined_captures, mode='lines', name='Cumulative Combined Capture'))
