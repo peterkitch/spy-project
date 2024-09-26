@@ -11,12 +11,24 @@ import pickle
 from tqdm import tqdm
 import os
 import json
-from pprint import pprint
 import shutil
-from itertools import zip_longest
+import time
+import numpy as np
+import gc
+import copy
+import threading
+import sys
+from pprint import pformat
 
-MAX_SMA_DAY = 30
+tqdm.pandas()
+master_stopwatch_start = None
+MAX_SMA_DAY = 113
 
+_precomputed_results_cache = {}
+_loading_in_progress = set()
+_loading_lock = threading.Lock()
+
+@lru_cache(maxsize=None)
 def fetch_data(ticker):
     try:
         df = yf.download(ticker, period='max', interval='1d', progress=False)
@@ -38,275 +50,221 @@ def identify_new_trading_days(df, existing_data):
             return new_trading_days
     return None
 
-def check_and_compute_missing_smas(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days):
-    print("Inside check_and_compute_missing_smas...")
-    print(f"MAX_SMA_DAY: {MAX_SMA_DAY}")
-    print(f"existing_max_sma_day: {existing_max_sma_day}")
-    print(f"total_trading_days: {total_trading_days}")
-    print("DataFrame before modifications:")
-    print()
-
-    # Print the first 5 rows
-    print("First 5 rows of the DataFrame:")
-    print(df.head(5))
-    print()
-
-    # Print the last 5 rows
-    print("Last 5 rows of the DataFrame:")
-    print(df.tail(5))
-
-    # Identify any missing SMA columns based on the expected range, limiting to the total trading days
-    missing_columns = [f'SMA_{i}' for i in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1) if f'SMA_{i}' not in df.columns]
-
-    # Check if there are any missing SMA columns
-    if missing_columns:
-        print()
-        print(f"Computing missing SMA columns: {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
-        print()
-        
-        # Compute all missing SMA columns at once
-        missing_sma_data = {
-            f'SMA_{window_size}': df['Close'].rolling(window=window_size, min_periods=window_size).mean()
-            for window_size in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1)
-            if total_trading_days >= window_size
-        }
-
-        # Concatenate the missing SMA columns with the original DataFrame
-        df = pd.concat([df, pd.DataFrame(missing_sma_data)], axis=1)
-
-        print(f"Finished computing {missing_columns[0]} to {missing_columns[-1]}") if missing_columns else None
-
-    else:
-        print()
-        print("No missing SMA columns found.")
-
-    # Get the number of new days to process
-    new_days_to_process = total_trading_days - existing_max_sma_day
-
-    # Update existing SMA columns for the new days' data
-    existing_columns = [f'SMA_{i}' for i in range(1, existing_max_sma_day + 1) if f'SMA_{i}' in df.columns]
-    for column in existing_columns:
-        window_size = int(column.split('_')[1])
-        df.loc[df.index[-new_days_to_process:], column] = df['Close'].rolling(window=window_size, min_periods=window_size).mean().iloc[-new_days_to_process:]
-
-    print("DataFrame after modifications:")
-    print()
-    
-    print("First 5 rows of the DataFrame:")
-    print(df.head(5))
-    print()
-
-    print("Last 5 rows of the DataFrame:")
-    print(df.tail(5))
-    print()
-    print("Finished check_and_compute_missing_smas.")
-    
-    return df
-
-def update_sma_and_captures(existing_data, new_trading_days, MAX_SMA_DAY, sma_pairs, buy_results, short_results):
-    print("Inside update_sma_and_captures...")
-
-    if new_trading_days is not None:
-        print(f"Concatenating existing_data and new_trading_days...")
-        updated_data = pd.concat([existing_data, new_trading_days])
-        print(f"Checking and computing missing SMAs...")
-        updated_data = check_and_compute_missing_smas(updated_data, MAX_SMA_DAY, len(existing_data))
-
-    # If MAX_SMA_DAY has expanded, calculate new SMA pairs
-    if MAX_SMA_DAY > len(existing_data):
-        print(f"Calculating new SMA pairs...")
-        # Add your code here to calculate new SMA pairs
-
-    # If there are new trading days, update SMA columns in a rolling window fashion
-    if new_trading_days is not None:
-        print(f"Updating SMA columns for new trading days...")
-        
-        # Update capture calculations for each SMA trading pair
-        print(f"Updating capture calculations for each SMA trading pair...")
-        for pair in tqdm(sma_pairs, desc="Processing pairs", dynamic_ncols=True):
-            if f'SMA_{pair[0]}' in updated_data.columns and f'SMA_{pair[1]}' in updated_data.columns:
-                sma1 = updated_data[f'SMA_{pair[0]}']
-                sma2 = updated_data[f'SMA_{pair[1]}']
-                
-                buy_signals = sma1 > sma2
-                buy_returns = updated_data['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                buy_capture = buy_returns.cumsum()
-                
-                short_signals = sma1 < sma2
-                short_returns = -updated_data['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                short_capture = short_returns.cumsum()
-                
-                # Update buy_results and short_results dictionaries by appending the new capture values
-                buy_results[pair] = pd.concat([buy_results.get(pair, pd.Series(dtype=float)), buy_capture])
-                short_results[pair] = pd.concat([short_results.get(pair, pd.Series(dtype=float)), short_capture])
-            else:
-                print(f"Missing SMA columns for pair {pair}. Skipping calculations.")
-
-    else:
-        print("No new trading days. Updating existing_data...")
-        updated_data = existing_data
-        
-        # Recalculate buy and short captures for existing SMA pairs
-        print(f"Recalculating buy and short captures for existing SMA pairs...")
-        for pair in tqdm(sma_pairs, desc="Processing pairs", dynamic_ncols=True):
-            if f'SMA_{pair[0]}' in updated_data.columns and f'SMA_{pair[1]}' in updated_data.columns:
-                sma1 = updated_data[f'SMA_{pair[0]}']
-                sma2 = updated_data[f'SMA_{pair[1]}']
-                
-                buy_signals = sma1 > sma2
-                buy_returns = updated_data['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                buy_capture = buy_returns.cumsum()
-                
-                short_signals = sma1 < sma2
-                short_returns = -updated_data['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                short_capture = short_returns.cumsum()
-                
-                # Update buy_results and short_results dictionaries by appending the new capture values
-                buy_results[pair] = pd.concat([buy_results.get(pair, pd.Series(dtype=float)), buy_capture])
-                short_results[pair] = pd.concat([short_results.get(pair, pd.Series(dtype=float)), short_capture])
-            else:
-                print(f"Missing SMA columns for pair {pair}. Skipping calculations.")
-
-    print("Finished update_sma_and_captures.")
-    return updated_data, buy_results, short_results
-
-def preprocess_data(df, MAX_SMA_DAY, existing_max_sma_day, total_trading_days):
-    print("Preprocessing data...")
-    
-    # Fill NaN values in 'Close' column to avoid propagation in SMA calculations
-    df['Close'] = df['Close'].ffill()
-
-    print("Columns before adding new SMA columns:")
-    print(df.columns)
-    print()
-    
-    # Compute new SMA columns
-    new_sma_columns = {f'SMA_{day}': df['Close'].rolling(window=day).mean() for day in range(existing_max_sma_day + 1, min(MAX_SMA_DAY, total_trading_days) + 1)}
-    df = pd.concat([df, pd.DataFrame(new_sma_columns)], axis=1)
-
-    print("Columns after adding new SMA columns:")
-    print(df.columns)
-    print()
-    
-    sma_combinations = [(i, j) for i in range(1, min(MAX_SMA_DAY, total_trading_days) + 1) for j in range(i + 1, min(MAX_SMA_DAY, total_trading_days) + 1)]
-    df.attrs['sma_combinations'] = sma_combinations
-    
-    print("Preprocessing complete.")
-    
-    return df, sma_combinations
-
 def get_last_modified_time(file_path):
-    if os.path.exists(file_path):
-        return os.path.getmtime(file_path)
-    return None
-
-@lru_cache(maxsize=None)
-def get_data(ticker, MAX_SMA_DAY, is_precomputing=False, cache_timestamp=None):
     try:
-        print()
-        print()
-        print(f"get_data called for {ticker} with MAX_SMA_DAY {MAX_SMA_DAY}")
-        pkl_file = f'{ticker}_precomputed_results.pkl'
-        new_trading_days = None  # Initialize new_trading_days to None
+        return os.path.getmtime(file_path)
+    except OSError:
+        return None
 
-        # Get the last modified timestamp of the pickle file
+def load_precomputed_results(ticker):
+    global _precomputed_results_cache, _loading_in_progress
+    with _loading_lock:
+        if ticker in _precomputed_results_cache:
+            tqdm.write(f"Using cached results for {ticker}")
+            return _precomputed_results_cache[ticker]
+
+        if ticker in _loading_in_progress:
+            tqdm.write(f"Loading in progress for {ticker}")
+            return None
+
+        _loading_in_progress.add(ticker)
+
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file):
+        try:
+            tqdm.write(f"Starting to load precomputed results for {ticker}...")
+            file_size = os.path.getsize(pkl_file)
+            tqdm.write(f"File size: {file_size / (1024 * 1024):.2f} MB")
+
+            with open(pkl_file, 'rb') as f:
+                results = pickle.load(f)
+
+            existing_max_sma_day = results.get('existing_max_sma_day', 0)
+            tqdm.write(f"Loaded existing_max_sma_day from file: {existing_max_sma_day}")
+
+            if not results:  # Check if the dictionary is empty
+                tqdm.write(f"Warning: Empty results loaded for {ticker}")
+                with _loading_lock:
+                    _loading_in_progress.remove(ticker)
+                return None
+
+            formatted_results = pformat(list(results.keys()))
+            tqdm.write(f"Loaded results for {ticker}: {formatted_results}")
+
+            # Verify that all expected keys are present
+            expected_keys = ['preprocessed_data', 'existing_max_sma_day', 'last_processed_date', 'top_buy_pair', 'top_short_pair']
+            if not all(key in results for key in expected_keys):
+                tqdm.write(f"Warning: Incomplete results loaded for {ticker}")
+                with _loading_lock:
+                    _loading_in_progress.remove(ticker)
+                return None
+
+            tqdm.write(f"Finished loading precomputed results for {ticker}.")
+            tqdm.write(f"Loaded existing_max_sma_day: {results['existing_max_sma_day']}")
+            with _loading_lock:
+                _precomputed_results_cache[ticker] = results
+                _loading_in_progress.remove(ticker)
+            return results
+        
+        except EOFError:
+            tqdm.write(f"Error: Pickle file for {ticker} is truncated or corrupted. Deleting the file.")
+            os.remove(pkl_file)
+            with _loading_lock:
+                _loading_in_progress.remove(ticker)
+            return None
+        except Exception as e:
+            tqdm.write(f"Error loading results for {ticker}: {str(e)}")
+            with _loading_lock:
+                _loading_in_progress.remove(ticker)
+            return None
+    else:
+        tqdm.write(f"No precomputed results found for {ticker}")
+        with _loading_lock:
+            _loading_in_progress.remove(ticker)
+        return None
+
+def save_precomputed_results(ticker, results):
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    try:
+        with open(pkl_file, 'wb') as f:
+            # Create a deep copy of the results to avoid modification during saving
+            results_copy = copy.deepcopy(results)
+            pickle.dump(results_copy, f)
+        print(f"Saved precomputed results for {ticker}")
+    except Exception as e:
+        print(f"Error saving precomputed results for {ticker}: {e}")
+
+def fetch_precomputed_results(ticker):
+    precomputed_results = load_precomputed_results(ticker)
+
+    if precomputed_results:
+        top_buy_pair = precomputed_results.get('top_buy_pair')
+        top_short_pair = precomputed_results.get('top_short_pair')
+        buy_results = precomputed_results.get('buy_results')
+        short_results = precomputed_results.get('short_results')
+    else:
+        # Set default values if precomputed results are not available
+        top_buy_pair = None
+        top_short_pair = None
+        buy_results = {}
+        short_results = {}
+
+    return top_buy_pair, top_short_pair, buy_results, short_results
+
+def get_data(ticker, MAX_SMA_DAY, is_precomputing=False, cache_timestamp=None):
+    global master_stopwatch_start
+    try:
+        print(f"\nget_data called for {ticker} with MAX_SMA_DAY {MAX_SMA_DAY}")
+        master_stopwatch_start = time.time()
+        print("Master stopwatch started")
+        pkl_file = f'{ticker}_precomputed_results.pkl'
+        new_trading_days = None
+
         last_modified_time = get_last_modified_time(pkl_file)
 
-        if cache_timestamp is None or last_modified_time != cache_timestamp:
-            # Invalidate the cache if the pickle file has been updated
-            get_data.cache_clear()
-            print("Cache invalidated due to updated pickle file.")
+        if not hasattr(get_data, 'cache'):
+            get_data.cache = {}
+        if not hasattr(get_data, 'cache_timestamps'):
+            get_data.cache_timestamps = {}
 
-        if os.path.exists(pkl_file):
-            try:
-                with open(pkl_file, 'rb') as file:
-                    results = pickle.load(file)
-                    df, sma_combinations = results.get('preprocessed_data', (None, None))
-                    existing_max_sma_day = results.get('existing_max_sma_day', 0)
-                    last_processed_date = results.get('last_processed_date')
-                    print(f"Loaded existing_max_sma_day: {existing_max_sma_day}")
+        cache_key = (ticker, MAX_SMA_DAY, is_precomputing, cache_timestamp)
 
-                    # Get the total trading days from the loaded DataFrame
-                    total_trading_days_loaded = len(df) if df is not None else 0
-                    print(f"Total trading days (from loaded DataFrame): {total_trading_days_loaded}")
+        # Define a threshold for significant time difference (e.g., 1 hour = 3600 seconds)
+        TIME_THRESHOLD = 3600
 
-            except (pickle.UnpicklingError, EOFError) as e:
-                print(f"Error loading precomputed results for {ticker}: {str(e)}")
-                results = {}  # Initialize results as an empty dictionary only if there's an error loading the pickle file
-                existing_max_sma_day = 0  # Set existing_max_sma_day to 0 if there's an error loading the pickle file
-                last_processed_date = None
-                df = None  # Set df to None if there's an error loading the pickle file
+        if ticker not in get_data.cache_timestamps or (last_modified_time - get_data.cache_timestamps.get(ticker, 0) > TIME_THRESHOLD) or MAX_SMA_DAY != get_data.cache.get(cache_key, (None,))[0]:
+            print(f"Loading PKL file if available... (Last modified: {last_modified_time}, Cached: {get_data.cache_timestamps.get(ticker, 'Not cached')}, MAX_SMA_DAY: {MAX_SMA_DAY})")
+            get_data.cache_timestamps[ticker] = last_modified_time
+            if cache_key in get_data.cache:
+                del get_data.cache[cache_key]
+        elif cache_key in get_data.cache:
+            print(f"Using cached data (no significant change in file modification time or MAX_SMA_DAY). Cached MAX_SMA_DAY: {get_data.cache[cache_key][0]}")
+            return get_data.cache[cache_key]
 
+        results = load_precomputed_results(ticker) if os.path.exists(pkl_file) else None
+
+        if results:
+            df = results.get('preprocessed_data')
+            existing_max_sma_day = results.get('existing_max_sma_day', 0)
+            last_processed_date = results.get('last_processed_date')
+            top_buy_pair = results.get('top_buy_pair')
+            top_short_pair = results.get('top_short_pair')
+            print(f"Loaded existing results for {ticker}:")
+            print(f"Existing max SMA day: {existing_max_sma_day}")
+            print(f"Last processed date: {last_processed_date}")
+            print(f"Total trading days: {len(df) if df is not None else 0}")
+            print(f"Top Buy Pair: {top_buy_pair}")
+            print(f"Top Short Pair: {top_short_pair}")
         else:
-            results = {}  # Initialize results as an empty dictionary if the pickle file doesn't exist
-            existing_max_sma_day = 0  # Set existing_max_sma_day to 0 if the pickle file doesn't exist
-            last_processed_date = None
-            df = None  # Set df to None if the pickle file doesn't exist
+            print(f"No existing results found for {ticker}")
+            results = {}
+            existing_max_sma_day, last_processed_date, df = 0, None, None
 
-        print(f"Fetching data for {ticker}...")
+        print(f"\nFetching data for {ticker}...")
         fetched_df = fetch_data(ticker)
 
         if fetched_df is not None and not fetched_df.empty:
             if df is None:
-                # If df is None, use the fetched DataFrame as the starting point
                 df = fetched_df
+                new_trading_days = df
             else:
-                # Identify new trading days
                 new_trading_days = fetched_df.loc[df.index.max():].iloc[1:]
-
                 if not new_trading_days.empty:
-                    # Update the existing DataFrame with new trading days
                     df = pd.concat([df, new_trading_days])
+                else:
+                    new_trading_days = None
 
-            # Get the total trading days from the updated DataFrame
             total_trading_days = len(df)
-            print(f"Total trading days (from fetched DataFrame): {total_trading_days}")
+            print(f"Total trading days: {total_trading_days}")
+            print(f"New trading days: {len(new_trading_days) if new_trading_days is not None else 0}")
 
-            print("Columns before updating SMA columns:")
-            print(df.columns)
-            print()
+            new_max_sma_day = min(MAX_SMA_DAY, total_trading_days)
+            adjusted_max_sma_day = max(new_max_sma_day, existing_max_sma_day)
+            has_new_trading_days = new_trading_days is not None and not new_trading_days.empty
+            needs_calculation = new_max_sma_day > existing_max_sma_day or MAX_SMA_DAY != existing_max_sma_day
+            needs_precompute = needs_calculation or has_new_trading_days
 
-            if existing_max_sma_day < min(MAX_SMA_DAY, total_trading_days):
-                print((
-                    "existing_max_sma_day is less than the minimum of\n"
-                    "MAX_SMA_DAY and total_trading_days. Computing missing SMA columns."
-                ))
-                df = check_and_compute_missing_smas(df, min(MAX_SMA_DAY, total_trading_days), existing_max_sma_day, total_trading_days)
+            print(f"MAX_SMA_DAY in Code: {MAX_SMA_DAY}")
+            print(f"Previous existing_max_sma_day: {existing_max_sma_day}")
+            print(f"Total trading days: {total_trading_days}")
+            print(f"New max SMA day: {new_max_sma_day}")
+            print(f"Adjusted max SMA day: {adjusted_max_sma_day}")
+            print(f"Needs calculation: {needs_calculation}")
+            print(f"Has new trading days: {has_new_trading_days}")
+            print(f"Needs precompute: {needs_precompute}")
+            
+            if not needs_precompute:
+                print("Using cached data without recalculation.")
+                cumulative_combined_captures = results.get('cumulative_combined_captures', pd.Series())
+                active_pairs = results.get('active_pairs', [])
+                return df, False, MAX_SMA_DAY, existing_max_sma_day, False, None, last_modified_time, adjusted_max_sma_day, False, False, results, cumulative_combined_captures, active_pairs
+            
+            print(f"MAX_SMA_DAY: {MAX_SMA_DAY}, total_trading_days: {total_trading_days}")
 
-                print("Columns after updating SMA columns:")
-                print()
-                print(df.columns)
-                print()
-
-                sma_combinations = [(i, j) for i in range(1, min(MAX_SMA_DAY, total_trading_days) + 1) for j in range(i + 1, min(MAX_SMA_DAY, total_trading_days) + 1)]
-
-                # Save the updated DataFrame back to the pickle file
-                results['preprocessed_data'] = (df, sma_combinations)
-                results['last_processed_date'] = last_processed_date
-                with open(pkl_file, 'wb') as file:
-                    pickle.dump(results, file)
-
-                pprint(f"Updated SMA combinations: {sma_combinations[:2]} ... {sma_combinations[-2:]}")
-                print(f"Updated DataFrame with missing SMA columns and saved to pickle file.")
+            if needs_precompute:
+                print("Triggering precomputation...")
             else:
-                print((
-                    "existing_max_sma_day is equal to or greater than the minimum of\n"
-                    "MAX_SMA_DAY and total_trading_days. No missing SMA columns to compute."
-                ))
-                print()
+                print("No precomputation needed.")
 
-            pprint(f"Columns in the DataFrame after updating SMA columns: {list(df.columns[:2])} ... {list(df.columns[-2:])}")
-            needs_precompute = (MAX_SMA_DAY > existing_max_sma_day) or (new_trading_days is not None) or (last_processed_date is None) or (last_processed_date < df.index.max())
-            return df, sma_combinations, True, MAX_SMA_DAY, existing_max_sma_day, needs_precompute, new_trading_days, last_modified_time
+            master_stopwatch_end = time.time()
+            duration = master_stopwatch_end - master_stopwatch_start
+            print(f"\nMaster stopwatch stopped. Total duration: {duration:.2f} seconds")
 
+            cumulative_combined_captures = results.get('cumulative_combined_captures', pd.Series())
+            active_pairs = results.get('active_pairs', [])
+
+            cache_result = (df, False, MAX_SMA_DAY, existing_max_sma_day, needs_precompute, new_trading_days, last_modified_time, adjusted_max_sma_day, needs_calculation, has_new_trading_days, results, cumulative_combined_captures, active_pairs)
+            get_data.cache[cache_key] = cache_result
+            return cache_result
+        
         else:
-            print(f"Failed to fetch data for {ticker}. Skipping preprocessing.")
-            return None, None, False, 0, 0, False, new_trading_days, last_modified_time  # Return default values instead of None
+            print(f"Failed to fetch data for {ticker}.")
+            return None, False, MAX_SMA_DAY, 0, False, None, last_modified_time, None, False, False, None, pd.Series(), []
 
     except Exception as e:
         print(f"An error occurred in get_data: {str(e)}")
-        return None, None, False, 0, 0, False, None, None  # Return default values in case of an error
-
+        return None, False, 0, 0, False, None, None, None, False, False, None, pd.Series(), []
+    
 @lru_cache(maxsize=None)
 def compute_signals(df, sma1, sma2):
     # Align the indexes of sma1 and sma2
@@ -338,34 +296,54 @@ def write_status(ticker, status):
     with open(status_path, 'w') as f:
         json.dump(status, f)
 
-def precompute_results(ticker, df, sma_combinations, MAX_SMA_DAY, existing_max_sma_day):
-    print(f"precompute_results called for {ticker} with MAX_SMA_DAY {MAX_SMA_DAY}")
-    results = {}
-    top_buy_pair = None
-    top_short_pair = None
-    print(f"Processing ticker: {ticker}")
+def precompute_results(ticker, df, max_sma_day, existing_max_sma_day, needs_precompute, new_trading_days, needs_calculation, has_new_trading_days):
+    print(f"precompute_results called for {ticker} with MAX_SMA_DAY {max_sma_day}")
+    print(f"Needs precompute: {needs_precompute}")
+    # Defragment the DataFrame
+    df = df.copy()
+    
     pkl_file = f'{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file) and not needs_precompute:
+        print(f"Existing results found for {ticker} and no precomputation needed. Using existing results.")
+        return load_precomputed_results(ticker)
+    
+    results = {}
     pkl_backup_file = f'{ticker}_precomputed_results_backup.pkl'
-
+    section_timings = {}
+    section_start = time.time()
+    
     # Load existing results
-    if os.path.exists(pkl_file):
-        with open(pkl_file, 'rb') as file:
-            existing_results = pickle.load(file)
-            if not existing_results:  # Check if the dictionary is empty
-                existing_results = None
-            else:
-                top_buy_pair = existing_results.get('top_buy_pair')
-                top_short_pair = existing_results.get('top_short_pair')
-                last_processed_date = existing_results.get('last_processed_date')
-                print(f"Loaded existing results for {ticker}")
-                print(f"Existing top buy pair: {top_buy_pair}")
-                print(f"Existing top short pair: {top_short_pair}")
-                is_new_ticker = False
+    existing_results = load_precomputed_results(ticker)
+    
+    if existing_results is not None and isinstance(existing_results, dict):
+        results.update(existing_results)
+        top_buy_pair = results.get('top_buy_pair')
+        top_short_pair = results.get('top_short_pair')
+        last_processed_date = results.get('last_processed_date')
+        existing_max_sma_day = results.get('existing_max_sma_day', 0)
+        existing_buy_results = results.get('buy_results', {})
+        existing_short_results = results.get('short_results', {})
+
+        # Recalculate SMA columns to ensure NaN values are preserved
+        print("Recalculating SMA columns...")
+        for i in range(1, existing_max_sma_day + 1):
+            df[f'SMA_{i}'] = df['Close'].rolling(window=i, min_periods=i).mean()
+
+        print(f"Loaded existing results for {ticker}")
+        print(f"Existing top buy pair: {top_buy_pair}")
+        print(f"Existing top short pair: {top_short_pair}")
+        print(f"Existing max SMA day: {existing_max_sma_day}")
+        print(f"Number of existing buy results: {len(existing_buy_results)}")
+        print(f"Number of existing short results: {len(existing_short_results)}")
     else:
-        existing_results = None
+        existing_buy_results = {}
+        existing_short_results = {}
         last_processed_date = None
-        is_new_ticker = True
+        existing_max_sma_day = 0
         print(f"No existing results found for {ticker}")
+
+    buy_results = existing_buy_results
+    short_results = existing_short_results
 
     try:
         if df is None or df.empty:
@@ -373,415 +351,363 @@ def precompute_results(ticker, df, sma_combinations, MAX_SMA_DAY, existing_max_s
             return None
         print(f"Data fetched and preprocessed for {ticker}.")
 
-        # Create a backup of the existing pickle file before starting the calculation
-        if os.path.exists(pkl_file):
-            shutil.copy(pkl_file, pkl_backup_file)
+        total_trading_days = len(df)
+        adjusted_max_sma_day = min(max(max_sma_day, existing_max_sma_day), total_trading_days)
+        print(f"Total trading days: {total_trading_days}")
+        print(f"MAX_SMA_DAY: {max_sma_day}")
+        print(f"existing_max_sma_day at start: {existing_max_sma_day}")
+        print(f"adjusted_max_sma_day: {adjusted_max_sma_day}")
 
-        min_date = df.index.min()
-        max_date = df.index.max()
-        start_date = min_date.strftime('%Y-%m-%d') if pd.notnull(min_date) else 'No date available'
-        last_date = max_date.strftime('%Y-%m-%d') if pd.notnull(max_date) else 'No date available'
+        start_date = df.index.min().strftime('%Y-%m-%d')
+        last_date = df.index.max().strftime('%Y-%m-%d')
         print(f"Start date for {ticker}: {start_date}")
         print(f"Last date for {ticker}: {last_date}")
 
         if existing_results:
-            existing_buy_results = existing_results.get('buy_results', {})
-            existing_short_results = existing_results.get('short_results', {})
-            print(f"Loaded existing_max_sma_day: {existing_max_sma_day}")
+            print(f"Using existing results for {ticker}:")
+            print(f"Existing max SMA day: {existing_max_sma_day}")
+            print(f"Number of buy results: {len(buy_results)}")
+            print(f"Number of short results: {len(short_results)}")
 
-            # Initialize buy_results and short_results with the stored capture series
-            buy_results = {pair: capture for pair, capture in existing_buy_results.items()}
-            short_results = {pair: capture for pair, capture in existing_short_results.items()}
-
-            print(f"Loaded existing buy_results keys: {list(buy_results.keys())}")
-            print(f"Loaded existing short_results keys: {list(short_results.keys())}")
-            print(f"Loaded existing buy_results values: {list(buy_results.values())[:2]} ... {list(buy_results.values())[-2:]}")
-            print(f"Loaded existing short_results values: {list(short_results.values())[:2]} ... {list(short_results.values())[-2:]}")
-
+            if buy_results and short_results:
+                buy_keys = list(buy_results.keys())
+                short_keys = list(short_results.keys())
+                print(f"Buy results range: {buy_keys[0]} to {buy_keys[-1]}")
+                print(f"Short results range: {short_keys[0]} to {short_keys[-1]}")
         else:
-            buy_results = {}
-            short_results = {}
+            print(f"No existing results for {ticker}, initializing with empty dictionaries")
+            existing_max_sma_day = 0
 
-        print(f"MAX_SMA_DAY: {MAX_SMA_DAY}")
-        print(f"existing_max_sma_day: {existing_max_sma_day}")
+        def calculate_captures(sma1, sma2, returns):
+            buy_signals = sma1 > sma2
+            short_signals = sma1 < sma2
+            buy_capture = returns.where(buy_signals.shift(1, fill_value=False), 0).cumsum()
+            short_capture = (-returns.where(short_signals.shift(1, fill_value=False), 0)).cumsum()
+            return buy_capture, short_capture
 
-        buy_results = existing_buy_results
-        short_results = existing_short_results
+        new_sma_pairs = []
+        if existing_max_sma_day is None:
+            existing_max_sma_day = 0
 
-        # Get the total trading days
-        total_trading_days = len(df)
+        needs_calculation = (min(total_trading_days, max_sma_day) > existing_max_sma_day)
+        has_new_trading_days = new_trading_days is not None and not new_trading_days.empty
 
-        # Calculate adjusted_max_sma_day
-        adjusted_max_sma_day = max(existing_max_sma_day, min(MAX_SMA_DAY, total_trading_days))
-        print(f"Adjusted max SMA day: {adjusted_max_sma_day}")
+        print(f"MAX_SMA_DAY: {max_sma_day}, total_trading_days: {total_trading_days}")
+        print(f"Existing max SMA day: {existing_max_sma_day}")
+        print(f"Needs calculation: {needs_calculation}")
+        print(f"Reason for calculation: {'New max SMA day' if needs_calculation else 'No calculation needed'}")
 
-        new_sma_pairs = []  # Initialize new_sma_pairs as an empty list
+        if needs_calculation or has_new_trading_days:
+            print(f"Performing calculation for new SMA pairs or new trading days.")
+            print("Calculating SMA columns...")
+            
+            # Initialize daily_top_buy_pairs and daily_top_short_pairs as empty dicts before calculation
+            daily_top_buy_pairs = {}
+            daily_top_short_pairs = {}
 
-        if MAX_SMA_DAY > existing_max_sma_day:
-            print(f"Performing brute-force calculation for new SMA pairs up to adjusted max SMA day.")
-            # Perform brute-force calculations for the new SMA pairs that are not already calculated
-            new_sma_pairs = [(i, j) for i in range(1, adjusted_max_sma_day) for j in range(i + 1, adjusted_max_sma_day + 1) if j > existing_max_sma_day and j > i]
+            adjusted_max_sma_day = min(max_sma_day, len(df))
 
-            # If there are no new SMA pairs, create a pair with the previous SMA day and the adjusted max SMA day
-            if len(new_sma_pairs) == 0 and existing_max_sma_day < adjusted_max_sma_day:
-                new_sma_pairs = [(existing_max_sma_day, adjusted_max_sma_day)]
-        else:
-            print(f"No new SMA pairs to calculate for {ticker}")
+            if needs_calculation and adjusted_max_sma_day > existing_max_sma_day:
+                print(f"Calculating new SMA columns from {existing_max_sma_day + 1} to {adjusted_max_sma_day}")
+                new_sma_data = {f'SMA_{i}': df['Close'].rolling(window=i, min_periods=i).mean() 
+                                for i in range(existing_max_sma_day + 1, adjusted_max_sma_day + 1)}
+                
+                # Concatenate new SMA columns to the existing DataFrame
+                df = pd.concat([df, pd.DataFrame(new_sma_data)], axis=1)
+                
+                new_sma_pairs = [(i, j) for i in range(existing_max_sma_day + 1, adjusted_max_sma_day) 
+                                for j in range(i + 1, adjusted_max_sma_day + 1)]
+            else:
+                new_sma_pairs = []
 
-        print(f"New SMA pairs: {new_sma_pairs[:2]} ... {new_sma_pairs[-2:]}")
+            all_sma_pairs = [(i, j) for i in range(1, adjusted_max_sma_day) 
+                             for j in range(i + 1, adjusted_max_sma_day + 1)]
 
-        buy_results = existing_buy_results
-        short_results = existing_short_results
+            print(f"New SMA pairs to calculate: {len(new_sma_pairs)}")
+            print(f"Total SMA pairs to process: {len(all_sma_pairs)}")
 
-        if new_sma_pairs:
-            print(f"Existing buy_results keys before brute-force calculation: {list(buy_results.keys())}")
-            print(f"Existing short_results keys before brute-force calculation: {list(short_results.keys())}")
+            calculation_start = time.time()
+            if all_sma_pairs:
+                print(f"Starting calculation for {ticker} with {len(all_sma_pairs)} SMA pairs...")
 
-            print(f"Starting brute-force calculation for {ticker} with new SMA pairs")
-            with tqdm(total=len(new_sma_pairs), desc=f'Brute-Force Calculation for {ticker}', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]') as pbar:
-                for pair in new_sma_pairs:
-                    try:
-                        sma1 = df[f'SMA_{pair[0]}']
-                        sma2 = df[f'SMA_{pair[1]}']
+                chunk_size = 1000  # Adjust based on your memory constraints
+                with tqdm(total=len(all_sma_pairs), desc=f'Calculation for {ticker}', unit='pair', dynamic_ncols=True) as pbar:
+                    for i in range(0, len(all_sma_pairs), chunk_size):
+                        chunk_pairs = all_sma_pairs[i:i+chunk_size]
+                        chunk_buy_results = {}
+                        chunk_short_results = {}
 
-                        # Align the SMA columns before calculating the buy and short signals
-                        sma1, sma2 = sma1.align(sma2, join='inner')
+                        for pair in chunk_pairs:
+                            try:
+                                sma1 = df[f'SMA_{pair[0]}']
+                                sma2 = df[f'SMA_{pair[1]}']
 
-                        # Calculate buy capture for the new SMA pair
-                        buy_signals = sma1 > sma2
-                        buy_returns = df['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                        buy_capture = buy_returns.cumsum()
-                        
-                        print(f"Buy capture series for the first new SMA pair: {buy_capture}")
+                                # Calculate returns
+                                returns = df['Close'].pct_change()
 
-                        # Store the entire buy_capture series in the dictionary
-                        buy_results[pair] = buy_capture
+                                # Calculate captures
+                                buy_capture, short_capture = calculate_captures(sma1, sma2, returns)
 
-                        print(f"Updated buy_results for the first new SMA pair: {buy_results[new_sma_pairs[0]]}")
+                                # Store the capture series in the chunk dictionaries
+                                chunk_buy_results[pair] = buy_capture
+                                chunk_short_results[pair] = short_capture
 
-                        # Calculate short capture for the new SMA pair
-                        short_signals = sma1 < sma2
-                        short_returns = -df['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                        short_capture = short_returns.cumsum()
-                        
-                        print(f"Short capture series for the first new SMA pair: {short_capture}")
+                                pbar.set_postfix_str(f"Current pair: {pair}")
+                            except Exception as e:
+                                tqdm.write(f"Error processing pair {pair}: {str(e)}")
 
-                        # Store the entire short_capture series in the dictionary
-                        short_results[pair] = short_capture
+                            pbar.update(1)
 
-                        print(f"Updated short_results for the first new SMA pair: {short_results[new_sma_pairs[0]]}")
+                        # Update the main results dictionaries
+                        buy_results.update(chunk_buy_results)
+                        short_results.update(chunk_short_results)
 
-                    except KeyError as e:
-                        print(f"KeyError occurred for pair {pair}: {str(e)}")
-                    except Exception as e:
-                        print(f"Error occurred for pair {pair}: {str(e)}")
+                        # Add inverse pairs
+                        inverse_buy_results = { (pair[1], pair[0]): -capture for pair, capture in chunk_short_results.items() }
+                        inverse_short_results = { (pair[1], pair[0]): -capture for pair, capture in chunk_buy_results.items() }
 
-                    pbar.update(1)
+                        buy_results.update(inverse_buy_results)
+                        short_results.update(inverse_short_results)
 
-            print(f"Finished brute-force calculation for {ticker} with new SMA pairs")
+                        # Clear memory
+                        del chunk_buy_results
+                        del chunk_short_results
+                        del inverse_buy_results
+                        del inverse_short_results
+                        gc.collect()  # Force garbage collection
+
+            else:
+                print(f"No SMA pairs to calculate for {ticker}")
+
+            print(f"\nProcessed {len(all_sma_pairs)} SMA pairs for {ticker}")
+            print(f"Total buy pairs: {len(buy_results)}, Total short pairs: {len(short_results)}")
+            print(f"Finished brute-force calculation for {ticker} with all SMA pairs")
+
+            section_timings['SMA pair calculation'] = time.time() - calculation_start
+            section_start = time.time()
 
             buy_keys = list(buy_results.keys())
             short_keys = list(short_results.keys())
 
-            print(f"Updated buy_results keys after brute-force calculation: {buy_keys[:2]} ... {buy_keys[-2:]}")
+            print(f"\nUpdated buy_results keys after brute-force calculation: {buy_keys[:2]} ... {buy_keys[-2:]}")
             print(f"Updated short_results keys after brute-force calculation: {short_keys[:2]} ... {short_keys[-2:]}")
-            
-            # Set last_processed_date to the maximum date in the DataFrame after the brute-force calculation
-            last_processed_date = df.index.max()
 
-            print(f"Updated buy_results keys after brute-force calculation: {list(buy_results.keys())}")
-            print(f"Updated short_results keys after brute-force calculation: {list(short_results.keys())}")
-            print(f"Updated buy_results values after brute-force calculation: {list(buy_results.values())[:2]} ... {list(buy_results.values())[-2:]}")
-            print(f"Updated short_results values after brute-force calculation: {list(short_results.values())[:2]} ... {list(short_results.values())[-2:]}")
-        
-        else:
-            print(f"No new SMA pairs to calculate for {ticker}.")
-            buy_results = existing_buy_results
-            short_results = existing_short_results
+            print(f"Previous existing_max_sma_day: {existing_max_sma_day}")
+            # Update existing_max_sma_day
+            existing_max_sma_day = adjusted_max_sma_day
+            print(f"Updated existing_max_sma_day: {existing_max_sma_day}")
 
-        daily_top_buy_pairs = {}
-        daily_top_short_pairs = {}
+            if needs_calculation:
+                print("Calculating daily top pairs...")
 
-        if not new_sma_pairs and (is_new_ticker or (last_processed_date is not None and last_processed_date >= df.index.max())):
-            print(f"No new SMA pairs to calculate and no unprocessed trading days for {ticker}. Skipping recalculation of buy and short captures.")
-        else:
-            print("Finding top buy and short pairs for each trading day...")
+                try:
+                    # Create buy_results_with_inverse and short_results_with_inverse
+                    buy_results_with_inverse = {**buy_results, **{(pair[1], pair[0]): -capture for pair, capture in short_results.items()}}
+                    short_results_with_inverse = {**short_results, **{(pair[1], pair[0]): -capture for pair, capture in buy_results.items()}}
 
-            # Create DataFrames from buy_results and short_results
-            buy_results_df = pd.DataFrame(buy_results)
-            short_results_df = pd.DataFrame(short_results)
+                    # Convert to DataFrames
+                    buy_results_with_inverse_df = pd.DataFrame(buy_results_with_inverse)
+                    short_results_with_inverse_df = pd.DataFrame(short_results_with_inverse)
 
-            # Find the top buy pair for each trading day
-            daily_top_buy_pairs = buy_results_df.idxmax(axis=1).to_dict()
+                    daily_top_buy_pairs = {}
+                    daily_top_short_pairs = {}
 
-            # Find the top short pair for each trading day
-            daily_top_short_pairs = short_results_df.idxmax(axis=1).to_dict()
+                    print("Finding top buy and short pairs for each date")
+                    for date in tqdm(df.index, desc="Processing dates"):
+                        # Find the top buy pair for this date
+                        top_buy_pair = buy_results_with_inverse_df.loc[date].idxmax()
+                        top_buy_capture = buy_results_with_inverse_df.loc[date, top_buy_pair]
+                        daily_top_buy_pairs[date] = (top_buy_pair, top_buy_capture)
 
-            for date in df.index:
-                date_buy_results = {pair: buy_results[pair].loc[date] for pair in buy_results.keys() if date in buy_results[pair].index}
-                date_short_results = {pair: short_results[pair].loc[date] for pair in short_results.keys() if date in short_results[pair].index}
+                        # Find the top short pair for this date
+                        top_short_pair = short_results_with_inverse_df.loc[date].idxmax()
+                        top_short_capture = short_results_with_inverse_df.loc[date, top_short_pair]
+                        daily_top_short_pairs[date] = (top_short_pair, top_short_capture)
 
-                if date_buy_results:
-                    daily_top_buy_pairs[date] = max(date_buy_results, key=date_buy_results.get)
-                if date_short_results:
-                    daily_top_short_pairs[date] = max(date_short_results, key=date_short_results.get)
+                    # Update results
+                    #results['daily_top_buy_pairs'] = daily_top_buy_pairs
+                    #results['daily_top_short_pairs'] = daily_top_short_pairs
 
-        print("\nBefore updating SMA values:")
-        # Display the first few and last few trading day rows along with the first few and last few SMA columns
-        print("\nFirst few and last few trading day rows with SMA columns:")
-        print()
-        display_columns = ['Open', 'High', 'Low', 'Close'] + [f'SMA_{i}' for i in range(1, adjusted_max_sma_day + 1)]
-        print(df.loc[:, display_columns].head())
-        print()
-        print(df.loc[:, display_columns].tail())
+                    #print("\nSample of daily top pairs:")
+                    #for i, (date, (buy_pair, buy_capture)) in enumerate(list(daily_top_buy_pairs.items())[-5:]):
+                        #short_pair, short_capture = daily_top_short_pairs[date]
+                        #print(f"Date: {date}")
+                        #print(f"  Top buy pair: {buy_pair}, capture: {buy_capture:.4f}")
+                        #print(f"  Top short pair: {short_pair}, capture: {short_capture:.4f}")
+                        #if i < 4:  # Add a newline between all but the last entry
+                    #print()
+                    #print("Sample of daily_top_buy_pairs:")
+                    #print(list(daily_top_buy_pairs.items())[:5])
+                    #print("Sample of daily_top_short_pairs:")
+                    #print(list(daily_top_short_pairs.items())[:5])
 
-        if buy_results and short_results:
-            try:
-                # Create DataFrames to store the cumulative sum capture percentages for each SMA pair
-                buy_results_df = pd.DataFrame.from_dict({pair: capture.iloc[-1] for pair, capture in buy_results.items()}, orient='index', columns=['buy_capture'])
-                short_results_df = pd.DataFrame.from_dict({pair: capture.iloc[-1] for pair, capture in short_results.items()}, orient='index', columns=['short_capture'])
+                    # Added print statements to check types and sample data
+                    #print("Inspecting daily_top_buy_pairs and daily_top_short_pairs:")
+                    #sample_key_buy = next(iter(daily_top_buy_pairs.keys()), None)
+                    #sample_value_buy = daily_top_buy_pairs.get(sample_key_buy, None)
+                    #print(f"Type of keys in daily_top_buy_pairs: {type(sample_key_buy)}")
+                    #print(f"Type of values in daily_top_buy_pairs: {type(sample_value_buy)}")
+                    #print(f"Sample key from daily_top_buy_pairs: {sample_key_buy}")
+                    #print(f"Sample value from daily_top_buy_pairs: {sample_value_buy}")
 
-                # Display the cumulative sum capture percentages for each SMA pair
-                print("\nCumulative sum capture percentages for each SMA pair:")
-                print()
-                results_df = pd.concat([buy_results_df, short_results_df], axis=1)
-                results_df.index.names = ['SMA Pair']
-                print(results_df)
-            except (KeyError, IndexError) as e:
-                print(f"Error displaying cumulative sum capture percentages: {str(e)}")
-        else:
-            print("\nNo buy_results or short_results to display.")
+                    #sample_key_short = next(iter(daily_top_short_pairs.keys()), None)
+                    #sample_value_short = daily_top_short_pairs.get(sample_key_short, None)
+                    #print(f"Type of keys in daily_top_short_pairs: {type(sample_key_short)}")
+                    #print(f"Type of values in daily_top_short_pairs: {type(sample_value_short)}")
+                    #print(f"Sample key from daily_top_short_pairs: {sample_key_short}")
+                    #print(f"Sample value from daily_top_short_pairs: {sample_value_short}")
 
-        # Update SMA values for trading days with enough data
-        for sma_day in range(1, adjusted_max_sma_day + 1):
-            sma_column = f'SMA_{sma_day}'
-            if sma_column in df.columns:
-                df.loc[df.index[sma_day-1]:, sma_column] = df['Close'].rolling(window=sma_day).mean()[sma_day-1:]
+                    # Existing print statements
+                    print(f"Number of daily top buy pairs calculated: {len(daily_top_buy_pairs)}")
+                    print(f"Number of daily top short pairs calculated: {len(daily_top_short_pairs)}")
+                except Exception as e:
+                    print(f"Error during calculation of daily top pairs: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print("Using existing daily captures and top pairs.")
+                daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
+                daily_top_short_pairs = results.get('daily_top_short_pairs', {})
 
-        print("\nAfter updating SMA values:")
-        print()
-        print(df.loc[:, display_columns].head())
-        print()
-        print(df.loc[:, display_columns].tail())
+            # Calculate cumulative combined captures
+            cumulative_combined_captures, active_pairs = get_or_calculate_combined_captures(
+                results=results,
+                df=df,
+                daily_top_buy_pairs=daily_top_buy_pairs,
+                daily_top_short_pairs=daily_top_short_pairs,
+                ticker=ticker
+            )
 
-        latest_existing_date = df.index.max()
+            # Ensure preprocessed_data is saved as a DataFrame and is non-empty
+            if not df.empty:
+                results['preprocessed_data'] = df.copy()
+                print(f"'preprocessed_data' saved successfully for {ticker}")
+            else:
+                print(f"Warning: DataFrame is empty for {ticker}")
 
-        print()
-        print(f"Date of last brute-force calculation up through SMA_{min(adjusted_max_sma_day, total_trading_days)}: {latest_existing_date}")
-        print()
-        print(f"Updated buy_results Range: {dict(list(buy_results.items())[:1])} ... {dict(list(buy_results.items())[-1:])}")
-        print()
-        print(f"Updated short_results Range: {dict(list(short_results.items())[:1])} ... {dict(list(short_results.items())[-1:])}")
-        print()
+            # Update the results dictionary
+            adjusted_max_sma_day = min(max_sma_day, total_trading_days)
+            new_existing_max_sma_day = max(existing_max_sma_day, min(max_sma_day, total_trading_days))
 
-        # Add the proposed condition here
-        if not is_new_ticker and (last_processed_date is None or last_processed_date < df.index.max()):
-            unprocessed_days = df.loc[last_processed_date:] if last_processed_date is not None else df
-            if not unprocessed_days.empty and (new_sma_pairs or buy_results):
-                print(f"Found unprocessed trading days from {unprocessed_days.index.min()} to {unprocessed_days.index.max()}")
-                print(f"Processing unprocessed trading days for existing SMA pairs...")
-
-                for pair in tqdm(buy_results.keys(), desc=f'Processing unprocessed days for {ticker}', unit='pair', dynamic_ncols=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
-                    try:
-                        sma1 = unprocessed_days[f'SMA_{pair[0]}']
-                        sma2 = unprocessed_days[f'SMA_{pair[1]}']
-
-                        # Align the SMA columns before calculating the buy and short signals
-                        sma1, sma2 = sma1.align(sma2, join='inner')
-
-                        # Calculate buy capture for the existing SMA pair with unprocessed days
-                        buy_signals = sma1 > sma2
-                        buy_returns = unprocessed_days['Close'].pct_change().where(buy_signals.shift(1, fill_value=False), 0)
-                        buy_capture = buy_returns.cumsum()  # Change from sum() to cumsum()
-                        buy_results[pair] = buy_results.get(pair, pd.Series(dtype=float)).add(buy_capture, fill_value=0)
-
-                        # Calculate short capture for the existing SMA pair with unprocessed days
-                        short_signals = sma1 < sma2
-                        short_returns = -unprocessed_days['Close'].pct_change().where(short_signals.shift(1, fill_value=False), 0)
-                        short_capture = short_returns.cumsum()  # Change from sum() to cumsum()
-                        short_results[pair] = short_results.get(pair, pd.Series(dtype=float)).add(short_capture, fill_value=0)
-
-                        # Update buy_results and short_results dictionaries by appending the new capture values
-                        buy_results[pair] = pd.concat([buy_results.get(pair, pd.Series(dtype=float)), buy_capture])
-                        short_results[pair] = pd.concat([short_results.get(pair, pd.Series(dtype=float)), short_capture])
-
-                    except KeyError as e:
-                        print(f"KeyError occurred for pair {pair}: {str(e)}")
-                    except Exception as e:
-                        print(f"Error occurred for pair {pair}: {str(e)}")
-
-                print(f"Finished processing unprocessed trading days for existing SMA pairs for {ticker}")
-                
-                # Update SMA values for all trading days affected by the unprocessed days
-                for sma_day in range(1, adjusted_max_sma_day + 1):
-                    sma_column = f'SMA_{sma_day}'
-                    if sma_column in df.columns:
-                        affected_days = df.index[-sma_day:]
-                        df.loc[affected_days, sma_column] = df.loc[affected_days, 'Close'].rolling(window=sma_day).mean()
-                
-                print("\nAfter processing unprocessed trading days:")
-                print(df.loc[:, display_columns].head())
-                print(df.loc[:, display_columns].tail())
-
-                if buy_results and short_results:
-                    try:
-                        # Display the updated cumulative sum capture percentages for each SMA pair
-                        print("\nUpdated cumulative sum capture percentages for each SMA pair:")
-                        display_pairs = list(buy_results.keys())[:5] + list(buy_results.keys())[-5:]
-                        buy_results_df = pd.DataFrame.from_dict({pair: capture.iloc[-1] for pair, capture in buy_results.items()}, orient='index', columns=['buy_capture'])
-                        short_results_df = pd.DataFrame.from_dict({pair: capture.iloc[-1] for pair, capture in short_results.items()}, orient='index', columns=['short_capture'])
-                        results_df = pd.concat([buy_results_df, short_results_df], axis=1)
-                        results_df.index.names = ['SMA Pair']
-                        print(results_df.loc[display_pairs, :])
-                    except (KeyError, IndexError) as e:
-                        print(f"Error displaying updated cumulative sum capture percentages: {str(e)}")
-                    else:
-                        print("\nNo buy_results or short_results to display after processing unprocessed trading days.")
-                        # Update last_processed_date to the maximum date in the DataFrame after processing unprocessed days
-                        last_processed_date = df.index.max()
-        else:
-            print(f"No unprocessed trading days or no existing SMA pairs for {ticker}. Skipping processing of unprocessed days.")
-
-            latest_existing_date = df.index.max()
-            
-            print(f"Date of last brute-force calculation up through SMA_{min(adjusted_max_sma_day, total_trading_days)}: {latest_existing_date}")
-            print(f"Updated buy_results Range: {list(buy_results.keys())[:2]} ... {list(buy_results.keys())[-2:]}")
-            print(f"Updated short_results Range: {list(short_results.keys())[:2]} ... {list(short_results.keys())[-2:]}")
-            print()
-
-        if buy_results and short_results:
-            buy_results_with_inverse = {pair: result.iloc[-1] for pair, result in buy_results.items()}
-            short_results_with_inverse = {pair: result.iloc[-1] for pair, result in short_results.items()}
-
-            # Add inverse pairs to the buy_results_with_inverse dictionary
-            for pair, result in short_results.items():
-                inverse_pair = (pair[1], pair[0])
-                buy_results_with_inverse[inverse_pair] = -result.iloc[-1]
-
-            # Add inverse pairs to the short_results_with_inverse dictionary
-            for pair, result in buy_results.items():
-                inverse_pair = (pair[1], pair[0])
-                short_results_with_inverse[inverse_pair] = -result.iloc[-1]
+            # Create buy_results_with_inverse and short_results_with_inverse
+            buy_results_with_inverse = {**buy_results, **{(pair[1], pair[0]): -capture for pair, capture in short_results.items()}}
+            short_results_with_inverse = {**short_results, **{(pair[1], pair[0]): -capture for pair, capture in buy_results.items()}}
 
             # Identify the top performing buy and short pairs from the respective dictionaries
-            top_buy_pair = max(buy_results_with_inverse, key=lambda x: buy_results_with_inverse[x]) if buy_results_with_inverse else None
-            top_short_pair = max(short_results_with_inverse, key=lambda x: short_results_with_inverse[x]) if short_results_with_inverse else None
+            if buy_results_with_inverse:
+                top_buy_pair = max(
+                    buy_results_with_inverse, 
+                    key=lambda x: buy_results_with_inverse[x].iloc[-1] if isinstance(buy_results_with_inverse[x], pd.Series) else buy_results_with_inverse[x]
+                )
+            else:
+                top_buy_pair = (0, 0)
 
-            # Print the top pairs along with their results
-            if top_buy_pair is not None:
-                print(f"Top Buy Pair for {ticker}: {top_buy_pair} with result {buy_results_with_inverse[top_buy_pair]}")
-            if top_short_pair is not None:
-                print(f"Top Short Pair for {ticker}: {top_short_pair} with result {short_results_with_inverse[top_short_pair]}")
-            print()
+            if short_results_with_inverse:
+                top_short_pair = max(
+                    short_results_with_inverse, 
+                    key=lambda x: short_results_with_inverse[x].iloc[-1] if isinstance(short_results_with_inverse[x], pd.Series) else short_results_with_inverse[x]
+                )
+            else:
+                top_short_pair = (0, 0)
 
-        # Update existing_max_sma_day in the results dictionary after brute-force calculations
-        results['existing_max_sma_day'] = adjusted_max_sma_day
-        results['last_processed_date'] = last_processed_date
-        results['daily_top_buy_pairs'] = daily_top_buy_pairs
-        results['daily_top_short_pairs'] = daily_top_short_pairs
+            # Update results, ensuring daily_top_buy_pairs and daily_top_short_pairs are included
+            results.update({
+                'top_buy_pair': top_buy_pair,
+                'top_short_pair': top_short_pair,
+                'buy_results': buy_results,
+                'short_results': short_results,
+                'start_date': start_date,
+                'last_date': last_date,
+                'total_trading_days': total_trading_days,
+                'existing_max_sma_day': new_existing_max_sma_day,
+                'last_processed_date': df.index[-1],
+                'last_processed_close': df['Close'].iloc[-1],
+                'cumulative_combined_captures': cumulative_combined_captures,
+                'active_pairs': active_pairs,
+                'daily_top_buy_pairs': daily_top_buy_pairs,
+                'daily_top_short_pairs': daily_top_short_pairs
+            })
 
-        # Save the results
-        results = {
-            'top_buy_pair': top_buy_pair,
-            'top_short_pair': top_short_pair,
-            'daily_top_buy_pairs': daily_top_buy_pairs,
-            'daily_top_short_pairs': daily_top_short_pairs,
-            'buy_results': buy_results,
-            'short_results': short_results,
-            'start_date': df.index.min().strftime('%Y-%m-%d'),
-            'last_date': df.index.max().strftime('%Y-%m-%d'),
-            'preprocessed_data': (df, sma_combinations),
-            'total_trading_days': total_trading_days,
-            'existing_max_sma_day': adjusted_max_sma_day,
-            'last_processed_date': last_processed_date
-        }
+            print(f"Current Top buy pair: {top_buy_pair} with results {buy_results_with_inverse[top_buy_pair].iloc[-1]:.6f}")
+            print(f"Current Top short pair: {top_short_pair} with results {short_results_with_inverse[top_short_pair].iloc[-1]:.6f}")
+            print("Calculated cumulative_combined_captures and active_pairs")
+            print(f"Saving existing_max_sma_day as: {new_existing_max_sma_day}")
+            print(f"MAX_SMA_DAY: {max_sma_day}, total_trading_days: {total_trading_days}")
+            print(f"Previous existing_max_sma_day: {existing_max_sma_day}, New existing_max_sma_day: {new_existing_max_sma_day}")
+            print("Results dictionary updated with daily top pairs.")
+            print(f"Number of daily top buy pairs in results: {len(results['daily_top_buy_pairs'])}")
+            print(f"Number of daily top short pairs in results: {len(results['daily_top_short_pairs'])}")
 
-        print(f"Saving results to {pkl_file}")
+            if needs_precompute:
+                print(f"Saving results to {pkl_file}")
+                
+                try:
+                    with tqdm(total=1, unit='file', desc=f"Saving {pkl_file}") as pbar:
+                        with open(pkl_file, 'wb') as f:
+                            pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        pbar.update(1)
 
-        try:
-            with open(pkl_file, 'wb') as file:
-                pickle.dump(results, file)
-            print("Results saved successfully.")
-            write_status(ticker, {"status": "complete", "progress": 100})
+                    print(f"Results saved successfully to {pkl_file}")
+                    write_status(ticker, {"status": "complete", "progress": 100})
 
-        except Exception as e:
-            print(f"Error occurred while saving results to {pkl_file}: {str(e)}")
-            print(error_message)
-            write_status(ticker, {"status": "failed", "message": error_message})
-   
+                except Exception as e:
+                    print(f"Error occurred while saving results to {pkl_file}: {str(e)}")
+                    write_status(ticker, {"status": "failed", "message": str(e)})
+
+                print("Finalizing and cleaning up...")
+                gc.collect()  # Force garbage collection
+                print("Process completed.")
+
+            else:
+                print("No changes detected. Skipping save.")
+
+        else:
+            print(f"No new SMA pairs to calculate. MAX_SMA_DAY: {max_sma_day}, existing_max_sma_day: {existing_max_sma_day}")
+            # Use existing daily top pairs
+            daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
+            daily_top_short_pairs = results.get('daily_top_short_pairs', {})
+
+        # Final steps
+        if 'master_stopwatch_start' in locals() and master_stopwatch_start is not None:
+            master_stopwatch_end = time.time()
+            duration = master_stopwatch_end - master_stopwatch_start
+            print(f"\nMaster stopwatch stopped. Total duration: {duration:.2f} seconds")
+            
+            print("\nMaster stopwatch breakdown:")
+            for section, section_duration in section_timings.items():
+                print(f"{section}: {section_duration:.2f} seconds")
+
+        return results
+
     except Exception as e:
         error_message = f"Error in precompute_results for {ticker}: {str(e)}"
         print(error_message)
         write_status(ticker, {"status": "failed", "message": error_message})
+        print()
+        
+        # Print more detailed error information
+        import traceback
+        print("Detailed error traceback:")
+        traceback.print_exc()
 
         # Restore the backup file if it exists
         if os.path.exists(pkl_backup_file):
             shutil.copy(pkl_backup_file, pkl_file)
             print("Backup file restored.")
+            print()
 
         return None
 
-    return results
-
-def load_precomputed_results(ticker):
-    pkl_file = f'{ticker}_precomputed_results.pkl'
-    if os.path.exists(pkl_file):
-        with open(pkl_file, 'rb') as file:
-            try:
-                results = pickle.load(file)
-                
-                # Check if 'top_buy_pair' and 'top_short_pair' are present in the results
-                if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                    print(f"Warning: 'top_buy_pair' or 'top_short_pair' not found in the precomputed results for {ticker}")
-                    results['top_buy_pair'] = None
-                    results['top_short_pair'] = None
-                
-                # Check if 'daily_top_buy_pairs' and 'daily_top_short_pairs' are present in the results
-                if 'daily_top_buy_pairs' not in results or 'daily_top_short_pairs' not in results:
-                    print(f"Warning: 'daily_top_buy_pairs' or 'daily_top_short_pairs' not found in the precomputed results for {ticker}")
-                    results['daily_top_buy_pairs'] = {}
-                    results['daily_top_short_pairs'] = {}
-                
-                # Check if 'buy_results' and 'short_results' are present in the results
-                if 'buy_results' not in results:
-                    results['buy_results'] = {}
-                else:
-                    # Convert buy_results to a dictionary with pair tuples as keys and capture series as values
-                    results['buy_results'] = {tuple(pair): capture for pair, capture in results['buy_results'].items()}
-
-                if 'short_results' not in results:
-                    results['short_results'] = {}
-                else:
-                    # Convert short_results to a dictionary with pair tuples as keys and capture series as values
-                    results['short_results'] = {tuple(pair): capture for pair, capture in results['short_results'].items()}
-                
-                # Check if 'existing_max_sma_day' is present in the results
-                if 'existing_max_sma_day' not in results:
-                    results['existing_max_sma_day'] = 0
-                
-                return results
-            except (pickle.UnpicklingError, EOFError, KeyError) as e:
-                print(f"Error loading precomputed results for {ticker}: {str(e)}")
-                return None
-    return None
-
-def fetch_precomputed_results(ticker):
-    precomputed_results = load_precomputed_results(ticker)
-
-    if precomputed_results:
-        top_buy_pair = precomputed_results.get('top_buy_pair')
-        top_short_pair = precomputed_results.get('top_short_pair')
-        buy_results = precomputed_results.get('buy_results')
-        short_results = precomputed_results.get('short_results')
-
-    else:
-        # Set default values if precomputed results are not available
-        top_buy_pair = {}
-        top_short_pair = {}
-        buy_results = {}
-        short_results = {} 
-
-    return top_buy_pair, top_short_pair, buy_results, short_results
+def save_results_checkpoint(ticker, daily_top_buy_pairs, daily_top_short_pairs, processed_rows, final=False):
+    checkpoint_file = f'{ticker}_checkpoint.pkl'
+    with open(checkpoint_file, 'wb') as f:
+        pickle.dump({
+            'daily_top_buy_pairs': daily_top_buy_pairs,
+            'daily_top_short_pairs': daily_top_short_pairs,
+            'processed_rows': processed_rows,
+            'final': final
+        }, f)
+    print(f"Saved checkpoint after processing {processed_rows} rows")
 
 # Initialize the Dash app with a dark theme and custom styles
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
@@ -797,16 +723,26 @@ def read_status(ticker):
                 print(f"Empty JSON file: {status_path}")
     return {"status": "not started", "progress": 0}
 
-# Call the function and print the status
-status = read_status('VIK')  # replace 'AAPL' with your ticker
+status = read_status('AAPL')
 print(status)
 
-# Update your Dash layout to include the status and interval component
+def inspect_pkl_file(ticker):
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file):
+        with open(pkl_file, 'rb') as f:
+            results = pickle.load(f)
+        print(f"Keys in {pkl_file}: {list(results.keys())}")
+    else:
+        print(f"{pkl_file} does not exist.")
+
+# Optionally, call it manually for a specific ticker
+# inspect_pkl_file('VIK')
+
 app.layout = html.Div(
     style={
         'background-color': 'black',
-        'color': '#00FF00',
-        'font-family': 'Courier New, monospace'
+        'color': '#80ff00',
+        'font-family': 'Impact, sans-serif'
     },
     children=[
         html.H1('Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework', className='text-center mt-3'),
@@ -826,11 +762,26 @@ app.layout = html.Div(
                 dcc.Graph(id='combined-capture-chart')
             ], width=12)
         ]),
+        # Add the new graph component here
         dbc.Row([
-            dbc.Col([
-                dcc.Graph(id='chart')
-            ], width=12)
-        ]),
+                    dbc.Col([
+                        dcc.Graph(id='historical-top-pairs-chart')  # New chart
+                    ], width=12)
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Switch(
+                            id='show-annotations-toggle',
+                            label='Show Signal Annotations',
+                            value=False  # Default to showing annotations
+                        )
+                    ], width=12)
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dcc.Graph(id='chart')
+                    ], width=12)
+                ]),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -973,7 +924,6 @@ def update_status(n_intervals, ticker):
             return f"Failed to process {ticker}: {status.get('message', '')}"
     return "Enter a ticker and press submit to start processing."
 
-# Callback to toggle the visibility of the Calculation Components section
 @app.callback(
     Output('calc-collapse', 'is_open'),
     [Input('toggle-calc-button', 'n_clicks')],
@@ -1057,19 +1007,30 @@ def validate_ticker_input(ticker):
     if not ticker:
         return ''
 
-    # Clear the cache when switching between tickers
-    get_data.cache_clear()
+    # Clear the cache when ticker changes
+    if hasattr(get_data, 'cache'):
+        get_data.cache.clear()
+    if hasattr(get_data, 'cache_timestamps'):
+        get_data.cache_timestamps.clear()
 
-    # Always call get_data first
-    df, sma_combinations, _, MAX_SMA_DAY, existing_max_sma_day, needs_precompute, new_trading_days, _ = get_data(ticker, MAX_SMA_DAY)
+    try:
+        result = get_data(ticker, MAX_SMA_DAY)
+        if len(result) == 13:
+            df, _, max_sma_day, existing_max_sma_day, needs_precompute, new_trading_days, _, adjusted_max_sma_day, needs_calculation, has_new_trading_days, results, cumulative_combined_captures, active_pairs = result
+        else:
+            print(f"Unexpected number of return values from get_data: {len(result)}")
+            return 'Error retrieving data. Please check the console for more information.'
+    except ValueError as e:
+        print(f"Error unpacking values from get_data: {e}")
+        return 'Error retrieving data. Please check the console for more information.'
 
     if df is None or df.empty:
         return ''
 
     # Trigger precomputation if needed
-    if needs_precompute or (new_trading_days is not None):
+    if needs_precompute or existing_max_sma_day < MAX_SMA_DAY:
         print(f"Triggering precomputation for {ticker}")
-        precompute_results(ticker, df, sma_combinations, MAX_SMA_DAY, existing_max_sma_day)
+        precompute_results(ticker, df, MAX_SMA_DAY, existing_max_sma_day, needs_precompute, new_trading_days, needs_calculation, has_new_trading_days)
 
     return ''
 
@@ -1103,35 +1064,194 @@ def calculate_trading_signals(df, daily_top_buy_pairs, daily_top_short_pairs, bu
 
     return trading_signals
 
-def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs, buy_results, short_results):
-    cumulative_combined_captures = []
+def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs):
+    tqdm.write(f"\nCalculating cumulative combined capture")
+    tqdm.write(f"Number of daily top buy pairs: {len(daily_top_buy_pairs)}")
+    tqdm.write(f"Number of daily top short pairs: {len(daily_top_short_pairs)}")
+    tqdm.write(f"Number of trading days in df: {len(df)}")
 
-    for date in df.index:
-        top_buy_pair = daily_top_buy_pairs.get(date)
-        top_short_pair = daily_top_short_pairs.get(date)
+    if not daily_top_buy_pairs or not daily_top_short_pairs:
+        tqdm.write("No daily top pairs available for processing cumulative combined captures.")
+        return pd.Series([0], index=[df.index[0]]), ['None']
 
-        if top_buy_pair and top_buy_pair in buy_results:
-            buy_signal = df[f'SMA_{top_buy_pair[0]}'].loc[date] > df[f'SMA_{top_buy_pair[1]}'].loc[date]
-            buy_capture = buy_results[top_buy_pair].loc[date] * 100 if buy_signal else 0
-        else:
-            buy_capture = 0
+    dates = sorted(set(daily_top_buy_pairs.keys()) | set(daily_top_short_pairs.keys()))
+    cumulative_combined_captures = []  # Start with empty lists
+    active_pairs = []
+    cumulative_capture = 0
 
-        if top_short_pair and top_short_pair in short_results:
-            short_signal = df[f'SMA_{top_short_pair[0]}'].loc[date] < df[f'SMA_{top_short_pair[1]}'].loc[date]
-            short_capture = short_results[top_short_pair].loc[date] * 100 if short_signal else 0
-        else:
-            short_capture = 0
+    tqdm.write("\nCalculating cumulative combined capture...")
+    with tqdm(total=len(dates), unit='date', desc='Processing dates', 
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]', 
+              ncols=100, mininterval=0.5, smoothing=0.01, leave=True) as pbar:
+        for i in range(len(dates)):
+            current_date = dates[i]
 
-        combined_capture = buy_capture - short_capture
+            if i == 0:
+                # For the first date, there's no previous date
+                previous_date = current_date  # You can set previous_date to current_date
+                current_position = 'None'
+                daily_capture = 0
+            else:
+                previous_date = dates[i - 1]
 
-        if cumulative_combined_captures:
-            cumulative_combined_capture = cumulative_combined_captures[-1] + combined_capture
-        else:
-            cumulative_combined_capture = combined_capture
+                # Get the top pairs for the previous day (which determine today's position)
+                prev_buy_pair, prev_buy_capture = daily_top_buy_pairs.get(previous_date, ((0, 0), 0))
+                prev_short_pair, prev_short_capture = daily_top_short_pairs.get(previous_date, ((0, 0), 0))
 
-        cumulative_combined_captures.append(cumulative_combined_capture)
+                # Determine the current day's position based on previous day's signals
+                buy_signal = df[f'SMA_{prev_buy_pair[0]}'].loc[previous_date] > df[f'SMA_{prev_buy_pair[1]}'].loc[previous_date]
+                short_signal = df[f'SMA_{prev_short_pair[0]}'].loc[previous_date] < df[f'SMA_{prev_short_pair[1]}'].loc[previous_date]
 
-    return pd.Series(cumulative_combined_captures, index=df.index)
+                if buy_signal and short_signal:
+                    # Both signals are TRUE, choose based on which pair is leading
+                    if prev_buy_capture > prev_short_capture:
+                        current_position = f"Buy {prev_buy_pair[0]},{prev_buy_pair[1]}"
+                    else:
+                        current_position = f"Short {prev_short_pair[0]},{prev_short_pair[1]}"
+                elif buy_signal:
+                    current_position = f"Buy {prev_buy_pair[0]},{prev_buy_pair[1]}"
+                elif short_signal:
+                    current_position = f"Short {prev_short_pair[0]},{prev_short_pair[1]}"
+                else:
+                    current_position = "None"
+
+                daily_return = df['Close'].loc[current_date] / df['Close'].loc[previous_date] - 1
+
+                if current_position.startswith('Buy'):
+                    daily_capture = daily_return * 100
+                elif current_position.startswith('Short'):
+                    daily_capture = -daily_return * 100
+                else:
+                    daily_capture = 0
+
+            cumulative_capture += daily_capture
+            cumulative_combined_captures.append(cumulative_capture)
+            active_pairs.append(current_position)
+
+            # Update the progress bar for each iteration
+            pbar.update(1)
+
+        # Update postfix at the very end
+        pbar.set_postfix({'Cumulative Capture': f'{cumulative_capture:.2f}%'})
+
+    # After the loop, print a summary
+    tqdm.write(f"\nCumulative Capture Summary:")
+    tqdm.write(f"Start Date: {dates[0]}")
+    tqdm.write(f"End Date: {dates[-1]}")
+    tqdm.write(f"Total Trading Days: {len(dates)}")
+    tqdm.write(f"Final Cumulative Capture: {cumulative_capture:.2f}%")
+    tqdm.write(f"Final Active Pair: {active_pairs[-1]}")
+
+    # Ensure that the lengths match before creating the Series
+    if len(cumulative_combined_captures) != len(dates):
+        tqdm.write(f"Length mismatch: cumulative_combined_captures has {len(cumulative_combined_captures)} elements, dates has {len(dates)} elements")
+        # Adjust lists if necessary
+        min_length = min(len(cumulative_combined_captures), len(dates))
+        cumulative_combined_captures = cumulative_combined_captures[:min_length]
+        dates = dates[:min_length]
+        active_pairs = active_pairs[:min_length]
+
+    return pd.Series(cumulative_combined_captures, index=dates), active_pairs
+
+def get_or_calculate_combined_captures(results, df, daily_top_buy_pairs, daily_top_short_pairs, ticker):
+    if 'cumulative_combined_captures' in results and 'active_pairs' in results:
+        cumulative_combined_captures = results['cumulative_combined_captures']
+        active_pairs = results['active_pairs']
+        print("Using stored cumulative_combined_captures and active_pairs")
+    else:
+        # Ensure daily_top_buy_pairs and daily_top_short_pairs are in the correct format
+        formatted_daily_top_buy_pairs = {}
+        formatted_daily_top_short_pairs = {}
+
+        for date, (pair, capture) in daily_top_buy_pairs.items():
+            if isinstance(pair, tuple) and len(pair) == 2:
+                formatted_daily_top_buy_pairs[date] = (pair, capture)
+            elif isinstance(pair, int):
+                formatted_daily_top_buy_pairs[date] = ((pair, capture), 0)
+            else:
+                print(f"Unexpected buy pair format for date {date}: {pair}")
+
+        for date, (pair, capture) in daily_top_short_pairs.items():
+            if isinstance(pair, tuple) and len(pair) == 2:
+                formatted_daily_top_short_pairs[date] = (pair, capture)
+            elif isinstance(pair, int):
+                formatted_daily_top_short_pairs[date] = ((pair, capture), 0)
+            else:
+                print(f"Unexpected short pair format for date {date}: {pair}")
+
+        cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
+            df, formatted_daily_top_buy_pairs, formatted_daily_top_short_pairs
+        )
+        print("Calculated new cumulative_combined_captures and active_pairs")
+
+        # Update the results dictionary with the new data
+        results['cumulative_combined_captures'] = cumulative_combined_captures
+        results['active_pairs'] = active_pairs
+        save_precomputed_results(ticker, results)
+
+    print(f"Number of cumulative combined captures: {len(cumulative_combined_captures)}")
+    print(f"Number of active pairs: {len(active_pairs)}")
+
+    return cumulative_combined_captures, active_pairs
+
+def prepare_historical_top_pairs_data(df, daily_top_buy_pairs, daily_top_short_pairs, buy_results, short_results, cumulative_combined_captures):
+    dates = sorted(daily_top_buy_pairs.keys())
+    
+    top_pairs = set()
+    top_pairs_performance = {}
+
+    for date in dates:
+        buy_pair, _ = daily_top_buy_pairs[date]
+        short_pair, _ = daily_top_short_pairs[date]
+
+        top_pairs.add(('Buy', buy_pair))
+        top_pairs.add(('Short', short_pair))
+
+    # Initialize performance series for all top pairs
+    for pair_type, pair in top_pairs:
+        if pair_type == 'Buy':
+            if pair in buy_results:
+                top_pairs_performance[f'Buy {pair}'] = buy_results[pair]
+            elif (pair[1], pair[0]) in short_results:  # Check for inverse pair
+                top_pairs_performance[f'Buy {pair}'] = -short_results[(pair[1], pair[0])]
+        else:  # Short pair
+            if pair in short_results:
+                top_pairs_performance[f'Short {pair}'] = short_results[pair]
+            elif (pair[1], pair[0]) in buy_results:  # Check for inverse pair
+                top_pairs_performance[f'Short {pair}'] = -buy_results[(pair[1], pair[0])]
+
+    return cumulative_combined_captures, top_pairs_performance
+
+def load_and_prepare_data(ticker):
+    results = load_precomputed_results(ticker)
+    if not results:
+        print(f"No results found for ticker: {ticker}")
+        return None, None, None, None, None, None
+    
+    # Ensure 'preprocessed_data' exists
+    if 'preprocessed_data' not in results:
+        print("Error: 'preprocessed_data' key missing in results.")
+        return None, None, None, None, None, None
+    
+    df = results['preprocessed_data']
+    daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
+    daily_top_short_pairs = results.get('daily_top_short_pairs', {})
+    cumulative_combined_captures = results.get('cumulative_combined_captures', pd.Series())
+    active_pairs = results.get('active_pairs', [])
+    
+    print(f"Loaded preprocessed_data with {len(df)} trading days.")
+    
+    # Only calculate if not already present in results
+    if 'cumulative_combined_captures' not in results or 'active_pairs' not in results:
+        cumulative_combined_captures, active_pairs = get_or_calculate_combined_captures(
+            results=results,
+            df=df,
+            daily_top_buy_pairs=daily_top_buy_pairs,
+            daily_top_short_pairs=daily_top_short_pairs,
+            ticker=ticker
+        )
+    
+    return results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs
 
 @app.callback(
     Output('combined-capture-chart', 'figure'),
@@ -1141,114 +1261,283 @@ def update_combined_capture_chart(ticker):
     if not ticker:
         return go.Figure()
 
-    # Clear the cache when the ticker changes
-    get_data.cache_clear()
+    results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs = load_and_prepare_data(ticker)
+    if results is None or df is None or daily_top_buy_pairs is None or daily_top_short_pairs is None or cumulative_combined_captures is None or active_pairs is None:
+        return go.Figure(layout=go.Layout(title=f"No data available for {ticker}"))
 
-    results = load_precomputed_results(ticker)
-    
-    if results is None:
-        return go.Figure(layout=go.Layout(
-            title=f"No data available for {ticker}",
-            xaxis_title="Trading Day",
-            yaxis_title="Cumulative Combined Capture (%)",
-            template="plotly_dark"
-        ))
-    
-    df = results['preprocessed_data'][0]
-    daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
-    daily_top_short_pairs = results.get('daily_top_short_pairs', {})
-    buy_results = results.get('buy_results', {})
-    short_results = results.get('short_results', {})
-    
-    if not daily_top_buy_pairs or not daily_top_short_pairs:
-        return go.Figure(layout=go.Layout(
-            title=f"Incomplete data for {ticker}: Missing daily top pairs",
-            xaxis_title="Trading Day",
-            yaxis_title="Cumulative Combined Capture (%)",
-            template="plotly_dark"
-        ))
-    
-    try:
-        cumulative_combined_captures = calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs, buy_results, short_results)
-    except KeyError as e:
-        return go.Figure(layout=go.Layout(
-            title=f"Incomplete data for {ticker}: {str(e)}",
-            xaxis_title="Trading Day",
-            yaxis_title="Cumulative Combined Capture (%)",
-            template="plotly_dark"
-        ))
-    
-    def get_color(pair, position):
-        if pair is None:
-            return 'blue'  # Default color if pair is None
-        
-        gap = pair[1] - pair[0]
-        max_gap = 3  # Adjust this value based on your maximum expected gap
-        brightness = min(gap / max_gap, 1)
-        
-        if position == 'buy':
-            base_color = (0, 128, 0)  # Green
-        else:
-            base_color = (255, 0, 0)  # Red
-        
-        r, g, b = base_color
-        return f'rgba({r}, {g}, {b}, {brightness})'
+    if len(cumulative_combined_captures) == 1 and active_pairs == ['None']:
+        return go.Figure(layout=go.Layout(title=f"No capture data available for {ticker}"))
 
-    fig = go.Figure()
-    
-    if daily_top_buy_pairs and daily_top_short_pairs:
-        colors = [get_color(pair, 'buy') if capture >= 0 else get_color(pair, 'short')
-                for pair, capture in zip_longest(daily_top_buy_pairs.values(), cumulative_combined_captures, fillvalue=None)]
-    else:
-        colors = ['blue'] * len(cumulative_combined_captures)  # Default color if no daily top buy pairs are available
-
-    # Create a DataFrame with captures and colors
     data = pd.DataFrame({
         'date': cumulative_combined_captures.index,
         'capture': cumulative_combined_captures,
-        'color': colors + ['blue'] * (len(cumulative_combined_captures) - len(colors)),  # Fill with 'blue' if there are not enough colors
-        'buy_pair': [f"SMA {pair[0]} / SMA {pair[1]}" if pair else 'N/A' for pair, _ in zip_longest(daily_top_buy_pairs.values(), cumulative_combined_captures, fillvalue=None)],
-        'short_pair': [f"SMA {pair[0]} / SMA {pair[1]}" if pair else 'N/A' for pair, _ in zip_longest(daily_top_short_pairs.values(), cumulative_combined_captures, fillvalue=None)],
+        'top_buy_pair': [
+            f"SMA {daily_top_buy_pairs.get(date, ((0, 0), 0))[0][0]} / SMA {daily_top_buy_pairs.get(date, ((0, 0), 0))[0][1]} ({daily_top_buy_pairs.get(date, ((0, 0), 0))[1] * 100:.2f}%)"
+            for date in cumulative_combined_captures.index
+        ],
+        'top_short_pair': [
+            f"SMA {daily_top_short_pairs.get(date, ((0, 0), 0))[0][0]} / SMA {daily_top_short_pairs.get(date, ((0, 0), 0))[0][1]} ({daily_top_short_pairs.get(date, ((0, 0), 0))[1] * 100:.2f}%)"
+            for date in cumulative_combined_captures.index
+        ],
+        'active_pair_current': active_pairs,
+        'active_pair_next': active_pairs[1:] + ['']  # Placeholder for the last day
     })
 
-    # Split data into segments based on color
-    for idx, (color, segment) in enumerate(data.groupby('color')):
-        segment = segment.dropna(subset=['capture'])  # Remove rows with NaN captures
-        if not segment.empty:
-            # Choose the appropriate pair based on whether the capture is positive or negative
-            segment['pair'] = segment['capture'].where(segment['capture'] < 0, segment['short_pair'])
-            segment['pair'] = segment['pair'].mask(segment['capture'] < 0, segment['buy_pair'])
-            fig.add_trace(go.Scatter(
-                x=segment['date'],
-                y=segment['capture'],
-                mode='lines',
-                name=f'Trace {idx+1}',
-                hovertemplate='Date: %{x}<br>Cumulative Combined Capture: %{y:.2f}%<br>Trading Pair: %{text}<extra></extra>',
-                text=segment['pair'],
-                line=dict(color=color),
-                legendgroup=f'Trace {idx+1}',
-                showlegend=True,
-            ))
+    # Calculate the next day's active pair for the last day
+    last_date = data['date'].iloc[-1]
+    top_buy_pair = daily_top_buy_pairs.get(last_date, ((0, 0), 0))[0]
+    top_short_pair = daily_top_short_pairs.get(last_date, ((0, 0), 0))[0]
     
+    if top_buy_pair[0] != 0 and top_buy_pair[1] != 0:
+        sma_long = df[f'SMA_{top_buy_pair[0]}'].iloc[-1]
+        sma_short = df[f'SMA_{top_buy_pair[1]}'].iloc[-1]
+        if sma_long > sma_short:
+            data.loc[data.index[-1], 'active_pair_next'] = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
+        elif sma_long < sma_short:
+            data.loc[data.index[-1], 'active_pair_next'] = f"Short ({top_short_pair[0]},{top_short_pair[1]})"
+        else:
+            data.loc[data.index[-1], 'active_pair_next'] = "None"
+    else:
+        data.loc[data.index[-1], 'active_pair_next'] = "None"
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=data['date'],
+        y=data['capture'],
+        mode='lines',
+        name='Combined Capture',
+        hovertemplate=(
+            'Date: %{x}<br>'
+            'Cumulative Combined Capture: %{y:.2f}%<br>'
+            'Top Buy Pair: %{customdata[0]}<br>'
+            'Top Short Pair: %{customdata[1]}<br>'
+            'Active Pair for Current Day: %{customdata[2]}<br>'
+            'Active Pair for Next Day: %{customdata[3]}'
+            '<extra></extra>'
+        ),
+        customdata=data[['top_buy_pair', 'top_short_pair', 'active_pair_current', 'active_pair_next']],
+        line=dict(color='blue'),
+    ))
+
     fig.update_layout(
         title=f'{ticker} Cumulative Combined Capture',
         xaxis_title='Trading Day',
         yaxis_title='Cumulative Combined Capture (%)',
         hovermode='x',
         template='plotly_dark',
-        showlegend=True,
-        legend=dict(
-            x=1.02,
-            y=1,
-            orientation='v',
-            bgcolor='rgba(0,0,0,0)',
-        ),
-        legend_title_text='Traces',
     )
 
-    # Add the "Dynamic Combined Capture" entry to the legend
-    fig.add_trace(go.Scatter(x=[], y=[], mode='lines', name='Dynamic Combined Capture', line=dict(color='rgba(0,0,0,0)')))
+    return fig
 
+@app.callback(
+    Output('historical-top-pairs-chart', 'figure'),
+    [Input('ticker-input', 'value'),
+     Input('show-annotations-toggle', 'value')]
+)
+def update_historical_top_pairs_chart(ticker, show_annotations):
+    if not ticker:
+        return go.Figure()
+
+    print(f"Updating historical top pairs chart for {ticker}")
+
+    results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs = load_and_prepare_data(ticker)
+    if results is None or df is None or daily_top_buy_pairs is None or daily_top_short_pairs is None or cumulative_combined_captures is None or active_pairs is None:
+        return go.Figure(layout=go.Layout(title=f"No data available for {ticker}"))
+
+    print(f"Number of trading days: {len(df)}")
+    print(f"Number of daily top buy pairs: {len(daily_top_buy_pairs)}")
+    print(f"Number of daily top short pairs: {len(daily_top_short_pairs)}")
+
+    fig = go.Figure()
+
+    colors = []  # Start with an empty list
+    for pair in active_pairs:  # Include all pairs
+        if pair == 'None':
+            colors.append('blue')
+        elif pair.startswith('Buy'):
+            colors.append('green')
+        elif pair.startswith('Short'):
+            colors.append('red')
+        else:
+            colors.append('gray')  # For any unexpected cases
+
+    # Ensure colors and cumulative_combined_captures have the same length
+    if len(colors) < len(cumulative_combined_captures):
+        colors.append(colors[-1])
+
+    colors = colors[:len(cumulative_combined_captures)]
+
+    print(f"Number of colors: {len(colors)}")
+    print(f"Unique colors: {set(colors)}")
+
+    # Function to create color segments
+    def create_color_segments(colors, cumulative_captures):
+        segments = []
+        current_color = colors[0]
+        start_index = 0
+        
+        for i in range(1, len(colors)):
+            if colors[i] != current_color:
+                segments.append({
+                    'color': current_color,
+                    'x': cumulative_captures.index[start_index:i],
+                    'y': cumulative_captures.iloc[start_index:i]
+                })
+                current_color = colors[i]
+                start_index = i
+        
+        # Add the last segment
+        segments.append({
+            'color': current_color,
+            'x': cumulative_captures.index[start_index:],
+            'y': cumulative_captures.iloc[start_index:]
+        })
+        
+        return segments
+
+    # Create color segments
+    color_segments = create_color_segments(colors, cumulative_combined_captures)
+
+    print(f"Number of color segments: {len(color_segments)}")
+
+    # Create separate traces for each color segment
+    current_color = colors[0]
+    x_segment = [cumulative_combined_captures.index[0]]
+    y_segment = [cumulative_combined_captures.iloc[0]]
+
+    for i in range(1, len(cumulative_combined_captures)):
+        if i < len(colors) and colors[i] != current_color:
+            fig.add_trace(go.Scatter(
+                x=x_segment,
+                y=y_segment,
+                mode='lines',
+                line=dict(color=current_color, width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+            x_segment = [cumulative_combined_captures.index[i-1]]
+            y_segment = [cumulative_combined_captures.iloc[i-1]]
+            current_color = colors[i]
+        
+        x_segment.append(cumulative_combined_captures.index[i])
+        y_segment.append(cumulative_combined_captures.iloc[i])
+
+    # Add the last segment
+    fig.add_trace(go.Scatter(
+        x=x_segment,
+        y=y_segment,
+        mode='lines',
+        line=dict(color=current_color, width=2),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+
+    # Prepare hover information for the next day's active pair
+    next_day_pairs = active_pairs[1:] + ['']  # Shift pairs by one day, leave last day empty for now
+
+    # Calculate the next day's active pair for the last day
+    last_date = cumulative_combined_captures.index[-1]
+    top_buy_pair = daily_top_buy_pairs.get(last_date, ((0, 0), 0))[0]
+    top_short_pair = daily_top_short_pairs.get(last_date, ((0, 0), 0))[0]
+
+    if top_buy_pair[0] != 0 and top_buy_pair[1] != 0:
+        sma_long = df[f'SMA_{top_buy_pair[0]}'].iloc[-1]
+        sma_short = df[f'SMA_{top_buy_pair[1]}'].iloc[-1]
+        if sma_long > sma_short:
+            next_day_pairs[-1] = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
+        elif sma_long < sma_short:
+            next_day_pairs[-1] = f"Short ({top_short_pair[0]},{top_short_pair[1]})"
+        else:
+            next_day_pairs[-1] = "None"
+    else:
+        next_day_pairs[-1] = "None"
+
+    # Add a transparent trace for hover information
+    fig.add_trace(go.Scatter(
+        x=cumulative_combined_captures.index,
+        y=cumulative_combined_captures,
+        mode='lines',
+        line=dict(color='rgba(0,0,0,0)', width=0),
+        showlegend=False,
+        hovertext=[f"Current: {pair}<br>Capture: {cap:.2f}%<br>Next: {next_pair}" 
+                for pair, cap, next_pair in zip(active_pairs, cumulative_combined_captures, next_day_pairs)],
+        hoverinfo='text+x'
+    ))
+
+    # Add annotations for pair changes
+    annotations = []
+    last_pair = None
+    annotation_count = 0
+    for i, (date, color) in enumerate(zip(cumulative_combined_captures.index, colors)):
+        pair = 'Buy' if color == 'green' else 'Short' if color == 'red' else 'Cash'
+        
+        # For all days except the last one, annotate the day before the change
+        if i < len(colors) - 1:
+            if i == 0 or pair != last_pair:
+                annotation_x = cumulative_combined_captures.index[max(0, i-1)]  # Use the previous day's date
+                annotation_y = cumulative_combined_captures.iloc[max(0, i-1)]  # Use the previous day's value
+                annotations.append(dict(
+                    x=annotation_x,
+                    y=annotation_y,
+                    text=pair,
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=2,
+                    arrowcolor="white",
+                    font=dict(size=10, color="white"),
+                    align="center",
+                    ax=0,
+                    ay=-40
+                ))
+                annotation_count += 1
+        # For the last day, add an annotation based on the next day's predicted signal
+        else:
+            next_day_pair = next_day_pairs[-1]  # Use the last element from next_day_pairs we calculated earlier
+            if next_day_pair.startswith('Buy'):
+                next_pair = 'Buy'
+            elif next_day_pair.startswith('Short'):
+                next_pair = 'Short'
+            else:
+                next_pair = 'Cash'
+            
+            annotations.append(dict(
+                x=date,
+                y=cumulative_combined_captures.iloc[-1],
+                text=next_pair,
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1,
+                arrowwidth=2,
+                arrowcolor="white",
+                font=dict(size=10, color="white"),
+                align="center",
+                ax=0,
+                ay=-40
+            ))
+            annotation_count += 1
+        
+        last_pair = pair
+
+    # Only add annotations if the toggle is on
+    if show_annotations:
+        fig.update_layout(annotations=annotations)
+    else:
+        fig.update_layout(annotations=[])  # Clear annotations if toggle is off
+
+    print(f"Number of annotations created: {annotation_count}")
+    print(f"Annotations display is set to: {'On' if show_annotations else 'Off'}")
+
+    fig.update_layout(
+        title=f'{ticker} Historical Top Pairs Performance',
+        xaxis_title='Trading Day',
+        yaxis_title='Cumulative Capture (%)',
+        hovermode='x unified',
+        template='plotly_dark',
+        showlegend=False  # This will remove the legend entirely
+    )
+    print("Historical Chart Update COMPLETE")
     return fig
 
 @app.callback(
@@ -1287,38 +1576,14 @@ def update_dynamic_strategy_display(ticker):
     buy_results = results.get('buy_results', {})
     short_results = results.get('short_results', {})
 
-    buy_results_with_inverse = {**{pair: result.iloc[-1] for pair, result in buy_results.items()},
-                                **{(pair[1], pair[0]): -result.iloc[-1] for pair, result in short_results.items()}}
-    short_results_with_inverse = {**{pair: result.iloc[-1] for pair, result in short_results.items()},
-                                  **{(pair[1], pair[0]): -result.iloc[-1] for pair, result in buy_results.items()}}
+    # Ensure that 'preprocessed_data' exists and is correctly formatted
+    df = results.get('preprocessed_data')
+    if df is None or df.empty:
+        print(f"Warning: 'preprocessed_data' is missing or empty for {ticker}")
+        return None
 
-    print()
-    try:
-        print(f"Loaded top_buy_pair: {top_buy_pair} with result {buy_results_with_inverse[top_buy_pair]}")
-    except KeyError:
-        print(f"Loaded top_buy_pair: {top_buy_pair} - Result not found")
-
-    try:
-        print(f"Loaded top_short_pair: {top_short_pair} with result {short_results_with_inverse[top_short_pair]}")
-    except KeyError:
-        print(f"Loaded top_short_pair: {top_short_pair} - Result not found")
-    print()
-
-    if top_buy_pair is None or top_short_pair is None:
-        return ["Top pairs not found. Please check data integrity."] * 10
-
-    # Check if 'preprocessed_data' is in results
-    if 'preprocessed_data' not in results:
-        print(f"'preprocessed_data' not found in results for {ticker}")
-        return ["Data not available or processing not yet complete. Please wait..."] * 10
-
-    # Use the cached data from the results
-    df = results['preprocessed_data'][0]
-
-    if f'SMA_{top_buy_pair[0]}' not in df.columns or f'SMA_{top_buy_pair[1]}' not in df.columns or \
-    f'SMA_{top_short_pair[0]}' not in df.columns or f'SMA_{top_short_pair[1]}' not in df.columns:
-        print(f"Required SMA columns not found in the DataFrame for {ticker}")
-        return ["Data not available or processing not yet complete. Please wait..."] * 10
+    if top_buy_pair is None or top_short_pair is None or df is None:
+        return ["Data integrity issue. Please check the precomputed results."] * 10
 
     try:
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
@@ -1335,65 +1600,90 @@ def update_dynamic_strategy_display(ticker):
         print(f"Required SMA columns not found in the DataFrame for {ticker}")
         return ["Data not available or processing not yet complete. Please wait..."] * 10
 
-    # Determine current trading direction based on active signals
-    if buy_returns_leader.size > 0 and short_returns_leader.size > 0:
-        if buy_returns_leader.sum() > short_returns_leader.sum():
-            trading_direction = "Current Trading Direction: Buy (Both triggers active, Buy leading)"
-            active_leader_returns = buy_returns_leader
-        else:
-            trading_direction = "Current Trading Direction: Short (Both triggers active, Short leading)"
-            active_leader_returns = short_returns_leader
-    elif buy_returns_leader.size > 0:
-        trading_direction = "Current Trading Direction: Buy"
+    buy_signal = sma1_buy_leader.iloc[-1] > sma2_buy_leader.iloc[-1]
+    short_signal = sma1_short_leader.iloc[-1] < sma2_short_leader.iloc[-1]
+
+    if buy_signal and not short_signal:
+        trading_signal = "Current Trading Signal: Buy"
         active_leader_returns = buy_returns_leader
-    elif short_returns_leader.size > 0:
-        trading_direction = "Current Trading Direction: Short"
+    elif short_signal and not buy_signal:
+        trading_signal = "Current Trading Signal: Short"
         active_leader_returns = short_returns_leader
     else:
-        trading_direction = "Current Trading Direction: Cash (No active triggers)"
+        trading_signal = "Current Trading Signal: Cash (No active triggers)"
         active_leader_returns = pd.Series([0])
 
     most_productive_buy_pair_text = f"Most Productive Buy Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}"
     most_productive_short_pair_text = f"Most Productive Short Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}"
-    avg_capture_buy_leader = f"Avg. Capture % for Buy Leader: {buy_returns_leader.mean() * 100:.9f}%" if buy_returns_leader.size > 0 else "Avg. Capture % for Buy Leader: N/A"
-    total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_returns_leader.cumsum().iloc[-1] * 100:.9f}%" if buy_returns_leader.size > 0 and not buy_returns_leader.cumsum().empty else "Total Capture for Buy Leader: N/A"
-    avg_capture_short_leader = f"Avg. Capture % for Short Leader: {short_returns_leader.mean() * 100:.9f}%" if short_returns_leader.size > 0 else "Avg. Capture % for Short Leader: N/A"
-    total_capture_short_leader = f"Total Capture for Short Leader: {short_returns_leader.cumsum().iloc[-1] * 100:.9f}%" if short_returns_leader.size > 0 and not short_returns_leader.cumsum().empty else "Total Capture for Short Leader: N/A"
-    performance_expectation = f"Performance Expectation: {active_leader_returns.mean() * 100:.9f}%" if active_leader_returns.size > 0 else "Performance Expectation: N/A"
-    confidence_percentage = f"Confidence Percentage: {(active_leader_returns > 0).mean() * 100:.9f}%" if active_leader_returns.size > 0 else "Confidence Percentage: N/A"
 
-    # Generate trading recommendations based on the current leading SMA pairs
-    daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
-    daily_top_short_pairs = results.get('daily_top_short_pairs', {})
+    buy_trigger_days = (buy_returns_leader != 0).sum()
+    short_trigger_days = (short_returns_leader != 0).sum()
 
-    latest_date = df.index[-1]
-    top_buy_pair = daily_top_buy_pairs.get(latest_date)
-    top_short_pair = daily_top_short_pairs.get(latest_date)
+    avg_capture_buy = buy_returns_leader[buy_returns_leader != 0].mean() if buy_trigger_days > 0 else 0
+    avg_capture_short = short_returns_leader[short_returns_leader != 0].mean() if short_trigger_days > 0 else 0
 
-    # Generate trading recommendations based on the current leading SMA pairs
-    buy_sma_slow = df[f'SMA_{top_buy_pair[0]}'].iloc[-1] if top_buy_pair and f'SMA_{top_buy_pair[0]}' in df.columns else None
-    short_sma_slow = df[f'SMA_{top_short_pair[0]}'].iloc[-1] if top_short_pair and f'SMA_{top_short_pair[0]}' in df.columns else None
-    
-    # Modify the trading recommendations based on ranges of possible closing outcomes
-    buy_threshold_range = [buy_sma_slow * 0.995, buy_sma_slow * 1.005] if buy_sma_slow else [None, None]
-    short_threshold_range = [short_sma_slow * 0.995, short_sma_slow * 1.005] if short_sma_slow else [None, None]
-    
-    buy_recommendation = f"Buy if {ticker} closes above {buy_threshold_range[0]:.2f} and below {buy_threshold_range[1]:.2f}" if trading_direction.startswith("Current Trading Direction: Buy") and buy_sma_slow else "Buy: N/A"
-    short_recommendation = f"Short if {ticker} closes below {short_threshold_range[1]:.2f} and above {short_threshold_range[0]:.2f}" if trading_direction.startswith("Current Trading Direction: Short") and short_sma_slow else "Short: N/A"
-    all_cash_recommendation = "Go All Cash" if trading_direction == "Current Trading Direction: Cash (No active triggers)" else "All Cash: N/A"
+    avg_capture_buy_leader = f"Avg. Daily Capture % for Buy Leader: {avg_capture_buy * 100:.4f}% (Trigger Days: {buy_trigger_days})"
+    avg_capture_short_leader = f"Avg. Daily Capture % for Short Leader: {avg_capture_short * 100:.4f}% (Trigger Days: {short_trigger_days})"
+
+    buy_capture = buy_results.get(top_buy_pair, pd.Series()).iloc[-1] if top_buy_pair in buy_results else \
+                  -short_results.get((top_buy_pair[1], top_buy_pair[0]), pd.Series()).iloc[-1] if (top_buy_pair[1], top_buy_pair[0]) in short_results else 0
+    total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_capture * 100:.4f}%"
+
+    short_capture = short_results.get(top_short_pair, pd.Series()).iloc[-1] if top_short_pair in short_results else \
+                    -buy_results.get((top_short_pair[1], top_short_pair[0]), pd.Series()).iloc[-1] if (top_short_pair[1], top_short_pair[0]) in buy_results else 0
+    total_capture_short_leader = f"Total Capture for Short Leader: {short_capture * 100:.4f}%"
+
+    # Retrieve precomputed cumulative combined capture data
+    cumulative_combined_captures = results.get('cumulative_combined_captures', pd.Series())
+    print(f"cumulative_combined_captures for {ticker}: {cumulative_combined_captures}")
+
+    if not cumulative_combined_captures.empty:
+        combined_total_capture = cumulative_combined_captures.iloc[-1]
+        combined_returns = cumulative_combined_captures.pct_change().fillna(0)
+        
+        combined_trigger_days = (combined_returns != 0).sum()
+        combined_wins = (combined_returns > 0).sum()
+        combined_losses = (combined_returns < 0).sum()
+        combined_win_ratio = combined_wins / combined_trigger_days if combined_trigger_days > 0 else 0
+        combined_avg_capture = combined_returns[combined_returns != 0].mean() if combined_trigger_days > 0 else 0
+
+        combined_strategy_text = f"""
+        Combined Strategy Performance:
+        Total Capture: {combined_total_capture:.4f}%
+        Avg. Daily Capture: {combined_avg_capture * 100:.4f}%
+        Win Ratio: {combined_win_ratio * 100:.2f}%
+        Trigger Days: {combined_trigger_days}
+        Wins: {combined_wins}, Losses: {combined_losses}
+        """
+    else:
+        combined_strategy_text = "No combined strategy data available."
+
+    active_trigger_days = (active_leader_returns != 0).sum()
+    if active_trigger_days > 0:
+        performance_expectation = active_leader_returns[active_leader_returns != 0].mean()
+        confidence_percentage = (active_leader_returns > 0).sum() / active_trigger_days
+        performance_expectation_text = f"Performance Expectation: {performance_expectation * 100:.4f}% (Trigger Days: {active_trigger_days})"
+        confidence_percentage_text = f"Win Ratio: {confidence_percentage * 100:.2f}% (Wins: {(active_leader_returns > 0).sum()}, Losses: {(active_leader_returns < 0).sum()})"
+    else:
+        performance_expectation_text = "Performance Expectation: N/A (No active triggers)"
+        confidence_percentage_text = "Win Ratio: N/A (No active triggers)"
+
+    sma_buy_slow = df[f'SMA_{top_buy_pair[0]}'].iloc[-1]
+    sma_short_slow = df[f'SMA_{top_short_pair[0]}'].iloc[-1]
+
+    buy_threshold = sma_buy_slow * 1.005
+    short_threshold = sma_short_slow * 0.995
 
     trading_recommendations = [
-        html.H6('Trading Recommendations for Next Day'),
+        html.H6('Trading Recommendations for Next Day', style={'margin-top': '20px', 'margin-bottom': '10px'}),
         html.Div([
-            html.P(f"Leading Buy SMA Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}") if top_buy_pair else html.P("No leading buy SMA pair"),
-            html.P(buy_recommendation)
-        ]),
-        html.Div([
-            html.P(f"Leading Short SMA Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}") if top_short_pair else html.P("No leading short SMA pair"),
-            html.P(short_recommendation)
-        ]),
-        html.Div([
-            html.P(all_cash_recommendation)
+            html.P(f"Leading Buy SMA Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}"),
+            html.P(f"Buy Signal Active: {'Yes' if buy_signal else 'No'}"),
+            html.P(f"Buy if Close is below: {buy_threshold:.2f}") if buy_signal else html.P("No Buy Signal"),
+            html.P(f"Leading Short SMA Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}"),
+            html.P(f"Short Signal Active: {'Yes' if short_signal else 'No'}"),
+            html.P(f"Short if Close is above: {short_threshold:.2f}") if short_signal else html.P("No Short Signal"),
+            html.P("Recommendation: Cash Position") if not buy_signal and not short_signal else None
         ])
     ]
 
@@ -1404,10 +1694,13 @@ def update_dynamic_strategy_display(ticker):
         total_capture_buy_leader,
         avg_capture_short_leader,
         total_capture_short_leader,
-        trading_direction,
-        performance_expectation,
-        confidence_percentage,
-        html.Div(trading_recommendations)
+        trading_signal,
+        performance_expectation_text,
+        confidence_percentage_text,
+        html.Div([
+            html.P(combined_strategy_text),
+            html.Div(trading_recommendations)
+        ])
     )
 
 @app.callback(
@@ -1485,19 +1778,36 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     trigger_days_buy = f"Buy Trigger Days: {buy_signals.sum()}"
     trigger_days_short = f"Short Trigger Days: {short_signals.sum()}"
 
-    # Calculate win ratios for Buy and Short
-    buy_win_ratio = (buy_returns > 0).mean()
-    short_win_ratio = (short_returns > 0).mean()
-    win_ratio_buy = f"Buy Win Ratio: {buy_win_ratio * 100:.9f}%" if pd.notnull(buy_win_ratio) else "Buy Win Ratio: N/A"
-    win_ratio_short = f"Short Win Ratio: {short_win_ratio * 100:.9f}%" if pd.notnull(short_win_ratio) else "Short Win Ratio: N/A"
+    # Calculate detailed statistics for Buy
+    buy_trigger_days = (buy_returns != 0).sum()
+    buy_wins = (buy_returns > 0).sum()
+    buy_losses = (buy_returns < 0).sum()
+    buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
+
+    # Calculate detailed statistics for Short
+    short_trigger_days = (short_returns != 0).sum()
+    short_wins = (short_returns > 0).sum()
+    short_losses = (short_returns < 0).sum()
+    short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
+
+    # Prepare detailed strings for display
+    win_ratio_buy = (f"Buy Win Ratio: {buy_win_ratio * 100:.2f}% "
+                     f"(Wins: {buy_wins}, Losses: {buy_losses}, "
+                     f"Trigger Days: {buy_trigger_days})")
+    
+    win_ratio_short = (f"Short Win Ratio: {short_win_ratio * 100:.2f}% "
+                       f"(Wins: {short_wins}, Losses: {short_losses}, "
+                       f"Trigger Days: {short_trigger_days})")
 
     # Calculate average daily capture and total capture for Buy and Short
-    buy_avg_daily_capture = buy_returns.mean()
-    short_avg_daily_capture = short_returns.mean()
-    avg_daily_capture_buy = f"Buy Avg. Daily Capture: {buy_avg_daily_capture * 100:.9f}%" if pd.notnull(buy_avg_daily_capture) else "Buy Avg. Daily Capture: N/A"
-    avg_daily_capture_short = f"Short Avg. Daily Capture: {short_avg_daily_capture * 100:.9f}%" if pd.notnull(short_avg_daily_capture) else "Short Avg. Daily Capture: N/A"
-    total_capture_buy = f"Buy Total Capture: {total_buy_capture.iloc[-1] * 100:.9f}%" if len(total_buy_capture) > 0 and pd.notnull(total_buy_capture.iloc[-1]) else "Buy Total Capture: N/A"
-    total_capture_short = f"Short Total Capture: {total_short_capture.iloc[-1] * 100:.9f}%" if len(total_short_capture) > 0 and pd.notnull(total_short_capture.iloc[-1]) else "Short Total Capture: N/A"
+    buy_avg_daily_capture = buy_returns[buy_returns != 0].mean() if buy_trigger_days > 0 else 0
+    short_avg_daily_capture = short_returns[short_returns != 0].mean() if short_trigger_days > 0 else 0
+    
+    avg_daily_capture_buy = f"Buy Avg. Daily Capture: {buy_avg_daily_capture * 100:.4f}%"
+    avg_daily_capture_short = f"Short Avg. Daily Capture: {short_avg_daily_capture * 100:.4f}%"
+    
+    total_capture_buy = f"Buy Total Capture: {total_buy_capture.iloc[-1] * 100:.4f}%" if len(total_buy_capture) > 0 else "Buy Total Capture: N/A"
+    total_capture_short = f"Short Total Capture: {total_short_capture.iloc[-1] * 100:.4f}%" if len(total_short_capture) > 0 else "Short Total Capture: N/A"
 
     return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short
 
