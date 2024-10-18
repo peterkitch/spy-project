@@ -9,6 +9,7 @@ build/
 *.pkl
 *.pkl.gz
 *.json
+*.npz
 
 # Ignore log files
 *.log
