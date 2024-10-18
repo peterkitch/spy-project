@@ -1,2 +1,22 @@
+# Ignore distribution directories
 dist/
 build/
+
+# Ignore cache files
+.cache/
+
+# Ignore pickle, JSON, and compressed files
+*.pkl
+*.pkl.gz
+*.json
+*.npz
+
+# Ignore log files
+*.log
+
+# Ignore batch files
+*.bat
+
+# Ignore results and status directories if applicable
+results/
+status/
