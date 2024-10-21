@@ -23,7 +23,6 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 import traceback
 import random
 import glob
-from dash import no_update
 from collections import defaultdict
 
 # Initialize the Dash app with a dark theme and custom styles
@@ -77,8 +76,7 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 tqdm.pandas()
-MAX_SMA_DAY = 200
-
+MAX_SMA_DAY = 113
 _precomputed_results_cache = {}
 _loading_in_progress = {}
 _loading_lock = threading.Lock()
@@ -732,21 +730,6 @@ def print_timing_summary(ticker):
         logger.info("=" * 80)
         logger.info("Load complete. Data is now available in the Dash app.")
 
-@app.callback(
-    Output("loading-spinner-output", "children"),
-    [Input('combined-capture-chart', 'figure'),
-     Input('historical-top-pairs-chart', 'figure'),
-     Input('chart', 'figure')],
-    [State('ticker-input', 'value')]
-)
-def update_output(combined_capture, historical_top_pairs, chart, ticker):
-    if all([combined_capture, historical_top_pairs, chart]):
-        print_timing_summary(ticker)
-    return "Charts loaded successfully"
-
-# Initialize the Dash app with a dark theme and custom styles
-app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
-
 # Function to read the processing status from a file
 def read_status(ticker):
     status_path = f"{ticker}_status.json"
@@ -850,6 +833,11 @@ app.layout = html.Div(
                     id='show-annotations-toggle',
                     label='Show Signal Annotations',
                     value=False  # Default to hiding annotations
+                ),
+                dbc.Switch(
+                    id='display-top-pairs-toggle',
+                    label='Display All Top Pair Traces',
+                    value=False  # Default to hiding top pair traces
                 )
             ], width=12)
         ]),
@@ -1443,9 +1431,11 @@ def update_combined_capture_chart(ticker, n_intervals):
     Output('historical-top-pairs-chart', 'figure'),
     [Input('ticker-input', 'value'),
      Input('show-annotations-toggle', 'value'),
+     Input('display-top-pairs-toggle', 'value'),
      Input('update-interval', 'n_intervals')]
 )
-def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
+def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pairs, n_intervals):
+
     if not ticker:
         return no_update  # Do not update the chart
 
@@ -1473,6 +1463,127 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
 
         fig = go.Figure()
 
+        if display_top_pairs:
+            # Collect all unique buy and short pairs
+            top_buy_pairs_set = set([daily_top_buy_pairs[date][0] for date in daily_top_buy_pairs])
+            top_short_pairs_set = set([daily_top_short_pairs[date][0] for date in daily_top_short_pairs])
+
+            # Compute total capture for each buy pair
+            buy_pair_performance = {}
+            for pair in top_buy_pairs_set:
+                try:
+                    sma1 = df[f'SMA_{pair[0]}']
+                    sma2 = df[f'SMA_{pair[1]}']
+                    signals = sma1 > sma2
+                    signals_shifted = signals.shift(1, fill_value=False)
+                    returns = df['Close'].pct_change()
+                    pair_returns = returns.where(signals_shifted, 0)
+                    cumulative_capture = pair_returns.cumsum() * 100
+                    total_capture = cumulative_capture.iloc[-1]
+                    buy_pair_performance[pair] = total_capture
+                except Exception as e:
+                    logger.error(f"Error processing Buy pair {pair}: {str(e)}")
+
+            # Compute total capture for each short pair
+            short_pair_performance = {}
+            for pair in top_short_pairs_set:
+                try:
+                    sma1 = df[f'SMA_{pair[0]}']
+                    sma2 = df[f'SMA_{pair[1]}']
+                    signals = sma1 < sma2
+                    signals_shifted = signals.shift(1, fill_value=False)
+                    returns = -df['Close'].pct_change()
+                    pair_returns = returns.where(signals_shifted, 0)
+                    cumulative_capture = pair_returns.cumsum() * 100
+                    total_capture = cumulative_capture.iloc[-1]
+                    short_pair_performance[pair] = total_capture
+                except Exception as e:
+                    logger.error(f"Error processing Short pair {pair}: {str(e)}")
+
+            # For buy pairs, calculate median performance
+            buy_performances = list(buy_pair_performance.values())
+            if buy_performances:
+                median_buy_performance = np.median(buy_performances)
+                max_buy_deviation = max(abs(perf - median_buy_performance) for perf in buy_performances)
+            else:
+                median_buy_performance = 0
+                max_buy_deviation = 1  # Avoid division by zero
+
+            # For short pairs, calculate median performance
+            short_performances = list(short_pair_performance.values())
+            if short_performances:
+                median_short_performance = np.median(short_performances)
+                max_short_deviation = max(abs(perf - median_short_performance) for perf in short_performances)
+            else:
+                median_short_performance = 0
+                max_short_deviation = 1  # Avoid division by zero
+
+            # For each buy pair, add trace with color intensity based on deviation from median
+            for pair, total_capture in buy_pair_performance.items():
+                try:
+                    # Calculate deviation from median
+                    deviation = abs(total_capture - median_buy_performance)
+                    # Normalize deviation to get intensity
+                    intensity = deviation / max_buy_deviation if max_buy_deviation != 0 else 1
+                    # Map intensity to color (dimmer for middle performers)
+                    green_value = int(50 + intensity * 205)  # From 50 to 255
+                    color = f'rgb(0,{green_value},0)'
+
+                    sma1 = df[f'SMA_{pair[0]}']
+                    sma2 = df[f'SMA_{pair[1]}']
+                    signals = sma1 > sma2
+                    signals_shifted = signals.shift(1, fill_value=False)
+                    returns = df['Close'].pct_change()
+                    pair_returns = returns.where(signals_shifted, 0)
+                    cumulative_capture = pair_returns.cumsum() * 100
+
+                    fig.add_trace(go.Scatter(
+                        x=df.index,
+                        y=cumulative_capture,
+                        mode='lines',
+                        name=f'Buy {pair}',
+                        line=dict(width=1.5, color=color),
+                        opacity=0.8,
+                        hoverinfo='skip'
+                    ))
+                except Exception as e:
+                    logger.error(f"Error processing Buy pair {pair}: {str(e)}")
+
+            # For each short pair, add trace with color intensity based on deviation from median
+            for pair, total_capture in short_pair_performance.items():
+                try:
+                    # Calculate deviation from median
+                    deviation = abs(total_capture - median_short_performance)
+                    # Normalize deviation to get intensity
+                    intensity = deviation / max_short_deviation if max_short_deviation != 0 else 1
+                    # Map intensity to color (dimmer for middle performers)
+                    red_value = int(50 + intensity * 205)  # From 50 to 255
+                    color = f'rgb({red_value},0,0)'
+
+                    sma1 = df[f'SMA_{pair[0]}']
+                    sma2 = df[f'SMA_{pair[1]}']
+                    signals = sma1 < sma2
+                    signals_shifted = signals.shift(1, fill_value=False)
+                    returns = -df['Close'].pct_change()
+                    pair_returns = returns.where(signals_shifted, 0)
+                    cumulative_capture = pair_returns.cumsum() * 100
+
+                    fig.add_trace(go.Scatter(
+                        x=df.index,
+                        y=cumulative_capture,
+                        mode='lines',
+                        name=f'Short {pair}',
+                        line=dict(width=1.5, color=color),
+                        opacity=0.8,
+                        hoverinfo='skip'
+                    ))
+                except Exception as e:
+                    logger.error(f"Error processing Short pair {pair}: {str(e)}")
+
+        # The rest of your existing code remains the same
+        # Add the combined capture trace and annotations as before
+
+        # Colors for the combined capture trace based on active pairs
         colors = []
         for i in range(len(active_pairs)):
             if i == len(active_pairs) - 1:
@@ -1481,7 +1592,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
             else:
                 # For all other days, use the next day's signal
                 next_pair = active_pairs[i + 1]
-            
+
             if next_pair == 'None':
                 colors.append('blue')
             elif next_pair.startswith('Buy'):
@@ -1495,11 +1606,6 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
         if len(colors) < len(cumulative_combined_captures):
             colors.extend([colors[-1]] * (len(cumulative_combined_captures) - len(colors)))
         colors = colors[:len(cumulative_combined_captures)]
-
-        log_separator()
-        logger.info(f"Number of colors: {len(colors)}")
-        logger.info(f"Unique colors: {set(colors)}")
-        log_separator()
 
         def create_color_segments(colors, cumulative_captures):
             segments = []
@@ -1527,8 +1633,6 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
             return segments
 
         color_segments = create_color_segments(colors, cumulative_combined_captures)
-
-        logger.info(f"Number of color segments: {len(color_segments)}")
 
         # Add traces for each color segment
         for segment in color_segments:
@@ -1580,7 +1684,6 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
         # Add annotations for pair changes
         annotations = []
         last_pair = None
-        annotation_count = 0
         for i, (date, color) in enumerate(zip(cumulative_combined_captures.index, colors)):
             pair = 'Buy' if color == 'green' else 'Short' if color == 'red' else 'Cash'
 
@@ -1599,8 +1702,6 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
                     ax=0,
                     ay=-40
                 ))
-                annotation_count += 1
-
             last_pair = pair
 
         # Only add annotations if the toggle is on
@@ -1608,9 +1709,6 @@ def update_historical_top_pairs_chart(ticker, show_annotations, n_intervals):
             fig.update_layout(annotations=annotations)
         else:
             fig.update_layout(annotations=[])
-
-        logger.info(f"Number of annotations created: {annotation_count}")
-        logger.info(f"Annotations display is set to: {'On' if show_annotations else 'Off'}")
 
         fig.update_layout(
             title=dict(
