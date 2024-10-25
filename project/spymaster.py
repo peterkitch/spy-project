@@ -90,6 +90,12 @@ memory = Memory(cache_dir, verbose=0)
 
 def fetch_data(ticker, is_secondary=False):
     try:
+        # Check for empty or whitespace-only ticker
+        if not ticker or not ticker.strip():
+            if not is_secondary:
+                logging.info("No primary ticker provided")
+            return pd.DataFrame()
+            
         df = yf.download(ticker, period='max', interval='1d', progress=False)
         df.index = pd.to_datetime(df.index)
         
@@ -97,7 +103,7 @@ def fetch_data(ticker, is_secondary=False):
             logging.info(f"Successfully fetched data for primary ticker {ticker}")
             # Add a row for the current date if it's not included
             today = pd.Timestamp.now().normalize()
-            if df.index[-1] < today:
+            if len(df) > 0 and df.index[-1] < today:  # Check if df has data before accessing index
                 last_row = df.iloc[-1].copy()
                 last_row.name = today
                 df = pd.concat([df, last_row.to_frame().T])
@@ -106,7 +112,7 @@ def fetch_data(ticker, is_secondary=False):
         
         return df
     except Exception as e:
-        logging.error(f"Failed to fetch data for {ticker}: {type(e).__name__} - {str(e)}")
+        logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
         return pd.DataFrame()
 
 def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
@@ -777,13 +783,6 @@ app.layout = html.Div(
                         dbc.Input(id='ticker-input', placeholder='Enter a valid ticker symbol (e.g., AAPL)', type='text', debounce=True),
                         dbc.FormFeedback(id='ticker-input-feedback', className='text-danger')
                     ])
-                ], className='mb-3'),
-                dbc.Card([
-                    dbc.CardHeader('Select Secondary Ticker Symbol(s) (Signal Follower(s))'),
-                    dbc.CardBody([
-                        dbc.Input(id='secondary-ticker-input', placeholder='Enter secondary ticker symbol(s) (e.g., MSFT, AMZN, ^GSPC)', type='text', debounce=True),
-                        dbc.FormFeedback(id='secondary-ticker-input-feedback', className='text-danger')
-                    ])
                 ], className='mb-3')
             ], width=12)
         ]),
@@ -798,7 +797,7 @@ app.layout = html.Div(
                             id='combined-capture-chart',
                             figure=go.Figure(
                                 layout=go.Layout(
-                                    title=dict(text="Combined Capture Chart", font=dict(color='#80ff00')),
+                                    title=dict(text="Cumulative Combined Capture Chart", font=dict(color='#80ff00')),
                                     plot_bgcolor='black',
                                     paper_bgcolor='black',
                                     font=dict(color='#80ff00'),
@@ -822,7 +821,7 @@ app.layout = html.Div(
                             id='historical-top-pairs-chart',
                             figure=go.Figure(
                                 layout=go.Layout(
-                                    title=dict(text="Historical Top Pairs Chart", font=dict(color='#80ff00')),
+                                    title=dict(text="Color-Coded Cumulative Combined Capture Chart", font=dict(color='#80ff00')),
                                     plot_bgcolor='black',
                                     paper_bgcolor='black',
                                     font=dict(color='#80ff00'),
@@ -891,8 +890,8 @@ app.layout = html.Div(
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        html.H5('Calculation Components', className='mb-0'),
-                        html.Button('Minimize', id='toggle-calc-button', className='btn btn-sm btn-secondary ml-auto')
+                        html.H5('Manual Calculation Components', className='mb-0'),
+                        html.Button(children='Maximize', id='toggle-calc-button', className='btn btn-sm btn-secondary ml-auto')
                     ]),
                     dbc.Collapse(
                         dbc.CardBody([
@@ -918,7 +917,7 @@ app.layout = html.Div(
                 dbc.Card([
                     dbc.CardHeader([
                         html.H5('Dynamic Master Trading Strategy', className='mb-0'),
-                        html.Button('Minimize', id='toggle-strategy-button', className='btn btn-sm btn-secondary ml-auto')
+                        html.Button(children='Maximize', id='toggle-strategy-button', className='btn btn-sm btn-secondary ml-auto')
                     ]),
                     dbc.Collapse(
                         dbc.CardBody([
@@ -935,7 +934,7 @@ app.layout = html.Div(
                             html.Div(id='processing-status')  # For showing processing status
                         ]),
                         id='strategy-collapse',
-                        is_open=True
+                        is_open=False
                     )
                 ])
             ], width=12)
@@ -947,9 +946,16 @@ app.layout = html.Div(
         #     type="default",
         #     children=[html.Div(id="loading-spinner-output")]
         # ),
-        # Insert the new code for the secondary ticker chart and metrics
+        # Secondary Ticker Input and Chart Section
         dbc.Row([
             dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader('Select Secondary Ticker Symbol(s)'),
+                    dbc.CardBody([
+                        dbc.Input(id='secondary-ticker-input', placeholder='Enter comma-separated tickers (e.g., MSFT, AMZN, ^GSPC)', type='text', debounce=True),
+                        dbc.FormFeedback(id='secondary-ticker-input-feedback', className='text-danger')
+                    ])
+                ], className='mb-3'),
                 dbc.Switch(
                     id='invert-signals-toggle',
                     label='Invert Signals',
@@ -988,19 +994,30 @@ app.layout = html.Div(
                                     columns=[],  # Will be updated in callback
                                     data=[],     # Will be updated in callback
                                     sort_action='native',
-                                    style_table={'overflowX': 'auto'},
+                                    style_table={
+                                        'overflowX': 'auto',
+                                        'backgroundColor': 'black',
+                                    },
                                     style_cell={
                                         'backgroundColor': 'black',
                                         'color': '#80ff00',
                                         'textAlign': 'left',
-                                        'minWidth': '50px', 'width': '100px', 'maxWidth': '180px',
+                                        'minWidth': '50px', 
+                                        'width': '100px', 
+                                        'maxWidth': '180px',
                                         'whiteSpace': 'normal',
+                                        'border': '1px solid #80ff00'
                                     },
                                     style_header={
                                         'backgroundColor': 'black',
                                         'color': '#80ff00',
-                                        'fontWeight': 'bold'
+                                        'fontWeight': 'bold',
+                                        'border': '2px solid #80ff00'
                                     },
+                                    style_data_conditional=[{
+                                        'if': {'row_index': 'odd'},
+                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                    }],
                                 )
                             ])
                         ], className='mt-3')
@@ -1026,7 +1043,7 @@ app.layout = html.Div(
 )
 def update_max_sma_day_display(ticker):
     if not ticker:
-        return 'Please enter a ticker symbol.'
+        return 'Please enter a ticker symbol to get started.'
 
     results = load_precomputed_results(ticker)
     if results is None:
@@ -1097,25 +1114,27 @@ def update_processing_status(n_intervals, ticker):
             return f"Data loaded for {ticker}."
 
 @app.callback(
-    Output('calc-collapse', 'is_open'),
+    [Output('calc-collapse', 'is_open'),
+     Output('toggle-calc-button', 'children')],
     [Input('toggle-calc-button', 'n_clicks')],
     [State('calc-collapse', 'is_open')],
 )
 def toggle_calc_collapse(n_clicks, is_open):
     if n_clicks:
-        return not is_open
-    return is_open
+        return not is_open, 'Minimize' if not is_open else 'Maximize'
+    return is_open, 'Maximize' if not is_open else 'Minimize'
 
 # Callback to toggle the visibility of the Dynamic Master Trading Strategy section
 @app.callback(
-    Output('strategy-collapse', 'is_open'),
+    [Output('strategy-collapse', 'is_open'),
+     Output('toggle-strategy-button', 'children')],
     [Input('toggle-strategy-button', 'n_clicks')],
     [State('strategy-collapse', 'is_open')],
 )
 def toggle_strategy_collapse(n_clicks, is_open):
     if n_clicks:
-        return not is_open
-    return is_open
+        return not is_open, 'Minimize' if not is_open else 'Maximize'
+    return is_open, 'Maximize' if not is_open else 'Minimize'
 
 @app.callback(
     [Output('sma-input-1', 'className'),
@@ -1476,7 +1495,7 @@ def update_combined_capture_chart(ticker, n_intervals):
 
     fig.update_layout(
         title=dict(
-            text=f'{ticker} Cumulative Combined Capture',
+            text=f'{ticker} Cumulative Combined Capture Chart',
             font=dict(color='#80ff00')
         ),
         xaxis_title='Trading Day',
@@ -1791,11 +1810,11 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 
         fig.update_layout(
             title=dict(
-                text=f'{ticker} Historical Top Pairs Performance',
+                text=f'{ticker} Color-Coded Cumulative Combined Capture Chart',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
-            yaxis_title='Cumulative Capture (%)',
+            yaxis_title='Cumulative Combined Capture (%)',
             hovermode='x unified',
             template='plotly_dark',
             showlegend=False,
@@ -2260,12 +2279,70 @@ def update_dynamic_strategy_display(ticker, n_intervals):
      Input('sma-input-4', 'value')]
 )
 def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
-    if ticker is None or any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
-        return go.Figure(), '', '', '', '', '', '', '', ''
+    if ticker is None:
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            plot_bgcolor='black',
+            paper_bgcolor='black',
+            font=dict(color='#80ff00'),
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            template='plotly_dark'
+        )
+        return empty_fig, '', '', '', '', '', '', '', ''
 
     df = fetch_data(ticker)
     if df is None or df.empty:
-        return go.Figure(layout=go.Layout(title=f"No data available for {ticker}")), '', '', '', '', '', '', '', ''
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            title=dict(
+                text=f"No data available for {ticker}",
+                font=dict(color='#80ff00')
+            ),
+            plot_bgcolor='black',
+            paper_bgcolor='black',
+            font=dict(color='#80ff00'),
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            template='plotly_dark'
+        )
+        return empty_fig, '', '', '', '', '', '', '', ''
+        
+    # Create base figure with just the price chart
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name=f'{ticker} Close'))
+    
+    # If any SMA inputs are missing, return just the price chart
+    if any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
+        fig.update_layout(
+            title=dict(
+                text=f'{ticker} Closing Prices',
+                font=dict(color='#80ff00')
+            ),
+            xaxis_title='Trading Day',
+            yaxis_title=f'{ticker} Closing Price',
+            template='plotly_dark',
+            font=dict(color='#80ff00'),
+            plot_bgcolor='black',
+            paper_bgcolor='black',
+            xaxis=dict(
+                color='#80ff00',
+                showgrid=True,
+                gridcolor='#80ff00',
+                zerolinecolor='#80ff00',
+                linecolor='#80ff00',
+                tickfont=dict(color='#80ff00')
+            ),
+            yaxis=dict(
+                color='#80ff00',
+                showgrid=True,
+                gridcolor='#80ff00',
+                zerolinecolor='#80ff00',
+                linecolor='#80ff00',
+                tickfont=dict(color='#80ff00')
+            )
+        )
+        return fig, '', '', '', '', '', '', '', ''
 
     min_date = df.index.min()
     max_date = df.index.max()
@@ -2459,12 +2536,19 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         empty_fig.update_layout(template='plotly_dark')
         return empty_fig, [], [], ''
 
-    # Parse secondary tickers
-    secondary_tickers = [ticker.strip() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
-    if not secondary_tickers:
+    try:
+        # Parse secondary tickers
+        secondary_tickers = [ticker.strip() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
+        if not secondary_tickers:
+            raise ValueError("No valid tickers found in input")
+        # Remove duplicates while preserving order
+        secondary_tickers = list(dict.fromkeys(secondary_tickers))
+        logger.info(f"Parsed secondary tickers: {secondary_tickers}")
+    except Exception as e:
+        logger.error(f"Error parsing secondary tickers: {str(e)}")
         empty_fig = go.Figure()
         empty_fig.update_layout(template='plotly_dark')
-        return empty_fig, [], [], ''
+        return empty_fig, [], [], 'Please enter valid comma-separated ticker symbols'
 
     # Check processing status of the primary ticker
     status = read_status(primary_ticker)
@@ -2592,6 +2676,10 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 'Avg Daily Capture (%)': round(avg_daily_capture, 4),
                 'Total Capture (%)': round(total_capture, 4)
             })
+            logger.info(f"Processed {ticker} - "
+                       f"Total Capture: {total_capture:.2f}%, "
+                       f"Win Ratio: {win_ratio:.2f}%, "
+                       f"Trigger Days: {trigger_days}")
 
             # Add trace to figure
             fig.add_trace(go.Scatter(
@@ -2633,7 +2721,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Date',
-            yaxis_title='Cumulative Capture (%)',
+            yaxis_title='Cumulative Combined Capture (%)',
             hovermode='x unified',
             template='plotly_dark',
             showlegend=True,
@@ -2661,8 +2749,59 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         # Only add signal changes as vertical lines and annotations if toggle is on
         if show_annotations:
             logger.info("Adding signal change annotations to secondary chart")
-            # Annotations can be added here if needed, but may be complex with multiple tickers
-            pass
+            shapes = []
+            annotations = []
+            
+            # Get signal changes once since all tickers follow the same primary signal
+            signals = pd.Series(active_pairs, index=dates).loc[common_dates]
+            if invert_signals:
+                signals = signals.apply(lambda x: 'Short' if x.startswith('Buy') else 'Buy' if x.startswith('Short') else x)
+            
+            signal_changes = signals != signals.shift(1)
+            signal_change_dates = signals.index[signal_changes]
+            signal_change_values = signals[signal_changes]
+            
+            # Add shapes and annotations for signal changes
+            for date, signal in zip(signal_change_dates, signal_change_values):
+                # Add vertical line shape
+                shapes.append(dict(
+                    type="line",
+                    xref="x",
+                    yref="paper",
+                    x0=date,
+                    x1=date,
+                    y0=0,
+                    y1=1,
+                    line=dict(
+                        color="#80ff00",
+                        width=1,
+                        dash="dash"
+                    ),
+                    opacity=0.5
+                ))
+                
+                # Add annotation with simplified text
+                annotations.append(dict(
+                    x=date,
+                    y=1,
+                    xref="x",
+                    yref="paper",
+                    text=signal,  # Just show the signal type without ticker name
+                    showarrow=False,
+                    font=dict(
+                        color="#80ff00",
+                        size=10
+                    ),
+                    bgcolor="rgba(0,0,0,0.5)",
+                    xanchor='left',
+                    yanchor='top'
+                ))
+            
+            # Update layout with all shapes and annotations
+            fig.update_layout(
+                shapes=shapes,
+                annotations=annotations
+            )
         else:
             # Ensure shapes and annotations are empty when toggle is off
             fig.update_layout(
