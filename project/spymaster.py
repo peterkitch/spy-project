@@ -97,18 +97,36 @@ def fetch_data(ticker, is_secondary=False):
             return pd.DataFrame()
             
         df = yf.download(ticker, period='max', interval='1d', progress=False)
-        df.index = pd.to_datetime(df.index)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
+        # Handle column names properly
+        if isinstance(df.columns, pd.MultiIndex):
+            # Get the Close prices while maintaining proper column name
+            close_data = df['Close'][ticker] if ('Close', ticker) in df.columns else None
+            if close_data is not None:
+                df = pd.DataFrame({'Close': close_data}, index=df.index)
+            else:
+                logger.error(f"Could not find Close price data for {ticker}")
+                return pd.DataFrame()
+        else:
+            # For single-level columns, standardize names
+            df.columns = [str(col).capitalize() for col in df.columns]
+            if 'Close' not in df.columns:
+                logger.error(f"Close column not found in single-level columns")
+                return pd.DataFrame()
+        
+        if df.empty:
+            logger.error(f"No valid data found for {ticker}")
+            return df
         
         if not is_secondary:
-            logging.info(f"Successfully fetched data for primary ticker {ticker}")
+            logging.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
             # Add a row for the current date if it's not included
-            today = pd.Timestamp.now().normalize()
+            today = pd.Timestamp.now().normalize().tz_localize(None)
             if len(df) > 0 and df.index[-1] < today:  # Check if df has data before accessing index
                 last_row = df.iloc[-1].copy()
                 last_row.name = today
                 df = pd.concat([df, last_row.to_frame().T])
-        else:
-            logging.info(f"Successfully fetched data for secondary ticker {ticker}")
         
         return df
     except Exception as e:
@@ -493,13 +511,23 @@ def precompute_results(ticker, event):
             # Prepare a list to store SMA DataFrames
             sma_list = []
 
+            logger.info("Beginning SMA calculations in chunks...")
             chunk_size_sma = 50  # Adjust based on memory constraints
-            for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
-                chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
-                sma_dict = {f'SMA_{j}': df['Close'].rolling(window=j, min_periods=j).mean() for j in range(i, chunk_end)}
-                sma_chunk = pd.DataFrame(sma_dict)
-                sma_list.append(sma_chunk)
-                gc.collect()
+            total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
+            
+            with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
+                for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
+                    chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
+                    sma_dict = {}
+                    for j in range(i, chunk_end):
+                        sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
+                        sma_dict[f'SMA_{j}'] = sma_values
+                    sma_chunk = pd.DataFrame(sma_dict, index=df.index)
+                    sma_list.append(sma_chunk)
+                    gc.collect()
+                    pbar.update(1)
+                    
+            logger.info(f"Completed SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
 
             # Concatenate all SMA chunks and add to the DataFrame at once
             sma_df = pd.concat(sma_list, axis=1)
