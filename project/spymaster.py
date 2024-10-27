@@ -2007,10 +2007,11 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     # Calculate wins and losses for buy signals
     buy_wins = np.sum(buy_returns_on_trigger_days > 0)
-    buy_losses = np.sum(buy_returns_on_trigger_days <= 0)
+    buy_losses = np.sum(buy_returns_on_trigger_days <= 0)  # Includes zero returns as losses
     buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    avg_capture_buy = np.mean(buy_returns_on_trigger_days) if buy_trigger_days > 0 else 0
-    buy_capture = np.sum(buy_returns_on_trigger_days) * 100 if buy_trigger_days > 0 else 0
+    # Calculate buy metrics with corrected percentages
+    avg_capture_buy = np.mean(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0  # Convert each return to percentage first
+    buy_capture = np.sum(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0  # Convert each return to percentage first
 
     # Calculate short returns on days when short signal was active
     short_signals_shifted = short_signals_leader.shift(1, fill_value=False)
@@ -2019,18 +2020,19 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     # Calculate wins and losses for short signals
     short_wins = np.sum(short_returns_on_trigger_days > 0)
-    short_losses = np.sum(short_returns_on_trigger_days <= 0)
+    short_losses = np.sum(short_returns_on_trigger_days <= 0)  # Includes zero returns as losses
     short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    avg_capture_short = np.mean(short_returns_on_trigger_days) if short_trigger_days > 0 else 0
-    short_capture = np.sum(short_returns_on_trigger_days) * 100 if short_trigger_days > 0 else 0
+    # Calculate short metrics with corrected percentages
+    avg_capture_short = np.mean(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0  # Convert each return to percentage first
+    short_capture = np.sum(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0  # Convert each return to percentage first
 
     avg_capture_buy_leader = (
-        f"Avg. Daily Capture % for Buy Leader: {avg_capture_buy * 100:.4f}% "
+        f"Avg. Daily Capture % for Buy Leader: {avg_capture_buy:.4f}% "
         f"(Trigger Days: {buy_trigger_days}, Wins: {buy_wins}, Losses: {buy_losses}, Win Ratio: {buy_win_ratio * 100:.2f}%)"
     )
 
     avg_capture_short_leader = (
-        f"Avg. Daily Capture % for Short Leader: {avg_capture_short * 100:.4f}% "
+        f"Avg. Daily Capture % for Short Leader: {avg_capture_short:.4f}% "
         f"(Trigger Days: {short_trigger_days}, Wins: {short_wins}, Losses: {short_losses}, Win Ratio: {short_win_ratio * 100:.2f}%)"
     )
 
@@ -2063,26 +2065,40 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                     combined_return = daily_return
                 else:
                     combined_return = -daily_return
+                combined_trigger_days += 1  # Count as trigger day
             elif buy_signal:
                 combined_return = daily_return
+                combined_trigger_days += 1  # Count as trigger day
             elif short_signal:
                 combined_return = -daily_return
+                combined_trigger_days += 1  # Count as trigger day
             else:
                 combined_return = 0
             
-            if combined_return != 0:
-                combined_trigger_days += 1
+            # Process wins/losses for any trigger day
+            if combined_trigger_days > combined_wins + combined_losses:
                 if combined_return > 0:
                     combined_wins += 1
-                else:
+                else:  # Count zero or negative returns as losses
                     combined_losses += 1
             
             combined_returns.append(combined_return)
 
     combined_returns = np.array(combined_returns)
-    combined_total_capture = np.sum(combined_returns) * 100
+    trigger_day_returns = []
+    returns_index = 0
+    
+    # Get returns only for trigger days
+    for ret in combined_returns:
+        if returns_index < combined_trigger_days:
+            if ret != 0:  # If it's a trigger day with non-zero return
+                trigger_day_returns.append(ret)
+                returns_index += 1
+
+    trigger_day_returns = np.array(trigger_day_returns)
+    combined_total_capture = np.sum(trigger_day_returns) * 100
     combined_win_ratio = combined_wins / combined_trigger_days if combined_trigger_days > 0 else 0
-    combined_avg_capture = np.mean(combined_returns) * 100 if combined_trigger_days > 0 else 0
+    combined_avg_capture = combined_total_capture / combined_trigger_days if combined_trigger_days > 0 else 0
 
     combined_strategy_text = f"""
     Combined Strategy Performance:
@@ -2200,14 +2216,14 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             html.Div([
                 html.H4("1. Summary of Top Performing Pairs", className="mb-3"),
-                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture:.4f}%)", className="mb-2"),
-                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture:.4f}%)", className="mb-2"),
+                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture * 100:.4f}%)", className="mb-2"),
+                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture * 100:.4f}%)", className="mb-2"),
             ], className="mb-4"),
             
             html.Div([
                 html.H4("2. Current Top Performing Pair Metrics", className="mb-3"),
                 html.H5("Buy Leader Performance:", className="mb-2"),
-                html.P(f"Average Daily Capture (%): {avg_capture_buy * 100:.4f}%", className="mb-1"),
+                html.P(f"Average Daily Capture (%): {avg_capture_buy:.4f}%", className="mb-1"),
                 html.P(f"Total Capture (%): {buy_capture:.4f}%", className="mb-1"),
                 html.P(f"Trigger Days: {int(buy_trigger_days):,}", className="mb-1"),
                 html.P(f"Wins: {int(buy_wins):,}", className="mb-1"),
@@ -2215,7 +2231,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                 html.P(f"Win Ratio: {buy_win_ratio * 100:.2f}%", className="mb-3"),
                 
                 html.H5("Short Leader Performance:", className="mb-2"),
-                html.P(f"Average Daily Capture (%): {avg_capture_short * 100:.4f}%", className="mb-1"),
+                html.P(f"Average Daily Capture (%): {avg_capture_short:.4f}%", className="mb-1"),
                 html.P(f"Total Capture (%): {short_capture:.4f}%", className="mb-1"),
                 html.P(f"Trigger Days: {int(short_trigger_days):,}", className="mb-1"),
                 html.P(f"Wins: {int(short_wins):,}", className="mb-1"),
@@ -2545,7 +2561,6 @@ def update_output_and_reset(combined_capture, historical_top_pairs, chart, ticke
 
 from dash import dash_table
 
-# Update the callback decorator to match the new outputs
 @app.callback(
     [Output('secondary-capture-chart', 'figure'),
      Output('secondary-metrics-table', 'data'),
@@ -2687,16 +2702,32 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             # Calculate all metrics using vectorized operations
             metrics = {
                 'Ticker': ticker,
-                'Trigger Days': int(np.sum(buy_mask | short_mask)),
-                'Daily Captures': daily_captures[daily_captures != 0]
+                'Trigger Days': int(np.sum(buy_mask | short_mask)),  # Total signal days
             }
             
             if metrics['Trigger Days'] > 0:
-                metrics['Wins'] = int(np.sum(metrics['Daily Captures'] > 0))
-                metrics['Losses'] = metrics['Trigger Days'] - metrics['Wins']
-                metrics['Win Ratio (%)'] = round(metrics['Wins'] / metrics['Trigger Days'] * 100, 2)
-                metrics['Avg Daily Capture (%)'] = round(np.mean(metrics['Daily Captures']), 4)
+                # Only consider days with active signals and shift them to align with returns
+                active_signal_days = buy_mask | short_mask
+                active_signal_days_shifted = np.roll(active_signal_days, 1)
+                active_signal_days_shifted[0] = False  # First day can't have a signal
+                
+                # Get captures for active signal days after shifting
+                signal_day_captures = daily_captures[active_signal_days_shifted]
+                
+                # Calculate wins and losses on all signal days
+                metrics['Wins'] = int(np.sum(signal_day_captures > 0))
+                metrics['Losses'] = int(np.sum(signal_day_captures <= 0))  # Count zero or negative returns as losses
+                
+                # Calculate ratios and averages using all signal days
+                metrics['Win Ratio (%)'] = round((metrics['Wins'] / metrics['Trigger Days'] * 100), 2)
+                metrics['Avg Daily Capture (%)'] = round(np.mean(signal_day_captures), 4)  # Include all signal day returns
                 metrics['Total Capture (%)'] = round(float(cumulative_captures.iloc[-1]), 4)
+                
+                # Add debug logging
+                logger.debug(f"Metrics for {ticker}:")
+                logger.debug(f"Total signal days: {metrics['Trigger Days']}")
+                logger.debug(f"Wins + Losses: {metrics['Wins'] + metrics['Losses']}")
+                logger.debug(f"Signal day captures shape: {signal_day_captures.shape}")
             else:
                 metrics.update({
                     'Wins': 0,
@@ -2706,11 +2737,12 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                     'Total Capture (%)': 0.0
                 })
             
-            metrics_list.append({k: v for k, v in metrics.items() if k != 'Daily Captures'})
+            metrics_list.append(metrics)
             logger.info(f"Processed {ticker} - "
                        f"Total Capture: {metrics['Total Capture (%)']}%, "
                        f"Win Ratio: {metrics['Win Ratio (%)']}%, "
                        f"Trigger Days: {metrics['Trigger Days']}")
+            
             # Add trace to figure
             fig.add_trace(go.Scatter(
                 x=cumulative_captures.index,
