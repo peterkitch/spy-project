@@ -1089,7 +1089,7 @@ def update_max_sma_day_display(ticker):
         return 'Loading data...'
 
     MAX_SMA_DAY = results.get('existing_max_sma_day', 'N/A')
-    return f"Current MAX_SMA_DAY for {ticker}: {MAX_SMA_DAY}"
+    return f"Current MAX_SMA_DAY for {ticker.upper()}: {MAX_SMA_DAY}"
 
 @app.callback(
     [Output('sma-input-1', 'max'),
@@ -2375,7 +2375,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
-            yaxis_title=f'{ticker} Closing Price',
+            yaxis_title=f'{ticker.upper()} Closing Price',
             template='plotly_dark',
             font=dict(color='#80ff00'),
             plot_bgcolor='black',
