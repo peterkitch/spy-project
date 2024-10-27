@@ -88,6 +88,10 @@ cache_dir = '.cache'
 os.makedirs(cache_dir, exist_ok=True)
 memory = Memory(cache_dir, verbose=0)
 
+def normalize_ticker(ticker):
+    """Normalize ticker to uppercase if it exists"""
+    return ticker.strip().upper() if ticker else ticker
+
 def fetch_data(ticker, is_secondary=False):
     try:
         # Check for empty or whitespace-only ticker
@@ -95,6 +99,9 @@ def fetch_data(ticker, is_secondary=False):
             if not is_secondary:
                 logging.info("No primary ticker provided")
             return pd.DataFrame()
+            
+        # Normalize ticker
+        ticker = normalize_ticker(ticker)
             
         df = yf.download(ticker, period='max', interval='1d', progress=False)
         df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -201,7 +208,7 @@ def load_precomputed_results(ticker, load_full_data=False):
             else:
                 logger.warning(f"Failed to load results from file for {ticker}")
 
-        logger.info(f"Starting to load precomputed results for {ticker}...")
+        logger.info(f"Starting to load precomputed results for {ticker.upper()}...")
         event = threading.Event()
         _loading_in_progress[ticker] = event
         threading.Thread(target=precompute_results, args=(ticker, event)).start()
@@ -255,12 +262,14 @@ def compute_signals(df, sma1, sma2):
     return {'buy_capture': buy_capture, 'short_capture': short_capture}
 
 def write_status(ticker, status):
+    ticker = normalize_ticker(ticker)
     status_path = f"{ticker}_status.json"
     with status_lock:
         with open(status_path, 'w') as f:
             json.dump(status, f)
 
 def save_precomputed_results(ticker, results):
+    ticker = normalize_ticker(ticker)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f'{ticker}_precomputed_results_temp.pkl')
@@ -422,6 +431,7 @@ def calculate_captures_vectorized(sma1, sma2, returns):
     return buy_capture, short_capture
 
 def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chunk, chunk_index):
+    ticker = normalize_ticker(ticker)
     chunk_file = f'{ticker}_results_chunk_{chunk_index}.npz'
     try:
         # Prepare data for saving
@@ -449,7 +459,7 @@ def precompute_results(ticker, event):
     global _loading_in_progress, _precomputed_results_cache
     with logging_redirect_tqdm():
         try:
-            logger.info(f"precompute_results called for {ticker}")
+            logger.info(f"precompute_results called for {ticker.upper()}")
             section_start = time.time()
             
             def log_section_time(section_name):
@@ -464,7 +474,7 @@ def precompute_results(ticker, event):
                 return None
             
             log_section("Data Preprocessing")
-            logger.info(f"Data fetched and preprocessed for {ticker}")
+            logger.info(f"Data fetched and preprocessed for {ticker.upper()}")
             section_times['Data Preprocessing'] = time.time() - section_start
             section_start = time.time()
 
@@ -564,7 +574,7 @@ def precompute_results(ticker, event):
             chunk_size = 100000  # Adjust based on your system's capabilities
             update_interval = 100  # Update progress more frequently
 
-            with tqdm(total=total_pairs_with_inverses, desc=f'Calculation for {ticker}', unit='pair', dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar_calc:
+            with tqdm(total=total_pairs_with_inverses, desc=f'Calculation for {ticker.upper()}', unit='pair', dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar_calc:
                 for i in range(0, total_pairs, chunk_size):
                     chunk_pairs = new_sma_pairs[i:i+chunk_size]
 
@@ -611,7 +621,7 @@ def precompute_results(ticker, event):
                     # Update the progress bar after processing the chunk
                     pbar_calc.update(len(chunk_pairs) * 2)
 
-            logger.info(f"Processed {pairs_processed} pairs out of {total_pairs_with_inverses} for {ticker}")
+            logger.info(f"Processed {pairs_processed} pairs out of {total_pairs_with_inverses} for {ticker.upper()}")
             logger.info(f"Total buy pairs: {total_pairs * 2}, Total short pairs: {total_pairs * 2}")
 
             # Update other results
@@ -684,8 +694,8 @@ def precompute_results(ticker, event):
             top_short_capture = short_results_with_inverse[top_short_pair]
 
             # Print the top pairs along with their results          
-            logger.info(f"Current Top Buy Pair for {ticker}: {top_buy_pair} with total capture {top_buy_capture:.6f}")
-            logger.info(f"Current Top Short Pair for {ticker}: {top_short_pair} with total capture {top_short_capture:.6f}")
+            logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture:.6f}")
+            logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture:.6f}")
 
             # Update the results dictionary with the latest total captures
             results['top_buy_pair'] = top_buy_pair
@@ -754,7 +764,7 @@ def print_timing_summary(ticker):
             logger.info(f"Daily Top Pairs Chunk Processing: {results['chunk_processing_time']:.2f} seconds")
         
         logger.info("=" * 80)
-        logger.info(f"Total processing time for {ticker}: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
+        logger.info(f"Total processing time for {ticker.upper()}: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
         logger.info("=" * 80)
         logger.info("Load complete. Data is now available in the Dash app.")
     elif results and 'load_time' in results:
@@ -762,12 +772,13 @@ def print_timing_summary(ticker):
         hours, rem = divmod(load_time, 3600)
         minutes, seconds = divmod(rem, 60)
         logger.info("=" * 80)
-        logger.info(f"Loading time for existing {ticker} data: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
+        logger.info(f"Loading time for existing {ticker.upper()} data: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
         logger.info("=" * 80)
         logger.info("Load complete. Data is now available in the Dash app.")
 
 # Function to read the processing status from a file
 def read_status(ticker):
+    ticker = normalize_ticker(ticker)
     status_path = f"{ticker}_status.json"
     if os.path.exists(status_path):
         with open(status_path, 'r') as file:
@@ -1523,7 +1534,7 @@ def update_combined_capture_chart(ticker, n_intervals):
 
     fig.update_layout(
         title=dict(
-            text=f'{ticker} Cumulative Combined Capture Chart',
+            text=f'{ticker.upper()} Cumulative Combined Capture Chart',
             font=dict(color='#80ff00')
         ),
         xaxis_title='Trading Day',
@@ -1838,7 +1849,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 
         fig.update_layout(
             title=dict(
-                text=f'{ticker} Color-Coded Cumulative Combined Capture Chart',
+                text=f'{ticker.upper()} Color-Coded Cumulative Combined Capture Chart',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
@@ -2344,7 +2355,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     if any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
         fig.update_layout(
             title=dict(
-                text=f'{ticker} Closing Prices',
+                text=f'{ticker.upper()} Closing Prices',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
@@ -2452,11 +2463,11 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     # Customize layout
     fig.update_layout(
         title=dict(
-            text=f'{ticker} Closing Prices, SMAs, and Total Capture (Start Date: {start_date}, Last Date: {last_date})',
+            text=f'{ticker.upper()} Closing Prices, SMAs, and Total Capture (Start Date: {start_date}, Last Date: {last_date})',
             font=dict(color='#80ff00')
         ),
         xaxis_title='Trading Day',
-        yaxis_title=f'{ticker} Closing Price',
+        yaxis_title=f'{ticker.upper()} Closing Price',
         hovermode='x',
         uirevision='static',
         template='plotly_dark',
@@ -2566,7 +2577,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
 
     try:
         # Parse secondary tickers
-        secondary_tickers = [ticker.strip() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
+        secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
         if not secondary_tickers:
             raise ValueError("No valid tickers found in input")
         # Remove duplicates while preserving order
@@ -2586,8 +2597,8 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         return empty_fig, [], [], 'Primary ticker data is still processing...'
 
     # Load primary ticker results
-    logger.info(f"Loading precomputed results for {primary_ticker}")
-    results = load_precomputed_results(primary_ticker)
+    logger.info(f"Loading precomputed results for {primary_ticker.upper()}")
+    results = load_precomputed_results(primary_ticker.upper())
     if results is None:
         empty_fig = go.Figure()
         empty_fig.update_layout(template='plotly_dark')
@@ -2598,7 +2609,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         logger.error(f"Missing required data in primary ticker results. Available keys: {results.keys()}")
         return empty_fig, [], [], 'Primary ticker data is incomplete.'
 
-    logger.info(f"Updating secondary capture chart for {secondary_tickers_input} following {primary_ticker}")
+    logger.info(f"Updating secondary capture chart for {secondary_tickers_input.upper()} following {primary_ticker.upper()}")
     logger.info(f"Primary ticker status: {status['status']}")
 
     try:
@@ -2607,7 +2618,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         for ticker in secondary_tickers:
             df = fetch_data(ticker, is_secondary=True)
             if df is None or df.empty:
-                logger.warning(f"Unable to fetch data for {ticker}")
+                logger.warning(f"Unable to fetch data for {ticker.upper()}. Skipping.")
                 continue
             secondary_dfs[ticker] = df
 
@@ -2633,7 +2644,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             # Align dates between primary and secondary data
             common_dates = dates.intersection(secondary_df.index)
             if len(common_dates) < 2:
-                logger.warning(f"Insufficient overlapping data between {primary_ticker} and {ticker}. Skipping.")
+                logger.warning(f"Insufficient overlapping data between {primary_ticker.upper()} and {ticker.upper()}. Skipping.")
                 continue
 
             # Create aligned series using NumPy for better performance
@@ -2642,7 +2653,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
 
             # Vectorized signal inversion using NumPy
             if invert_signals:
-                logger.info(f"Inverting signals for secondary chart {ticker}")
+                logger.info(f"Inverting signals for secondary chart {ticker.upper()}")
                 signals_array = np.where(
                     np.char.startswith(signals_array, 'Buy'),
                     np.char.replace(signals_array, 'Buy', 'Short', count=1),
@@ -2747,7 +2758,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         # Adjust figure layout
         fig.update_layout(
             title=dict(
-                text=f'{", ".join(secondary_dfs.keys())} Performance Following {primary_ticker} {"(Inverted)" if invert_signals else ""} Signals',
+                text=f'{", ".join(secondary_dfs.keys())} Performance Following {primary_ticker.upper()} {"(Inverted)" if invert_signals else ""} Signals',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Date',
