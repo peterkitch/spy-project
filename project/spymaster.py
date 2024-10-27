@@ -2652,7 +2652,6 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                         signals_array
                     )
                 )
-                logger.info(f"First few inverted signals for {ticker}: {signals_array[:5]}")
 
             # Fast signal filling using NumPy
             signals_filled = pd.Series(
@@ -2685,30 +2684,33 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             # Compute cumulative captures
             cumulative_captures = daily_captures.cumsum()
 
-            # Calculate trading metrics
-            trigger_days = int((buy_mask | short_mask).sum())
-            triggered_captures = daily_captures[daily_captures != 0]
-            wins = int((triggered_captures > 0).sum())
-            losses = int((triggered_captures <= 0).sum())
-            avg_daily_capture = float(triggered_captures.mean()) if trigger_days > 0 else 0.0
-            total_capture = float(cumulative_captures.iloc[-1])
-            win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0.0
-
-            # Store metrics in a list
-            metrics_list.append({
+            # Calculate all metrics using vectorized operations
+            metrics = {
                 'Ticker': ticker,
-                'Trigger Days': trigger_days,
-                'Wins': wins,
-                'Losses': losses,
-                'Win Ratio (%)': round(win_ratio, 2),
-                'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-                'Total Capture (%)': round(total_capture, 4)
-            })
+                'Trigger Days': int(np.sum(buy_mask | short_mask)),
+                'Daily Captures': daily_captures[daily_captures != 0]
+            }
+            
+            if metrics['Trigger Days'] > 0:
+                metrics['Wins'] = int(np.sum(metrics['Daily Captures'] > 0))
+                metrics['Losses'] = metrics['Trigger Days'] - metrics['Wins']
+                metrics['Win Ratio (%)'] = round(metrics['Wins'] / metrics['Trigger Days'] * 100, 2)
+                metrics['Avg Daily Capture (%)'] = round(np.mean(metrics['Daily Captures']), 4)
+                metrics['Total Capture (%)'] = round(float(cumulative_captures.iloc[-1]), 4)
+            else:
+                metrics.update({
+                    'Wins': 0,
+                    'Losses': 0,
+                    'Win Ratio (%)': 0.0,
+                    'Avg Daily Capture (%)': 0.0,
+                    'Total Capture (%)': 0.0
+                })
+            
+            metrics_list.append({k: v for k, v in metrics.items() if k != 'Daily Captures'})
             logger.info(f"Processed {ticker} - "
-                       f"Total Capture: {total_capture:.2f}%, "
-                       f"Win Ratio: {win_ratio:.2f}%, "
-                       f"Trigger Days: {trigger_days}")
-
+                       f"Total Capture: {metrics['Total Capture (%)']}%, "
+                       f"Win Ratio: {metrics['Win Ratio (%)']}%, "
+                       f"Trigger Days: {metrics['Trigger Days']}")
             # Add trace to figure
             fig.add_trace(go.Scatter(
                 x=cumulative_captures.index,
