@@ -164,7 +164,8 @@ def load_precomputed_results(ticker, load_full_data=False):
     global _precomputed_results_cache, _loading_in_progress
     with _loading_lock:
         if ticker in _precomputed_results_cache:
-            logger.debug(f"Using cached results for {ticker}")
+            # Only log debug info for cached results to prevent duplicate headers
+            logger.debug(f"Using cached results for {ticker.upper()}")
             return _precomputed_results_cache[ticker]
 
         if ticker in _loading_in_progress:
@@ -174,6 +175,9 @@ def load_precomputed_results(ticker, load_full_data=False):
         # Attempt to load from file if not in cache and not currently loading
         pkl_file = f'{ticker}_precomputed_results.pkl'
         if os.path.exists(pkl_file):
+            log_separator()
+            log_section(f"Loading Existing Data for {ticker.upper()}")
+            logger.info(f"Loading precomputed results from file for {ticker.upper()}")
             load_start_time = time.time()
             results = load_precomputed_results_from_file(pkl_file)
             if results:
@@ -203,11 +207,21 @@ def load_precomputed_results(ticker, load_full_data=False):
                     results['short_results'] = short_results
 
                 _precomputed_results_cache[ticker] = results
-                logger.debug(f"Loaded results from file for {ticker}")
+                logger.debug(f"Loaded results from file for {ticker.upper()}")
                 return results
             else:
-                logger.warning(f"Failed to load results from file for {ticker}")
+               logger.warning(f"Failed to load results from file for {ticker.upper()}")
 
+        # Check if we've already tried and failed due to insufficient data
+        status = read_status(ticker)
+        if status.get('message') == "Insufficient trading history":
+            return None
+
+        logger.info("")  # First line break
+        logger.info("")  # Second line break
+        log_separator()    
+        log_section(f"Loading Ticker {ticker.upper()}")
+        log_separator()
         logger.info(f"Starting to load precomputed results for {ticker.upper()}...")
         event = threading.Event()
         _loading_in_progress[ticker] = event
@@ -344,7 +358,6 @@ def process_chunk_for_top_pairs(chunk_file, total_days):
     return max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs
 
 def calculate_daily_top_pairs(df, ticker):
-    log_section("Daily Top Pairs Calculation")
     section_start = time.time()
     logger.info("Calculating daily top pairs...")
     total_days = len(df.index)
@@ -471,6 +484,13 @@ def precompute_results(ticker, event):
             if df is None or df.empty:
                 write_status(ticker, {"status": "failed", "message": "No data"})
                 logger.warning(f"No data fetched for {ticker}")
+                return None
+                
+            # Check for minimum required trading days
+            if len(df) < 2:  # Minimum 2 days needed for calculations
+                write_status(ticker, {"status": "failed", "message": "Insufficient trading history"})
+                logger.warning(f"Unable to process {ticker.upper()}: Found only {len(df)} trading day(s). Min. 2 trading days required.")
+                logger.warning("Please enter a different ticker symbol.")
                 return None
             
             log_section("Data Preprocessing")
@@ -621,6 +641,7 @@ def precompute_results(ticker, event):
                     # Update the progress bar after processing the chunk
                     pbar_calc.update(len(chunk_pairs) * 2)
 
+            pairs_processed = total_pairs * 2  # Each pair has a regular and inverse version
             logger.info(f"Processed {pairs_processed} pairs out of {total_pairs_with_inverses} for {ticker.upper()}")
             logger.info(f"Total buy pairs: {total_pairs * 2}, Total short pairs: {total_pairs * 2}")
 
@@ -756,7 +777,6 @@ def print_timing_summary(ticker):
         
         logger.info("=" * 80)
         logger.info("Processing Time Summary:")
-        logger.info("=" * 80)
         for section, time_taken in section_times.items():
             logger.info(f"{section}: {time_taken:.2f} seconds")
         
@@ -1240,7 +1260,6 @@ def validate_ticker_input(ticker):
     return ''
 
 def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs):
-    log_separator()
     logger.info("Calculating cumulative combined capture")
     logger.info(f"Number of trading days: {len(df)}")
 
@@ -1313,6 +1332,7 @@ def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_sho
     logger.info("Cumulative Capture Summary:")
     logger.info(f"Date range: {dates[0]} to {dates[-1]}")
     logger.info(f"Total Trading Days: {len(dates)}")
+    log_separator()
     logger.info(f"Final Cumulative Capture: {cumulative_capture:.2f}%")
     log_separator()
 
@@ -2203,23 +2223,30 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         sample_price = low + (high - low) * 0.01 if high != float('inf') else low * 1.01
         signal, active_pair = predict_signal(sample_price)
         recommendations = {
-            'Buy': 'Enter Buy Position',
-            'Short': 'Enter Short Position',
-            'Cash': 'Hold Cash Position'
+            'Buy': 'Enter Buy',
+            'Short': 'Enter Short',
+            'Cash': 'Hold Cash'
         }
-        recommendation = recommendations.get(signal, 'Hold Cash Position')
+        recommendation = recommendations.get(signal, 'Hold Cash')
         price_range_str = f"${low:.2f} - ${high:.2f}" if high != float('inf') else f"${low:.2f} and above"
+        # Format signal with SMA pair numbers
+        if signal in ['Buy', 'Short']:
+            signal_display = f"{signal} ({top_buy_pair[0]},{top_buy_pair[1]})" if signal == 'Buy' else f"{signal} ({top_short_pair[0]},{top_short_pair[1]})"
+        else:
+            signal_display = signal
+            
         predictions.append({
             'price_range': price_range_str,
-            'signal': signal,
+            'signal': signal_display,
             'active_pair': active_pair,
             'recommendation': recommendation
         })
 
-    # Log the predictions for debugging
-    logger.info("Forecast Recommendations:")
+    # Only log predictions once after all are generated
+    log_section("Forecast Recommendations")
     for pred in predictions:
-        logger.info(f"Range: {pred['price_range']}, Signal: {pred['signal']}, Pair: {pred['active_pair']}, Recommendation: {pred['recommendation']}")
+        logger.info(f"Range: {pred['price_range']}, Signal: {pred['signal']}, Recommendation: {pred['recommendation']}")
+    logger.info("\n")  # Add two line breaks
 
     trading_recommendations = [
         html.Div([
@@ -2535,12 +2562,9 @@ def print_timing_summary(ticker):
         hours, rem = divmod(total_time, 3600)
         minutes, seconds = divmod(rem, 60)
         
-        logger.info("=" * 80)
-        logger.info("Processing Time Summary:")
-        logger.info("=" * 80)
+        log_section("Processing Time Summary")
         for section, time_taken in section_times.items():
             logger.info(f"{section}: {time_taken:.2f} seconds")
-        logger.info("=" * 80)
         logger.info(f"Total processing time for {ticker}: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
         logger.info("=" * 80)
         logger.info("Load complete. Data is now available in the Dash app.")
