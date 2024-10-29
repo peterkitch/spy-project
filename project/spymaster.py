@@ -1528,9 +1528,12 @@ def update_combined_capture_chart(ticker, n_intervals):
         next_active_pair = f"Short ({top_short_pair[0]},{top_short_pair[1]})"
     else:
         next_active_pair = "None"
-
+    
+    logger.info("")
+    log_separator()
     logger.info(f"Active Pair for Upcoming Trading Session: {next_active_pair}")
     log_separator()
+    logger.info("")
 
     fig = go.Figure()
 
