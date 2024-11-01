@@ -1,7 +1,9 @@
 import yfinance as yf
 import plotly.graph_objects as go
+import dash
 from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, dash_table
 import dash_bootstrap_components as dbc
+from dash.dependencies import Input, Output, State, ALL
 import pandas as pd
 from functools import lru_cache
 from functools import partial
@@ -1130,6 +1132,136 @@ app.layout = html.Div(
                 )
             ], width=12)
         ]),
+        # New Section: Multi-Primary Signal Aggregator
+        html.H2('Multi-Primary Signal Aggregator', className='text-center mt-5'),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.H5('Aggregate Signals from Multiple Primary Tickers', className='mb-0'),
+                        html.Button(children='Maximize', id='toggle-multi-primary-button', className='btn btn-sm btn-secondary ml-auto')
+                    ]),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                            # Secondary Ticker Input
+                            html.Div([
+                                html.Label("Secondary Ticker (Signal Follower):", className='mb-2'),
+                                dbc.Input(
+                                    id='multi-secondary-ticker-input',
+                                    placeholder='Enter a single ticker (e.g., DJT)',
+                                    type='text',
+                                    debounce=True
+                                ),
+                                html.Div(id='multi-secondary-feedback', className='text-danger')
+                            ], className='mb-3'),
+
+                            # Primary Tickers Input
+                            html.Div([
+                                html.Label("Primary Signal Generators:", className='mb-2'),
+                                html.Div([
+                                    dbc.Row([
+                                        dbc.Col(
+                                            dbc.Input(
+                                                id={'type': 'primary-ticker-input', 'index': 0},
+                                                placeholder='Enter ticker (e.g., CENN)',
+                                                type='text',
+                                                debounce=True
+                                            ),
+                                            width=4
+                                        ),
+                                        dbc.Col(
+                                            dbc.Switch(
+                                                id={'type': 'invert-primary-switch', 'index': 0},
+                                                label='Invert Signals',
+                                                value=False
+                                            ),
+                                            width=2
+                                        ),
+                                        dbc.Col(
+                                            dbc.Switch(
+                                                id={'type': 'mute-primary-switch', 'index': 0},
+                                                label='Mute',
+                                                value=False
+                                            ),
+                                            width=2
+                                        ),
+                                        dbc.Col(
+                                            dbc.Button(
+                                                'Delete',
+                                                id={'type': 'delete-primary-button', 'index': 0},
+                                                color='danger',
+                                                size='sm'
+                                            ),
+                                            width=2
+                                        )
+                                    ], className='mb-2', id={'type': 'primary-ticker-row', 'index': 0})
+                                ], id='primary-tickers-container'),
+                                dbc.Button('Add Primary Ticker', id='add-primary-button', color='success', size='sm', className='mt-2')
+                            ], className='mb-3'),
+                            # Results Display
+                            dcc.Loading(
+                                id="loading-multi-primary",
+                                type="default",
+                                children=[
+                                    dcc.Graph(
+                                        id='multi-primary-chart',
+                                        figure=go.Figure(
+                                            layout=go.Layout(
+                                                title=dict(text="Combined Signals Capture Chart", font=dict(color='#80ff00')),
+                                                plot_bgcolor='black',
+                                                paper_bgcolor='black',
+                                                font=dict(color='#80ff00'),
+                                                xaxis=dict(visible=False),
+                                                yaxis=dict(visible=False),
+                                                template='plotly_dark'
+                                            )
+                                        )
+                                    ),
+                                    dbc.Card([
+                                        dbc.CardHeader('Aggregated Signal Performance'),
+                                        dbc.CardBody([
+                                            dash_table.DataTable(
+                                                id='multi-primary-metrics-table',
+                                                columns=[],  # Will be updated in callback
+                                                data=[],     # Will be updated in callback
+                                                sort_action='native',
+                                                style_table={
+                                                    'overflowX': 'auto',
+                                                    'backgroundColor': 'black',
+                                                },
+                                                style_cell={
+                                                    'backgroundColor': 'black',
+                                                    'color': '#80ff00',
+                                                    'textAlign': 'left',
+                                                    'minWidth': '50px', 
+                                                    'width': '100px', 
+                                                    'maxWidth': '180px',
+                                                    'whiteSpace': 'normal',
+                                                    'border': '1px solid #80ff00'
+                                                },
+                                                style_header={
+                                                    'backgroundColor': 'black',
+                                                    'color': '#80ff00',
+                                                    'fontWeight': 'bold',
+                                                    'border': '2px solid #80ff00'
+                                                },
+                                                style_data_conditional=[{
+                                                    'if': {'row_index': 'odd'},
+                                                    'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                                }],
+                                            )
+                                        ])
+                                    ], className='mt-3')
+                                ]
+                            )
+                        ]),
+                        id='multi-primary-collapse',
+                        is_open=True
+                    )
+                ], className='mb-3')
+            ], width=12)
+        ]),
+
         # Add intervals at the end
         dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
         dcc.Interval(id='loading-interval', interval=2000, n_intervals=0),  # Update every 2 seconds
@@ -2910,6 +3042,275 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
        logger.error(f"Error in secondary chart processing: {str(e)}")
        logger.error(traceback.format_exc())
        return empty_fig, [], [], f'Processing error: {str(e)}'
+
+# Callback to add/remove primary ticker inputs dynamically
+@app.callback(
+    Output('primary-tickers-container', 'children'),
+    [Input('add-primary-button', 'n_clicks'),
+     Input({'type': 'delete-primary-button', 'index': ALL}, 'n_clicks')],
+    State('primary-tickers-container', 'children'),
+    prevent_initial_call=True
+)
+def update_primary_tickers(add_click, delete_clicks, children):
+    ctx = dash.callback_context
+
+    if not ctx.triggered:
+        raise dash.exceptions.PreventUpdate
+
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if triggered_id == 'add-primary-button':
+        # Add a new primary ticker row
+        new_index = len(children)
+        new_ticker_row = dbc.Row([
+            dbc.Col(
+                dbc.Input(
+                    id={'type': 'primary-ticker-input', 'index': new_index},
+                    placeholder='Enter ticker (e.g., CENN)',
+                    type='text',
+                    debounce=True
+                ),
+                width=4
+            ),
+            dbc.Col(
+                dbc.Switch(
+                    id={'type': 'invert-primary-switch', 'index': new_index},
+                    label='Invert Signals',
+                    value=False
+                ),
+                width=2
+            ),
+            dbc.Col(
+                dbc.Switch(
+                    id={'type': 'mute-primary-switch', 'index': new_index},
+                    label='Mute',
+                    value=False
+                ),
+                width=2
+            ),
+            dbc.Col(
+                dbc.Button(
+                    'Delete',
+                    id={'type': 'delete-primary-button', 'index': new_index},
+                    color='danger',
+                    size='sm'
+                ),
+                width=2
+            )
+        ], className='mb-2', id={'type': 'primary-ticker-row', 'index': new_index})
+
+        children.append(new_ticker_row)
+        return children
+
+    else:
+        # A delete button was clicked
+        delete_index = int(eval(triggered_id)['index'])
+
+        # Remove the child with the matching index
+        new_children = [child for child in children if child['props']['id']['index'] != delete_index]
+
+        # Re-index the remaining children
+        for i, child in enumerate(new_children):
+            child['props']['id']['index'] = i
+            for col in child['props']['children']:
+                component = col['props']['children']
+                if isinstance(component, dict) and 'id' in component['props']:
+                    component['props']['id']['index'] = i
+
+        return new_children
+
+# Callback to process aggregated signals and update the chart and metrics table
+@app.callback(
+    [Output('multi-primary-chart', 'figure'),
+     Output('multi-primary-metrics-table', 'data'),
+     Output('multi-primary-metrics-table', 'columns'),
+     Output('multi-secondary-feedback', 'children')],
+    [Input({'type': 'primary-ticker-input', 'index': ALL}, 'value'),
+     Input({'type': 'invert-primary-switch', 'index': ALL}, 'value'),
+     Input({'type': 'mute-primary-switch', 'index': ALL}, 'value'),
+     Input('multi-secondary-ticker-input', 'value')],
+    [State('update-interval', 'n_intervals')],
+    prevent_initial_call=True
+)
+def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, secondary_tickers_input, n_intervals):
+    if not secondary_tickers_input:
+        return no_update, no_update, no_update, 'Please enter at least one secondary ticker.'
+
+    # Filter out empty or muted primary tickers
+    primary_tickers_filtered = []
+    invert_signals_filtered = []
+    for ticker, invert, mute in zip(primary_tickers, invert_signals, mute_signals):
+        if ticker and not mute:
+            primary_tickers_filtered.append(ticker.strip().upper())
+            invert_signals_filtered.append(invert)
+
+    if not primary_tickers_filtered:
+        return no_update, no_update, no_update, 'Please enter at least one primary ticker.'
+
+    # Parse secondary tickers
+    secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
+    if not secondary_tickers:
+        return no_update, no_update, no_update, 'Please enter at least one secondary ticker.'
+
+    # Load primary tickers data
+    primary_signals_list = []
+    date_indexes = []
+    for idx, (ticker, invert) in enumerate(zip(primary_tickers_filtered, invert_signals_filtered)):
+        results = load_precomputed_results(ticker)
+        if not results:
+            return no_update, no_update, no_update, f'Data not ready for primary ticker {ticker}.'
+        signals = results.get('active_pairs')
+        dates = results['preprocessed_data'].index
+
+        # Create signals_series from signals and dates
+        signals_series = pd.Series(signals, index=dates)
+
+        # Process signals to extract 'Buy', 'Short', or 'None'
+        signals_series = signals_series.astype(str)
+        processed_signals = signals_series.apply(
+            lambda x: 'Buy' if x.strip().startswith('Buy') else
+                      'Short' if x.strip().startswith('Short') else 'None'
+        )
+
+        # Apply inversion if necessary
+        if invert:
+            processed_signals = processed_signals.replace({'Buy': 'Short', 'Short': 'Buy'})
+
+        # Store the processed signals in a list
+        primary_signals_list.append(processed_signals)
+        date_indexes.append(set(processed_signals.index))
+
+    # Find common dates among all primary tickers
+    common_dates = set.intersection(*date_indexes)
+    common_dates = sorted(common_dates)
+
+    if not common_dates:
+        return no_update, no_update, no_update, 'No overlapping dates among primary tickers.'
+
+    # Combine signals into a DataFrame
+    signals_df = pd.DataFrame({f'primary_{i}': sig.loc[common_dates] for i, sig in enumerate(primary_signals_list)})
+
+    # Function to determine combined signal
+    def get_combined_signal(row):
+        # List of signals excluding 'None'
+        active_signals = [s for s in row if s != 'None']
+
+        if not active_signals:
+            return 'None'
+
+        # Check if all active signals are the same
+        if all(s == active_signals[0] for s in active_signals):
+            return active_signals[0]
+        else:
+            return 'None'  # Signals are mixed and cancel out
+
+    # Apply the combination function
+    combined_signals = signals_df.apply(get_combined_signal, axis=1)
+
+    # Initialize figure
+    fig = go.Figure()
+    metrics_data = []
+
+    # Process each secondary ticker
+    for secondary_ticker in secondary_tickers:
+        # Fetch data for secondary ticker
+        secondary_data = fetch_data(secondary_ticker)
+        if secondary_data is None or secondary_data.empty:
+            continue  # Skip this ticker if data is unavailable
+
+        # Align dates with combined signals
+        common_dates_sec = combined_signals.index.intersection(secondary_data.index)
+        if len(common_dates_sec) < 2:
+            continue  # Skip if insufficient data overlap
+
+        signals = combined_signals.loc[common_dates_sec].astype(str)
+        prices = secondary_data['Close'].loc[common_dates_sec]
+
+        # Reindex signals and prices to a common index
+        common_index = signals.index.union(prices.index)
+        signals = signals.reindex(common_index).fillna('None')
+        prices = prices.reindex(common_index).ffill()
+
+        # Compute daily returns
+        daily_returns = prices.pct_change().fillna(0)
+
+        # Ensure signals and daily_returns have the same index
+        signals = signals.loc[daily_returns.index]
+
+        # Initialize daily_captures as float
+        daily_captures = pd.Series(0.0, index=signals.index, dtype='float64')
+
+        buy_mask = signals == 'Buy'
+        short_mask = signals == 'Short'
+
+        daily_captures[buy_mask] = daily_returns[buy_mask] * 100
+        daily_captures[short_mask] = -daily_returns[short_mask] * 100
+
+        cumulative_captures = daily_captures.cumsum()
+
+        # Prepare metrics
+        trigger_days = (buy_mask | short_mask).sum()
+        wins = (daily_captures > 0).sum()
+        losses = (daily_captures <= 0).sum()
+        win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
+        avg_daily_capture = daily_captures.mean() if trigger_days > 0 else 0
+        total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0
+
+        metrics_data.append({
+            'Secondary Ticker': secondary_ticker.upper(),
+            'Trigger Days': int(trigger_days),
+            'Wins': int(wins),
+            'Losses': int(losses),
+            'Win Ratio (%)': round(win_ratio, 2),
+            'Avg Daily Capture (%)': round(avg_daily_capture, 4),
+            'Total Capture (%)': round(total_capture, 4)
+        })
+
+        # Add trace to figure
+        fig.add_trace(go.Scatter(
+            x=cumulative_captures.index,
+            y=cumulative_captures.values,
+            mode='lines',
+            name=secondary_ticker.upper(),
+            line=dict(width=2),
+        ))
+
+    if not metrics_data:
+        return no_update, no_update, no_update, 'No valid data for secondary tickers.'
+
+    columns = [{'name': col, 'id': col} for col in metrics_data[0].keys()]
+
+    # Update figure layout
+    fig.update_layout(
+        title=dict(
+            text='Combined Signals Capture for Secondary Tickers',
+            font=dict(color='#80ff00')
+        ),
+        xaxis_title='Date',
+        yaxis_title='Cumulative Capture (%)',
+        template='plotly_dark',
+        font=dict(color='#80ff00'),
+        plot_bgcolor='black',
+        paper_bgcolor='black',
+        xaxis=dict(
+            color='#80ff00',
+            showgrid=True,
+            gridcolor='#80ff00',
+            zerolinecolor='#80ff00',
+            linecolor='#80ff00',
+            tickfont=dict(color='#80ff00')
+        ),
+        yaxis=dict(
+            color='#80ff00',
+            showgrid=True,
+            gridcolor='#80ff00',
+            zerolinecolor='#80ff00',
+            linecolor='#80ff00',
+            tickfont=dict(color='#80ff00')
+        )
+    )
+
+    return fig, metrics_data, columns, ''
 
 if __name__ == "__main__":
     # Run the Dash app
