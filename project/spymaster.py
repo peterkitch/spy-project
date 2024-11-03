@@ -2787,261 +2787,255 @@ def update_output_and_reset(combined_capture, historical_top_pairs, chart, ticke
 from dash import dash_table
 
 @app.callback(
-   [Output('secondary-capture-chart', 'figure'),
-    Output('secondary-metrics-table', 'data'),
-    Output('secondary-metrics-table', 'columns'),
-    Output('secondary-ticker-input-feedback', 'children')],
-   [Input('ticker-input', 'value'),
-    Input('secondary-ticker-input', 'value'),
-    Input('invert-signals-toggle', 'value'),
-    Input('show-secondary-annotations-toggle', 'value'),
-    Input('update-interval', 'n_intervals'),
-    Input('trading-recommendations', 'children')],
-   prevent_initial_call=True
+    [Output('secondary-capture-chart', 'figure'),
+     Output('secondary-metrics-table', 'data'),
+     Output('secondary-metrics-table', 'columns'),
+     Output('secondary-ticker-input-feedback', 'children')],
+    [Input('ticker-input', 'value'),
+     Input('secondary-ticker-input', 'value'),
+     Input('invert-signals-toggle', 'value'),
+     Input('show-secondary-annotations-toggle', 'value'),
+     Input('update-interval', 'n_intervals'),
+     Input('trading-recommendations', 'children')],
+    prevent_initial_call=True
 )
 def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, invert_signals, show_annotations, n_intervals, trading_recommendations):
-   empty_fig = go.Figure()
-   empty_fig.update_layout(template='plotly_dark')
-   
-   if not primary_ticker or not secondary_tickers_input:
-       return empty_fig, [], [], ''
+    empty_fig = go.Figure()
+    empty_fig.update_layout(template='plotly_dark')
 
-   # Load and verify primary ticker results
-   results = load_precomputed_results(primary_ticker)
-   if not results:
-       return empty_fig, [], [], 'Waiting for primary ticker data...'
-   
-   # Check for required data components
-   required_keys = ['preprocessed_data', 'active_pairs', 'cumulative_combined_captures']
-   if not all(key in results for key in required_keys):
-       return empty_fig, [], [], 'Waiting for complete primary ticker analysis...'
+    if not primary_ticker or not secondary_tickers_input:
+        return empty_fig, [], [], ''
 
-   # Parse secondary tickers
-   try:
-       logger.info(f"\n{'-' * 80}")
-       logger.info("INITIATING SECONDARY ANALYSIS")
-       logger.info(f"Primary Ticker: {primary_ticker.upper()}")
-       
-       secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
-       if not secondary_tickers:
-           return empty_fig, [], [], 'Please enter valid ticker symbols'
-       
-       # Remove duplicates while preserving order
-       secondary_tickers = list(dict.fromkeys(secondary_tickers))
-       logger.info(f"Processing secondary tickers: {', '.join(secondary_tickers)}")
-       logger.info(f"{'-' * 80}\n")
+    # Load and verify primary ticker results
+    results = load_precomputed_results(primary_ticker)
+    if not results:
+        return empty_fig, [], [], 'Waiting for primary ticker data...'
 
-       # Fetch secondary ticker data
-       secondary_dfs = {}
-       for ticker in secondary_tickers:
-           df = fetch_data(ticker, is_secondary=True)
-           if df is not None and not df.empty:
-               secondary_dfs[ticker] = df
-           else:
-               logger.warning(f"Unable to fetch data for {ticker.upper()}")
+    # Check for required data components
+    required_keys = ['preprocessed_data', 'active_pairs', 'cumulative_combined_captures']
+    if not all(key in results for key in required_keys):
+        return empty_fig, [], [], 'Waiting for complete primary ticker analysis...'
 
-       if not secondary_dfs:
-           return empty_fig, [], [], 'No valid data available for secondary tickers'
+    # Parse secondary tickers
+    try:
+        logger.info(f"\n{'-' * 80}")
+        logger.info("INITIATING SECONDARY ANALYSIS")
+        logger.info(f"Primary Ticker: {primary_ticker.upper()}")
 
-       # Process signals
-       active_pairs = results['active_pairs']
-       cumulative_combined_captures = results['cumulative_combined_captures']
-       dates = cumulative_combined_captures.index
+        secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
+        if not secondary_tickers:
+            return empty_fig, [], [], 'Please enter valid ticker symbols'
 
-       logger.info(f"Processing signals for {len(dates)} trading days")
-       
-       # Initialize containers
-       fig = go.Figure()
-       metrics_list = []
+        # Remove duplicates while preserving order
+        secondary_tickers = list(dict.fromkeys(secondary_tickers))
+        logger.info(f"Processing secondary tickers: {', '.join(secondary_tickers)}")
+        logger.info(f"{'-' * 80}\n")
 
-       # Process each secondary ticker
-       for ticker, secondary_df in secondary_dfs.items():
-           common_dates = dates.intersection(secondary_df.index)
-           if len(common_dates) < 2:
-               logger.warning(f"Insufficient data overlap for {ticker.upper()}")
-               continue
+        # Fetch secondary ticker data
+        secondary_dfs = {}
+        for ticker in secondary_tickers:
+            df = fetch_data(ticker, is_secondary=True)
+            if df is not None and not df.empty:
+                secondary_dfs[ticker] = df
+            else:
+                logger.warning(f"Unable to fetch data for {ticker.upper()}")
 
-           # Align signals
-           signals = pd.Series(active_pairs, index=dates).loc[common_dates]
-           signals_array = signals.values.astype(str)
+        if not secondary_dfs:
+            return empty_fig, [], [], 'No valid data available for secondary tickers'
 
-           # Handle signal inversion if needed
-           if invert_signals:
-               signals_array = np.where(
-                   np.char.startswith(signals_array, 'Buy'),
-                   np.char.replace(signals_array, 'Buy', 'Short', count=1),
-                   np.where(
-                       np.char.startswith(signals_array, 'Short'),
-                       np.char.replace(signals_array, 'Short', 'Buy', count=1),
-                       signals_array
-                   )
-               )
+        # Process signals
+        active_pairs = results['active_pairs']
+        cumulative_combined_captures = results['cumulative_combined_captures']
+        dates = cumulative_combined_captures.index
 
-           # Process signals and returns
-           signals_filled = pd.Series(
-               np.where(signals_array == 'nan', 'None', signals_array),
-               index=common_dates
-           )
+        logger.info(f"Processing signals for {len(dates)} trading days")
 
-           prices = secondary_df['Close'].loc[common_dates].values
-           daily_returns = np.diff(prices) / prices[:-1]
-           daily_returns = np.insert(daily_returns, 0, 0)
+        # Initialize containers
+        fig = go.Figure()
+        metrics_list = []
 
-           # Calculate captures
-           buy_mask = np.char.startswith(signals_filled.values.astype(str), 'Buy')
-           short_mask = np.char.startswith(signals_filled.values.astype(str), 'Short')
+        # Process each secondary ticker
+        for ticker, secondary_df in secondary_dfs.items():
+            common_dates = dates.intersection(secondary_df.index)
+            if len(common_dates) < 2:
+                logger.warning(f"Insufficient data overlap for {ticker.upper()}")
+                continue
 
-           daily_captures = np.zeros(len(signals_filled))
-           daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-           daily_captures[short_mask] = -daily_returns[short_mask] * 100
+            # Align signals and prices
+            signals = pd.Series(active_pairs, index=dates).loc[common_dates]
+            signals = signals.astype(str)
+            prices = secondary_df['Close'].loc[common_dates]
 
-           daily_captures = pd.Series(daily_captures, index=signals_filled.index)
-           daily_captures = daily_captures.fillna(0.0)
-           daily_captures = daily_captures.shift(1).fillna(0.0)
-           cumulative_captures = daily_captures.cumsum()
+            # Apply inversion if necessary
+            if invert_signals:
+                signals = signals.apply(
+                    lambda x: 'Short' if x.startswith('Buy') else
+                              'Buy' if x.startswith('Short') else x
+                )
 
-           # Calculate metrics
-           trigger_days = int(np.sum(buy_mask | short_mask))
-           metrics = {'Ticker': ticker, 'Trigger Days': trigger_days}
-           
-           if trigger_days > 0:
-               active_days = buy_mask | short_mask
-               active_days_shifted = np.roll(active_days, 1)
-               active_days_shifted[0] = False
-               
-               signal_captures = daily_captures[active_days_shifted]
-               wins = int(np.sum(signal_captures > 0))
-               
-               metrics.update({
-                   'Wins': wins,
-                   'Losses': trigger_days - wins,
-                   'Win Ratio (%)': round((wins / trigger_days * 100), 2),
-                   'Avg Daily Capture (%)': round(np.mean(signal_captures), 4),
-                   'Total Capture (%)': round(float(cumulative_captures.iloc[-1]), 4)
-               })
-           else:
-               metrics.update({
-                   'Wins': 0, 'Losses': 0, 'Win Ratio (%)': 0.0,
-                   'Avg Daily Capture (%)': 0.0, 'Total Capture (%)': 0.0
-               })
+            # Process signals to extract 'Buy', 'Short', or 'None'
+            signals = signals.apply(
+                lambda x: 'Buy' if x.strip().startswith('Buy') else
+                          'Short' if x.strip().startswith('Short') else 'None'
+            )
 
-           metrics_list.append(metrics)
-           logger.info(f"Processed {ticker} - Capture: {metrics['Total Capture (%)']:.2f}%, "
-                      f"Win Ratio: {metrics['Win Ratio (%)']:.2f}%, "
-                      f"Days: {metrics['Trigger Days']}")
+            # Reindex signals and prices to a common index
+            common_index = signals.index.union(prices.index)
+            signals = signals.reindex(common_index).fillna('None')
+            prices = prices.reindex(common_index).ffill()
 
-           # Add chart trace
-           fig.add_trace(go.Scatter(
-               x=cumulative_captures.index,
-               y=cumulative_captures,
-               mode='lines',
-               name=ticker,
-               line=dict(width=2),
-               hovertemplate=(
-                   "Ticker: " + ticker + "<br>" +
-                   "Date: %{x}<br>" +
-                   "Cumulative Capture: %{y:.2f}%<br>" +
-                   "Signal: %{customdata}<br>" +
-                   "<extra></extra>"
-               ),
-               customdata=signals_filled.values
-           ))
+            # Compute daily returns
+            daily_returns = prices.pct_change().fillna(0)
 
-       if not metrics_list:
-           return empty_fig, [], [], 'No valid data available for processing'
+            # Ensure signals and daily_returns have the same index
+            signals = signals.loc[daily_returns.index]
 
-       # Prepare metrics table
-       metrics_df = pd.DataFrame(metrics_list)
-       metrics_df.sort_values(by='Avg Daily Capture (%)', ascending=False, inplace=True)
-       columns = [{'name': col, 'id': col} for col in metrics_df.columns]
-       data = metrics_df.to_dict('records')
+            # Calculate captures
+            buy_mask = signals == 'Buy'
+            short_mask = signals == 'Short'
 
-       # Configure chart layout
-       fig.update_layout(
-           title=dict(
-               text=f'{", ".join(secondary_dfs.keys())} Following {primary_ticker.upper()} {"(Inverted)" if invert_signals else ""} Signals',
-               font=dict(color='#80ff00')
-           ),
-           xaxis_title='Date',
-           yaxis_title='Cumulative Capture (%)',
-           hovermode='x unified',
-           template='plotly_dark',
-           showlegend=True,
-           font=dict(color='#80ff00'),
-           plot_bgcolor='black',
-           paper_bgcolor='black',
-           xaxis=dict(
-               color='#80ff00',
-               showgrid=True,
-               gridcolor='#80ff00',
-               zerolinecolor='#80ff00',
-               linecolor='#80ff00',
-               tickfont=dict(color='#80ff00')
-           ),
-           yaxis=dict(
-               color='#80ff00',
-               showgrid=True,
-               gridcolor='#80ff00',
-               zerolinecolor='#80ff00',
-               linecolor='#80ff00',
-               tickfont=dict(color='#80ff00')
-           )
-       )
+            daily_captures = pd.Series(0.0, index=signals.index)
+            daily_captures[buy_mask] = daily_returns[buy_mask] * 100
+            daily_captures[short_mask] = -daily_returns[short_mask] * 100
 
-       # Add annotations if enabled
-       if show_annotations:
-           shapes = []
-           annotations = []
-           
-           signals = pd.Series(active_pairs, index=dates).loc[common_dates]
-           if invert_signals:
-               signals = signals.apply(lambda x: 'Short' if x.startswith('Buy') else 'Buy' if x.startswith('Short') else x)
-           
-           changes = signals != signals.shift(1)
-           change_dates = signals.index[changes]
-           change_values = signals[changes]
-           
-           for date, signal in zip(change_dates, change_values):
-               shapes.append(dict(
-                   type="line",
-                   xref="x",
-                   yref="paper",
-                   x0=date,
-                   x1=date,
-                   y0=0,
-                   y1=1,
-                   line=dict(
-                       color="#80ff00",
-                       width=1,
-                       dash="dash"
-                   ),
-                   opacity=0.5
-               ))
-               
-               annotations.append(dict(
-                   x=date,
-                   y=1,
-                   xref="x",
-                   yref="paper",
-                   text=signal,
-                   showarrow=False,
-                   font=dict(
-                       color="#80ff00",
-                       size=10
-                   ),
-                   bgcolor="rgba(0,0,0,0.5)",
-                   xanchor='left',
-                   yanchor='top'
-               ))
-           
-           fig.update_layout(shapes=shapes, annotations=annotations)
+            cumulative_captures = daily_captures.cumsum()
 
-       return fig, data, columns, ''
+            # Calculate metrics
+            trigger_days = int((buy_mask | short_mask).sum())
+            metrics = {'Ticker': ticker, 'Trigger Days': trigger_days}
 
-   except Exception as e:
-       logger.error(f"Error in secondary chart processing: {str(e)}")
-       logger.error(traceback.format_exc())
-       return empty_fig, [], [], f'Processing error: {str(e)}'
+            if trigger_days > 0:
+                signal_captures = daily_captures[buy_mask | short_mask]
+                wins = int((signal_captures > 0).sum())
+                losses = trigger_days - wins
+                win_ratio = round((wins / trigger_days * 100), 2) if trigger_days > 0 else 0.0
+                avg_daily_capture = round(signal_captures.mean(), 4) if trigger_days > 0 else 0.0
+                total_capture = round(cumulative_captures.iloc[-1], 4) if not cumulative_captures.empty else 0.0
+
+                metrics.update({
+                    'Wins': wins,
+                    'Losses': losses,
+                    'Win Ratio (%)': win_ratio,
+                    'Avg Daily Capture (%)': avg_daily_capture,
+                    'Total Capture (%)': total_capture
+                })
+            else:
+                metrics.update({
+                    'Wins': 0, 'Losses': 0, 'Win Ratio (%)': 0.0,
+                    'Avg Daily Capture (%)': 0.0, 'Total Capture (%)': 0.0
+                })
+
+            metrics_list.append(metrics)
+            logger.info(f"Processed {ticker} - Capture: {metrics['Total Capture (%)']:.2f}%, "
+                        f"Win Ratio: {metrics['Win Ratio (%)']:.2f}%, "
+                        f"Days: {metrics['Trigger Days']}")
+
+            # Add chart trace
+            fig.add_trace(go.Scatter(
+                x=cumulative_captures.index,
+                y=cumulative_captures.values,
+                mode='lines',
+                name=ticker,
+                line=dict(width=2),
+                hovertemplate=(
+                    "Ticker: " + ticker + "<br>" +
+                    "Date: %{x}<br>" +
+                    "Cumulative Capture: %{y:.2f}%<br>" +
+                    "Signal: %{customdata}<br>" +
+                    "<extra></extra>"
+                ),
+                customdata=signals.values
+            ))
+
+        if not metrics_list:
+            return empty_fig, [], [], 'No valid data available for processing'
+
+        # Prepare metrics table
+        metrics_df = pd.DataFrame(metrics_list)
+        metrics_df.sort_values(by='Avg Daily Capture (%)', ascending=False, inplace=True)
+        columns = [{'name': col, 'id': col} for col in metrics_df.columns]
+        data = metrics_df.to_dict('records')
+
+        # Configure chart layout
+        fig.update_layout(
+            title=dict(
+                text=f'{", ".join(secondary_dfs.keys())} Following {primary_ticker.upper()} {"(Inverted)" if invert_signals else ""} Signals',
+                font=dict(color='#80ff00')
+            ),
+            xaxis_title='Date',
+            yaxis_title='Cumulative Capture (%)',
+            hovermode='x unified',
+            template='plotly_dark',
+            showlegend=True,
+            font=dict(color='#80ff00'),
+            plot_bgcolor='black',
+            paper_bgcolor='black',
+            xaxis=dict(
+                color='#80ff00',
+                showgrid=True,
+                gridcolor='#80ff00',
+                zerolinecolor='#80ff00',
+                linecolor='#80ff00',
+                tickfont=dict(color='#80ff00')
+            ),
+            yaxis=dict(
+                color='#80ff00',
+                showgrid=True,
+                gridcolor='#80ff00',
+                zerolinecolor='#80ff00',
+                linecolor='#80ff00',
+                tickfont=dict(color='#80ff00')
+            )
+        )
+
+        # Add annotations if enabled
+        if show_annotations:
+            shapes = []
+            annotations = []
+
+            # Identify signal changes
+            signal_changes = signals[signals != signals.shift(1)]
+            for date, signal in signal_changes.iteritems():
+                shapes.append(dict(
+                    type="line",
+                    xref="x",
+                    yref="paper",
+                    x0=date,
+                    x1=date,
+                    y0=0,
+                    y1=1,
+                    line=dict(
+                        color="#80ff00",
+                        width=1,
+                        dash="dash"
+                    ),
+                    opacity=0.5
+                ))
+
+                annotations.append(dict(
+                    x=date,
+                    y=1,
+                    xref="x",
+                    yref="paper",
+                    text=signal,
+                    showarrow=False,
+                    font=dict(
+                        color="#80ff00",
+                        size=10
+                    ),
+                    bgcolor="rgba(0,0,0,0.5)",
+                    xanchor='left',
+                    yanchor='top'
+                ))
+
+            fig.update_layout(shapes=shapes, annotations=annotations)
+
+        return fig, data, columns, ''
+
+    except Exception as e:
+        logger.error(f"Error in secondary chart processing: {str(e)}")
+        logger.error(traceback.format_exc())
+        return empty_fig, [], [], f'Processing error: {str(e)}'
 
 # Callback to add/remove primary ticker inputs dynamically
 @app.callback(
