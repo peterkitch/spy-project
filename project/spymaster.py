@@ -2351,6 +2351,14 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     total_capture = signal_captures.sum() if trigger_days > 0 else 0
     std_dev = signal_captures.std() if trigger_days > 0 else 0
     
+    # Calculate annualized Sharpe Ratio
+    if trigger_days > 0 and std_dev != 0:
+        annualized_return = avg_daily_capture * 252
+        annualized_std = std_dev * np.sqrt(252)
+        sharpe_ratio = (annualized_return - 5.0) / annualized_std  # Using annual 5% risk-free rate
+    else:
+        sharpe_ratio = 0
+    
     # Calculate combined win ratio
     combined_win_ratio = combined_wins / combined_trigger_days if combined_trigger_days > 0 else 0
 
@@ -2506,9 +2514,10 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                 html.P(f"Total Capture (%): {total_capture:.4f}%", className="mb-1"),
                 html.P(f"Average Daily Capture (%): {avg_daily_capture:.4f}%", className="mb-1"),
                 html.P(f"Daily Standard Deviation (%): {std_dev:.4f}%", className="mb-1"),
-                html.P(f"Trigger Days: {trigger_days:,}", className="mb-1"),
-                html.P(f"Wins: {wins:,}", className="mb-1"),
-                html.P(f"Losses: {losses:,}", className="mb-1"),
+                html.P(f"Annualized Sharpe Ratio: {sharpe_ratio:.2f}", className="mb-1"),
+                html.P(f"Trigger Days: {combined_trigger_days:,}", className="mb-1"),
+                html.P(f"Wins: {combined_wins:,}", className="mb-1"),
+                html.P(f"Losses: {combined_losses:,}", className="mb-1"),
                 html.P(f"Win Ratio: {win_ratio:.2f}%", className="mb-1"),
             ], className="mb-4"),
             
@@ -2942,11 +2951,15 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 total_capture = round(cumulative_captures.iloc[-1], 4) if not cumulative_captures.empty else 0.0
 
                 std_dev = round(signal_captures.std(), 4) if trigger_days > 0 else 0.0
+                risk_free_rate = 5.0  # 5% annual rate
+                daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
+                sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
                 metrics.update({
                     'Wins': wins,
                     'Losses': losses,
                     'Win Ratio (%)': win_ratio,
                     'Std Dev (%)': std_dev,
+                    'Sharpe Ratio': round(sharpe_ratio, 2),
                     'Avg Daily Capture (%)': avg_daily_capture,
                     'Total Capture (%)': total_capture
                 })
@@ -3286,6 +3299,9 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         # Ensure losses is calculated correctly
         losses = trigger_days - wins  # This ensures losses + wins = trigger_days
         
+        risk_free_rate = 5.0  # 5% annual rate
+        daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
+        sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
         metrics_data.append({
             'Secondary Ticker': secondary_ticker.upper(),
             'Trigger Days': int(trigger_days),
@@ -3293,6 +3309,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
             'Losses': int(losses),
             'Win Ratio (%)': round(win_ratio, 2),
             'Std Dev (%)': round(std_dev, 4),
+            'Sharpe Ratio': round(sharpe_ratio, 2),
             'Avg Daily Capture (%)': round(avg_daily_capture, 4),
             'Total Capture (%)': round(total_capture, 4)
         })
