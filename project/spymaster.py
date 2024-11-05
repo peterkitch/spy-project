@@ -16,6 +16,7 @@ import tempfile
 import shutil
 import time
 import numpy as np
+from scipy import stats
 import gc
 import threading
 from threading import Lock
@@ -2266,6 +2267,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     combined_trigger_days = 0
     combined_wins = 0
     combined_losses = 0
+    all_captures = []  # Store all daily captures for statistical analysis
 
     for date in df.index[1:]:  # Start from the second day to calculate returns
         prev_date = df.index[df.index < date][-1]  # Get the previous trading day
@@ -2350,7 +2352,26 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0
     total_capture = signal_captures.sum() if trigger_days > 0 else 0
     std_dev = signal_captures.std() if trigger_days > 0 else 0
-    
+
+    # Calculate statistical significance
+    if trigger_days > 1 and std_dev > 0:
+        t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+        degrees_of_freedom = trigger_days - 1
+        p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+        
+        # Log statistical significance results
+        logger.info("\nStatistical Significance Analysis:")
+        logger.info(f"t-Statistic: {t_statistic:.4f}")
+        logger.info(f"p-Value: {p_value:.4f}")
+        logger.info(f"Degrees of Freedom: {degrees_of_freedom}")
+        logger.info("Confidence Levels:")
+        logger.info(f"  90% (p < 0.10): {'Significant' if p_value < 0.10 else 'Not Significant'}")
+        logger.info(f"  95% (p < 0.05): {'Significant' if p_value < 0.05 else 'Not Significant'}")
+        logger.info(f"  99% (p < 0.01): {'Significant' if p_value < 0.01 else 'Not Significant'}\n")
+    else:
+        t_statistic = None
+        p_value = None
+        
     # Calculate annualized Sharpe Ratio
     if trigger_days > 0 and std_dev != 0:
         annualized_return = avg_daily_capture * 252
@@ -2358,7 +2379,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         sharpe_ratio = (annualized_return - 5.0) / annualized_std  # Using annual 5% risk-free rate
     else:
         sharpe_ratio = 0
-    
+        
     # Calculate combined win ratio
     combined_win_ratio = combined_wins / combined_trigger_days if combined_trigger_days > 0 else 0
 
@@ -2515,6 +2536,20 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                 html.P(f"Average Daily Capture (%): {avg_daily_capture:.4f}%", className="mb-1"),
                 html.P(f"Daily Standard Deviation (%): {std_dev:.4f}%", className="mb-1"),
                 html.P(f"Annualized Sharpe Ratio: {sharpe_ratio:.2f}", className="mb-1"),
+                html.Div([
+                    html.H5("Statistical Significance Analysis:", className="mb-2"),
+                    html.P(f"t-Statistic: {t_statistic:.4f}" if t_statistic is not None else "t-Statistic: N/A", className="mb-1"),
+                    html.P(f"p-Value: {p_value:.4f}" if p_value is not None else "p-Value: N/A", className="mb-1"),
+                    html.P("Confidence Levels:", className="mb-1"),
+                    html.Ul([
+                        html.Li(f"90% Confidence: {'Significant' if p_value is not None and p_value < 0.10 else 'Not Significant'}", 
+                            style={'color': 'green' if p_value is not None and p_value < 0.10 else 'red'}),
+                        html.Li(f"95% Confidence: {'Significant' if p_value is not None and p_value < 0.05 else 'Not Significant'}", 
+                            style={'color': 'green' if p_value is not None and p_value < 0.05 else 'red'}),
+                        html.Li(f"99% Confidence: {'Significant' if p_value is not None and p_value < 0.01 else 'Not Significant'}", 
+                            style={'color': 'green' if p_value is not None and p_value < 0.01 else 'red'}),
+                    ], className="mb-2"),
+                ], className="mb-3"),
                 html.P(f"Trigger Days: {combined_trigger_days:,}", className="mb-1"),
                 html.P(f"Wins: {combined_wins:,}", className="mb-1"),
                 html.P(f"Losses: {combined_losses:,}", className="mb-1"),
@@ -2954,12 +2989,28 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 risk_free_rate = 5.0  # 5% annual rate
                 daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
                 sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
+                
+                # Calculate statistical significance
+                if trigger_days > 1 and std_dev > 0:
+                    t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+                    degrees_of_freedom = trigger_days - 1
+                    p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+                    t_statistic = round(t_statistic, 4)
+                    p_value = round(p_value, 4)
+                else:
+                    t_statistic = None
+                    p_value = None
                 metrics.update({
                     'Wins': wins,
                     'Losses': losses,
                     'Win Ratio (%)': win_ratio,
                     'Std Dev (%)': std_dev,
                     'Sharpe Ratio': round(sharpe_ratio, 2),
+                    't-Statistic': t_statistic if t_statistic is not None else 'N/A',
+                    'p-Value': p_value if p_value is not None else 'N/A',
+                    'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+                    'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+                    'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
                     'Avg Daily Capture (%)': avg_daily_capture,
                     'Total Capture (%)': total_capture
                 })
@@ -3302,6 +3353,17 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         risk_free_rate = 5.0  # 5% annual rate
         daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
         sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
+        # Calculate statistical significance
+        if trigger_days > 1 and std_dev > 0:
+            t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+            degrees_of_freedom = trigger_days - 1
+            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+            t_statistic = round(t_statistic, 4)
+            p_value = round(p_value, 4)
+        else:
+            t_statistic = None
+            p_value = None
+
         metrics_data.append({
             'Secondary Ticker': secondary_ticker.upper(),
             'Trigger Days': int(trigger_days),
@@ -3310,6 +3372,11 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
             'Win Ratio (%)': round(win_ratio, 2),
             'Std Dev (%)': round(std_dev, 4),
             'Sharpe Ratio': round(sharpe_ratio, 2),
+            't-Statistic': t_statistic if t_statistic is not None else 'N/A',
+            'p-Value': p_value if p_value is not None else 'N/A',
+            'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+            'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+            'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
             'Avg Daily Capture (%)': round(avg_daily_capture, 4),
             'Total Capture (%)': round(total_capture, 4)
         })
