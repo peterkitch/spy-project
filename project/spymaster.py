@@ -2260,7 +2260,9 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
     daily_top_short_pairs = results.get('daily_top_short_pairs', {})
 
+    # Initialize arrays for combined strategy analysis
     combined_returns = []
+    daily_returns = df['Close'].pct_change().fillna(0)  # Pre-calculate daily returns
     combined_trigger_days = 0
     combined_wins = 0
     combined_losses = 0
@@ -2301,30 +2303,56 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             combined_returns.append(combined_return)
 
-    combined_returns = np.array(combined_returns)
-    trigger_day_returns = []
-    returns_index = 0
+    # Combined Strategy Performance
+    signals = pd.Series('None', index=df.index[1:])
+    daily_returns = df['Close'].pct_change().loc[df.index[1:]]
+
+    for date in df.index[1:]:
+        prev_date = df.index[df.index < date][-1]
+
+        buy_pair, buy_capture = daily_top_buy_pairs.get(prev_date, ((0, 0), 0))
+        short_pair, short_capture = daily_top_short_pairs.get(prev_date, ((0, 0), 0))
+
+        if buy_pair != (0, 0) and short_pair != (0, 0):
+            buy_signal = df[f'SMA_{buy_pair[0]}'].loc[prev_date] > df[f'SMA_{buy_pair[1]}'].loc[prev_date]
+            short_signal = df[f'SMA_{short_pair[0]}'].loc[prev_date] < df[f'SMA_{short_pair[1]}'].loc[prev_date]
+
+            if buy_signal and short_signal:
+                if buy_capture > short_capture:
+                    signal = 'Buy'
+                else:
+                    signal = 'Short'
+            elif buy_signal:
+                signal = 'Buy'
+            elif short_signal:
+                signal = 'Short'
+            else:
+                signal = 'None'
+        else:
+            signal = 'None'
+
+        signals.loc[date] = signal
+
+    # Create daily captures
+    daily_captures = pd.Series(0.0, index=signals.index)
+    buy_mask = signals == 'Buy'
+    short_mask = signals == 'Short'
+
+    daily_captures[buy_mask] = daily_returns[buy_mask] * 100
+    daily_captures[short_mask] = -daily_returns[short_mask] * 100
+
+    # Calculate metrics
+    trigger_days = int((buy_mask | short_mask).sum())
+    signal_captures = daily_captures[buy_mask | short_mask]
+    wins = int((signal_captures > 0).sum())
+    losses = trigger_days - wins
+    win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
+    avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0
+    total_capture = signal_captures.sum() if trigger_days > 0 else 0
+    std_dev = signal_captures.std() if trigger_days > 0 else 0
     
-    # Get returns only for trigger days
-    for ret in combined_returns:
-        if returns_index < combined_trigger_days:
-            if ret != 0:  # If it's a trigger day with non-zero return
-                trigger_day_returns.append(ret)
-                returns_index += 1
-
-    trigger_day_returns = np.array(trigger_day_returns)
-    combined_total_capture = np.sum(trigger_day_returns) * 100
+    # Calculate combined win ratio
     combined_win_ratio = combined_wins / combined_trigger_days if combined_trigger_days > 0 else 0
-    combined_avg_capture = combined_total_capture / combined_trigger_days if combined_trigger_days > 0 else 0
-
-    combined_strategy_text = f"""
-    Combined Strategy Performance:
-    Total Capture: {combined_total_capture:.4f}%
-    Avg. Daily Capture: {combined_avg_capture:.4f}%
-    Win Ratio: {combined_win_ratio * 100:.2f}%
-    Trigger Days: {combined_trigger_days}
-    Wins: {combined_wins}, Losses: {combined_losses}
-    """
 
     # Performance expectation (using the next trading signal)
     if next_trading_signal_type == "Buy":
@@ -2475,12 +2503,13 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             html.Div([
                 html.H4("4. Combined Strategy Performance", className="mb-3"),
-                html.P(f"Total Capture (%): {combined_total_capture:.4f}%", className="mb-1"),
-                html.P(f"Average Daily Capture (%): {combined_avg_capture:.4f}%", className="mb-1"),
-                html.P(f"Trigger Days: {combined_trigger_days:,}", className="mb-1"),
-                html.P(f"Wins: {combined_wins:,}", className="mb-1"),
-                html.P(f"Losses: {combined_losses:,}", className="mb-1"),
-                html.P(f"Win Ratio: {combined_win_ratio * 100:.2f}%", className="mb-1"),
+                html.P(f"Total Capture (%): {total_capture:.4f}%", className="mb-1"),
+                html.P(f"Average Daily Capture (%): {avg_daily_capture:.4f}%", className="mb-1"),
+                html.P(f"Daily Standard Deviation (%): {std_dev:.4f}%", className="mb-1"),
+                html.P(f"Trigger Days: {trigger_days:,}", className="mb-1"),
+                html.P(f"Wins: {wins:,}", className="mb-1"),
+                html.P(f"Losses: {losses:,}", className="mb-1"),
+                html.P(f"Win Ratio: {win_ratio:.2f}%", className="mb-1"),
             ], className="mb-4"),
             
             html.Div([
@@ -2912,10 +2941,12 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 avg_daily_capture = round(signal_captures.mean(), 4) if trigger_days > 0 else 0.0
                 total_capture = round(cumulative_captures.iloc[-1], 4) if not cumulative_captures.empty else 0.0
 
+                std_dev = round(signal_captures.std(), 4) if trigger_days > 0 else 0.0
                 metrics.update({
                     'Wins': wins,
                     'Losses': losses,
                     'Win Ratio (%)': win_ratio,
+                    'Std Dev (%)': std_dev,
                     'Avg Daily Capture (%)': avg_daily_capture,
                     'Total Capture (%)': total_capture
                 })
@@ -3247,15 +3278,21 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         wins = (daily_captures > 0).sum()
         losses = (daily_captures <= 0).sum()
         win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-        avg_daily_capture = daily_captures.mean() if trigger_days > 0 else 0
+        # Calculate metrics only on trigger days (buy or short)
+        trigger_mask = buy_mask | short_mask
+        avg_daily_capture = daily_captures[trigger_mask].mean() if trigger_days > 0 else 0
         total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0
-
+        std_dev = daily_captures[trigger_mask].std() if trigger_days > 0 else 0
+        # Ensure losses is calculated correctly
+        losses = trigger_days - wins  # This ensures losses + wins = trigger_days
+        
         metrics_data.append({
             'Secondary Ticker': secondary_ticker.upper(),
             'Trigger Days': int(trigger_days),
             'Wins': int(wins),
             'Losses': int(losses),
             'Win Ratio (%)': round(win_ratio, 2),
+            'Std Dev (%)': round(std_dev, 4),
             'Avg Daily Capture (%)': round(avg_daily_capture, 4),
             'Total Capture (%)': round(total_capture, 4)
         })
