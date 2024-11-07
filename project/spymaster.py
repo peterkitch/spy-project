@@ -28,11 +28,14 @@ import random
 import glob
 from collections import defaultdict
 import warnings
+import pytz
 
 # Initialize the Dash app with a dark theme and custom styles
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 
 master_stopwatch_start = None
+
+status_lock = threading.Lock()
 
 # Remove any existing handlers
 for handler in logging.root.handlers[:]:
@@ -122,47 +125,54 @@ def fetch_data(ticker, is_secondary=False):
         # Add retries for network issues
         max_retries = 3
         retry_delay = 2
+        df = pd.DataFrame()
         for attempt in range(max_retries):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     df = yf.download(ticker, period='max', interval='1d', progress=False)
-                break
+                if not df.empty:
+                    break
             except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}. Retrying...")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"All attempts failed for {ticker}")
-                    write_status(ticker, {"status": "failed", "message": "Download failed"})
-                    return pd.DataFrame()
+                logger.warning(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}. Retrying...")
+                time.sleep(retry_delay)
+        else:
+            # If df is empty after all retries
+            logger.error(f"No data fetched for {ticker}")
+            write_status(ticker, {"status": "failed", "message": "No data"})
+            return pd.DataFrame()
+
+        # Ensure the index is datetime and timezone naive
         df.index = pd.to_datetime(df.index).tz_localize(None)
         
         # Handle column names properly
         if isinstance(df.columns, pd.MultiIndex):
-            # Get the Close prices while maintaining proper column name
-            close_data = df['Close'][ticker] if ('Close', ticker) in df.columns else None
-            if close_data is not None:
-                df = pd.DataFrame({'Close': close_data}, index=df.index)
+            # For MultiIndex, get the Close prices for the ticker
+            if ('Close', ticker) in df.columns:
+                close_data = df['Close'][ticker]
+            elif ('Close', '') in df.columns:
+                close_data = df['Close']['']
             else:
-                logger.error(f"Could not find Close price data for {ticker}")
+                logger.error(f"Could not find Close price data for {ticker} in MultiIndex columns")
                 return pd.DataFrame()
+            df = pd.DataFrame({'Close': close_data}, index=df.index)
         else:
             # For single-level columns, standardize names
             df.columns = [str(col).capitalize() for col in df.columns]
             if 'Close' not in df.columns:
-                logger.error(f"Close column not found in single-level columns")
+                logger.error(f"Close column not found in single-level columns for {ticker}")
                 return pd.DataFrame()
+            df = df[['Close']]
         
         if df.empty:
             logger.error(f"No valid data found for {ticker}")
-            return df
+            return pd.DataFrame()
         
         if not is_secondary:
             logging.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
             # Add a row for the current date if it's not included
             today = pd.Timestamp.now().normalize().tz_localize(None)
-            if len(df) > 0 and df.index[-1] < today:  # Check if df has data before accessing index
+            if len(df) > 0 and df.index[-1] < today:
                 last_row = df.iloc[-1].copy()
                 last_row.name = today
                 df = pd.concat([df, last_row.to_frame().T])
@@ -309,16 +319,16 @@ def compute_signals(df, sma1, sma2):
 
 def write_status(ticker, status):
     ticker = normalize_ticker(ticker)
-    status_path = f"{ticker}_status.json"
+    status_file = f"{ticker}_status.json"
     with status_lock:
-        with open(status_path, 'w') as f:
+        with open(status_file, 'w') as f:
             json.dump(status, f)
 
 def save_precomputed_results(ticker, results):
     ticker = normalize_ticker(ticker)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, f'{ticker}_precomputed_results_temp.pkl')
+    # Use a unique temporary file in the current directory to avoid conflicts
+    temp_file_path = os.path.join(current_dir, f'{ticker}_precomputed_results_temp_{threading.get_ident()}.pkl')
     final_file_path = os.path.join(current_dir, f'{ticker}_precomputed_results.pkl')
 
     try:
@@ -336,21 +346,27 @@ def save_precomputed_results(ticker, results):
         with open(temp_file_path, 'wb') as f:
             pickle.dump(main_results, f)
 
-        # Atomically move the temp file to the final destination
-        shutil.move(temp_file_path, final_file_path)
-        logging.info(f"Main results saved successfully to {final_file_path}")
-        logging.info(f"Number of daily_top_buy_pairs saved: {len(main_results.get('daily_top_buy_pairs', {}))}")
-        logging.info(f"Number of daily_top_short_pairs saved: {len(main_results.get('daily_top_short_pairs', {}))}")
-
-        # Since buy_results and short_results are saved in chunks during processing,
-        # we no longer need to save them here.
-
-        logging.info(f"All results saved successfully for {ticker}")
+        # Atomically replace the final file with the temp file
+        try:
+            os.replace(temp_file_path, final_file_path)
+            logging.info(f"Main results saved successfully to {final_file_path}")
+            logging.info(f"Number of daily_top_buy_pairs saved: {len(main_results.get('daily_top_buy_pairs', {}))}")
+            logging.info(f"Number of daily_top_short_pairs saved: {len(main_results.get('daily_top_short_pairs', {}))}")
+            logging.info(f"All results saved successfully for {ticker}")
+        except Exception as e:
+            logging.error(f"Error saving results for {ticker}: {str(e)}")
+            logging.error(traceback.format_exc())
+            # Clean up temp file if it exists
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
     except PermissionError:
         logging.error(f"Permission denied when saving results to {final_file_path}. Please check file permissions.")
     except Exception as e:
         logging.error(f"Error saving results for {ticker}: {str(e)}")
         logging.error(traceback.format_exc())
+        # Clean up temp file if it exists
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
     # Return the main_results even if an exception occurred
     return main_results
@@ -570,53 +586,112 @@ def precompute_results(ticker, event):
             
             if not needs_precompute:
                 logger.info(f"Existing results found for {ticker} and no precomputation needed. Using existing results.")
+                # Load existing results
+                results = load_precomputed_results(ticker)
+                # Ensure 'active_pairs' is present in results
+                if 'active_pairs' not in results or not results['active_pairs']:
+                    # Recalculate cumulative combined captures and active pairs
+                    logger.info(f"'active_pairs' not found or empty for {ticker}, recalculating...")
+                    daily_top_buy_pairs = results.get('daily_top_buy_pairs')
+                    daily_top_short_pairs = results.get('daily_top_short_pairs')
+                    if daily_top_buy_pairs and daily_top_short_pairs:
+                        df = results['preprocessed_data']
+                        cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
+                            df, daily_top_buy_pairs, daily_top_short_pairs)
+                        results['cumulative_combined_captures'] = cumulative_combined_captures
+                        results['active_pairs'] = active_pairs
+                        # Save the updated results
+                        save_precomputed_results(ticker, results)
+                    else:
+                        logger.warning(f"Missing daily top pairs for {ticker}, unable to recalculate 'active_pairs'.")
+
+                # Update status, cache, and signal loading completion
+                write_status(ticker, {"status": "complete", "progress": 100})
                 with _loading_lock:
-                    _precomputed_results_cache[ticker] = existing_results
-                return existing_results
-            
-            results = existing_results or {}
-            
-            start_date = df.index.min().strftime('%Y-%m-%d')
-            last_date = df.index.max().strftime('%Y-%m-%d')
-            logger.info(f"Date range: {start_date} to {last_date}")
+                    _precomputed_results_cache[ticker] = results
+                    # Signal that loading is complete
+                    if ticker in _loading_in_progress:
+                        _loading_in_progress[ticker].set()
+                        del _loading_in_progress[ticker]
 
-            # Begin SMA Calculation
-            log_section("SMA Calculation")
-            logger.info("Calculating new SMA columns...")
+                # Force an update of the Dash app
+                logger.info("Updating Dash app layout...")
+                app.layout = app.layout
+                logger.info("Dash app layout updated.")
 
-            # Prepare a list to store SMA DataFrames
-            sma_list = []
+                # Store timing information if needed (optional)
+                results['section_times'] = section_times
+                results['start_time'] = master_stopwatch_start
 
-            logger.info("Beginning SMA calculations in chunks...")
-            chunk_size_sma = 50  # Adjust based on memory constraints
-            total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
-            
-            with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
-                for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
-                    chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
-                    sma_dict = {}
-                    for j in range(i, chunk_end):
-                        sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
-                        sma_dict[f'SMA_{j}'] = sma_values
-                    sma_chunk = pd.DataFrame(sma_dict, index=df.index)
-                    sma_list.append(sma_chunk)
-                    gc.collect()
-                    pbar.update(1)
-                    
-            logger.info(f"Completed SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
+                # Print final message
+                logger.info("Computation and loading process completed.")
 
-            # Concatenate all SMA chunks and add to the DataFrame at once
-            sma_df = pd.concat(sma_list, axis=1)
-            df = pd.concat([df, sma_df], axis=1)
-            df = df.copy()  # De-fragment the DataFrame
+                # Return the results
+                return results
 
-            logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
+            else:
+                # Proceed with precomputations as before (no changes needed here)
+                results = existing_results or {}
 
-            # Ensure NaN values for the first j-1 rows of each SMA column
-            for j in range(1, max_sma_day + 1):
-                df.iloc[:j-1, df.columns.get_loc(f'SMA_{j}')] = np.nan
+                start_date = df.index.min().strftime('%Y-%m-%d')
+                last_date = df.index.max().strftime('%Y-%m-%d')
+                logger.info(f"Date range: {start_date} to {last_date}")
 
-            logger.info("Ensured correct NaN values for SMA calculations.")
+                # Begin SMA Calculation
+                log_section("SMA Calculation")
+                logger.info("Calculating new SMA columns...")
+
+                # Check if there are new SMA periods to compute
+                if max_sma_day > existing_max_sma_day:
+                    # Prepare a list to store SMA DataFrames
+                    sma_list = []
+
+                    logger.info("Beginning SMA calculations in chunks...")
+                    chunk_size_sma = 50  # Adjust based on memory constraints
+                    total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
+
+                    with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
+                        for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
+                            chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
+                            sma_dict = {}
+                            for j in range(i, chunk_end):
+                                sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
+                                sma_dict[f'SMA_{j}'] = sma_values
+                            sma_chunk = pd.DataFrame(sma_dict, index=df.index)
+                            sma_list.append(sma_chunk)
+                            gc.collect()
+                            pbar.update(1)
+
+                    logger.info(f"Completed SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
+
+                    # Concatenate all SMA chunks and add to the DataFrame at once
+                    sma_df = pd.concat(sma_list, axis=1)
+                    df = pd.concat([df, sma_df], axis=1)
+                    df = df.copy()  # De-fragment the DataFrame
+
+                    logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
+
+                else:
+                    # No new SMA periods to compute
+                    logger.info("No new SMA periods to compute.")
+                    # Update existing SMA columns for new data
+                    logger.info("Updating existing SMA columns for new data.")
+                    # Recalculate existing SMA columns for the new data
+                    for sma_period in range(1, max_sma_day + 1):
+                        sma_column_name = f'SMA_{sma_period}'
+                        df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
+                        df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
+                    df = df.copy()  # De-fragment the DataFrame
+
+                logger.info("SMA columns updated.")
+
+                # Proceed to ensure NaN values for all SMA columns
+                logger.info("Ensuring correct NaN values for SMA calculations.")
+                for j in range(1, max_sma_day + 1):
+                    sma_column_name = f'SMA_{j}'
+                    df.iloc[:j-1, df.columns.get_loc(sma_column_name)] = np.nan
+
+                logger.info("Ensured correct NaN values for SMA calculations.")
 
             # Pre-calculate new SMAs
             sma_columns = {}
@@ -846,13 +921,14 @@ def print_timing_summary(ticker):
 def read_status(ticker):
     ticker = normalize_ticker(ticker)
     status_path = f"{ticker}_status.json"
-    if os.path.exists(status_path):
-        with open(status_path, 'r') as file:
-            try:
-                return json.load(file)
-            except json.JSONDecodeError:
-                print(f"Empty JSON file: {status_path}")
-    return {"status": "not started", "progress": 0}
+    with status_lock:
+        if os.path.exists(status_path):
+            with open(status_path, 'r') as file:
+                try:
+                    return json.load(file)
+                except json.JSONDecodeError:
+                    print(f"Empty JSON file: {status_path}")
+        return {"status": "not started", "progress": 0}
 
 status = read_status('AAPL')
 print(status)
@@ -1262,8 +1338,66 @@ app.layout = html.Div(
                 ], className='mb-3')
             ], width=12)
         ]),
-
-        # Add intervals at the end
+        # Add the Ticker Batch Process section at the base of the Dash app
+        html.H2('Ticker Batch Process', className='text-center mt-5'),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader('Enter Tickers to Batch Process'),
+                    dbc.CardBody([
+                        dbc.Textarea(
+                            id='batch-ticker-input',
+                            placeholder='Enter ticker symbols separated by commas (e.g., AAPL, MSFT, GOOG)',
+                            style={'width': '100%', 'height': '100px'}
+                        ),
+                        dbc.Button('Process Tickers', id='batch-process-button', color='primary', className='mt-2'),
+                        dbc.FormFeedback(id='batch-ticker-input-feedback', className='text-danger')
+                    ])
+                ], className='mb-3'),
+                dcc.Loading(
+                    id="loading-batch-process",
+                    type="default",
+                    children=[
+                        dash_table.DataTable(
+                            id='batch-process-table',
+                            columns=[
+                                {'name': 'Ticker', 'id': 'Ticker'},
+                                {'name': 'Last Date', 'id': 'Last Date'},
+                                {'name': 'Last Price', 'id': 'Last Price'},
+                                {'name': 'Next Day Active Signal', 'id': 'Next Day Active Signal'},
+                                {'name': 'Processing Status', 'id': 'Processing Status'}
+                            ],
+                            data=[],
+                            style_table={
+                                'overflowX': 'auto',
+                                'backgroundColor': 'black',
+                            },
+                            style_cell={
+                                'backgroundColor': 'black',
+                                'color': '#80ff00',
+                                'textAlign': 'left',
+                                'minWidth': '50px',
+                                'width': '100px',
+                                'maxWidth': '180px',
+                                'whiteSpace': 'normal',
+                                'border': '1px solid #80ff00'
+                            },
+                            style_header={
+                                'backgroundColor': 'black',
+                                'color': '#80ff00',
+                                'fontWeight': 'bold',
+                                'border': '2px solid #80ff00'
+                            },
+                            style_data_conditional=[{
+                                'if': {'row_index': 'odd'},
+                                'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                            }],
+                        )
+                    ]
+                )
+            ], width=12)
+        ]),
+        dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
         dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
         dcc.Interval(id='loading-interval', interval=2000, n_intervals=0),  # Update every 2 seconds
         # Loading spinner output (if needed)
@@ -3426,6 +3560,120 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     )
 
     return fig, metrics_data, columns, ''
+
+# Global variables for processing queue, worker thread, and all tickers
+ticker_queue = []
+all_tickers = set()
+processing_thread = None
+processing_lock = threading.Lock()
+
+@app.callback(
+    [Output('batch-process-table', 'data'),
+     Output('batch-ticker-input-feedback', 'children')],
+    [Input('batch-process-button', 'n_clicks'),
+     Input('batch-update-interval', 'n_intervals')],
+    [State('batch-ticker-input', 'value'),
+     State('batch-process-table', 'data')],
+    prevent_initial_call=True
+)
+def batch_process_tickers(n_clicks, n_intervals, tickers_input, existing_table_data):
+    ctx = dash.callback_context
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if triggered_id == 'batch-process-button':
+        if not tickers_input:
+            return existing_table_data or [], 'Please enter at least one ticker symbol.'
+    
+        tickers = [ticker.strip().upper() for ticker in tickers_input.split(',') if ticker.strip()]
+        if not tickers:
+            return existing_table_data or [], 'Please enter valid ticker symbols.'
+    
+        # Add tickers to the processing queue and all_tickers set
+        with processing_lock:
+            for ticker in tickers:
+                all_tickers.add(ticker)
+                if ticker not in ticker_queue:
+                    ticker_queue.append(ticker)
+    
+        # Start the processing thread if not already running
+        global processing_thread
+        if processing_thread is None or not processing_thread.is_alive():
+            processing_thread = threading.Thread(target=process_ticker_queue, daemon=True)
+            processing_thread.start()
+    
+        return existing_table_data or [], ''
+    else:
+        # Interval triggered: Update the DataTable
+        table_data = []
+        tickers_to_check = list(all_tickers)
+        for ticker in tickers_to_check:
+            status = read_status(ticker)
+            if status['status'] == 'complete':
+                results = load_precomputed_results(ticker)
+                if results and 'preprocessed_data' in results:
+                    df = results['preprocessed_data']
+                    # Get the last datetime
+                    last_datetime = df.index[-1]
+                    # Ensure the datetime is timezone-aware (UTC)
+                    if last_datetime.tzinfo is None:
+                        last_datetime = last_datetime.replace(tzinfo=pytz.utc)
+                    # Convert to Los Angeles time zone
+                    la_timezone = pytz.timezone('America/Los_Angeles')
+                    last_datetime_la = last_datetime.astimezone(la_timezone)
+                    # Format date and time
+                    last_date = last_datetime_la.strftime('%Y-%m-%d %I:%M:%S %p')
+                    # Get the last price
+                    last_price = df['Close'].iloc[-1]
+                    # Format the price to two decimal places
+                    last_price = f"${last_price:.2f}"
+                    active_pairs = results.get('active_pairs', [])
+                    next_day_signal = active_pairs[-1] if active_pairs else 'N/A'
+                else:
+                    last_date = 'N/A'
+                    last_price = 'N/A'
+                    next_day_signal = 'N/A'
+                processing_status = 'Complete'
+            elif status['status'] == 'failed':
+                last_date = 'N/A'
+                last_price = 'N/A'
+                next_day_signal = 'N/A'
+                processing_status = 'Failed'
+            elif status['status'] == 'processing':
+                last_date = 'N/A'
+                last_price = 'N/A'
+                next_day_signal = 'N/A'
+                processing_status = 'Processing'
+            else:
+                last_date = 'N/A'
+                last_price = 'N/A'
+                next_day_signal = 'N/A'
+                processing_status = 'Pending'
+    
+            table_data.append({
+                'Ticker': ticker,
+                'Last Date': last_date,
+                'Last Price': last_price,
+                'Next Day Active Signal': next_day_signal,
+                'Processing Status': processing_status
+            })
+    
+        # Sort the table_data list alphabetically by 'Ticker'
+        table_data.sort(key=lambda x: x['Ticker'])
+        return table_data, ''
+
+def process_ticker_queue():
+    while True:
+        with processing_lock:
+            if not ticker_queue:
+                break
+            ticker = ticker_queue.pop(0)
+        # Update status to processing
+        write_status(ticker, {'status': 'processing', 'progress': 0})
+        event = threading.Event()
+        precompute_results(ticker, event)
+        # After processing, update status
+        write_status(ticker, {'status': 'complete', 'progress': 100})
+
 
 if __name__ == "__main__":
     # Run the Dash app
