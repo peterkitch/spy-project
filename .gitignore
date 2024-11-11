@@ -1,4 +1,8 @@
-
 *.pkl
 *.json
-*.json
+*.npz
+
+debug.log
+
+!devbox.json
+!devbox.lock

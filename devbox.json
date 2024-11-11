@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.13.6/.schema/devbox.schema.json",
+  "packages": [
+    "python-full@3.12.7",
+    "python312Packages.matplotlib@latest",
+    "python312Packages.tqdm@latest",
+    "python312Packages.scipy@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      ". $VENV_DIR/bin/activate && pip install -r requirements.txt > /dev/null"
+    ],
+    "scripts": {
+      "test": [
+        "echo \"Error: no test specified\" && exit 1"
+      ],
+
+      "server": [
+        "python project/spymaster.py"
+      ]
+    }
+  }
+}
