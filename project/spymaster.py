@@ -217,15 +217,14 @@ def fetch_data(ticker, is_secondary=False):
                         df = pd.concat([df, last_row.to_frame().T])
                         logger.info(f"Added current market day {today} to data")
                     else:
-                        logger.info("Current time is outside market hours, not adding today's date")
+                        logger.debug("Current time is outside market hours, not adding today's date")
                 else:
                     if today.weekday() >= 5:
-                        logger.info("Current day is weekend, not adding today's date")
+                        logger.debug("Current day is weekend, not adding today's date")
                     elif df.index[-1] >= today:
                         logger.info("Data already includes the latest date")
                     else:
-                        logger.info("Conditions not met for adding current date")
-        
+                        logger.info("Conditions not met for adding current date")      
         return df
     except Exception as e:
         logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
@@ -4108,14 +4107,13 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input):
 
     # Parse tickers
     primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
-    # Ensure that only a single secondary ticker is entered
     secondary_tickers = [ticker.strip().upper() for ticker in secondary_ticker_input.split(',') if ticker.strip()]
     if len(secondary_tickers) != 1:
         return [], 'Please enter exactly one secondary ticker.'
     secondary_ticker = secondary_tickers[0]
 
-    # Limit the number of primary tickers to prevent excessive combinations
-    max_primary_tickers = 20  # Adjust as needed
+    # Limit the number of primary tickers
+    max_primary_tickers = 20
     if len(primary_tickers) > max_primary_tickers:
         return [], f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.'
 
@@ -4124,170 +4122,248 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input):
     if secondary_data is None or secondary_data.empty:
         return [], f'No data found for secondary ticker {secondary_ticker}.'
 
-    # Fetch "Next Day Active Signal" for each primary ticker
+    # Fetch data for each primary ticker
     primary_signals = {}
     date_indexes = {}
     for ticker in primary_tickers:
         results = load_precomputed_results(ticker)
         if not results or 'active_pairs' not in results:
             return [], f'Data not processed for primary ticker {ticker}. Please wait.'
+
         active_pairs = results['active_pairs']
         dates = results['preprocessed_data'].index
 
-        # Ensure active_pairs and dates have the same length
+        # Handle length mismatch
         if len(active_pairs) != len(dates):
             if len(active_pairs) == len(dates) - 1:
                 dates = dates[1:]
             else:
                 return [], f'Length mismatch between active_pairs and dates for ticker {ticker}. Cannot proceed.'
 
+        # Create signals series
         signals_series = pd.Series(active_pairs, index=dates)
-        # Process signals to extract 'Buy', 'Short', or 'None'
-        signals_series = signals_series.astype(str)
-        processed_signals = signals_series.apply(
-            lambda x: 'Buy' if x.strip().startswith('Buy') else
-                      'Short' if x.strip().startswith('Short') else 'None'
-        )
-        primary_signals[ticker] = processed_signals
-        date_indexes[ticker] = set(processed_signals.index)
+        
+        # Process for next day's signals
+        if 'preprocessed_data' in results and 'daily_top_buy_pairs' in results and 'daily_top_short_pairs' in results:
+            df = results['preprocessed_data']
+            last_date = df.index[-1]
+            buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
+            short_pair_data = results['daily_top_short_pairs'].get(last_date)
+            
+            if buy_pair_data and short_pair_data:
+                try:
+                    # Validate pair data structure
+                    if not isinstance(buy_pair_data[0], tuple) or not isinstance(short_pair_data[0], tuple):
+                        raise ValueError("Invalid pair data structure")
+                            
+                    # Calculate next day's signal
+                    buy_pair = buy_pair_data[0]
+                    short_pair = short_pair_data[0]
+                    buy_capture = buy_pair_data[1]
+                    short_capture = short_pair_data[1]
+                        
+                    # Validate SMA columns exist
+                    required_smas = [
+                        f'SMA_{buy_pair[0]}', f'SMA_{buy_pair[1]}',
+                        f'SMA_{short_pair[0]}', f'SMA_{short_pair[1]}'
+                    ]
+                    if not all(sma in df.columns for sma in required_smas):
+                        raise ValueError("Missing required SMA columns")
+                        
+                    buy_signal = df[f'SMA_{buy_pair[0]}'].loc[last_date] > df[f'SMA_{buy_pair[1]}'].loc[last_date]
+                    short_signal = df[f'SMA_{short_pair[0]}'].loc[last_date] < df[f'SMA_{short_pair[1]}'].loc[last_date]
+                        
+                    # Determine next signal
+                    if buy_signal and short_signal:
+                        next_signal = f"Buy" if buy_capture > short_capture else f"Short"
+                    elif buy_signal:
+                        next_signal = f"Buy"
+                    elif short_signal:
+                        next_signal = f"Short"
+                    else:
+                        next_signal = "None"
+                        
+                    # Store current signals for performance calculation
+                    processed_signals = signals_series.astype(str).apply(
+                        lambda x: 'Buy' if x.strip().startswith('Buy') else
+                                'Short' if x.strip().startswith('Short') else 'None'
+                    )
+                    
+                    # Append next_signal to processed_signals
+                    next_date = secondary_data.index[secondary_data.index > last_date]
+                    if not next_date.empty:
+                        next_date = next_date[0]
+                        processed_signals = processed_signals.append(pd.Series([next_signal], index=[next_date]))
+                    else:
+                        # No future date available, cannot append next_signal
+                        pass
+                        
+                    # Store signals and next_signal
+                    logger.info(f"Ticker {ticker} - Next signal: {next_signal}")
+                        
+                    primary_signals[ticker] = {
+                        'signals_with_next': processed_signals,
+                        'next_signal': next_signal
+                    }
+                    date_indexes[ticker] = set(processed_signals.index)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing signals for {ticker}: {str(e)}")
+                    return [], f'Error processing signals for {ticker}.'
+            else:
+                return [], f'Incomplete data for ticker {ticker}.'
+        else:
+            return [], f'Missing data in results for ticker {ticker}.'
 
-    # Generate possible states for each ticker based on their signals
+    # Generate possible states for each ticker based on next day's signals
     ticker_states = {}
     for ticker in primary_tickers:
-        signal = primary_signals[ticker].iloc[-1]  # Get the most recent signal
-        if signal == 'Buy':
-            # Possible states: Include (Invert Signals OFF) or Mute
-            ticker_states[ticker] = [(False, False), (False, True)]  # (Invert Signals, Mute)
-        elif signal == 'Short':
-            # Possible states: Include with Invert or Mute
-            ticker_states[ticker] = [(True, False), (False, True)]  # (Invert Signals, Mute)
+        signal = primary_signals[ticker]['next_signal']
+        logger.debug(f"Using next day signal for {ticker}: {signal}")
+        
+        # Determine possible states based on next signal
+        if 'Buy' in signal:
+            ticker_states[ticker] = [(False, False), (False, True)]  # (invert_signals, mute)
+        elif 'Short' in signal:
+            ticker_states[ticker] = [(True, False), (False, True)]  # (invert_signals, mute)
         else:
-            # Signal is 'None'; only possible state is Mute
-            ticker_states[ticker] = [(False, True)]  # (Invert Signals, Mute)
+            ticker_states[ticker] = [(False, True)]  # Only mute option for 'None' signals
 
-    # Generate all possible combinations
+    # Generate combinations
     ticker_state_lists = list(ticker_states.values())
     combinations = list(product(*ticker_state_lists))
     combination_labels = []
     valid_combinations = []
+
     for states in combinations:
         label_parts = []
         state_dict = {}
+        
         for ticker, (invert_signals, mute) in zip(ticker_states.keys(), states):
             if mute:
-                continue  # Exclude muted tickers from the label
-            else:
-                if invert_signals:
-                    # Ticker is inverted; wrap in HTML for red color
-                    label_parts.append(f"<span style='color:red'>{ticker}</span>")
+                state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
+                continue  # Skip muted tickers in label
+            
+            # Get next day's signal for display
+            next_signal = primary_signals[ticker]['next_signal']
+            if invert_signals:
+                # Invert the signal for display
+                if 'Buy' in next_signal:
+                    display_signal = 'Short'
+                elif 'Short' in next_signal:
+                    display_signal = 'Buy'
                 else:
-                    # Ticker is regular; wrap in HTML for neon green color
-                    label_parts.append(f"<span style='color:#80ff00'>{ticker}</span>")
+                    display_signal = next_signal
+                label_parts.append(f"<span style='color:red'>{ticker}</span>")
+            else:
+                display_signal = next_signal
+                label_parts.append(f"<span style='color:#80ff00'>{ticker}</span>")
+            
             state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
+        
         label = ', '.join(label_parts)
         combination_labels.append(label)
         valid_combinations.append(state_dict)
 
-    # Limit the number of combinations to prevent excessive computation time
-    max_combinations = 4100  # Adjust as needed
+    # Check combination limit
+    max_combinations = 1058576 # changed from 4100
     if len(combinations) > max_combinations:
         return [], f'Too many combinations ({len(combinations)}). Please reduce the number of primary tickers.'
 
-    # Prepare data structures
+    # Prepare for results
     results_list = []
 
-    # Iterate over each combination
+    # Process each combination
     for idx, state_dict in enumerate(valid_combinations):
-        # Identify un-muted tickers in the current combination
-        unmuted_tickers = [ticker for ticker in primary_tickers if ticker in state_dict and not state_dict[ticker]['mute']]
+        
+        # Get unmuted tickers
+        unmuted_tickers = [ticker for ticker in primary_tickers 
+                          if ticker in state_dict and not state_dict[ticker]['mute']]
 
         if not unmuted_tickers:
-            continue  # Skip combinations where all tickers are muted
+            continue  # Skip if all tickers are muted
 
-        # Find common dates among un-muted tickers and secondary data
+        # Find common dates
         common_dates = set(secondary_data.index)
         for ticker in unmuted_tickers:
             common_dates = common_dates.intersection(date_indexes[ticker])
         common_dates = sorted(common_dates)
 
         if not common_dates:
-            continue  # Skip if no overlapping dates among un-muted tickers
+            continue  # Skip if no overlapping dates
 
-        # Build combined signals
+        # Build combined signals DataFrame for performance calculation
         combined_signals_df = pd.DataFrame(index=common_dates)
         for ticker in unmuted_tickers:
             state = state_dict[ticker]
             invert_signals = state['invert_signals']
-            signals_series = primary_signals[ticker].loc[common_dates]
-
-            # Process signals
-            processed_signals = signals_series.copy()
+            
+            # Use signals_with_next for performance calculation
+            signals_with_next = primary_signals[ticker]['signals_with_next'].loc[common_dates]
+            
+            # Apply inversion if needed
             if invert_signals:
-                # Invert signals
-                processed_signals = processed_signals.replace({'Buy': 'Short', 'Short': 'Buy'})
-            # else: use signals as-is
+                signals = signals_with_next.replace({'Buy': 'Short', 'Short': 'Buy'})
+            else:
+                signals = signals_with_next
+            
+            combined_signals_df[ticker] = signals
 
-            # Collect processed signals into DataFrame
-            combined_signals_df[ticker] = processed_signals
-
-        # Combine signals using consistent logic
+        # Combine signals
         def get_combined_signal(row):
-            active_signals = [signal for signal in row if signal != 'None']
+            active_signals = [s for s in row if s != 'None']
             if not active_signals:
                 return 'None'
-            elif all(signal == 'Buy' for signal in active_signals):
+            if all(s == 'Buy' for s in active_signals):
                 return 'Buy'
-            elif all(signal == 'Short' for signal in active_signals):
+            if all(s == 'Short' for s in active_signals):
                 return 'Short'
-            else:
-                return 'None'  # Mixed signals cancel out
+            return 'None'
 
         combined_signals = combined_signals_df.apply(get_combined_signal, axis=1)
 
+        # No need to shift signals since we included the next day's signal
+        signals = combined_signals.fillna('None')
+
         # Align signals and prices
-        signals = combined_signals
-        prices = secondary_data['Close'].loc[common_dates]
-
-        # Reindex signals and prices to a common index
-        common_index = signals.index.union(prices.index)
-        signals = signals.reindex(common_index).fillna('None')
-        prices = prices.reindex(common_index).ffill()
-
-        # Compute daily returns
+        prices = secondary_data['Close'].loc[signals.index]
         daily_returns = prices.pct_change().fillna(0)
 
         # Ensure signals and daily_returns have the same index
         signals = signals.loc[daily_returns.index]
 
-        # Initialize daily_captures as float
-        daily_captures = pd.Series(0.0, index=signals.index, dtype='float64')
-
+        # Calculate daily captures
+        daily_captures = pd.Series(0.0, index=signals.index)
         buy_mask = signals == 'Buy'
         short_mask = signals == 'Short'
-
+        
         daily_captures[buy_mask] = daily_returns[buy_mask] * 100
         daily_captures[short_mask] = -daily_returns[short_mask] * 100
 
-        cumulative_captures = daily_captures.cumsum()
-
-        # Prepare metrics
+        # Calculate metrics
         trigger_days = (buy_mask | short_mask).sum()
         if trigger_days == 0:
-            continue  # Skip combinations with no trigger days
-        wins = (daily_captures > 0).sum()
+            continue  # Skip combinations with no triggers
+
+        # Calculate wins and losses
+        trigger_captures = daily_captures[buy_mask | short_mask]
+        wins = (trigger_captures > 0).sum()
         losses = trigger_days - wins
         win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-        # Calculate metrics only on trigger days
-        trigger_mask = buy_mask | short_mask
-        avg_daily_capture = daily_captures[trigger_mask].mean() if trigger_days > 0 else 0
-        total_capture = daily_captures[trigger_mask].sum() if trigger_days > 0 else 0
-        std_dev = daily_captures[trigger_mask].std() if trigger_days > 0 else 0
 
+        # Calculate performance metrics
+        avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
+        total_capture = trigger_captures.sum() if trigger_days > 0 else 0
+        std_dev = trigger_captures.std() if trigger_days > 0 else 0
+
+        # Calculate Sharpe ratio
         risk_free_rate = 5.0  # 5% annual rate
-        daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
-        sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
+        daily_rf_rate = risk_free_rate / 252
+        annualized_return = avg_daily_capture * 252
+        annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
+        sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
 
-        # Store the results
+        # Store results
         results_list.append({
             'Combination': combination_labels[idx],
             'Sharpe Ratio': round(sharpe_ratio, 4),
@@ -4299,13 +4375,10 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input):
     if not results_list:
         return [], 'No valid combinations found.'
 
-    # Sort the results by Sharpe Ratio in descending order
+    # Sort by Sharpe Ratio
     results_list.sort(key=lambda x: x['Sharpe Ratio'], reverse=True)
 
-    # Feedback message
-    feedback_message = 'Optimization complete. Please verify the results by manually entering the best combination into the Multi-Primary Signal Aggregator.'
-
-    return results_list, feedback_message
+    return results_list, 'Optimization complete. Please verify the results by manually entering the best combination into the Multi-Primary Signal Aggregator.'
 
 @app.callback(
     [Output({'type': 'primary-ticker-input', 'index': ALL}, 'value'),
