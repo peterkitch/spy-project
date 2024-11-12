@@ -215,16 +215,16 @@ def fetch_data(ticker, is_secondary=False):
                         last_row = df.iloc[-1].copy()
                         last_row.name = today
                         df = pd.concat([df, last_row.to_frame().T])
-                        logger.info(f"Added current market day {today} to data")
+                        logger.debug(f"Added current market day {today} to data")
                     else:
                         logger.debug("Current time is outside market hours, not adding today's date")
                 else:
                     if today.weekday() >= 5:
                         logger.debug("Current day is weekend, not adding today's date")
                     elif df.index[-1] >= today:
-                        logger.info("Data already includes the latest date")
+                        logger.debug("Data already includes the latest date")
                     else:
-                        logger.info("Conditions not met for adding current date")      
+                        logger.debug("Conditions not met for adding current date")      
         return df
     except Exception as e:
         logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
