@@ -35,6 +35,87 @@ from bs4 import BeautifulSoup
 import uuid
 import ast
 
+# Additional imports for the update process
+logger = logging.getLogger(__name__)
+
+# Path to the .npz and .pkl files
+NPZ_FILE_PATH = "path/to/your/npz/file.npz"
+PKL_FILE_PATH = "path/to/your/pkl/file.pkl"
+
+# Step 1: Load Existing Data from .npz File
+def load_npz_file(npz_file_path):
+    if os.path.exists(npz_file_path):
+        try:
+            with np.load(npz_file_path, allow_pickle=True) as data:
+                npz_data = {key: data[key] for key in data}
+            logger.info(f"Successfully loaded data from {npz_file_path}")
+            return npz_data
+        except Exception as e:
+            logger.error(f"Error loading .npz file {npz_file_path}: {str(e)}")
+            return None
+    else:
+        logger.warning(f".npz file {npz_file_path} does not exist.")
+        return None
+
+# Step 2: Update Data After Market Close
+def update_after_market_close(npz_data, new_data):
+    # Assuming new_data is a dictionary containing updated simple moving averages or any other data
+    for key, value in new_data.items():
+        if key in npz_data:
+            # Update the existing data
+            npz_data[key] = value
+        else:
+            # Add new data if it doesn't exist
+            npz_data[key] = value
+    return npz_data
+
+# Step 3: Save Updated Data Back to .npz File
+def save_npz_file(npz_file_path, npz_data):
+    try:
+        np.savez(npz_file_path, **npz_data)
+        logger.info(f"Successfully saved updated data to {npz_file_path}")
+    except Exception as e:
+        logger.error(f"Error saving .npz file {npz_file_path}: {str(e)}")
+
+# Step 4: Save Data to .pkl File for Efficient Loading
+def save_pkl_file(pkl_file_path, data):
+    try:
+        # Ensure 'close' key is included
+        if 'close' not in data:
+            logger.error(f"Missing 'close' key in data before saving to {pkl_file_path}")
+        with open(pkl_file_path, 'wb') as f:
+            pickle.dump(data, f)
+        logger.info(f"Successfully saved data to {pkl_file_path}")
+    except Exception as e:
+        logger.error(f"Error saving .pkl file {pkl_file_path}: {str(e)}")
+
+# Step 5: Retain .npz File After .pkl Update
+# The .npz file is essential for future calculations and should not be removed at this time.
+# We can revisit this if we decide to manage older `.npz` files outside of our rolling SMA window.
+
+# Step 6: Load Saved Closing Dates from .pkl File
+def load_saved_closing_dates(ticker):
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file):
+        try:
+            with open(pkl_file, 'rb') as f:
+                data = pickle.load(f)
+                if 'close' in data:
+                    if isinstance(data['close'], list):
+                        return data['close'][-5:]  # Extract the last 5 items directly from the list
+                    elif isinstance(data['close'], pd.Series):
+                        return data['close'].tail(5).index.tolist()
+                    else:
+                        logger.error(f"Unexpected data type for 'close' in {pkl_file}: {type(data['close'])}")
+                        return []
+                else:
+                    logger.critical(f"'close' key not found in {pkl_file}. Data may be corrupted.")
+                    # Consider halting recomputation or notifying for manual intervention
+                    return []
+        except Exception as e:
+            logger.error(f"Failed to load saved closing dates from {pkl_file} for {ticker}: {str(e)}")
+    return []
+
 # Initialize the Dash app with a dark theme and custom styles
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 
@@ -144,7 +225,7 @@ def fetch_data(ticker, is_secondary=False):
         else:
             # If df is empty after all retries
             logger.error(f"No data fetched for {ticker}")
-            write_status(ticker, {"status": "failed", "message": "No data"})
+            set_ticker_status(ticker, "failed", message="No data")
             return pd.DataFrame()
 
         # Ensure the index is datetime and timezone naive
@@ -172,6 +253,21 @@ def fetch_data(ticker, is_secondary=False):
         if df.empty:
             logger.error(f"No valid data found for {ticker}")
             return pd.DataFrame()
+            
+        # Handle duplicate latest dates by using latest price for next business day
+        latest_date = df.index.max()
+        if len(df[df.index == latest_date]) > 1:
+            logger.info(f"Found duplicate entries for {ticker} on {latest_date}")
+            # Get latest price for current date
+            latest_entries = df[df.index == latest_date]
+            latest_price = latest_entries['Close'].iloc[-1]
+            # Remove duplicates and keep one entry for today
+            df = df[df.index != latest_date]
+            df.loc[latest_date, 'Close'] = latest_entries['Close'].iloc[-2]  # Second to last price for current day
+            # Add the very latest price as next day's opening price
+            next_date = latest_date + pd.Timedelta(days=1)
+            df.loc[next_date, 'Close'] = latest_price
+            logger.info(f"Split latest entries between {latest_date} ({df.loc[latest_date, 'Close']:.2f}) and {next_date} ({latest_price:.2f})")
         
         if not is_secondary:
             logging.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
@@ -230,6 +326,38 @@ def fetch_data(ticker, is_secondary=False):
         logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
         return pd.DataFrame()
 
+def needs_update(ticker, current_df):
+    """Check if ticker data needs updating"""
+    # Release any open file handles first
+    gc.collect()  # Help force release of file handles
+    
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    if not os.path.exists(pkl_file):
+        return True, "No existing data"
+        
+    try:
+        stored_results = load_precomputed_results_from_file(pkl_file)
+        if not stored_results or 'preprocessed_data' not in stored_results:
+            return True, "Invalid stored data"
+            
+        stored_df = stored_results['preprocessed_data']
+        if stored_df.empty or current_df.empty:
+            return True, "Empty data comparison" 
+            
+        if current_df.index.max() > stored_df.index.max():
+            return True, "New data available"
+            
+        # Check last trading day for price changes
+        last_date = stored_df.index.max()
+        if not np.isclose(stored_df.loc[last_date, 'Close'], 
+                         current_df.loc[last_date, 'Close']):
+            return True, "Price data updated"
+            
+        return False, "Data current"
+    except Exception as e:
+        logger.error(f"Error checking update status: {str(e)}")
+        return True, str(e)
+        
 def get_last_valid_trading_day(df):
     """Get the most recent day with valid trading data."""
     for date in sorted(df.index, reverse=True):
@@ -243,7 +371,18 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
         try:
             with open(pkl_file, 'rb') as f:
                 data = pickle.load(f)
+            
+            # Ensure the data has the correct structure, converting if needed
+            if isinstance(data, dict) and 'preprocessed_data' in data:
+                if isinstance(data['preprocessed_data'], list):
+                    # Convert list to DataFrame if necessary
+                    data['preprocessed_data'] = pd.DataFrame(data['preprocessed_data'])
+                elif not isinstance(data['preprocessed_data'], pd.DataFrame):
+                    logging.error(f"Unexpected data format for 'preprocessed_data' in {pkl_file}. Expected DataFrame.")
+                    return None
+
             return data
+        
         except PermissionError:
             logging.error(f"Permission denied when loading results from {pkl_file}. Retrying...")
             time.sleep(delay)
@@ -254,12 +393,71 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
         except Exception as e:
             logging.error(f"Error loading results from {pkl_file}: {str(e)}")
             break
+
     logging.error(f"Failed to load results from {pkl_file} after {max_retries} retries.")
     return None
 
 def load_precomputed_results(ticker, load_full_data=False):
     global _precomputed_results_cache, _loading_in_progress
     with _loading_lock:
+        # Check if data needs updating
+        current_df = fetch_data(ticker)
+        if current_df is not None and not current_df.empty:
+            # Compare the last 5 saved closing dates to decide whether full recomputation is necessary
+            saved_dates = load_saved_closing_dates(ticker)  # Function to load the last 5 saved dates
+            latest_dates = current_df.index[-5:].tolist()  # Get the last 5 dates from the fetched DataFrame
+
+            if saved_dates and saved_dates != latest_dates:
+                # Determine if only partial data update is required
+                partial_update_required = any(date not in saved_dates for date in latest_dates)
+                if partial_update_required:
+                    needs_recompute = False
+                    logger.info(f"Partial data update required for {ticker}, updating recent 5 days.")
+                    update_recent_days(ticker, current_df)  # Function to update only the recent 5 days
+                else:
+                    needs_recompute, reason = needs_update(ticker, current_df)
+            else:
+                needs_recompute, reason = needs_update(ticker, current_df)
+            if needs_recompute:
+                logger.info(f"Recomputing {ticker} data: {reason}")
+                
+                # Set load_full_data to True to trigger loading of complete data
+                load_full_data = True
+
+                # Clear cache first
+                if ticker in _precomputed_results_cache:
+                    del _precomputed_results_cache[ticker]
+                
+                # Wait for any existing operations to complete
+                time.sleep(1)  # Give time for file operations to complete
+                gc.collect()   # Help release file handles
+
+                # Try to remove files with retry logic, excluding critical JSON and PKL files
+                for attempt in range(3):  # Try 3 times
+                    try:
+                        for file in glob.glob(f'{ticker}_*.*'):
+                            try:
+                                # Ensure we do not delete essential files
+                                if file.endswith("_status.json") or file.endswith("_precomputed_results.pkl"):
+                                    logger.info(f"Skipping deletion of essential file: {file}")
+                                    continue
+                                
+                                if os.path.exists(file):
+                                    # Close any open handles before removing
+                                    with open(file, 'r'):
+                                        pass
+                                    time.sleep(0.5)  # Ensure proper delay before deleting
+                                    os.remove(file)
+                                    logger.info(f"Successfully removed {file}")
+                            except OSError as e:
+                                logger.warning(f"Failed to remove {file} on attempt {attempt + 1}: {e}")
+                        break  # If successful, break the retry loop
+                    except Exception as e:
+                        logger.error(f"Error during file cleanup attempt {attempt + 1}: {e}")
+                        if attempt < 2:  # If not the last attempt
+                            time.sleep(1)  # Wait before retrying
+                        continue
+
         if ticker in _precomputed_results_cache:
             # Only log debug info for cached results to prevent duplicate headers
             logger.debug(f"Using cached results for {ticker.upper()}")
@@ -325,6 +523,72 @@ def load_precomputed_results(ticker, load_full_data=False):
         threading.Thread(target=precompute_results, args=(ticker, event)).start()
         return None
 
+# Function to load the last 5 saved closing dates for the ticker from the precomputed results file
+def load_saved_closing_dates(ticker):
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file):
+        try:
+            with open(pkl_file, 'rb') as f:
+                data = pickle.load(f)
+                # Use "close" instead of "close_prices" if that's the correct key
+                if 'close' in data:
+                    if isinstance(data['close'], list):
+                        return data['close'][-5:]  # Extract the last 5 items directly from the list
+                    elif isinstance(data['close'], pd.Series):
+                        return data['close'].tail(5).index.tolist()
+                    else:
+                        logger.error(f"Unexpected data type for 'close' in {pkl_file}: {type(data['close'])}")
+                        return []
+                else:
+                    logger.warning(f"'close' key not found in {pkl_file}")
+                    return []
+        except Exception as e:
+            logger.error(f"Failed to load saved closing dates from {pkl_file} for {ticker}: {str(e)}")
+    return []
+
+def update_recent_days(ticker, current_df):
+    """Update recent days in the precomputed results, including recalculating moving averages."""
+    pkl_file = f'{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file):
+        try:
+            with open(pkl_file, 'rb') as f:
+                data = pickle.load(f)
+
+            # Get the recent days that need updating
+            recent_days_df = current_df.loc[current_df.index[-5:]]  # Last 5 days from current data
+
+            # Update the moving averages for these recent days
+            for sma_period in data['sma_periods']:
+                sma_column_name = f'SMA_{sma_period}'
+                data[sma_column_name].update(recent_days_df['close_prices'].rolling(window=sma_period).mean())
+
+            # Update the DataFrame in the cache
+            data.update(recent_days_df)
+
+            # Save the updated precomputed results
+            with open(pkl_file, 'wb') as f:
+                pickle.dump(data, f)
+            logger.info(f"Updated recent 5 days and recalculated moving averages for {ticker}")
+
+        except Exception as e:
+            logger.error(f"Failed to update recent days for {ticker}: {str(e)}")
+    else:
+        logger.warning(f"Precomputed results file {pkl_file} does not exist for updating recent days.")
+
+def align_dates(primary_data, secondary_data):
+    """Align dates between primary and secondary data"""
+    # Find common date range
+    start_date = max(primary_data.index.min(), secondary_data.index.min())
+    end_date = min(primary_data.index.max(), secondary_data.index.max())
+    
+    # Filter both datasets to common range
+    primary_aligned = primary_data[start_date:end_date]
+    secondary_aligned = secondary_data[start_date:end_date]
+    
+    # Keep only dates present in both
+    common_dates = primary_aligned.index.intersection(secondary_aligned.index)
+    return common_dates
+
 def fetch_precomputed_results(ticker):
     precomputed_results = load_precomputed_results(ticker)
 
@@ -375,10 +639,32 @@ def compute_signals(df, sma1, sma2):
 def write_status(ticker, status):
     ticker = normalize_ticker(ticker)
     status_file = f"{ticker}_status.json"
+    temp_file = f"{ticker}_status_temp.json"
     with status_lock:
-        with open(status_file, 'w') as f:
-            json.dump(status, f)
-
+        try:
+            # Write to temp file first
+            with open(temp_file, 'w') as f:
+                json.dump(status, f)
+            # Then atomically replace the actual status file
+            os.replace(temp_file, status_file)
+        except Exception as e:
+            logger.error(f"Error writing status for {ticker}: {str(e)}")
+            # Retry mechanism to remove the temp file in case it's being accessed by another process
+            if os.path.exists(temp_file):
+                logger.info(f"Temporary file {temp_file} exists, attempting to remove it...")
+                for attempt in range(5):  # Increase retry count to 5 times
+                    try:
+                        os.remove(temp_file)
+                        logger.info(f"Temporary file {temp_file} successfully removed on attempt {attempt + 1}")
+                        break
+                    except PermissionError as e:
+                        logger.warning(f"Attempt {attempt + 1} to remove {temp_file} failed: {e}")
+                        if attempt < 4:  # If not the last attempt, wait and retry
+                            time.sleep(1)  # Increase sleep time for better file release
+                    except Exception as e:
+                        logger.error(f"Unexpected error while removing temporary file {temp_file}: {str(e)}")
+                        break
+                    
 def save_precomputed_results(ticker, results):
     ticker = normalize_ticker(ticker)
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -427,38 +713,50 @@ def save_precomputed_results(ticker, results):
     return main_results
 
 def process_chunk_for_top_pairs(chunk_file, total_days):
-    data = np.load(chunk_file, allow_pickle=True)
-    buy_pairs = data['buy_pairs']
-    buy_values = data['buy_values']
-    short_pairs = data['short_pairs']
-    short_values = data['short_values']
+    try:
+        # Force release any previous file handles
+        logger.info(f"Starting cleanup before processing {chunk_file}")
+        gc.collect()
+        time.sleep(0.1)  # Small delay to ensure cleanup
+        logger.info("Cleanup completed")
 
-    buy_values = np.array(buy_values)
-    short_values = np.array(short_values)
+        # Use context manager with copy to memory
+        with np.load(chunk_file, allow_pickle=True) as data:
+            # Load and copy data to memory immediately
+            buy_pairs = data['buy_pairs'].copy()
+            buy_values = data['buy_values'].copy()
+            short_pairs = data['short_pairs'].copy()
+            short_values = data['short_values'].copy()
+        logger.info("Successfully loaded and copied chunk data")
+            
+        # Process after file is closed
+        max_buy_captures = np.full(total_days, -np.inf)
+        max_short_captures = np.full(total_days, -np.inf)
+        max_buy_pairs = [None] * total_days
+        max_short_pairs = [None] * total_days
 
-    max_buy_captures = np.full(total_days, -np.inf)
-    max_short_captures = np.full(total_days, -np.inf)
-    max_buy_pairs = [None] * total_days
-    max_short_pairs = [None] * total_days
+        num_pairs = len(buy_pairs)
+        for i in range(num_pairs):
+            buy_capture = buy_values[i]
+            short_capture = short_values[i]
+            buy_pair = tuple(buy_pairs[i])
+            short_pair = tuple(short_pairs[i])
 
-    num_pairs = len(buy_pairs)
-    for i in range(num_pairs):
-        buy_capture = buy_values[i]
-        short_capture = short_values[i]
-        buy_pair = tuple(buy_pairs[i])
-        short_pair = tuple(short_pairs[i])
+            # Update buy captures
+            better_buy = buy_capture > max_buy_captures
+            max_buy_captures = np.where(better_buy, buy_capture, max_buy_captures)
+            max_buy_pairs = [buy_pair if better_buy[j] else max_buy_pairs[j] for j in range(total_days)]
 
-        # Update buy captures
-        better_buy = buy_capture > max_buy_captures
-        max_buy_captures = np.where(better_buy, buy_capture, max_buy_captures)
-        max_buy_pairs = [buy_pair if better_buy[j] else max_buy_pairs[j] for j in range(total_days)]
+            # Update short captures
+            better_short = short_capture > max_short_captures
+            max_short_captures = np.where(better_short, short_capture, max_short_captures)
+            max_short_pairs = [short_pair if better_short[j] else max_short_pairs[j] for j in range(total_days)]
 
-        # Update short captures
-        better_short = short_capture > max_short_captures
-        max_short_captures = np.where(better_short, short_capture, max_short_captures)
-        max_short_pairs = [short_pair if better_short[j] else max_short_pairs[j] for j in range(total_days)]
-
-    return max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs
+        return max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs
+        
+    except Exception as e:
+        logger.error(f"Error processing chunk file {chunk_file}: {str(e)}")
+        return None, None, None, None
 
 def calculate_daily_top_pairs(df, ticker):
     section_start = time.time()
@@ -481,28 +779,42 @@ def calculate_daily_top_pairs(df, ticker):
     max_short_pairs_global = [None] * total_days
 
     chunk_processing_times = []
-    with tqdm(total=len(chunk_files), desc="Processing chunks for daily top pairs", unit="chunk", dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar:
+    
+    with tqdm(total=len(chunk_files), desc="Processing chunks for daily top pairs", 
+              unit="chunk", dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar:
         for chunk_file in chunk_files:
-            tqdm.write(f"Processing chunk file: {chunk_file}")
             chunk_start_time = time.time()
             try:
-                max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs = process_chunk_for_top_pairs(chunk_file, total_days)
-                tqdm.write(f"Finished processing {chunk_file}")
-
-                # Update global max captures and pairs
+                # Process chunk and ensure file is closed properly
+                results = process_chunk_for_top_pairs(chunk_file, total_days)
+                if results is None:
+                    logger.error(f"Skipping chunk {chunk_file} due to processing error")
+                    continue
+                    
+                max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs = results
+                
+                # Update global maximums
                 better_buy = max_buy_captures > max_buy_captures_global
                 max_buy_captures_global = np.where(better_buy, max_buy_captures, max_buy_captures_global)
-                max_buy_pairs_global = [max_buy_pairs[i] if better_buy[i] else max_buy_pairs_global[i] for i in range(total_days)]
+                max_buy_pairs_global = [max_buy_pairs[i] if better_buy[i] else max_buy_pairs_global[i] 
+                                      for i in range(total_days)]
 
                 better_short = max_short_captures > max_short_captures_global
                 max_short_captures_global = np.where(better_short, max_short_captures, max_short_captures_global)
-                max_short_pairs_global = [max_short_pairs[i] if better_short[i] else max_short_pairs_global[i] for i in range(total_days)]
-
+                max_short_pairs_global = [max_short_pairs[i] if better_short[i] else max_short_pairs_global[i] 
+                                        for i in range(total_days)]
+                
+                chunk_end_time = time.time()
+                chunk_processing_times.append(chunk_end_time - chunk_start_time)
+                logger.info(f"Successfully processed chunk {chunk_file}")
+                
             except Exception as exc:
-                logger.error(f'Chunk {chunk_file} generated an exception: {exc}')
-            chunk_end_time = time.time()
-            chunk_processing_times.append(chunk_end_time - chunk_start_time)
-            pbar.update(1)
+                logger.error(f'Error processing chunk {chunk_file}: {exc}')
+                logger.error(traceback.format_exc())
+            finally:
+                pbar.update(1)
+                gc.collect()  # Force garbage collection after each chunk
+                time.sleep(0.1)  # Small delay to ensure file handles are released
 
     # Build the daily top pairs dictionaries
     daily_top_buy_pairs = {}
@@ -562,7 +874,10 @@ def calculate_captures_vectorized(sma1, sma2, returns):
 
 def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chunk, chunk_index):
     ticker = normalize_ticker(ticker)
-    chunk_file = f'{ticker}_results_chunk_{chunk_index}.npz'
+    # Use a temporary file first
+    temp_file = f'{ticker}_results_chunk_{chunk_index}_temp.npz'
+    final_file = f'{ticker}_results_chunk_{chunk_index}.npz'
+    
     try:
         # Prepare data for saving
         buy_pairs = np.array(list(buy_results_chunk.keys()))
@@ -570,17 +885,37 @@ def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chun
         short_pairs = np.array(list(short_results_chunk.keys()))
         short_values = np.array(list(short_results_chunk.values()))
         
-        logger.info(f"Saving chunk {chunk_index}...")
-
-        # Save the chunk synchronously
-        np.savez(chunk_file, buy_pairs=buy_pairs, buy_values=buy_values,
+        logger.info(f"Saving chunk {chunk_index} to temporary file...")
+        
+        # Save to temporary file first
+        np.savez(temp_file, buy_pairs=buy_pairs, buy_values=buy_values,
                  short_pairs=short_pairs, short_values=short_values)
         
-        file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)  # Size in GB
-        logger.info(f"Chunk {chunk_index} saved successfully to {chunk_file} (Size: {file_size:.2f} GB)")
+        # If temporary save successful, rename to final file
+        if os.path.exists(final_file):
+            os.remove(final_file)  # Remove old file if it exists
+        os.rename(temp_file, final_file)
+        
+        file_size = os.path.getsize(final_file) / (1024 * 1024 * 1024)  # Size in GB
+        logger.info(f"Chunk {chunk_index} saved successfully to {final_file} (Size: {file_size:.2f} GB)")
     except Exception as e:
         logger.error(f"Error saving results for {ticker}: {str(e)}")
         logger.error(traceback.format_exc())
+        # Retry mechanism to remove the temp file in case it's being accessed by another process
+        if os.path.exists(temp_file):
+            logger.info(f"Temporary file {temp_file} exists, attempting to remove it...")
+            for attempt in range(5):  # Increase retry count to 5 times
+                try:
+                    os.remove(temp_file)
+                    logger.info(f"Temporary file {temp_file} successfully removed on attempt {attempt + 1}")
+                    break
+                except PermissionError as e:
+                    logger.warning(f"Attempt {attempt + 1} to remove {temp_file} failed: {e}")
+                    if attempt < 4:  # If not the last attempt, wait and retry
+                        time.sleep(1)  # Increase sleep time for better file release
+                except Exception as e:
+                    logger.error(f"Unexpected error while removing temporary file {temp_file}: {str(e)}")
+                    break
 
 def precompute_results(ticker, event):
     global master_stopwatch_start
@@ -661,7 +996,7 @@ def precompute_results(ticker, event):
                         logger.warning(f"Missing daily top pairs for {ticker}, unable to recalculate 'active_pairs'.")
 
                 # Update status, cache, and signal loading completion
-                write_status(ticker, {"status": "complete", "progress": 100})
+                set_ticker_status(ticker, "complete", progress=100)
                 with _loading_lock:
                     _precomputed_results_cache[ticker] = results
                     # Signal that loading is complete
@@ -730,12 +1065,13 @@ def precompute_results(ticker, event):
                     # No new SMA periods to compute
                     logger.info("No new SMA periods to compute.")
                     # Update existing SMA columns for new data
-                    logger.info("Updating existing SMA columns for new data.")
-                    # Recalculate existing SMA columns for the new data
+                    logger.info("Updating existing SMA columns for recent data only.")
+                    # Only update the last 5 trading days to avoid unnecessary recomputation
+                    recent_days = 5
                     for sma_period in range(1, max_sma_day + 1):
                         sma_column_name = f'SMA_{sma_period}'
-                        df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
-                        df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
+                        df[sma_column_name].iloc[-recent_days:] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean().iloc[-recent_days:]
+                        df.iloc[-recent_days:, df.columns.get_loc(sma_column_name)] = np.nan
                     df = df.copy()  # De-fragment the DataFrame
 
                 logger.info("SMA columns updated.")
@@ -801,7 +1137,7 @@ def precompute_results(ticker, event):
                     # Update status
                     pairs_processed = min(i + chunk_size, total_pairs) * 2
                     progress_percentage = pairs_processed / total_pairs_with_inverses * 100
-                    write_status(ticker, {"status": "processing", "progress": progress_percentage})
+                    set_ticker_status(ticker, "processing", progress=progress_percentage)
 
                     # Save results after processing each chunk (synchronously)
                     tqdm.write(f"Saving chunk {i // chunk_size}...")
@@ -883,8 +1219,21 @@ def precompute_results(ticker, event):
                 buy_results_with_inverse[inverse_pair] = -result[-1]
 
             # Identify the top performing buy and short pairs from the respective dictionaries
-            top_buy_pair = max(buy_results_with_inverse, key=buy_results_with_inverse.get)
-            top_short_pair = max(short_results_with_inverse, key=short_results_with_inverse.get)
+            if buy_results_with_inverse:
+                top_buy_pair = max(buy_results_with_inverse, key=buy_results_with_inverse.get)
+                top_buy_capture = buy_results_with_inverse[top_buy_pair]
+            else:
+                logger.warning(f"No buy results available for {ticker}. Setting default values.")
+                top_buy_pair = None
+                top_buy_capture = 0.0
+
+            if short_results_with_inverse:
+                top_short_pair = max(short_results_with_inverse, key=short_results_with_inverse.get)
+                top_short_capture = short_results_with_inverse[top_short_pair]
+            else:
+                logger.warning(f"No short results available for {ticker}. Setting default values.")
+                top_short_pair = None
+                top_short_capture = 0.0
 
             # Calculate the total capture for the top pairs
             top_buy_capture = buy_results_with_inverse[top_buy_pair]
@@ -900,12 +1249,23 @@ def precompute_results(ticker, event):
             results['top_short_pair'] = top_short_pair
             results['top_short_capture'] = top_short_capture
 
-            # Save final results
+            # Save final results including close_prices
             logger.info(f"Saving final results to {pkl_file}")
+            results['close_prices'] = df['Close']  # Store as a Pandas Series for better integration with existing methods
             with tqdm(total=1, desc="Saving final results", unit="file", leave=True, position=0) as pbar_save:
                 save_precomputed_results(ticker, results)
                 pbar_save.update(1)
-            write_status(ticker, {"status": "complete", "progress": 100})
+            set_ticker_status(ticker, "complete", progress=100)
+
+            # Explicitly save the status JSON file to ensure it is retained
+            status_data = {"status": "complete", "progress": 100}
+            write_status(ticker, status_data)
+
+            # Save the final PKL again to ensure it is not accidentally deleted
+            with tqdm(total=1, desc="Saving final PKL results again", unit="file", leave=True, position=0) as pbar_save_final:
+                save_precomputed_results(ticker, results)
+                pbar_save_final.update(1)
+            logger.info(f"Final PKL results saved again for {ticker}.")
 
             logger.info("Process completed.")
 
@@ -940,6 +1300,49 @@ def precompute_results(ticker, event):
 
     # Print final message outside of the try-except block
     logger.info("Computation and loading process completed.")
+
+def set_ticker_status(ticker, status, progress=None, message=None):
+    """Manage ticker status transitions atomically"""
+    ticker = normalize_ticker(ticker)
+    temp_file = f"{ticker}_status_temp.json"
+    status_file = f"{ticker}_status.json"
+    
+    with status_lock:
+        try:
+            # Prepare status data
+            status_data = {"status": status}
+            if progress is not None:
+                status_data["progress"] = progress
+            if message is not None:
+                status_data["message"] = message
+                
+            # Write to temp file first
+            with open(temp_file, 'w') as f:
+                json.dump(status_data, f)
+            
+            # Atomically replace status file
+            os.replace(temp_file, status_file)
+            
+            # Log status change
+            logger.info(f"Status updated for {ticker}: {status_data}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update status for {ticker}: {str(e)}")
+            # Retry mechanism to remove the temp file in case it's being accessed by another process
+            if os.path.exists(temp_file):
+                logger.info(f"Temporary file {temp_file} exists, attempting to remove it...")
+                for attempt in range(5):  # Increase retry count to 5 times
+                    try:
+                        os.remove(temp_file)
+                        logger.info(f"Temporary file {temp_file} successfully removed on attempt {attempt + 1}")
+                        break
+                    except PermissionError as e:
+                        logger.warning(f"Attempt {attempt + 1} to remove {temp_file} failed: {e}")
+                        if attempt < 4:  # If not the last attempt, wait and retry
+                            time.sleep(1)  # Increase sleep time for better file release
+                    except Exception as e:
+                        logger.error(f"Unexpected error while removing temporary file {temp_file}: {str(e)}")
+                        break
 
 def print_timing_summary(ticker):
     results = _precomputed_results_cache.get(ticker)
@@ -977,12 +1380,20 @@ def read_status(ticker):
     ticker = normalize_ticker(ticker)
     status_path = f"{ticker}_status.json"
     with status_lock:
-        if os.path.exists(status_path):
-            with open(status_path, 'r') as file:
-                try:
-                    return json.load(file)
-                except json.JSONDecodeError:
-                    print(f"Empty JSON file: {status_path}")
+        try:
+            if os.path.exists(status_path):
+                with open(status_path, 'r') as file:
+                    status = json.load(file)
+                    # Prevent reprocessing if already complete
+                    if status.get('status') == "complete":
+                        if ticker in _loading_in_progress:
+                            logger.warning(f"Preventing reprocess of completed ticker {ticker}")
+                            return status
+                    return status
+        except json.JSONDecodeError:
+            logger.error(f"Empty JSON file: {status_path}")
+        except Exception as e:
+            logger.error(f"Error reading status for {ticker}: {str(e)}")
         return {"status": "not started", "progress": 0}
 
 status = read_status('AAPL')
@@ -1009,7 +1420,7 @@ app.layout = html.Div(
         'font-family': 'Impact, sans-serif'
     },
     children=[
-        html.H1('Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework', className='text-center mt-3'),
+        html.H1('Adaptive Mean Reversion SMA Optimization Trading Framework', className='text-center mt-3'),
         html.Div(id='max-sma-day-display', style={'font-size': '18px', 'margin-bottom': '20px'}),
         dbc.Row([
             dbc.Col([
@@ -1538,7 +1949,7 @@ app.layout = html.Div(
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
         dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
         dcc.Interval(id='loading-interval', interval=2000, n_intervals=0),  # Update every 2 seconds
-        # Loading spinner output (if needed)
+
         dcc.Loading(
             id="loading-spinner",
             type="default",
@@ -3219,6 +3630,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
 
     return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short
 
+# Disable the update interval when data is loaded
 @app.callback(
     Output('update-interval', 'disabled'),
     [Input('ticker-input', 'value'),
@@ -3229,10 +3641,12 @@ def disable_interval_when_data_loaded(ticker, n_intervals):
         return True  # Disable interval when no ticker is entered
 
     status = read_status(ticker)
-    if status['status'] == 'complete' or status['status'] == 'failed':
-        return True  # Disable interval once data is loaded or if processing failed
-    else:
+    # Only keep interval running during active processing
+    if status['status'] == 'processing':
         return False  # Keep interval running while processing
+
+    # Disable interval for all other states
+    return True  # Disable interval once data is loaded or if processing failed
     
 def print_timing_summary(ticker):
     results = _precomputed_results_cache.get(ticker)
@@ -4430,6 +4844,36 @@ def populate_multi_primary_aggregator(active_cell, data, primary_input_ids, inve
 
     return tickers, invert_values, mute_values
 
+def main():
+    # Load existing data from .npz file
+    npz_data = load_npz_file(NPZ_FILE_PATH)
+    if npz_data is None:
+        logger.error("Failed to load .npz data. Exiting the update process.")
+        return
+
+    # Assume new_data is obtained from your trading system after market close
+    new_data = {
+        'sma_10': np.array([10.5, 10.7, 10.8]),  # Example updated SMA 10 values
+        'sma_20': np.array([20.1, 20.3, 20.4]),  # Example updated SMA 20 values
+        # Add more indicators or updated values here
+    }
+
+    # Update the .npz data with new information
+    updated_data = update_after_market_close(npz_data, new_data)
+
+    # Only save if there are changes to avoid unnecessary writes
+    if updated_data != npz_data:
+        # Save the updated data back to the .npz file
+        save_npz_file(NPZ_FILE_PATH, updated_data)
+
+        # Save the updated data to a .pkl file for efficient loading
+        save_pkl_file(PKL_FILE_PATH, updated_data)
+
+    logger.info("Update process completed successfully.")
+
 if __name__ == "__main__":
-    # Run the Dash app
+    # First run the main update process
+    main()
+    
+    # Then run the Dash app
     app.run_server(debug=True)
