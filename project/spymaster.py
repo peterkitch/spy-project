@@ -104,6 +104,29 @@ def normalize_ticker(ticker):
     """Normalize ticker to uppercase if it exists"""
     return ticker.strip().upper() if ticker else ticker
 
+def load_manual_prices(ticker):
+    """Load manually entered prices from storage"""
+    manual_prices_file = f'{ticker}_manual_prices.json'
+    if os.path.exists(manual_prices_file):
+        with open(manual_prices_file, 'r') as f:
+            try:
+                data = json.load(f)
+                return {pd.Timestamp(date): price for date, price in data.items()}
+            except Exception as e:
+                logger.error(f"Error loading manual prices for {ticker}: {str(e)}")
+    return {}
+
+def save_manual_prices(ticker, prices_dict):
+    """Save manually entered prices to storage"""
+    manual_prices_file = f'{ticker}_manual_prices.json'
+    try:
+        # Convert timestamps to strings for JSON serialization
+        data = {date.strftime('%Y-%m-%d'): price for date, price in prices_dict.items()}
+        with open(manual_prices_file, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Error saving manual prices for {ticker}: {str(e)}")
+
 def fetch_data(ticker, is_secondary=False):
     try:
         # Check if we've already determined this is an invalid ticker
@@ -217,15 +240,27 @@ def fetch_data(ticker, is_secondary=False):
                         df = pd.concat([df, last_row.to_frame().T])
                         logger.debug(f"Added current market day {today} to data")
                     else:
-                        logger.debug("Current time is outside market hours, not adding today's date")
-                else:
-                    if today.weekday() >= 5:
-                        logger.debug("Current day is weekend, not adding today's date")
-                    elif df.index[-1] >= today:
-                        logger.debug("Data already includes the latest date")
-                    else:
-                        logger.debug("Conditions not met for adding current date")      
-        return df
+                        if today.weekday() >= 5:
+                            logger.debug("Current day is weekend, not adding today's date")
+                        elif df.index[-1] >= today:
+                            logger.debug("Data already includes the latest date")
+                        else:
+                            logger.debug("Conditions not met for adding current date")
+                            
+            # Add any manual prices
+            manual_prices = load_manual_prices(ticker)
+            if manual_prices:
+                manual_df = pd.DataFrame(
+                    {'Close': [price for price in manual_prices.values()]},
+                    index=[date for date in manual_prices.keys()]
+                )
+                # Combine with existing data, keeping manual prices for overlapping dates
+                df = pd.concat([df, manual_df]).sort_index()
+                df = df[~df.index.duplicated(keep='last')]
+                logger.info(f"Added {len(manual_prices)} manual prices for {ticker}")
+                            
+            return df
+            
     except Exception as e:
         logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
         return pd.DataFrame()
@@ -260,6 +295,18 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
 def load_precomputed_results(ticker, load_full_data=False):
     global _precomputed_results_cache, _loading_in_progress
     with _loading_lock:
+        # First check if we need manual price entry
+        df = fetch_data(ticker)
+        if df is not None and not df.empty:
+            current_date = pd.Timestamp.now().normalize()
+            latest_data_date = df.index[-1]
+            manual_prices = load_manual_prices(ticker)
+            
+            # If we don't have current date data and no manual price exists
+            if latest_data_date < current_date and current_date not in manual_prices:
+                logger.info(f"Waiting for manual price input for {ticker}")
+                return None  # This will trigger the modal and pause processing
+
         if ticker in _precomputed_results_cache:
             # Only log debug info for cached results to prevent duplicate headers
             logger.debug(f"Using cached results for {ticker.upper()}")
@@ -1536,14 +1583,31 @@ app.layout = html.Div(
         ]),
 
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
-        dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
-        dcc.Interval(id='loading-interval', interval=2000, n_intervals=0),  # Update every 2 seconds
-        # Loading spinner output (if needed)
+        dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),
+        dcc.Interval(id='loading-interval', interval=2000, n_intervals=0),
         dcc.Loading(
             id="loading-spinner",
             type="default",
             children=[html.Div(id="loading-spinner-output")]
         ),
+        # Modal for manual price entry
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("Manual Price Entry")),
+            dbc.ModalBody([
+                html.P(id='manual-price-message'),
+                dbc.Input(
+                    id='manual-price-input',
+                    type='number',
+                    placeholder='Enter closing price',
+                    step='any'
+                ),
+                html.Div(id='manual-price-feedback', className='text-danger')
+            ]),
+            dbc.ModalFooter([
+                dbc.Button("Cancel", id="manual-price-cancel", className="ms-auto", n_clicks=0),
+                dbc.Button("Submit", id="manual-price-submit", className="ms-2", n_clicks=0),
+            ]),
+        ], id="manual-price-modal", is_open=False),
     ]
 )
 
@@ -4080,6 +4144,87 @@ def batch_process_tickers(n_clicks, n_intervals, tickers_input, existing_table_d
         # Sort the table_data list alphabetically by 'Ticker'
         table_data.sort(key=lambda x: x['Ticker'])
         return table_data, ''
+
+@app.callback(
+    [Output('manual-price-modal', 'is_open'),
+     Output('manual-price-message', 'children'),
+     Output('manual-price-feedback', 'children')],
+    [Input('ticker-input', 'value'),
+     Input('manual-price-submit', 'n_clicks'),
+     Input('manual-price-cancel', 'n_clicks')],
+    [State('manual-price-input', 'value'),
+     State('manual-price-modal', 'is_open')],
+    prevent_initial_call=True
+)
+def manage_manual_price_modal(ticker, submit_clicks, cancel_clicks, manual_price, is_open):
+    if not ticker:
+        return False, '', ''
+    
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return False, '', ''
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # If modal is closed and a ticker is entered, check if we need manual price
+    if trigger_id == 'ticker-input':
+        df = fetch_data(ticker)
+        if df is None or df.empty:
+            return False, '', ''
+        
+        current_date = pd.Timestamp.now().normalize()
+        latest_data_date = df.index[-1]
+        manual_prices = load_manual_prices(ticker)
+        
+        if latest_data_date < current_date and current_date not in manual_prices:
+            message = f"""
+            Latest data for {ticker} is from {latest_data_date.strftime('%Y-%m-%d')}.
+            Current date is {current_date.strftime('%Y-%m-%d')}.
+            Would you like to manually enter today's closing price?
+            """
+            return True, message, ''
+    
+    # Handle submit button click
+    elif trigger_id == 'manual-price-submit':
+        if manual_price is None:
+            return is_open, 'Please enter a valid price', 'Price is required'
+        
+        try:
+            current_date = pd.Timestamp.now().normalize()
+            
+            # Save the manual price
+            manual_prices = load_manual_prices(ticker)
+            manual_prices[current_date] = float(manual_price)
+            save_manual_prices(ticker, manual_prices)
+            
+            # Clear the cache to force reprocessing
+            with _loading_lock:
+                if ticker in _precomputed_results_cache:
+                    del _precomputed_results_cache[ticker]
+            
+            # Fetch fresh data incorporating manual price
+            df = fetch_data(ticker)
+            if df is None or df.empty:
+                return is_open, 'Error: Unable to fetch data', 'Please try again'
+            
+            # Trigger reprocessing
+            event = threading.Event()
+            _loading_in_progress[ticker] = event
+            threading.Thread(target=precompute_results, args=(ticker, event)).start()
+            
+            logger.info(f"Manual price of {manual_price} added for {ticker} on {current_date}")
+            logger.info("Triggered reprocessing with manual price")
+            return False, '', ''
+        
+        except Exception as e:
+            logger.error(f"Error adding manual price: {str(e)}")
+            return is_open, 'Error adding price', str(e)
+    
+    # Handle cancel button click
+    elif trigger_id == 'manual-price-cancel':
+        return False, '', ''
+    
+    return is_open, '', ''
 
 def process_ticker_queue():
     while True:
