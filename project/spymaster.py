@@ -1495,10 +1495,19 @@ app.layout = html.Div(
                             id='optimization-results-table',
                             columns=[
                                 {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
-                                {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
-                                {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'},
-                                {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
                                 {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
+                                {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
+                                {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
+                                {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
+                                {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
+                                {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
+                                {'name': 't-Statistic', 'id': 't-Statistic'},
+                                {'name': 'p-Value', 'id': 'p-Value'},
+                                {'name': 'Significant 90%', 'id': 'Significant 90%'},
+                                {'name': 'Significant 95%', 'id': 'Significant 95%'},
+                                {'name': 'Significant 99%', 'id': 'Significant 99%'},
+                                {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
+                                {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
                             ],
                             data=[],
                             sort_action='native',  # Enable sorting for all columns
@@ -4363,13 +4372,33 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input):
         annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
         sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
 
+        # Calculate statistical significance
+        if trigger_days > 1 and std_dev > 0:
+            t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+            degrees_of_freedom = trigger_days - 1
+            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+            t_statistic = round(t_statistic, 4)
+            p_value = round(p_value, 4)
+        else:
+            t_statistic = None
+            p_value = None
+
         # Store results
         results_list.append({
             'Combination': combination_labels[idx],
-            'Sharpe Ratio': round(sharpe_ratio, 4),
-            'Total Capture (%)': round(total_capture, 4),
-            'Win Ratio (%)': round(win_ratio, 2),
             'Trigger Days': int(trigger_days),
+            'Wins': int(wins),
+            'Losses': int(losses),
+            'Win Ratio (%)': round(win_ratio, 2),
+            'Std Dev (%)': round(std_dev, 4),
+            'Sharpe Ratio': round(sharpe_ratio, 2),
+            't-Statistic': t_statistic if t_statistic is not None else 'N/A',
+            'p-Value': p_value if p_value is not None else 'N/A',
+            'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+            'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+            'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
+            'Avg Daily Capture (%)': round(avg_daily_capture, 4),
+            'Total Capture (%)': round(total_capture, 4)
         })
 
     if not results_list:
@@ -4378,7 +4407,25 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input):
     # Sort by Sharpe Ratio
     results_list.sort(key=lambda x: x['Sharpe Ratio'], reverse=True)
 
-    return results_list, 'Optimization complete. Please verify the results by manually entering the best combination into the Multi-Primary Signal Aggregator.'
+    # Define columns for the DataTable
+    columns = [
+        {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
+        {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
+        {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
+        {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
+        {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
+        {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
+        {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
+        {'name': 't-Statistic', 'id': 't-Statistic'},
+        {'name': 'p-Value', 'id': 'p-Value'},
+        {'name': 'Significant 90%', 'id': 'Significant 90%'},
+        {'name': 'Significant 95%', 'id': 'Significant 95%'},
+        {'name': 'Significant 99%', 'id': 'Significant 99%'},
+        {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
+        {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
+    ]
+
+    return results_list, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.'
 
 @app.callback(
     [Output({'type': 'primary-ticker-input', 'index': ALL}, 'value'),
