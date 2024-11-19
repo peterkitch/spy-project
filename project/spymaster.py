@@ -95,6 +95,10 @@ _loading_lock = threading.Lock()
 
 status_lock = Lock()
 
+optimization_lock = threading.Lock()
+optimization_in_progress = False
+optimization_results_cache = {}  # Add this line to store results
+
 # Set up persistent cache
 cache_dir = '.cache'
 os.makedirs(cache_dir, exist_ok=True)
@@ -1514,6 +1518,7 @@ app.layout = html.Div(
                             markdown_options={'html': True},  # Enable HTML rendering in markdown cells
                             style_data={'whiteSpace': 'normal', 'height': 'auto'},
                             cell_selectable=True,
+                            selected_cells=[],
                             style_table={
                                 'overflowX': 'auto',
                                 'backgroundColor': 'black',
@@ -1534,19 +1539,26 @@ app.layout = html.Div(
                                 'fontWeight': 'bold',
                                 'border': '2px solid #80ff00'
                             },
-                            style_data_conditional=[{
-                                'if': {'row_index': 'odd'},
-                                'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                            }],
+                            style_data_conditional=[
+                                {
+                                    'if': {'row_index': 'odd'},
+                                    'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                },
+                                {
+                                    'if': {'state': 'selected'},
+                                    'backgroundColor': 'rgba(0, 255, 0, 0.2)',
+                                    'border': '2px solid #80ff00'
+                                }
+                            ],
                         )
                     ]
                 )
             ], width=12)
         ]),
-
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
         dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
-        dcc.Interval(id='loading-interval', interval=2000, n_intervals=0),  # Update every 2 seconds
+        dcc.Interval(id='loading-interval', interval=5000, n_intervals=0),  # Update every 5 seconds
+        dcc.Interval(id='optimization-update-interval', interval=5000, n_intervals=0, disabled=False),
         # Loading spinner output (if needed)
         dcc.Loading(
             id="loading-spinner",
@@ -3591,29 +3603,52 @@ def update_primary_tickers(add_click, delete_clicks, active_cell, children, virt
     elif 'delete-primary-button' in triggered_id:
         # A delete button was clicked
         triggered_dict = ast.literal_eval(triggered_id)
-        if 'index' in triggered_dict:
-            delete_index = int(triggered_dict['index'])
-        else:
+        if 'index' not in triggered_dict:
             raise PreventUpdate
 
-        # Remove the child with the matching index
-        new_children = [child for child in children if child['props']['id']['index'] != delete_index]
-
+        delete_index = int(triggered_dict['index'])
+        logger.info(f"Delete requested for index: {delete_index}")
+        
+        # Log current state before deletion
+        current_indices = [child['props']['id']['index'] for child in children]
+        logger.info(f"Current indices before deletion: {current_indices}")
+        
+        # Find the child to delete by matching the exact index
+        child_to_delete = None
+        for child in children:
+            if child['props']['id']['index'] == delete_index:
+                child_to_delete = child
+                break
+                
+        if child_to_delete is None:
+            logger.warning(f"Could not find child with index {delete_index}")
+            raise PreventUpdate
+            
+        # Remove the specific child
+        children.remove(child_to_delete)
+        
         # Re-index the remaining children
-        new_children = reindex_children(new_children)
-
+        new_children = reindex_children(children)
+        
+        # Log state after reindexing
+        new_indices = [child['props']['id']['index'] for child in new_children]
+        logger.info(f"Indices after reindexing: {new_indices}")
+        
         return new_children
 
     elif triggered_id == 'optimization-results-table':
-        # Handle clicks on the Combination column
+        # Clear existing state before handling new combination
         if not active_cell or active_cell['column_id'] != 'Combination':
             raise PreventUpdate
-
+        
         row = active_cell['row']
-        # Use derived_virtual_data to get the correct row data after sorting/filtering
         if virtual_data is None or row is None or row >= len(virtual_data):
             raise PreventUpdate
 
+        # Clear any existing children
+        logger.info("Clearing existing primary ticker configuration")
+        children = []
+        
         combination_html = virtual_data[row]['Combination']
 
         # Parse the HTML content to extract tickers and their states
@@ -3690,12 +3725,23 @@ def create_primary_ticker_row(index, ticker_value='', invert_value=False, mute_v
 def reindex_children(children):
     # Re-index the children and update their IDs and keys
     for i, child in enumerate(children):
+        # Update row index
         child['props']['id']['index'] = i
         child['key'] = str(uuid.uuid4())
+        
+        # Update all components within the row
         for col in child['props']['children']:
             component = col['props']['children']
-            if isinstance(component, dict) and 'id' in component:
-                component['id']['index'] = i
+            if isinstance(component, dict):
+                if 'props' in component:
+                    # Update ID in props if it exists
+                    if 'id' in component['props'] and isinstance(component['props']['id'], dict):
+                        component['props']['id']['index'] = i
+                # Update direct ID if it exists
+                elif 'id' in component and isinstance(component['id'], dict):
+                    component['id']['index'] = i
+    
+    logger.info(f"Reindexed {len(children)} rows with indices: {[child['props']['id']['index'] for child in children]}")
     return children
 
 # Callback to process aggregated signals and update the chart and metrics table
@@ -3737,7 +3783,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     for idx, (ticker, invert) in enumerate(zip(primary_tickers_filtered, invert_signals_filtered)):
         results = load_precomputed_results(ticker)
         if not results:
-            return no_update, no_update, no_update, f'Data not ready for primary ticker {ticker}.'
+            return no_update, no_update, no_update, f'Processing Data for primary ticker {ticker}. Please wait.'
         signals = results.get('active_pairs')
         dates = results['preprocessed_data'].index
 
@@ -4105,327 +4151,422 @@ def process_ticker_queue():
 
 @app.callback(
     [Output('optimization-results-table', 'data'),
+     Output('optimization-results-table', 'columns'),
      Output('optimization-feedback', 'children')],
     [Input('optimization-primary-tickers', 'value'),
-     Input('optimization-secondary-ticker', 'value')],
+     Input('optimization-secondary-ticker', 'value'),
+     Input('optimization-update-interval', 'n_intervals')],
     prevent_initial_call=True
 )
-def optimize_signals(primary_tickers_input, secondary_ticker_input):
-    if not primary_tickers_input or not secondary_ticker_input:
-        return [], 'Please enter both primary and secondary tickers.'
+def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals):
+    global optimization_in_progress
+    empty_columns = [{'name': i, 'id': i} for i in ['Combination']]
+    
+    try:
+        ctx = dash.callback_context
+        triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    # Parse tickers
-    primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
-    secondary_tickers = [ticker.strip().upper() for ticker in secondary_ticker_input.split(',') if ticker.strip()]
-    if len(secondary_tickers) != 1:
-        return [], 'Please enter exactly one secondary ticker.'
-    secondary_ticker = secondary_tickers[0]
-
-    # Limit the number of primary tickers
-    max_primary_tickers = 20
-    if len(primary_tickers) > max_primary_tickers:
-        return [], f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.'
-
-    # Fetch secondary ticker data
-    secondary_data = fetch_data(secondary_ticker)
-    if secondary_data is None or secondary_data.empty:
-        return [], f'No data found for secondary ticker {secondary_ticker}.'
-
-    # Fetch data for each primary ticker
-    primary_signals = {}
-    date_indexes = {}
-    for ticker in primary_tickers:
-        results = load_precomputed_results(ticker)
-        if not results or 'active_pairs' not in results:
-            return [], f'Data not processed for primary ticker {ticker}. Please wait.'
-
-        active_pairs = results['active_pairs']
-        dates = results['preprocessed_data'].index
-
-        # Handle length mismatch
-        if len(active_pairs) != len(dates):
-            if len(active_pairs) == len(dates) - 1:
-                dates = dates[1:]
-            else:
-                return [], f'Length mismatch between active_pairs and dates for ticker {ticker}. Cannot proceed.'
-
-        # Create signals series
-        signals_series = pd.Series(active_pairs, index=dates)
-        
-        # Process for next day's signals
-        if 'preprocessed_data' in results and 'daily_top_buy_pairs' in results and 'daily_top_short_pairs' in results:
-            df = results['preprocessed_data']
-            last_date = df.index[-1]
-            buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
-            short_pair_data = results['daily_top_short_pairs'].get(last_date)
+        # Handle interval updates
+        if triggered_id == 'optimization-update-interval':
+            if not primary_tickers_input or not secondary_ticker_input:
+                raise PreventUpdate
+                
+            # Check if we have cached results and all tickers are processed
+            cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
+            if cache_key in optimization_results_cache:
+                # Verify all tickers are fully processed
+                primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+                all_processed = all(
+                    read_status(ticker).get('status') == 'complete'
+                    for ticker in primary_tickers
+                )
+                if all_processed:
+                    return optimization_results_cache[cache_key]
+                
+            # Check processing status of primary tickers
+            primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
+            processing_statuses = []
+            completed_tickers = []
+            any_processing = False
+            needs_processing = False
             
-            if buy_pair_data and short_pair_data:
-                try:
-                    # Validate pair data structure
-                    if not isinstance(buy_pair_data[0], tuple) or not isinstance(short_pair_data[0], tuple):
-                        raise ValueError("Invalid pair data structure")
-                            
-                    # Calculate next day's signal
-                    buy_pair = buy_pair_data[0]
-                    short_pair = short_pair_data[0]
-                    buy_capture = buy_pair_data[1]
-                    short_capture = short_pair_data[1]
-                        
-                    # Validate SMA columns exist
-                    required_smas = [
-                        f'SMA_{buy_pair[0]}', f'SMA_{buy_pair[1]}',
-                        f'SMA_{short_pair[0]}', f'SMA_{short_pair[1]}'
-                    ]
-                    if not all(sma in df.columns for sma in required_smas):
-                        raise ValueError("Missing required SMA columns")
-                        
-                    buy_signal = df[f'SMA_{buy_pair[0]}'].loc[last_date] > df[f'SMA_{buy_pair[1]}'].loc[last_date]
-                    short_signal = df[f'SMA_{short_pair[0]}'].loc[last_date] < df[f'SMA_{short_pair[1]}'].loc[last_date]
-                        
-                    # Determine next signal
-                    if buy_signal and short_signal:
-                        next_signal = f"Buy" if buy_capture > short_capture else f"Short"
-                    elif buy_signal:
-                        next_signal = f"Buy"
-                    elif short_signal:
-                        next_signal = f"Short"
-                    else:
-                        next_signal = "None"
-                        
-                    # Store current signals for performance calculation
-                    processed_signals = signals_series.astype(str).apply(
-                        lambda x: 'Buy' if x.strip().startswith('Buy') else
-                                'Short' if x.strip().startswith('Short') else 'None'
-                    )
+            for ticker in primary_tickers:
+                status = read_status(ticker)
+                if status['status'] == 'processing':
+                    any_processing = True
+                    processing_statuses.append(f"{ticker}: {status['progress']:.1f}%")
+                elif status['status'] == 'complete':
+                    completed_tickers.append(ticker)
+                elif status['status'] in ['not started', 'failed']:
+                    needs_processing = True
+                    processing_statuses.append(f"{ticker}: Waiting...")
+                elif status['status'] == 'failed':
+                    processing_statuses.append(f"{ticker}: Failed")
                     
-                    # Append next_signal to processed_signals
-                    next_date = secondary_data.index[secondary_data.index > last_date]
-                    if not next_date.empty:
-                        next_date = next_date[0]
-                        processed_signals = processed_signals.append(pd.Series([next_signal], index=[next_date]))
-                    else:
-                        # No future date available, cannot append next_signal
-                        pass
-                        
-                    # Store signals and next_signal
-                    logger.info(f"Ticker {ticker} - Next signal: {next_signal}")
-                        
-                    primary_signals[ticker] = {
-                        'signals_with_next': processed_signals,
-                        'next_signal': next_signal
-                    }
-                    date_indexes[ticker] = set(processed_signals.index)
-                        
-                except Exception as e:
-                    logger.error(f"Error processing signals for {ticker}: {str(e)}")
-                    return [], f'Error processing signals for {ticker}.'
-            else:
-                return [], f'Incomplete data for ticker {ticker}.'
-        else:
-            return [], f'Missing data in results for ticker {ticker}.'
-
-    # Generate possible states for each ticker based on next day's signals
-    ticker_states = {}
-    for ticker in primary_tickers:
-        signal = primary_signals[ticker]['next_signal']
-        logger.debug(f"Using next day signal for {ticker}: {signal}")
-        
-        # Determine possible states based on next signal
-        if 'Buy' in signal:
-            ticker_states[ticker] = [(False, False), (False, True)]  # (invert_signals, mute)
-        elif 'Short' in signal:
-            ticker_states[ticker] = [(True, False), (False, True)]  # (invert_signals, mute)
-        else:
-            ticker_states[ticker] = [(False, True)]  # Only mute option for 'None' signals
-
-    # Generate combinations
-    ticker_state_lists = list(ticker_states.values())
-    combinations = list(product(*ticker_state_lists))
-    combination_labels = []
-    valid_combinations = []
-
-    for states in combinations:
-        label_parts = []
-        state_dict = {}
-        
-        for ticker, (invert_signals, mute) in zip(ticker_states.keys(), states):
-            if mute:
-                state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
-                continue  # Skip muted tickers in label
+            if any_processing or needs_processing:
+                status_message = f"Processing: {', '.join(processing_statuses)}"
+                if completed_tickers:
+                    status_message += f" | Completed: {', '.join(completed_tickers)}"
+                return [], empty_columns, status_message
             
-            # Get next day's signal for display
-            next_signal = primary_signals[ticker]['next_signal']
-            if invert_signals:
-                # Invert the signal for display
-                if 'Buy' in next_signal:
-                    display_signal = 'Short'
-                elif 'Short' in next_signal:
-                    display_signal = 'Buy'
+        # For non-interval triggers, ensure we're not already processing
+        elif not triggered_id == 'optimization-update-interval':
+            if optimization_in_progress:
+                return [], empty_columns, "Optimization already in progress. Please wait..."
+            
+            # Acquire lock for new processing
+            if not optimization_lock.acquire(blocking=False):
+                return [], empty_columns, "Another optimization is in progress. Please wait..."
+            
+            optimization_in_progress = True
+
+        # Basic input validation
+        if not primary_tickers_input or not secondary_ticker_input:
+            if optimization_in_progress:
+                optimization_in_progress = False
+                if optimization_lock.locked():
+                    optimization_lock.release()
+            return [], empty_columns, 'Please enter both primary and secondary tickers.'
+
+        # Parse tickers
+        primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
+        secondary_tickers = [ticker.strip().upper() for ticker in secondary_ticker_input.split(',') if ticker.strip()]
+        if len(secondary_tickers) != 1:
+            return [], empty_columns, 'Please enter exactly one secondary ticker.'
+        secondary_ticker = secondary_tickers[0]
+
+        # Limit the number of primary tickers
+        max_primary_tickers = 20
+        if len(primary_tickers) > max_primary_tickers:
+            return [], empty_columns, f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.'
+
+        # Fetch secondary ticker data
+        secondary_data = fetch_data(secondary_ticker)
+        if secondary_data is None or secondary_data.empty:
+            return [], empty_columns, f'No data found for secondary ticker {secondary_ticker}.'
+
+        # Fetch data for each primary ticker
+        primary_signals = {}
+        date_indexes = {}
+        for ticker in primary_tickers:
+            results = load_precomputed_results(ticker)
+            if not results or 'active_pairs' not in results:
+                return [], empty_columns, f'Data not processed for primary ticker {ticker}. Please wait.'
+
+            active_pairs = results['active_pairs']
+            dates = results['preprocessed_data'].index
+
+            # Handle length mismatch
+            if len(active_pairs) != len(dates):
+                if len(active_pairs) == len(dates) - 1:
+                    dates = dates[1:]
+                else:
+                    return [], empty_columns, f'Length mismatch between active_pairs and dates for ticker {ticker}. Cannot proceed.'
+
+            # Create signals series
+            signals_series = pd.Series(active_pairs, index=dates)
+            
+            # Process for next day's signals
+            if 'preprocessed_data' in results and 'daily_top_buy_pairs' in results and 'daily_top_short_pairs' in results:
+                df = results['preprocessed_data']
+                last_date = df.index[-1]
+                buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
+                short_pair_data = results['daily_top_short_pairs'].get(last_date)
+                
+                if buy_pair_data and short_pair_data:
+                    try:
+                        # Validate pair data structure
+                        if not isinstance(buy_pair_data[0], tuple) or not isinstance(short_pair_data[0], tuple):
+                            raise ValueError("Invalid pair data structure")
+                                
+                        # Calculate next day's signal
+                        buy_pair = buy_pair_data[0]
+                        short_pair = short_pair_data[0]
+                        buy_capture = buy_pair_data[1]
+                        short_capture = short_pair_data[1]
+                            
+                        # Validate SMA columns exist
+                        required_smas = [
+                            f'SMA_{buy_pair[0]}', f'SMA_{buy_pair[1]}',
+                            f'SMA_{short_pair[0]}', f'SMA_{short_pair[1]}'
+                        ]
+                        if not all(sma in df.columns for sma in required_smas):
+                            raise ValueError("Missing required SMA columns")
+                            
+                        buy_signal = df[f'SMA_{buy_pair[0]}'].loc[last_date] > df[f'SMA_{buy_pair[1]}'].loc[last_date]
+                        short_signal = df[f'SMA_{short_pair[0]}'].loc[last_date] < df[f'SMA_{short_pair[1]}'].loc[last_date]
+                            
+                        # Determine next signal
+                        if buy_signal and short_signal:
+                            next_signal = f"Buy" if buy_capture > short_capture else f"Short"
+                        elif buy_signal:
+                            next_signal = f"Buy"
+                        elif short_signal:
+                            next_signal = f"Short"
+                        else:
+                            next_signal = "None"
+                            
+                        # Store current signals for performance calculation
+                        processed_signals = signals_series.astype(str).apply(
+                            lambda x: 'Buy' if x.strip().startswith('Buy') else
+                                    'Short' if x.strip().startswith('Short') else 'None'
+                        )
+                        
+                        # Append next_signal to processed_signals
+                        next_date = secondary_data.index[secondary_data.index > last_date]
+                        if not next_date.empty:
+                            next_date = next_date[0]
+                            processed_signals = processed_signals.append(pd.Series([next_signal], index=[next_date]))
+                        else:
+                            # No future date available, cannot append next_signal
+                            pass
+                            
+                        # Only log signals during initial processing, not during interval updates
+                        if triggered_id != 'optimization-update-interval':
+                            logger.info(f"Ticker {ticker} - Next signal: {next_signal}")
+                            
+                        primary_signals[ticker] = {
+                            'signals_with_next': processed_signals,
+                            'next_signal': next_signal
+                        }
+                        date_indexes[ticker] = set(processed_signals.index)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing signals for {ticker}: {str(e)}")
+                        return [], empty_columns, f'Error processing signals for {ticker}.'
+                else:
+                    return [], empty_columns, f'Incomplete data for ticker {ticker}.'
+            else:
+                return [], empty_columns, f'Missing data in results for ticker {ticker}.'
+
+        # Generate possible states for each ticker based on next day's signals
+        ticker_states = {}
+        for ticker in primary_tickers:
+            signal = primary_signals[ticker]['next_signal']
+            logger.debug(f"Using next day signal for {ticker}: {signal}")
+            
+            # Determine possible states based on next signal
+            if 'Buy' in signal:
+                ticker_states[ticker] = [(False, False), (False, True)]  # (invert_signals, mute)
+            elif 'Short' in signal:
+                ticker_states[ticker] = [(True, False), (False, True)]  # (invert_signals, mute)
+            else:
+                ticker_states[ticker] = [(False, True)]  # Only mute option for 'None' signals
+
+        # Generate combinations
+        ticker_state_lists = list(ticker_states.values())
+        combinations = list(product(*ticker_state_lists))
+        combination_labels = []
+        valid_combinations = []
+
+        for states in combinations:
+            label_parts = []
+            state_dict = {}
+            
+            for ticker, (invert_signals, mute) in zip(ticker_states.keys(), states):
+                if mute:
+                    state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
+                    continue  # Skip muted tickers in label
+                
+                # Get next day's signal for display
+                next_signal = primary_signals[ticker]['next_signal']
+                if invert_signals:
+                    # Invert the signal for display
+                    if 'Buy' in next_signal:
+                        display_signal = 'Short'
+                    elif 'Short' in next_signal:
+                        display_signal = 'Buy'
+                    else:
+                        display_signal = next_signal
+                    label_parts.append(f"<span style='color:red'>{ticker}</span>")
                 else:
                     display_signal = next_signal
-                label_parts.append(f"<span style='color:red'>{ticker}</span>")
-            else:
-                display_signal = next_signal
-                label_parts.append(f"<span style='color:#80ff00'>{ticker}</span>")
+                    label_parts.append(f"<span style='color:#80ff00'>{ticker}</span>")
+                
+                state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
             
-            state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
-        
-        label = ', '.join(label_parts)
-        combination_labels.append(label)
-        valid_combinations.append(state_dict)
+            label = ', '.join(label_parts)
+            combination_labels.append(label)
+            valid_combinations.append(state_dict)
 
-    # Check combination limit
-    max_combinations = 1058576 # changed from 4100
-    if len(combinations) > max_combinations:
-        return [], f'Too many combinations ({len(combinations)}). Please reduce the number of primary tickers.'
+        # Check combination limit
+        max_combinations = 1058576 # changed from 4100
+        if len(combinations) > max_combinations:
+            return [], empty_columns, f'Too many combinations ({len(combinations)}). Please reduce the number of primary tickers.'
 
-    # Prepare for results
-    results_list = []
+        # Prepare for results
+        results_list = []
 
-    # Process each combination
-    for idx, state_dict in enumerate(valid_combinations):
-        
-        # Get unmuted tickers
-        unmuted_tickers = [ticker for ticker in primary_tickers 
-                          if ticker in state_dict and not state_dict[ticker]['mute']]
-
-        if not unmuted_tickers:
-            continue  # Skip if all tickers are muted
-
-        # Find common dates
-        common_dates = set(secondary_data.index)
-        for ticker in unmuted_tickers:
-            common_dates = common_dates.intersection(date_indexes[ticker])
-        common_dates = sorted(common_dates)
-
-        if not common_dates:
-            continue  # Skip if no overlapping dates
-
-        # Build combined signals DataFrame for performance calculation
-        combined_signals_df = pd.DataFrame(index=common_dates)
-        for ticker in unmuted_tickers:
-            state = state_dict[ticker]
-            invert_signals = state['invert_signals']
+        # Process each combination
+        for idx, state_dict in enumerate(valid_combinations):
             
-            # Use signals_with_next for performance calculation
-            signals_with_next = primary_signals[ticker]['signals_with_next'].loc[common_dates]
-            
-            # Apply inversion if needed
-            if invert_signals:
-                signals = signals_with_next.replace({'Buy': 'Short', 'Short': 'Buy'})
-            else:
-                signals = signals_with_next
-            
-            combined_signals_df[ticker] = signals
+            # Get unmuted tickers
+            unmuted_tickers = [ticker for ticker in primary_tickers 
+                             if ticker in state_dict and not state_dict[ticker]['mute']]
 
-        # Combine signals
-        def get_combined_signal(row):
-            active_signals = [s for s in row if s != 'None']
-            if not active_signals:
+            if not unmuted_tickers:
+                continue  # Skip if all tickers are muted
+
+            # Find common dates
+            common_dates = set(secondary_data.index)
+            for ticker in unmuted_tickers:
+                common_dates = common_dates.intersection(date_indexes[ticker])
+            common_dates = sorted(common_dates)
+
+            if not common_dates:
+                continue  # Skip if no overlapping dates
+
+            # Build combined signals DataFrame for performance calculation
+            combined_signals_df = pd.DataFrame(index=common_dates)
+            for ticker in unmuted_tickers:
+                state = state_dict[ticker]
+                invert_signals = state['invert_signals']
+                
+                # Use signals_with_next for performance calculation
+                signals_with_next = primary_signals[ticker]['signals_with_next'].loc[common_dates]
+                
+                # Apply inversion if needed
+                if invert_signals:
+                    signals = signals_with_next.replace({'Buy': 'Short', 'Short': 'Buy'})
+                else:
+                    signals = signals_with_next
+                
+                combined_signals_df[ticker] = signals
+
+            # Combine signals
+            def get_combined_signal(row):
+                active_signals = [s for s in row if s != 'None']
+                if not active_signals:
+                    return 'None'
+                if all(s == 'Buy' for s in active_signals):
+                    return 'Buy'
+                if all(s == 'Short' for s in active_signals):
+                    return 'Short'
                 return 'None'
-            if all(s == 'Buy' for s in active_signals):
-                return 'Buy'
-            if all(s == 'Short' for s in active_signals):
-                return 'Short'
-            return 'None'
 
-        combined_signals = combined_signals_df.apply(get_combined_signal, axis=1)
+            combined_signals = combined_signals_df.apply(get_combined_signal, axis=1)
 
-        # No need to shift signals since we included the next day's signal
-        signals = combined_signals.fillna('None')
+            # No need to shift signals since we included the next day's signal
+            signals = combined_signals.fillna('None')
 
-        # Align signals and prices
-        prices = secondary_data['Close'].loc[signals.index]
-        daily_returns = prices.pct_change().fillna(0)
+            # Align signals and prices
+            prices = secondary_data['Close'].loc[signals.index]
+            daily_returns = prices.pct_change().fillna(0)
 
-        # Ensure signals and daily_returns have the same index
-        signals = signals.loc[daily_returns.index]
+            # Ensure signals and daily_returns have the same index
+            signals = signals.loc[daily_returns.index]
 
-        # Calculate daily captures
-        daily_captures = pd.Series(0.0, index=signals.index)
-        buy_mask = signals == 'Buy'
-        short_mask = signals == 'Short'
-        
-        daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-        daily_captures[short_mask] = -daily_returns[short_mask] * 100
+            # Calculate daily captures
+            daily_captures = pd.Series(0.0, index=signals.index)
+            buy_mask = signals == 'Buy'
+            short_mask = signals == 'Short'
+            
+            daily_captures[buy_mask] = daily_returns[buy_mask] * 100
+            daily_captures[short_mask] = -daily_returns[short_mask] * 100
 
-        # Calculate metrics
-        trigger_days = (buy_mask | short_mask).sum()
-        if trigger_days == 0:
-            continue  # Skip combinations with no triggers
+            # Calculate metrics
+            trigger_days = (buy_mask | short_mask).sum()
+            if trigger_days == 0:
+                continue  # Skip combinations with no triggers
 
-        # Calculate wins and losses
-        trigger_captures = daily_captures[buy_mask | short_mask]
-        wins = (trigger_captures > 0).sum()
-        losses = trigger_days - wins
-        win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
+            # Calculate wins and losses
+            trigger_captures = daily_captures[buy_mask | short_mask]
+            wins = (trigger_captures > 0).sum()
+            losses = trigger_days - wins
+            win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
 
-        # Calculate performance metrics
-        avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
-        total_capture = trigger_captures.sum() if trigger_days > 0 else 0
-        std_dev = trigger_captures.std() if trigger_days > 0 else 0
+            # Calculate performance metrics
+            avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
+            total_capture = trigger_captures.sum() if trigger_days > 0 else 0
+            std_dev = trigger_captures.std() if trigger_days > 0 else 0
 
-        # Calculate Sharpe ratio
-        risk_free_rate = 5.0  # 5% annual rate
-        daily_rf_rate = risk_free_rate / 252
-        annualized_return = avg_daily_capture * 252
-        annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
-        sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
+            # Calculate Sharpe ratio
+            risk_free_rate = 5.0  # 5% annual rate
+            daily_rf_rate = risk_free_rate / 252
+            annualized_return = avg_daily_capture * 252
+            annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
+            sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
 
-        # Calculate statistical significance
-        if trigger_days > 1 and std_dev > 0:
-            t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-            degrees_of_freedom = trigger_days - 1
-            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-            t_statistic = round(t_statistic, 4)
-            p_value = round(p_value, 4)
-        else:
-            t_statistic = None
-            p_value = None
+            # Calculate statistical significance
+            if trigger_days > 1 and std_dev > 0:
+                t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+                degrees_of_freedom = trigger_days - 1
+                p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+                t_statistic = round(t_statistic, 4)
+                p_value = round(p_value, 4)
+            else:
+                t_statistic = None
+                p_value = None
 
-        # Store results
-        results_list.append({
-            'Combination': combination_labels[idx],
-            'Trigger Days': int(trigger_days),
-            'Wins': int(wins),
-            'Losses': int(losses),
-            'Win Ratio (%)': round(win_ratio, 2),
-            'Std Dev (%)': round(std_dev, 4),
-            'Sharpe Ratio': round(sharpe_ratio, 2),
-            't-Statistic': t_statistic if t_statistic is not None else 'N/A',
-            'p-Value': p_value if p_value is not None else 'N/A',
-            'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-            'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-            'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-            'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-            'Total Capture (%)': round(total_capture, 4)
-        })
+            # Store results
+            results_list.append({
+                'Combination': combination_labels[idx],
+                'Trigger Days': int(trigger_days),
+                'Wins': int(wins),
+                'Losses': int(losses),
+                'Win Ratio (%)': round(win_ratio, 2),
+                'Std Dev (%)': round(std_dev, 4),
+                'Sharpe Ratio': round(sharpe_ratio, 2),
+                't-Statistic': t_statistic if t_statistic is not None else 'N/A',
+                'p-Value': p_value if p_value is not None else 'N/A',
+                'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+                'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+                'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
+                'Avg Daily Capture (%)': round(avg_daily_capture, 4),
+                'Total Capture (%)': round(total_capture, 4)
+            })
 
-    if not results_list:
-        return [], 'No valid combinations found.'
+        if not results_list:
+            if optimization_in_progress:
+                optimization_in_progress = False
+                if optimization_lock.locked():
+                    optimization_lock.release()
+            return [], empty_columns, 'No valid combinations found.'
 
-    # Sort by Sharpe Ratio
-    results_list.sort(key=lambda x: x['Sharpe Ratio'], reverse=True)
+        # Sort by Sharpe Ratio
+        results_list.sort(key=lambda x: x['Sharpe Ratio'], reverse=True)
 
-    # Define columns for the DataTable
-    columns = [
-        {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
-        {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
-        {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
-        {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
-        {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
-        {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
-        {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
-        {'name': 't-Statistic', 'id': 't-Statistic'},
-        {'name': 'p-Value', 'id': 'p-Value'},
-        {'name': 'Significant 90%', 'id': 'Significant 90%'},
-        {'name': 'Significant 95%', 'id': 'Significant 95%'},
-        {'name': 'Significant 99%', 'id': 'Significant 99%'},
-        {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
-        {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
-    ]
+        # Define columns for the DataTable
+        columns = [
+            {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
+            {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
+            {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
+            {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
+            {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
+            {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
+            {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
+            {'name': 't-Statistic', 'id': 't-Statistic'},
+            {'name': 'p-Value', 'id': 'p-Value'},
+            {'name': 'Significant 90%', 'id': 'Significant 90%'},
+            {'name': 'Significant 95%', 'id': 'Significant 95%'},
+            {'name': 'Significant 99%', 'id': 'Significant 99%'},
+            {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
+            {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
+        ]
 
-    return results_list, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.'
+        try:
+            # Cache the results before returning
+            cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
+            optimization_results_cache[cache_key] = (results_list, columns, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.')
+            return optimization_results_cache[cache_key]
+        finally:
+            optimization_in_progress = False
+            if optimization_lock.locked():
+                optimization_lock.release()
+                
+    except PreventUpdate:
+        raise  # Re-raise PreventUpdate without logging
+    except Exception as e:
+        logger.error(f"Error in optimize_signals: {str(e)}")
+        logger.error(traceback.format_exc())
+        if optimization_in_progress:
+            optimization_in_progress = False
+            if optimization_lock.locked():
+                optimization_lock.release()
+        return [], empty_columns, f"Error: {str(e)}"
+
+# Add this variable at the top of your script with other globals
+last_active_cell = None
 
 @app.callback(
     [Output({'type': 'primary-ticker-input', 'index': ALL}, 'value'),
@@ -4433,49 +4574,70 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input):
      Output({'type': 'mute-primary-switch', 'index': ALL}, 'value')],
     [Input('optimization-results-table', 'active_cell')],
     [State('optimization-results-table', 'data'),
-     State({'type': 'primary-ticker-input', 'index': ALL}, 'id'),
-     State({'type': 'invert-primary-switch', 'index': ALL}, 'id'),
-     State({'type': 'mute-primary-switch', 'index': ALL}, 'id')],
+     State({'type': 'primary-ticker-input', 'index': ALL}, 'id')],
     prevent_initial_call=True
 )
-def populate_multi_primary_aggregator(active_cell, data, primary_input_ids, invert_switch_ids, mute_switch_ids):
-    if not active_cell or active_cell['column_id'] != 'Combination':
+def populate_multi_primary_aggregator(active_cell, data, primary_input_ids):
+    global last_active_cell
+    
+    if not active_cell:
         raise PreventUpdate
 
-    row = active_cell['row']
-    combination_html = data[row]['Combination']
+    # Check if this is the same cell click we already processed
+    if last_active_cell == active_cell:
+        raise PreventUpdate
+    
+    last_active_cell = active_cell
+    
+    if active_cell['column_id'] != 'Combination':
+        raise PreventUpdate
 
-    # Parse the HTML content to extract tickers and their states
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(combination_html, 'html.parser')
-    tickers = []
-    invert_values = []
-    mute_values = []
+    try:
+        row = active_cell['row']
+        combination_html = data[row]['Combination']
+        
+        # Parse the HTML content (only log once)
+        logger.info(f"Processing combination from row {row}")
+        
+        soup = BeautifulSoup(combination_html, 'html.parser')
+        parsed_data = []
+        
+        for span in soup.find_all('span'):
+            ticker = span.text.strip()
+            style = span.get('style', '')
+            invert = 'color:red' in style or 'color: red' in style
+            parsed_data.append({
+                'ticker': ticker,
+                'invert': invert,
+                'mute': False
+            })
+            
+        # Prepare outputs
+        num_slots = len(primary_input_ids)
+        ticker_values = []
+        invert_values = []
+        mute_values = []
 
-    for span in soup.find_all('span'):
-        ticker = span.text
-        style = span.get('style', '')
-        if 'red' in style:
-            invert = [True]
-        else:
-            invert = [False]
-        tickers.append(ticker)
-        invert_values.append(invert)
-        mute_values.append([False])  # Since muted tickers are excluded
+        # Fill with parsed data
+        for i in range(min(num_slots, len(parsed_data))):
+            ticker_values.append(parsed_data[i]['ticker'])
+            invert_values.append(parsed_data[i]['invert'])
+            mute_values.append(parsed_data[i]['mute'])
 
-    # Update the "Multi-Primary Signal Aggregator" inputs
-    # Assuming you have a fixed number of input slots
-    max_slots = len(primary_input_ids)
-    tickers = tickers[:max_slots]
-    invert_values = invert_values[:max_slots]
-    mute_values = mute_values[:max_slots]
+        # Fill remaining slots with empty values
+        while len(ticker_values) < num_slots:
+            ticker_values.append('')
+            invert_values.append(False)
+            mute_values.append(False)
 
-    # Fill remaining slots with empty strings or default values
-    tickers += [''] * (max_slots - len(tickers))
-    invert_values += [[False]] * (max_slots - len(invert_values))
-    mute_values += [[False]] * (max_slots - len(mute_values))
+        # Only log the final configuration once
+        logger.info(f"Configured {len(parsed_data)} tickers")
+        return ticker_values, invert_values, mute_values
 
-    return tickers, invert_values, mute_values
+    except Exception as e:
+        logger.error(f"Error processing combination: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise PreventUpdate
 
 if __name__ == "__main__":
     # Run the Dash app
