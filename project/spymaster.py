@@ -1514,7 +1514,11 @@ app.layout = html.Div(
                                 {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
                             ],
                             data=[],
-                            sort_action='native',  # Enable sorting for all columns
+                            sort_action='custom',
+                            sort_mode='multi',
+                            sort_by=[],
+                            persistence=True,
+                            persistence_type='session',
                             markdown_options={'html': True},  # Enable HTML rendering in markdown cells
                             style_data={'whiteSpace': 'normal', 'height': 'auto'},
                             cell_selectable=True,
@@ -1548,6 +1552,12 @@ app.layout = html.Div(
                                     'if': {'state': 'selected'},
                                     'backgroundColor': 'rgba(0, 255, 0, 0.2)',
                                     'border': '2px solid #80ff00'
+                                },
+                                {
+                                    'if': {'filter_query': '{Combination} = "AVERAGES"'},
+                                    'backgroundColor': 'rgba(0, 255, 0, 0.15)',
+                                    'fontWeight': 'bold',
+                                    'border-bottom': '2px solid #80ff00'
                                 }
                             ],
                         )
@@ -4155,10 +4165,11 @@ def process_ticker_queue():
      Output('optimization-feedback', 'children')],
     [Input('optimization-primary-tickers', 'value'),
      Input('optimization-secondary-ticker', 'value'),
-     Input('optimization-update-interval', 'n_intervals')],
+     Input('optimization-update-interval', 'n_intervals'),
+     Input('optimization-results-table', 'sort_by')],
     prevent_initial_call=True
 )
-def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals):
+def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals, sort_by):
     global optimization_in_progress
     empty_columns = [{'name': i, 'id': i} for i in ['Combination']]
     
@@ -4166,22 +4177,102 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals)
         ctx = dash.callback_context
         triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
+        # Check cache first for any request type
+        if primary_tickers_input and secondary_ticker_input:
+            cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
+            if cache_key in optimization_results_cache:
+                cached_results, cached_columns, cached_message, cached_sort = optimization_results_cache[cache_key]
+                
+                # If this is a sort request, update the cached sort state
+                if triggered_id == 'optimization-results-table':
+                    current_sort = sort_by
+                else:
+                    current_sort = cached_sort
+                
+                if current_sort:
+                    # Apply cached sort (rest of sorting logic remains the same)
+                    averages_row = next((row for row in cached_results if row['Combination'] == 'AVERAGES'), None)
+                    sortable_data = [row for row in cached_results if row['Combination'] != 'AVERAGES']
+                    
+                    for sort_spec in current_sort:
+                        col_id = sort_spec['column_id']
+                        is_ascending = sort_spec['direction'] == 'asc'
+                        try:
+                            if col_id in ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
+                                        'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
+                                        'Total Capture (%)']:
+                                sortable_data = sorted(
+                                    sortable_data,
+                                    key=lambda x: (float(str(x[col_id]).replace('N/A', '-inf'))
+                                                 if x[col_id] != 'N/A' else float('-inf')),
+                                    reverse=not is_ascending
+                                )
+                            else:
+                                sortable_data = sorted(
+                                    sortable_data,
+                                    key=lambda x: str(x[col_id]),
+                                    reverse=not is_ascending
+                                )
+                        except Exception as e:
+                            logger.error(f"Sorting error for column {col_id}: {str(e)}")
+                            continue
+                    
+                    sorted_results = [averages_row] + sortable_data if averages_row else sortable_data
+                    # Update cache with new sort state
+                    optimization_results_cache[cache_key] = (sorted_results, cached_columns, cached_message, current_sort)
+                    return sorted_results, cached_columns, cached_message
+
+                return cached_results, cached_columns, cached_message
+
         # Handle interval updates
         if triggered_id == 'optimization-update-interval':
             if not primary_tickers_input or not secondary_ticker_input:
                 raise PreventUpdate
                 
-            # Check if we have cached results and all tickers are processed
+            # Handle cached results and sorting
             cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
             if cache_key in optimization_results_cache:
-                # Verify all tickers are fully processed
-                primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+                cached_results, cached_columns, cached_message = optimization_results_cache[cache_key]
+                
+                # If this is a sort request, handle it without reprocessing
+                if ctx.triggered_id == 'optimization-results-table.sort_by' and cached_results:
+                    # Separate averages row from sortable data
+                    averages_row = next((row for row in cached_results if row['Combination'] == 'AVERAGES'), None)
+                    sortable_data = [row for row in cached_results if row['Combination'] != 'AVERAGES']
+                    
+                    # Apply sorting if requested
+                    if sort_by:
+                        for sort_spec in sort_by:
+                            col_id = sort_spec['column_id']
+                            is_ascending = sort_spec['direction'] == 'asc'
+                            # Handle different column types
+                            if col_id in ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
+                                        'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
+                                        'Total Capture (%)']:
+                                sortable_data = sorted(sortable_data,
+                                                     key=lambda x: float(x[col_id]) if x[col_id] != 'N/A' else float('-inf'),
+                                                     reverse=not is_ascending)
+                            else:
+                                sortable_data = sorted(sortable_data,
+                                                     key=lambda x: str(x[col_id]),
+                                                     reverse=not is_ascending)
+                    
+                    # Return sorted data with averages row at top
+                    if averages_row:
+                        sorted_results = [averages_row] + sortable_data
+                    else:
+                        sorted_results = sortable_data
+                        
+                    return sorted_results, cached_columns, cached_message
+                
+                # For non-sort requests, verify processing status
+                primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
                 all_processed = all(
                     read_status(ticker).get('status') == 'complete'
                     for ticker in primary_tickers
                 )
                 if all_processed:
-                    return optimization_results_cache[cache_key]
+                    return optimization_results_cache[cache_key][:3]
                 
             # Check processing status of primary tickers
             primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
@@ -4321,8 +4412,8 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals)
                             # No future date available, cannot append next_signal
                             pass
                             
-                        # Only log signals during initial processing, not during interval updates
-                        if triggered_id != 'optimization-update-interval':
+                        # Only log signals during initial processing, not during sorts or interval updates
+                        if ctx.triggered_id not in ['optimization-results-table.sort_by', 'optimization-update-interval']:
                             logger.info(f"Ticker {ticker} - Next signal: {next_signal}")
                             
                         primary_signals[ticker] = {
@@ -4545,10 +4636,65 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals)
         ]
 
         try:
-            # Cache the results before returning
+            # Calculate averages for numeric columns
+            if results_list:
+                averages = {
+                    'Combination': 'AVERAGES',
+                    'Trigger Days': round(sum(r['Trigger Days'] for r in results_list) / len(results_list)),
+                    'Wins': round(sum(r['Wins'] for r in results_list) / len(results_list)),
+                    'Losses': round(sum(r['Losses'] for r in results_list) / len(results_list)),
+                    'Win Ratio (%)': round(sum(r['Win Ratio (%)'] for r in results_list) / len(results_list), 2),
+                    'Std Dev (%)': round(sum(r['Std Dev (%)'] for r in results_list) / len(results_list), 4),
+                    'Sharpe Ratio': round(sum(r['Sharpe Ratio'] for r in results_list) / len(results_list), 2),
+                    't-Statistic': round(sum(float(r['t-Statistic']) if r['t-Statistic'] != 'N/A' else 0 for r in results_list) / 
+                                      sum(1 for r in results_list if r['t-Statistic'] != 'N/A'), 4) if any(r['t-Statistic'] != 'N/A' for r in results_list) else 'N/A',
+                    'p-Value': round(sum(float(r['p-Value']) if r['p-Value'] != 'N/A' else 0 for r in results_list) / 
+                                   sum(1 for r in results_list if r['p-Value'] != 'N/A'), 4) if any(r['p-Value'] != 'N/A' for r in results_list) else 'N/A',
+                    'Significant 90%': f"{round(sum(1 for r in results_list if r['Significant 90%'] == 'Yes') / len(results_list) * 100, 1)}% of combinations",
+                    'Significant 95%': f"{round(sum(1 for r in results_list if r['Significant 95%'] == 'Yes') / len(results_list) * 100, 1)}% of combinations",
+                    'Significant 99%': f"{round(sum(1 for r in results_list if r['Significant 99%'] == 'Yes') / len(results_list) * 100, 1)}% of combinations",
+                    'Avg Daily Capture (%)': round(sum(r['Avg Daily Capture (%)'] for r in results_list) / len(results_list), 4),
+                    'Total Capture (%)': round(sum(r['Total Capture (%)'] for r in results_list) / len(results_list), 4)
+                }        
+            # Handle sorting and fixed averages row
             cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
-            optimization_results_cache[cache_key] = (results_list, columns, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.')
-            return optimization_results_cache[cache_key]
+            if results_list:
+                # Store current sort state with the cache
+                current_sort = getattr(ctx.inputs, 'optimization-results-table.sort_by', None)
+                sortable_data = sorted(results_list, key=lambda x: x['Sharpe Ratio'], reverse=True)
+                
+                # Apply current sort if exists
+                if current_sort:
+                    for sort_spec in current_sort:
+                        col_id = sort_spec['column_id']
+                        is_ascending = sort_spec['direction'] == 'asc'
+                        try:
+                            if col_id in ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
+                                        'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
+                                        'Total Capture (%)']:
+                                sortable_data = sorted(
+                                    sortable_data,
+                                    key=lambda x: (float(str(x[col_id]).replace('N/A', '-inf'))
+                                                 if x[col_id] != 'N/A' else float('-inf')),
+                                    reverse=not is_ascending
+                                )
+                            else:
+                                sortable_data = sorted(
+                                    sortable_data,
+                                    key=lambda x: str(x[col_id]),
+                                    reverse=not is_ascending
+                                )
+                        except Exception as e:
+                            logger.error(f"Sorting error for column {col_id}: {str(e)}")
+                            continue
+                
+                fixed_results = [averages] + sortable_data
+                optimization_results_cache[cache_key] = (fixed_results, columns, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.', current_sort)
+            else:
+                optimization_results_cache[cache_key] = ([], columns, 'No valid combinations found.', None)
+            return optimization_results_cache[cache_key][:3]
+
+
         finally:
             optimization_in_progress = False
             if optimization_lock.locked():
