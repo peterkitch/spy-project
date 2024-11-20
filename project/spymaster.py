@@ -139,7 +139,9 @@ def fetch_data(ticker, is_secondary=False):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    df = yf.download(ticker, period='max', interval='1d', progress=False)
+                    # auto_adjust=False to ensure we get both Adj Close and Close columns
+                    df = yf.download(ticker, period='max', interval='1d', progress=False, 
+                                   auto_adjust=False)
                 if not df.empty:
                     break
             except Exception as e:
@@ -154,24 +156,58 @@ def fetch_data(ticker, is_secondary=False):
         # Ensure the index is datetime and timezone naive
         df.index = pd.to_datetime(df.index).tz_localize(None)
         
+        # Track if we're using adjusted prices
+        using_adjusted = False
+        
         # Handle column names properly
         if isinstance(df.columns, pd.MultiIndex):
-            # For MultiIndex, get the Close prices for the ticker
-            if ('Close', ticker) in df.columns:
-                close_data = df['Close'][ticker]
-            elif ('Close', '') in df.columns:
-                close_data = df['Close']['']
-            else:
-                logger.error(f"Could not find Close price data for {ticker} in MultiIndex columns")
+            try:
+                # Try to get Adj Close first
+                if ('Adj Close', ticker) in df.columns:
+                    price_data = df['Adj Close'][ticker]
+                    using_adjusted = True
+                elif ('Adj Close', '') in df.columns:
+                    price_data = df['Adj Close']['']
+                    using_adjusted = True
+                # Fall back to Close if Adj Close is not available
+                elif ('Close', ticker) in df.columns:
+                    price_data = df['Close'][ticker]
+                elif ('Close', '') in df.columns:
+                    price_data = df['Close']['']
+                else:
+                    logger.error(f"Could not find price data for {ticker} in MultiIndex columns")
+                    return pd.DataFrame()
+                df = pd.DataFrame({'Close': price_data}, index=df.index)
+            except Exception as e:
+                logger.error(f"Error processing MultiIndex data for {ticker}: {str(e)}")
                 return pd.DataFrame()
-            df = pd.DataFrame({'Close': close_data}, index=df.index)
         else:
-            # For single-level columns, standardize names
-            df.columns = [str(col).capitalize() for col in df.columns]
-            if 'Close' not in df.columns:
-                logger.error(f"Close column not found in single-level columns for {ticker}")
+            try:
+                # For single-level columns, standardize names and prefer Adj Close
+                df.columns = [str(col).capitalize() for col in df.columns]
+                if 'Adj Close' in df.columns:
+                    price_data = df['Adj Close']
+                    using_adjusted = True
+                elif 'Adj_Close' in df.columns:
+                    price_data = df['Adj_Close']
+                    using_adjusted = True
+                elif 'Close' in df.columns:
+                    price_data = df['Close']
+                else:
+                    logger.error(f"No price data found in single-level columns for {ticker}")
+                    return pd.DataFrame()
+                df = pd.DataFrame({'Close': price_data}, index=df.index)
+            except Exception as e:
+                logger.error(f"Error processing single-level data for {ticker}: {str(e)}")
                 return pd.DataFrame()
-            df = df[['Close']]
+                
+        # Log price type only once per ticker
+        if not hasattr(fetch_data, f'logged_price_{ticker}'):
+            if using_adjusted:
+                logger.info(f"Using Adjusted Close data for {ticker}")
+            else:
+                logger.warning(f"Adjusted Close not available for {ticker} - defaulting to Close prices")
+            setattr(fetch_data, f'logged_price_{ticker}', True)
         
         if df.empty:
             logger.error(f"No valid data found for {ticker}")
@@ -194,9 +230,8 @@ def fetch_data(ticker, is_secondary=False):
             if is_crypto_ticker(ticker):
                 logger.info(f"Crypto ticker {ticker} detected - allowing 24/7 trading")
                 if len(df) > 0 and df.index[-1] < today:
-                    last_row = df.iloc[-1].copy()
-                    last_row.name = today
-                    df = pd.concat([df, last_row.to_frame().T])
+                    last_adj_close = df['Close'].iloc[-1]  # Already using adjusted price if available
+                    df.loc[today, 'Close'] = last_adj_close
                     logger.info(f"Added current day {today} to crypto data")
             else:
                 # Only add today if:
@@ -216,9 +251,8 @@ def fetch_data(ticker, is_secondary=False):
                     
                     # Only add today's date if we're during market hours
                     if market_open <= et_now <= market_close:
-                        last_row = df.iloc[-1].copy()
-                        last_row.name = today
-                        df = pd.concat([df, last_row.to_frame().T])
+                        last_adj_close = df['Close'].iloc[-1]  # Already using adjusted price if available
+                        df.loc[today, 'Close'] = last_adj_close
                         logger.debug(f"Added current market day {today} to data")
                     else:
                         logger.debug("Current time is outside market hours, not adding today's date")
@@ -235,9 +269,9 @@ def fetch_data(ticker, is_secondary=False):
         return pd.DataFrame()
 
 def get_last_valid_trading_day(df):
-    """Get the most recent day with valid trading data."""
+    """Get the most recent day with valid adjusted trading data."""
     for date in sorted(df.index, reverse=True):
-        if pd.notna(df.loc[date, 'Close']):
+        if pd.notna(df.loc[date, 'Close']):  # Already using adjusted price stored in 'Close'
             return date
     return None
 
@@ -529,8 +563,9 @@ def calculate_daily_top_pairs(df, ticker):
     return daily_top_buy_pairs, daily_top_short_pairs, total_chunk_processing_time
 
 def calculate_captures_vectorized(sma1, sma2, returns):
+    """Calculate captures using adjusted price returns."""
     try:
-        # Ensure inputs are numpy arrays
+        # Ensure inputs are numpy arrays (returns are based on adjusted prices)
         sma1 = np.asarray(sma1)
         sma2 = np.asarray(sma2)
         returns = np.asarray(returns)
@@ -4068,7 +4103,10 @@ def batch_process_tickers(n_clicks, n_intervals, tickers_input, existing_table_d
                         
                         # Get the last price from the valid trading day
                         # Convert back to tz-naive for lookup
-                        last_price = df.loc[last_valid_date.tz_localize(None), 'Close']
+                        if 'Adj Close' in df.columns:
+                            last_price = df.loc[last_valid_date.tz_localize(None), 'Adj Close']
+                        else:
+                            last_price = df.loc[last_valid_date.tz_localize(None), 'Close']
                         last_price = f"${last_price:.2f}"
                         
                         # Get next day signal with validation
