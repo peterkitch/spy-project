@@ -1025,7 +1025,7 @@ def read_status(ticker):
         return {"status": "not started", "progress": 0}
 
 status = read_status('AAPL')
-print(status)
+logger.info(status)
 
 def inspect_pkl_file(ticker, sample_size=5):
     pkl_file = f'{ticker}_precomputed_results.pkl'
@@ -1034,12 +1034,9 @@ def inspect_pkl_file(ticker, sample_size=5):
             results = pickle.load(f)
         keys = list(results.keys())
         sample_keys = random.sample(keys, min(sample_size, len(keys)))
-        print(f"Sample keys in {pkl_file}: {sample_keys}")
+        logger.info(f"Sample keys in {pkl_file}: {sample_keys}")
     else:
-        print(f"{pkl_file} does not exist.")
-
-# Optionally, call it manually for a specific ticker
-# inspect_pkl_file('VIK')
+        logger.warning(f"{pkl_file} does not exist.")
 
 app.layout = html.Div(
     style={
@@ -1603,7 +1600,7 @@ app.layout = html.Div(
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
         dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
         dcc.Interval(id='loading-interval', interval=5000, n_intervals=0),  # Update every 5 seconds
-        dcc.Interval(id='optimization-update-interval', interval=5000, n_intervals=0, disabled=False),
+        dcc.Interval(id='optimization-update-interval', interval=5000, n_intervals=0, disabled=True),
         # Loading spinner output (if needed)
         dcc.Loading(
             id="loading-spinner",
@@ -1904,15 +1901,15 @@ def get_or_calculate_combined_captures(results, df, daily_top_buy_pairs, daily_t
         cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
             df, formatted_daily_top_buy_pairs, formatted_daily_top_short_pairs
         )
-        print("Calculated new cumulative_combined_captures and active_pairs")
+        logger.info("Calculated new cumulative_combined_captures and active_pairs")
 
         # Update the results dictionary with the new data
         results['cumulative_combined_captures'] = cumulative_combined_captures
         results['active_pairs'] = active_pairs
         save_precomputed_results(ticker, results)
 
-    print(f"Number of cumulative combined captures: {len(cumulative_combined_captures)}")
-    print(f"Number of active pairs: {len(active_pairs)}")
+    logger.info(f"Number of cumulative combined captures: {len(cumulative_combined_captures)}")
+    logger.info(f"Number of active pairs: {len(active_pairs)}")
 
     return cumulative_combined_captures, active_pairs
 
@@ -4200,20 +4197,32 @@ def process_ticker_queue():
 @app.callback(
     [Output('optimization-results-table', 'data'),
      Output('optimization-results-table', 'columns'),
-     Output('optimization-feedback', 'children')],
-    [Input('optimization-primary-tickers', 'value'),
-     Input('optimization-secondary-ticker', 'value'),
+     Output('optimization-feedback', 'children'),
+     Output('optimization-update-interval', 'disabled')],
+    [Input('optimize-signals-button', 'n_clicks'),
      Input('optimization-update-interval', 'n_intervals'),
      Input('optimization-results-table', 'sort_by')],
+    [State('optimization-primary-tickers', 'value'),
+     State('optimization-secondary-ticker', 'value')],
     prevent_initial_call=True
 )
-def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals, sort_by):
+def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, secondary_ticker_input):
     global optimization_in_progress
     empty_columns = [{'name': i, 'id': i} for i in ['Combination']]
     
     try:
         ctx = dash.callback_context
         triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        
+        # Validate inputs
+        if not primary_tickers_input or not secondary_ticker_input:
+            raise PreventUpdate
+        
+        primary_tickers_input = primary_tickers_input.strip()
+        secondary_ticker_input = secondary_ticker_input.strip()
+        
+        if not primary_tickers_input or not secondary_ticker_input:
+            raise PreventUpdate
 
         # Check cache first for any request type
         if primary_tickers_input and secondary_ticker_input:
@@ -4258,19 +4267,18 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
                     sorted_results = [averages_row] + sortable_data if averages_row else sortable_data
                     # Update cache with new sort state
                     optimization_results_cache[cache_key] = (sorted_results, cached_columns, cached_message, current_sort)
-                    return sorted_results, cached_columns, cached_message
+                    return sorted_results, cached_columns, cached_message, True  # Add the fourth output
 
-                return cached_results, cached_columns, cached_message
+                return cached_results, cached_columns, cached_message, True  # Add the fourth output
 
         # Handle interval updates
         if triggered_id == 'optimization-update-interval':
+            # Prevent processing if inputs are None or empty
             if not primary_tickers_input or not secondary_ticker_input:
                 raise PreventUpdate
-                
-            # Handle cached results and sorting
             cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
             if cache_key in optimization_results_cache:
-                cached_results, cached_columns, cached_message = optimization_results_cache[cache_key]
+                cached_results, cached_columns, cached_message, cached_sort = optimization_results_cache[cache_key]
                 
                 # If this is a sort request, handle it without reprocessing
                 if ctx.triggered_id == 'optimization-results-table.sort_by' and cached_results:
@@ -4301,8 +4309,8 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
                     else:
                         sorted_results = sortable_data
                         
-                    return sorted_results, cached_columns, cached_message
-                
+                    return sorted_results, cached_columns, cached_message, False  # Keep the interval active
+
                 # For non-sort requests, verify processing status
                 primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
                 all_processed = all(
@@ -4310,7 +4318,7 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
                     for ticker in primary_tickers
                 )
                 if all_processed:
-                    return optimization_results_cache[cache_key][:3]
+                    return optimization_results_cache[cache_key][:3] + (True,)
                 
             # Check processing status of primary tickers
             primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
@@ -4336,18 +4344,27 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
                 status_message = f"Processing: {', '.join(processing_statuses)}"
                 if completed_tickers:
                     status_message += f" | Completed: {', '.join(completed_tickers)}"
-                return [], empty_columns, status_message
+                return [], empty_columns, status_message, False  # Keep the interval active
+
+            # After handling everything, prevent further updates
+            raise PreventUpdate
+
+        # Handle button click to start optimization
+        if triggered_id == 'optimize-signals-button':
+            if n_clicks is None or n_clicks == 0:
+                raise PreventUpdate  # Button has not been clicked
             
-        # For non-interval triggers, ensure we're not already processing
-        elif not triggered_id == 'optimization-update-interval':
             if optimization_in_progress:
-                return [], empty_columns, "Optimization already in progress. Please wait..."
-            
+                return [], empty_columns, "Optimization already in progress. Please wait...", False  # Keep interval disabled
+
             # Acquire lock for new processing
             if not optimization_lock.acquire(blocking=False):
-                return [], empty_columns, "Another optimization is in progress. Please wait..."
-            
+                return [], empty_columns, "Another optimization is in progress. Please wait...", False  # Keep interval disabled
+
             optimization_in_progress = True
+
+            # Proceed to processing code without returning immediately
+            # Remove the 'return' statement here to allow the processing to proceed
 
         # Basic input validation
         if not primary_tickers_input or not secondary_ticker_input:
@@ -4365,7 +4382,7 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
         secondary_ticker = secondary_tickers[0]
 
         # Limit the number of primary tickers
-        max_primary_tickers = 20
+        max_primary_tickers = 18 # Limit to 18 tickers for performance
         if len(primary_tickers) > max_primary_tickers:
             return [], empty_columns, f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.'
 
@@ -4445,11 +4462,11 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
                         next_date = secondary_data.index[secondary_data.index > last_date]
                         if not next_date.empty:
                             next_date = next_date[0]
-                            processed_signals = processed_signals.append(pd.Series([next_signal], index=[next_date]))
+                            processed_signals = pd.concat([processed_signals, pd.Series([next_signal], index=[next_date])])
                         else:
                             # No future date available, cannot append next_signal
                             pass
-                            
+             
                         # Only log signals during initial processing, not during sorts or interval updates
                         if ctx.triggered_id not in ['optimization-results-table.sort_by', 'optimization-update-interval']:
                             logger.info(f"Ticker {ticker} - Next signal: {next_signal}")
@@ -4482,9 +4499,9 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
             else:
                 ticker_states[ticker] = [(False, True)]  # Only mute option for 'None' signals
 
-        # Generate combinations
+        # Generate combinations as an iterator
         ticker_state_lists = list(ticker_states.values())
-        combinations = list(product(*ticker_state_lists))
+        combinations = product(*ticker_state_lists)  # Do not convert to list to save memory
         combination_labels = []
         valid_combinations = []
 
@@ -4518,139 +4535,161 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
             combination_labels.append(label)
             valid_combinations.append(state_dict)
 
-        # Check combination limit
-        max_combinations = 1058576 # changed from 4100
-        if len(combinations) > max_combinations:
-            return [], empty_columns, f'Too many combinations ({len(combinations)}). Please reduce the number of primary tickers.'
+        # Calculate total number of combinations
+        from functools import reduce
+        import operator
+
+        total_combinations = reduce(operator.mul, [len(states) for states in ticker_state_lists], 1)
+        logger.info(f"Total combinations to process: {total_combinations}")
 
         # Prepare for results
         results_list = []
 
-        # Process each combination
-        for idx, state_dict in enumerate(valid_combinations):
-            
-            # Get unmuted tickers
-            unmuted_tickers = [ticker for ticker in primary_tickers 
-                             if ticker in state_dict and not state_dict[ticker]['mute']]
+        # Process each combination with a single progress bar
+        from tqdm import tqdm
 
-            if not unmuted_tickers:
-                continue  # Skip if all tickers are muted
-
-            # Find common dates
-            common_dates = set(secondary_data.index)
-            for ticker in unmuted_tickers:
-                common_dates = common_dates.intersection(date_indexes[ticker])
-            common_dates = sorted(common_dates)
-
-            if not common_dates:
-                continue  # Skip if no overlapping dates
-
-            # Build combined signals DataFrame for performance calculation
-            combined_signals_df = pd.DataFrame(index=common_dates)
-            for ticker in unmuted_tickers:
-                state = state_dict[ticker]
-                invert_signals = state['invert_signals']
+        logger.info(f"Total combinations to process: {len(valid_combinations)}")
+        with tqdm(total=len(valid_combinations), desc="Calculating metrics for combinations") as pbar:
+            for idx, state_dict in enumerate(valid_combinations):
                 
-                # Use signals_with_next for performance calculation
-                signals_with_next = primary_signals[ticker]['signals_with_next'].loc[common_dates]
+                # Get unmuted tickers
+                unmuted_tickers = [ticker for ticker in primary_tickers 
+                                if ticker in state_dict and not state_dict[ticker]['mute']]
+
+                if not unmuted_tickers:
+                    pbar.update(1)
+                    continue  # Skip if all tickers are muted
+
+                # Find common dates
+                common_dates = set(secondary_data.index)
+                for ticker in unmuted_tickers:
+                    common_dates = common_dates.intersection(date_indexes[ticker])
+                common_dates = sorted(common_dates)
+
+                if not common_dates:
+                    pbar.update(1)
+                    continue  # Skip if no overlapping dates
+
+                # Build combined signals DataFrame for performance calculation
+                combined_signals_df = pd.DataFrame(index=common_dates)
+                for ticker in unmuted_tickers:
+                    state = state_dict[ticker]
+                    invert_signals = state['invert_signals']
+                    
+                    # Use signals_with_next for performance calculation
+                    signals_with_next = primary_signals[ticker]['signals_with_next'].loc[common_dates]
+                    
+                    # Apply inversion if needed
+                    if invert_signals:
+                        signals = signals_with_next.replace({'Buy': 'Short', 'Short': 'Buy'})
+                    else:
+                        signals = signals_with_next
+                    
+                    combined_signals_df[ticker] = signals
+
+                # Combine signals using vectorization without deprecated 'applymap' method
+                signal_mapping = {'Buy': 1, 'Short': -1, 'None': 0}
+
+                # Apply mapping using 'apply' and 'map' to avoid FutureWarning
+                signal_values = combined_signals_df.apply(lambda col: col.map(signal_mapping)).values.astype(int)
+
+                sum_signals = np.sum(signal_values, axis=1)
+                signal_counts = np.count_nonzero(signal_values != 0, axis=1)
+
+                # Determine combined signals
+                combined_signals_array = np.where(
+                    signal_counts == 0, 'None',
+                    np.where(
+                        sum_signals == signal_counts, 'Buy',
+                        np.where(
+                            sum_signals == -signal_counts, 'Short',
+                            'None'
+                        )
+                    )
+                )
+                combined_signals = pd.Series(combined_signals_array, index=combined_signals_df.index)
+
+                # No need to shift signals since we included the next day's signal
+                signals = combined_signals.fillna('None')
+
+                # Align signals and prices
+                prices = secondary_data['Close'].loc[signals.index]
+                daily_returns = prices.pct_change().fillna(0)
+
+                # Ensure signals and daily_returns have the same index
+                signals = signals.loc[daily_returns.index]
+
+                # Calculate daily captures
+                daily_captures = pd.Series(0.0, index=signals.index)
+                buy_mask = signals == 'Buy'
+                short_mask = signals == 'Short'
                 
-                # Apply inversion if needed
-                if invert_signals:
-                    signals = signals_with_next.replace({'Buy': 'Short', 'Short': 'Buy'})
+                daily_captures[buy_mask] = daily_returns[buy_mask] * 100
+                daily_captures[short_mask] = -daily_returns[short_mask] * 100
+
+                # Calculate metrics
+                trigger_days = (buy_mask | short_mask).sum()
+                if trigger_days == 0:
+                    pbar.update(1)
+                    continue  # Skip combinations with no triggers
+
+                # Calculate wins and losses
+                trigger_captures = daily_captures[buy_mask | short_mask]
+                wins = (trigger_captures > 0).sum()
+                losses = trigger_days - wins
+                win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
+
+                # Calculate performance metrics
+                avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
+                total_capture = trigger_captures.sum() if trigger_days > 0 else 0
+                std_dev = trigger_captures.std() if trigger_days > 0 else 0
+
+                # Calculate Sharpe ratio
+                risk_free_rate = 5.0  # 5% annual rate
+                daily_rf_rate = risk_free_rate / 252
+                annualized_return = avg_daily_capture * 252
+                annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
+                sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
+
+                # Calculate statistical significance
+                if trigger_days > 1 and std_dev > 0:
+                    t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+                    degrees_of_freedom = trigger_days - 1
+                    p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+                    t_statistic = round(t_statistic, 4)
+                    p_value = round(p_value, 4)
                 else:
-                    signals = signals_with_next
-                
-                combined_signals_df[ticker] = signals
+                    t_statistic = None
+                    p_value = None
 
-            # Combine signals
-            def get_combined_signal(row):
-                active_signals = [s for s in row if s != 'None']
-                if not active_signals:
-                    return 'None'
-                if all(s == 'Buy' for s in active_signals):
-                    return 'Buy'
-                if all(s == 'Short' for s in active_signals):
-                    return 'Short'
-                return 'None'
+                # Store results
+                results_list.append({
+                    'id': idx,  # Add a unique identifier
+                    'Combination': combination_labels[idx],
+                    'Trigger Days': int(trigger_days),
+                    'Wins': int(wins),
+                    'Losses': int(losses),
+                    'Win Ratio (%)': round(win_ratio, 2),
+                    'Std Dev (%)': round(std_dev, 4),
+                    'Sharpe Ratio': round(sharpe_ratio, 2),
+                    't-Statistic': t_statistic if t_statistic is not None else 'N/A',
+                    'p-Value': p_value if p_value is not None else 'N/A',
+                    'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+                    'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+                    'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
+                    'Avg Daily Capture (%)': round(avg_daily_capture, 4),
+                    'Total Capture (%)': round(total_capture, 4)
+                })
 
-            combined_signals = combined_signals_df.apply(get_combined_signal, axis=1)
-
-            # No need to shift signals since we included the next day's signal
-            signals = combined_signals.fillna('None')
-
-            # Align signals and prices
-            prices = secondary_data['Close'].loc[signals.index]
-            daily_returns = prices.pct_change().fillna(0)
-
-            # Ensure signals and daily_returns have the same index
-            signals = signals.loc[daily_returns.index]
-
-            # Calculate daily captures
-            daily_captures = pd.Series(0.0, index=signals.index)
-            buy_mask = signals == 'Buy'
-            short_mask = signals == 'Short'
-            
-            daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-            daily_captures[short_mask] = -daily_returns[short_mask] * 100
-
-            # Calculate metrics
-            trigger_days = (buy_mask | short_mask).sum()
-            if trigger_days == 0:
-                continue  # Skip combinations with no triggers
-
-            # Calculate wins and losses
-            trigger_captures = daily_captures[buy_mask | short_mask]
-            wins = (trigger_captures > 0).sum()
-            losses = trigger_days - wins
-            win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-
-            # Calculate performance metrics
-            avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
-            total_capture = trigger_captures.sum() if trigger_days > 0 else 0
-            std_dev = trigger_captures.std() if trigger_days > 0 else 0
-
-            # Calculate Sharpe ratio
-            risk_free_rate = 5.0  # 5% annual rate
-            daily_rf_rate = risk_free_rate / 252
-            annualized_return = avg_daily_capture * 252
-            annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
-            sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
-
-            # Calculate statistical significance
-            if trigger_days > 1 and std_dev > 0:
-                t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-                degrees_of_freedom = trigger_days - 1
-                p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-                t_statistic = round(t_statistic, 4)
-                p_value = round(p_value, 4)
-            else:
-                t_statistic = None
-                p_value = None
-
-            # Store results
-            results_list.append({
-                'Combination': combination_labels[idx],
-                'Trigger Days': int(trigger_days),
-                'Wins': int(wins),
-                'Losses': int(losses),
-                'Win Ratio (%)': round(win_ratio, 2),
-                'Std Dev (%)': round(std_dev, 4),
-                'Sharpe Ratio': round(sharpe_ratio, 2),
-                't-Statistic': t_statistic if t_statistic is not None else 'N/A',
-                'p-Value': p_value if p_value is not None else 'N/A',
-                'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-                'Total Capture (%)': round(total_capture, 4)
-            })
+                # Update progress bar
+                pbar.update(1)
 
         if not results_list:
             if optimization_in_progress:
                 optimization_in_progress = False
                 if optimization_lock.locked():
                     optimization_lock.release()
-            return [], empty_columns, 'No valid combinations found.'
+            return [], empty_columns, 'No valid combinations found.', True  # Add the fourth output
 
         # Sort by Sharpe Ratio
         results_list.sort(key=lambda x: x['Sharpe Ratio'], reverse=True)
@@ -4730,8 +4769,7 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
                 optimization_results_cache[cache_key] = (fixed_results, columns, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.', current_sort)
             else:
                 optimization_results_cache[cache_key] = ([], columns, 'No valid combinations found.', None)
-            return optimization_results_cache[cache_key][:3]
-
+            return optimization_results_cache[cache_key][:3] + (True,)
 
         finally:
             optimization_in_progress = False
@@ -4747,7 +4785,7 @@ def optimize_signals(primary_tickers_input, secondary_ticker_input, n_intervals,
             optimization_in_progress = False
             if optimization_lock.locked():
                 optimization_lock.release()
-        return [], empty_columns, f"Error: {str(e)}"
+        return [], empty_columns, f"Error: {str(e)}", True  # Add the fourth output
 
 # Add this variable at the top of your script with other globals
 last_active_cell = None
@@ -4758,34 +4796,50 @@ last_active_cell = None
      Output({'type': 'mute-primary-switch', 'index': ALL}, 'value')],
     [Input('optimization-results-table', 'active_cell')],
     [State('optimization-results-table', 'data'),
+     State('optimization-results-table', 'page_current'),
+     State('optimization-results-table', 'page_size'),
      State({'type': 'primary-ticker-input', 'index': ALL}, 'id')],
     prevent_initial_call=True
 )
-def populate_multi_primary_aggregator(active_cell, data, primary_input_ids):
+def populate_multi_primary_aggregator(active_cell, data, page_current, page_size, primary_input_ids):
     global last_active_cell
-    
+
     if not active_cell:
         raise PreventUpdate
 
     # Check if this is the same cell click we already processed
     if last_active_cell == active_cell:
         raise PreventUpdate
-    
+
     last_active_cell = active_cell
-    
+
     if active_cell['column_id'] != 'Combination':
         raise PreventUpdate
 
     try:
         row = active_cell['row']
-        combination_html = data[row]['Combination']
-        
+
+        # Calculate the absolute row index
+        if page_current is not None and page_size is not None:
+            absolute_row_index = row + page_current * page_size
+        else:
+            absolute_row_index = row  # Assume absolute index when pagination is disabled
+
+
+        # Ensure the index is within the bounds of the data
+        if absolute_row_index >= len(data):
+            raise PreventUpdate
+
+        row_data = data[absolute_row_index]
+        combination_html = row_data['Combination']
+
         # Parse the HTML content (only log once)
-        logger.info(f"Processing combination from row {row}")
-        
+        logger.info(f"Processing combination from absolute row index {absolute_row_index}")
+
+        # Existing parsing logic
         soup = BeautifulSoup(combination_html, 'html.parser')
         parsed_data = []
-        
+
         for span in soup.find_all('span'):
             ticker = span.text.strip()
             style = span.get('style', '')
@@ -4795,7 +4849,7 @@ def populate_multi_primary_aggregator(active_cell, data, primary_input_ids):
                 'invert': invert,
                 'mute': False
             })
-            
+
         # Prepare outputs
         num_slots = len(primary_input_ids)
         ticker_values = []
@@ -4814,7 +4868,6 @@ def populate_multi_primary_aggregator(active_cell, data, primary_input_ids):
             invert_values.append(False)
             mute_values.append(False)
 
-        # Only log the final configuration once
         logger.info(f"Configured {len(parsed_data)} tickers")
         return ticker_values, invert_values, mute_values
 
