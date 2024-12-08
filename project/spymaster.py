@@ -746,7 +746,59 @@ def precompute_results(ticker, event):
 
                 # Begin SMA Calculation
                 log_section("SMA Calculation")
-                logger.info("Calculating new SMA columns...")
+                logger.info("Checking SMA cache...")
+
+                cache_dir = '.sma_cache'
+                os.makedirs(cache_dir, exist_ok=True) 
+                sma_cache_path = os.path.join(cache_dir, f'sma_full_{ticker}.npz')
+
+                try:
+                    if os.path.exists(sma_cache_path):
+                        logger.info("Loading SMAs from cache...")
+                        with np.load(sma_cache_path) as data:
+                            for i in range(1, max_sma_day + 1):
+                                df[f'SMA_{i}'] = data[f'SMA_{i}']
+                        logger.info("Successfully loaded SMAs from cache")
+                        # Continue processing without recomputing SMAs
+                    else:
+                        logger.info("Computing new SMA columns...")
+                        # Existing SMA calculation logic remains here
+                        if buy_sma_columns:
+                            if len(buy_sma_columns) % 2 != 0:
+                                logger.warning(f"buy_sma_columns has an odd number of elements ({len(buy_sma_columns)}). Removing the last SMA to make pairs even.")
+                                buy_sma_columns = buy_sma_columns[:-1]
+                            buy_sma1 = df.loc[:, buy_sma_columns[::2]].values
+                            buy_sma2 = df.loc[:, buy_sma_columns[1::2]].values
+                        else:
+                            buy_sma1 = np.array([])
+                            buy_sma2 = np.array([])
+                    
+                        if short_sma_columns:
+                            if len(short_sma_columns) % 2 != 0:
+                                logger.warning(f"short_sma_columns has an odd number of elements ({len(short_sma_columns)}). Removing the last SMA to make pairs even.")
+                                short_sma_columns = short_sma_columns[:-1]
+                            short_sma1 = df.loc[:, short_sma_columns[::2]].values
+                            short_sma2 = df.loc[:, short_sma_columns[1::2]].values
+                        else:
+                            short_sma1 = np.array([])
+                            short_sma2 = np.array([])
+                    
+                        # Cache the computed SMAs
+                        try:
+                            # Verify all SMA columns are present before caching
+                            expected_sma_columns = [f'SMA_{i}' for i in range(1, max_sma_day + 1)]
+                            missing_smas = [sma for sma in expected_sma_columns if sma not in df.columns]
+                            if not missing_smas:
+                                # Cache the computed SMAs
+                                sma_dict = {f'SMA_{i}': df[f'SMA_{i}'].values for i in range(1, max_sma_day + 1)}
+                                np.savez_compressed(sma_cache_path, **sma_dict)
+                                logger.info("Saved SMAs to cache")
+                            else:
+                                logger.warning(f"Missing SMA columns: {missing_smas}. Cannot cache incomplete SMA data.")
+                        except Exception as e:
+                            logger.warning(f"Failed to save SMA cache: {str(e)}")
+                except Exception as e:
+                    logger.warning(f"Failed to save SMA cache: {str(e)}")
 
                 # Check if there are new SMA periods to compute
                 if max_sma_day > existing_max_sma_day:
@@ -2540,29 +2592,23 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return no_update, ["Data integrity issue - missing top pairs"] * 10
+        return [no_update] + ["Data integrity issue - missing top pairs"] * 9
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return no_update, ["Data integrity issue - missing preprocessed data"] * 10
+        return [no_update] + ["Data integrity issue - missing preprocessed data"] * 9
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return no_update, ["Data integrity issue - invalid pair format"] * 10
-    if df is None or df.empty:
-        logger.warning(f"Warning: 'preprocessed_data' is missing or empty for {ticker}")
-        return ["Data integrity issue. Please check the precomputed results."] * 10
-
-    if top_buy_pair is None or top_short_pair is None:
-        return ["Data integrity issue. Please check the precomputed results."] * 10
+        return [no_update] + ["Data integrity issue - invalid pair format"] * 9
 
     try:
         # Validate top pairs data
         if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [top_buy_pair, top_short_pair]):
             logger.error(f"Invalid pair format detected for {ticker}")
-            return ["Invalid pair format detected. Please reprocess data."] * 10
+            return [no_update] + ["Invalid pair format detected. Please reprocess data."] * 9
 
         # Validate that all required SMA columns exist
         required_smas = [
@@ -2573,7 +2619,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         missing_smas = [sma for sma in required_smas if sma not in df.columns]
         if missing_smas:
             logger.error(f"Missing SMA columns for {ticker}: {missing_smas}")
-            return ["Missing required SMA columns. Please reprocess data."] * 10
+            return [no_update] + ["Missing required SMA columns. Please reprocess data."] * 9
 
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
@@ -2586,7 +2632,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     except KeyError:
         logger.error(f"Required SMA columns not found in the DataFrame for {ticker}")
-        return ["Data not available or processing not yet complete. Please wait..."] * 10
+        return [no_update] + ["Data not available or processing not yet complete. Please wait..."] * 9
 
     current_date = df.index[-1]
     previous_date = df.index[-2]
@@ -2628,7 +2674,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     # Validate dates exist in the index
     if previous_date not in df.index or current_date not in df.index:
         logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
-        return ["Missing required dates in data. Please reprocess data."] * 10
+        return [no_update] + ["Missing required dates in data. Please reprocess data."] * 9
 
     try:
         # Calculate signals for today based on yesterday's close with validation
@@ -2644,7 +2690,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
-        return ["Error calculating signals. Please check the data."] * 10
+        return [no_update] + ["Error calculating signals. Please check the data."] * 9
 
     # Determine the current trading signal type
     if buy_signal and not short_signal:
@@ -2713,107 +2759,170 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
     daily_top_short_pairs = results.get('daily_top_short_pairs', {})
 
-    # Initialize arrays for combined strategy analysis
-    combined_returns = []
-    daily_returns = df['Close'].pct_change().fillna(0)  # Pre-calculate daily returns
-    combined_trigger_days = 0
-    combined_wins = 0
-    combined_losses = 0
-    all_captures = []  # Store all daily captures for statistical analysis
+    # Extract necessary data
+    buy_pairs = np.array([pair_capture[0] for pair_capture in daily_top_buy_pairs.values()])  # Shape: (num_pairs, 2)
+    short_pairs = np.array([pair_capture[0] for pair_capture in daily_top_short_pairs.values()])  # Shape: (num_pairs, 2)
 
-    for date in df.index[1:]:  # Start from the second day to calculate returns
-        prev_dates = df.index[df.index < date]
-        if not prev_dates.empty:
-            prev_date = prev_dates[-1]  # Get the previous trading day
-        else:
-            continue  # Skip if there is no previous date
-        
-        buy_pair, buy_capture = daily_top_buy_pairs.get(prev_date, ((0, 0), 0))
-        short_pair, short_capture = daily_top_short_pairs.get(prev_date, ((0, 0), 0))
-        
-        # Check if buy_pair and short_pair are valid
-        if buy_pair != (0, 0) or short_pair != (0, 0):
-            # Initialize signals
-            buy_signal = False
-            short_signal = False
-            
-            # Calculate buy_signal if buy_pair is valid
-            if buy_pair != (0, 0) and f'SMA_{buy_pair[0]}' in df.columns and f'SMA_{buy_pair[1]}' in df.columns:
-                buy_signal = df[f'SMA_{buy_pair[0]}'].loc[prev_date] > df[f'SMA_{buy_pair[1]}'].loc[prev_date]
-            
-            # Calculate short_signal if short_pair is valid
-            if short_pair != (0, 0) and f'SMA_{short_pair[0]}' in df.columns and f'SMA_{short_pair[1]}' in df.columns:
-                short_signal = df[f'SMA_{short_pair[0]}'].loc[prev_date] < df[f'SMA_{short_pair[1]}'].loc[prev_date]
-            
-            # Ensure dates exist in 'Close' prices
-            if prev_date in df['Close'] and date in df['Close']:
-                daily_return = df['Close'].loc[date] / df['Close'].loc[prev_date] - 1
-            else:
-                daily_return = 0  # Or handle appropriately
-            
-            combined_return = 0  # Default value
-            
-            if buy_signal and short_signal:
-                if buy_capture > short_capture:
-                    combined_return = daily_return
-                else:
-                    combined_return = -daily_return
-                combined_trigger_days += 1  # Count as trigger day
-            elif buy_signal:
-                combined_return = daily_return
-                combined_trigger_days += 1  # Count as trigger day
-            elif short_signal:
-                combined_return = -daily_return
-                combined_trigger_days += 1  # Count as trigger day
-            else:
-                combined_return = 0
-            
-            # Process wins/losses for any trigger day
-            if combined_trigger_days > combined_wins + combined_losses:
-                if combined_return > 0:
-                    combined_wins += 1
-                else:  # Count zero or negative returns as losses
-                    combined_losses += 1
-            
-            combined_returns.append(combined_return)
+    # Function to safely retrieve SMA column names
+    def get_sma_columns(pairs, pair_type):
+        columns = []
+        for pair in pairs:
+            if len(pair) != 2:
+                logger.error(f"Invalid {pair_type} pair format: {pair}")
+                continue
+            sma1, sma2 = pair
+            col1 = f'SMA_{sma1}'
+            col2 = f'SMA_{sma2}'
+            if col1 not in df.columns or col2 not in df.columns:
+                logger.error(f"Missing SMA columns for {pair_type} pair: {pair}")
+                continue
+            columns.extend([col1, col2])
+        return columns
 
-    # Combined Strategy Performance
-    signals = pd.Series('None', index=df.index[1:])
-    daily_returns = df['Close'].pct_change().loc[df.index[1:]]
+    # Extract SMA column names for buy and short pairs
+    buy_sma_columns = get_sma_columns(buy_pairs, "buy")
+    short_sma_columns = get_sma_columns(short_pairs, "short")
 
-    for date in df.index[1:]:
-        prev_date = df.index[df.index < date][-1]
+    # Ensure unique columns to prevent duplication
+    buy_sma_columns = list(dict.fromkeys(buy_sma_columns))
+    short_sma_columns = list(dict.fromkeys(short_sma_columns))
 
-        buy_pair, buy_capture = daily_top_buy_pairs.get(prev_date, ((0, 0), 0))
-        short_pair, short_capture = daily_top_short_pairs.get(prev_date, ((0, 0), 0))
+    # Define cache path and create cache directory if needed
+    cache_dir = '.sma_cache'
+    os.makedirs(cache_dir, exist_ok=True) 
+    sma_cache_path = os.path.join(cache_dir, f'sma_cache_{ticker}.npz')
 
-        if buy_pair != (0, 0) and short_pair != (0, 0):
-            buy_signal = df[f'SMA_{buy_pair[0]}'].loc[prev_date] > df[f'SMA_{buy_pair[1]}'].loc[prev_date]
-            short_signal = df[f'SMA_{short_pair[0]}'].loc[prev_date] < df[f'SMA_{short_pair[1]}'].loc[prev_date]
+    # Try to load from cache
+    try:
+        if os.path.exists(sma_cache_path):
+            logger.info(f"Loading SMA pairs from cache: {sma_cache_path}")
+            with np.load(sma_cache_path) as data:
+                buy_sma1 = data['buy_sma1']
+                buy_sma2 = data['buy_sma2'] 
+                short_sma1 = data['short_sma1']
+                short_sma2 = data['short_sma2']
+            return buy_sma1, buy_sma2, short_sma1, short_sma2
+    except Exception as e:
+        logger.warning(f"Cache load failed: {str(e)}. Computing from scratch.")
 
-            if buy_signal and short_signal:
-                if buy_capture > short_capture:
-                    signal = 'Buy'
-                else:
-                    signal = 'Short'
-            elif buy_signal:
-                signal = 'Buy'
-            elif short_signal:
-                signal = 'Short'
-            else:
-                signal = 'None'
-        else:
-            signal = 'None'
+    # Compute if cache missing or invalid
+    logger.info(f"Computing SMA pairs for {ticker}")
+    # Extract SMA values using vectorized operations
+    if buy_sma_columns:
+        if len(buy_sma_columns) % 2 != 0:
+            buy_sma_columns = buy_sma_columns[:-1]
+        buy_sma1 = df[buy_sma_columns[::2]].values
+        buy_sma2 = df[buy_sma_columns[1::2]].values
+    else:
+        buy_sma1 = np.array([])
+        buy_sma2 = np.array([])
 
-        signals.loc[date] = signal
+    if short_sma_columns:
+        if len(short_sma_columns) % 2 != 0:
+            short_sma_columns = short_sma_columns[:-1]
+        short_sma1 = df[short_sma_columns[::2]].values
+        short_sma2 = df[short_sma_columns[1::2]].values
+    else:
+        short_sma1 = np.array([])
+        short_sma2 = np.array([])
 
-    # Create daily captures
-    daily_captures = pd.Series(0.0, index=signals.index)
-    buy_mask = signals == 'Buy'
-    short_mask = signals == 'Short'
+    # Save to cache
+    try:
+        np.savez_compressed(sma_cache_path,
+            buy_sma1=buy_sma1,
+            buy_sma2=buy_sma2, 
+            short_sma1=short_sma1,
+            short_sma2=short_sma2)
+    except Exception as e:
+        logger.warning(f"Cache save failed: {str(e)}")
 
-    daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-    daily_captures[short_mask] = -daily_returns[short_mask] * 100
+    # Calculate buy and short signals
+    # Ensure that buy_sma1 and buy_sma2 have the same number of columns
+    if buy_sma1.shape[1] != buy_sma2.shape[1]:
+        logger.error(f"Mismatch in buy SMA pairs: buy_sma1 has {buy_sma1.shape[1]} columns, buy_sma2 has {buy_sma2.shape[1]} columns.")
+        return ["Data integrity issue. Please check the SMA pairing."] * 10
+
+    buy_signals = buy_sma1 > buy_sma2  # Shape: (num_days, num_pairs)
+    short_signals = short_sma1 < short_sma2  # Shape: (num_days, num_pairs)
+
+    # Shift signals by one day to align with returns
+    buy_signals_shifted = np.vstack([np.zeros((1, buy_signals.shape[1]), dtype=bool), buy_signals[:-1]])
+    short_signals_shifted = np.vstack([np.zeros((1, short_signals.shape[1]), dtype=bool), short_signals[:-1]])
+
+    # Calculate daily returns
+    daily_returns = df['Close'].pct_change().fillna(0).astype(np.float32).values  # Shape: (num_days,)
+
+    # Define daily_returns_trimmed to align with boolean masks
+    daily_returns_trimmed = daily_returns[1:]  # Use daily_returns from day 1 to end, length N-1
+
+    # Precompute logical masks to avoid repeated calculations
+    both_signals = buy_signals_shifted.any(axis=1) & short_signals_shifted.any(axis=1)  # Shape: (num_days,)
+    only_buy_signals = buy_signals_shifted.any(axis=1) & ~short_signals_shifted.any(axis=1)  # Shape: (num_days,)
+    only_short_signals = ~buy_signals_shifted.any(axis=1) & short_signals_shifted.any(axis=1)  # Shape: (num_days,)
+
+    # Align the boolean masks with daily_returns_trimmed by removing the first element
+    both_signals = both_signals[1:]          # Shape: (N-1,)
+    only_buy_signals = only_buy_signals[1:]  # Shape: (N-1,)
+    only_short_signals = only_short_signals[1:]  # Shape: (N-1,)
+
+    # Aggregate buy_capture across all pairs to determine per-day action
+    buy_capture_any = buy_capture.any()  # This should be a single boolean value
+
+    # Calculate combined returns using a sign multiplier for improved performance
+    signs = np.zeros_like(daily_returns_trimmed)
+    signs[both_signals] = 1 if buy_capture_any else -1
+    signs[only_buy_signals] = 1
+    signs[only_short_signals] = -1
+    combined_returns = daily_returns_trimmed * signs
+
+    # Validate that combined_returns and boolean masks have the same length
+    if combined_returns.shape[0] != both_signals.shape[0]:
+        logger.error(f"Mismatch in dimensions: combined_returns has length {combined_returns.shape[0]}, but both_signals has length {both_signals.shape[0]}")
+        return ["Data integrity issue. Please check the precomputed results."] * 10
+
+    # Calculate wins and losses
+    combined_wins = np.sum(combined_returns > 0)
+    combined_losses = np.sum(combined_returns <= 0)
+    combined_trigger_days = combined_wins + combined_losses
+
+    # Vectorized determination of signals based on previous day's SMA comparisons
+
+    # Exclude the last row to align with signal shifts
+    buy_signals_prev = buy_signals_shifted[:-1]  # Shape: (num_days-1, num_pairs)
+    short_signals_prev = short_signals_shifted[:-1]
+
+    # Initialize signals array
+    signals = np.full(len(buy_signals_prev), 'None', dtype=object)
+
+    # Create masks for different signal scenarios
+    both_signals_mask = buy_signals_prev.any(axis=1) & short_signals_prev.any(axis=1)  # Shape: (N-2,)
+    only_buy_mask = buy_signals_prev.any(axis=1) & ~short_signals_prev.any(axis=1)  # Shape: (N-2,)
+    only_short_mask = ~buy_signals_prev.any(axis=1) & short_signals_prev.any(axis=1)  # Shape: (N-2,)
+
+    # Apply Buy or Short based on capture comparison where both signals are active
+    signals[both_signals_mask] = np.where(
+        buy_capture_any,
+        'Buy',
+        'Short'
+    )
+
+    # Apply Buy where only buy signals are active
+    signals[only_buy_mask] = 'Buy'
+
+    # Apply Short where only short signals are active
+    signals[only_short_mask] = 'Short'
+
+    # Align signals and daily_returns_trimmed by trimming to the minimum length
+    min_length = min(len(signals), len(daily_returns_trimmed))
+    signals_aligned = signals[:min_length]
+    daily_returns_trimmed_aligned = daily_returns_trimmed[:min_length]
+
+    # Create daily captures with aligned signals and returns
+    daily_captures = np.zeros_like(daily_returns_trimmed_aligned)
+    buy_mask = signals_aligned == 'Buy'
+    short_mask = signals_aligned == 'Short'
+    daily_captures[buy_mask] = daily_returns_trimmed_aligned[buy_mask] * 100
+    daily_captures[short_mask] = -daily_returns_trimmed_aligned[short_mask] * 100
 
     # Calculate metrics
     trigger_days = int((buy_mask | short_mask).sum())
@@ -2831,19 +2940,29 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         degrees_of_freedom = trigger_days - 1
         p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
         
+        # Determine significance levels
+        confidence_levels = {
+            '90%': p_value < 0.10,
+            '95%': p_value < 0.05,
+            '99%': p_value < 0.01
+        }
+        
         # Log statistical significance results
         logger.info("\nStatistical Significance Analysis:")
         logger.info(f"t-Statistic: {t_statistic:.4f}")
         logger.info(f"p-Value: {p_value:.4f}")
         logger.info(f"Degrees of Freedom: {degrees_of_freedom}")
         logger.info("Confidence Levels:")
-        logger.info(f"  90% (p < 0.10): {'Significant' if p_value < 0.10 else 'Not Significant'}")
-        logger.info(f"  95% (p < 0.05): {'Significant' if p_value < 0.05 else 'Not Significant'}")
-        logger.info(f"  99% (p < 0.01): {'Significant' if p_value < 0.01 else 'Not Significant'}\n")
+        for level, significant in confidence_levels.items():
+            status = 'Significant' if significant else 'Not Significant'
+            logger.info(f"  {level} Confidence: {status}")
+        logger.info("\n")  # Add line break
     else:
         t_statistic = None
         p_value = None
-        
+        logger.info("\nStatistical Significance Analysis:")
+        logger.info("Insufficient data to perform statistical significance analysis.\n")
+
     # Calculate annualized Sharpe Ratio
     if trigger_days > 0 and std_dev != 0:
         annualized_return = avg_daily_capture * 252
@@ -2969,8 +3088,8 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             html.Div([
                 html.H4("1. Summary of Top Performing Pairs", className="mb-3"),
-                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture * 100:.4f}%)", className="mb-2"),
-                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture * 100:.4f}%)", className="mb-2"),
+                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture:.4f}%)", className="mb-2"),
+                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture:.4f}%)", className="mb-2"),
             ], className="mb-4"),
             
             html.Div([
@@ -2994,12 +3113,22 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             html.Div([
                 html.H4("3. Trading Signals", className="mb-3"),
-                html.P(f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
-                       f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" if trading_signal_type == "Buy" else 
-                       f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})", className="mb-2"),
-                html.P(f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
-                       f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" if next_trading_signal_type == "Buy" else 
-                       f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})", className="mb-2"),
+                html.P(
+                    f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
+                    f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" 
+                    if trading_signal_type == "Buy" else 
+                    f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
+                    f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})",
+                    className="mb-2"
+                ),
+                html.P(
+                    f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
+                    f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" 
+                    if next_trading_signal_type == "Buy" else 
+                    f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
+                    f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})",
+                    className="mb-2"
+                ),
             ], className="mb-4"),
             
             html.Div([
