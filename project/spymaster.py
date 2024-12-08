@@ -417,52 +417,27 @@ def write_status(ticker, status):
         with open(status_file, 'w') as f:
             json.dump(status, f)
 
-def save_precomputed_results(ticker, results):
+def save_precomputed_results(ticker, daily_top_buy_pairs, daily_top_short_pairs, preprocessed_data, max_sma_day):
     ticker = normalize_ticker(ticker)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Use a unique temporary file in the current directory to avoid conflicts
-    temp_file_path = os.path.join(current_dir, f'{ticker}_precomputed_results_temp_{threading.get_ident()}.pkl')
-    final_file_path = os.path.join(current_dir, f'{ticker}_precomputed_results.pkl')
-
-    try:
-        # Save main results (excluding buy_results and short_results)
-        main_results = {k: v for k, v in results.items() if k not in ['buy_results', 'short_results']}
+    results = {
+        'preprocessed_data': preprocessed_data,
+        'existing_max_sma_day': max_sma_day,
+        'last_processed_date': preprocessed_data.index[-1],
+        'daily_top_buy_pairs': daily_top_buy_pairs,
+        'daily_top_short_pairs': daily_top_short_pairs,
+        'start_date': preprocessed_data.index[0],
+        'last_date': preprocessed_data.index[-1]
+    }
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tf:
+        pickle.dump(results, tf)
+        temp_name = tf.name
         
-        # Ensure daily_top_buy_pairs and daily_top_short_pairs are included
-        if 'daily_top_buy_pairs' not in main_results or 'daily_top_short_pairs' not in main_results:
-            logging.warning("daily_top_pairs not found in results, recalculating...")
-            daily_top_buy_pairs, daily_top_short_pairs = calculate_daily_top_pairs(
-                results['preprocessed_data'], ticker)
-            main_results['daily_top_buy_pairs'] = daily_top_buy_pairs
-            main_results['daily_top_short_pairs'] = daily_top_short_pairs
-        
-        with open(temp_file_path, 'wb') as f:
-            pickle.dump(main_results, f)
-
-        # Atomically replace the final file with the temp file
-        try:
-            os.replace(temp_file_path, final_file_path)
-            logging.info(f"Main results saved successfully to {final_file_path}")
-            logging.info(f"Number of daily_top_buy_pairs saved: {len(main_results.get('daily_top_buy_pairs', {}))}")
-            logging.info(f"Number of daily_top_short_pairs saved: {len(main_results.get('daily_top_short_pairs', {}))}")
-            logging.info(f"All results saved successfully for {ticker}")
-        except Exception as e:
-            logging.error(f"Error saving results for {ticker}: {str(e)}")
-            logging.error(traceback.format_exc())
-            # Clean up temp file if it exists
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-    except PermissionError:
-        logging.error(f"Permission denied when saving results to {final_file_path}. Please check file permissions.")
-    except Exception as e:
-        logging.error(f"Error saving results for {ticker}: {str(e)}")
-        logging.error(traceback.format_exc())
-        # Clean up temp file if it exists
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-    # Return the main_results even if an exception occurred
-    return main_results
+    final_name = f'{ticker}_precomputed_results.pkl'
+    shutil.move(temp_name, final_name)
+    
+    logger.info(f"Saved results for {ticker}")
+    return results
 
 def process_chunk_for_top_pairs(chunk_file, total_days):
     data = np.load(chunk_file, allow_pickle=True)
@@ -603,22 +578,60 @@ def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chun
     ticker = normalize_ticker(ticker)
     chunk_file = f'{ticker}_results_chunk_{chunk_index}.npz'
     try:
-        # Prepare data for saving
-        buy_pairs = np.array(list(buy_results_chunk.keys()))
-        buy_values = np.array(list(buy_results_chunk.values()))
-        short_pairs = np.array(list(short_results_chunk.keys()))
-        short_values = np.array(list(short_results_chunk.values()))
-        
-        logger.info(f"Saving chunk {chunk_index}...")
+        # Validate input data types
+        if not isinstance(buy_results_chunk, dict) or not isinstance(short_results_chunk, dict):
+            logger.error(f"Invalid chunk data types for {ticker}: expected dicts but got {type(buy_results_chunk)} and {type(short_results_chunk)}")
+            np.savez(chunk_file, buy_pairs=np.array([]), buy_values=np.array([]),
+                     short_pairs=np.array([]), short_values=np.array([]))
+            return
 
-        # Save the chunk synchronously
-        np.savez(chunk_file, buy_pairs=buy_pairs, buy_values=buy_values,
-                 short_pairs=short_pairs, short_values=short_values)
+        # Attempt to extract a sample array of values to determine the number of days
+        combined_dict = {**buy_results_chunk, **short_results_chunk}
+        example_values = next(iter(combined_dict.values()), None)
         
-        file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)  # Size in GB
-        logger.info(f"Chunk {chunk_index} saved successfully to {chunk_file} (Size: {file_size:.2f} GB)")
+        # Check if we have valid data
+        if example_values is None or not isinstance(example_values, np.ndarray):
+            logger.info(f"No valid arrays found in chunk {chunk_index} for {ticker}. Saving empty results.")
+            np.savez(chunk_file, buy_pairs=np.array([]), buy_values=np.array([]),
+                     short_pairs=np.array([]), short_values=np.array([]))
+            return
+
+        num_days = len(example_values)
+
+        # Convert dictionaries to numpy arrays for vectorized operations
+        buy_pairs = np.array(list(buy_results_chunk.keys()), dtype=object)
+        buy_values = np.array(list(buy_results_chunk.values()), dtype=np.float64)
+        short_pairs = np.array(list(short_results_chunk.keys()), dtype=object)
+        short_values = np.array(list(short_results_chunk.values()), dtype=np.float64)
+
+        # Handle the case where we might have no data (empty arrays)
+        if buy_values.size == 0:
+            top_buy_pairs = np.array([], dtype=object)
+            top_buy_values = np.array([], dtype=np.float64)
+        else:
+            # Use nanargmax to handle any potential NaN values
+            max_buy_indices = np.nanargmax(buy_values, axis=0)
+            top_buy_pairs = buy_pairs[max_buy_indices]
+            top_buy_values = buy_values[max_buy_indices, np.arange(num_days)]
+
+        if short_values.size == 0:
+            top_short_pairs = np.array([], dtype=object)
+            top_short_values = np.array([], dtype=np.float64)
+        else:
+            max_short_indices = np.nanargmax(short_values, axis=0)
+            top_short_pairs = short_pairs[max_short_indices]
+            top_short_values = short_values[max_short_indices, np.arange(num_days)]
+
+        # Save the results in compressed format to reduce file size
+        np.savez_compressed(chunk_file,
+                            buy_pairs=top_buy_pairs, buy_values=top_buy_values,
+                            short_pairs=top_short_pairs, short_values=top_short_values)
+
+        file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)
+        logger.info(f"Chunk {chunk_index} saved successfully for {ticker}: {file_size:.2f} GB")
+
     except Exception as e:
-        logger.error(f"Error saving results for {ticker}: {str(e)}")
+        logger.error(f"Error saving chunk {chunk_index} for {ticker}: {str(e)}")
         logger.error(traceback.format_exc())
 
 def precompute_results(ticker, event):
@@ -787,78 +800,90 @@ def precompute_results(ticker, event):
 
                 logger.info("Ensured correct NaN values for SMA calculations.")
 
-            # Pre-calculate new SMAs
-            sma_columns = {}
-            for i in range(existing_max_sma_day + 1, max_sma_day + 1):
-                sma_columns[i] = df['Close'].rolling(window=i).mean().values
+            # Process SMA pairs and find top performers in a fully vectorized manner
+            log_section("SMA Pairs Processing")
+            daily_top_buy_pairs = {}
+            daily_top_short_pairs = {}
 
-            logger.info("Generating new SMA pairs...")
-            start_time = time.time()
-            new_sma_pairs = [
-                (i, j) for i in range(existing_max_sma_day + 1, max_sma_day)
-                for j in range(i + 1, max_sma_day + 1)
-            ]
-            total_pairs = len(new_sma_pairs)
-            total_pairs_with_inverses = total_pairs * 2
-            logger.info(f"Generated {total_pairs} unique SMA pairs (including inverses: {total_pairs_with_inverses}) in {time.time() - start_time:.2f} seconds")
+            dates = df.index
+            returns = df['Close'].pct_change().fillna(0).values  # numpy array of returns
+            all_pairs = np.array([(i, j) for i in range(1, max_sma_day) for j in range(i+1, max_sma_day+1)])
+            num_pairs = len(all_pairs)
 
-            returns = df['Close'].pct_change().values
+            # Extract SMA columns into a numpy array for fast vectorized operations
+            # Shape: (num_days, max_sma_day)
+            sma_matrix = np.empty((len(dates), max_sma_day), dtype=np.float64)
+            for k in range(1, max_sma_day+1):
+                sma_matrix[:, k-1] = df[f'SMA_{k}'].values
 
-            # Begin Capture Calculation
-            log_section("Capture Calculation")
-            chunk_size = 100000  # Adjust based on your system's capabilities
-            update_interval = 100  # Update progress more frequently
+            # Precompute signals for ALL pairs at once:
+            # For each pair (i,j), signals = sma_matrix[:, i-1] > sma_matrix[:, j-1]
+            # We'll do this per day as needed, but vectorized per day.
 
-            with tqdm(total=total_pairs_with_inverses, desc=f'Calculation for {ticker.upper()}', unit='pair', dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar_calc:
-                for i in range(0, total_pairs, chunk_size):
-                    chunk_pairs = new_sma_pairs[i:i+chunk_size]
+            with tqdm(total=len(dates), desc="Processing trading days") as pbar:
+                for day_idx, date in enumerate(dates):
+                    # Slice up to current day
+                    day_slice = slice(0, day_idx+1)
 
-                    sma1_array = np.array([sma_columns[pair[0]] for pair in chunk_pairs])
-                    sma2_array = np.array([sma_columns[pair[1]] for pair in chunk_pairs])
+                    # Extract SMA values up to current date
+                    sma_up_to_day = sma_matrix[day_slice, :]
 
-                    buy_captures, short_captures = calculate_captures_vectorized(sma1_array, sma2_array, returns)
+                    # We will compute captures for all pairs at once:
+                    # For each pair (i,j):
+                    #   buy_signals = sma_up_to_day[:, i-1] > sma_up_to_day[:, j-1]
+                    #   returns_up_to_day = returns[day_slice]
+                    #   capture = sum(returns_up_to_day[buy_signals]) * 100
 
-                    # Initialize chunk dictionaries
-                    buy_results_chunk = {}
-                    short_results_chunk = {}
+                    # Vectorized approach:
+                    i_indices = all_pairs[:, 0] - 1
+                    j_indices = all_pairs[:, 1] - 1
 
-                    # Process original pairs
-                    buy_results_chunk.update(zip(chunk_pairs, buy_captures))
-                    short_results_chunk.update(zip(chunk_pairs, short_captures))
+                    sma_i = sma_up_to_day[:, i_indices]  # shape: (day_idx+1, num_pairs)
+                    sma_j = sma_up_to_day[:, j_indices]  # shape: (day_idx+1, num_pairs)
 
-                    # Process inverse pairs
-                    inverse_pairs = [(pair[1], pair[0]) for pair in chunk_pairs]
-                    inverse_buy_captures = -short_captures
-                    inverse_short_captures = -buy_captures
+                    buy_signals = sma_i > sma_j
+                    # Shift signals by 1 day:
+                    buy_signals = np.roll(buy_signals, 1, axis=0)
+                    buy_signals[0, :] = False  # first day can't have a previous signal
 
-                    buy_results_chunk.update(zip(inverse_pairs, inverse_buy_captures))
-                    short_results_chunk.update(zip(inverse_pairs, inverse_short_captures))
+                    # Compute captures:
+                    returns_up_to_day = returns[day_slice]  # shape: (day_idx+1,)
+                    # Expand returns for broadcasting:
+                    returns_expanded = np.broadcast_to(returns_up_to_day[:, np.newaxis], (day_idx+1, num_pairs))
+                    captures = (returns_expanded * buy_signals * 100).sum(axis=0)
 
-                    # Update progress bar
-                    pbar_calc.update(len(chunk_pairs) * 2)
+                    # Find best buy pair (max capture):
+                    max_buy_idx = np.nanargmax(captures) if len(captures) > 0 else None
+                    best_buy_capture = captures[max_buy_idx] if max_buy_idx is not None else float('-inf')
+                    best_buy_pair = tuple(all_pairs[max_buy_idx]) if max_buy_idx is not None else (0,0)
 
-                    # Update status
-                    pairs_processed = min(i + chunk_size, total_pairs) * 2
-                    progress_percentage = pairs_processed / total_pairs_with_inverses * 100
-                    write_status(ticker, {"status": "processing", "progress": progress_percentage})
+                    # For short pairs, we invert captures:
+                    # short capture = sum of returns on days where signals = not(buy_signals), but we can reuse logic:
+                    # If buy_signal captures daily_return positively, short should capture negatively.
+                    # Actually, short capture = sum(-returns_up_to_day where buy_signals=False)
+                    # Instead of recomputing signals, we can note that short capture = - (sum of returns where buy_signal) 
+                    # plus sum of returns for all days since we must consider days without buy_signal.
+                    # Simpler: just reuse captures but invert:
+                    #   short_signals = not buy_signals (but we must consider shift)
+                    # Actually, we can directly calculate short captures similarly:
+                    short_signals = np.logical_not(buy_signals)
+                    short_captures = (returns_expanded * short_signals * (-100)).sum(axis=0)
 
-                    # Save results after processing each chunk (synchronously)
-                    tqdm.write(f"Saving chunk {i // chunk_size}...")
-                    save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chunk, i // chunk_size)
-                    tqdm.write(f"Chunk {i // chunk_size} saved successfully.")
+                    # Find best short pair:
+                    max_short_idx = np.nanargmax(short_captures) if len(short_captures) > 0 else None
+                    best_short_capture = short_captures[max_short_idx] if max_short_idx is not None else float('-inf')
+                    best_short_pair = tuple(all_pairs[max_short_idx]) if max_short_idx is not None else (0,0)
 
-                    # Clear the chunk dictionaries to free up memory
-                    buy_results_chunk.clear()
-                    short_results_chunk.clear()
-                    gc.collect()
-                    tqdm.write("Garbage collection completed.")
+                    daily_top_buy_pairs[date] = (best_buy_pair, best_buy_capture)
+                    daily_top_short_pairs[date] = (best_short_pair, best_short_capture)
 
-                    # Update the progress bar after processing the chunk
-                    pbar_calc.update(len(chunk_pairs) * 2)
+                    pbar.update(1)
 
-            pairs_processed = total_pairs * 2  # Each pair has a regular and inverse version
-            logger.info(f"Processed {pairs_processed} pairs out of {total_pairs_with_inverses} for {ticker.upper()}")
-            logger.info(f"Total buy pairs: {total_pairs * 2}, Total short pairs: {total_pairs * 2}")
+            # Update results
+            results['daily_top_buy_pairs'] = daily_top_buy_pairs
+            results['daily_top_short_pairs'] = daily_top_short_pairs
+
+            write_status(ticker, {"status": "processing", "progress": 50})
 
             # Update other results
             results['preprocessed_data'] = df
@@ -868,18 +893,6 @@ def precompute_results(ticker, event):
             results['last_date'] = last_date
             results['total_trading_days'] = total_trading_days
 
-            # Begin Daily Top Pairs Calculation
-            log_section("Daily Top Pairs Calculation")
-            section_start = log_section_time("Daily Top Pairs Calculation")
-            daily_top_buy_pairs, daily_top_short_pairs, chunk_processing_time = calculate_daily_top_pairs(df, ticker)
-            results['chunk_processing_time'] = chunk_processing_time
-            
-            results['daily_top_buy_pairs'] = daily_top_buy_pairs
-            results['daily_top_short_pairs'] = daily_top_short_pairs
-
-            # Save the results after calculating daily top pairs
-            save_precomputed_results(ticker, results)
-
             # Begin Cumulative Combined Captures Calculation
             log_section("Cumulative Combined Captures")
             section_start = log_section_time("Cumulative Combined Captures")
@@ -888,46 +901,11 @@ def precompute_results(ticker, event):
             results['cumulative_combined_captures'] = cumulative_combined_captures
             results['active_pairs'] = active_pairs
 
-            # Load buy and short results from chunk files
-            buy_results = {}
-            short_results = {}
-            chunk_files = sorted(glob.glob(f'{ticker}_results_chunk_*.npz'))
-
-            with tqdm(total=len(chunk_files), desc=f"Loading chunks for {ticker}", unit="chunk") as pbar:
-                for chunk_file in chunk_files:
-                    data = np.load(chunk_file, allow_pickle=True)
-                    buy_pairs = data['buy_pairs']
-                    buy_values = data['buy_values']
-                    short_pairs = data['short_pairs']
-                    short_values = data['short_values']
-
-                    # Reconstruct dictionaries
-                    buy_results.update(zip(map(tuple, buy_pairs), buy_values))
-                    short_results.update(zip(map(tuple, short_pairs), short_values))
-
-                    pbar.update(1)
-
-            # Calculate top pairs
-            buy_results_with_inverse = {}
-            short_results_with_inverse = {}
-
-            for pair, result in buy_results.items():
-                buy_results_with_inverse[pair] = result[-1]
-                inverse_pair = (pair[1], pair[0])
-                short_results_with_inverse[inverse_pair] = -result[-1]
-
-            for pair, result in short_results.items():
-                short_results_with_inverse[pair] = result[-1]
-                inverse_pair = (pair[1], pair[0])
-                buy_results_with_inverse[inverse_pair] = -result[-1]
-
-            # Identify the top performing buy and short pairs from the respective dictionaries
-            top_buy_pair = max(buy_results_with_inverse, key=buy_results_with_inverse.get)
-            top_short_pair = max(short_results_with_inverse, key=short_results_with_inverse.get)
-
-            # Calculate the total capture for the top pairs
-            top_buy_capture = buy_results_with_inverse[top_buy_pair]
-            top_short_capture = short_results_with_inverse[top_short_pair]
+            # Find best overall pairs from daily results
+            top_buy_pair = daily_top_buy_pairs[df.index[-1]][0]
+            top_short_pair = daily_top_short_pairs[df.index[-1]][0]
+            top_buy_capture = daily_top_buy_pairs[df.index[-1]][1]
+            top_short_capture = daily_top_short_pairs[df.index[-1]][1]
 
             # Print the top pairs along with their results          
             logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture:.6f}")
@@ -942,7 +920,13 @@ def precompute_results(ticker, event):
             # Save final results
             logger.info(f"Saving final results to {pkl_file}")
             with tqdm(total=1, desc="Saving final results", unit="file", leave=True, position=0) as pbar_save:
-                save_precomputed_results(ticker, results)
+                save_precomputed_results(
+                    ticker,
+                    results['daily_top_buy_pairs'],
+                    results['daily_top_short_pairs'],
+                    results['preprocessed_data'],
+                    results['existing_max_sma_day']
+                )
                 pbar_save.update(1)
             write_status(ticker, {"status": "complete", "progress": 100})
 
@@ -1906,7 +1890,13 @@ def get_or_calculate_combined_captures(results, df, daily_top_buy_pairs, daily_t
         # Update the results dictionary with the new data
         results['cumulative_combined_captures'] = cumulative_combined_captures
         results['active_pairs'] = active_pairs
-        save_precomputed_results(ticker, results)
+        save_precomputed_results(
+            ticker,
+            results['daily_top_buy_pairs'],
+            results['daily_top_short_pairs'],
+            results['preprocessed_data'],
+            results['existing_max_sma_day']
+        )
 
     logger.info(f"Number of cumulative combined captures: {len(cumulative_combined_captures)}")
     logger.info(f"Number of active pairs: {len(active_pairs)}")
@@ -3074,7 +3064,14 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     # After Forecast Recommendations are complete, update results
     results['last_recommendation_time'] = time.time()
-    save_precomputed_results(ticker, results)
+    save_precomputed_results(
+        ticker,
+        results['daily_top_buy_pairs'],
+        results['daily_top_short_pairs'],
+        results['preprocessed_data'],
+        results['existing_max_sma_day']
+    )
+
 
     return (
         most_productive_buy_pair_text,
