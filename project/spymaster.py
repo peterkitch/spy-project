@@ -811,7 +811,12 @@ def precompute_results(ticker, event):
 
             dates = df.index
             returns = df['Close'].pct_change().fillna(0).values  # numpy array of returns
-            all_pairs = np.array([(i, j) for i in range(1, max_sma_day+1) for j in range(1, max_sma_day+1) if i != j])
+            all_pairs = np.array([
+                (i, j) 
+                for i in range(1, max_sma_day+1) 
+                for j in range(1, max_sma_day+1) 
+                if i != j
+            ])
             num_pairs = len(all_pairs)
 
             # Extract SMA columns into a numpy array for fast vectorized operations
@@ -1996,17 +2001,17 @@ def update_combined_capture_chart(ticker, n_intervals):
         'date': cumulative_combined_captures.index,
         'capture': cumulative_combined_captures,
         'top_buy_pair': [
-            f"SMA {daily_top_buy_pairs[date][0][0]} / SMA {daily_top_buy_pairs[date][0][1]} ({daily_top_buy_pairs[date][1] * 100:.2f}%)"
+            f"SMA {daily_top_buy_pairs[date][0][0]} / SMA {daily_top_buy_pairs[date][0][1]} ({daily_top_buy_pairs[date][1]:.2f}%)"
             if date in daily_top_buy_pairs and isinstance(daily_top_buy_pairs[date][0], tuple)
-            else f"SMA {daily_top_buy_pairs[date][0]} / SMA {daily_top_buy_pairs[date][1]} ({daily_top_buy_pairs[date][1] * 100:.2f}%)"
+            else f"SMA {daily_top_buy_pairs[date][0]} / SMA {daily_top_buy_pairs[date][1]} ({daily_top_buy_pairs[date][1]:.2f}%)"
             if date in daily_top_buy_pairs
             else "No Data"
             for date in cumulative_combined_captures.index
         ],
         'top_short_pair': [
-            f"SMA {daily_top_short_pairs[date][0][0]} / SMA {daily_top_short_pairs[date][0][1]} ({daily_top_short_pairs[date][1] * 100:.2f}%)"
+            f"SMA {daily_top_short_pairs[date][0][0]} / SMA {daily_top_short_pairs[date][0][1]} ({daily_top_short_pairs[date][1]:.2f}%)"
             if date in daily_top_short_pairs and isinstance(daily_top_short_pairs[date][0], tuple)
-            else f"SMA {daily_top_short_pairs[date][0]} / SMA {daily_top_short_pairs[date][1]} ({daily_top_short_pairs[date][1] * 100:.2f}%)"
+            else f"SMA {daily_top_short_pairs[date][0]} / SMA {daily_top_short_pairs[date][1]} ({daily_top_short_pairs[date][1]:.2f}%)"
             if date in daily_top_short_pairs
             else "No Data"
             for date in cumulative_combined_captures.index
@@ -2057,7 +2062,7 @@ def update_combined_capture_chart(ticker, n_intervals):
     else:
         data.loc[data.index[-1], 'active_pair_next'] = "None"
 
-    print(f"Sample data rows:\n{data.head()}\n{data.tail()}")
+    print(f"Sample data rows:\n{data.head(10)}\n{data.tail(10)}")
 
     # Calculate the active pair for the upcoming trading session
     last_date = df.index[-1]
