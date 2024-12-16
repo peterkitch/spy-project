@@ -20,3 +20,7 @@ build/
 # Ignore results and status directories if applicable
 results/
 status/
+
+# Ignore Excel files
+*.xlsx
+*.xls
