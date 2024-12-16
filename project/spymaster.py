@@ -921,8 +921,8 @@ def precompute_results(ticker, event):
             if 'top_short_pair' not in results:
                 results['top_short_pair'] = (0,0)
 
-            logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture:.6f}")
-            logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture:.6f}")
+            logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture}")
+            logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture}")
 
             logger.info(f"Saving final results to {pkl_file}")
             with tqdm(total=1, desc="Saving final results", unit="file", leave=True, position=0) as pbar_save:
