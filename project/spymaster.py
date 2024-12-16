@@ -88,7 +88,7 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 tqdm.pandas()
-MAX_SMA_DAY = 113
+MAX_SMA_DAY = 114
 _precomputed_results_cache = {}
 _loading_in_progress = {}
 _loading_lock = threading.Lock()
@@ -804,65 +804,83 @@ def precompute_results(ticker, event):
                     else:
                         logger.warning(f"Missing SMA columns even after computation: {missing_smas}. Cannot cache incomplete SMA data.")
 
-            # Process SMA pairs and find top performers in a fully vectorized manner
+            # Process SMA pairs and find top performers in a fully vectorized manner with chunking
             log_section("SMA Pairs Processing")
             daily_top_buy_pairs = {}
             daily_top_short_pairs = {}
 
             dates = df.index
-            returns = df['Close'].pct_change().fillna(0).values  # numpy array of returns
-            all_pairs = np.array([
-                (i, j) 
-                for i in range(1, max_sma_day+1) 
-                for j in range(1, max_sma_day+1) 
-                if i != j
-            ])
-            num_pairs = len(all_pairs)
+            returns = df['Close'].pct_change().fillna(0).values
 
-            # Extract SMA columns into a numpy array for fast vectorized operations
-            # Shape: (num_days, max_sma_day)
+            # Determine total pairs
+            total_pairs = sum(1 for i in range(1, max_sma_day+1) for j in range(1, max_sma_day+1) if i != j)
+            chunk_size_pairs = 100000 if max_sma_day <= 500 else 75000 if max_sma_day <= 1000 else 50000 if max_sma_day <= 1500 else 25000
+            num_pair_chunks = (total_pairs + chunk_size_pairs - 1) // chunk_size_pairs
+
+            logger.info(f"Processing {total_pairs} pairs in {num_pair_chunks} chunks of {chunk_size_pairs}")
+
             sma_matrix = np.empty((len(dates), max_sma_day), dtype=np.float64)
             for k in range(1, max_sma_day+1):
                 sma_matrix[:, k-1] = df[f'SMA_{k}'].values
 
-            # Precompute signals for ALL pairs at once:
-            # For each pair (i,j), signals = sma_matrix[:, i-1] > sma_matrix[:, j-1]
-            # We'll do this per day as needed, but vectorized per day.
+            pair_count = 0
+            with tqdm(total=num_pair_chunks, desc="Processing SMA pair chunks", unit="chunk") as pbar_pairs:
+                for chunk_idx in range(num_pair_chunks):
+                    start_idx = chunk_idx * chunk_size_pairs
+                    end_idx = min((chunk_idx + 1) * chunk_size_pairs, total_pairs)
 
-            # Pre-allocate arrays and compute all at once
-            num_days = len(dates)
-            num_pairs = len(all_pairs)
-            i_indices = all_pairs[:, 0] - 1
-            j_indices = all_pairs[:, 1] - 1
+                    # Generate pairs for this chunk
+                    chunk_pairs = []
+                    pc = 0
+                    for i in range(1, max_sma_day+1):
+                        for j in range(1, max_sma_day+1):
+                            if i != j:
+                                if pc >= start_idx and pc < end_idx:
+                                    chunk_pairs.append((i, j))
+                                pc += 1
+                                if pc >= end_idx:
+                                    break
+                        if pc >= end_idx:
+                            break
 
-            # Vectorized processing
-            sma_i = sma_matrix[:, i_indices]
-            sma_j = sma_matrix[:, j_indices]
-            buy_signals = np.vstack([np.zeros((1, num_pairs)), (sma_i[:-1] > sma_j[:-1])])
-            short_signals = np.vstack([np.zeros((1, num_pairs)), (sma_i[:-1] < sma_j[:-1])])
+                    chunk_pairs = np.array(chunk_pairs)
+                    num_pairs_chunk = len(chunk_pairs)
+                    if num_pairs_chunk == 0:
+                        pbar_pairs.update(1)
+                        continue
 
-            returns_expanded = returns[:, np.newaxis]
-            buy_captures = np.cumsum(returns_expanded * buy_signals * 100, axis=0)
-            short_captures = np.cumsum(-returns_expanded * short_signals * 100, axis=0)
+                    i_indices = chunk_pairs[:, 0] - 1
+                    j_indices = chunk_pairs[:, 1] - 1
 
-            # Pre-compute indices
-            max_buy_indices = np.argmax(buy_captures, axis=1)
-            max_short_indices = np.argmax(short_captures, axis=1)
+                    sma_i = sma_matrix[:, i_indices]
+                    sma_j = sma_matrix[:, j_indices]
+                    buy_signals = np.vstack([np.zeros((1, num_pairs_chunk), dtype=bool), (sma_i[:-1] > sma_j[:-1])])
+                    short_signals = np.vstack([np.zeros((1, num_pairs_chunk), dtype=bool), (sma_i[:-1] < sma_j[:-1])])
 
-            # Create dictionaries with progress bar
-            logger.info("Building daily pairs dictionaries...")
-            with tqdm(total=2, desc="Building pairs dictionaries") as pbar:
-                daily_top_buy_pairs = {
-                    dates[i]: (tuple(all_pairs[max_buy_indices[i]]), buy_captures[i, max_buy_indices[i]])
-                    for i in range(num_days)
-                }
-                pbar.update(1)
-                
-                daily_top_short_pairs = {
-                    dates[i]: (tuple(all_pairs[max_short_indices[i]]), short_captures[i, max_short_indices[i]])
-                    for i in range(num_days)
-                }
-                pbar.update(1)
+                    returns_expanded = returns[:, np.newaxis]
+                    buy_captures = np.cumsum(returns_expanded * buy_signals * 100, axis=0)
+                    short_captures = np.cumsum(-returns_expanded * short_signals * 100, axis=0)
+
+                    # Update daily_top_buy_pairs and daily_top_short_pairs directly from this chunk
+                    for day_idx in range(len(dates)):
+                        # Buy
+                        max_buy_val = np.max(buy_captures[day_idx])
+                        max_buy_idx = np.argmax(buy_captures[day_idx])
+                        current_buy_pair = tuple(chunk_pairs[max_buy_idx])
+                        if dates[day_idx] not in daily_top_buy_pairs or max_buy_val > daily_top_buy_pairs[dates[day_idx]][1]:
+                            daily_top_buy_pairs[dates[day_idx]] = (current_buy_pair, float(max_buy_val))
+
+                        # Short
+                        max_short_val = np.max(short_captures[day_idx])
+                        max_short_idx = np.argmax(short_captures[day_idx])
+                        current_short_pair = tuple(chunk_pairs[max_short_idx])
+                        if dates[day_idx] not in daily_top_short_pairs or max_short_val > daily_top_short_pairs[dates[day_idx]][1]:
+                            daily_top_short_pairs[dates[day_idx]] = (current_short_pair, float(max_short_val))
+
+                    del sma_i, sma_j, buy_signals, short_signals, buy_captures, short_captures
+                    gc.collect()
+
+                    pbar_pairs.update(1)
 
             # Update results
             results['daily_top_buy_pairs'] = daily_top_buy_pairs
