@@ -88,7 +88,7 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 tqdm.pandas()
-MAX_SMA_DAY = 113
+MAX_SMA_DAY = 114
 _precomputed_results_cache = {}
 _loading_in_progress = {}
 _loading_lock = threading.Lock()
@@ -419,50 +419,14 @@ def write_status(ticker, status):
 
 def save_precomputed_results(ticker, results):
     ticker = normalize_ticker(ticker)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Use a unique temporary file in the current directory to avoid conflicts
-    temp_file_path = os.path.join(current_dir, f'{ticker}_precomputed_results_temp_{threading.get_ident()}.pkl')
-    final_file_path = os.path.join(current_dir, f'{ticker}_precomputed_results.pkl')
+    final_name = f'{ticker}_precomputed_results.pkl'
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tf:
+        pickle.dump(results, tf)
+        temp_name = tf.name
 
-    try:
-        # Save main results (excluding buy_results and short_results)
-        main_results = {k: v for k, v in results.items() if k not in ['buy_results', 'short_results']}
-        
-        # Ensure daily_top_buy_pairs and daily_top_short_pairs are included
-        if 'daily_top_buy_pairs' not in main_results or 'daily_top_short_pairs' not in main_results:
-            logging.warning("daily_top_pairs not found in results, recalculating...")
-            daily_top_buy_pairs, daily_top_short_pairs = calculate_daily_top_pairs(
-                results['preprocessed_data'], ticker)
-            main_results['daily_top_buy_pairs'] = daily_top_buy_pairs
-            main_results['daily_top_short_pairs'] = daily_top_short_pairs
-        
-        with open(temp_file_path, 'wb') as f:
-            pickle.dump(main_results, f)
-
-        # Atomically replace the final file with the temp file
-        try:
-            os.replace(temp_file_path, final_file_path)
-            logging.info(f"Main results saved successfully to {final_file_path}")
-            logging.info(f"Number of daily_top_buy_pairs saved: {len(main_results.get('daily_top_buy_pairs', {}))}")
-            logging.info(f"Number of daily_top_short_pairs saved: {len(main_results.get('daily_top_short_pairs', {}))}")
-            logging.info(f"All results saved successfully for {ticker}")
-        except Exception as e:
-            logging.error(f"Error saving results for {ticker}: {str(e)}")
-            logging.error(traceback.format_exc())
-            # Clean up temp file if it exists
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-    except PermissionError:
-        logging.error(f"Permission denied when saving results to {final_file_path}. Please check file permissions.")
-    except Exception as e:
-        logging.error(f"Error saving results for {ticker}: {str(e)}")
-        logging.error(traceback.format_exc())
-        # Clean up temp file if it exists
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-    # Return the main_results even if an exception occurred
-    return main_results
+    shutil.move(temp_name, final_name)
+    logger.info(f"Saved results for {ticker}")
+    return results
 
 def process_chunk_for_top_pairs(chunk_file, total_days):
     data = np.load(chunk_file, allow_pickle=True)
@@ -603,22 +567,60 @@ def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chun
     ticker = normalize_ticker(ticker)
     chunk_file = f'{ticker}_results_chunk_{chunk_index}.npz'
     try:
-        # Prepare data for saving
-        buy_pairs = np.array(list(buy_results_chunk.keys()))
-        buy_values = np.array(list(buy_results_chunk.values()))
-        short_pairs = np.array(list(short_results_chunk.keys()))
-        short_values = np.array(list(short_results_chunk.values()))
-        
-        logger.info(f"Saving chunk {chunk_index}...")
+        # Validate input data types
+        if not isinstance(buy_results_chunk, dict) or not isinstance(short_results_chunk, dict):
+            logger.error(f"Invalid chunk data types for {ticker}: expected dicts but got {type(buy_results_chunk)} and {type(short_results_chunk)}")
+            np.savez(chunk_file, buy_pairs=np.array([]), buy_values=np.array([]),
+                     short_pairs=np.array([]), short_values=np.array([]))
+            return
 
-        # Save the chunk synchronously
-        np.savez(chunk_file, buy_pairs=buy_pairs, buy_values=buy_values,
-                 short_pairs=short_pairs, short_values=short_values)
+        # Attempt to extract a sample array of values to determine the number of days
+        combined_dict = {**buy_results_chunk, **short_results_chunk}
+        example_values = next(iter(combined_dict.values()), None)
         
-        file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)  # Size in GB
-        logger.info(f"Chunk {chunk_index} saved successfully to {chunk_file} (Size: {file_size:.2f} GB)")
+        # Check if we have valid data
+        if example_values is None or not isinstance(example_values, np.ndarray):
+            logger.info(f"No valid arrays found in chunk {chunk_index} for {ticker}. Saving empty results.")
+            np.savez(chunk_file, buy_pairs=np.array([]), buy_values=np.array([]),
+                     short_pairs=np.array([]), short_values=np.array([]))
+            return
+
+        num_days = len(example_values)
+
+        # Convert dictionaries to numpy arrays for vectorized operations
+        buy_pairs = np.array(list(buy_results_chunk.keys()), dtype=object)
+        buy_values = np.array(list(buy_results_chunk.values()), dtype=np.float64)
+        short_pairs = np.array(list(short_results_chunk.keys()), dtype=object)
+        short_values = np.array(list(short_results_chunk.values()), dtype=np.float64)
+
+        # Handle the case where we might have no data (empty arrays)
+        if buy_values.size == 0:
+            top_buy_pairs = np.array([], dtype=object)
+            top_buy_values = np.array([], dtype=np.float64)
+        else:
+            # Use nanargmax to handle any potential NaN values
+            max_buy_indices = np.nanargmax(buy_values, axis=0)
+            top_buy_pairs = buy_pairs[max_buy_indices]
+            top_buy_values = buy_values[max_buy_indices, np.arange(num_days)]
+
+        if short_values.size == 0:
+            top_short_pairs = np.array([], dtype=object)
+            top_short_values = np.array([], dtype=np.float64)
+        else:
+            max_short_indices = np.nanargmax(short_values, axis=0)
+            top_short_pairs = short_pairs[max_short_indices]
+            top_short_values = short_values[max_short_indices, np.arange(num_days)]
+
+        # Save the results in compressed format to reduce file size
+        np.savez_compressed(chunk_file,
+                            buy_pairs=top_buy_pairs, buy_values=top_buy_values,
+                            short_pairs=top_short_pairs, short_values=top_short_values)
+
+        file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)
+        logger.info(f"Chunk {chunk_index} saved successfully for {ticker}: {file_size:.2f} GB")
+
     except Exception as e:
-        logger.error(f"Error saving results for {ticker}: {str(e)}")
+        logger.error(f"Error saving chunk {chunk_index} for {ticker}: {str(e)}")
         logger.error(traceback.format_exc())
 
 def precompute_results(ticker, event):
@@ -665,7 +667,7 @@ def precompute_results(ticker, event):
                 existing_max_sma_day = 0
                 last_processed_date = None
 
-            MAX_TRADING_DAYS = 30000  # Adjust this value based on your system's capabilities
+            MAX_TRADING_DAYS = 30000  # Adjust if needed
             total_trading_days = len(df)
             if total_trading_days > MAX_TRADING_DAYS:
                 df = df.iloc[-MAX_TRADING_DAYS:]
@@ -680,185 +682,211 @@ def precompute_results(ticker, event):
             
             if not needs_precompute:
                 logger.info(f"Existing results found for {ticker} and no precomputation needed. Using existing results.")
-                # Load existing results
                 results = load_precomputed_results(ticker)
-                # Ensure 'active_pairs' is present in results
                 if 'active_pairs' not in results or not results['active_pairs']:
-                    # Recalculate cumulative combined captures and active pairs
                     logger.info(f"'active_pairs' not found or empty for {ticker}, recalculating...")
                     daily_top_buy_pairs = results.get('daily_top_buy_pairs')
                     daily_top_short_pairs = results.get('daily_top_short_pairs')
                     if daily_top_buy_pairs and daily_top_short_pairs:
                         df = results['preprocessed_data']
-                        cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
-                            df, daily_top_buy_pairs, daily_top_short_pairs)
+                        cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs)
                         results['cumulative_combined_captures'] = cumulative_combined_captures
                         results['active_pairs'] = active_pairs
-                        # Save the updated results
                         save_precomputed_results(ticker, results)
                     else:
                         logger.warning(f"Missing daily top pairs for {ticker}, unable to recalculate 'active_pairs'.")
 
-                # Update status, cache, and signal loading completion
+                # Ensure required keys exist
+                if 'top_buy_pair' not in results:
+                    results['top_buy_pair'] = (0,0)
+                if 'top_short_pair' not in results:
+                    results['top_short_pair'] = (0,0)
+                if 'cumulative_combined_captures' not in results:
+                    results['cumulative_combined_captures'] = pd.Series([0], index=[df.index[0]])
+                if 'active_pairs' not in results:
+                    results['active_pairs'] = ['None'] * len(df)
+
                 write_status(ticker, {"status": "complete", "progress": 100})
                 with _loading_lock:
                     _precomputed_results_cache[ticker] = results
-                    # Signal that loading is complete
                     if ticker in _loading_in_progress:
                         _loading_in_progress[ticker].set()
                         del _loading_in_progress[ticker]
 
-                # Force an update of the Dash app
                 logger.info("Updating Dash app layout...")
                 app.layout = app.layout
                 logger.info("Dash app layout updated.")
 
-                # Store timing information if needed (optional)
                 results['section_times'] = section_times
                 results['start_time'] = master_stopwatch_start
 
-                # Print final message
                 logger.info("Computation and loading process completed.")
-
-                # Return the results
                 return results
 
             else:
-                # Proceed with precomputations as before (no changes needed here)
                 results = existing_results or {}
 
                 start_date = df.index.min().strftime('%Y-%m-%d')
                 last_date = df.index.max().strftime('%Y-%m-%d')
                 logger.info(f"Date range: {start_date} to {last_date}")
 
-                # Begin SMA Calculation
                 log_section("SMA Calculation")
-                logger.info("Calculating new SMA columns...")
+                logger.info("Checking SMA cache...")
 
-                # Check if there are new SMA periods to compute
-                if max_sma_day > existing_max_sma_day:
-                    # Prepare a list to store SMA DataFrames
-                    sma_list = []
+                cache_dir = '.sma_cache'
+                os.makedirs(cache_dir, exist_ok=True)
+                sma_cache_path = os.path.join(cache_dir, f'sma_full_{ticker}.npz')
 
-                    logger.info("Beginning SMA calculations in chunks...")
-                    chunk_size_sma = 50  # Adjust based on memory constraints
-                    total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
+                smas_loaded = False
+                if os.path.exists(sma_cache_path):
+                    logger.info("Loading SMAs from cache...")
+                    try:
+                        with np.load(sma_cache_path) as data:
+                            for i in range(1, max_sma_day + 1):
+                                df[f'SMA_{i}'] = data[f'SMA_{i}']
+                        logger.info("Successfully loaded SMAs from cache")
+                        smas_loaded = True
+                    except Exception as e:
+                        logger.warning(f"Error loading SMAs from cache: {str(e)}")
 
-                    with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
-                        for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
-                            chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
-                            sma_dict = {}
-                            for j in range(i, chunk_end):
-                                sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
-                                sma_dict[f'SMA_{j}'] = sma_values
-                            sma_chunk = pd.DataFrame(sma_dict, index=df.index)
-                            sma_list.append(sma_chunk)
-                            gc.collect()
-                            pbar.update(1)
+                if not smas_loaded:
+                    logger.info("Computing new SMA columns...")
+                    if max_sma_day > existing_max_sma_day:
+                        sma_list = []
+                        logger.info("Beginning SMA calculations in chunks...")
+                        chunk_size_sma = 50
+                        total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
 
-                    logger.info(f"Completed SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
+                        with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
+                            for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
+                                chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
+                                sma_dict = {}
+                                for j in range(i, chunk_end):
+                                    sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
+                                    sma_dict[f'SMA_{j}'] = sma_values
+                                sma_chunk = pd.DataFrame(sma_dict, index=df.index)
+                                sma_list.append(sma_chunk)
+                                gc.collect()
+                                pbar.update(1)
 
-                    # Concatenate all SMA chunks and add to the DataFrame at once
-                    sma_df = pd.concat(sma_list, axis=1)
-                    df = pd.concat([df, sma_df], axis=1)
-                    df = df.copy()  # De-fragment the DataFrame
+                        logger.info(f"Completed SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
 
-                    logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
+                        sma_df = pd.concat(sma_list, axis=1)
+                        df = pd.concat([df, sma_df], axis=1)
+                        df = df.copy()
+                        logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
 
-                else:
-                    # No new SMA periods to compute
-                    logger.info("No new SMA periods to compute.")
-                    # Update existing SMA columns for new data
-                    logger.info("Updating existing SMA columns for new data.")
-                    # Recalculate existing SMA columns for the new data
-                    for sma_period in range(1, max_sma_day + 1):
-                        sma_column_name = f'SMA_{sma_period}'
-                        df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
-                        df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
-                    df = df.copy()  # De-fragment the DataFrame
+                    else:
+                        logger.info("No new SMA periods to compute.")
+                        logger.info("Updating existing SMA columns for new data.")
+                        for sma_period in range(1, max_sma_day + 1):
+                            sma_column_name = f'SMA_{sma_period}'
+                            df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
+                            df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
+                        df = df.copy()
 
-                logger.info("SMA columns updated.")
+                    logger.info("SMA columns updated.")
+                    logger.info("Ensuring correct NaN values for SMA calculations.")
+                    for j in range(1, max_sma_day + 1):
+                        sma_column_name = f'SMA_{j}'
+                        df.iloc[:j-1, df.columns.get_loc(sma_column_name)] = np.nan
+                    logger.info("Ensured correct NaN values for SMA calculations.")
 
-                # Proceed to ensure NaN values for all SMA columns
-                logger.info("Ensuring correct NaN values for SMA calculations.")
-                for j in range(1, max_sma_day + 1):
-                    sma_column_name = f'SMA_{j}'
-                    df.iloc[:j-1, df.columns.get_loc(sma_column_name)] = np.nan
+                    expected_sma_columns = [f'SMA_{i}' for i in range(1, max_sma_day + 1)]
+                    missing_smas = [sma for sma in expected_sma_columns if sma not in df.columns]
+                    if not missing_smas:
+                        try:
+                            sma_dict = {f'SMA_{i}': df[f'SMA_{i}'].values for i in range(1, max_sma_day + 1)}
+                            np.savez_compressed(sma_cache_path, **sma_dict)
+                            logger.info("Saved SMAs to cache after full computation")
+                        except Exception as e:
+                            logger.warning(f"Failed to save SMA cache: {str(e)}")
+                    else:
+                        logger.warning(f"Missing SMA columns even after computation: {missing_smas}. Cannot cache incomplete SMA data.")
 
-                logger.info("Ensured correct NaN values for SMA calculations.")
+            # Process SMA pairs and find top performers in a fully vectorized manner with chunking
+            log_section("SMA Pairs Processing")
+            daily_top_buy_pairs = {}
+            daily_top_short_pairs = {}
 
-            # Pre-calculate new SMAs
-            sma_columns = {}
-            for i in range(existing_max_sma_day + 1, max_sma_day + 1):
-                sma_columns[i] = df['Close'].rolling(window=i).mean().values
+            dates = df.index
+            returns = df['Close'].pct_change().fillna(0).values
 
-            logger.info("Generating new SMA pairs...")
-            start_time = time.time()
-            new_sma_pairs = [
-                (i, j) for i in range(existing_max_sma_day + 1, max_sma_day)
-                for j in range(i + 1, max_sma_day + 1)
-            ]
-            total_pairs = len(new_sma_pairs)
-            total_pairs_with_inverses = total_pairs * 2
-            logger.info(f"Generated {total_pairs} unique SMA pairs (including inverses: {total_pairs_with_inverses}) in {time.time() - start_time:.2f} seconds")
+            # Determine total pairs
+            total_pairs = sum(1 for i in range(1, max_sma_day+1) for j in range(1, max_sma_day+1) if i != j)
+            chunk_size_pairs = 100000 if max_sma_day <= 500 else 75000 if max_sma_day <= 1000 else 50000 if max_sma_day <= 1500 else 25000
+            num_pair_chunks = (total_pairs + chunk_size_pairs - 1) // chunk_size_pairs
 
-            returns = df['Close'].pct_change().values
+            logger.info(f"Processing {total_pairs} pairs in {num_pair_chunks} chunks of {chunk_size_pairs}")
 
-            # Begin Capture Calculation
-            log_section("Capture Calculation")
-            chunk_size = 100000  # Adjust based on your system's capabilities
-            update_interval = 100  # Update progress more frequently
+            sma_matrix = np.empty((len(dates), max_sma_day), dtype=np.float64)
+            for k in range(1, max_sma_day+1):
+                sma_matrix[:, k-1] = df[f'SMA_{k}'].values
 
-            with tqdm(total=total_pairs_with_inverses, desc=f'Calculation for {ticker.upper()}', unit='pair', dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar_calc:
-                for i in range(0, total_pairs, chunk_size):
-                    chunk_pairs = new_sma_pairs[i:i+chunk_size]
+            pair_count = 0
+            with tqdm(total=num_pair_chunks, desc="Processing SMA pair chunks", unit="chunk") as pbar_pairs:
+                for chunk_idx in range(num_pair_chunks):
+                    start_idx = chunk_idx * chunk_size_pairs
+                    end_idx = min((chunk_idx + 1) * chunk_size_pairs, total_pairs)
 
-                    sma1_array = np.array([sma_columns[pair[0]] for pair in chunk_pairs])
-                    sma2_array = np.array([sma_columns[pair[1]] for pair in chunk_pairs])
+                    # Generate pairs for this chunk
+                    chunk_pairs = []
+                    pc = 0
+                    for i in range(1, max_sma_day+1):
+                        for j in range(1, max_sma_day+1):
+                            if i != j:
+                                if pc >= start_idx and pc < end_idx:
+                                    chunk_pairs.append((i, j))
+                                pc += 1
+                                if pc >= end_idx:
+                                    break
+                        if pc >= end_idx:
+                            break
 
-                    buy_captures, short_captures = calculate_captures_vectorized(sma1_array, sma2_array, returns)
+                    chunk_pairs = np.array(chunk_pairs)
+                    num_pairs_chunk = len(chunk_pairs)
+                    if num_pairs_chunk == 0:
+                        pbar_pairs.update(1)
+                        continue
 
-                    # Initialize chunk dictionaries
-                    buy_results_chunk = {}
-                    short_results_chunk = {}
+                    i_indices = chunk_pairs[:, 0] - 1
+                    j_indices = chunk_pairs[:, 1] - 1
 
-                    # Process original pairs
-                    buy_results_chunk.update(zip(chunk_pairs, buy_captures))
-                    short_results_chunk.update(zip(chunk_pairs, short_captures))
+                    sma_i = sma_matrix[:, i_indices]
+                    sma_j = sma_matrix[:, j_indices]
+                    buy_signals = np.vstack([np.zeros((1, num_pairs_chunk), dtype=bool), (sma_i[:-1] > sma_j[:-1])])
+                    short_signals = np.vstack([np.zeros((1, num_pairs_chunk), dtype=bool), (sma_i[:-1] < sma_j[:-1])])
 
-                    # Process inverse pairs
-                    inverse_pairs = [(pair[1], pair[0]) for pair in chunk_pairs]
-                    inverse_buy_captures = -short_captures
-                    inverse_short_captures = -buy_captures
+                    returns_expanded = returns[:, np.newaxis]
+                    buy_captures = np.cumsum(returns_expanded * buy_signals * 100, axis=0)
+                    short_captures = np.cumsum(-returns_expanded * short_signals * 100, axis=0)
 
-                    buy_results_chunk.update(zip(inverse_pairs, inverse_buy_captures))
-                    short_results_chunk.update(zip(inverse_pairs, inverse_short_captures))
+                    # Update daily_top_buy_pairs and daily_top_short_pairs directly from this chunk
+                    for day_idx in range(len(dates)):
+                        # Buy
+                        max_buy_val = np.max(buy_captures[day_idx])
+                        max_buy_idx = np.argmax(buy_captures[day_idx])
+                        current_buy_pair = tuple(chunk_pairs[max_buy_idx])
+                        if dates[day_idx] not in daily_top_buy_pairs or max_buy_val > daily_top_buy_pairs[dates[day_idx]][1]:
+                            daily_top_buy_pairs[dates[day_idx]] = (current_buy_pair, float(max_buy_val))
 
-                    # Update progress bar
-                    pbar_calc.update(len(chunk_pairs) * 2)
+                        # Short
+                        max_short_val = np.max(short_captures[day_idx])
+                        max_short_idx = np.argmax(short_captures[day_idx])
+                        current_short_pair = tuple(chunk_pairs[max_short_idx])
+                        if dates[day_idx] not in daily_top_short_pairs or max_short_val > daily_top_short_pairs[dates[day_idx]][1]:
+                            daily_top_short_pairs[dates[day_idx]] = (current_short_pair, float(max_short_val))
 
-                    # Update status
-                    pairs_processed = min(i + chunk_size, total_pairs) * 2
-                    progress_percentage = pairs_processed / total_pairs_with_inverses * 100
-                    write_status(ticker, {"status": "processing", "progress": progress_percentage})
-
-                    # Save results after processing each chunk (synchronously)
-                    tqdm.write(f"Saving chunk {i // chunk_size}...")
-                    save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chunk, i // chunk_size)
-                    tqdm.write(f"Chunk {i // chunk_size} saved successfully.")
-
-                    # Clear the chunk dictionaries to free up memory
-                    buy_results_chunk.clear()
-                    short_results_chunk.clear()
+                    del sma_i, sma_j, buy_signals, short_signals, buy_captures, short_captures
                     gc.collect()
-                    tqdm.write("Garbage collection completed.")
 
-                    # Update the progress bar after processing the chunk
-                    pbar_calc.update(len(chunk_pairs) * 2)
+                    pbar_pairs.update(1)
 
-            pairs_processed = total_pairs * 2  # Each pair has a regular and inverse version
-            logger.info(f"Processed {pairs_processed} pairs out of {total_pairs_with_inverses} for {ticker.upper()}")
-            logger.info(f"Total buy pairs: {total_pairs * 2}, Total short pairs: {total_pairs * 2}")
+            # Update results
+            results['daily_top_buy_pairs'] = daily_top_buy_pairs
+            results['daily_top_short_pairs'] = daily_top_short_pairs
+
+            write_status(ticker, {"status": "processing", "progress": 50})
 
             # Update other results
             results['preprocessed_data'] = df
@@ -868,116 +896,84 @@ def precompute_results(ticker, event):
             results['last_date'] = last_date
             results['total_trading_days'] = total_trading_days
 
-            # Begin Daily Top Pairs Calculation
-            log_section("Daily Top Pairs Calculation")
-            section_start = log_section_time("Daily Top Pairs Calculation")
-            daily_top_buy_pairs, daily_top_short_pairs, chunk_processing_time = calculate_daily_top_pairs(df, ticker)
-            results['chunk_processing_time'] = chunk_processing_time
-            
-            results['daily_top_buy_pairs'] = daily_top_buy_pairs
-            results['daily_top_short_pairs'] = daily_top_short_pairs
-
-            # Save the results after calculating daily top pairs
-            save_precomputed_results(ticker, results)
-
             # Begin Cumulative Combined Captures Calculation
             log_section("Cumulative Combined Captures")
             section_start = log_section_time("Cumulative Combined Captures")
-            cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs)
+            cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
+                df,
+                results['daily_top_buy_pairs'],
+                results['daily_top_short_pairs']
+            )
 
             results['cumulative_combined_captures'] = cumulative_combined_captures
             results['active_pairs'] = active_pairs
 
-            # Load buy and short results from chunk files
-            buy_results = {}
-            short_results = {}
-            chunk_files = sorted(glob.glob(f'{ticker}_results_chunk_*.npz'))
+            # Find best overall pairs from daily results
+            last_day = df.index[-1]
+            if last_day in results['daily_top_buy_pairs']:
+                top_buy_pair = results['daily_top_buy_pairs'][last_day][0]
+                top_buy_capture = results['daily_top_buy_pairs'][last_day][1]
+            else:
+                top_buy_pair = (0,0)
+                top_buy_capture = 0
 
-            with tqdm(total=len(chunk_files), desc=f"Loading chunks for {ticker}", unit="chunk") as pbar:
-                for chunk_file in chunk_files:
-                    data = np.load(chunk_file, allow_pickle=True)
-                    buy_pairs = data['buy_pairs']
-                    buy_values = data['buy_values']
-                    short_pairs = data['short_pairs']
-                    short_values = data['short_values']
+            if last_day in results['daily_top_short_pairs']:
+                top_short_pair = results['daily_top_short_pairs'][last_day][0]
+                top_short_capture = results['daily_top_short_pairs'][last_day][1]
+            else:
+                top_short_pair = (0,0)
+                top_short_capture = 0
 
-                    # Reconstruct dictionaries
-                    buy_results.update(zip(map(tuple, buy_pairs), buy_values))
-                    short_results.update(zip(map(tuple, short_pairs), short_values))
-
-                    pbar.update(1)
-
-            # Calculate top pairs
-            buy_results_with_inverse = {}
-            short_results_with_inverse = {}
-
-            for pair, result in buy_results.items():
-                buy_results_with_inverse[pair] = result[-1]
-                inverse_pair = (pair[1], pair[0])
-                short_results_with_inverse[inverse_pair] = -result[-1]
-
-            for pair, result in short_results.items():
-                short_results_with_inverse[pair] = result[-1]
-                inverse_pair = (pair[1], pair[0])
-                buy_results_with_inverse[inverse_pair] = -result[-1]
-
-            # Identify the top performing buy and short pairs from the respective dictionaries
-            top_buy_pair = max(buy_results_with_inverse, key=buy_results_with_inverse.get)
-            top_short_pair = max(short_results_with_inverse, key=short_results_with_inverse.get)
-
-            # Calculate the total capture for the top pairs
-            top_buy_capture = buy_results_with_inverse[top_buy_pair]
-            top_short_capture = short_results_with_inverse[top_short_pair]
-
-            # Print the top pairs along with their results          
-            logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture:.6f}")
-            logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture:.6f}")
-
-            # Update the results dictionary with the latest total captures
             results['top_buy_pair'] = top_buy_pair
             results['top_buy_capture'] = top_buy_capture
             results['top_short_pair'] = top_short_pair
             results['top_short_capture'] = top_short_capture
 
-            # Save final results
+            # Ensure required keys are always present
+            if 'cumulative_combined_captures' not in results:
+                results['cumulative_combined_captures'] = pd.Series([0], index=[df.index[0]])
+            if 'active_pairs' not in results:
+                results['active_pairs'] = ['None'] * len(df)
+            if 'top_buy_pair' not in results:
+                results['top_buy_pair'] = (0,0)
+            if 'top_short_pair' not in results:
+                results['top_short_pair'] = (0,0)
+
+            logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture}")
+            logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture}")
+
             logger.info(f"Saving final results to {pkl_file}")
             with tqdm(total=1, desc="Saving final results", unit="file", leave=True, position=0) as pbar_save:
                 save_precomputed_results(ticker, results)
+
                 pbar_save.update(1)
+
             write_status(ticker, {"status": "complete", "progress": 100})
 
             logger.info("Process completed.")
 
-            # Update the cache
             with _loading_lock:
                 _precomputed_results_cache[ticker] = results
-                # Signal that loading is complete
                 if ticker in _loading_in_progress:
                     _loading_in_progress[ticker].set()
                     del _loading_in_progress[ticker]
 
-            # Force an update of the Dash app
             logger.info("Updating Dash app layout...")
             app.layout = app.layout
             logger.info("Dash app layout updated.")
 
-            # Store timing information for later use
             results['section_times'] = section_times
             results['start_time'] = master_stopwatch_start
 
         except Exception as e:
-            # Handle exceptions
             logger.error(f"Error in precompute_results for {ticker}: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())
         finally:
-            # Ensure the event is set even if an error occurs
             with _loading_lock:
                 if ticker in _loading_in_progress:
                     _loading_in_progress[ticker].set()
                     del _loading_in_progress[ticker]
 
-    # Print final message outside of the try-except block
     logger.info("Computation and loading process completed.")
 
 def print_timing_summary(ticker):
@@ -2023,17 +2019,17 @@ def update_combined_capture_chart(ticker, n_intervals):
         'date': cumulative_combined_captures.index,
         'capture': cumulative_combined_captures,
         'top_buy_pair': [
-            f"SMA {daily_top_buy_pairs[date][0][0]} / SMA {daily_top_buy_pairs[date][0][1]} ({daily_top_buy_pairs[date][1] * 100:.2f}%)"
+            f"SMA {daily_top_buy_pairs[date][0][0]} / SMA {daily_top_buy_pairs[date][0][1]} ({daily_top_buy_pairs[date][1]:.2f}%)"
             if date in daily_top_buy_pairs and isinstance(daily_top_buy_pairs[date][0], tuple)
-            else f"SMA {daily_top_buy_pairs[date][0]} / SMA {daily_top_buy_pairs[date][1]} ({daily_top_buy_pairs[date][1] * 100:.2f}%)"
+            else f"SMA {daily_top_buy_pairs[date][0]} / SMA {daily_top_buy_pairs[date][1]} ({daily_top_buy_pairs[date][1]:.2f}%)"
             if date in daily_top_buy_pairs
             else "No Data"
             for date in cumulative_combined_captures.index
         ],
         'top_short_pair': [
-            f"SMA {daily_top_short_pairs[date][0][0]} / SMA {daily_top_short_pairs[date][0][1]} ({daily_top_short_pairs[date][1] * 100:.2f}%)"
+            f"SMA {daily_top_short_pairs[date][0][0]} / SMA {daily_top_short_pairs[date][0][1]} ({daily_top_short_pairs[date][1]:.2f}%)"
             if date in daily_top_short_pairs and isinstance(daily_top_short_pairs[date][0], tuple)
-            else f"SMA {daily_top_short_pairs[date][0]} / SMA {daily_top_short_pairs[date][1]} ({daily_top_short_pairs[date][1] * 100:.2f}%)"
+            else f"SMA {daily_top_short_pairs[date][0]} / SMA {daily_top_short_pairs[date][1]} ({daily_top_short_pairs[date][1]:.2f}%)"
             if date in daily_top_short_pairs
             else "No Data"
             for date in cumulative_combined_captures.index
@@ -2084,7 +2080,7 @@ def update_combined_capture_chart(ticker, n_intervals):
     else:
         data.loc[data.index[-1], 'active_pair_next'] = "None"
 
-    print(f"Sample data rows:\n{data.head()}\n{data.tail()}")
+    print(f"Sample data rows:\n{data.head(10)}\n{data.tail(10)}")
 
     # Calculate the active pair for the upcoming trading session
     last_date = df.index[-1]
@@ -2178,7 +2174,6 @@ def update_combined_capture_chart(ticker, n_intervals):
      Input('update-interval', 'n_intervals')]
 )
 def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pairs, n_intervals):
-
     if not ticker:
         return no_update  # Do not update the chart
 
@@ -2192,6 +2187,20 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
         results = load_precomputed_results(ticker)
         if results is None:
             return no_update  # Do not update the chart
+
+        # Ensure required keys exist before accessing
+        required_keys = [
+            'preprocessed_data',
+            'daily_top_buy_pairs',
+            'daily_top_short_pairs',
+            'cumulative_combined_captures',
+            'active_pairs'
+        ]
+        missing_keys = [k for k in required_keys if k not in results]
+        if missing_keys:
+            logger.error(f"Missing required keys in results for {ticker}: {missing_keys}")
+            # Return no_update since we cannot proceed without these keys
+            return no_update
 
         # Extract required data from results
         df = results['preprocessed_data']
@@ -2550,29 +2559,23 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return no_update, ["Data integrity issue - missing top pairs"] * 10
+        return [no_update] + ["Data integrity issue - missing top pairs"] * 9
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return no_update, ["Data integrity issue - missing preprocessed data"] * 10
+        return [no_update] + ["Data integrity issue - missing preprocessed data"] * 9
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return no_update, ["Data integrity issue - invalid pair format"] * 10
-    if df is None or df.empty:
-        logger.warning(f"Warning: 'preprocessed_data' is missing or empty for {ticker}")
-        return ["Data integrity issue. Please check the precomputed results."] * 10
-
-    if top_buy_pair is None or top_short_pair is None:
-        return ["Data integrity issue. Please check the precomputed results."] * 10
+        return [no_update] + ["Data integrity issue - invalid pair format"] * 9
 
     try:
         # Validate top pairs data
         if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [top_buy_pair, top_short_pair]):
             logger.error(f"Invalid pair format detected for {ticker}")
-            return ["Invalid pair format detected. Please reprocess data."] * 10
+            return [no_update] + ["Invalid pair format detected. Please reprocess data."] * 9
 
         # Validate that all required SMA columns exist
         required_smas = [
@@ -2583,7 +2586,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         missing_smas = [sma for sma in required_smas if sma not in df.columns]
         if missing_smas:
             logger.error(f"Missing SMA columns for {ticker}: {missing_smas}")
-            return ["Missing required SMA columns. Please reprocess data."] * 10
+            return [no_update] + ["Missing required SMA columns. Please reprocess data."] * 9
 
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
@@ -2596,7 +2599,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     except KeyError:
         logger.error(f"Required SMA columns not found in the DataFrame for {ticker}")
-        return ["Data not available or processing not yet complete. Please wait..."] * 10
+        return [no_update] + ["Data not available or processing not yet complete. Please wait..."] * 9
 
     current_date = df.index[-1]
     previous_date = df.index[-2]
@@ -2638,7 +2641,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     # Validate dates exist in the index
     if previous_date not in df.index or current_date not in df.index:
         logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
-        return ["Missing required dates in data. Please reprocess data."] * 10
+        return [no_update] + ["Missing required dates in data. Please reprocess data."] * 9
 
     try:
         # Calculate signals for today based on yesterday's close with validation
@@ -2654,7 +2657,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
-        return ["Error calculating signals. Please check the data."] * 10
+        return [no_update] + ["Error calculating signals. Please check the data."] * 9
 
     # Determine the current trading signal type
     if buy_signal and not short_signal:
@@ -2723,107 +2726,170 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
     daily_top_short_pairs = results.get('daily_top_short_pairs', {})
 
-    # Initialize arrays for combined strategy analysis
-    combined_returns = []
-    daily_returns = df['Close'].pct_change().fillna(0)  # Pre-calculate daily returns
-    combined_trigger_days = 0
-    combined_wins = 0
-    combined_losses = 0
-    all_captures = []  # Store all daily captures for statistical analysis
+    # Extract necessary data
+    buy_pairs = np.array([pair_capture[0] for pair_capture in daily_top_buy_pairs.values()])  # Shape: (num_pairs, 2)
+    short_pairs = np.array([pair_capture[0] for pair_capture in daily_top_short_pairs.values()])  # Shape: (num_pairs, 2)
 
-    for date in df.index[1:]:  # Start from the second day to calculate returns
-        prev_dates = df.index[df.index < date]
-        if not prev_dates.empty:
-            prev_date = prev_dates[-1]  # Get the previous trading day
-        else:
-            continue  # Skip if there is no previous date
-        
-        buy_pair, buy_capture = daily_top_buy_pairs.get(prev_date, ((0, 0), 0))
-        short_pair, short_capture = daily_top_short_pairs.get(prev_date, ((0, 0), 0))
-        
-        # Check if buy_pair and short_pair are valid
-        if buy_pair != (0, 0) or short_pair != (0, 0):
-            # Initialize signals
-            buy_signal = False
-            short_signal = False
-            
-            # Calculate buy_signal if buy_pair is valid
-            if buy_pair != (0, 0) and f'SMA_{buy_pair[0]}' in df.columns and f'SMA_{buy_pair[1]}' in df.columns:
-                buy_signal = df[f'SMA_{buy_pair[0]}'].loc[prev_date] > df[f'SMA_{buy_pair[1]}'].loc[prev_date]
-            
-            # Calculate short_signal if short_pair is valid
-            if short_pair != (0, 0) and f'SMA_{short_pair[0]}' in df.columns and f'SMA_{short_pair[1]}' in df.columns:
-                short_signal = df[f'SMA_{short_pair[0]}'].loc[prev_date] < df[f'SMA_{short_pair[1]}'].loc[prev_date]
-            
-            # Ensure dates exist in 'Close' prices
-            if prev_date in df['Close'] and date in df['Close']:
-                daily_return = df['Close'].loc[date] / df['Close'].loc[prev_date] - 1
-            else:
-                daily_return = 0  # Or handle appropriately
-            
-            combined_return = 0  # Default value
-            
-            if buy_signal and short_signal:
-                if buy_capture > short_capture:
-                    combined_return = daily_return
-                else:
-                    combined_return = -daily_return
-                combined_trigger_days += 1  # Count as trigger day
-            elif buy_signal:
-                combined_return = daily_return
-                combined_trigger_days += 1  # Count as trigger day
-            elif short_signal:
-                combined_return = -daily_return
-                combined_trigger_days += 1  # Count as trigger day
-            else:
-                combined_return = 0
-            
-            # Process wins/losses for any trigger day
-            if combined_trigger_days > combined_wins + combined_losses:
-                if combined_return > 0:
-                    combined_wins += 1
-                else:  # Count zero or negative returns as losses
-                    combined_losses += 1
-            
-            combined_returns.append(combined_return)
+    # Function to safely retrieve SMA column names
+    def get_sma_columns(pairs, pair_type):
+        columns = []
+        for pair in pairs:
+            if len(pair) != 2:
+                logger.error(f"Invalid {pair_type} pair format: {pair}")
+                continue
+            sma1, sma2 = pair
+            col1 = f'SMA_{sma1}'
+            col2 = f'SMA_{sma2}'
+            if col1 not in df.columns or col2 not in df.columns:
+                logger.error(f"Missing SMA columns for {pair_type} pair: {pair}")
+                continue
+            columns.extend([col1, col2])
+        return columns
 
-    # Combined Strategy Performance
-    signals = pd.Series('None', index=df.index[1:])
-    daily_returns = df['Close'].pct_change().loc[df.index[1:]]
+    # Extract SMA column names for buy and short pairs
+    buy_sma_columns = get_sma_columns(buy_pairs, "buy")
+    short_sma_columns = get_sma_columns(short_pairs, "short")
 
-    for date in df.index[1:]:
-        prev_date = df.index[df.index < date][-1]
+    # Ensure unique columns to prevent duplication
+    buy_sma_columns = list(dict.fromkeys(buy_sma_columns))
+    short_sma_columns = list(dict.fromkeys(short_sma_columns))
 
-        buy_pair, buy_capture = daily_top_buy_pairs.get(prev_date, ((0, 0), 0))
-        short_pair, short_capture = daily_top_short_pairs.get(prev_date, ((0, 0), 0))
+    # Define cache path and create cache directory if needed
+    cache_dir = '.sma_cache'
+    os.makedirs(cache_dir, exist_ok=True) 
+    sma_cache_path = os.path.join(cache_dir, f'sma_cache_{ticker}.npz')
 
-        if buy_pair != (0, 0) and short_pair != (0, 0):
-            buy_signal = df[f'SMA_{buy_pair[0]}'].loc[prev_date] > df[f'SMA_{buy_pair[1]}'].loc[prev_date]
-            short_signal = df[f'SMA_{short_pair[0]}'].loc[prev_date] < df[f'SMA_{short_pair[1]}'].loc[prev_date]
+    # Try to load from cache
+    try:
+        if os.path.exists(sma_cache_path):
+            logger.info(f"Loading SMA pairs from cache: {sma_cache_path}")
+            with np.load(sma_cache_path) as data:
+                buy_sma1 = data['buy_sma1']
+                buy_sma2 = data['buy_sma2'] 
+                short_sma1 = data['short_sma1']
+                short_sma2 = data['short_sma2']
 
-            if buy_signal and short_signal:
-                if buy_capture > short_capture:
-                    signal = 'Buy'
-                else:
-                    signal = 'Short'
-            elif buy_signal:
-                signal = 'Buy'
-            elif short_signal:
-                signal = 'Short'
-            else:
-                signal = 'None'
-        else:
-            signal = 'None'
+    except Exception as e:
+        logger.warning(f"Cache load failed: {str(e)}. Computing from scratch.")
 
-        signals.loc[date] = signal
+    # Compute if cache missing or invalid
+    logger.info(f"Computing SMA pairs for {ticker}")
+    # Extract SMA values using vectorized operations
+    if buy_sma_columns:
+        if len(buy_sma_columns) % 2 != 0:
+            buy_sma_columns = buy_sma_columns[:-1]
+        buy_sma1 = df[buy_sma_columns[::2]].values
+        buy_sma2 = df[buy_sma_columns[1::2]].values
+    else:
+        buy_sma1 = np.array([])
+        buy_sma2 = np.array([])
 
-    # Create daily captures
-    daily_captures = pd.Series(0.0, index=signals.index)
-    buy_mask = signals == 'Buy'
-    short_mask = signals == 'Short'
+    if short_sma_columns:
+        if len(short_sma_columns) % 2 != 0:
+            short_sma_columns = short_sma_columns[:-1]
+        short_sma1 = df[short_sma_columns[::2]].values
+        short_sma2 = df[short_sma_columns[1::2]].values
+    else:
+        short_sma1 = np.array([])
+        short_sma2 = np.array([])
 
-    daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-    daily_captures[short_mask] = -daily_returns[short_mask] * 100
+    # Save to cache
+    try:
+        np.savez_compressed(sma_cache_path,
+            buy_sma1=buy_sma1,
+            buy_sma2=buy_sma2, 
+            short_sma1=short_sma1,
+            short_sma2=short_sma2)
+    except Exception as e:
+        logger.warning(f"Cache save failed: {str(e)}")
+
+    # Calculate buy and short signals
+    # Ensure that buy_sma1 and buy_sma2 have the same number of columns
+    if buy_sma1.shape[1] != buy_sma2.shape[1]:
+        logger.error(f"Mismatch in buy SMA pairs: buy_sma1 has {buy_sma1.shape[1]} columns, buy_sma2 has {buy_sma2.shape[1]} columns.")
+        return ["Data integrity issue. Please check the SMA pairing."] * 10
+
+    buy_signals = buy_sma1 > buy_sma2  # Shape: (num_days, num_pairs)
+    short_signals = short_sma1 < short_sma2  # Shape: (num_days, num_pairs)
+
+    # Shift signals by one day to align with returns
+    buy_signals_shifted = np.vstack([np.zeros((1, buy_signals.shape[1]), dtype=bool), buy_signals[:-1]])
+    short_signals_shifted = np.vstack([np.zeros((1, short_signals.shape[1]), dtype=bool), short_signals[:-1]])
+
+    # Calculate daily returns
+    daily_returns = df['Close'].pct_change().fillna(0).astype(np.float32).values  # Shape: (num_days,)
+
+    # Define daily_returns_trimmed to align with boolean masks
+    daily_returns_trimmed = daily_returns[1:]  # Use daily_returns from day 1 to end, length N-1
+
+    # Precompute logical masks to avoid repeated calculations
+    both_signals = buy_signals_shifted.any(axis=1) & short_signals_shifted.any(axis=1)  # Shape: (num_days,)
+    only_buy_signals = buy_signals_shifted.any(axis=1) & ~short_signals_shifted.any(axis=1)  # Shape: (num_days,)
+    only_short_signals = ~buy_signals_shifted.any(axis=1) & short_signals_shifted.any(axis=1)  # Shape: (num_days,)
+
+    # Align the boolean masks with daily_returns_trimmed by removing the first element
+    both_signals = both_signals[1:]          # Shape: (N-1,)
+    only_buy_signals = only_buy_signals[1:]  # Shape: (N-1,)
+    only_short_signals = only_short_signals[1:]  # Shape: (N-1,)
+
+    # Aggregate buy_capture across all pairs to determine per-day action
+    buy_capture_any = buy_capture.any()  # This should be a single boolean value
+
+    # Calculate combined returns using a sign multiplier for improved performance
+    signs = np.zeros_like(daily_returns_trimmed)
+    signs[both_signals] = 1 if buy_capture_any else -1
+    signs[only_buy_signals] = 1
+    signs[only_short_signals] = -1
+    combined_returns = daily_returns_trimmed * signs
+
+    # Validate that combined_returns and boolean masks have the same length
+    if combined_returns.shape[0] != both_signals.shape[0]:
+        logger.error(f"Mismatch in dimensions: combined_returns has length {combined_returns.shape[0]}, but both_signals has length {both_signals.shape[0]}")
+        return ["Data integrity issue. Please check the precomputed results."] * 10
+
+    # Calculate wins and losses
+    combined_wins = np.sum(combined_returns > 0)
+    combined_losses = np.sum(combined_returns <= 0)
+    combined_trigger_days = combined_wins + combined_losses
+
+    # Vectorized determination of signals based on previous day's SMA comparisons
+
+    # Exclude the last row to align with signal shifts
+    buy_signals_prev = buy_signals_shifted[:-1]  # Shape: (num_days-1, num_pairs)
+    short_signals_prev = short_signals_shifted[:-1]
+
+    # Initialize signals array
+    signals = np.full(len(buy_signals_prev), 'None', dtype=object)
+
+    # Create masks for different signal scenarios
+    both_signals_mask = buy_signals_prev.any(axis=1) & short_signals_prev.any(axis=1)  # Shape: (N-2,)
+    only_buy_mask = buy_signals_prev.any(axis=1) & ~short_signals_prev.any(axis=1)  # Shape: (N-2,)
+    only_short_mask = ~buy_signals_prev.any(axis=1) & short_signals_prev.any(axis=1)  # Shape: (N-2,)
+
+    # Apply Buy or Short based on capture comparison where both signals are active
+    signals[both_signals_mask] = np.where(
+        buy_capture_any,
+        'Buy',
+        'Short'
+    )
+
+    # Apply Buy where only buy signals are active
+    signals[only_buy_mask] = 'Buy'
+
+    # Apply Short where only short signals are active
+    signals[only_short_mask] = 'Short'
+
+    # Align signals and daily_returns_trimmed by trimming to the minimum length
+    min_length = min(len(signals), len(daily_returns_trimmed))
+    signals_aligned = signals[:min_length]
+    daily_returns_trimmed_aligned = daily_returns_trimmed[:min_length]
+
+    # Create daily captures with aligned signals and returns
+    daily_captures = np.zeros_like(daily_returns_trimmed_aligned)
+    buy_mask = signals_aligned == 'Buy'
+    short_mask = signals_aligned == 'Short'
+    daily_captures[buy_mask] = daily_returns_trimmed_aligned[buy_mask] * 100
+    daily_captures[short_mask] = -daily_returns_trimmed_aligned[short_mask] * 100
 
     # Calculate metrics
     trigger_days = int((buy_mask | short_mask).sum())
@@ -2841,19 +2907,29 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         degrees_of_freedom = trigger_days - 1
         p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
         
+        # Determine significance levels
+        confidence_levels = {
+            '90%': p_value < 0.10,
+            '95%': p_value < 0.05,
+            '99%': p_value < 0.01
+        }
+        
         # Log statistical significance results
         logger.info("\nStatistical Significance Analysis:")
         logger.info(f"t-Statistic: {t_statistic:.4f}")
         logger.info(f"p-Value: {p_value:.4f}")
         logger.info(f"Degrees of Freedom: {degrees_of_freedom}")
         logger.info("Confidence Levels:")
-        logger.info(f"  90% (p < 0.10): {'Significant' if p_value < 0.10 else 'Not Significant'}")
-        logger.info(f"  95% (p < 0.05): {'Significant' if p_value < 0.05 else 'Not Significant'}")
-        logger.info(f"  99% (p < 0.01): {'Significant' if p_value < 0.01 else 'Not Significant'}\n")
+        for level, significant in confidence_levels.items():
+            status = 'Significant' if significant else 'Not Significant'
+            logger.info(f"  {level} Confidence: {status}")
+        logger.info("\n")  # Add line break
     else:
         t_statistic = None
         p_value = None
-        
+        logger.info("\nStatistical Significance Analysis:")
+        logger.info("Insufficient data to perform statistical significance analysis.\n")
+
     # Calculate annualized Sharpe Ratio
     if trigger_days > 0 and std_dev != 0:
         annualized_return = avg_daily_capture * 252
@@ -2979,8 +3055,8 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             html.Div([
                 html.H4("1. Summary of Top Performing Pairs", className="mb-3"),
-                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture * 100:.4f}%)", className="mb-2"),
-                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture * 100:.4f}%)", className="mb-2"),
+                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture:.4f}%)", className="mb-2"),
+                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture:.4f}%)", className="mb-2"),
             ], className="mb-4"),
             
             html.Div([
@@ -3004,12 +3080,22 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             
             html.Div([
                 html.H4("3. Trading Signals", className="mb-3"),
-                html.P(f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
-                       f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" if trading_signal_type == "Buy" else 
-                       f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})", className="mb-2"),
-                html.P(f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
-                       f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" if next_trading_signal_type == "Buy" else 
-                       f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})", className="mb-2"),
+                html.P(
+                    f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
+                    f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" 
+                    if trading_signal_type == "Buy" else 
+                    f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
+                    f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})",
+                    className="mb-2"
+                ),
+                html.P(
+                    f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
+                    f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" 
+                    if next_trading_signal_type == "Buy" else 
+                    f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
+                    f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})",
+                    className="mb-2"
+                ),
             ], className="mb-4"),
             
             html.Div([
