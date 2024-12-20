@@ -865,14 +865,16 @@ def precompute_results(ticker, event):
                     for day_idx in range(len(dates)):
                         # Buy
                         max_buy_val = np.max(buy_captures[day_idx])
-                        max_buy_idx = np.argmax(buy_captures[day_idx])
+                        # Reverse priority in case of ties
+                        max_buy_idx = len(buy_captures[day_idx]) - 1 - np.argmax(buy_captures[day_idx][::-1])
                         current_buy_pair = tuple(chunk_pairs[max_buy_idx])
                         if dates[day_idx] not in daily_top_buy_pairs or max_buy_val > daily_top_buy_pairs[dates[day_idx]][1]:
                             daily_top_buy_pairs[dates[day_idx]] = (current_buy_pair, float(max_buy_val))
 
                         # Short
                         max_short_val = np.max(short_captures[day_idx])
-                        max_short_idx = np.argmax(short_captures[day_idx])
+                        # Reverse priority in case of ties
+                        max_short_idx = len(short_captures[day_idx]) - 1 - np.argmax(short_captures[day_idx][::-1])
                         current_short_pair = tuple(chunk_pairs[max_short_idx])
                         if dates[day_idx] not in daily_top_short_pairs or max_short_val > daily_top_short_pairs[dates[day_idx]][1]:
                             daily_top_short_pairs[dates[day_idx]] = (current_short_pair, float(max_short_val))
@@ -2644,13 +2646,13 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         return [no_update] + ["Missing required dates in data. Please reprocess data."] * 9
 
     try:
-        # Calculate signals for today based on yesterday's close with validation
+        # Calculate signals for today based on yesterday's close
         buy_signal = (sma1_buy_leader.loc[previous_date] > sma2_buy_leader.loc[previous_date]) if all(
             pd.notna([sma1_buy_leader.loc[previous_date], sma2_buy_leader.loc[previous_date]])) else False
         short_signal = (sma1_short_leader.loc[previous_date] < sma2_short_leader.loc[previous_date]) if all(
             pd.notna([sma1_short_leader.loc[previous_date], sma2_short_leader.loc[previous_date]])) else False
 
-        # Calculate signals for tomorrow based on today's close with validation
+        # Calculate signals for tomorrow based on today's close
         next_buy_signal = (sma1_buy_leader.loc[current_date] > sma2_buy_leader.loc[current_date]) if all(
             pd.notna([sma1_buy_leader.loc[current_date], sma2_buy_leader.loc[current_date]])) else False
         next_short_signal = (sma1_short_leader.loc[current_date] < sma2_short_leader.loc[current_date]) if all(
@@ -2683,31 +2685,25 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     most_productive_buy_pair_text = f"Most Productive Buy Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}"
     most_productive_short_pair_text = f"Most Productive Short Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}"
 
-    # Calculate buy returns on days when buy signal was active
+    # Buy metrics
     buy_signals_shifted = buy_signals_leader.shift(1, fill_value=False)
     buy_returns_on_trigger_days = close_pct_change[buy_signals_shifted]
     buy_trigger_days = np.sum(buy_signals_shifted)
-
-    # Calculate wins and losses for buy signals
     buy_wins = np.sum(buy_returns_on_trigger_days > 0)
-    buy_losses = np.sum(buy_returns_on_trigger_days <= 0)  # Includes zero returns as losses
+    buy_losses = np.sum(buy_returns_on_trigger_days <= 0)
     buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    # Calculate buy metrics with corrected percentages
-    avg_capture_buy = np.mean(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0  # Convert each return to percentage first
-    buy_capture = np.sum(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0  # Convert each return to percentage first
+    avg_capture_buy = np.mean(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0
+    buy_capture = np.sum(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0
 
-    # Calculate short returns on days when short signal was active
+    # Short metrics
     short_signals_shifted = short_signals_leader.shift(1, fill_value=False)
     short_returns_on_trigger_days = -close_pct_change[short_signals_shifted]
     short_trigger_days = np.sum(short_signals_shifted)
-
-    # Calculate wins and losses for short signals
     short_wins = np.sum(short_returns_on_trigger_days > 0)
-    short_losses = np.sum(short_returns_on_trigger_days <= 0)  # Includes zero returns as losses
+    short_losses = np.sum(short_returns_on_trigger_days <= 0)
     short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    # Calculate short metrics with corrected percentages
-    avg_capture_short = np.mean(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0  # Convert each return to percentage first
-    short_capture = np.sum(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0  # Convert each return to percentage first
+    avg_capture_short = np.mean(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0
+    short_capture = np.sum(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0
 
     avg_capture_buy_leader = (
         f"Avg. Daily Capture % for Buy Leader: {avg_capture_buy:.4f}% "
@@ -2722,226 +2718,133 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_capture:.4f}%"
     total_capture_short_leader = f"Total Capture for Short Leader: {short_capture:.4f}%"
 
-    # Calculate combined strategy performance
+    # Recalculate the dynamic cumulative performance for combined strategy
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
     daily_top_short_pairs = results.get('daily_top_short_pairs', {})
 
-    # Extract necessary data
-    buy_pairs = np.array([pair_capture[0] for pair_capture in daily_top_buy_pairs.values()])  # Shape: (num_pairs, 2)
-    short_pairs = np.array([pair_capture[0] for pair_capture in daily_top_short_pairs.values()])  # Shape: (num_pairs, 2)
-
-    # Function to safely retrieve SMA column names
-    def get_sma_columns(pairs, pair_type):
-        columns = []
-        for pair in pairs:
-            if len(pair) != 2:
-                logger.error(f"Invalid {pair_type} pair format: {pair}")
-                continue
-            sma1, sma2 = pair
-            col1 = f'SMA_{sma1}'
-            col2 = f'SMA_{sma2}'
-            if col1 not in df.columns or col2 not in df.columns:
-                logger.error(f"Missing SMA columns for {pair_type} pair: {pair}")
-                continue
-            columns.extend([col1, col2])
-        return columns
-
-    # Extract SMA column names for buy and short pairs
-    buy_sma_columns = get_sma_columns(buy_pairs, "buy")
-    short_sma_columns = get_sma_columns(short_pairs, "short")
-
-    # Ensure unique columns to prevent duplication
-    buy_sma_columns = list(dict.fromkeys(buy_sma_columns))
-    short_sma_columns = list(dict.fromkeys(short_sma_columns))
-
-    # Define cache path and create cache directory if needed
-    cache_dir = '.sma_cache'
-    os.makedirs(cache_dir, exist_ok=True) 
-    sma_cache_path = os.path.join(cache_dir, f'sma_cache_{ticker}.npz')
-
-    # Try to load from cache
-    try:
-        if os.path.exists(sma_cache_path):
-            logger.info(f"Loading SMA pairs from cache: {sma_cache_path}")
-            with np.load(sma_cache_path) as data:
-                buy_sma1 = data['buy_sma1']
-                buy_sma2 = data['buy_sma2'] 
-                short_sma1 = data['short_sma1']
-                short_sma2 = data['short_sma2']
-
-    except Exception as e:
-        logger.warning(f"Cache load failed: {str(e)}. Computing from scratch.")
-
-    # Compute if cache missing or invalid
-    logger.info(f"Computing SMA pairs for {ticker}")
-    # Extract SMA values using vectorized operations
-    if buy_sma_columns:
-        if len(buy_sma_columns) % 2 != 0:
-            buy_sma_columns = buy_sma_columns[:-1]
-        buy_sma1 = df[buy_sma_columns[::2]].values
-        buy_sma2 = df[buy_sma_columns[1::2]].values
-    else:
-        buy_sma1 = np.array([])
-        buy_sma2 = np.array([])
-
-    if short_sma_columns:
-        if len(short_sma_columns) % 2 != 0:
-            short_sma_columns = short_sma_columns[:-1]
-        short_sma1 = df[short_sma_columns[::2]].values
-        short_sma2 = df[short_sma_columns[1::2]].values
-    else:
-        short_sma1 = np.array([])
-        short_sma2 = np.array([])
-
-    # Save to cache
-    try:
-        np.savez_compressed(sma_cache_path,
-            buy_sma1=buy_sma1,
-            buy_sma2=buy_sma2, 
-            short_sma1=short_sma1,
-            short_sma2=short_sma2)
-    except Exception as e:
-        logger.warning(f"Cache save failed: {str(e)}")
-
-    # Calculate buy and short signals
-    # Ensure that buy_sma1 and buy_sma2 have the same number of columns
-    if buy_sma1.shape[1] != buy_sma2.shape[1]:
-        logger.error(f"Mismatch in buy SMA pairs: buy_sma1 has {buy_sma1.shape[1]} columns, buy_sma2 has {buy_sma2.shape[1]} columns.")
-        return ["Data integrity issue. Please check the SMA pairing."] * 10
-
-    buy_signals = buy_sma1 > buy_sma2  # Shape: (num_days, num_pairs)
-    short_signals = short_sma1 < short_sma2  # Shape: (num_days, num_pairs)
-
-    # Shift signals by one day to align with returns
-    buy_signals_shifted = np.vstack([np.zeros((1, buy_signals.shape[1]), dtype=bool), buy_signals[:-1]])
-    short_signals_shifted = np.vstack([np.zeros((1, short_signals.shape[1]), dtype=bool), short_signals[:-1]])
-
-    # Calculate daily returns
-    daily_returns = df['Close'].pct_change().fillna(0).astype(np.float32).values  # Shape: (num_days,)
-
-    # Define daily_returns_trimmed to align with boolean masks
-    daily_returns_trimmed = daily_returns[1:]  # Use daily_returns from day 1 to end, length N-1
-
-    # Precompute logical masks to avoid repeated calculations
-    both_signals = buy_signals_shifted.any(axis=1) & short_signals_shifted.any(axis=1)  # Shape: (num_days,)
-    only_buy_signals = buy_signals_shifted.any(axis=1) & ~short_signals_shifted.any(axis=1)  # Shape: (num_days,)
-    only_short_signals = ~buy_signals_shifted.any(axis=1) & short_signals_shifted.any(axis=1)  # Shape: (num_days,)
-
-    # Align the boolean masks with daily_returns_trimmed by removing the first element
-    both_signals = both_signals[1:]          # Shape: (N-1,)
-    only_buy_signals = only_buy_signals[1:]  # Shape: (N-1,)
-    only_short_signals = only_short_signals[1:]  # Shape: (N-1,)
-
-    # Aggregate buy_capture across all pairs to determine per-day action
-    buy_capture_any = buy_capture.any()  # This should be a single boolean value
-
-    # Calculate combined returns using a sign multiplier for improved performance
-    signs = np.zeros_like(daily_returns_trimmed)
-    signs[both_signals] = 1 if buy_capture_any else -1
-    signs[only_buy_signals] = 1
-    signs[only_short_signals] = -1
-    combined_returns = daily_returns_trimmed * signs
-
-    # Validate that combined_returns and boolean masks have the same length
-    if combined_returns.shape[0] != both_signals.shape[0]:
-        logger.error(f"Mismatch in dimensions: combined_returns has length {combined_returns.shape[0]}, but both_signals has length {both_signals.shape[0]}")
-        return ["Data integrity issue. Please check the precomputed results."] * 10
-
-    # Calculate wins and losses
-    combined_wins = np.sum(combined_returns > 0)
-    combined_losses = np.sum(combined_returns <= 0)
-    combined_trigger_days = combined_wins + combined_losses
-
-    # Vectorized determination of signals based on previous day's SMA comparisons
-
-    # Exclude the last row to align with signal shifts
-    buy_signals_prev = buy_signals_shifted[:-1]  # Shape: (num_days-1, num_pairs)
-    short_signals_prev = short_signals_shifted[:-1]
-
-    # Initialize signals array
-    signals = np.full(len(buy_signals_prev), 'None', dtype=object)
-
-    # Create masks for different signal scenarios
-    both_signals_mask = buy_signals_prev.any(axis=1) & short_signals_prev.any(axis=1)  # Shape: (N-2,)
-    only_buy_mask = buy_signals_prev.any(axis=1) & ~short_signals_prev.any(axis=1)  # Shape: (N-2,)
-    only_short_mask = ~buy_signals_prev.any(axis=1) & short_signals_prev.any(axis=1)  # Shape: (N-2,)
-
-    # Apply Buy or Short based on capture comparison where both signals are active
-    signals[both_signals_mask] = np.where(
-        buy_capture_any,
-        'Buy',
-        'Short'
-    )
-
-    # Apply Buy where only buy signals are active
-    signals[only_buy_mask] = 'Buy'
-
-    # Apply Short where only short signals are active
-    signals[only_short_mask] = 'Short'
-
-    # Align signals and daily_returns_trimmed by trimming to the minimum length
-    min_length = min(len(signals), len(daily_returns_trimmed))
-    signals_aligned = signals[:min_length]
-    daily_returns_trimmed_aligned = daily_returns_trimmed[:min_length]
-
-    # Create daily captures with aligned signals and returns
-    daily_captures = np.zeros_like(daily_returns_trimmed_aligned)
-    buy_mask = signals_aligned == 'Buy'
-    short_mask = signals_aligned == 'Short'
-    daily_captures[buy_mask] = daily_returns_trimmed_aligned[buy_mask] * 100
-    daily_captures[short_mask] = -daily_returns_trimmed_aligned[short_mask] * 100
-
-    # Calculate metrics
-    trigger_days = int((buy_mask | short_mask).sum())
-    signal_captures = daily_captures[buy_mask | short_mask]
-    wins = int((signal_captures > 0).sum())
-    losses = trigger_days - wins
-    win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-    avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0
-    total_capture = signal_captures.sum() if trigger_days > 0 else 0
-    std_dev = signal_captures.std() if trigger_days > 0 else 0
-
-    # Calculate statistical significance
-    if trigger_days > 1 and std_dev > 0:
-        t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-        degrees_of_freedom = trigger_days - 1
-        p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-        
-        # Determine significance levels
-        confidence_levels = {
-            '90%': p_value < 0.10,
-            '95%': p_value < 0.05,
-            '99%': p_value < 0.01
-        }
-        
-        # Log statistical significance results
-        logger.info("\nStatistical Significance Analysis:")
-        logger.info(f"t-Statistic: {t_statistic:.4f}")
-        logger.info(f"p-Value: {p_value:.4f}")
-        logger.info(f"Degrees of Freedom: {degrees_of_freedom}")
-        logger.info("Confidence Levels:")
-        for level, significant in confidence_levels.items():
-            status = 'Significant' if significant else 'Not Significant'
-            logger.info(f"  {level} Confidence: {status}")
-        logger.info("\n")  # Add line break
-    else:
+    dates = sorted(set(daily_top_buy_pairs.keys()) & set(daily_top_short_pairs.keys()))
+    if not dates:
+        total_capture = 0
+        avg_daily_capture = 0
+        trigger_days = 0
+        wins = 0
+        losses = 0
+        win_ratio = 0
+        std_dev = 0
         t_statistic = None
         p_value = None
-        logger.info("\nStatistical Significance Analysis:")
-        logger.info("Insufficient data to perform statistical significance analysis.\n")
-
-    # Calculate annualized Sharpe Ratio
-    if trigger_days > 0 and std_dev != 0:
-        annualized_return = avg_daily_capture * 252
-        annualized_std = std_dev * np.sqrt(252)
-        sharpe_ratio = (annualized_return - 5.0) / annualized_std  # Using annual 5% risk-free rate
-    else:
         sharpe_ratio = 0
-        
-    # Calculate combined win ratio
-    combined_win_ratio = combined_wins / combined_trigger_days if combined_trigger_days > 0 else 0
+    else:
+        daily_returns_series = df['Close'].pct_change().fillna(0)
+        cumulative_captures = []
+        current_capture = 0
+        active_signals = []
 
-    # Performance expectation (using the next trading signal)
+        for i in range(1, len(dates)):
+            prev_day = dates[i-1]
+            current_day = dates[i]
+
+            prev_buy_pair, prev_buy_cap = daily_top_buy_pairs[prev_day]
+            prev_short_pair, prev_short_cap = daily_top_short_pairs[prev_day]
+
+            if (prev_buy_pair != (0,0)) and (prev_short_pair != (0,0)):
+                buy_signal = df[f'SMA_{prev_buy_pair[0]}'].loc[prev_day] > df[f'SMA_{prev_buy_pair[1]}'].loc[prev_day]
+                short_signal = df[f'SMA_{prev_short_pair[0]}'].loc[prev_day] < df[f'SMA_{prev_short_pair[1]}'].loc[prev_day]
+
+                if buy_signal and short_signal:
+                    if prev_buy_cap > prev_short_cap:
+                        current_position = 'Buy'
+                    else:
+                        current_position = 'Short'
+                elif buy_signal:
+                    current_position = 'Buy'
+                elif short_signal:
+                    current_position = 'Short'
+                else:
+                    current_position = 'None'
+            elif (prev_buy_pair != (0,0)):
+                buy_signal = df[f'SMA_{prev_buy_pair[0]}'].loc[prev_day] > df[f'SMA_{prev_buy_pair[1]}'].loc[prev_day]
+                current_position = 'Buy' if buy_signal else 'None'
+            elif (prev_short_pair != (0,0)):
+                short_signal = df[f'SMA_{prev_short_pair[0]}'].loc[prev_day] < df[f'SMA_{prev_short_pair[1]}'].loc[prev_day]
+                current_position = 'Short' if short_signal else 'None'
+            else:
+                current_position = 'None'
+
+            daily_return = daily_returns_series.loc[current_day]
+            if current_position == 'Buy':
+                daily_capture = daily_return * 100
+            elif current_position == 'Short':
+                daily_capture = -daily_return * 100
+            else:
+                daily_capture = 0
+
+            current_capture += daily_capture
+            cumulative_captures.append(daily_capture)
+            active_signals.append(current_position)
+
+        if len(cumulative_captures) > 0:
+            # Revised snippet to properly count trigger days (including zero-capture days as losses) and ensure consistency:
+
+            # Determine triggered days based on active_signals rather than capture values
+            trigger_mask = [sig in ('Buy', 'Short') for sig in active_signals]
+            trigger_days = sum(trigger_mask)
+
+            # Extract signal_captures only for triggered days, including zero captures
+            signal_captures = np.array([cap for cap, active_sig in zip(cumulative_captures, active_signals) if active_sig in ('Buy', 'Short')])
+
+            wins = np.sum(signal_captures > 0)
+            losses = np.sum(signal_captures <= 0)  # zero captures count as losses here
+            win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
+            avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0
+            total_capture = signal_captures.sum() if trigger_days > 0 else 0
+            std_dev = signal_captures.std() if trigger_days > 0 else 0
+
+            if trigger_days > 1 and std_dev > 0:
+                t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+                degrees_of_freedom = trigger_days - 1
+                p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+                confidence_levels = {
+                    '90%': p_value < 0.10,
+                    '95%': p_value < 0.05,
+                    '99%': p_value < 0.01
+                }
+                logger.info("\nStatistical Significance Analysis:")
+                logger.info(f"t-Statistic: {t_statistic:.4f}")
+                logger.info(f"p-Value: {p_value:.4f}")
+                logger.info(f"Degrees of Freedom: {degrees_of_freedom}")
+                logger.info("Confidence Levels:")
+                for level, significant in confidence_levels.items():
+                    status = 'Significant' if significant else 'Not Significant'
+                    logger.info(f"  {level} Confidence: {status}")
+                logger.info("\n")
+            else:
+                t_statistic = None
+                p_value = None
+                logger.info("\nStatistical Significance Analysis:")
+                logger.info("Insufficient data to perform statistical significance analysis.\n")
+
+            if trigger_days > 0 and std_dev != 0:
+                annualized_return = avg_daily_capture * 252
+                annualized_std = std_dev * np.sqrt(252)
+                sharpe_ratio = (annualized_return - 5.0) / annualized_std
+            else:
+                sharpe_ratio = 0
+        else:
+            total_capture = 0
+            avg_daily_capture = 0
+            trigger_days = 0
+            wins = 0
+            losses = 0
+            win_ratio = 0
+            std_dev = 0
+            t_statistic = None
+            p_value = None
+            sharpe_ratio = 0
+
+    # Remove any references to combined_* variables.
+    # Use trigger_days, wins, losses directly in output.
+
     if next_trading_signal_type == "Buy":
         active_returns = buy_returns_on_trigger_days
     elif next_trading_signal_type == "Short":
@@ -2966,12 +2869,10 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     def find_crossing_price(n1, n2):
         if n1 == n2:
-            return None  # Cannot compute crossing price when periods are equal
-        # Ensure there is enough data
+            return None
         min_length = max(n1, n2)
         if len(df) < min_length:
-            return None  # Not enough data to compute SMAs
-        # Sum of the previous (n1 - 1) closing prices, excluding the current price
+            return None
         sum1 = df['Close'].iloc[-(n1):-1].sum()
         sum2 = df['Close'].iloc[-(n2):-1].sum()
         numerator = n1 * sum2 - n2 * sum1
@@ -2981,28 +2882,20 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         crossing_price = numerator / denominator
         return crossing_price if crossing_price > 0 and np.isfinite(crossing_price) else None
 
-    # Calculate crossing prices
     crossing_price_buy = find_crossing_price(top_buy_pair[0], top_buy_pair[1])
     crossing_price_short = find_crossing_price(top_short_pair[0], top_short_pair[1])
 
-    # Get current price and set a reasonable upper bound
     current_price = df['Close'].iloc[-1]
-    max_price = current_price * 1.5  # Adjust this multiplier as needed
-
-    # Create price points
+    max_price = current_price * 1.5
     price_points = []
     if crossing_price_buy is not None and crossing_price_buy > 0:
         price_points.append(crossing_price_buy)
     if crossing_price_short is not None and crossing_price_short > 0:
         price_points.append(crossing_price_short)
-    # Include the current price
     price_points.append(current_price)
-    # Remove duplicates and sort
     price_points = sorted(set(price_points))
-    # Ensure 0 is included if not already
     if 0 not in price_points:
         price_points.insert(0, 0)
-    # Add a reasonable upper bound
     price_points.append(max_price)
 
     price_ranges = []
@@ -3011,16 +2904,13 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         high = price_points[i + 1]
         if high > low:
             price_ranges.append({'low': low, 'high': high})
-    # Add the last range if needed
     if price_points[-1] < float('inf'):
         price_ranges.append({'low': price_points[-1], 'high': float('inf')})
 
-    # Predict signals for each price range
     predictions = []
     for pr in price_ranges:
         low = pr['low']
         high = pr['high']
-        # Choose a sample price slightly above the low to avoid edge cases
         sample_price = low + (high - low) * 0.01 if high != float('inf') else low * 1.01
         signal, active_pair = predict_signal(sample_price)
         recommendations = {
@@ -3030,7 +2920,6 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         }
         recommendation = recommendations.get(signal, 'Hold Cash')
         price_range_str = f"${low:.2f} - ${high:.2f}" if high != float('inf') else f"${low:.2f} and above"
-        # Format signal with SMA pair numbers
         if signal in ['Buy', 'Short']:
             signal_display = f"{signal} ({top_buy_pair[0]},{top_buy_pair[1]})" if signal == 'Buy' else f"{signal} ({top_short_pair[0]},{top_short_pair[1]})"
         else:
@@ -3043,11 +2932,10 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             'recommendation': recommendation
         })
 
-    # Only log predictions once after all are generated
     log_section("Forecast Recommendations")
     for pred in predictions:
         logger.info(f"Range: {pred['price_range']}, Signal: {pred['signal']}, Recommendation: {pred['recommendation']}")
-    logger.info("\n")  # Add two line breaks
+    logger.info("\n")
 
     trading_recommendations = [
         html.Div([
@@ -3118,9 +3006,10 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                             style={'color': 'green' if p_value is not None and p_value < 0.01 else 'red'}),
                     ], className="mb-2"),
                 ], className="mb-3"),
-                html.P(f"Trigger Days: {combined_trigger_days:,}", className="mb-1"),
-                html.P(f"Wins: {combined_wins:,}", className="mb-1"),
-                html.P(f"Losses: {combined_losses:,}", className="mb-1"),
+                # Use trigger_days, wins, losses directly
+                html.P(f"Trigger Days: {trigger_days:,}", className="mb-1"),
+                html.P(f"Wins: {wins:,}", className="mb-1"),
+                html.P(f"Losses: {losses:,}", className="mb-1"),
                 html.P(f"Win Ratio: {win_ratio:.2f}%", className="mb-1"),
             ], className="mb-4"),
             
