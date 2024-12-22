@@ -2784,26 +2784,38 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             active_signals.append(current_position)
 
         if len(cumulative_captures) > 0:
-            # Revised snippet to properly count trigger days (including zero-capture days as losses) and ensure consistency:
-
-            # Determine triggered days based on active_signals rather than capture values
+            # Create signal mask excluding first day (to match the shifted signals approach)
             trigger_mask = [sig in ('Buy', 'Short') for sig in active_signals]
             trigger_days = sum(trigger_mask)
 
-            # Extract signal_captures only for triggered days, including zero captures
-            signal_captures = np.array([cap for cap, active_sig in zip(cumulative_captures, active_signals) if active_sig in ('Buy', 'Short')])
+            # Extract signal_captures only for triggered days
+            signal_captures = np.array([
+                cap for cap, active_sig in zip(cumulative_captures, active_signals)
+                if active_sig in ('Buy', 'Short')
+            ])
 
-            wins = np.sum(signal_captures > 0)
-            losses = np.sum(signal_captures <= 0)  # zero captures count as losses here
-            win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-            avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0
-            total_capture = signal_captures.sum() if trigger_days > 0 else 0
-            std_dev = signal_captures.std() if trigger_days > 0 else 0
+            if signal_captures.size > 0:
+                wins = np.sum(signal_captures > 0)
+                losses = trigger_days - wins  # Ensure wins + losses equals trigger days
+                win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0.0
+                avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0.0
+                total_capture = signal_captures.sum() if trigger_days > 0 else 0.0
 
-            if trigger_days > 1 and std_dev > 0:
-                t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
+                # Calculate standard deviation using ddof=1 for sample standard deviation
+                if trigger_days > 1:
+                    std_dev = np.std(signal_captures, ddof=1)
+                else:
+                    std_dev = 0.0
+            else:
+                wins = losses = 0
+                win_ratio = avg_daily_capture = total_capture = std_dev = 0.0
+
+            # t-Statistic & p-value
+            if trigger_days > 1 and std_dev != 0:
+                t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
                 degrees_of_freedom = trigger_days - 1
                 p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+
                 confidence_levels = {
                     '90%': p_value < 0.10,
                     '95%': p_value < 0.05,
@@ -2824,26 +2836,27 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                 logger.info("\nStatistical Significance Analysis:")
                 logger.info("Insufficient data to perform statistical significance analysis.\n")
 
-            if trigger_days > 0 and std_dev != 0:
+            # Annualized Sharpe Ratio logic consistent with other sections
+            risk_free_rate = 5.0
+            if trigger_days > 1 and std_dev != 0:
                 annualized_return = avg_daily_capture * 252
                 annualized_std = std_dev * np.sqrt(252)
-                sharpe_ratio = (annualized_return - 5.0) / annualized_std
+                sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std
             else:
-                sharpe_ratio = 0
+                sharpe_ratio = 0.0
+
         else:
-            total_capture = 0
-            avg_daily_capture = 0
+            # No captures at all
+            total_capture = 0.0
+            avg_daily_capture = 0.0
             trigger_days = 0
             wins = 0
             losses = 0
-            win_ratio = 0
-            std_dev = 0
+            win_ratio = 0.0
+            std_dev = 0.0
             t_statistic = None
             p_value = None
-            sharpe_ratio = 0
-
-    # Remove any references to combined_* variables.
-    # Use trigger_days, wins, losses directly in output.
+            sharpe_ratio = 0.0
 
     if next_trading_signal_type == "Buy":
         active_returns = buy_returns_on_trigger_days
