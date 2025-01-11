@@ -3452,30 +3452,46 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 wins = int((signal_captures > 0).sum())
                 losses = trigger_days - wins
                 win_ratio = round((wins / trigger_days * 100), 2) if trigger_days > 0 else 0.0
-                avg_daily_capture = round(signal_captures.mean(), 4) if trigger_days > 0 else 0.0
-                total_capture = round(cumulative_captures.iloc[-1], 4) if not cumulative_captures.empty else 0.0
 
-                std_dev = round(signal_captures.std(), 4) if trigger_days > 0 else 0.0
-                risk_free_rate = 5.0  # 5% annual rate
-                daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
-                sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
-                
-                # Calculate statistical significance
-                if trigger_days > 1 and std_dev > 0:
-                    t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-                    degrees_of_freedom = trigger_days - 1
-                    p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-                    t_statistic = round(t_statistic, 4)
-                    p_value = round(p_value, 4)
+                # Compute raw (unrounded) values for the captures:
+                raw_avg_daily = signal_captures.mean() if trigger_days > 0 else 0.0
+                raw_total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0.0
+
+                # Compute standard deviation with ddof=1 for sample std if we have more than 1 trigger day:
+                raw_std_dev = signal_captures.std(ddof=1) if trigger_days > 1 else 0.0
+
+                # Sharpe ratio logic (annualized), using raw values first:
+                risk_free_rate = 5.0  # 5% annual
+                annualized_return = raw_avg_daily * 252
+                annualized_std = raw_std_dev * np.sqrt(252) if raw_std_dev > 0 else 0.0
+                raw_sharpe = 0.0
+                if annualized_std > 0:
+                    raw_sharpe = (annualized_return - risk_free_rate) / annualized_std
+
+                # Calculate t-stat and p-value with raw values:
+                if trigger_days > 1 and raw_std_dev > 0:
+                    t_statistic_val = raw_avg_daily / (raw_std_dev / np.sqrt(trigger_days))
+                    dfreedom = trigger_days - 1
+                    p_val = 2 * (1 - stats.t.cdf(abs(t_statistic_val), df=dfreedom))
+                    # Now round:
+                    t_statistic = round(t_statistic_val, 4)
+                    p_value = round(p_val, 4)
                 else:
                     t_statistic = None
                     p_value = None
+
+                # Finally, round or format the metrics for display:
+                avg_daily_capture = round(raw_avg_daily, 4)
+                total_capture = round(raw_total_capture, 4)
+                std_dev = round(raw_std_dev, 4)
+                sharpe_ratio = round(raw_sharpe, 2)
+
                 metrics.update({
                     'Wins': wins,
                     'Losses': losses,
                     'Win Ratio (%)': win_ratio,
                     'Std Dev (%)': std_dev,
-                    'Sharpe Ratio': round(sharpe_ratio, 2),
+                    'Sharpe Ratio': sharpe_ratio,
                     't-Statistic': t_statistic if t_statistic is not None else 'N/A',
                     'p-Value': p_value if p_value is not None else 'N/A',
                     'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
@@ -3486,8 +3502,11 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 })
             else:
                 metrics.update({
-                    'Wins': 0, 'Losses': 0, 'Win Ratio (%)': 0.0,
-                    'Avg Daily Capture (%)': 0.0, 'Total Capture (%)': 0.0
+                    'Wins': 0,
+                    'Losses': 0,
+                    'Win Ratio (%)': 0.0,
+                    'Avg Daily Capture (%)': 0.0,
+                    'Total Capture (%)': 0.0
                 })
 
             metrics_list.append(metrics)
