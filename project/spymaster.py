@@ -1043,8 +1043,66 @@ app.layout = html.Div(
         'font-family': 'Impact, sans-serif'
     },
     children=[
-        html.H1('Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework', className='text-center mt-3'),
+        # Header of the app
+        html.H1(
+            'Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework', 
+            className='text-center mt-3'
+        ),
+        # Help button and modal for step-by-step guidance (using dbc.Modal)
+        dbc.Button("Help", id="help-button", color="info", className="mb-3"),
+        dbc.Modal(
+            [
+                dbc.ModalHeader("Understanding the Trading App - A Fisherman's Guide to Signal Mining"),
+                dbc.ModalBody(
+                    [
+                        html.P("This app is an exploratory tool for discovering statistical relationships between securities (and themselves) using adaptive moving average signals."),
+                        html.H5("Getting Started:"),
+                        html.P([
+                            "1. Begin with impactsearch.py ",
+                            html.A("http://127.0.0.1:8051/", href="http://127.0.0.1:8051/", target="_blank"),
+                            " to identify potential statistical relationships between tickers (You'll have to make sure the script is running in a separate console). Ensure that the Secondary Ticker you enter is the ticker that you are investigating. All of the Primary Tickers that you enter will have the results of their trading signals being sent to the Secondary Ticker. You can enter as many Primary Tickers as you want. The more the better to find the strongest connections and predictible impact on your Secondary Ticker. When the processing is complete, you will find a .xlsx file in the project folder for you to sort through. Take a list of approximately 5 of the most positive and 5 of the most negative impacts on your Secondary Ticker with you to the next step."
+                        ]),
+                        html.H5("2. Core Workflow Example (S&P 500 Study):"),
+                        html.Ul([
+                            html.Li("Use the Ticker Batch Process to input your list of tickers from the impactsearch.py results."),
+                            html.Li("In the Automated Signal Optimization Ssection, enter your same list of tickers (if you don't use the Ticker Batch Process first, you'll run into some annoying issues). Then enter your target Secondary Ticker in the Enter Secondary Ticker input field. Hit Optimize Signals and wait for the process to complete."),
+                            html.Li("Look for combinations showing strong statistical significance. Use the carrots to sort the columns and find the best combinations. Note that you can only sort all available rows when you are on the first page of the results -- sorting results on any other page simply sorts the results of that given page."),
+                            html.Li("Find a build that you would like to investigate and verify by clicking the cell containing the ticker combination. This will auto-populate the Multi-Primary Signal Aggregator section above."),
+                            html.Li("From here you have multiple options. You can enter your secondary ticker in the secondary ticker field but you can also enter multiple secondary tickers. If you are curious about your build and it's impact on a wide range of tickers, input your universe of tickers (e.g., 1,500+ symbols) in the Secondary field."),
+                            html.Li("Process time: ~12 minutes for 1,500 tickers."),
+                            html.Li("Mine the results for high/low Sharpe Ratios and examine the metrics. Trading decisions should be based on statistical significance and not just the highest Sharpe Ratio. At a minimum, a 90 percent significance should be observed (up for debate)"),
+                        ]),
+                        html.H5("3. Critical Metrics Assessment:"),
+                        html.Ul([
+                            html.Li("Trigger Days: Below 30 typically indicates insufficient sample size."),
+                            html.Li("Win/Loss Ratio: Consider in context with trigger day count."),
+                            html.Li("Sharpe Ratio: Key performance indicator, but verify sample size."),
+                            html.Li("Statistical Significance: Check p-values and confidence levels."),
+                            html.Li("Total Capture: Evaluate alongside other metrics.")
+                        ]),
+                        html.H5("Key Principles:"),
+                        html.Ul([
+                            html.Li("Trade on Statistics, Not Emotion."),
+                            html.Li("Question Results That Seem Too Good."),
+                            html.Li("Verify Findings Using Multiple App Features."),
+                            html.Li("Look for Unexpected Connections."),
+                            html.Li("Maintain Healthy Skepticism."),
+                            html.Li("Sample Size Matters.")
+                        ]),
+                        html.P("Remember: This is a data mining tool. The signals adapt daily, and no single 'build' or combination will work forever. Focus on finding statistical edges rather than perfect predictions."),
+                        html.P("Warning: All analysis is based on historical data and statistical relationships. Past performance does not guarantee future results. Always verify signals across multiple timeframes and consider your risk tolerance.")
+                    ]
+                ),
+                dbc.ModalFooter(
+                    dbc.Button("Close", id="close-help", className="ml-auto")
+                )
+            ],
+            id="help-modal",
+            is_open=False
+        ),
+        # Display for maximum SMA day information
         html.Div(id='max-sma-day-display', style={'font-size': '18px', 'margin-bottom': '20px'}),
+        # Row for Primary Ticker input
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -1058,6 +1116,11 @@ app.layout = html.Div(
                             valid=False,
                             invalid=False
                         ),
+                        dbc.Tooltip(
+                            "Enter the ticker symbol for the asset you wish to analyze. This symbol will be used to fetch historical data and generate SMA-based signals.",
+                            target="ticker-input",
+                            placement="right"
+                        ),
                         dbc.FormFeedback(
                             id='ticker-input-feedback',
                             type="invalid",
@@ -1067,7 +1130,9 @@ app.layout = html.Div(
                 ], className='mb-3')
             ], width=12)
         ]),
+        # Store for timing summary flag
         dcc.Store(id='timing-summary-printed', data=False),
+        # Row for Combined Capture Chart
         dbc.Row([
             dbc.Col([
                 dcc.Loading(
@@ -1092,6 +1157,7 @@ app.layout = html.Div(
                 )
             ], width=12)
         ]),
+        # Row for Historical Top Pairs Chart
         dbc.Row([
             dbc.Col([
                 dcc.Loading(
@@ -1116,6 +1182,7 @@ app.layout = html.Div(
                 )
             ], width=12)
         ]),
+        # Row for toggles
         dbc.Row([
             dbc.Col([
                 dbc.Switch(
@@ -1130,11 +1197,13 @@ app.layout = html.Div(
                 )
             ], width=12)
         ]),
+        # Row for generic chart
         dbc.Row([
             dbc.Col([
                 dcc.Graph(id='chart')
             ], width=12)
         ]),
+        # Row for Buy Pair and Short Pair input cards
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -1193,6 +1262,7 @@ app.layout = html.Div(
                 ])
             ], width=6)
         ]),
+        # Row for Dynamic Master Trading Strategy card
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -1220,6 +1290,7 @@ app.layout = html.Div(
                 ])
             ], width=12)
         ]),
+        # Row for Secondary Ticker input and Signal Following Metrics
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -1309,7 +1380,7 @@ app.layout = html.Div(
                     ]),
                     dbc.Collapse(
                         dbc.CardBody([
-                            # Secondary Ticker Input
+                            # Secondary Ticker Input for Multi-Primary Aggregator
                             html.Div([
                                 html.Label("Secondary Ticker (Signal Follower):", className='mb-2'),
                                 dbc.Input(
@@ -1320,8 +1391,7 @@ app.layout = html.Div(
                                 ),
                                 html.Div(id='multi-secondary-feedback', className='text-danger')
                             ], className='mb-3'),
-
-                            # Primary Tickers Input
+                            # Primary Tickers Input for Multi-Primary Aggregator
                             html.Div([
                                 html.Label("Primary Signal Generators:", className='mb-2'),
                                 html.Div([
@@ -1364,7 +1434,7 @@ app.layout = html.Div(
                                 ], id='primary-tickers-container'),
                                 dbc.Button('Add Primary Ticker', id='add-primary-button', color='success', size='sm', className='mt-2')
                             ], className='mb-3'),
-                            # Results Display
+                            # Results Display for Multi-Primary Aggregator
                             dcc.Loading(
                                 id="loading-multi-primary",
                                 type="default",
@@ -1427,7 +1497,7 @@ app.layout = html.Div(
                 ], className='mb-3')
             ], width=12)
         ]),
-        # Add the Ticker Batch Process section at the base of the Dash app
+        # Ticker Batch Process Section
         html.H2('Ticker Batch Process', className='text-center mt-5'),
         dbc.Row([
             dbc.Col([
@@ -1486,7 +1556,7 @@ app.layout = html.Div(
                 )
             ], width=12)
         ]),
-        # New Section: Automated Signal Optimization
+        # Automated Signal Optimization Section
         html.H2('Automated Signal Optimization', className='text-center mt-5'),
         dbc.Row([
             dbc.Col([
@@ -1519,7 +1589,7 @@ app.layout = html.Div(
                         html.Div(id='optimization-feedback', className='text-danger mt-2'),
                     ])
                 ], className='mb-3'),
-                # Loading spinner
+                # Loading spinner and results table for optimization
                 dcc.Loading(
                     id="loading-optimization",
                     type="default",
@@ -1595,6 +1665,7 @@ app.layout = html.Div(
                 )
             ], width=12)
         ]),
+        # Interval components for periodic updates
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
         dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
         dcc.Interval(id='loading-interval', interval=5000, n_intervals=0),  # Update every 5 seconds
@@ -4882,6 +4953,18 @@ def populate_multi_primary_aggregator(active_cell, data, page_current, page_size
         logger.error(f"Error processing combination: {str(e)}")
         logger.error(traceback.format_exc())
         raise PreventUpdate
+
+@app.callback(
+    Output("help-modal", "is_open"),
+    [Input("help-button", "n_clicks"), Input("close-help", "n_clicks")],
+    [State("help-modal", "is_open")],
+    prevent_initial_call=True
+)
+def toggle_help_modal(n1, n2, is_open):
+    # Toggle the Help modal open or closed when either the Help or Close button is clicked
+    if n1 or n2:
+        return not is_open
+    return is_open
 
 if __name__ == "__main__":
     # Run the Dash app
