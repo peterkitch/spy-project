@@ -5495,6 +5495,101 @@ def toggle_help_modal(n1, n2, is_open):
 # Removed redundant test callback - ticker submission is already logged in validate_ticker_input
 
 # ============================================================================
+# CONSOLE INPUT HANDLER
+# ============================================================================
+def print_console_help():
+    """Print help information for console commands"""
+    logger.info(f"\n{Colors.CYAN}{'='*80}{Colors.ENDC}")
+    logger.info(f"{Colors.YELLOW}PRJCT9 Console Commands:{Colors.ENDC}")
+    logger.info(f"{Colors.OKGREEN}  Enter tickers:{Colors.ENDC} Type comma-separated tickers (e.g., AAPL, MSFT, GOOGL)")
+    logger.info(f"{Colors.OKGREEN}  help:{Colors.ENDC} Show this help message")
+    logger.info(f"{Colors.OKGREEN}  status:{Colors.ENDC} Show processing status")
+    logger.info(f"{Colors.OKGREEN}  clear:{Colors.ENDC} Clear console")
+    logger.info(f"{Colors.OKGREEN}  exit:{Colors.ENDC} Stop console input (Dash app continues running)")
+    logger.info(f"{Colors.CYAN}{'='*80}{Colors.ENDC}\n")
+
+def process_console_tickers(ticker_input):
+    """Process tickers entered in console"""
+    try:
+        # Clean and parse tickers
+        tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+        
+        if not tickers:
+            logger.warning("No valid tickers entered")
+            return
+        
+        logger.info(f"\n{Colors.CYAN}[📊] Processing {len(tickers)} ticker(s) from console...{Colors.ENDC}")
+        
+        # Process each ticker
+        for ticker in tickers:
+            try:
+                # Check if it's a valid ticker first
+                df = fetch_data(ticker)
+                if df is None or df.empty:
+                    logger.error(f"  ❌ {ticker}: Invalid ticker or no data available")
+                    continue
+                
+                # Process the ticker
+                logger.info(f"\n{Colors.OKGREEN}[⏳] Starting processing for {ticker}...{Colors.ENDC}")
+                results = get_data(ticker, MAX_SMA_DAY)
+                
+                if results:
+                    logger.info(f"{Colors.OKGREEN}[✅] {ticker} processing complete!{Colors.ENDC}")
+                else:
+                    logger.info(f"{Colors.YELLOW}[⚠️] {ticker} is being processed in background{Colors.ENDC}")
+                    
+            except Exception as e:
+                logger.error(f"  ❌ Error processing {ticker}: {str(e)}")
+                
+        logger.info(f"\n{Colors.CYAN}[✓] Console batch processing complete{Colors.ENDC}")
+        
+    except Exception as e:
+        logger.error(f"Error in console ticker processing: {str(e)}")
+
+def console_input_handler():
+    """Handle console input in a separate thread"""
+    import sys
+    import time
+    
+    # Wait a moment for the server to start
+    time.sleep(2)
+    
+    logger.info(f"\n{Colors.OKGREEN}[🎯] Console input ready! Type 'help' for commands{Colors.ENDC}")
+    
+    while True:
+        try:
+            # Use a simple prompt
+            user_input = input(f"\n{Colors.CYAN}PRJCT9> {Colors.ENDC}")
+            
+            if not user_input:
+                continue
+                
+            user_input = user_input.strip()
+            
+            if user_input.lower() == 'exit':
+                logger.info(f"{Colors.YELLOW}[👋] Exiting console input mode{Colors.ENDC}")
+                break
+            elif user_input.lower() == 'help':
+                print_console_help()
+            elif user_input.lower() == 'clear':
+                os.system('cls' if os.name == 'nt' else 'clear')
+            elif user_input.lower() == 'status':
+                # Show current processing status
+                if _loading_in_progress:
+                    logger.info(f"{Colors.YELLOW}Currently processing: {', '.join(_loading_in_progress.keys())}{Colors.ENDC}")
+                else:
+                    logger.info(f"{Colors.OKGREEN}No active processing{Colors.ENDC}")
+            else:
+                # Process as ticker input
+                process_console_tickers(user_input)
+                
+        except (EOFError, KeyboardInterrupt):
+            # Handle Ctrl+C or closed input
+            break
+        except Exception as e:
+            logger.error(f"Console input error: {str(e)}")
+
+# ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 if __name__ == "__main__":
@@ -5589,7 +5684,19 @@ if __name__ == "__main__":
         import dash._utils
         dash._utils.print = lambda *args, **kwargs: None
         
-        app.run_server(debug=debug_mode, host='127.0.0.1', port=8050, use_reloader=False)
+        # Start console input handler in a separate thread
+        console_thread = threading.Thread(target=console_input_handler, daemon=True)
+        console_thread.start()
+        
+        # Temporarily redirect stdout to suppress "Dash is running on..." message
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        
+        try:
+            app.run_server(debug=debug_mode, host='127.0.0.1', port=8050, use_reloader=False)
+        finally:
+            sys.stdout = old_stdout
     except KeyboardInterrupt:
         cleanup_server()
     except Exception as e:
