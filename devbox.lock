@@ -1,0 +1,254 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "python-full@3.12.7": {
+      "last_modified": "2024-11-03T14:18:04Z",
+      "plugin_version": "0.0.4",
+      "resolved": "github:NixOS/nixpkgs/4ae2e647537bcdbb82265469442713d066675275#python312Full",
+      "source": "devbox-search",
+      "version": "3.12.7",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/yr9nfpcaad4g233mgfp9znrja4m27vbr-python3-3.12.7",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/yr9nfpcaad4g233mgfp9znrja4m27vbr-python3-3.12.7"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/qw0c6a16n96inrf1rjs19x7sjk6xfzrr-python3-3.12.7",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/4a91p7dm9sd9d3kwf5y1909n2v8jk7xz-python3-3.12.7-debug"
+            }
+          ],
+          "store_path": "/nix/store/qw0c6a16n96inrf1rjs19x7sjk6xfzrr-python3-3.12.7"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ak0sh27jipas724h0c7raxvdfmw824k8-python3-3.12.7",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ak0sh27jipas724h0c7raxvdfmw824k8-python3-3.12.7"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/gvd44msxzammmdlkkpgdhlppfr4l3kwp-python3-3.12.7",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/lkyhd2w3d5bqdrg2am27wzby7wbiwiwf-python3-3.12.7-debug"
+            }
+          ],
+          "store_path": "/nix/store/gvd44msxzammmdlkkpgdhlppfr4l3kwp-python3-3.12.7"
+        }
+      }
+    },
+    "python312Packages.matplotlib@latest": {
+      "last_modified": "2024-11-03T14:18:04Z",
+      "resolved": "github:NixOS/nixpkgs/4ae2e647537bcdbb82265469442713d066675275#python312Packages.matplotlib",
+      "source": "devbox-search",
+      "version": "3.9.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ab8vamjs5id0z7w29f48isd161gm84cm-python3.12-matplotlib-3.9.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/pimk2lks85jrr0hsbp2k2ggjh2yyzi7y-python3.12-matplotlib-3.9.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/ab8vamjs5id0z7w29f48isd161gm84cm-python3.12-matplotlib-3.9.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/bc9arnxfzyh6xz14h1fx7ykmdjs4g5qs-python3.12-matplotlib-3.9.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/ddk41xm8mbk4igdma8iayp1sn77fhxbr-python3.12-matplotlib-3.9.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/bc9arnxfzyh6xz14h1fx7ykmdjs4g5qs-python3.12-matplotlib-3.9.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/p43b5qdaah370p4i7yjhf8s91qvi801x-python3.12-matplotlib-3.9.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/73f2w72x9wjzrnlvr8q07d3nj567shas-python3.12-matplotlib-3.9.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/p43b5qdaah370p4i7yjhf8s91qvi801x-python3.12-matplotlib-3.9.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/1bwvsf7xgmsxbpp78j4q5f12wbzn55ls-python3.12-matplotlib-3.9.2",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/c1g5ms4jjj0rys9cw8azlg8qaj9p7q68-python3.12-matplotlib-3.9.2-dist"
+            }
+          ],
+          "store_path": "/nix/store/1bwvsf7xgmsxbpp78j4q5f12wbzn55ls-python3.12-matplotlib-3.9.2"
+        }
+      }
+    },
+    "python312Packages.scipy@latest": {
+      "last_modified": "2024-11-03T14:18:04Z",
+      "resolved": "github:NixOS/nixpkgs/4ae2e647537bcdbb82265469442713d066675275#python312Packages.scipy",
+      "source": "devbox-search",
+      "version": "1.14.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/n916ds9fr2lrds381nsnq7xkap7wi22a-python3.12-scipy-1.14.0",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/n6q04j1bk216w9f46f9yz0gx5iwf238h-python3.12-scipy-1.14.0-dist"
+            }
+          ],
+          "store_path": "/nix/store/n916ds9fr2lrds381nsnq7xkap7wi22a-python3.12-scipy-1.14.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/k4k3k49khklvkj8b9c11f5vbqpvqf58b-python3.12-scipy-1.14.0",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/dlfjzdrl07f1l1f1mpcvgw5sczyspawv-python3.12-scipy-1.14.0-dist"
+            }
+          ],
+          "store_path": "/nix/store/k4k3k49khklvkj8b9c11f5vbqpvqf58b-python3.12-scipy-1.14.0"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/cnhjk92xlnsncri183hsxgl6572gy2kg-python3.12-scipy-1.14.0",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/gki6pwj3saqqfjn78ddm1wsq7kflqmz9-python3.12-scipy-1.14.0-dist"
+            }
+          ],
+          "store_path": "/nix/store/cnhjk92xlnsncri183hsxgl6572gy2kg-python3.12-scipy-1.14.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/cj5sn9nnfyk716xh399x68j8890g7qjv-python3.12-scipy-1.14.0",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/kkgha1ddkz4m7nlr0g48qy2dy5zc02cd-python3.12-scipy-1.14.0-dist"
+            }
+          ],
+          "store_path": "/nix/store/cj5sn9nnfyk716xh399x68j8890g7qjv-python3.12-scipy-1.14.0"
+        }
+      }
+    },
+    "python312Packages.tqdm@latest": {
+      "last_modified": "2024-11-03T14:18:04Z",
+      "resolved": "github:NixOS/nixpkgs/4ae2e647537bcdbb82265469442713d066675275#python312Packages.tqdm",
+      "source": "devbox-search",
+      "version": "4.66.5",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/j12sza9n8kavwcykc7mzyk5irypnpqp7-python3.12-tqdm-4.66.5",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/bszc90q05bjcf3ynlbh17mvzx7jfp9kh-python3.12-tqdm-4.66.5-dist"
+            }
+          ],
+          "store_path": "/nix/store/j12sza9n8kavwcykc7mzyk5irypnpqp7-python3.12-tqdm-4.66.5"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/9qfh1qcry9jf7lw6ww9mbx11rbjpzcv9-python3.12-tqdm-4.66.5",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/lfyzdbh50yr76k7alvp89hyqbhxjhxkm-python3.12-tqdm-4.66.5-dist"
+            }
+          ],
+          "store_path": "/nix/store/9qfh1qcry9jf7lw6ww9mbx11rbjpzcv9-python3.12-tqdm-4.66.5"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ch4rxy53hnq50xwcy6pvy31bajcjskb4-python3.12-tqdm-4.66.5",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/liv91d0ikmaxr5bpaim77n9210lijv6l-python3.12-tqdm-4.66.5-dist"
+            }
+          ],
+          "store_path": "/nix/store/ch4rxy53hnq50xwcy6pvy31bajcjskb4-python3.12-tqdm-4.66.5"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/nsg23rvd5lgblcx0vx06axniqaz3nm73-python3.12-tqdm-4.66.5",
+              "default": true
+            },
+            {
+              "name": "dist",
+              "path": "/nix/store/3csscg30qb2hlrqrpxcdhrj1dz1yvp5n-python3.12-tqdm-4.66.5-dist"
+            }
+          ],
+          "store_path": "/nix/store/nsg23rvd5lgblcx0vx06axniqaz3nm73-python3.12-tqdm-4.66.5"
+        }
+      }
+    }
+  }
+}
