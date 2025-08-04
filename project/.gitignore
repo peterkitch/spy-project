@@ -24,3 +24,12 @@ status/
 # Ignore Excel files
 *.xlsx
 *.xls
+
+# Ignore Claude AI context file
+CLAUDE.md
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

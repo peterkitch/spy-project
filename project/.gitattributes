@@ -1,0 +1,5 @@
+# Force LF line endings for Python files
+*.py text eol=lf
+
+# Auto-detect for other files
+* text=auto

@@ -20,6 +20,9 @@ from scipy import stats
 import gc
 import threading
 from threading import Lock
+import signal
+import atexit
+import sys
 from joblib import Memory
 import logging
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -36,7 +39,188 @@ import uuid
 import ast
 
 # Initialize the Dash app with a dark theme and custom styles
-app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY, "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"])
+
+# Add custom styles with spin animation
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>PRJCT9 - Advanced Trading Analysis</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;700&family=Share+Tech+Mono&family=Exo+2:wght@300;400;700;900&display=swap');
+            
+            /* Global font hierarchy */
+            body {
+                font-family: 'Rajdhani', monospace;
+                font-weight: 400;
+                letter-spacing: 0.5px;
+            }
+            
+            h1 { 
+                font-family: 'Orbitron', monospace !important;
+                font-weight: 900 !important;
+                text-transform: uppercase;
+            }
+            
+            h2, h3, h4, h5 {
+                font-family: 'Exo 2', sans-serif !important;
+                font-weight: 700 !important;
+                text-transform: uppercase;
+                letter-spacing: 1.5px;
+            }
+            
+            .btn {
+                font-family: 'Share Tech Mono', monospace !important;
+                text-transform: uppercase;
+                letter-spacing: 1.2px;
+                font-weight: 600;
+            }
+            
+            input, .form-control {
+                font-family: 'Share Tech Mono', monospace !important;
+                letter-spacing: 0.8px;
+            }
+            
+            .card-header {
+                font-family: 'Exo 2', sans-serif !important;
+                font-weight: 600;
+                letter-spacing: 1px;
+            }
+            
+            /* Table headers */
+            th {
+                font-family: 'Orbitron', monospace !important;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            
+            /* Animations - slowed down by 50% */
+            @keyframes spin {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+            }
+            
+            @keyframes pulse-glow {
+                0% { 
+                    text-shadow: 0 0 20px rgba(128, 255, 0, 0.8);
+                    filter: brightness(1);
+                }
+                50% { 
+                    text-shadow: 0 0 40px rgba(128, 255, 0, 1), 0 0 60px rgba(128, 255, 0, 0.8);
+                    filter: brightness(1.2);
+                }
+                100% { 
+                    text-shadow: 0 0 20px rgba(128, 255, 0, 0.8);
+                    filter: brightness(1);
+                }
+            }
+            
+            .pulsating-header {
+                animation: pulse-glow 4s ease-in-out infinite;
+            }
+            .card {
+                transition: all 0.3s ease;
+                border: 1px solid rgba(128, 255, 0, 0.3);
+            }
+            .card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 30px rgba(128, 255, 0, 0.5);
+                border-color: rgba(128, 255, 0, 0.8);
+            }
+            .btn {
+                transition: all 0.3s ease;
+                position: relative;
+                overflow: hidden;
+            }
+            .btn:hover {
+                box-shadow: 0 0 20px rgba(128, 255, 0, 0.6);
+                filter: brightness(1.1);
+            }
+            .btn::after {
+                content: '';
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                width: 0;
+                height: 0;
+                border-radius: 50%;
+                background: rgba(255, 255, 255, 0.3);
+                transform: translate(-50%, -50%);
+                transition: width 0.6s, height 0.6s;
+            }
+            .btn:active::after {
+                width: 300px;
+                height: 300px;
+            }
+            input.form-control:focus {
+                box-shadow: 0 0 10px rgba(128, 255, 0, 0.5);
+                border-color: #80ff00;
+            }
+            .loading-text {
+                animation: pulse 3s ease-in-out infinite;
+            }
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            .processing-overlay {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.8);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 9999;
+            }
+            .processing-content {
+                text-align: center;
+                color: #80ff00;
+            }
+            .processing-spinner {
+                border: 3px solid rgba(128, 255, 0, 0.3);
+                border-top: 3px solid #80ff00;
+                border-radius: 50%;
+                width: 60px;
+                height: 60px;
+                animation: spin 1s linear infinite;
+                margin: 0 auto 20px;
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(20px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+                animation: fadeIn 0.5s ease-out;
+            }
+            .glow-border {
+                animation: border-glow 4s ease-in-out infinite;
+            }
+            @keyframes border-glow {
+                0% { box-shadow: 0 0 5px rgba(128, 255, 0, 0.5); }
+                50% { box-shadow: 0 0 20px rgba(128, 255, 0, 0.8), 0 0 30px rgba(128, 255, 0, 0.6); }
+                100% { box-shadow: 0 0 5px rgba(128, 255, 0, 0.5); }
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 master_stopwatch_start = None
 
@@ -50,16 +234,73 @@ for handler in logging.root.handlers[:]:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Create handlers
+# Suppress various library logs
+logging.getLogger('werkzeug').setLevel(logging.ERROR)  # HTTP requests
+logging.getLogger('flask.app').setLevel(logging.ERROR)  # Flask logs
+logging.getLogger('yfinance').setLevel(logging.ERROR)  # yfinance logs
+
+# Color codes for terminal
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    # Custom colors for PROJECT 9
+    NEON_GREEN = '\033[38;5;82m'
+    BRIGHT_GREEN = '\033[38;5;46m'
+    DIM_GREEN = '\033[38;5;22m'
+    YELLOW = '\033[38;5;226m'
+    ORANGE = '\033[38;5;208m'
+    PURPLE = '\033[38;5;141m'
+    CYAN = '\033[38;5;51m'
+
+# Track which tickers have had their price data logged
+_logged_price_tickers = set()
+
+# Custom formatter with colors
+class ColoredFormatter(logging.Formatter):
+    format_dict = {
+        logging.DEBUG: Colors.OKCYAN + '%(asctime)s - DEBUG - %(message)s' + Colors.ENDC,
+        logging.INFO: Colors.OKGREEN + '%(message)s' + Colors.ENDC,
+        logging.WARNING: Colors.WARNING + '[!] %(asctime)s - WARNING - %(message)s' + Colors.ENDC,
+        logging.ERROR: Colors.FAIL + '[X] %(asctime)s - ERROR - %(message)s' + Colors.ENDC,
+        logging.CRITICAL: Colors.FAIL + Colors.BOLD + '[!!!] %(asctime)s - CRITICAL - %(message)s' + Colors.ENDC,
+    }
+    
+    def format(self, record):
+        log_fmt = self.format_dict.get(record.levelno, '%(message)s')
+        formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
+        return formatter.format(record)
+
+# Force UTF-8 encoding for Windows
+import sys
+import io
+import os
+
+# Set console to UTF-8 mode on Windows
+if sys.platform == 'win32':
+    # Set console code page to UTF-8
+    os.system('chcp 65001 > nul 2>&1')
+
+# Create console handler - let logging handle the encoding
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 
-file_handler = logging.FileHandler('debug.log')
+# Force UTF-8 encoding on the handler's stream
+if sys.platform == 'win32':
+    # This is the key fix - set the encoding on the handler's stream
+    console_handler.stream = open(sys.stdout.fileno(), 'w', encoding='utf-8', closefd=False)
+
+file_handler = logging.FileHandler('debug.log', encoding='utf-8')
 file_handler.setLevel(logging.DEBUG)
 
 # Create formatters and add them to handlers
-console_formatter = logging.Formatter('%(message)s')
-console_handler.setFormatter(console_formatter)
+console_handler.setFormatter(ColoredFormatter())
 
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
@@ -71,15 +312,65 @@ logger.addHandler(file_handler)
 # Prevent logger from propagating messages to the root logger
 logger.propagate = False
 
-# Function to log a separator line
-def log_separator():
-    logger.info("=" * 80)
+# Enhanced logging functions with colors
+def log_separator(char="═", color=Colors.DIM_GREEN, width=80):
+    logger.info(color + char * width + Colors.ENDC)
 
-# Function to log a section header
-def log_section(section_name):
-    log_separator()
-    logger.info(f" {section_name} ".center(80, "-"))
-    log_separator()
+def log_section(section_name, color=Colors.NEON_GREEN):
+    section_text = (
+        color + "═" * 80 + Colors.ENDC + "\n" +
+        color + Colors.BOLD + f"⚡ {section_name} ⚡".center(80, " ") + Colors.ENDC + "\n" +
+        color + "═" * 80 + Colors.ENDC
+    )
+    logger.info(section_text)
+
+def log_ticker_section(ticker, action="PROCESSING"):
+    """Special section header for ticker changes"""
+    logger.info("")  # Blank line before
+    ticker_text = (
+        Colors.PURPLE + "✦" * 80 + Colors.ENDC + "\n" +
+        Colors.PURPLE + Colors.BOLD + f"📊 TICKER: {ticker} | {action} 📊".center(80, " ") + Colors.ENDC + "\n" +
+        Colors.PURPLE + "✦" * 80 + Colors.ENDC
+    )
+    logger.info(ticker_text)
+
+def log_success(message):
+    logger.info(Colors.BRIGHT_GREEN + "[✓] " + message + Colors.ENDC)
+
+def log_processing(message):
+    logger.info(Colors.CYAN + "[⚙️] " + message + Colors.ENDC)
+
+def log_result(label, value, color=Colors.YELLOW):
+    # Ensure output fits within 80 chars
+    formatted_line = f"{label}: {value}"
+    if len(formatted_line) > 76:  # Leave room for prefix
+        formatted_line = formatted_line[:73] + "..."
+    logger.info(f"  {Colors.OKGREEN}{label}:{Colors.ENDC} {color}{Colors.BOLD}{value}{Colors.ENDC}")
+
+def log_metric(label, value, unit="", indent=2):
+    """Log a metric with consistent formatting"""
+    indent_str = " " * indent
+    if unit:
+        logger.info(f"{indent_str}{Colors.CYAN}{label}:{Colors.ENDC} {Colors.YELLOW}{value}{unit}{Colors.ENDC}")
+    else:
+        logger.info(f"{indent_str}{Colors.CYAN}{label}:{Colors.ENDC} {Colors.YELLOW}{value}{Colors.ENDC}")
+
+def log_data_info(label, value, color=Colors.BRIGHT_GREEN):
+    """Log data information with consistent formatting"""
+    logger.info(f"  {Colors.OKBLUE}{label}:{Colors.ENDC} {color}{value}{Colors.ENDC}")
+
+def log_warning_msg(message):
+    logger.info(Colors.WARNING + "[⚠️] " + message + Colors.ENDC)
+
+def log_error_msg(message):
+    logger.info(Colors.FAIL + "[❌] " + message + Colors.ENDC)
+
+def log_subsection(title, char="─", color=Colors.DIM_GREEN):
+    """Create a subsection with lighter separators"""
+    logger.info("")
+    logger.info(color + char * 40 + Colors.ENDC)
+    logger.info(color + f"🔸 {title} 🔸".center(40, " ") + Colors.ENDC)
+    logger.info(color + char * 40 + Colors.ENDC)
 
 # Suppress yfinance debug logs
 logging.getLogger('yfinance').setLevel(logging.WARNING)
@@ -88,6 +379,31 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 tqdm.pandas()
+
+# Configure TQDM to fit within 80 characters
+from tqdm import tqdm as original_tqdm
+
+# Create a wrapper class that preserves all tqdm functionality
+class CustomTqdm(original_tqdm):
+    def __init__(self, *args, **kwargs):
+        # Set default parameters for width and ASCII
+        kwargs.setdefault('ncols', 75)  # Reduced to ensure it fits
+        kwargs.setdefault('ascii', True)
+        kwargs.setdefault('leave', True)
+        kwargs.setdefault('bar_format', '{l_bar}{bar}| {n_fmt}/{total_fmt}')  # Simplified format
+        super().__init__(*args, **kwargs)
+    
+    @staticmethod
+    def write(*args, **kwargs):
+        # Preserve the write method
+        original_tqdm.write(*args, **kwargs)
+
+# Override tqdm with our custom version
+tqdm = CustomTqdm
+
+# ============================================================================
+# CONFIGURATION AND GLOBAL VARIABLES
+# ============================================================================
 MAX_SMA_DAY = 114
 _precomputed_results_cache = {}
 _loading_in_progress = {}
@@ -104,6 +420,9 @@ cache_dir = '.cache'
 os.makedirs(cache_dir, exist_ok=True)
 memory = Memory(cache_dir, verbose=0)
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 def normalize_ticker(ticker):
     """Normalize ticker to uppercase if it exists"""
     return ticker.strip().upper() if ticker else ticker
@@ -125,7 +444,7 @@ def fetch_data(ticker, is_secondary=False):
         # Check for empty or whitespace-only ticker
         if not ticker or not ticker.strip():
             if not is_secondary:
-                logger.info("No primary ticker provided")
+                logger.warning("No primary ticker provided")
             return pd.DataFrame()
             
         # Normalize ticker
@@ -202,12 +521,13 @@ def fetch_data(ticker, is_secondary=False):
                 return pd.DataFrame()
                 
         # Log price type only once per ticker
-        if not hasattr(fetch_data, f'logged_price_{ticker}'):
+        global _logged_price_tickers
+        if ticker not in _logged_price_tickers and not is_secondary:
             if using_adjusted:
-                logger.info(f"Using Adjusted Close data for {ticker}")
+                log_result("Price Data", f"Using Adjusted Close for {ticker}", Colors.BRIGHT_GREEN)
             else:
                 logger.warning(f"Adjusted Close not available for {ticker} - defaulting to Close prices")
-            setattr(fetch_data, f'logged_price_{ticker}', True)
+            _logged_price_tickers.add(ticker)
         
         if df.empty:
             logger.error(f"No valid data found for {ticker}")
@@ -268,6 +588,9 @@ def fetch_data(ticker, is_secondary=False):
         logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
         return pd.DataFrame()
 
+# ============================================================================
+# DATA FETCHING AND PROCESSING FUNCTIONS
+# ============================================================================
 def get_last_valid_trading_day(df):
     """Get the most recent day with valid adjusted trading data."""
     for date in sorted(df.index, reverse=True):
@@ -297,6 +620,7 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
 
 def load_precomputed_results(ticker, load_full_data=False):
     global _precomputed_results_cache, _loading_in_progress
+    
     with _loading_lock:
         if ticker in _precomputed_results_cache:
             # Only log debug info for cached results to prevent duplicate headers
@@ -307,12 +631,14 @@ def load_precomputed_results(ticker, load_full_data=False):
             logger.debug(f"Loading in progress for {ticker}")
             return None  # Return None immediately if loading is in progress
 
+        # Log ticker input for new requests
+        logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
+        
         # Attempt to load from file if not in cache and not currently loading
         pkl_file = f'{ticker}_precomputed_results.pkl'
         if os.path.exists(pkl_file):
-            log_separator()
-            log_section(f"Loading Existing Data for {ticker.upper()}")
-            logger.info(f"Loading precomputed results from file for {ticker.upper()}")
+            log_ticker_section(ticker.upper(), "LOADING EXISTING DATA")
+            log_processing(f"Loading precomputed results from file for {ticker.upper()}")
             load_start_time = time.time()
             results = load_precomputed_results_from_file(pkl_file)
             if results:
@@ -324,7 +650,7 @@ def load_precomputed_results(ticker, load_full_data=False):
                     
                     chunk_load_start = time.time()
 
-                    with tqdm(total=len(chunk_files), desc=f"Loading chunks for {ticker}", unit="chunk", dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar:
+                    with tqdm(total=len(chunk_files), desc=f"Loading chunks", unit="chunk") as pbar:
                         for chunk_file in chunk_files:
                             data = np.load(chunk_file, allow_pickle=True)
                             buy_pairs = data['buy_pairs']
@@ -352,15 +678,14 @@ def load_precomputed_results(ticker, load_full_data=False):
         if status.get('message') == "Insufficient trading history":
             return None
 
-        logger.info("")  # First line break
-        logger.info("")  # Second line break
-        log_separator()    
-        log_section(f"Loading Ticker {ticker.upper()}")
-        log_separator()
-        logger.info(f"Starting to load precomputed results for {ticker.upper()}...")
+        log_ticker_section(ticker.upper(), "COMPUTING NEW DATA")
+        log_processing(f"Starting to precompute results for {ticker.upper()}...")
         event = threading.Event()
         _loading_in_progress[ticker] = event
-        threading.Thread(target=precompute_results, args=(ticker, event)).start()
+        # Set daemon=True so the thread doesn't prevent program exit
+        thread = threading.Thread(target=precompute_results, args=(ticker, event))
+        thread.daemon = True
+        thread.start()
         return None
 
 def fetch_precomputed_results(ticker):
@@ -381,7 +706,12 @@ def fetch_precomputed_results(ticker):
     return top_buy_pair, top_short_pair, buy_results, short_results
 
 def get_data(ticker, MAX_SMA_DAY):
-    logging.info(f"get_data called for {ticker} with MAX_SMA_DAY {MAX_SMA_DAY}")
+    # Use logger instead of logging for consistency
+    # Internal function call - no logging needed
+    # Force flush to ensure output appears
+    for handler in logger.handlers:
+        handler.flush()
+    
     results = load_precomputed_results(ticker)
     return results
     
@@ -425,7 +755,7 @@ def save_precomputed_results(ticker, results):
         temp_name = tf.name
 
     shutil.move(temp_name, final_name)
-    logger.info(f"Saved results for {ticker}")
+    # Don't log here - it disrupts progress bar output
     return results
 
 def process_chunk_for_top_pairs(chunk_file, total_days):
@@ -462,9 +792,12 @@ def process_chunk_for_top_pairs(chunk_file, total_days):
 
     return max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs
 
+# ============================================================================
+# SIGNAL CALCULATION AND OPTIMIZATION FUNCTIONS
+# ============================================================================
 def calculate_daily_top_pairs(df, ticker):
     section_start = time.time()
-    logger.info("Calculating daily top pairs...")
+    log_processing("Calculating daily top pairs...")
     total_days = len(df.index)
     dates = df.index
 
@@ -483,7 +816,7 @@ def calculate_daily_top_pairs(df, ticker):
     max_short_pairs_global = [None] * total_days
 
     chunk_processing_times = []
-    with tqdm(total=len(chunk_files), desc="Processing chunks for daily top pairs", unit="chunk", dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar:
+    with tqdm(total=len(chunk_files), desc="Processing top pairs", unit="chunk") as pbar:
         for chunk_file in chunk_files:
             tqdm.write(f"Processing chunk file: {chunk_file}")
             chunk_start_time = time.time()
@@ -515,8 +848,6 @@ def calculate_daily_top_pairs(df, ticker):
 
     logger.info(f"Number of daily top pairs: Buy: {len(daily_top_buy_pairs)}, Short: {len(daily_top_short_pairs)}")
     logger.info("Daily top pairs calculation completed.")
-    logger.info(f"Number of daily top buy pairs: {len(max_buy_pairs_global)}")
-    logger.info(f"Number of daily top short pairs: {len(max_short_pairs_global)}")
 
     total_chunk_processing_time = sum(chunk_processing_times)
     logger.info(f"Total time for processing chunks: {total_chunk_processing_time:.2f} seconds")
@@ -623,14 +954,22 @@ def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chun
         logger.error(f"Error saving chunk {chunk_index} for {ticker}: {str(e)}")
         logger.error(traceback.format_exc())
 
+# ============================================================================
+# PRECOMPUTATION AND CACHING FUNCTIONS
+# ============================================================================
 def precompute_results(ticker, event):
     global master_stopwatch_start
     master_stopwatch_start = time.time()
     section_times = {}
     global _loading_in_progress, _precomputed_results_cache
+    
+    # Header is shown by log_ticker_section in load_precomputed_results
     with logging_redirect_tqdm():
         try:
-            logger.info(f"precompute_results called for {ticker.upper()}")
+            # Internal function call - no logging needed
+            # Force flush to ensure output appears
+            for handler in logger.handlers:
+                handler.flush()
             section_start = time.time()
             
             def log_section_time(section_name):
@@ -651,8 +990,9 @@ def precompute_results(ticker, event):
                 logger.warning("Please enter a different ticker symbol.")
                 return None
             
+            logger.info("")  # Line break before section
             log_section("Data Preprocessing")
-            logger.info(f"Data fetched and preprocessed for {ticker.upper()}")
+            log_processing(f"Data loading initiated for {ticker.upper()}")
             section_times['Data Preprocessing'] = time.time() - section_start
             section_start = time.time()
 
@@ -730,60 +1070,61 @@ def precompute_results(ticker, event):
                 last_date = df.index.max().strftime('%Y-%m-%d')
                 logger.info(f"Date range: {start_date} to {last_date}")
 
-                log_section("SMA Calculation")
-                logger.info("Checking SMA cache...")
+            logger.info("")  # Line break before section
+            log_section("SMA Calculation")
+            logger.info("Checking SMA cache...")
 
-                cache_dir = '.sma_cache'
-                os.makedirs(cache_dir, exist_ok=True)
-                sma_cache_path = os.path.join(cache_dir, f'sma_full_{ticker}.npz')
+            cache_dir = '.sma_cache'
+            os.makedirs(cache_dir, exist_ok=True)
+            sma_cache_path = os.path.join(cache_dir, f'sma_full_{ticker}.npz')
 
-                smas_loaded = False
-                if os.path.exists(sma_cache_path):
-                    logger.info("Loading SMAs from cache...")
-                    try:
-                        with np.load(sma_cache_path) as data:
-                            for i in range(1, max_sma_day + 1):
-                                df[f'SMA_{i}'] = data[f'SMA_{i}']
-                        logger.info("Successfully loaded SMAs from cache")
-                        smas_loaded = True
-                    except Exception as e:
-                        logger.warning(f"Error loading SMAs from cache: {str(e)}")
+            smas_loaded = False
+            if os.path.exists(sma_cache_path):
+                logger.info("Loading SMAs from cache...")
+                try:
+                    with np.load(sma_cache_path) as data:
+                        for i in range(1, max_sma_day + 1):
+                            df[f'SMA_{i}'] = data[f'SMA_{i}']
+                    logger.info("Successfully loaded SMAs from cache")
+                    smas_loaded = True
+                except Exception as e:
+                    logger.warning(f"Error loading SMAs from cache: {str(e)}")
 
-                if not smas_loaded:
-                    logger.info("Computing new SMA columns...")
-                    if max_sma_day > existing_max_sma_day:
-                        sma_list = []
-                        logger.info("Beginning SMA calculations in chunks...")
-                        chunk_size_sma = 50
-                        total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
+            if not smas_loaded:
+                logger.info("Computing new SMA columns...")
+                if max_sma_day > existing_max_sma_day:
+                    sma_list = []
+                    logger.info("Beginning SMA calculations in chunks...")
+                    chunk_size_sma = 50
+                    total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
 
-                        with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
-                            for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
-                                chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
-                                sma_dict = {}
-                                for j in range(i, chunk_end):
-                                    sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
-                                    sma_dict[f'SMA_{j}'] = sma_values
-                                sma_chunk = pd.DataFrame(sma_dict, index=df.index)
-                                sma_list.append(sma_chunk)
-                                gc.collect()
-                                pbar.update(1)
+                    with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
+                        for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
+                            chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
+                            sma_dict = {}
+                            for j in range(i, chunk_end):
+                                sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
+                                sma_dict[f'SMA_{j}'] = sma_values
+                            sma_chunk = pd.DataFrame(sma_dict, index=df.index)
+                            sma_list.append(sma_chunk)
+                            gc.collect()
+                            pbar.update(1)
 
-                        logger.info(f"Completed SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
+                    logger.info(f"\nCompleted SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
 
-                        sma_df = pd.concat(sma_list, axis=1)
-                        df = pd.concat([df, sma_df], axis=1)
-                        df = df.copy()
-                        logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
+                    sma_df = pd.concat(sma_list, axis=1)
+                    df = pd.concat([df, sma_df], axis=1)
+                    df = df.copy()
+                    logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
 
-                    else:
-                        logger.info("No new SMA periods to compute.")
-                        logger.info("Updating existing SMA columns for new data.")
-                        for sma_period in range(1, max_sma_day + 1):
-                            sma_column_name = f'SMA_{sma_period}'
-                            df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
-                            df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
-                        df = df.copy()
+                else:
+                    logger.info("No new SMA periods to compute.")
+                    logger.info("Updating existing SMA columns for new data.")
+                    for sma_period in range(1, max_sma_day + 1):
+                        sma_column_name = f'SMA_{sma_period}'
+                        df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
+                        df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
+                    df = df.copy()
 
                     logger.info("SMA columns updated.")
                     logger.info("Ensuring correct NaN values for SMA calculations.")
@@ -805,6 +1146,7 @@ def precompute_results(ticker, event):
                         logger.warning(f"Missing SMA columns even after computation: {missing_smas}. Cannot cache incomplete SMA data.")
 
             # Process SMA pairs and find top performers in a fully vectorized manner with chunking
+            logger.info("")  # Line break before section
             log_section("SMA Pairs Processing")
             daily_top_buy_pairs = {}
             daily_top_short_pairs = {}
@@ -883,7 +1225,10 @@ def precompute_results(ticker, event):
                     gc.collect()
 
                     pbar_pairs.update(1)
-
+            
+            # Add line break after progress bar
+            logger.info("")
+            
             # Update results
             results['daily_top_buy_pairs'] = daily_top_buy_pairs
             results['daily_top_short_pairs'] = daily_top_short_pairs
@@ -899,6 +1244,7 @@ def precompute_results(ticker, event):
             results['total_trading_days'] = total_trading_days
 
             # Begin Cumulative Combined Captures Calculation
+            logger.info("")  # Line break before section
             log_section("Cumulative Combined Captures")
             section_start = log_section_time("Cumulative Combined Captures")
             cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
@@ -949,10 +1295,13 @@ def precompute_results(ticker, event):
                 save_precomputed_results(ticker, results)
 
                 pbar_save.update(1)
-
+            
+            # Add line break after progress bar
+            logger.info("")
+            
             write_status(ticker, {"status": "complete", "progress": 100})
-
-            logger.info("Process completed.")
+            
+            log_success("Process completed.")
 
             with _loading_lock:
                 _precomputed_results_cache[ticker] = results
@@ -988,25 +1337,27 @@ def print_timing_summary(ticker):
         hours, rem = divmod(total_time, 3600)
         minutes, seconds = divmod(rem, 60)
         
-        logger.info("=" * 80)
-        logger.info("Processing Time Summary:")
+        logger.info("")  # Line break before section
+        log_section("PROCESSING TIME SUMMARY", Colors.CYAN)
+        
         for section, time_taken in section_times.items():
-            logger.info(f"{section}: {time_taken:.2f} seconds")
+            log_metric(section, f"{time_taken:.2f}", " seconds")
         
         if 'chunk_processing_time' in results:
-            logger.info(f"Daily Top Pairs Chunk Processing: {results['chunk_processing_time']:.2f} seconds")
+            log_metric("Daily Top Pairs Chunk Processing", f"{results['chunk_processing_time']:.2f}", " seconds")
         
-        logger.info("=" * 80)
-        logger.info(f"Total processing time for {ticker.upper()}: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
-        logger.info("=" * 80)
+        logger.info("")
+        log_separator("-", Colors.DIM_GREEN)
+        log_result("Total processing time", f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
+        log_separator("═", Colors.DIM_GREEN)
         logger.info("Load complete. Data is now available in the Dash app.")
     elif results and 'load_time' in results:
         load_time = results['load_time']
         hours, rem = divmod(load_time, 3600)
         minutes, seconds = divmod(rem, 60)
-        logger.info("=" * 80)
+        log_separator("═", Colors.DIM_GREEN)
         logger.info(f"Loading time for existing {ticker.upper()} data: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
-        logger.info("=" * 80)
+        log_separator("═", Colors.DIM_GREEN)
         logger.info("Load complete. Data is now available in the Dash app.")
 
 # Function to read the processing status from a file
@@ -1022,9 +1373,6 @@ def read_status(ticker):
                     print(f"Empty JSON file: {status_path}")
         return {"status": "not started", "progress": 0}
 
-status = read_status('AAPL')
-logger.info(status)
-
 def inspect_pkl_file(ticker, sample_size=5):
     pkl_file = f'{ticker}_precomputed_results.pkl'
     if os.path.exists(pkl_file):
@@ -1036,20 +1384,83 @@ def inspect_pkl_file(ticker, sample_size=5):
     else:
         logger.warning(f"{pkl_file} does not exist.")
 
-app.layout = html.Div(
+# ============================================================================
+# APPLICATION LAYOUT
+# ============================================================================
+app.layout = dbc.Container(
+    fluid=True,
     style={
         'background-color': 'black',
         'color': '#80ff00',
-        'font-family': 'Impact, sans-serif'
+        'font-family': 'Impact, sans-serif',
+        'padding': '20px 40px',
+        'minHeight': '100vh'
     },
     children=[
         # Header of the app
-        html.H1(
-            'Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework', 
-            className='text-center mt-3'
-        ),
+        html.Div([
+            html.H1([
+                html.Span('PR', style={'display': 'inline'}),
+                html.Span(
+                    html.I(className="fas fa-atom", 
+                          style={
+                              "color": "#80ff00", 
+                              "animation": "spin 8s linear infinite",
+                              "fontSize": "0.85em"
+                          }),
+                    style={
+                        "display": "inline-block",
+                        "verticalAlign": "middle",
+                        "margin": "0 2px",  # Equal spacing on both sides
+                        "position": "relative",
+                        "left": "-3px",  # Shift left by 3px
+                        "width": "1em",  # Fixed width container
+                        "height": "1em",  # Fixed height container
+                        "lineHeight": "1em",
+                        "textAlign": "center"
+                    }
+                ),
+                html.Span('JCT9', style={'display': 'inline'})
+            ], 
+            className='text-center mt-3 pulsating-header',
+            style={
+                "fontSize": "60px",
+                "letterSpacing": "8px",
+                "fontFamily": "Orbitron, monospace",
+                "fontWeight": "900",
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "center"
+            }),
+            html.P(
+                'Adaptive Simple Moving Average Pair Optimization and Mean Reversion-Based Systematic Trading Framework',
+                className='text-center',
+                style={
+                    "color": "#80ff00",
+                    "fontSize": "14px",
+                    "marginTop": "10px",
+                    "fontFamily": "Rajdhani, monospace",
+                    "letterSpacing": "2px",
+                    "opacity": "0.8"
+                }
+            ),
+        ]),
         # Help button and modal for step-by-step guidance (using dbc.Modal)
-        dbc.Button("Help", id="help-button", color="info", className="mb-3"),
+        dbc.Button(
+            [html.I(className="fas fa-question-circle me-2 pulse", style={"animation": "pulse 4s infinite"}), "Help"], 
+            id="help-button", 
+            color="success", 
+            className="mb-3",
+            style={
+                "boxShadow": "0 0 15px rgba(128, 255, 0, 0.6)",
+                "position": "fixed",
+                "top": "20px",
+                "right": "20px",
+                "zIndex": "1000",
+                "fontWeight": "bold",
+                "letterSpacing": "1px"
+            }
+        ),
         dbc.Modal(
             [
                 dbc.ModalHeader("Understanding the Trading App - A Fisherman's Guide to Signal Mining"),
@@ -1106,7 +1517,10 @@ app.layout = html.Div(
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader('Select Primary Ticker Symbol (Signal Generator)'),
+                    dbc.CardHeader([
+                        html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
+                        'Select Primary Ticker Symbol (Signal Generator)'
+                    ], className="glow-border"),
                     dbc.CardBody([
                         dbc.Input(
                             id='ticker-input', 
@@ -1137,7 +1551,8 @@ app.layout = html.Div(
             dbc.Col([
                 dcc.Loading(
                     id="loading-combined-capture",
-                    type="default",
+                    type="circle",
+                    color="#80ff00",
                     children=[
                         dcc.Graph(
                             id='combined-capture-chart',
@@ -1162,7 +1577,7 @@ app.layout = html.Div(
             dbc.Col([
                 dcc.Loading(
                     id="loading-historical-top-pairs",
-                    type="default",
+                    type="circle",
                     children=[
                         dcc.Graph(
                             id='historical-top-pairs-chart',
@@ -1207,8 +1622,21 @@ app.layout = html.Div(
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader('Buy Pair'),
+                    dbc.CardHeader([
+                        html.Div([
+                            html.Div([
+                                html.I(className="fas fa-arrow-trend-up me-2", style={"color": "#00ff41"}),
+                                'Buy Pair'
+                            ], style={"fontSize": "1.25rem", "fontWeight": "bold"}),
+                            html.Small('Signal when: SMA₁ value > SMA₂ value', 
+                                     style={"color": "#aaa", "fontStyle": "italic"})
+                        ])
+                    ], style={"color": "#80ff00"}),
                     dbc.CardBody([
+                        dbc.Alert([
+                            html.I(className="fas fa-info-circle me-2"),
+                            "Buy signal triggers when the first SMA's value exceeds the second SMA's value"
+                        ], color="info", className="py-2 mb-3", style={"fontSize": "0.9rem"}),
                         html.Div([
                             html.Label(id='sma-input-1-label', className='mb-1'),
                             dcc.Input(id='sma-input-1', type='number', min=1, max=MAX_SMA_DAY, step=1, className='form-control'),
@@ -1222,8 +1650,21 @@ app.layout = html.Div(
                     ])
                 ], className='mb-3'),
                 dbc.Card([
-                    dbc.CardHeader('Short Pair'),
+                    dbc.CardHeader([
+                        html.Div([
+                            html.Div([
+                                html.I(className="fas fa-arrow-trend-down me-2", style={"color": "#ff0040"}),
+                                'Short Pair'
+                            ], style={"fontSize": "1.25rem", "fontWeight": "bold"}),
+                            html.Small('Signal when: SMA₁ value < SMA₂ value', 
+                                     style={"color": "#aaa", "fontStyle": "italic"})
+                        ])
+                    ], style={"color": "#80ff00"}),
                     dbc.CardBody([
+                        dbc.Alert([
+                            html.I(className="fas fa-info-circle me-2"),
+                            "Short signal triggers when the first SMA's value is less than the second SMA's value"
+                        ], color="danger", className="py-2 mb-3", style={"fontSize": "0.9rem"}),
                         html.Div([
                             html.Label(id='sma-input-3-label', className='mb-1'),
                             dcc.Input(id='sma-input-3', type='number', min=1, max=MAX_SMA_DAY, step=1, className='form-control'),
@@ -1240,17 +1681,27 @@ app.layout = html.Div(
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        html.H5('Manual Calculation Components', className='mb-0'),
+                        html.Div([
+                            html.H5('Your Custom Pair Results', className='mb-0'),
+                            html.Small('Live analysis of the SMA pairs entered on the left', 
+                                     style={"color": "#aaa", "fontStyle": "italic"})
+                        ]),
                         html.Button(children='Maximize', id='toggle-calc-button', className='btn btn-sm btn-secondary ml-auto')
-                    ]),
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
                     dbc.Collapse(
                         dbc.CardBody([
-                            html.H6('Buy Pair', className='mt-3'),
+                            html.Div([
+                                html.I(className="fas fa-arrow-trend-up me-2", style={"color": "#00ff41"}),
+                                html.Span(id='buy-pair-header', children='Buy Pair', style={"fontWeight": "bold", "fontSize": "1.1rem"})
+                            ], className='mt-3 mb-2'),
                             html.Div(id='trigger-days-buy'),
                             html.Div(id='win-ratio-buy'),
                             html.Div(id='avg-daily-capture-buy'),
                             html.Div(id='total-capture-buy'),
-                            html.H6('Short Pair', className='mt-3'),
+                            html.Div([
+                                html.I(className="fas fa-arrow-trend-down me-2", style={"color": "#ff0040"}),
+                                html.Span(id='short-pair-header', children='Short Pair', style={"fontWeight": "bold", "fontSize": "1.1rem"})
+                            ], className='mt-3 mb-2'),
                             html.Div(id='trigger-days-short'),
                             html.Div(id='win-ratio-short'),
                             html.Div(id='avg-daily-capture-short'),
@@ -1282,7 +1733,15 @@ app.layout = html.Div(
                             html.Div(id='performance-expectation'),
                             html.Div(id='confidence-percentage'),
                             html.Div(id='trading-recommendations'),
-                            html.Div(id='processing-status')  # For showing processing status
+                            html.Div(id='processing-status'),  # For showing processing status
+                            dbc.Progress(
+                                id="processing-progress-bar",
+                                value=0,
+                                striped=True,
+                                animated=True,
+                                className="mt-2",
+                                style={"height": "20px", "display": "none"}
+                            )
                         ]),
                         id='strategy-collapse',
                         is_open=False
@@ -1294,7 +1753,10 @@ app.layout = html.Div(
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader('Select Secondary Ticker Symbol(s)'),
+                    dbc.CardHeader([
+                        html.I(className="fas fa-link me-2"),
+                        'Select Secondary Ticker Symbol(s)'
+                    ], style={"color": "#80ff00"}),
                     dbc.CardBody([
                         dbc.Input(id='secondary-ticker-input', placeholder='Enter comma-separated tickers (e.g., MSFT, AMZN, ^GSPC)', type='text', debounce=True),
                         dbc.FormFeedback(id='secondary-ticker-input-feedback', className='text-danger')
@@ -1314,7 +1776,7 @@ app.layout = html.Div(
                 ),
                 dcc.Loading(
                     id="loading-secondary-capture",
-                    type="default",
+                    type="circle",
                     children=[
                         dcc.Graph(
                             id='secondary-capture-chart',
@@ -1331,7 +1793,10 @@ app.layout = html.Div(
                             )
                         ),
                         dbc.Card([
-                            dbc.CardHeader('Signal Following Metrics'),
+                            dbc.CardHeader([
+                                html.I(className="fas fa-chart-bar me-2"),
+                                'Signal Following Metrics'
+                            ], style={"color": "#80ff00"}),
                             dbc.CardBody([
                                 dash_table.DataTable(
                                     id='secondary-metrics-table',
@@ -1432,12 +1897,19 @@ app.layout = html.Div(
                                         )
                                     ], className='mb-2', id={'type': 'primary-ticker-row', 'index': 0})
                                 ], id='primary-tickers-container'),
-                                dbc.Button('Add Primary Ticker', id='add-primary-button', color='success', size='sm', className='mt-2')
+                                dbc.Button(
+                                    [html.I(className="fas fa-plus me-2"), 'Add Primary Ticker'], 
+                                    id='add-primary-button', 
+                                    color='success', 
+                                    size='sm', 
+                                    className='mt-2',
+                                    style={"boxShadow": "0 0 10px rgba(0, 255, 65, 0.5)"}
+                                )
                             ], className='mb-3'),
                             # Results Display for Multi-Primary Aggregator
                             dcc.Loading(
                                 id="loading-multi-primary",
-                                type="default",
+                                type="circle",
                                 children=[
                                     dcc.Graph(
                                         id='multi-primary-chart',
@@ -1454,7 +1926,10 @@ app.layout = html.Div(
                                         )
                                     ),
                                     dbc.Card([
-                                        dbc.CardHeader('Aggregated Signal Performance'),
+                                        dbc.CardHeader([
+                                            html.I(className="fas fa-chart-pie me-2"),
+                                            'Aggregated Signal Performance'
+                                        ], style={"color": "#80ff00"}),
                                         dbc.CardBody([
                                             dash_table.DataTable(
                                                 id='multi-primary-metrics-table',
@@ -1502,20 +1977,29 @@ app.layout = html.Div(
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader('Enter Tickers to Batch Process'),
+                    dbc.CardHeader([
+                        html.I(className="fas fa-tasks me-2"),
+                        'Enter Tickers to Batch Process'
+                    ], style={"color": "#80ff00"}),
                     dbc.CardBody([
                         dbc.Textarea(
                             id='batch-ticker-input',
                             placeholder='Enter ticker symbols separated by commas (e.g., AAPL, MSFT, GOOG)',
                             style={'width': '100%', 'height': '100px'}
                         ),
-                        dbc.Button('Process Tickers', id='batch-process-button', color='primary', className='mt-2'),
+                        dbc.Button(
+                            [html.I(className="fas fa-play me-2"), 'Process Tickers'], 
+                            id='batch-process-button', 
+                            color='primary', 
+                            className='mt-2',
+                            style={"boxShadow": "0 0 15px rgba(128, 255, 0, 0.5)"}
+                        ),
                         dbc.FormFeedback(id='batch-ticker-input-feedback', className='text-danger')
                     ])
                 ], className='mb-3'),
                 dcc.Loading(
                     id="loading-batch-process",
-                    type="default",
+                    type="circle",
                     children=[
                         dash_table.DataTable(
                             id='batch-process-table',
@@ -1561,7 +2045,10 @@ app.layout = html.Div(
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader('Optimize Primary Signals for Secondary Ticker'),
+                    dbc.CardHeader([
+                        html.I(className="fas fa-magic me-2"),
+                        'Optimize Primary Signals for Secondary Ticker'
+                    ], style={"color": "#80ff00"}),
                     dbc.CardBody([
                         # Input for secondary ticker (Signal Follower)
                         html.Div([
@@ -1584,7 +2071,13 @@ app.layout = html.Div(
                             ),
                         ]),
                         # Button to start optimization
-                        dbc.Button('Optimize Signals', id='optimize-signals-button', color='primary', className='mt-2'),
+                        dbc.Button(
+                            [html.I(className="fas fa-magic me-2"), 'Optimize Signals'], 
+                            id='optimize-signals-button', 
+                            color='primary', 
+                            className='mt-2',
+                            style={"boxShadow": "0 0 15px rgba(128, 255, 0, 0.5)"}
+                        ),
                         # Feedback message
                         html.Div(id='optimization-feedback', className='text-danger mt-2'),
                     ])
@@ -1592,7 +2085,7 @@ app.layout = html.Div(
                 # Loading spinner and results table for optimization
                 dcc.Loading(
                     id="loading-optimization",
-                    type="default",
+                    type="circle",
                     children=[
                         # Table to display results
                         dash_table.DataTable(
@@ -1673,12 +2166,42 @@ app.layout = html.Div(
         # Loading spinner output (if needed)
         dcc.Loading(
             id="loading-spinner",
-            type="default",
+            type="circle",
+            color="#80ff00",
             children=[html.Div(id="loading-spinner-output")]
         ),
+        # Notification container
+        html.Div(id="notification-container", style={
+            "position": "fixed",
+            "top": "80px",
+            "right": "20px",
+            "zIndex": "1001",
+            "maxWidth": "400px"
+        }),
+        # Enhanced Footer
+        html.Hr(style={"borderColor": "#80ff00", "borderWidth": "2px", "opacity": "0.5", "marginTop": "50px"}),
+        html.Div([
+            html.P([
+                html.I(className="fas fa-atom me-2", style={"animation": "spin 6s linear infinite"}),
+                "PRJCT9 | Advanced Trading Analysis Platform",
+                html.Span(" | ", style={"color": "#666"}),
+                "Built by ", html.Strong("Rebel Atom LLC", style={"color": "#80ff00"})
+            ], className="text-center", style={"color": "#80ff00", "fontSize": "14px"}),
+            html.P([
+                "© 2025 Rebel Atom LLC. All rights reserved. ",
+                html.Span("Version 2.0", className="badge bg-success ms-2")
+            ], className="text-center text-muted", style={"fontSize": "12px", "marginTop": "10px"})
+        ], style={"marginBottom": "30px"})
     ]
 )
 
+# ============================================================================
+# CALLBACKS - UI INTERACTION HANDLERS
+# ============================================================================
+
+# -----------------------------------------------------------------------------
+# Ticker and SMA Display Callbacks
+# -----------------------------------------------------------------------------
 @app.callback(
     Output('max-sma-day-display', 'children'),
     [Input('ticker-input', 'value')]
@@ -1726,8 +2249,8 @@ def update_sma_labels(ticker, n_intervals):
     labels = [
         f"Enter 1st SMA Day (1-{trading_days}) for Buy Pair:",
         f"Enter 2nd SMA Day (1-{trading_days}) for Buy Pair:",
-        f"Enter 3rd SMA Day (1-{trading_days}) for Short Pair:",
-        f"Enter 4th SMA Day (1-{trading_days}) for Short Pair:"
+        f"Enter 1st SMA Day (1-{trading_days}) for Short Pair:",
+        f"Enter 2nd SMA Day (1-{trading_days}) for Short Pair:"
     ]
 
     return max_values + labels
@@ -1840,20 +2363,26 @@ def validate_ticker_input(ticker):
         return 'Please enter a ticker symbol.', False, True
 
     ticker = normalize_ticker(ticker)
+    
+    # Ticker input will be logged when processing starts
+    
     df = fetch_data(ticker)
     
     if df is None or df.empty:
+        logger.error(f"Invalid ticker '{ticker}' - no data available from yfinance")
         return f"Invalid ticker '{ticker}' entered. Please enter a valid yfinance ticker.", False, True
 
     results = get_data(ticker, MAX_SMA_DAY)
     if results is None:
+        # Data loading message already shown in precompute_results
         return 'Loading data...', False, False
+    else:
+        logger.info(f"{Colors.OKGREEN}[✅] Data ready for {ticker.upper()}{Colors.ENDC}")
 
     return '', True, False
 
 def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs):
     logger.info("Calculating cumulative combined capture")
-    logger.info(f"Number of trading days: {len(df)}")
 
     if not daily_top_buy_pairs or not daily_top_short_pairs:
         logger.warning("No daily top pairs available for processing cumulative combined captures.")
@@ -1930,7 +2459,10 @@ def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_sho
                     tqdm.write(f"Day {i+1}: Top Buy Pair: {current_buy_pair}, Top Short Pair: {current_short_pair}, Cumulative Capture: {current_capture:.2f}%")
 
                 pbar.update(1)
-
+    
+    # Add line break after progress bar
+    logger.info("")
+    
     # After the loop, print a summary
     logger.info("Cumulative Capture Summary:")
     logger.info(f"Date range: {dates[0]} to {dates[-1]}")
@@ -2049,7 +2581,7 @@ def load_and_prepare_data(ticker):
     cumulative_combined_captures = results.get('cumulative_combined_captures', pd.Series())
     active_pairs = results.get('active_pairs', [])
     
-    logger.info(f"Loaded preprocessed_data with {len(df)} trading days.")
+    # Silent load - no logging in callback
     
     # Only calculate if not already present in results
     if 'cumulative_combined_captures' not in results or 'active_pairs' not in results:
@@ -2063,6 +2595,9 @@ def load_and_prepare_data(ticker):
     
     return results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs
 
+# -----------------------------------------------------------------------------
+# Chart Update Callbacks
+# -----------------------------------------------------------------------------
 @app.callback(
     Output('combined-capture-chart', 'figure'),
     [Input('ticker-input', 'value'),
@@ -2153,7 +2688,8 @@ def update_combined_capture_chart(ticker, n_intervals):
     else:
         data.loc[data.index[-1], 'active_pair_next'] = "None"
 
-    print(f"Sample data rows:\n{data.head(10)}\n{data.tail(10)}")
+    # Commented out sample data display to reduce log clutter
+    # logger.debug(f"Sample data rows:\n{data.head(10)}\n{data.tail(10)}")
 
     # Calculate the active pair for the upcoming trading session
     last_date = df.index[-1]
@@ -2181,11 +2717,7 @@ def update_combined_capture_chart(ticker, n_intervals):
     else:
         next_active_pair = "None"
     
-    logger.info("")
-    log_separator()
-    logger.info(f"Active Pair for Upcoming Trading Session: {next_active_pair}")
-    log_separator()
-    logger.info("")
+    # Active pair info will be shown in statistical analysis section
 
     fig = go.Figure()
 
@@ -2282,9 +2814,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
         cumulative_combined_captures = results['cumulative_combined_captures']
         active_pairs = results['active_pairs']
 
-        logger.info(f"Number of trading days: {len(df)}")
-        logger.info(f"Number of daily top buy pairs: {len(daily_top_buy_pairs)}")
-        logger.info(f"Number of daily top short pairs: {len(daily_top_short_pairs)}")
+        # Data already loaded - no logging needed in callback
 
         fig = go.Figure()
 
@@ -2892,15 +3422,16 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                     '95%': p_value < 0.05,
                     '99%': p_value < 0.01
                 }
-                logger.info("\nStatistical Significance Analysis:")
-                logger.info(f"t-Statistic: {t_statistic:.4f}")
-                logger.info(f"p-Value: {p_value:.4f}")
-                logger.info(f"Degrees of Freedom: {degrees_of_freedom}")
-                logger.info("Confidence Levels:")
+                log_subsection("Statistical Significance Analysis")
+                log_metric("t-Statistic", f"{t_statistic:.4f}")
+                log_metric("p-Value", f"{p_value:.4f}")
+                log_metric("Degrees of Freedom", degrees_of_freedom)
+                logger.info("")
+                logger.info(f"{Colors.CYAN}Confidence Levels:{Colors.ENDC}")
                 for level, significant in confidence_levels.items():
                     status = 'Significant' if significant else 'Not Significant'
-                    logger.info(f"  {level} Confidence: {status}")
-                logger.info("\n")
+                    color = Colors.BRIGHT_GREEN if significant else Colors.ORANGE
+                    logger.info(f"  {Colors.OKBLUE}{level} Confidence:{Colors.ENDC} {color}{status}{Colors.ENDC}")
             else:
                 t_statistic = None
                 p_value = None
@@ -3016,10 +3547,11 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             'recommendation': recommendation
         })
 
+    logger.info("")  # Line break before section
     log_section("Forecast Recommendations")
     for pred in predictions:
-        logger.info(f"Range: {pred['price_range']}, Signal: {pred['signal']}, Recommendation: {pred['recommendation']}")
-    logger.info("\n")
+        logger.info(f"  💵 {pred['price_range']:<20} → {pred['signal']:<12} [{pred['recommendation']}]")
+    logger.info("")  # Clean line break
 
     trading_recommendations = [
         html.Div([
@@ -3157,7 +3689,9 @@ def update_dynamic_strategy_display(ticker, n_intervals):
      Output('trigger-days-short', 'children'),
      Output('win-ratio-short', 'children'),
      Output('avg-daily-capture-short', 'children'),
-     Output('total-capture-short', 'children')],
+     Output('total-capture-short', 'children'),
+     Output('buy-pair-header', 'children'),
+     Output('short-pair-header', 'children')],
     [Input('ticker-input', 'value'),
      Input('sma-input-1', 'value'),
      Input('sma-input-2', 'value'),
@@ -3175,7 +3709,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', ''
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results'
 
     df = fetch_data(ticker)
     if df is None or df.empty:
@@ -3192,7 +3726,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', ''
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results'
         
     # Create base figure with just the price chart
     fig = go.Figure()
@@ -3228,7 +3762,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                 tickfont=dict(color='#80ff00')
             )
         )
-        return fig, '', '', '', '', '', '', '', ''
+        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results'
 
     min_date = df.index.min()
     max_date = df.index.max()
@@ -3339,7 +3873,11 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         )
     )
 
-    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short
+    # Create header labels with the actual pair values
+    buy_pair_header = f"Buy Pair ({sma_day_1}, {sma_day_2}) Results" if sma_day_1 and sma_day_2 else "Buy Pair Results"
+    short_pair_header = f"Short Pair ({sma_day_3}, {sma_day_4}) Results" if sma_day_3 and sma_day_4 else "Short Pair Results"
+    
+    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header
 
 @app.callback(
     Output('update-interval', 'disabled'),
@@ -3356,22 +3894,7 @@ def disable_interval_when_data_loaded(ticker, n_intervals):
     else:
         return False  # Keep interval running while processing
     
-def print_timing_summary(ticker):
-    results = _precomputed_results_cache.get(ticker)
-    if results and 'section_times' in results and 'start_time' in results:
-        section_times = results['section_times']
-        start_time = results['start_time']
-        
-        total_time = time.time() - start_time
-        hours, rem = divmod(total_time, 3600)
-        minutes, seconds = divmod(rem, 60)
-        
-        log_section("Processing Time Summary")
-        for section, time_taken in section_times.items():
-            logger.info(f"{section}: {time_taken:.2f} seconds")
-        logger.info(f"Total processing time for {ticker}: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
-        logger.info("=" * 80)
-        logger.info("Load complete. Data is now available in the Dash app.")
+# Removed duplicate print_timing_summary - using the one defined earlier
 
 @app.callback(
     [Output("loading-spinner-output", "children"),
@@ -4093,6 +4616,9 @@ all_tickers = set()
 processing_thread = None
 processing_lock = threading.Lock()
 
+# -----------------------------------------------------------------------------
+# Batch Processing and Optimization Callbacks
+# -----------------------------------------------------------------------------
 @app.callback(
     [Output('batch-process-table', 'data'),
      Output('batch-ticker-input-feedback', 'children')],
@@ -4966,6 +5492,106 @@ def toggle_help_modal(n1, n2, is_open):
         return not is_open
     return is_open
 
+# Removed redundant test callback - ticker submission is already logged in validate_ticker_input
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 if __name__ == "__main__":
-    # Run the Dash app
-    app.run_server(debug=True)
+    import signal
+    import atexit
+    
+    # Handler for graceful shutdown
+    def signal_handler(sig, frame):
+        logger.info(f"\n{Colors.YELLOW}[🛑] Shutting down server...{Colors.ENDC}")
+        logger.info(f"{Colors.CYAN}[👋] Thank you for using PRJCT9!{Colors.ENDC}")
+        sys.exit(0)
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Only show startup header once (not in the reloader process)
+    import os
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        # This is the parent process, show the header
+        logger.info(Colors.NEON_GREEN + Colors.BOLD + "\n" + "═" * 80 + Colors.ENDC)
+        logger.info("")
+        # Cool box-drawing art for PRJCT9
+        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ██████╗ ██████╗      ██╗ ██████╗████████╗ █████╗ ".center(80) + Colors.ENDC)
+        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ██╔══██╗██╔══██╗     ██║██╔════╝╚══██╔══╝██╔══██╗".center(80) + Colors.ENDC)
+        logger.info(Colors.NEON_GREEN + Colors.BOLD + "    ██████╔╝██████╔╝     ██║██║        ██║   ╚██████║".center(80) + Colors.ENDC)
+        logger.info(Colors.NEON_GREEN + Colors.BOLD + "    ██╔═══╝ ██╔══██╗██   ██║██║        ██║    ╚═══██║".center(80) + Colors.ENDC)
+        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ██║     ██║  ██║╚█████╔╝╚██████╗   ██║    █████╔╝".center(80) + Colors.ENDC)
+        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ╚═╝     ╚═╝  ╚═╝ ╚════╝  ╚═════╝   ╚═╝    ╚════╝ ".center(80) + Colors.ENDC)
+        logger.info("")
+        logger.info(Colors.YELLOW + "Advanced Trading Analysis Platform".center(80) + Colors.ENDC)
+        logger.info(Colors.CYAN + "Built by Rebel Atom LLC".center(80) + Colors.ENDC)
+        logger.info("")
+        logger.info(Colors.NEON_GREEN + Colors.BOLD + "═" * 80 + "\n" + Colors.ENDC)
+        
+        log_processing("Starting Dash server...")
+        logger.info(f"{Colors.CYAN}[🌐] Server URL: {Colors.YELLOW}http://127.0.0.1:8050{Colors.ENDC}")
+        logger.info(f"{Colors.CYAN}[🛑] Stop server: {Colors.YELLOW}Press Ctrl+C{Colors.ENDC}")
+        logger.info(Colors.DIM_GREEN + "─" * 80 + Colors.ENDC + "\n")
+    
+    # Run with debug=False to see console output properly
+    # Set debug=True if you need hot reloading
+    debug_mode = os.environ.get('DASH_DEBUG', 'False').lower() == 'true'
+    
+    # Define cleanup function
+    def cleanup_server():
+        logger.info(f"\n{Colors.YELLOW}[⚡] Shutting down server...{Colors.ENDC}")
+        try:
+            # Kill any process using port 8050
+            if sys.platform == 'win32':
+                os.system('netstat -ano | findstr :8050 > temp_port.txt 2>nul')
+                try:
+                    with open('temp_port.txt', 'r') as f:
+                        lines = f.readlines()
+                    os.remove('temp_port.txt')
+                    for line in lines:
+                        if 'LISTENING' in line:
+                            parts = line.strip().split()
+                            pid = parts[-1]
+                            if pid.isdigit():
+                                os.system(f'taskkill /F /PID {pid} >nul 2>&1')
+                except:
+                    pass
+            
+            # Force terminate all daemon threads
+            os._exit(0)
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+        finally:
+            logger.info(f"{Colors.GREEN}[✓] Server shutdown complete{Colors.ENDC}")
+    
+    # Register cleanup handlers
+    def signal_handler(signum, frame):
+        cleanup_server()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    if sys.platform == 'win32':
+        signal.signal(signal.SIGBREAK, signal_handler)
+    
+    atexit.register(cleanup_server)
+    
+    try:
+        # Suppress Flask's startup message
+        import click
+        import werkzeug
+        # Override both click.echo and werkzeug logging
+        click.echo = lambda *args, **kwargs: None
+        werkzeug._internal._log = lambda *args, **kwargs: None
+        
+        # Suppress Dash's startup message
+        import dash._utils
+        dash._utils.print = lambda *args, **kwargs: None
+        
+        app.run_server(debug=debug_mode, host='127.0.0.1', port=8050, use_reloader=False)
+    except KeyboardInterrupt:
+        cleanup_server()
+    except Exception as e:
+        logger.error(f"Server error: {str(e)}")
+        cleanup_server()
