@@ -33,3 +33,20 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Ignore MCP server container directory
+mcp-server/
+
+# Ignore JetBrains (IntelliJ/PyCharm) project configuration
+.idea/
+*.iml
+misc.xml
+.keep
+
+# Ignore notebooks and large data files
+*.ipynb
+*.csv
+*.zip
+
+# Ignore all Markdown files
+*.md
