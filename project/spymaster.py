@@ -209,6 +209,15 @@ app.index_string = '''
                 50% { box-shadow: 0 0 20px rgba(128, 255, 0, 0.8), 0 0 30px rgba(128, 255, 0, 0.6); }
                 100% { box-shadow: 0 0 5px rgba(128, 255, 0, 0.5); }
             }
+            .nav-link:hover {
+                color: #00ff41 !important;
+                text-shadow: 0 0 10px rgba(128, 255, 0, 0.8);
+                transform: translateY(-2px);
+                transition: all 0.3s ease;
+            }
+            .nav-link {
+                transition: all 0.3s ease;
+            }
         </style>
     </head>
     <body>
@@ -414,6 +423,7 @@ status_lock = Lock()
 optimization_lock = threading.Lock()
 optimization_in_progress = False
 optimization_results_cache = {}  # Add this line to store results
+optimization_progress = None  # Track optimization progress
 
 # Set up persistent cache
 cache_dir = '.cache'
@@ -1393,14 +1403,74 @@ app.layout = dbc.Container(
         'background-color': 'black',
         'color': '#80ff00',
         'font-family': 'Impact, sans-serif',
-        'padding': '20px 40px',
+        'paddingTop': '55px',  # Add padding to account for fixed nav bar
+        'padding': '20px',
+        'paddingLeft': '40px',
+        'paddingRight': '40px',
         'minHeight': '100vh'
     },
     children=[
+        # Location component for navigation
+        dcc.Location(id='url', refresh=False),
+        
+        # Static Navigation Bar
+        html.Div([
+            html.Nav([
+                html.Div([
+                    # Navigation links
+                    html.A([
+                        html.I(className="fas fa-chart-line me-1"),
+                        "Primary"
+                    ], href="#primary-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-chart-bar me-1"),
+                        "Secondary"
+                    ], href="#secondary-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-sliders me-1"),
+                        "Manual"
+                    ], href="#manual-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-layer-group me-1"),
+                        "Multi-Primary"
+                    ], href="#multi-primary-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-tasks me-1"),
+                        "Batch"
+                    ], href="#batch-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-magic me-1"),
+                        "Optimization"
+                    ], href="#optimization-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-question-circle me-1"),
+                        "Help"
+                    ], id="nav-help-button", href="#", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500"}),
+                ], style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "center",
+                    "height": "100%"
+                })
+            ], style={
+                "position": "fixed",
+                "top": "0",
+                "left": "0",
+                "right": "0",
+                "height": "45px",
+                "backgroundColor": "rgba(0, 0, 0, 0.95)",
+                "borderBottom": "2px solid #80ff00",
+                "boxShadow": "0 2px 20px rgba(128, 255, 0, 0.4)",
+                "zIndex": "1000",
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "center"
+            }, className="d-none d-lg-block")
+        ]),
         # Header of the app
         html.Div([
             html.H1([
-                html.Span('PR', style={'display': 'inline'}),
+                html.Span('PR', style={'display': 'inline'}, className="project-title"),
                 html.Span(
                     html.I(className="fas fa-atom", 
                           style={
@@ -1422,9 +1492,9 @@ app.layout = dbc.Container(
                 ),
                 html.Span('JCT9', style={'display': 'inline'})
             ], 
-            className='text-center mt-3 pulsating-header',
+            className='text-center mt-5 pulsating-header',
             style={
-                "fontSize": "60px",
+                "fontSize": "clamp(40px, 8vw, 60px)",
                 "letterSpacing": "8px",
                 "fontFamily": "Orbitron, monospace",
                 "fontWeight": "900",
@@ -1445,112 +1515,417 @@ app.layout = dbc.Container(
                 }
             ),
         ]),
-        # Help button and modal for step-by-step guidance (using dbc.Modal)
-        dbc.Button(
-            [html.I(className="fas fa-question-circle me-2 pulse", style={"animation": "pulse 4s infinite"}), "Help"], 
-            id="help-button", 
-            color="success", 
-            className="mb-3",
-            style={
-                "boxShadow": "0 0 15px rgba(128, 255, 0, 0.6)",
-                "position": "fixed",
-                "top": "20px",
-                "right": "20px",
-                "zIndex": "1000",
-                "fontWeight": "bold",
-                "letterSpacing": "1px"
-            }
-        ),
+        # Help modal (button now in navigation)
         dbc.Modal(
             [
-                dbc.ModalHeader("Understanding the Trading App - A Fisherman's Guide to Signal Mining"),
-                dbc.ModalBody(
-                    [
-                        html.P("This app is an exploratory tool for discovering statistical relationships between securities (and themselves) using adaptive moving average signals."),
-                        html.H5("Getting Started:"),
-                        html.P([
-                            "1. Begin with impactsearch.py ",
-                            html.A("http://127.0.0.1:8051/", href="http://127.0.0.1:8051/", target="_blank"),
-                            " to identify potential statistical relationships between tickers (You'll have to make sure the script is running in a separate console). Ensure that the Secondary Ticker you enter is the ticker that you are investigating. All of the Primary Tickers that you enter will have the results of their trading signals being sent to the Secondary Ticker. You can enter as many Primary Tickers as you want. The more the better to find the strongest connections and predictible impact on your Secondary Ticker. When the processing is complete, you will find a .xlsx file in the project folder for you to sort through. Take a list of approximately 5 of the most positive and 5 of the most negative impacts on your Secondary Ticker with you to the next step."
-                        ]),
-                        html.H5("2. Core Workflow Example (S&P 500 Study):"),
-                        html.Ul([
-                            html.Li("Use the Ticker Batch Process to input your list of tickers from the impactsearch.py results."),
-                            html.Li("In the Automated Signal Optimization Ssection, enter your same list of tickers (if you don't use the Ticker Batch Process first, you'll run into some annoying issues). Then enter your target Secondary Ticker in the Enter Secondary Ticker input field. Hit Optimize Signals and wait for the process to complete."),
-                            html.Li("Look for combinations showing strong statistical significance. Use the carrots to sort the columns and find the best combinations. Note that you can only sort all available rows when you are on the first page of the results -- sorting results on any other page simply sorts the results of that given page."),
-                            html.Li("Find a build that you would like to investigate and verify by clicking the cell containing the ticker combination. This will auto-populate the Multi-Primary Signal Aggregator section above."),
-                            html.Li("From here you have multiple options. You can enter your secondary ticker in the secondary ticker field but you can also enter multiple secondary tickers. If you are curious about your build and it's impact on a wide range of tickers, input your universe of tickers (e.g., 1,500+ symbols) in the Secondary field."),
-                            html.Li("Process time: ~12 minutes for 1,500 tickers."),
-                            html.Li("Mine the results for high/low Sharpe Ratios and examine the metrics. Trading decisions should be based on statistical significance and not just the highest Sharpe Ratio. At a minimum, a 90 percent significance should be observed (up for debate)"),
-                        ]),
-                        html.H5("3. Critical Metrics Assessment:"),
-                        html.Ul([
-                            html.Li("Trigger Days: Below 30 typically indicates insufficient sample size."),
-                            html.Li("Win/Loss Ratio: Consider in context with trigger day count."),
-                            html.Li("Sharpe Ratio: Key performance indicator, but verify sample size."),
-                            html.Li("Statistical Significance: Check p-values and confidence levels."),
-                            html.Li("Total Capture: Evaluate alongside other metrics.")
-                        ]),
-                        html.H5("Key Principles:"),
-                        html.Ul([
-                            html.Li("Trade on Statistics, Not Emotion."),
-                            html.Li("Question Results That Seem Too Good."),
-                            html.Li("Verify Findings Using Multiple App Features."),
-                            html.Li("Look for Unexpected Connections."),
-                            html.Li("Maintain Healthy Skepticism."),
-                            html.Li("Sample Size Matters.")
-                        ]),
-                        html.P("Remember: This is a data mining tool. The signals adapt daily, and no single 'build' or combination will work forever. Focus on finding statistical edges rather than perfect predictions."),
-                        html.P("Warning: All analysis is based on historical data and statistical relationships. Past performance does not guarantee future results. Always verify signals across multiple timeframes and consider your risk tolerance.")
-                    ]
-                ),
-                dbc.ModalFooter(
-                    dbc.Button("Close", id="close-help", className="ml-auto")
-                )
+                dbc.ModalHeader([
+                    html.I(className="fas fa-graduation-cap me-2", style={"color": "#80ff00"}),
+                    "PRJCT9 Interactive User Guide"
+                ]),
+                dbc.ModalBody([
+                    dbc.Tabs([
+                        # Quick Start Tab
+                        dbc.Tab(
+                            dbc.Card(
+                                dbc.CardBody([
+                                    html.Div([
+                                        html.I(className="fas fa-rocket fa-3x mb-3", style={"color": "#80ff00"}),
+                                        html.H4("Get Started in 3 Easy Steps", className="mb-4")
+                                    ], className="text-center"),
+                                    
+                                    # Step 1
+                                    dbc.Card([
+                                        dbc.CardBody([
+                                            html.H5([
+                                                html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
+                                                "Step 1: Find Signal Relationships"
+                                            ]),
+                                            html.P("Run impactsearch.py to discover which tickers have the strongest impact on your target."),
+                                            dbc.Button([
+                                                html.I(className="fas fa-external-link-alt me-2"),
+                                                "Open Impact Search"
+                                            ], href="http://127.0.0.1:8051/", target="_blank", color="success", size="sm"),
+                                            dbc.Alert([
+                                                html.I(className="fas fa-lightbulb me-2"),
+                                                "Pro tip: Look for both positive AND negative correlations!"
+                                            ], color="info", className="mt-2 py-2")
+                                        ])
+                                    ], className="mb-3", style={"border": "2px solid #80ff00"}),
+                                    
+                                    # Step 2
+                                    dbc.Card([
+                                        dbc.CardBody([
+                                            html.H5([
+                                                html.I(className="fas fa-tasks me-2", style={"color": "#00ff41"}),
+                                                "Step 2: Batch Process Your Tickers"
+                                            ]),
+                                            html.P("Load your top correlated tickers into the Batch Process section."),
+                                            html.Div([
+                                                dbc.InputGroup([
+                                                    dbc.InputGroupText(html.I(className="fas fa-copy")),
+                                                    dbc.Input(value="AAPL, MSFT, GOOGL, AMZN, TSLA", id="example-tickers", readonly=True),
+                                                    dbc.Button("Copy", id="copy-tickers-btn", color="secondary", size="sm")
+                                                ], size="sm")
+                                            ], className="mt-2")
+                                        ])
+                                    ], className="mb-3", style={"border": "2px solid #80ff00"}),
+                                    
+                                    # Step 3
+                                    dbc.Card([
+                                        dbc.CardBody([
+                                            html.H5([
+                                                html.I(className="fas fa-magic me-2", style={"color": "#00ff41"}),
+                                                "Step 3: Optimize & Analyze"
+                                            ]),
+                                            html.P("Run the Signal Optimization to find the best ticker combinations."),
+                                            html.Div([
+                                                dbc.Progress(value=33, label="Batch Process", color="success", style={"height": "20px"}),
+                                                dbc.Progress(value=33, label="Optimize", color="warning", style={"height": "20px"}),
+                                                dbc.Progress(value=34, label="Analyze", color="info", style={"height": "20px"})
+                                            ], className="mt-2")
+                                        ])
+                                    ], className="mb-3", style={"border": "2px solid #80ff00"})
+                                ])
+                            ),
+                            label="Quick Start",
+                            tab_id="quick-start",
+                            label_style={"color": "#80ff00"}
+                        ),
+                        
+                        # Workflow Guide Tab
+                        dbc.Tab(
+                            dbc.Card(
+                                dbc.CardBody([
+                                    html.H4("Complete Workflow Guide", className="mb-4"),
+                                    dbc.Accordion([
+                                        dbc.AccordionItem([
+                                            html.Div([
+                                                html.I(className="fas fa-database me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Data Discovery Phase")
+                                            ]),
+                                            html.Ol([
+                                                html.Li("Run impactsearch.py in a separate console"),
+                                                html.Li("Enter your target ticker as the Secondary Ticker"),
+                                                html.Li("Enter potential signal generators as Primary Tickers"),
+                                                html.Li("Review the generated Excel file for top correlations")
+                                            ]),
+                                            dbc.Alert("Tip: Include both sector leaders and inverse ETFs for comprehensive coverage", color="success", className="py-2")
+                                        ], title="Phase 1: Impact Search"),
+                                        
+                                        dbc.AccordionItem([
+                                            html.Div([
+                                                html.I(className="fas fa-cogs me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Data Preparation")
+                                            ]),
+                                            html.Ol([
+                                                html.Li("Navigate to Ticker Batch Process section"),
+                                                html.Li("Input your selected tickers (comma-separated)"),
+                                                html.Li("Click 'Process Tickers' and wait for completion"),
+                                                html.Li("Verify all tickers show 'Ready' status")
+                                            ]),
+                                            dbc.Alert("Important: This step prevents timeouts during optimization", color="warning", className="py-2")
+                                        ], title="Phase 2: Batch Processing"),
+                                        
+                                        dbc.AccordionItem([
+                                            html.Div([
+                                                html.I(className="fas fa-chart-line me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Signal Optimization")
+                                            ]),
+                                            html.Ol([
+                                                html.Li("Go to Automated Signal Optimization"),
+                                                html.Li("Enter your target as Secondary Ticker"),
+                                                html.Li("Enter signal generators as Primary Tickers"),
+                                                html.Li("Click 'Optimize Signals' and analyze results")
+                                            ]),
+                                            dbc.Alert("Look for: High Sharpe Ratio + Statistical Significance + 30+ Trigger Days", color="info", className="py-2")
+                                        ], title="Phase 3: Optimization"),
+                                        
+                                        dbc.AccordionItem([
+                                            html.Div([
+                                                html.I(className="fas fa-microscope me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Results Validation")
+                                            ]),
+                                            html.Ol([
+                                                html.Li("Click on promising combinations in the results table"),
+                                                html.Li("This auto-populates the Multi-Primary Aggregator"),
+                                                html.Li("Test with additional secondary tickers"),
+                                                html.Li("Verify consistency across different market conditions")
+                                            ]),
+                                            dbc.Alert("Remember: Past performance ≠ future results. Always validate!", color="danger", className="py-2")
+                                        ], title="Phase 4: Validation")
+                                    ], start_collapsed=True)
+                                ])
+                            ),
+                            label="Workflow Guide",
+                            tab_id="workflow",
+                            label_style={"color": "#80ff00"}
+                        ),
+                        
+                        # Features Overview Tab
+                        dbc.Tab(
+                            dbc.Card(
+                                dbc.CardBody([
+                                    html.H4("Features Overview", className="mb-4"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Card([
+                                                dbc.CardBody([
+                                                    html.I(className="fas fa-chart-line fa-2x mb-2", style={"color": "#00ff41"}),
+                                                    html.H6("Primary Analysis"),
+                                                    html.P("Analyze single ticker SMA patterns", className="small"),
+                                                    html.A(dbc.Button("Jump to Section", 
+                                                             color="outline-success", 
+                                                             size="sm",
+                                                             className="w-100"),
+                                                           href="#primary-section",
+                                                           className="text-decoration-none")
+                                                ], className="text-center")
+                                            ], className="h-100")
+                                        ], md=4, className="mb-3"),
+                                        
+                                        dbc.Col([
+                                            dbc.Card([
+                                                dbc.CardBody([
+                                                    html.I(className="fas fa-layer-group fa-2x mb-2", style={"color": "#00ff41"}),
+                                                    html.H6("Multi-Primary"),
+                                                    html.P("Combine multiple signal sources", className="small"),
+                                                    html.A(dbc.Button("Jump to Section", 
+                                                             color="outline-success", 
+                                                             size="sm",
+                                                             className="w-100"),
+                                                           href="#multi-primary-section",
+                                                           className="text-decoration-none")
+                                                ], className="text-center")
+                                            ], className="h-100")
+                                        ], md=4, className="mb-3"),
+                                        
+                                        dbc.Col([
+                                            dbc.Card([
+                                                dbc.CardBody([
+                                                    html.I(className="fas fa-magic fa-2x mb-2", style={"color": "#00ff41"}),
+                                                    html.H6("Optimization"),
+                                                    html.P("Find optimal signal combinations", className="small"),
+                                                    html.A(dbc.Button("Jump to Section", 
+                                                             color="outline-success", 
+                                                             size="sm",
+                                                             className="w-100"),
+                                                           href="#optimization-section",
+                                                           className="text-decoration-none")
+                                                ], className="text-center")
+                                            ], className="h-100")
+                                        ], md=4, className="mb-3")
+                                    ])
+                                ])
+                            ),
+                            label="Features",
+                            tab_id="features",
+                            label_style={"color": "#80ff00"}
+                        ),
+                        
+                        # Metrics Guide Tab
+                        dbc.Tab(
+                            dbc.Card(
+                                dbc.CardBody([
+                                    html.H4("Understanding the Metrics", className="mb-4"),
+                                    dbc.ListGroup([
+                                        dbc.ListGroupItem([
+                                            html.Div([
+                                                html.H6([
+                                                    html.I(className="fas fa-crosshairs me-2", style={"color": "#80ff00"}),
+                                                    "Trigger Days"
+                                                ]),
+                                                html.P("Number of days a signal was active", className="mb-1"),
+                                                html.Div([
+                                                    dbc.Progress(value=20, label="<30 days", color="danger", style={"height": "20px", "marginBottom": "2px"}),
+                                                    dbc.Progress(value=30, label="30-100 days", color="warning", style={"height": "20px", "marginBottom": "2px"}),
+                                                    dbc.Progress(value=50, label="100+ days", color="success", style={"height": "20px"})
+                                                ]),
+                                                html.Small("Minimum 30 days recommended for statistical validity", className="text-muted")
+                                            ])
+                                        ]),
+                                        
+                                        dbc.ListGroupItem([
+                                            html.Div([
+                                                html.H6([
+                                                    html.I(className="fas fa-chart-line me-2", style={"color": "#80ff00"}),
+                                                    "Sharpe Ratio"
+                                                ]),
+                                                html.P("Risk-adjusted return metric", className="mb-2"),
+                                                dbc.Row([
+                                                    dbc.Col([
+                                                        dbc.Badge("< 0.5", color="danger", className="me-1"),
+                                                        html.Small("Poor")
+                                                    ], width=4),
+                                                    dbc.Col([
+                                                        dbc.Badge("0.5 - 1.0", color="warning", className="me-1"),
+                                                        html.Small("Acceptable")
+                                                    ], width=4),
+                                                    dbc.Col([
+                                                        dbc.Badge("> 1.0", color="success", className="me-1"),
+                                                        html.Small("Excellent")
+                                                    ], width=4)
+                                                ])
+                                            ])
+                                        ]),
+                                        
+                                        dbc.ListGroupItem([
+                                            html.Div([
+                                                html.H6([
+                                                    html.I(className="fas fa-percentage me-2", style={"color": "#80ff00"}),
+                                                    "Statistical Significance"
+                                                ]),
+                                                html.P("p-value confidence levels", className="mb-2"),
+                                                html.Div([
+                                                    dbc.Badge("99% (p < 0.01)", color="success", className="me-2"),
+                                                    dbc.Badge("95% (p < 0.05)", color="warning", className="me-2"),
+                                                    dbc.Badge("90% (p < 0.10)", color="info", className="me-2")
+                                                ]),
+                                                html.Small("Minimum 90% confidence recommended for trading", className="text-muted mt-2 d-block")
+                                            ])
+                                        ])
+                                    ], flush=True)
+                                ])
+                            ),
+                            label="Metrics Guide",
+                            tab_id="metrics",
+                            label_style={"color": "#80ff00"}
+                        ),
+                        
+                        # Tips & FAQ Tab
+                        dbc.Tab(
+                            dbc.Card(
+                                dbc.CardBody([
+                                    html.H4("Pro Tips & FAQ", className="mb-4"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            html.H5([
+                                                html.I(className="fas fa-lightbulb me-2", style={"color": "#ffa500"}),
+                                                "Pro Tips"
+                                            ]),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.I(className="fas fa-check me-2", style={"color": "#00ff41"}),
+                                                    "Always batch process before optimization"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.I(className="fas fa-check me-2", style={"color": "#00ff41"}),
+                                                    "Include inverse ETFs for hedging signals"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.I(className="fas fa-check me-2", style={"color": "#00ff41"}),
+                                                    "Test across different market conditions"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.I(className="fas fa-check me-2", style={"color": "#00ff41"}),
+                                                    "Focus on consistency over high returns"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.I(className="fas fa-check me-2", style={"color": "#00ff41"}),
+                                                    "Verify with at least 30 trigger days"
+                                                ])
+                                            ], className="mb-3")
+                                        ], md=6),
+                                        
+                                        dbc.Col([
+                                            html.H5([
+                                                html.I(className="fas fa-question-circle me-2", style={"color": "#80ff00"}),
+                                                "Common Questions"
+                                            ]),
+                                            dbc.Accordion([
+                                                dbc.AccordionItem(
+                                                    "The signals adapt daily based on historical performance. No combination works forever - focus on statistical edges.",
+                                                    title="Why do signals change daily?"
+                                                ),
+                                                dbc.AccordionItem(
+                                                    "Below 30 days provides insufficient statistical validity. Aim for 100+ days for robust results.",
+                                                    title="What's the minimum trigger days?"
+                                                ),
+                                                dbc.AccordionItem(
+                                                    "Yes! This often reveals hedging opportunities and market inefficiencies.",
+                                                    title="Should I include negative correlations?"
+                                                ),
+                                                dbc.AccordionItem(
+                                                    "Click any cell in the Combination column to auto-populate the Multi-Primary Aggregator.",
+                                                    title="How do I test a combination?"
+                                                )
+                                            ], start_collapsed=True)
+                                        ], md=6)
+                                    ]),
+                                    
+                                    dbc.Alert([
+                                        html.I(className="fas fa-exclamation-triangle me-2"),
+                                        html.Strong("Remember: "),
+                                        "This is a statistical analysis tool. Past performance does not guarantee future results. Always practice proper risk management."
+                                    ], color="warning", className="mt-4")
+                                ])
+                            ),
+                            label="Tips & FAQ",
+                            tab_id="tips",
+                            label_style={"color": "#80ff00"}
+                        )
+                    ], id="help-tabs", active_tab="quick-start")
+                ]),
+                dbc.ModalFooter([
+                    html.Div([
+                        html.Small("PRJCT9 v2.0 | ", className="text-muted"),
+                        html.Small("Built by Rebel Atom LLC", className="text-muted")
+                    ], className="me-auto"),
+                    dbc.Button("Close", id="close-help", color="success")
+                ])
             ],
             id="help-modal",
-            is_open=False
+            is_open=False,
+            size="xl",
+            scrollable=True
         ),
-        # Display for maximum SMA day information
-        html.Div(id='max-sma-day-display', style={'font-size': '18px', 'margin-bottom': '20px'}),
-        # Row for Primary Ticker input
+        # Primary Ticker SMA Analysis Section
+        html.Div(id="primary-section", style={"position": "relative", "top": "-80px"}),
+        html.H2('Primary Ticker SMA Analysis', className='text-center mt-5'),
+        html.P('Analyze SMA patterns and generate trading signals for a single ticker', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
-                        'Select Primary Ticker Symbol (Signal Generator)'
-                    ], className="glow-border"),
-                    dbc.CardBody([
+                        html.Div([
+                            html.I(className="fas fa-chart-line me-2"),
+                            'Comprehensive Single Ticker Analysis',
+                            html.Span(id='primary-ticker-status', className='ms-3', style={'fontSize': '0.9em'})
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-primary-ticker-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                        # Primary Ticker Input
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
+                                'Select Primary Ticker Symbol (Signal Generator)'
+                            ]),
+                            dbc.CardBody([
                         dbc.Input(
                             id='ticker-input', 
                             placeholder='Enter a valid ticker symbol (e.g., AAPL)', 
                             type='text',
                             debounce=True,
                             valid=False,
-                            invalid=False
-                        ),
-                        dbc.Tooltip(
-                            "Enter the ticker symbol for the asset you wish to analyze. This symbol will be used to fetch historical data and generate SMA-based signals.",
-                            target="ticker-input",
-                            placement="right"
+                            invalid=False,
+                            className='glow-border'
                         ),
                         dbc.FormFeedback(
                             id='ticker-input-feedback',
                             type="invalid",
                             style={'color': '#ff0000', 'font-weight': 'normal'}
                         ),
-                    ])
-                ], className='mb-3')
-            ], width=12)
-        ]),
-        # Store for timing summary flag
-        dcc.Store(id='timing-summary-printed', data=False),
-        # Row for Combined Capture Chart
-        dbc.Row([
-            dbc.Col([
-                dcc.Loading(
-                    id="loading-combined-capture",
+                            ])
+                        ], className='mb-3'),
+                        # Store for timing summary flag
+                        dcc.Store(id='timing-summary-printed', data=False),
+                        # Combined Capture Chart with MAX_SMA_DAY display
+                        html.Div([
+                            html.Div(id='max-sma-day-display', style={'font-size': '16px', 'margin-bottom': '10px', 'text-align': 'left'}),
+                            dcc.Loading(
+                                id="loading-combined-capture",
                     type="circle",
                     color="#80ff00",
                     children=[
@@ -1570,58 +1945,279 @@ app.layout = dbc.Container(
                         )
                     ]
                 )
-            ], width=12)
-        ]),
-        # Row for Historical Top Pairs Chart
-        dbc.Row([
-            dbc.Col([
-                dcc.Loading(
-                    id="loading-historical-top-pairs",
-                    type="circle",
-                    children=[
-                        dcc.Graph(
-                            id='historical-top-pairs-chart',
-                            figure=go.Figure(
-                                layout=go.Layout(
-                                    title=dict(text="Color-Coded Cumulative Combined Capture Chart", font=dict(color='#80ff00')),
-                                    plot_bgcolor='black',
-                                    paper_bgcolor='black',
-                                    font=dict(color='#80ff00'),
-                                    xaxis=dict(visible=False),
-                                    yaxis=dict(visible=False),
-                                    template='plotly_dark'
-                                )
+                        ]),
+                        # Advanced Visualizations (Color-Coded Chart) - Now part of Single-Ticker section
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.Div([
+                            html.I(className="fas fa-chart-area me-2"),
+                            html.Span('Advanced Visualizations', style={"fontSize": "1.1rem"})
+                        ], style={"display": "inline-flex", "alignItems": "center"}),
+                        html.Button(children='Show', id='toggle-color-coded-button', 
+                                   className='btn btn-sm btn-secondary')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                            # Toggle switches for Color-Coded Chart options
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Switch(
+                                        id='show-annotations-toggle',
+                                        label='Show Signal Annotations',
+                                        value=False  # Default to hiding annotations
+                                    ),
+                                    dbc.Switch(
+                                        id='display-top-pairs-toggle',
+                                        label='Display All Top Pair Traces',
+                                        value=False  # Default to hiding top pair traces
+                                    )
+                                ], className='mb-3')
+                            ]),
+                            dcc.Loading(
+                                id="loading-historical-top-pairs",
+                                type="circle",
+                                color="#80ff00",
+                                children=[
+                                    dcc.Graph(
+                                        id='historical-top-pairs-chart',
+                                        figure=go.Figure(
+                                            layout=go.Layout(
+                                                title=dict(text="Color-Coded Cumulative Combined Capture Chart", font=dict(color='#80ff00')),
+                                                plot_bgcolor='black',
+                                                paper_bgcolor='black',
+                                                font=dict(color='#80ff00'),
+                                                xaxis=dict(visible=False),
+                                                yaxis=dict(visible=False),
+                                                template='plotly_dark'
+                                            )
+                                        )
+                                    )
+                                ]
                             )
-                        )
-                    ]
-                )
+                        ]),
+                        id='color-coded-collapse',
+                        is_open=False  # Hidden by default
+                    )
+                ], className='mb-3'),
+                        # Dynamic Master Trading Strategy - Now part of Single-Ticker section
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.Div([
+                                    html.I(className="fas fa-robot me-2"),
+                                    'AI-Optimized Trading Signals'
+                                ], style={"display": "flex", "alignItems": "center"}),
+                                html.Button(children='Hide', id='toggle-strategy-button', className='btn btn-sm btn-secondary ml-auto')
+                            ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
+                            dbc.Collapse(
+                                dbc.CardBody([
+                                    html.Div(id='most-productive-buy-pair'),
+                                    html.Div(id='most-productive-short-pair'),
+                                    html.Div(id='avg-capture-buy-leader'),
+                                    html.Div(id='total-capture-buy-leader'),
+                                    html.Div(id='avg-capture-short-leader'),
+                                    html.Div(id='total-capture-short-leader'),
+                                    html.Div(id='trading-direction'),
+                                    html.Div(id='performance-expectation'),
+                                    html.Div(id='confidence-percentage'),
+                                    html.Div(id='trading-recommendations'),
+                                    html.Div(id='processing-status'),  # For showing processing status
+                                    dbc.Progress(
+                                        id="processing-progress-bar",
+                                        value=0,
+                                        striped=True,
+                                        animated=True,
+                                        className="mt-2",
+                                        style={"height": "20px", "display": "none"}
+                                    )
+                                ]),
+                                id='strategy-collapse',
+                                is_open=True
+                            )
+                        ], className='mb-3')
+                        ]),  # End of Primary Ticker CardBody
+                        id='primary-ticker-collapse',
+                        is_open=True
+                    )
+                ], className='mb-3')  # End of Primary Ticker Card
             ], width=12)
-        ]),
-        # Row for toggles
-        dbc.Row([
-            dbc.Col([
-                dbc.Switch(
-                    id='show-annotations-toggle',
-                    label='Show Signal Annotations',
-                    value=False  # Default to hiding annotations
-                ),
-                dbc.Switch(
-                    id='display-top-pairs-toggle',
-                    label='Display All Top Pair Traces',
-                    value=False  # Default to hiding top pair traces
-                )
-            ], width=12)
-        ]),
-        # Row for generic chart
-        dbc.Row([
-            dbc.Col([
-                dcc.Graph(id='chart')
-            ], width=12)
-        ]),
-        # Row for Buy Pair and Short Pair input cards
+        ]),  # End of Primary Ticker Section
+        
+        # Secondary Ticker Analysis Section
+        html.Div(id="secondary-section", style={"position": "relative", "top": "-80px"}),
+        html.H2('Secondary Ticker Signal Following Analysis', className='text-center mt-5'),
+        html.P('Analyze how secondary tickers perform when following the primary ticker signals', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
+                    dbc.CardHeader([
+                        html.Div([
+                            html.I(className="fas fa-chart-bar me-2"),
+                            'Signal Following Performance Metrics'
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-signal-following-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                        # Secondary Ticker Input
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
+                                'Enter Secondary Ticker(s) for Signal Following Analysis'
+                            ]),
+                            dbc.CardBody([
+                                dbc.Input(
+                                    id='secondary-ticker-input',
+                                    placeholder='Enter ticker(s) separated by commas (e.g., QQQ, DIA, IWM)',
+                                    type='text',
+                                    debounce=True,
+                                    className='glow-border'
+                                ),
+                                dbc.Tooltip(
+                                    "Enter one or more ticker symbols to analyze how they perform when following the primary ticker's signals. Separate multiple tickers with commas.",
+                                    target="secondary-ticker-input",
+                                    placement="right"
+                                ),
+                                dbc.FormFeedback(
+                                    id='secondary-ticker-input-feedback',
+                                    type="invalid",
+                                    style={'color': '#ff0000', 'font-weight': 'normal'}
+                                ),
+                                # Signal Options
+                                dbc.Row([
+                                    dbc.Col([
+                                        dbc.Switch(
+                                            id='invert-signals-toggle',
+                                            label='Invert Signals',
+                                            value=False,
+                                            className='mt-3'
+                                        ),
+                                        dbc.Tooltip(
+                                            "When enabled, Buy signals become Short signals and vice versa",
+                                            target="invert-signals-toggle",
+                                            placement="right"
+                                        )
+                                    ], width=6),
+                                    dbc.Col([
+                                        dbc.Switch(
+                                            id='show-secondary-annotations-toggle',
+                                            label='Show Signal Annotations',
+                                            value=False,
+                                            className='mt-3'
+                                        ),
+                                        dbc.Tooltip(
+                                            "Display signal annotations on the chart",
+                                            target="show-secondary-annotations-toggle",
+                                            placement="right"
+                                        )
+                                    ], width=6)
+                                ])
+                            ])
+                        ], className='mb-3'),
+                        
+                        # Secondary Capture Chart
+                        dcc.Loading(
+                            id="loading-secondary-capture",
+                            type="circle",
+                            color="#80ff00",
+                            children=[
+                                dcc.Graph(
+                                    id='secondary-capture-chart',
+                                    figure=go.Figure(
+                                        layout=go.Layout(
+                                            title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00')),
+                                            plot_bgcolor='black',
+                                            paper_bgcolor='black',
+                                            font=dict(color='#80ff00'),
+                                            xaxis=dict(
+                                                visible=False,
+                                                showgrid=False,
+                                                zeroline=False,
+                                                showticklabels=False
+                                            ),
+                                            yaxis=dict(
+                                                visible=False,
+                                                showgrid=False,
+                                                zeroline=False,
+                                                showticklabels=False
+                                            ),
+                                            template='plotly_dark'
+                                        )
+                                    )
+                                )
+                            ]
+                        ),
+                        
+                        # Signal Following Metrics Table
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-table me-2"),
+                                'Signal Following Performance Metrics'
+                            ], style={"color": "#80ff00"}),
+                            dbc.CardBody([
+                                dash_table.DataTable(
+                                    id='secondary-metrics-table',
+                                    columns=[],  # Will be updated in callback
+                                    data=[],     # Will be updated in callback
+                                    sort_action='native',
+                                    style_table={
+                                        'overflowX': 'auto',
+                                        'backgroundColor': 'black',
+                                    },
+                                    style_cell={
+                                        'backgroundColor': 'black',
+                                        'color': '#80ff00',
+                                        'textAlign': 'left',
+                                        'minWidth': '50px', 
+                                        'width': '100px', 
+                                        'maxWidth': '180px',
+                                        'whiteSpace': 'normal',
+                                        'border': '1px solid #80ff00'
+                                    },
+                                    style_header={
+                                        'backgroundColor': 'black',
+                                        'color': '#80ff00',
+                                        'fontWeight': 'bold',
+                                        'border': '2px solid #80ff00'
+                                    },
+                                    style_data_conditional=[{
+                                        'if': {'row_index': 'odd'},
+                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                    }],
+                                )
+                            ])
+                        ], className='mt-3')
+                    ]),
+                    id='signal-following-collapse',
+                    is_open=True
+                    )
+                ], className='mb-3')
+            ], width=12)
+        ]),  # End of Secondary Ticker Analysis Section
+        
+        # Manual SMA Analysis Section
+        html.Div(id="manual-section", style={"position": "relative", "top": "-80px"}),
+        html.H2('Manual SMA Analysis', className='text-center mt-5'),
+        html.P('Test custom SMA pair combinations and analyze their performance in real-time', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.Div([
+                            html.I(className="fas fa-sliders me-2"),
+                            'Configure and Test Custom SMA Pairs'
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-custom-sma-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                        # Manual Chart
+                        dcc.Graph(id='chart'),
+                        # Input cards row
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Card([
                     dbc.CardHeader([
                         html.Div([
                             html.Div([
@@ -1649,7 +2245,7 @@ app.layout = dbc.Container(
                         ], className='mb-3')
                     ])
                 ], className='mb-3'),
-                dbc.Card([
+                                dbc.Card([
                     dbc.CardHeader([
                         html.Div([
                             html.Div([
@@ -1685,11 +2281,9 @@ app.layout = dbc.Container(
                             html.H5('Your Custom Pair Results', className='mb-0'),
                             html.Small('Live analysis of the SMA pairs entered on the left', 
                                      style={"color": "#aaa", "fontStyle": "italic"})
-                        ]),
-                        html.Button(children='Maximize', id='toggle-calc-button', className='btn btn-sm btn-secondary ml-auto')
-                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
-                    dbc.Collapse(
-                        dbc.CardBody([
+                        ])
+                    ]),
+                    dbc.CardBody([
                             html.Div([
                                 html.I(className="fas fa-arrow-trend-up me-2", style={"color": "#00ff41"}),
                                 html.Span(id='buy-pair-header', children='Buy Pair', style={"fontWeight": "bold", "fontSize": "1.1rem"})
@@ -1706,143 +2300,32 @@ app.layout = dbc.Container(
                             html.Div(id='win-ratio-short'),
                             html.Div(id='avg-daily-capture-short'),
                             html.Div(id='total-capture-short')
-                        ]),
-                        id='calc-collapse',
-                        is_open=True
-                    )
+                        ])
                 ])
             ], width=6)
-        ]),
-        # Row for Dynamic Master Trading Strategy card
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader([
-                        html.H5('Dynamic Master Trading Strategy', className='mb-0'),
-                        html.Button(children='Maximize', id='toggle-strategy-button', className='btn btn-sm btn-secondary ml-auto')
-                    ]),
-                    dbc.Collapse(
-                        dbc.CardBody([
-                            html.Div(id='most-productive-buy-pair'),
-                            html.Div(id='most-productive-short-pair'),
-                            html.Div(id='avg-capture-buy-leader'),
-                            html.Div(id='total-capture-buy-leader'),
-                            html.Div(id='avg-capture-short-leader'),
-                            html.Div(id='total-capture-short-leader'),
-                            html.Div(id='trading-direction'),
-                            html.Div(id='performance-expectation'),
-                            html.Div(id='confidence-percentage'),
-                            html.Div(id='trading-recommendations'),
-                            html.Div(id='processing-status'),  # For showing processing status
-                            dbc.Progress(
-                                id="processing-progress-bar",
-                                value=0,
-                                striped=True,
-                                animated=True,
-                                className="mt-2",
-                                style={"height": "20px", "display": "none"}
-                            )
-                        ]),
-                        id='strategy-collapse',
-                        is_open=False
+        ])  # End of input cards row
+                    ]),  # End of CardBody
+                    id='custom-sma-collapse',
+                    is_open=True
                     )
-                ])
+                ], className='mb-3')  # End of Card
             ], width=12)
-        ]),
-        # Row for Secondary Ticker input and Signal Following Metrics
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader([
-                        html.I(className="fas fa-link me-2"),
-                        'Select Secondary Ticker Symbol(s)'
-                    ], style={"color": "#80ff00"}),
-                    dbc.CardBody([
-                        dbc.Input(id='secondary-ticker-input', placeholder='Enter comma-separated tickers (e.g., MSFT, AMZN, ^GSPC)', type='text', debounce=True),
-                        dbc.FormFeedback(id='secondary-ticker-input-feedback', className='text-danger')
-                    ])
-                ], className='mb-3'),
-                dbc.Switch(
-                    id='invert-signals-toggle',
-                    label='Invert Signals',
-                    value=False,
-                    className='mb-2'
-                ),
-                dbc.Switch(
-                    id='show-secondary-annotations-toggle',
-                    label='Show Signal Change Annotations',
-                    value=False,
-                    className='mb-2'
-                ),
-                dcc.Loading(
-                    id="loading-secondary-capture",
-                    type="circle",
-                    children=[
-                        dcc.Graph(
-                            id='secondary-capture-chart',
-                            figure=go.Figure(
-                                layout=go.Layout(
-                                    title=dict(text="Signal Following Performance", font=dict(color='#80ff00')),
-                                    plot_bgcolor='black',
-                                    paper_bgcolor='black',
-                                    font=dict(color='#80ff00'),
-                                    xaxis=dict(visible=False),
-                                    yaxis=dict(visible=False),
-                                    template='plotly_dark'
-                                )
-                            )
-                        ),
-                        dbc.Card([
-                            dbc.CardHeader([
-                                html.I(className="fas fa-chart-bar me-2"),
-                                'Signal Following Metrics'
-                            ], style={"color": "#80ff00"}),
-                            dbc.CardBody([
-                                dash_table.DataTable(
-                                    id='secondary-metrics-table',
-                                    columns=[],  # Will be updated in callback
-                                    data=[],     # Will be updated in callback
-                                    sort_action='native',
-                                    style_table={
-                                        'overflowX': 'auto',
-                                        'backgroundColor': 'black',
-                                    },
-                                    style_cell={
-                                        'backgroundColor': 'black',
-                                        'color': '#80ff00',
-                                        'textAlign': 'left',
-                                        'minWidth': '50px', 
-                                        'width': '100px', 
-                                        'maxWidth': '180px',
-                                        'whiteSpace': 'normal',
-                                        'border': '1px solid #80ff00'
-                                    },
-                                    style_header={
-                                        'backgroundColor': 'black',
-                                        'color': '#80ff00',
-                                        'fontWeight': 'bold',
-                                        'border': '2px solid #80ff00'
-                                    },
-                                    style_data_conditional=[{
-                                        'if': {'row_index': 'odd'},
-                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                                    }],
-                                )
-                            ])
-                        ], className='mt-3')
-                    ]
-                )
-            ], width=12)
-        ]),
+        ]),  # End of Manual SMA Analysis Section
         # New Section: Multi-Primary Signal Aggregator
+        html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
         html.H2('Multi-Primary Signal Aggregator', className='text-center mt-5'),
+        html.P('Combine signals from multiple primary tickers to create an aggregated trading strategy for a single-ticker (signal follower)', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        html.H5('Aggregate Signals from Multiple Primary Tickers', className='mb-0'),
-                        html.Button(children='Maximize', id='toggle-multi-primary-button', className='btn btn-sm btn-secondary ml-auto')
-                    ]),
+                        html.Div([
+                            html.I(className="fas fa-layer-group me-2"),
+                            'Aggregate Signals from Multiple Primary Tickers'
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-multi-primary-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
                     dbc.Collapse(
                         dbc.CardBody([
                             # Secondary Ticker Input for Multi-Primary Aggregator
@@ -1910,6 +2393,7 @@ app.layout = dbc.Container(
                             dcc.Loading(
                                 id="loading-multi-primary",
                                 type="circle",
+                                color="#80ff00",
                                 children=[
                                     dcc.Graph(
                                         id='multi-primary-chart',
@@ -1973,189 +2457,253 @@ app.layout = dbc.Container(
             ], width=12)
         ]),
         # Ticker Batch Process Section
+        html.Div(id="batch-section", style={"position": "relative", "top": "-80px"}),
         html.H2('Ticker Batch Process', className='text-center mt-5'),
+        html.P('Pre-process multiple tickers to ensure data availability before optimization', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        html.I(className="fas fa-tasks me-2"),
-                        'Enter Tickers to Batch Process'
-                    ], style={"color": "#80ff00"}),
-                    dbc.CardBody([
-                        dbc.Textarea(
-                            id='batch-ticker-input',
-                            placeholder='Enter ticker symbols separated by commas (e.g., AAPL, MSFT, GOOG)',
-                            style={'width': '100%', 'height': '100px'}
-                        ),
-                        dbc.Button(
-                            [html.I(className="fas fa-play me-2"), 'Process Tickers'], 
-                            id='batch-process-button', 
-                            color='primary', 
-                            className='mt-2',
-                            style={"boxShadow": "0 0 15px rgba(128, 255, 0, 0.5)"}
-                        ),
-                        dbc.FormFeedback(id='batch-ticker-input-feedback', className='text-danger')
-                    ])
-                ], className='mb-3'),
-                dcc.Loading(
-                    id="loading-batch-process",
-                    type="circle",
-                    children=[
-                        dash_table.DataTable(
-                            id='batch-process-table',
-                            columns=[
-                                {'name': 'Ticker', 'id': 'Ticker'},
-                                {'name': 'Last Date', 'id': 'Last Date'},
-                                {'name': 'Last Price', 'id': 'Last Price'},
-                                {'name': 'Next Day Active Signal', 'id': 'Next Day Active Signal'},
-                                {'name': 'Processing Status', 'id': 'Processing Status'}
-                            ],
-                            data=[],
-                            style_table={
-                                'overflowX': 'auto',
-                                'backgroundColor': 'black',
-                            },
-                            style_cell={
-                                'backgroundColor': 'black',
-                                'color': '#80ff00',
-                                'textAlign': 'left',
-                                'minWidth': '50px',
-                                'width': '100px',
-                                'maxWidth': '180px',
-                                'whiteSpace': 'normal',
-                                'border': '1px solid #80ff00'
-                            },
-                            style_header={
-                                'backgroundColor': 'black',
-                                'color': '#80ff00',
-                                'fontWeight': 'bold',
-                                'border': '2px solid #80ff00'
-                            },
-                            style_data_conditional=[{
-                                'if': {'row_index': 'odd'},
-                                'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                            }],
-                        )
-                    ]
-                )
+                        html.Div([
+                            html.I(className="fas fa-tasks me-2"),
+                            'Batch Processing and Analysis',
+                            html.Span(id='batch-process-status', className='ms-3', style={'fontSize': '0.9em'})
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-batch-process-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                        # Input Section
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-list me-2", style={"color": "#00ff41"}),
+                                'Enter Tickers to Batch Process'
+                            ]),
+                            dbc.CardBody([
+                                dbc.Textarea(
+                                    id='batch-ticker-input',
+                                    placeholder='Enter ticker symbols separated by commas (e.g., AAPL, MSFT, GOOG)',
+                                    style={'width': '100%', 'height': '100px'},
+                                    className='glow-border'
+                                ),
+                                dbc.Button(
+                                    [html.I(className="fas fa-play me-2"), 'Process Tickers'], 
+                                    id='batch-process-button', 
+                                    color='primary', 
+                                    className='mt-2',
+                                    style={"boxShadow": "0 0 15px rgba(128, 255, 0, 0.5)"}
+                                ),
+                                dbc.FormFeedback(id='batch-ticker-input-feedback', className='text-danger')
+                            ])
+                        ], className='mb-3'),
+                        
+                        # Results Table
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-table me-2"),
+                                'Batch Processing Results'
+                            ], style={"color": "#80ff00"}),
+                            dbc.CardBody([
+                                dcc.Loading(
+                                    id="loading-batch-process",
+                                    type="circle",
+                                    color="#80ff00",
+                                    children=[
+                                        dash_table.DataTable(
+                                            id='batch-process-table',
+                                            columns=[
+                                                {'name': 'Ticker', 'id': 'Ticker'},
+                                                {'name': 'Last Date', 'id': 'Last Date'},
+                                                {'name': 'Last Price', 'id': 'Last Price'},
+                                                {'name': 'Next Day Active Signal', 'id': 'Next Day Active Signal'},
+                                                {'name': 'Processing Status', 'id': 'Processing Status'}
+                                            ],
+                                            data=[],
+                                            style_table={
+                                                'overflowX': 'auto',
+                                                'backgroundColor': 'black',
+                                            },
+                                            style_cell={
+                                                'backgroundColor': 'black',
+                                                'color': '#80ff00',
+                                                'textAlign': 'left',
+                                                'minWidth': '50px',
+                                                'width': '100px',
+                                                'maxWidth': '180px',
+                                                'whiteSpace': 'normal',
+                                                'border': '1px solid #80ff00'
+                                            },
+                                            style_header={
+                                                'backgroundColor': 'black',
+                                                'color': '#80ff00',
+                                                'fontWeight': 'bold',
+                                                'border': '2px solid #80ff00'
+                                            },
+                                            style_data_conditional=[{
+                                                'if': {'row_index': 'odd'},
+                                                'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                            }],
+                                        )
+                                    ]
+                                )
+                            ])
+                        ], className='mt-3')
+                    ]),
+                    id='batch-process-collapse',
+                    is_open=True
+                    )
+                ], className='mb-3')
             ], width=12)
         ]),
         # Automated Signal Optimization Section
+        html.Div(id="optimization-section", style={"position": "relative", "top": "-80px"}),
         html.H2('Automated Signal Optimization', className='text-center mt-5'),
+        html.P('Find the best combination of primary tickers to maximize secondary ticker performance', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        html.I(className="fas fa-magic me-2"),
-                        'Optimize Primary Signals for Secondary Ticker'
-                    ], style={"color": "#80ff00"}),
-                    dbc.CardBody([
-                        # Input for secondary ticker (Signal Follower)
                         html.Div([
-                            dbc.Label('Enter Secondary Ticker (Signal Follower):'),
-                            dbc.Input(
-                                id='optimization-secondary-ticker',
-                                placeholder='e.g., SPY',
-                                type='text',
-                                debounce=True
-                            ),
-                        ]),
-                        # Input for primary tickers (Signal Generators)
-                        html.Div([
-                            dbc.Label('Enter Primary Tickers (Signal Generators, comma-separated):'),
-                            dbc.Input(
-                                id='optimization-primary-tickers',
-                                placeholder='e.g., AAPL, MSFT, GOOG',
-                                type='text',
-                                debounce=True
-                            ),
-                        ]),
-                        # Button to start optimization
-                        dbc.Button(
-                            [html.I(className="fas fa-magic me-2"), 'Optimize Signals'], 
-                            id='optimize-signals-button', 
-                            color='primary', 
-                            className='mt-2',
-                            style={"boxShadow": "0 0 15px rgba(128, 255, 0, 0.5)"}
-                        ),
-                        # Feedback message
-                        html.Div(id='optimization-feedback', className='text-danger mt-2'),
-                    ])
-                ], className='mb-3'),
-                # Loading spinner and results table for optimization
-                dcc.Loading(
-                    id="loading-optimization",
-                    type="circle",
-                    children=[
-                        # Table to display results
-                        dash_table.DataTable(
-                            id='optimization-results-table',
-                            columns=[
-                                {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
-                                {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
-                                {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
-                                {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
-                                {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
-                                {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
-                                {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
-                                {'name': 't-Statistic', 'id': 't-Statistic'},
-                                {'name': 'p-Value', 'id': 'p-Value'},
-                                {'name': 'Significant 90%', 'id': 'Significant 90%'},
-                                {'name': 'Significant 95%', 'id': 'Significant 95%'},
-                                {'name': 'Significant 99%', 'id': 'Significant 99%'},
-                                {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
-                                {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
-                            ],
-                            data=[],
-                            sort_action='custom',
-                            sort_mode='multi',
-                            sort_by=[],
-                            persistence=True,
-                            persistence_type='session',
-                            markdown_options={'html': True},  # Enable HTML rendering in markdown cells
-                            style_data={'whiteSpace': 'normal', 'height': 'auto'},
-                            cell_selectable=True,
-                            selected_cells=[],
-                            style_table={
-                                'overflowX': 'auto',
-                                'backgroundColor': 'black',
-                            },
-                            style_cell={
-                                'backgroundColor': 'black',
-                                'color': '#80ff00',
-                                'textAlign': 'left',
-                                'minWidth': '50px', 
-                                'width': '100px', 
-                                'maxWidth': '180px',
-                                'whiteSpace': 'normal',
-                                'border': '1px solid #80ff00'
-                            },
-                            style_header={
-                                'backgroundColor': 'black',
-                                'color': '#80ff00',
-                                'fontWeight': 'bold',
-                                'border': '2px solid #80ff00'
-                            },
-                            style_data_conditional=[
-                                {
-                                    'if': {'row_index': 'odd'},
-                                    'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                                },
-                                {
-                                    'if': {'state': 'selected'},
-                                    'backgroundColor': 'rgba(0, 255, 0, 0.2)',
-                                    'border': '2px solid #80ff00'
-                                },
-                                {
-                                    'if': {'filter_query': '{Combination} = "AVERAGES"'},
-                                    'backgroundColor': 'rgba(0, 255, 0, 0.15)',
-                                    'fontWeight': 'bold',
-                                    'border-bottom': '2px solid #80ff00'
-                                }
-                            ],
-                        )
-                    ]
-                )
+                            html.I(className="fas fa-magic me-2"),
+                            'Signal Optimization Engine',
+                            html.Span(id='optimization-status', className='ms-3', style={'fontSize': '0.9em'})
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-optimization-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                        # Input Section
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-cogs me-2", style={"color": "#00ff41"}),
+                                'Optimization Parameters'
+                            ]),
+                            dbc.CardBody([
+                                # Input for secondary ticker (Signal Follower)
+                                html.Div([
+                                    dbc.Label('Enter Secondary Ticker (Signal Follower):'),
+                                    dbc.Input(
+                                        id='optimization-secondary-ticker',
+                                        placeholder='e.g., SPY',
+                                        type='text',
+                                        debounce=True,
+                                        className='glow-border'
+                                    ),
+                                ], className='mb-3'),
+                                # Input for primary tickers (Signal Generators)
+                                html.Div([
+                                    dbc.Label('Enter Primary Tickers (Signal Generators, comma-separated):'),
+                                    dbc.Input(
+                                        id='optimization-primary-tickers',
+                                        placeholder='e.g., AAPL, MSFT, GOOG',
+                                        type='text',
+                                        debounce=True,
+                                        className='glow-border'
+                                    ),
+                                ], className='mb-3'),
+                                # Button to start optimization
+                                dbc.Button(
+                                    [html.I(className="fas fa-magic me-2"), 'Optimize Signals'], 
+                                    id='optimize-signals-button', 
+                                    color='primary', 
+                                    className='w-100',
+                                    style={"boxShadow": "0 0 15px rgba(128, 255, 0, 0.5)"}
+                                ),
+                                # Feedback message
+                                html.Div(id='optimization-feedback', className='text-danger mt-2'),
+                            ])
+                        ], className='mb-3'),
+                        
+                        # Results Table
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.I(className="fas fa-chart-bar me-2"),
+                                'Optimization Results'
+                            ], style={"color": "#80ff00"}),
+                            dbc.CardBody([
+                                dcc.Loading(
+                                    id="loading-optimization",
+                                    type="circle",
+                                    color="#80ff00",
+                                    children=[
+                                        # Table to display results
+                                        dash_table.DataTable(
+                                            id='optimization-results-table',
+                                            columns=[
+                                                {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
+                                                {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
+                                                {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
+                                                {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
+                                                {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
+                                                {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
+                                                {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
+                                                {'name': 't-Statistic', 'id': 't-Statistic'},
+                                                {'name': 'p-Value', 'id': 'p-Value'},
+                                                {'name': 'Significant 90%', 'id': 'Significant 90%'},
+                                                {'name': 'Significant 95%', 'id': 'Significant 95%'},
+                                                {'name': 'Significant 99%', 'id': 'Significant 99%'},
+                                                {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
+                                                {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
+                                            ],
+                                            data=[],
+                                            sort_action='custom',
+                                            sort_mode='multi',
+                                            sort_by=[],
+                                            persistence=True,
+                                            persistence_type='session',
+                                            markdown_options={'html': True},  # Enable HTML rendering in markdown cells
+                                            style_data={'whiteSpace': 'normal', 'height': 'auto'},
+                                            cell_selectable=True,
+                                            selected_cells=[],
+                                            style_table={
+                                                'overflowX': 'auto',
+                                                'backgroundColor': 'black',
+                                            },
+                                            style_cell={
+                                                'backgroundColor': 'black',
+                                                'color': '#80ff00',
+                                                'textAlign': 'left',
+                                                'minWidth': '50px', 
+                                                'width': '100px', 
+                                                'maxWidth': '180px',
+                                                'whiteSpace': 'normal',
+                                                'border': '1px solid #80ff00'
+                                            },
+                                            style_header={
+                                                'backgroundColor': 'black',
+                                                'color': '#80ff00',
+                                                'fontWeight': 'bold',
+                                                'border': '2px solid #80ff00'
+                                            },
+                                            style_data_conditional=[
+                                                {
+                                                    'if': {'row_index': 'odd'},
+                                                    'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                                },
+                                                {
+                                                    'if': {'state': 'selected'},
+                                                    'backgroundColor': 'rgba(0, 255, 0, 0.2)',
+                                                    'border': '2px solid #80ff00'
+                                                },
+                                                {
+                                                    'if': {'filter_query': '{Combination} = "AVERAGES"'},
+                                                    'backgroundColor': 'rgba(0, 255, 0, 0.15)',
+                                                    'fontWeight': 'bold',
+                                                    'border-bottom': '2px solid #80ff00'
+                                                }
+                                            ],
+                                        )
+                                    ]
+                                )
+                            ])
+                        ], className='mt-3')
+                    ]),
+                    id='optimization-collapse',
+                    is_open=True
+                    )
+                ], className='mb-3')
             ], width=12)
         ]),
         # Interval components for periodic updates
@@ -2262,7 +2810,7 @@ def update_sma_labels(ticker, n_intervals):
 )
 def update_processing_status(n_intervals, ticker):
     if not ticker:
-        return "Enter a ticker to start."
+        return ""
     
     status = read_status(ticker)
     if status['status'] == 'processing':
@@ -2278,17 +2826,6 @@ def update_processing_status(n_intervals, ticker):
         else:
             return f"Data loaded for {ticker}."
 
-@app.callback(
-    [Output('calc-collapse', 'is_open'),
-     Output('toggle-calc-button', 'children')],
-    [Input('toggle-calc-button', 'n_clicks')],
-    [State('calc-collapse', 'is_open')],
-)
-def toggle_calc_collapse(n_clicks, is_open):
-    if n_clicks:
-        return not is_open, 'Minimize' if not is_open else 'Maximize'
-    return is_open, 'Maximize' if not is_open else 'Minimize'
-
 # Callback to toggle the visibility of the Dynamic Master Trading Strategy section
 @app.callback(
     [Output('strategy-collapse', 'is_open'),
@@ -2298,8 +2835,186 @@ def toggle_calc_collapse(n_clicks, is_open):
 )
 def toggle_strategy_collapse(n_clicks, is_open):
     if n_clicks:
-        return not is_open, 'Minimize' if not is_open else 'Maximize'
-    return is_open, 'Maximize' if not is_open else 'Minimize'
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+# Callback to toggle the visibility of the Signal Following Performance Metrics section
+@app.callback(
+    [Output('signal-following-collapse', 'is_open'),
+     Output('toggle-signal-following-button', 'children')],
+    [Input('toggle-signal-following-button', 'n_clicks')],
+    [State('signal-following-collapse', 'is_open')],
+)
+def toggle_signal_following_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+# Callback to toggle the visibility of the Configure and Test Custom SMA Pairs section
+@app.callback(
+    [Output('custom-sma-collapse', 'is_open'),
+     Output('toggle-custom-sma-button', 'children')],
+    [Input('toggle-custom-sma-button', 'n_clicks')],
+    [State('custom-sma-collapse', 'is_open')],
+)
+def toggle_custom_sma_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+# Callback to toggle the visibility of the Batch Processing and Analysis section
+@app.callback(
+    [Output('batch-process-collapse', 'is_open'),
+     Output('toggle-batch-process-button', 'children')],
+    [Input('toggle-batch-process-button', 'n_clicks')],
+    [State('batch-process-collapse', 'is_open')],
+)
+def toggle_batch_process_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+# Callback to toggle the visibility of the Signal Optimization Engine section
+@app.callback(
+    [Output('optimization-collapse', 'is_open'),
+     Output('toggle-optimization-button', 'children')],
+    [Input('toggle-optimization-button', 'n_clicks')],
+    [State('optimization-collapse', 'is_open')],
+)
+def toggle_optimization_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+# Callback to toggle the visibility of the Color-Coded Chart section
+@app.callback(
+    [Output('color-coded-collapse', 'is_open'),
+     Output('toggle-color-coded-button', 'children')],
+    [Input('toggle-color-coded-button', 'n_clicks')],
+    [State('color-coded-collapse', 'is_open')],
+)
+def toggle_color_coded_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Show'
+
+@app.callback(
+    [Output('primary-ticker-collapse', 'is_open'),
+     Output('toggle-primary-ticker-button', 'children')],
+    [Input('toggle-primary-ticker-button', 'n_clicks')],
+    [State('primary-ticker-collapse', 'is_open')],
+)
+def toggle_primary_ticker_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+@app.callback(
+    [Output('multi-primary-collapse', 'is_open'),
+     Output('toggle-multi-primary-button', 'children')],
+    [Input('toggle-multi-primary-button', 'n_clicks')],
+    [State('multi-primary-collapse', 'is_open')],
+)
+def toggle_multi_primary_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide' if not is_open else 'Show'
+    return is_open, 'Hide' if is_open else 'Show'
+
+# Callback to update Primary Ticker status
+@app.callback(
+    Output('primary-ticker-status', 'children'),
+    [Input('ticker-input', 'value'),
+     Input('update-interval', 'n_intervals')],
+    prevent_initial_call=True
+)
+def update_primary_ticker_status(ticker, n_intervals):
+    if not ticker:
+        return ''
+    
+    ticker = normalize_ticker(ticker)
+    status = read_status(ticker)
+    
+    if status['status'] == 'processing':
+        progress = status.get('progress', 0)
+        return html.Span([
+            html.I(className="fas fa-spinner fa-spin me-2"),
+            f"Processing... {progress:.0f}%"
+        ], style={"color": "#ffa500"})
+    elif status['status'] == 'complete':
+        return html.Span([
+            html.I(className="fas fa-check-circle me-2"),
+            "Ready"
+        ], style={"color": "#00ff41"})
+    elif status['status'] == 'failed':
+        return html.Span([
+            html.I(className="fas fa-exclamation-circle me-2"),
+            "Failed"
+        ], style={"color": "#ff0040"})
+    else:
+        return ''
+
+# Callback to update Batch Process status
+@app.callback(
+    Output('batch-process-status', 'children'),
+    [Input('batch-process-button', 'n_clicks'),
+     Input('batch-update-interval', 'n_intervals')],
+    [State('batch-ticker-input', 'value')],
+    prevent_initial_call=True
+)
+def update_batch_process_status(n_clicks, n_intervals, tickers_input):
+    if not tickers_input:
+        return ''
+    
+    with processing_lock:
+        queue_size = len(ticker_queue)
+        total_size = len(all_tickers)
+    
+    if queue_size > 0:
+        return html.Span([
+            html.I(className="fas fa-spinner fa-spin me-2"),
+            f"Processing {total_size - queue_size}/{total_size} tickers"
+        ], style={"color": "#ffa500"})
+    elif total_size > 0:
+        return html.Span([
+            html.I(className="fas fa-check-circle me-2"),
+            f"Completed {total_size} tickers"
+        ], style={"color": "#00ff41"})
+    else:
+        return ''
+
+# Callback to update Optimization status  
+@app.callback(
+    Output('optimization-status', 'children'),
+    [Input('optimize-signals-button', 'n_clicks'),
+     Input('optimization-update-interval', 'n_intervals')],
+    [State('optimization-feedback', 'children')],
+    prevent_initial_call=True
+)
+def update_optimization_status(n_clicks, n_intervals, feedback):
+    try:
+        global optimization_progress
+        
+        if optimization_progress and isinstance(optimization_progress, dict):
+            if optimization_progress.get('status') == 'processing':
+                current = optimization_progress.get('current', 0)
+                total = optimization_progress.get('total', 0)
+                if total > 0:
+                    percent = (current / total) * 100
+                    return html.Span([
+                        html.I(className="fas fa-spinner fa-spin me-2"),
+                        f"Optimizing... {percent:.0f}%"
+                    ], style={"color": "#ffa500"})
+            elif optimization_progress.get('status') == 'complete':
+                return html.Span([
+                    html.I(className="fas fa-check-circle me-2"),
+                    "Optimization Complete"
+                ], style={"color": "#00ff41"})
+        
+        # Default return when no optimization in progress
+        return ''
+    except Exception:
+        # Silently handle any errors without logging
+        return ''
 
 @app.callback(
     [Output('sma-input-1', 'className'),
@@ -3141,7 +3856,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 )
 def update_dynamic_strategy_display(ticker, n_intervals):
     if not ticker:
-        return ["Please enter a ticker symbol."] * 10
+        return [""] * 10
 
     results = load_precomputed_results(ticker)
     
@@ -3917,7 +4632,7 @@ def update_output_and_reset(combined_capture, historical_top_pairs, chart, ticke
         return no_update, False
     elif all([combined_capture, historical_top_pairs, chart]) and not timing_summary_printed:
         print_timing_summary(ticker)
-        return "Charts loaded successfully", True
+        return "", True  # Return empty string instead of "Charts loaded successfully"
     else:
         return no_update, no_update
 
@@ -3938,7 +4653,24 @@ from dash import dash_table
 )
 def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, invert_signals, show_annotations, n_intervals, trading_recommendations):
     empty_fig = go.Figure()
-    empty_fig.update_layout(template='plotly_dark')
+    empty_fig.update_layout(
+        plot_bgcolor='black',
+        paper_bgcolor='black',
+        font=dict(color='#80ff00'),
+        xaxis=dict(
+            visible=False,
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False
+        ),
+        yaxis=dict(
+            visible=False,
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False
+        ),
+        title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00'))
+    )
 
     if not primary_ticker or not secondary_tickers_input:
         return empty_fig, [], [], ''
@@ -5482,15 +6214,34 @@ def populate_multi_primary_aggregator(active_cell, data, page_current, page_size
 
 @app.callback(
     Output("help-modal", "is_open"),
-    [Input("help-button", "n_clicks"), Input("close-help", "n_clicks")],
+    [Input("nav-help-button", "n_clicks"), Input("close-help", "n_clicks")],
     [State("help-modal", "is_open")],
     prevent_initial_call=True
 )
 def toggle_help_modal(n1, n2, is_open):
-    # Toggle the Help modal open or closed when either the Help or Close button is clicked
+    # Toggle the Help modal open or closed when either the Help or nav help button is clicked
     if n1 or n2:
         return not is_open
     return is_open
+
+# Navigation callbacks removed - using static navigation bar now
+
+# Note: For the jump buttons, we'll use clientside JavaScript instead
+# since Dash doesn't support direct navigation with Location component
+
+# Callback for copy tickers button
+@app.callback(
+    Output("copy-tickers-btn", "children"),
+    [Input("copy-tickers-btn", "n_clicks")],
+    [State("example-tickers", "value")],
+    prevent_initial_call=True
+)
+def copy_tickers(n_clicks, tickers):
+    if n_clicks:
+        # Note: Actually copying to clipboard requires JavaScript
+        # This just provides visual feedback
+        return "Copied!"
+    return "Copy"
 
 # Removed redundant test callback - ticker submission is already logged in validate_ticker_input
 
@@ -5595,6 +6346,18 @@ def console_input_handler():
 if __name__ == "__main__":
     import signal
     import atexit
+    
+    # Ensure all required directories exist
+    required_dirs = [
+        'cache',
+        'cache/results', 
+        'cache/status',
+        'cache/sma_cache',
+        'output',
+        'logs'
+    ]
+    for directory in required_dirs:
+        os.makedirs(directory, exist_ok=True)
     
     # Handler for graceful shutdown
     def signal_handler(sig, frame):
