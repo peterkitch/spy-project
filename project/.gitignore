@@ -5,11 +5,21 @@ build/
 # Ignore cache files
 .cache/
 
-# Ignore pickle, JSON, and compressed files
+# Ignore pickle and compressed files
 *.pkl
 *.pkl.gz
-*.json
 *.npz
+
+# Ignore status and analysis JSON files
+*_status.json
+*_analysis.json
+
+# QC backtest outputs
+QC/Clone of Project 9/backtests/
+QC/**/backtests/
+
+# QC data directory
+QC/data/
 
 # Ignore log files
 *.log
@@ -33,3 +43,20 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Ignore MCP server container directory
+mcp-server/
+
+# Ignore JetBrains (IntelliJ/PyCharm) project configuration
+.idea/
+*.iml
+misc.xml
+.keep
+
+# Ignore notebooks and large data files
+*.ipynb
+*.csv
+*.zip
+
+# Ignore all Markdown files
+*.md
