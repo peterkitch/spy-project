@@ -5,12 +5,16 @@ build/
 # Ignore cache files
 .cache/
 
-# Ignore pickle and compressed files
+# Ignore organized cache and output directories
+cache/
+output/
+
+# Ignore pickle and compressed files (if any remain in root)
 *.pkl
 *.pkl.gz
 *.npz
 
-# Ignore status and analysis JSON files
+# Ignore status and analysis JSON files (if any remain in root)
 *_status.json
 *_analysis.json
 

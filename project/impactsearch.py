@@ -21,7 +21,7 @@ console_handler.setLevel(logging.INFO)  # Keep console at INFO to avoid too many
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
-file_handler = logging.FileHandler('analysis.log', mode='w')
+file_handler = logging.FileHandler('logs/impactsearch.log', mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
@@ -413,7 +413,7 @@ app.layout = dbc.Container([
     html.P("Use this tool to analyze the impact of various primary tickers against a single secondary ticker. "
            "Enter one or multiple primary tickers separated by commas, and a single secondary ticker. Then click 'Process'."),
     html.P("If you have a large number of primary tickers, processing will take time. We have enabled vectorization, "
-           "logging, and a TQDM console progress bar to provide insight. Check the console and analysis.log for details."),
+           "logging, and a TQDM console progress bar to provide insight. Check the console and logs/impactsearch.log for details."),
     dbc.Row([
         dbc.Col([
             dbc.Card([
@@ -501,7 +501,7 @@ def run_analysis(n_clicks, secondary_ticker, primary_tickers_input):
 
     # Once done, export if we have any results
     if processed_metrics:
-        output_filename = f"{secondary_ticker}_analysis.xlsx"
+        output_filename = f"output/analysis/{secondary_ticker}_analysis.xlsx"
         export_results_to_excel(output_filename, processed_metrics)
         message = f"Processing complete. Check {output_filename} for results."
         progress_value = 100
@@ -514,7 +514,7 @@ def run_analysis(n_clicks, secondary_ticker, primary_tickers_input):
 
 if __name__ == "__main__":
     # Clean up old log files
-    log_files = ['analysis.log', 'debug.log', 'impactsearch.log']
+    log_files = ['logs/analysis.log', 'logs/debug.log', 'logs/impactsearch.log']
     for file in log_files:
         if os.path.exists(file):
             try:

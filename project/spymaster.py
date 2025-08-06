@@ -296,7 +296,7 @@ if sys.platform == 'win32':
     # This is the key fix - set the encoding on the handler's stream
     console_handler.stream = open(sys.stdout.fileno(), 'w', encoding='utf-8', closefd=False)
 
-file_handler = logging.FileHandler('debug.log', encoding='utf-8')
+file_handler = logging.FileHandler('logs/spymaster.log', encoding='utf-8')
 file_handler.setLevel(logging.DEBUG)
 
 # Create formatters and add them to handlers
@@ -430,7 +430,7 @@ def normalize_ticker(ticker):
 def fetch_data(ticker, is_secondary=False):
     try:
         # Check if we've already determined this is an invalid ticker
-        status_file = f"{ticker}_status.json"
+        status_file = f"cache/status/{ticker}_status.json"
         if os.path.exists(status_file):
             try:
                 with open(status_file, 'r') as f:
@@ -635,7 +635,7 @@ def load_precomputed_results(ticker, load_full_data=False):
         logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
         
         # Attempt to load from file if not in cache and not currently loading
-        pkl_file = f'{ticker}_precomputed_results.pkl'
+        pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
         if os.path.exists(pkl_file):
             log_ticker_section(ticker.upper(), "LOADING EXISTING DATA")
             log_processing(f"Loading precomputed results from file for {ticker.upper()}")
@@ -646,7 +646,7 @@ def load_precomputed_results(ticker, load_full_data=False):
                     # Load buy and short results incrementally
                     buy_results = {}
                     short_results = {}
-                    chunk_files = sorted(glob.glob(f'{ticker}_results_chunk_*.npz'))
+                    chunk_files = sorted(glob.glob(f'cache/sma_cache/{ticker}_results_chunk_*.npz'))
                     
                     chunk_load_start = time.time()
 
@@ -742,14 +742,14 @@ def compute_signals(df, sma1, sma2):
 
 def write_status(ticker, status):
     ticker = normalize_ticker(ticker)
-    status_file = f"{ticker}_status.json"
+    status_file = f"cache/status/{ticker}_status.json"
     with status_lock:
         with open(status_file, 'w') as f:
             json.dump(status, f)
 
 def save_precomputed_results(ticker, results):
     ticker = normalize_ticker(ticker)
-    final_name = f'{ticker}_precomputed_results.pkl'
+    final_name = f'cache/results/{ticker}_precomputed_results.pkl'
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tf:
         pickle.dump(results, tf)
         temp_name = tf.name
@@ -802,7 +802,7 @@ def calculate_daily_top_pairs(df, ticker):
     dates = df.index
 
     # Get list of chunk files
-    chunk_files = sorted(glob.glob(f'{ticker}_results_chunk_*.npz'))
+    chunk_files = sorted(glob.glob(f'cache/sma_cache/{ticker}_results_chunk_*.npz'))
     logger.info(f"Found {len(chunk_files)} chunk files to process.")
 
     if not chunk_files:
@@ -896,7 +896,7 @@ def calculate_captures_vectorized(sma1, sma2, returns):
 
 def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chunk, chunk_index):
     ticker = normalize_ticker(ticker)
-    chunk_file = f'{ticker}_results_chunk_{chunk_index}.npz'
+    chunk_file = f'cache/sma_cache/{ticker}_results_chunk_{chunk_index}.npz'
     try:
         # Validate input data types
         if not isinstance(buy_results_chunk, dict) or not isinstance(short_results_chunk, dict):
@@ -996,7 +996,7 @@ def precompute_results(ticker, event):
             section_times['Data Preprocessing'] = time.time() - section_start
             section_start = time.time()
 
-            pkl_file = f'{ticker}_precomputed_results.pkl'
+            pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
             
             if os.path.exists(pkl_file):
                 existing_results = load_precomputed_results_from_file(pkl_file)
@@ -1074,7 +1074,7 @@ def precompute_results(ticker, event):
             log_section("SMA Calculation")
             logger.info("Checking SMA cache...")
 
-            cache_dir = '.sma_cache'
+            cache_dir = 'cache/sma_cache'
             os.makedirs(cache_dir, exist_ok=True)
             sma_cache_path = os.path.join(cache_dir, f'sma_full_{ticker}.npz')
 
@@ -1363,7 +1363,7 @@ def print_timing_summary(ticker):
 # Function to read the processing status from a file
 def read_status(ticker):
     ticker = normalize_ticker(ticker)
-    status_path = f"{ticker}_status.json"
+    status_path = f"cache/status/{ticker}_status.json"
     with status_lock:
         if os.path.exists(status_path):
             with open(status_path, 'r') as file:
@@ -1374,7 +1374,7 @@ def read_status(ticker):
         return {"status": "not started", "progress": 0}
 
 def inspect_pkl_file(ticker, sample_size=5):
-    pkl_file = f'{ticker}_precomputed_results.pkl'
+    pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
     if os.path.exists(pkl_file):
         with open(pkl_file, 'rb') as f:
             results = pickle.load(f)
