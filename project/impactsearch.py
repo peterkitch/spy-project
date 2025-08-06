@@ -501,7 +501,7 @@ def run_analysis(n_clicks, secondary_ticker, primary_tickers_input):
 
     # Once done, export if we have any results
     if processed_metrics:
-        output_filename = f"output/analysis/{secondary_ticker}_analysis.xlsx"
+        output_filename = f"output/{secondary_ticker}_analysis.xlsx"
         export_results_to_excel(output_filename, processed_metrics)
         message = f"Processing complete. Check {output_filename} for results."
         progress_value = 100
@@ -513,6 +513,11 @@ def run_analysis(n_clicks, secondary_ticker, primary_tickers_input):
     return message, progress_value, {'marginTop': '20px', 'height': '30px'}
 
 if __name__ == "__main__":
+    # Ensure all required directories exist
+    required_dirs = ['cache', 'cache/results', 'cache/status', 'cache/sma_cache', 'output', 'logs']
+    for directory in required_dirs:
+        os.makedirs(directory, exist_ok=True)
+    
     # Clean up old log files
     log_files = ['logs/analysis.log', 'logs/debug.log', 'logs/impactsearch.log']
     for file in log_files:

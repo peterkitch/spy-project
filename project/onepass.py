@@ -416,7 +416,7 @@ def run_onepass_analysis(n_clicks, primary_tickers_input):
 
     # Once done, export if we have any results
     if processed_metrics:
-        out_file = "output/analysis/onepass.xlsx"
+        out_file = "output/onepass.xlsx"
         export_results_to_excel(out_file, processed_metrics)
         message = f"Processing complete. Check {out_file} for results."
         progress_value = 100
@@ -432,6 +432,11 @@ def run_onepass_analysis(n_clicks, primary_tickers_input):
 ##################
 
 if __name__ == "__main__":
+    # Ensure all required directories exist
+    required_dirs = ['cache', 'cache/results', 'cache/status', 'cache/sma_cache', 'output', 'logs']
+    for directory in required_dirs:
+        os.makedirs(directory, exist_ok=True)
+    
     # Optional: Clean up old logs if needed
     log_files = ['logs/analysis.log', 'logs/debug.log', 'logs/onepass.log']
     for file in log_files:
