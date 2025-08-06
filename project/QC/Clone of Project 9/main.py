@@ -59,6 +59,8 @@ class SymbolData:
         self.MAX_STALE_DAYS = 10  
         self.pre_1998_loaded = False
         self._checked_legacy = False  # Track if we've attempted CSV download
+        self.pending_disposal = False   # marked for deferred exit
+        self.pending_disposal_day_count = 0
                     
     def _load_pre_1998_data(self):
         if self.algorithm.LiveMode:
@@ -512,6 +514,14 @@ class SymbolData:
             temp_yesterday_signal = self.signal_for_tomorrow
 
 class OnePassSafe(QCAlgorithm):
+    """
+    Adaptive SMA pair optimization strategy with multi-ticker support.
+    
+    New parameter (as of this update):
+    - hold_until_signal_change: When true, positions in symbols that lose leader status 
+      are held until the trading signal changes, rather than being liquidated immediately.
+      This allows positions to continue until the next natural exit point.
+    """
 
     TRADE_LEAD_MINUTES = 1
     
@@ -538,6 +548,8 @@ class OnePassSafe(QCAlgorithm):
         self.min_dollar_volume = float(self.GetParameter("min_dollar_volume", "1000000"))
         self._grace_days = int(self.GetParameter("grace_days", "3"))
         self._last_good_tick = {}  # Symbol → date of last pass
+        self.hold_until_signal_change  = self.GetParameter("hold_until_signal_change", "false").lower() == "true"
+        self.pending_disposal_max_days = int(self.GetParameter("pending_disposal_max_days", "30"))
         self.sort_by = self.GetParameter("sort_by", "sharpe_ratio").lower().strip()
         if self.sort_by not in {"sharpe_ratio", "cumulative_capture", "running_sharpe", "win_ratio", "weighted_win_ratio", "avg_cap"}:
             self.sort_by = "sharpe_ratio"
@@ -673,8 +685,8 @@ class OnePassSafe(QCAlgorithm):
 
             self.UniverseSettings.Resolution = Resolution.Daily
             self.UniverseSettings.DataNormalizationMode = DataNormalizationMode.Adjusted
-            self.UniverseSettings.FilterFineData = True # 
-            self.UniverseSettings.FilterNonTradableSymbols = True 
+            self.UniverseSettings.FilterFineData = True
+            self.UniverseSettings.FilterNonTradableSymbols = True
             self.AddUniverse(self.CoarseSelectionFunction)
             self.SetBenchmark("SPY")
             self.initialized = True
@@ -1230,6 +1242,67 @@ class OnePassSafe(QCAlgorithm):
         if not all(self.symbol_data[s].warmup_complete for s in self.leader_symbols):
             return
 
+        # STEP 1 ─────────────────────────────────────────────────────────────
+        # Handle exits / pending‑disposal symbols *before* we open any new
+        # trades.  This guarantees that (a) freed buying‑power is immediately
+        # available and (b) symbols that have dropped out of the leader set
+        # still get checked every day until their signal flips.
+
+        for sym in list(self.Portfolio.Keys):
+            if sym == self._schedule_symbol or not self.Portfolio[sym].Invested:
+                continue
+
+            data = self.symbol_data.get(sym, None)
+
+            # (0) Symbol has re‑entered the leader pool – clear flag and keep.
+            if sym in self.leader_symbols:
+                if data and data.pending_disposal:
+                    data.pending_disposal = False
+                    data.pending_disposal_day_count = 0
+                continue
+
+            # (1) Immediate‑liquidation mode (old behaviour)
+            if not self.hold_until_signal_change or data is None:
+                if self.Securities[sym].IsTradable:
+                    self.Liquidate(sym, tag="No longer a leader")
+                elif self.Time.day == 1:
+                    self._log.note(f"Cannot liquidate non‑tradable {sym.Value}")
+                continue
+
+            # (2) hold‑until‑signal‑change mode
+            if not data.pending_disposal:                               # first day out
+                data.pending_disposal = True
+                data.pending_disposal_day_count = 0
+                if self.DebugMode:
+                    self.Debug(f"[DISPOSAL] {self.Time.date()} {sym.Value} marked for disposal on signal change")
+                continue
+
+            # bump counter and force‑exit if max days exceeded
+            if data.pending_disposal:
+                data.pending_disposal_day_count += 1
+                if (self.pending_disposal_max_days > 0 and
+                    data.pending_disposal_day_count >= self.pending_disposal_max_days):
+                    if self.Securities[sym].IsTradable:
+                        self.Liquidate(sym, tag=f"Timeout {self.pending_disposal_max_days}d")
+                    else:
+                        self._log.note(f"Timeout hit but {sym.Value} not tradable")
+                    data.pending_disposal = False
+                    continue         # slot now free → next symbol
+
+            # already pending – liquidate when the plan flips
+            cur_side  = "Buy"  if self.Portfolio[sym].IsLong  else \
+                        "Short" if self.Portfolio[sym].IsShort else "None"
+            next_side = data._yesterday_signal                    # derived from yesterday's close
+
+            if next_side != cur_side:                             # signal changed → exit now
+                if self.Securities[sym].IsTradable:
+                    self.Liquidate(sym, tag="Signal changed – final exit")
+                    data.pending_disposal = False
+                    if self.DebugMode:
+                        self.Debug(f"[DISPOSAL] {self.Time.date()} {sym.Value} liquidated ({cur_side}→{next_side})")
+                elif self.Time.day == 1:
+                    self._log.note(f"Cannot liquidate non‑tradable {sym.Value}")
+
         for sym in list(self.leader_symbols):
             data = self.symbol_data[sym]
 
@@ -1291,6 +1364,15 @@ class OnePassSafe(QCAlgorithm):
             else:
                 need_flip = (cur_qty > 0 and sig == "Short") or (cur_qty < 0 and sig == "Buy") or cur_qty == 0
                 if need_flip:
+                    # ── enforce self.portfolio_size BEFORE opening a brand‑new position ──
+                    if cur_qty == 0 and sig != "None":
+                        invested_now = sum(1 for s in self.Portfolio.Keys if self.Portfolio[s].Invested)
+                        if invested_now >= self.portfolio_size:
+                            if self.DebugMode:
+                                self.Debug(f"[CAP] {self.Time.date()} skip {sym.Value}: "
+                                           f"{invested_now}/{self.portfolio_size} slots in use")
+                            continue          # no free slot – wait for the next run
+                    # --------------------------------------------------------------------
                     if cur_qty != 0:
                         self.Liquidate(sym, tag="Liquidated")
                     self.SetHoldings(
@@ -1370,15 +1452,6 @@ class OnePassSafe(QCAlgorithm):
                 if rebalance_count > 0:
                     self.Debug(f"[REBALANCE] {self.Time.date()}: Adjusted {rebalance_count} positions (tol={self.rebalance_tolerance:.0%})")
                 self._last_rebalance_date = self.Time.date()
-        
-        # Liquidate symbols that lost leader status
-        for sym in list(self.Portfolio.Keys):
-            if sym != self._schedule_symbol and self.Portfolio[sym].Invested and sym not in self.leader_symbols:
-                if self.Securities[sym].IsTradable:
-                    self.Liquidate(sym, tag="No longer a leader")
-                else:
-                    if self.Time.day == 1:
-                        self._log.note(f"Cannot liquidate non-tradable {sym.Value}")
     
     def _check_spread(self, symbol):
         security = self.Securities[symbol]
