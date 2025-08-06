@@ -23,7 +23,7 @@ console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
-file_handler = logging.FileHandler('analysis.log', mode='w')
+file_handler = logging.FileHandler('logs/onepass.log', mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
@@ -416,7 +416,7 @@ def run_onepass_analysis(n_clicks, primary_tickers_input):
 
     # Once done, export if we have any results
     if processed_metrics:
-        out_file = "onepass.xlsx"
+        out_file = "output/analysis/onepass.xlsx"
         export_results_to_excel(out_file, processed_metrics)
         message = f"Processing complete. Check {out_file} for results."
         progress_value = 100
@@ -433,7 +433,7 @@ def run_onepass_analysis(n_clicks, primary_tickers_input):
 
 if __name__ == "__main__":
     # Optional: Clean up old logs if needed
-    log_files = ['analysis.log', 'debug.log', 'impactsearch.log']
+    log_files = ['logs/analysis.log', 'logs/debug.log', 'logs/onepass.log']
     for file in log_files:
         if os.path.exists(file):
             try:
