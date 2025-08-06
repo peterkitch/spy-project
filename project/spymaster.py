@@ -3052,6 +3052,55 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, tick
 
     return input_classes + error_messages
 
+# Callback to auto-populate SMA inputs with top pairs when ticker processing completes
+@app.callback(
+    [Output('sma-input-1', 'value'),
+     Output('sma-input-2', 'value'),
+     Output('sma-input-3', 'value'),
+     Output('sma-input-4', 'value')],
+    [Input('ticker-input', 'value'),
+     Input('update-interval', 'n_intervals')],
+    prevent_initial_call=True
+)
+def auto_populate_sma_inputs(ticker, n_intervals):
+    """Auto-populate SMA input fields with top-performing pairs when data is ready."""
+    if not ticker:
+        return no_update, no_update, no_update, no_update
+    
+    # Check if data processing is complete
+    status = read_status(ticker)
+    if status['status'] != 'complete':
+        return no_update, no_update, no_update, no_update
+    
+    # Load precomputed results
+    results = load_precomputed_results(ticker)
+    if not results:
+        return no_update, no_update, no_update, no_update
+    
+    # Extract top pairs
+    top_buy_pair = results.get('top_buy_pair')
+    top_short_pair = results.get('top_short_pair')
+    
+    # Validate pairs exist and are in correct format
+    if not top_buy_pair or not top_short_pair:
+        return no_update, no_update, no_update, no_update
+    
+    if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
+        return no_update, no_update, no_update, no_update
+    
+    if len(top_buy_pair) != 2 or len(top_short_pair) != 2:
+        return no_update, no_update, no_update, no_update
+    
+    # Return the SMA values for auto-population
+    # Only update if the current values are None (empty)
+    # This prevents overwriting user-entered values
+    return (
+        top_buy_pair[0],    # Buy pair first SMA
+        top_buy_pair[1],    # Buy pair second SMA
+        top_short_pair[0],  # Short pair first SMA
+        top_short_pair[1]   # Short pair second SMA
+    )
+
 def get_existing_max_sma_day(df):
     sma_columns = [col for col in df.columns if 'SMA_' in col]
     
