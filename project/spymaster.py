@@ -38,6 +38,715 @@ from bs4 import BeautifulSoup
 import uuid
 import ast
 
+# Performance Metrics Utility Class
+class PerformanceMetrics:
+    """Centralized performance metrics and grading system"""
+    
+    # Standardized color thresholds
+    COLORS = {
+        'excellent': '#00ff41',  # Bright green
+        'good': '#80ff00',       # Light green
+        'moderate': '#ffff00',   # Yellow
+        'warning': '#ff8800',    # Orange
+        'poor': '#ff0040',       # Red
+        'neutral': '#808080'     # Gray
+    }
+    
+    # Standardized performance thresholds
+    THRESHOLDS = {
+        'sharpe': {'excellent': 2.0, 'good': 1.5, 'moderate': 1.0, 'warning': 0.5, 'poor': 0},
+        'win_rate': {'excellent': 65, 'good': 60, 'moderate': 55, 'warning': 50, 'poor': 45},
+        'max_drawdown': {'excellent': -5, 'good': -10, 'moderate': -15, 'warning': -20, 'poor': -25},
+        'total_capture': {'excellent': 100, 'good': 50, 'moderate': 30, 'warning': 20, 'poor': 10},
+        'annualized_return': {'excellent': 20, 'good': 15, 'moderate': 10, 'warning': 5, 'poor': 0},
+        'calmar': {'excellent': 3.0, 'good': 2.0, 'moderate': 1.0, 'warning': 0.5, 'poor': 0}
+    }
+    
+    @classmethod
+    def get_color_for_metric(cls, metric_type, value):
+        """Get color based on metric type and value"""
+        thresholds = cls.THRESHOLDS.get(metric_type, {})
+        
+        if value >= thresholds.get('excellent', float('inf')):
+            return cls.COLORS['excellent']
+        elif value >= thresholds.get('good', float('inf')):
+            return cls.COLORS['good']
+        elif value >= thresholds.get('moderate', float('inf')):
+            return cls.COLORS['moderate']
+        elif value >= thresholds.get('warning', float('inf')):
+            return cls.COLORS['warning']
+        else:
+            return cls.COLORS['poor']
+    
+    @classmethod
+    def calculate_annualized_return(cls, total_return, years):
+        """
+        Calculate annualized return from total return and time period
+        
+        Args:
+            total_return: Total return percentage (e.g., 100 for 100%)
+            years: Number of years (can be fractional)
+        
+        Returns:
+            Annualized return percentage
+        """
+        if years <= 0 or total_return is None:
+            return 0
+        
+        # Convert percentage to decimal for calculation
+        total_return_decimal = total_return / 100
+        
+        # Calculate annualized return: (1 + total_return) ^ (1/years) - 1
+        annualized_return_decimal = (1 + total_return_decimal) ** (1 / years) - 1
+        
+        # Convert back to percentage
+        return annualized_return_decimal * 100
+    
+    @classmethod
+    def calculate_grade(cls, sharpe, win_rate=None, max_drawdown=None, total_capture=None, years=None):
+        """
+        Unified grade calculation function
+        
+        Args:
+            sharpe: Sharpe ratio
+            win_rate: Win rate percentage (0-100)
+            max_drawdown: Maximum drawdown percentage (negative value)
+            total_capture: Total capture value
+            years: Time period in years for annualizing returns
+        
+        Returns:
+            tuple: (grade, color)
+        """
+        score = 0
+        metrics_used = 0
+        
+        # Sharpe ratio contribution (0-40 points)
+        if sharpe is not None:
+            metrics_used += 1
+            if sharpe > cls.THRESHOLDS['sharpe']['excellent']:
+                score += 40
+            elif sharpe > cls.THRESHOLDS['sharpe']['good']:
+                score += 35
+            elif sharpe > cls.THRESHOLDS['sharpe']['moderate']:
+                score += 30
+            elif sharpe > cls.THRESHOLDS['sharpe']['warning']:
+                score += 20
+            elif sharpe > cls.THRESHOLDS['sharpe']['poor']:
+                score += 10
+        
+        # Win rate contribution (0-30 points)
+        if win_rate is not None:
+            metrics_used += 1
+            if win_rate > cls.THRESHOLDS['win_rate']['excellent']:
+                score += 30
+            elif win_rate > cls.THRESHOLDS['win_rate']['good']:
+                score += 25
+            elif win_rate > cls.THRESHOLDS['win_rate']['moderate']:
+                score += 20
+            elif win_rate > cls.THRESHOLDS['win_rate']['warning']:
+                score += 15
+            elif win_rate > cls.THRESHOLDS['win_rate']['poor']:
+                score += 10
+        
+        # Max drawdown contribution (0-30 points)
+        if max_drawdown is not None:
+            metrics_used += 1
+            if max_drawdown > cls.THRESHOLDS['max_drawdown']['excellent']:
+                score += 30
+            elif max_drawdown > cls.THRESHOLDS['max_drawdown']['good']:
+                score += 25
+            elif max_drawdown > cls.THRESHOLDS['max_drawdown']['moderate']:
+                score += 20
+            elif max_drawdown > cls.THRESHOLDS['max_drawdown']['warning']:
+                score += 15
+            elif max_drawdown > cls.THRESHOLDS['max_drawdown']['poor']:
+                score += 10
+        
+        # Annualized return contribution (0-30 points)
+        # Use annualized return if we have both total_capture and years
+        if total_capture is not None and years is not None and years > 0:
+            metrics_used += 1
+            annualized_return = cls.calculate_annualized_return(total_capture, years)
+            if annualized_return > cls.THRESHOLDS['annualized_return']['excellent']:
+                score += 30
+            elif annualized_return > cls.THRESHOLDS['annualized_return']['good']:
+                score += 25
+            elif annualized_return > cls.THRESHOLDS['annualized_return']['moderate']:
+                score += 20
+            elif annualized_return > cls.THRESHOLDS['annualized_return']['warning']:
+                score += 15
+            elif annualized_return > cls.THRESHOLDS['annualized_return']['poor']:
+                score += 10
+        # Fall back to total capture if no time period provided
+        elif total_capture is not None and max_drawdown is None:
+            metrics_used += 1
+            if total_capture > cls.THRESHOLDS['total_capture']['excellent']:
+                score += 30
+            elif total_capture > cls.THRESHOLDS['total_capture']['good']:
+                score += 25
+            elif total_capture > cls.THRESHOLDS['total_capture']['moderate']:
+                score += 20
+            elif total_capture > cls.THRESHOLDS['total_capture']['warning']:
+                score += 15
+            elif total_capture > cls.THRESHOLDS['total_capture']['poor']:
+                score += 10
+        
+        # Normalize score based on metrics used
+        if metrics_used > 0:
+            max_possible = 40 + (30 * (metrics_used - 1))
+            score_percentage = (score / max_possible) * 100
+        else:
+            score_percentage = 0
+        
+        # Convert score to grade
+        if score_percentage >= 90:
+            return "A+", cls.COLORS['excellent']
+        elif score_percentage >= 80:
+            return "A", cls.COLORS['excellent']
+        elif score_percentage >= 70:
+            return "B+", cls.COLORS['good']
+        elif score_percentage >= 60:
+            return "B", cls.COLORS['good']
+        elif score_percentage >= 50:
+            return "C+", cls.COLORS['moderate']
+        elif score_percentage >= 40:
+            return "C", cls.COLORS['moderate']
+        elif score_percentage >= 30:
+            return "D", cls.COLORS['warning']
+        else:
+            return "F", cls.COLORS['poor']
+    
+    @classmethod
+    def get_status_emoji(cls, win_rate):
+        """Get status emoji based on win rate"""
+        if win_rate >= cls.THRESHOLDS['win_rate']['excellent']:
+            return "🔥"
+        elif win_rate >= cls.THRESHOLDS['win_rate']['moderate']:
+            return "✅"
+        elif win_rate >= cls.THRESHOLDS['win_rate']['poor']:
+            return "⚠️"
+        else:
+            return "❌"
+    
+    @classmethod
+    def get_trend_indicator(cls, current_value, previous_value, higher_is_better=True):
+        """Get trend arrow indicator based on change"""
+        if previous_value is None:
+            return ""
+        
+        diff = current_value - previous_value
+        if abs(diff) < 0.01:  # No significant change
+            return "→"
+        elif diff > 0:
+            return "↑" if higher_is_better else "↓"
+        else:
+            return "↓" if higher_is_better else "↑"
+    
+    @classmethod
+    def get_progress_bar_color(cls, win_rate):
+        """Get progress bar color based on win rate (returns Bootstrap color name)"""
+        if win_rate > cls.THRESHOLDS['win_rate']['moderate'] / 100:
+            return "success"
+        elif win_rate > cls.THRESHOLDS['win_rate']['poor'] / 100:
+            return "warning"
+        else:
+            return "danger"
+    
+    @classmethod
+    def create_performance_heatmap(cls, top_pairs_data, metric='total_capture'):
+        """
+        Create a performance heatmap showing top SMA pairs
+        
+        Args:
+            top_pairs_data: Dict with pair tuples as keys and performance metrics as values
+            metric: Which metric to display ('total_capture', 'win_rate', 'sharpe')
+        """
+        if not top_pairs_data:
+            return html.Div("No data available for heatmap", style={"color": "#888"})
+        
+        # Sort pairs by performance
+        sorted_pairs = sorted(top_pairs_data.items(), 
+                            key=lambda x: x[1].get(metric, 0), 
+                            reverse=True)[:5]  # Top 5 pairs
+        
+        # Create heatmap rows
+        rows = []
+        for pair, metrics in sorted_pairs:
+            # Handle new format where pair might be ('Buy', sma1, sma2) or ('Short', sma1, sma2)
+            if isinstance(pair, tuple) and len(pair) == 3 and pair[0] in ['Buy', 'Short']:
+                # New format with type prefix
+                pair_str = f"{pair[0]}: SMA {pair[1]}/{pair[2]}"
+            elif isinstance(pair, tuple) and len(pair) == 2:
+                # Old format for backwards compatibility
+                pair_type = "Buy" if metrics.get('type') == 'buy' else "Short" if metrics.get('type') == 'short' else ""
+                pair_str = f"{pair_type}: SMA {pair[0]}/{pair[1]}" if pair_type else f"SMA {pair[0]}/{pair[1]}"
+            else:
+                pair_str = str(pair)
+            value = metrics.get(metric, 0)
+            
+            # Determine color based on value
+            if metric == 'total_capture':
+                color = cls.get_color_for_metric('total_capture', value)
+                display_value = f"{value:.2f}%"
+            elif metric == 'win_rate':
+                color = cls.get_color_for_metric('win_rate', value)
+                display_value = f"{value:.1f}%"
+            elif metric == 'sharpe':
+                color = cls.get_color_for_metric('sharpe', value)
+                display_value = f"{value:.2f}"
+            else:
+                color = "#80ff00"
+                display_value = str(value)
+            
+            rows.append(
+                html.Div([
+                    html.Span(pair_str, style={"width": "40%", "display": "inline-block"}),
+                    html.Div([
+                        html.Div(
+                            display_value,
+                            style={
+                                "backgroundColor": color,
+                                "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
+                                "padding": "2px 8px",
+                                "borderRadius": "4px",
+                                "textAlign": "center",
+                                "width": f"{min(100, abs(value))}%",
+                                "minWidth": "60px"
+                            }
+                        )
+                    ], style={"width": "60%", "display": "inline-block"})
+                ], className="mb-1")
+            )
+        
+        return html.Div([
+            html.H6("Top Performing Pairs", style={"color": "#80ff00", "marginBottom": "10px"}),
+            html.Div(rows)
+        ])
+    
+    @classmethod
+    def create_signal_strength_meter(cls, buy_signal_strength, short_signal_strength):
+        """
+        Create signal strength meters showing conviction levels
+        
+        Args:
+            buy_signal_strength: Float 0-100 representing buy signal strength
+            short_signal_strength: Float 0-100 representing short signal strength
+        """
+        # Handle None or NaN values
+        if buy_signal_strength is None or pd.isna(buy_signal_strength):
+            buy_signal_strength = 0
+        if short_signal_strength is None or pd.isna(short_signal_strength):
+            short_signal_strength = 0
+            
+        def create_meter(strength, signal_type, color):
+            # Determine conviction level
+            if strength >= 80:
+                conviction = "STRONG"
+                meter_color = "#00ff41"
+            elif strength >= 60:
+                conviction = "MODERATE"
+                meter_color = "#ffff00"
+            elif strength >= 40:
+                conviction = "WEAK"
+                meter_color = "#ff8800"
+            else:
+                conviction = "VERY WEAK"
+                meter_color = "#ff0040"
+            
+            return html.Div([
+                html.Label(f"{signal_type} Signal Strength", 
+                          style={"fontSize": "0.9rem", "color": color}),
+                dbc.Progress(
+                    value=strength,
+                    max=100,
+                    color="success" if strength >= 60 else "warning" if strength >= 40 else "danger",
+                    striped=True,
+                    animated=strength >= 60,
+                    label=f"{strength:.1f}% ({conviction})",
+                    style={"height": "25px", "marginBottom": "5px"}
+                )
+            ])
+        
+        return html.Div([
+            create_meter(buy_signal_strength, "Buy", "#00ff41"),
+            create_meter(short_signal_strength, "Short", "#ff0040")
+        ])
+    
+    @classmethod
+    def create_quick_stats_cards(cls, stats_dict):
+        """
+        Create quick stats cards for key metrics
+        
+        Args:
+            stats_dict: Dictionary with metric names and values
+        """
+        cards = []
+        
+        for metric_name, value in stats_dict.items():
+            # Determine icon and color based on metric
+            if 'total return' in metric_name.lower():
+                icon = "fas fa-chart-line"
+                color = cls.get_color_for_metric('total_capture', value)
+                formatted_value = f"{value:.2f}%"
+            elif 'annual return' in metric_name.lower():
+                icon = "fas fa-calendar-alt"
+                color = cls.get_color_for_metric('annualized_return', value)
+                formatted_value = f"{value:.2f}%"
+            elif 'capture' in metric_name.lower():
+                icon = "fas fa-chart-line"
+                color = cls.get_color_for_metric('total_capture', value)
+                formatted_value = f"{value:.2f}%"
+            elif 'sharpe' in metric_name.lower():
+                icon = "fas fa-balance-scale"
+                color = cls.get_color_for_metric('sharpe', value)
+                formatted_value = f"{value:.2f}"
+            elif 'win' in metric_name.lower():
+                icon = "fas fa-trophy"
+                color = cls.get_color_for_metric('win_rate', value)
+                formatted_value = f"{value:.1f}%"
+            elif 'drawdown' in metric_name.lower():
+                # Use a basic arrow-down icon that's universally available
+                icon = "fas fa-arrow-down"
+                color = cls.get_color_for_metric('max_drawdown', value)
+                formatted_value = f"{value:.1f}%"
+            else:
+                icon = "fas fa-info-circle"
+                color = "#80ff00"
+                formatted_value = str(value)
+            
+            card = dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.I(className=f"{icon} fa-2x mb-2", 
+                              style={"color": color}),
+                        html.H4(formatted_value, 
+                               style={"color": color, "marginBottom": "5px"}),
+                        html.Small(metric_name, 
+                                 style={"color": "#aaa"})
+                    ], style={"textAlign": "center", "padding": "15px"})
+                ], style={"backgroundColor": "#1a1a1a", "border": f"1px solid {color}"})
+            ], width=3, className="mb-3")
+            
+            cards.append(card)
+        
+        return dbc.Row(cards)
+    
+    @classmethod
+    def create_visual_signal_indicators(cls, current_signal, next_signal):
+        """
+        Create visual signal indicators with arrows and icons
+        
+        Args:
+            current_signal: Current trading signal (Buy/Short/Cash)
+            next_signal: Next trading signal (Buy/Short/Cash)
+        """
+        def get_signal_icon(signal):
+            if "Buy" in signal:
+                return html.Span([
+                    html.I(className="fas fa-arrow-up fa-2x", 
+                          style={"color": "#00ff41", "marginRight": "10px"}),
+                    html.Span("BUY", style={
+                        "color": "#00ff41",
+                        "fontWeight": "bold",
+                        "fontSize": "1.2rem",
+                        "backgroundColor": "rgba(0, 255, 65, 0.1)",
+                        "padding": "5px 15px",
+                        "borderRadius": "15px",
+                        "border": "2px solid #00ff41"
+                    })
+                ])
+            elif "Short" in signal:
+                return html.Span([
+                    html.I(className="fas fa-arrow-down fa-2x", 
+                          style={"color": "#ff0040", "marginRight": "10px"}),
+                    html.Span("SHORT", style={
+                        "color": "#ff0040",
+                        "fontWeight": "bold",
+                        "fontSize": "1.2rem",
+                        "backgroundColor": "rgba(255, 0, 64, 0.1)",
+                        "padding": "5px 15px",
+                        "borderRadius": "15px",
+                        "border": "2px solid #ff0040"
+                    })
+                ])
+            else:
+                return html.Span([
+                    html.I(className="fas fa-pause-circle fa-2x", 
+                          style={"color": "#ffff00", "marginRight": "10px"}),
+                    html.Span("HOLD", style={
+                        "color": "#ffff00",
+                        "fontWeight": "bold",
+                        "fontSize": "1.2rem",
+                        "backgroundColor": "rgba(255, 255, 0, 0.1)",
+                        "padding": "5px 15px",
+                        "borderRadius": "15px",
+                        "border": "2px solid #ffff00"
+                    })
+                ])
+        
+        return html.Div([
+            dbc.Row([
+                dbc.Col([
+                    html.H6("Current Signal", style={"color": "#aaa", "marginBottom": "10px"}),
+                    get_signal_icon(current_signal)
+                ], width=6, style={"textAlign": "center"}),
+                dbc.Col([
+                    html.H6("Next Signal", style={"color": "#aaa", "marginBottom": "10px"}),
+                    get_signal_icon(next_signal)
+                ], width=6, style={"textAlign": "center"})
+            ])
+        ], className="mb-3", style={
+            "backgroundColor": "rgba(128, 255, 0, 0.05)",
+            "padding": "20px",
+            "borderRadius": "10px",
+            "border": "1px solid rgba(128, 255, 0, 0.2)"
+        })
+    
+    @classmethod
+    def create_alert_badges(cls, alerts_dict):
+        """
+        Create alert badges for significant changes
+        
+        Args:
+            alerts_dict: Dictionary of alert conditions and their status
+        """
+        badges = []
+        
+        for alert_name, alert_info in alerts_dict.items():
+            if alert_info['triggered']:
+                if alert_info['severity'] == 'high':
+                    color = "#ff0040"
+                    icon = "fas fa-exclamation-triangle"
+                elif alert_info['severity'] == 'medium':
+                    color = "#ff8800"
+                    icon = "fas fa-exclamation-circle"
+                else:
+                    color = "#ffff00"
+                    icon = "fas fa-info-circle"
+                
+                badge = html.Span([
+                    html.I(className=f"{icon} me-2"),
+                    alert_info['message']
+                ], style={
+                    "backgroundColor": color,
+                    "color": "black" if color == "#ffff00" else "white",
+                    "padding": "4px 12px",
+                    "borderRadius": "12px",
+                    "fontSize": "0.85rem",
+                    "marginRight": "10px",
+                    "marginBottom": "5px",
+                    "display": "inline-block"
+                })
+                badges.append(badge)
+        
+        if badges:
+            return html.Div([
+                html.H6("Alerts", style={"color": "#ff8800", "marginBottom": "10px"}),
+                html.Div(badges)
+            ], className="mb-3")
+        else:
+            return html.Div()  # Return empty div if no alerts
+    
+    @classmethod
+    def create_strategy_comparison_table(cls, strategies_data):
+        """
+        Create a comparison table for different strategies
+        
+        Args:
+            strategies_data: List of dictionaries with strategy metrics
+        """
+        if not strategies_data:
+            return html.Div("No strategies to compare", style={"color": "#888"})
+        
+        # Create table headers
+        headers = ["Strategy", "Capture %", "Win Rate", "Sharpe", "Max DD", "Grade"]
+        
+        # Create table rows
+        rows = []
+        for strategy in strategies_data:
+            # Determine colors for each metric
+            capture_color = cls.get_color_for_metric('total_capture', strategy.get('capture', 0))
+            winrate_color = cls.get_color_for_metric('win_rate', strategy.get('win_rate', 0))
+            sharpe_color = cls.get_color_for_metric('sharpe', strategy.get('sharpe', 0))
+            dd_color = cls.get_color_for_metric('max_drawdown', strategy.get('max_dd', 0))
+            
+            # Calculate grade
+            grade, _ = cls.calculate_grade(
+                strategy.get('sharpe', 0),
+                strategy.get('win_rate', 0),
+                strategy.get('max_dd', 0)
+            )
+            grade_color = cls.COLORS['excellent'] if grade in ["A+", "A"] else \
+                         cls.COLORS['good'] if grade in ["B+", "B"] else \
+                         cls.COLORS['moderate'] if grade in ["C+", "C"] else \
+                         cls.COLORS['poor']
+            
+            row = html.Tr([
+                html.Td(strategy.get('name', 'Unknown'), style={"color": "#80ff00"}),
+                html.Td(f"{strategy.get('capture', 0):.2f}%", style={"color": capture_color}),
+                html.Td(f"{strategy.get('win_rate', 0):.1f}%", style={"color": winrate_color}),
+                html.Td(f"{strategy.get('sharpe', 0):.2f}", style={"color": sharpe_color}),
+                html.Td(f"{strategy.get('max_dd', 0):.1f}%", style={"color": dd_color}),
+                html.Td(html.Span(grade, style={
+                    "backgroundColor": grade_color,
+                    "color": "black" if grade_color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
+                    "padding": "2px 8px",
+                    "borderRadius": "8px"
+                }))
+            ])
+            rows.append(row)
+        
+        table = html.Table([
+            html.Thead([
+                html.Tr([html.Th(header, style={"color": "#80ff00", "borderBottom": "2px solid #80ff00"}) 
+                        for header in headers])
+            ]),
+            html.Tbody(rows)
+        ], style={
+            "width": "100%",
+            "borderCollapse": "collapse",
+            "marginTop": "10px"
+        })
+        
+        return html.Div([
+            html.H6("Strategy Comparison", style={"color": "#80ff00", "marginBottom": "10px"}),
+            table
+        ], className="mb-3")
+    
+    @classmethod
+    def create_strategy_confidence_badge(cls, p_value, sample_size):
+        """
+        Create confidence badge based on statistical significance
+        
+        Args:
+            p_value: Statistical p-value
+            sample_size: Number of samples/trades
+        """
+        if p_value is None or sample_size < 30:
+            confidence = "LOW"
+            color = "#ff0040"
+            icon = "fas fa-exclamation-triangle"
+            tooltip = f"Insufficient data (n={sample_size}). Need at least 30 trades for statistical confidence."
+        elif p_value < 0.01:
+            confidence = "VERY HIGH"
+            color = "#00ff41"
+            icon = "fas fa-check-double"
+            tooltip = f"99% confidence level achieved (p={p_value:.4f}, n={sample_size})"
+        elif p_value < 0.05:
+            confidence = "HIGH"
+            color = "#80ff00"
+            icon = "fas fa-check"
+            tooltip = f"95% confidence level achieved (p={p_value:.4f}, n={sample_size})"
+        elif p_value < 0.10:
+            confidence = "MODERATE"
+            color = "#ffff00"
+            icon = "fas fa-minus-circle"
+            tooltip = f"90% confidence level achieved (p={p_value:.4f}, n={sample_size})"
+        else:
+            confidence = "LOW"
+            color = "#ff8800"
+            icon = "fas fa-question-circle"
+            tooltip = f"Results not statistically significant (p={p_value:.4f}, n={sample_size})"
+        
+        badge = html.Div([
+            html.Span([
+                html.I(className=f"{icon} me-2"),
+                f"Strategy Confidence: {confidence}"
+            ], id="confidence-badge-target",
+               style={
+                "backgroundColor": color,
+                "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
+                "padding": "8px 16px",
+                "borderRadius": "20px",
+                "fontSize": "1rem",
+                "fontWeight": "bold",
+                "display": "inline-block",
+                "cursor": "help"
+            }),
+            dbc.Tooltip(tooltip, target="confidence-badge-target", placement="bottom")
+        ])
+        
+        return badge
+    
+    @classmethod
+    def create_risk_reward_matrix(cls, sharpe, max_drawdown):
+        """
+        Create risk/reward matrix badge based on Sharpe ratio and Max Drawdown
+        Returns an HTML component showing risk/reward positioning
+        """
+        # Handle None or NaN values
+        if sharpe is None or pd.isna(sharpe):
+            sharpe = 0
+        if max_drawdown is None or pd.isna(max_drawdown):
+            max_drawdown = 0
+            
+        # Determine risk level based on max drawdown
+        low_risk = max_drawdown > cls.THRESHOLDS['max_drawdown']['good']  # > -10%
+        
+        # Determine reward level based on Sharpe ratio
+        high_reward = sharpe > cls.THRESHOLDS['sharpe']['good']  # > 1.5
+        
+        # Create matrix positioning
+        if high_reward and low_risk:
+            icon = "🌟"
+            text = "LOW RISK / HIGH REWARD"
+            color = cls.COLORS['excellent']
+            bg_color = "rgba(0, 255, 65, 0.1)"
+            description = "Optimal positioning - Strong returns with controlled risk"
+        elif high_reward and not low_risk:
+            icon = "🔥"
+            text = "HIGH RISK / HIGH REWARD"
+            color = cls.COLORS['moderate']
+            bg_color = "rgba(255, 255, 0, 0.1)"
+            description = "Aggressive positioning - Strong returns but elevated risk"
+        elif not high_reward and low_risk:
+            icon = "✅"
+            text = "LOW RISK / LOW REWARD"
+            color = cls.COLORS['good']
+            bg_color = "rgba(128, 255, 0, 0.1)"
+            description = "Conservative positioning - Limited returns but protected capital"
+        else:
+            icon = "⚠️"
+            text = "HIGH RISK / LOW REWARD"
+            color = cls.COLORS['poor']
+            bg_color = "rgba(255, 0, 64, 0.1)"
+            description = "Unfavorable positioning - Poor risk-adjusted returns"
+        
+        # Use a simple unique ID based on the component type and values
+        matrix_id = f"risk-reward-matrix-{abs(hash(f'{sharpe:.3f}-{max_drawdown:.1f}')) % 10000}"
+        
+        return html.Div([
+            html.Div([
+                html.Span(icon, style={"fontSize": "1.5rem", "marginRight": "8px"}),
+                html.Span(text, style={
+                    "fontWeight": "bold",
+                    "fontSize": "0.9rem",
+                    "letterSpacing": "1px"
+                })
+            ], id=matrix_id, style={
+                "backgroundColor": bg_color,
+                "color": color,
+                "padding": "8px 16px",
+                "borderRadius": "20px",
+                "border": f"2px solid {color}",
+                "display": "inline-flex",
+                "alignItems": "center",
+                "cursor": "help",
+                "boxShadow": f"0 0 10px {bg_color}",
+                "marginTop": "10px",
+                "marginBottom": "10px"
+            }),
+            dbc.Tooltip(
+                [
+                    html.Div(description, style={"marginBottom": "8px"}),
+                    html.Div(f"Sharpe Ratio: {sharpe:.3f} | Max Drawdown: {max_drawdown:.1f}%", 
+                            style={"fontSize": "0.85rem", "opacity": "0.9"})
+                ],
+                target=matrix_id,
+                placement="bottom"
+            )
+        ])
+
 # Initialize the Dash app with a dark theme and custom styles
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY, "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"])
 
@@ -161,6 +870,31 @@ app.index_string = '''
                 box-shadow: 0 0 10px rgba(128, 255, 0, 0.5);
                 border-color: #80ff00;
             }
+            
+            /* Custom Progress Bar Colors - Theme Aligned */
+            .progress-bar.bg-success {
+                background-color: #00ff41 !important;
+                box-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+            }
+            .progress-bar.bg-warning {
+                background-color: #ffff00 !important;
+                box-shadow: 0 0 10px rgba(255, 255, 0, 0.5);
+                color: #000 !important;
+            }
+            .progress-bar.bg-danger {
+                background-color: #ff0040 !important;
+                box-shadow: 0 0 10px rgba(255, 0, 64, 0.5);
+            }
+            .progress-bar.bg-info {
+                background-color: #80ff00 !important;
+                box-shadow: 0 0 10px rgba(128, 255, 0, 0.5);
+                color: #000 !important;
+            }
+            .progress {
+                background-color: rgba(0, 0, 0, 0.8);
+                border: 1px solid rgba(128, 255, 0, 0.2);
+            }
+            
             .loading-text {
                 animation: pulse 3s ease-in-out infinite;
             }
@@ -2010,6 +2744,37 @@ app.layout = dbc.Container(
                             ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
                             dbc.Collapse(
                                 dbc.CardBody([
+                                    # Strategy Grade Badge
+                                    html.Div(id='strategy-grade-badge', className='mb-3'),
+                                    
+                                    # Performance Progress Bars
+                                    html.Div(id='performance-progress-bars', className='mb-3'),
+                                    
+                                    # Risk/Reward Matrix
+                                    html.Div(id='ai-risk-reward-matrix', className='mb-3'),
+                                    
+                                    # Performance Heatmap
+                                    html.Div(id='performance-heatmap', className='mb-3'),
+                                    
+                                    # Signal Strength Meters
+                                    html.Div(id='signal-strength-meters', className='mb-3'),
+                                    
+                                    # Strategy Confidence Badge
+                                    html.Div(id='strategy-confidence-badge', className='mb-3'),
+                                    
+                                    # Quick Stats Cards
+                                    html.Div(id='quick-stats-cards', className='mb-3'),
+                                    
+                                    # Visual Signal Indicators
+                                    html.Div(id='visual-signal-indicators', className='mb-3'),
+                                    
+                                    # Alert Badges
+                                    html.Div(id='alert-badges', className='mb-3'),
+                                    
+                                    # Strategy Comparison Table
+                                    html.Div(id='strategy-comparison-table', className='mb-3'),
+                                    
+                                    # Original content
                                     html.Div(id='most-productive-buy-pair'),
                                     html.Div(id='most-productive-short-pair'),
                                     html.Div(id='avg-capture-buy-leader'),
@@ -2072,11 +2837,6 @@ app.layout = dbc.Container(
                                     type='text',
                                     debounce=True,
                                     className='glow-border'
-                                ),
-                                dbc.Tooltip(
-                                    "Enter one or more ticker symbols to analyze how they perform when following the primary ticker's signals. Separate multiple tickers with commas.",
-                                    target="secondary-ticker-input",
-                                    placement="right"
                                 ),
                                 dbc.FormFeedback(
                                     id='secondary-ticker-input-feedback',
@@ -2180,10 +2940,93 @@ app.layout = dbc.Container(
                                         'fontWeight': 'bold',
                                         'border': '2px solid #80ff00'
                                     },
-                                    style_data_conditional=[{
-                                        'if': {'row_index': 'odd'},
-                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                                    }],
+                                    style_data_conditional=[
+                                        {
+                                            'if': {'row_index': 'odd'},
+                                            'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                        },
+                                        # Color code Win Ratio column using centralized thresholds
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Win Ratio (%)}} > {}'.format(PerformanceMetrics.THRESHOLDS['win_rate']['good']),
+                                                'column_id': 'Win Ratio (%)'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['excellent'],
+                                            'fontWeight': 'bold'
+                                        },
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Win Ratio (%)}} > {} && {{Win Ratio (%)}} <= {}'.format(
+                                                    PerformanceMetrics.THRESHOLDS['win_rate']['warning'],
+                                                    PerformanceMetrics.THRESHOLDS['win_rate']['good']
+                                                ),
+                                                'column_id': 'Win Ratio (%)'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['moderate']
+                                        },
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Win Ratio (%)}} <= {}'.format(PerformanceMetrics.THRESHOLDS['win_rate']['warning']),
+                                                'column_id': 'Win Ratio (%)'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['poor']
+                                        },
+                                        # Color code Total Capture column using centralized thresholds
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Total Capture (%)}} > {}'.format(PerformanceMetrics.THRESHOLDS['total_capture']['good']),
+                                                'column_id': 'Total Capture (%)'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['excellent'],
+                                            'fontWeight': 'bold'
+                                        },
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Total Capture (%)}} > {} && {{Total Capture (%)}} <= {}'.format(
+                                                    PerformanceMetrics.THRESHOLDS['total_capture']['warning'],
+                                                    PerformanceMetrics.THRESHOLDS['total_capture']['good']
+                                                ),
+                                                'column_id': 'Total Capture (%)'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['moderate']
+                                        },
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Total Capture (%)}} <= {}'.format(PerformanceMetrics.THRESHOLDS['total_capture']['warning']),
+                                                'column_id': 'Total Capture (%)'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['poor']
+                                        },
+                                        # Color code Sharpe Ratio column using centralized thresholds
+                                        {
+                                            'if': {
+                                                'filter_query': '{{Sharpe Ratio}} > {}'.format(PerformanceMetrics.THRESHOLDS['sharpe']['moderate']),
+                                                'column_id': 'Sharpe Ratio'
+                                            },
+                                            'color': PerformanceMetrics.COLORS['excellent'],
+                                            'fontWeight': 'bold'
+                                        },
+                                        {
+                                            'if': {
+                                                'filter_query': '{Sharpe Ratio} > 0 && {Sharpe Ratio} <= 1',
+                                                'column_id': 'Sharpe Ratio'
+                                            },
+                                            'color': '#ffff00'
+                                        },
+                                        {
+                                            'if': {
+                                                'filter_query': '{Sharpe Ratio} <= 0',
+                                                'column_id': 'Sharpe Ratio'
+                                            },
+                                            'color': '#ff0040'
+                                        },
+                                        # Style the Status column
+                                        {
+                                            'if': {'column_id': 'Status'},
+                                            'textAlign': 'center',
+                                            'fontSize': '1.2rem'
+                                        }
+                                    ],
                                 )
                             ])
                         ], className='mt-3')
@@ -2315,6 +3158,8 @@ app.layout = dbc.Container(
                                 html.I(className="fas fa-chart-line me-2", style={"color": "#80ff00"}),
                                 html.Span(id='combined-performance-header', children='Combined Performance', style={"fontWeight": "bold"})
                             ], className='mb-2'),
+                            # Risk/Reward Matrix placeholder
+                            html.Div(id='manual-risk-reward-matrix', className='mb-2'),
                             html.Div(id='combined-sharpe-ratio', children='Sharpe Ratio: --', className='mb-1'),
                             html.Div(id='combined-max-drawdown', children='Max Drawdown: --', className='mb-1'),
                             html.Div(id='combined-calmar-ratio', children='Calmar Ratio: --', className='mb-1'),
@@ -3915,7 +4760,17 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
         return no_update  # Do not update the chart in case of error
 
 @app.callback(
-    [Output('most-productive-buy-pair', 'children'),
+    [Output('strategy-grade-badge', 'children'),
+     Output('performance-progress-bars', 'children'),
+     Output('ai-risk-reward-matrix', 'children'),
+     Output('performance-heatmap', 'children'),
+     Output('signal-strength-meters', 'children'),
+     Output('strategy-confidence-badge', 'children'),
+     Output('quick-stats-cards', 'children'),
+     Output('visual-signal-indicators', 'children'),
+     Output('alert-badges', 'children'),
+     Output('strategy-comparison-table', 'children'),
+     Output('most-productive-buy-pair', 'children'),
      Output('most-productive-short-pair', 'children'),
      Output('avg-capture-buy-leader', 'children'),
      Output('total-capture-buy-leader', 'children'),
@@ -3930,38 +4785,38 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 )
 def update_dynamic_strategy_display(ticker, n_intervals):
     if not ticker:
-        return [""] * 10
+        return [""] * 20
 
     results = load_precomputed_results(ticker)
     
     if results is None:
-        return ["Data not available. Please wait..."] * 10
+        return ["", "", "", "", "", "", "", "", "", "", "Data not available. Please wait..."] + [""] * 9
     
     if 'status' in results:
         if results['status'] == 'processing':
-            return ["Data is currently being processed."] * 10
+            return ["", "", "", "", "", "", "", "", "", "", "Data is currently being processed."] + [""] * 9
         elif results['status'] == 'complete':
             if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                return ["Processing complete, but top pairs not found. Please check data integrity."] * 10
+                return ["", "", "", "", "", "", "", "", "", "", "Processing complete, but top pairs not found. Please check data integrity."] + [""] * 9
         elif results['status'] == 'failed':
-            return [f"Processing failed for {ticker}. Please check the error message."] * 10
+            return ["", "", "", "", "", "", "", "", "", "", f"Processing failed for {ticker}. Please check the error message."] + [""] * 9
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
     
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return [no_update] + ["Data integrity issue - missing top pairs"] * 9
+        return ["", "", "", "", "", "", "", "", "", "", "Data integrity issue - missing top pairs"] + [""] * 9
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return [no_update] + ["Data integrity issue - missing preprocessed data"] * 9
+        return ["", "", "", "", "", "", "", "", "", "", "Data integrity issue - missing preprocessed data"] + [""] * 9
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return [no_update] + ["Data integrity issue - invalid pair format"] * 9
+        return [no_update, no_update] + ["Data integrity issue - invalid pair format"] * 18
 
     try:
         # Validate top pairs data
@@ -3983,7 +4838,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
         buy_signals_leader = sma1_buy_leader > sma2_buy_leader
-        close_pct_change = df['Close'].pct_change().values
+        close_pct_change = df['Close'].pct_change()  # Keep as Series, not numpy array
 
         sma1_short_leader = df[f'SMA_{top_short_pair[0]}']
         sma2_short_leader = df[f'SMA_{top_short_pair[1]}']
@@ -4078,22 +4933,96 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     # Buy metrics
     buy_signals_shifted = buy_signals_leader.shift(1, fill_value=False)
     buy_returns_on_trigger_days = close_pct_change[buy_signals_shifted]
-    buy_trigger_days = np.sum(buy_signals_shifted)
-    buy_wins = np.sum(buy_returns_on_trigger_days > 0)
-    buy_losses = np.sum(buy_returns_on_trigger_days <= 0)
+    buy_trigger_days = int(buy_signals_shifted.sum())
+    buy_wins = int((buy_returns_on_trigger_days > 0).sum())
+    buy_losses = int((buy_returns_on_trigger_days <= 0).sum())
     buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    avg_capture_buy = np.mean(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0
-    buy_capture = np.sum(buy_returns_on_trigger_days * 100) if buy_trigger_days > 0 else 0
-
+    avg_capture_buy = float(buy_returns_on_trigger_days.mean() * 100) if buy_trigger_days > 0 else 0
+    buy_capture = float(buy_returns_on_trigger_days.sum() * 100) if buy_trigger_days > 0 else 0
+    
+    # Calculate Buy Leader Sharpe Ratio and Max Drawdown
+    # Create a full series with 0s when not in position
+    buy_leader_daily_returns = close_pct_change.copy()
+    buy_leader_daily_returns[~buy_signals_shifted] = 0
+    
+    # For Sharpe, we only use returns when in position
+    if buy_trigger_days > 0:
+        # Get returns only for days in position for statistics
+        returns_in_position = close_pct_change[buy_signals_shifted]
+        
+        # Calculate total return and annualized return
+        total_years = len(df) / 252  # Total years of data
+        if total_years > 0 and buy_capture != 0:
+            # Annualized return based on total capture and total time
+            buy_leader_annual_return = ((1 + buy_capture/100) ** (1/total_years)) - 1
+            
+            # Annualized volatility of daily returns when in position
+            if len(returns_in_position) > 0:
+                daily_vol = float(returns_in_position.std())
+                buy_leader_annual_std = daily_vol * np.sqrt(252)
+                buy_leader_sharpe = (buy_leader_annual_return - 0.05) / buy_leader_annual_std if buy_leader_annual_std > 0 else 0
+            else:
+                buy_leader_sharpe = 0
+        else:
+            buy_leader_sharpe = 0
+    else:
+        buy_leader_sharpe = 0
+    
+    # Max Drawdown - use cumulative returns with 0s when not in position
+    buy_cumulative = (1 + buy_leader_daily_returns).cumprod()
+    if len(buy_cumulative) > 0:
+        buy_rolling_max = buy_cumulative.expanding().max()
+        buy_drawdowns = (buy_cumulative - buy_rolling_max) / buy_rolling_max * 100
+        buy_leader_max_dd = float(buy_drawdowns.min())
+    else:
+        buy_leader_max_dd = 0
+    
     # Short metrics
     short_signals_shifted = short_signals_leader.shift(1, fill_value=False)
     short_returns_on_trigger_days = -close_pct_change[short_signals_shifted]
-    short_trigger_days = np.sum(short_signals_shifted)
-    short_wins = np.sum(short_returns_on_trigger_days > 0)
-    short_losses = np.sum(short_returns_on_trigger_days <= 0)
+    short_trigger_days = int(short_signals_shifted.sum())
+    short_wins = int((short_returns_on_trigger_days > 0).sum())
+    short_losses = int((short_returns_on_trigger_days <= 0).sum())
     short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    avg_capture_short = np.mean(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0
-    short_capture = np.sum(short_returns_on_trigger_days * 100) if short_trigger_days > 0 else 0
+    avg_capture_short = float(short_returns_on_trigger_days.mean() * 100) if short_trigger_days > 0 else 0
+    short_capture = float(short_returns_on_trigger_days.sum() * 100) if short_trigger_days > 0 else 0
+    
+    # Calculate Short Leader Sharpe Ratio and Max Drawdown
+    # Create a full series with 0s when not in position
+    short_leader_daily_returns = -close_pct_change.copy()
+    short_leader_daily_returns[~short_signals_shifted] = 0
+    
+    # For Sharpe, we only use returns when in position
+    if short_trigger_days > 0:
+        # Get returns only for days in position for statistics
+        returns_in_position = -close_pct_change[short_signals_shifted]
+        
+        # Calculate total return and annualized return
+        total_years = len(df) / 252  # Total years of data
+        if total_years > 0 and short_capture != 0:
+            # Annualized return based on total capture and total time
+            short_leader_annual_return = ((1 + short_capture/100) ** (1/total_years)) - 1
+            
+            # Annualized volatility of daily returns when in position
+            if len(returns_in_position) > 0:
+                daily_vol = float(returns_in_position.std())
+                short_leader_annual_std = daily_vol * np.sqrt(252)
+                short_leader_sharpe = (short_leader_annual_return - 0.05) / short_leader_annual_std if short_leader_annual_std > 0 else 0
+            else:
+                short_leader_sharpe = 0
+        else:
+            short_leader_sharpe = 0
+    else:
+        short_leader_sharpe = 0
+    
+    # Max Drawdown - use cumulative returns with 0s when not in position
+    short_cumulative = (1 + short_leader_daily_returns).cumprod()
+    if len(short_cumulative) > 0:
+        short_rolling_max = short_cumulative.expanding().max()
+        short_drawdowns = (short_cumulative - short_rolling_max) / short_rolling_max * 100
+        short_leader_max_dd = float(short_drawdowns.min())
+    else:
+        short_leader_max_dd = 0
 
     avg_capture_buy_leader = (
         f"Avg. Daily Capture % for Buy Leader: {avg_capture_buy:.4f}% "
@@ -4105,8 +5034,8 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         f"(Trigger Days: {short_trigger_days}, Wins: {short_wins}, Losses: {short_losses}, Win Ratio: {short_win_ratio * 100:.2f}%)"
     )
 
-    total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_capture:.4f}%"
-    total_capture_short_leader = f"Total Capture for Short Leader: {short_capture:.4f}%"
+    total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_capture:.4f}% | Sharpe: {buy_leader_sharpe:.2f} | Max DD: {buy_leader_max_dd:.2f}%"
+    total_capture_short_leader = f"Total Capture for Short Leader: {short_capture:.4f}% | Sharpe: {short_leader_sharpe:.2f} | Max DD: {short_leader_max_dd:.2f}%"
 
     # Recalculate the dynamic cumulative performance for combined strategy
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
@@ -4124,6 +5053,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         t_statistic = None
         p_value = None
         sharpe_ratio = 0
+        max_drawdown = 0
     else:
         daily_returns_series = df['Close'].pct_change().fillna(0)
         cumulative_captures = []
@@ -4235,6 +5165,16 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                 sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std
             else:
                 sharpe_ratio = 0.0
+            
+            # Calculate Maximum Drawdown for dynamic strategy
+            if len(cumulative_captures) > 0:
+                cumulative_returns = pd.Series(cumulative_captures).cumsum()
+                equity_curve = (1 + cumulative_returns / 100)  # Convert to equity curve
+                running_max = equity_curve.expanding().max()
+                drawdown_series = (equity_curve - running_max) / running_max * 100
+                max_drawdown = drawdown_series.min()
+            else:
+                max_drawdown = 0.0
 
         else:
             # No captures at all
@@ -4248,6 +5188,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             t_statistic = None
             p_value = None
             sharpe_ratio = 0.0
+            max_drawdown = 0.0
 
     if next_trading_signal_type == "Buy":
         active_returns = buy_returns_on_trigger_days
@@ -4320,9 +5261,9 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         recommendations = {
             'Buy': 'Enter Buy',
             'Short': 'Enter Short',
-            'Cash': 'Hold Cash'
+            'Cash': 'All Cash'
         }
-        recommendation = recommendations.get(signal, 'Hold Cash')
+        recommendation = recommendations.get(signal, 'All Cash')
         price_range_str = f"${low:.2f} - ${high:.2f}" if high != float('inf') else f"${low:.2f} and above"
         if signal in ['Buy', 'Short']:
             signal_display = f"{signal} ({top_buy_pair[0]},{top_buy_pair[1]})" if signal == 'Buy' else f"{signal} ({top_short_pair[0]},{top_short_pair[1]})"
@@ -4421,16 +5362,18 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             html.Div([
                 html.H4("5. Trading Recommendations", className="mb-3"),
                 html.H5(f"For Current Trading Session ({current_date.strftime('%Y-%m-%d')}):", className="mb-2"),
-                html.P(f"Leading Buy SMA Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]} (Total Capture: {buy_capture:.4f}%)", className="mb-1"),
-                html.P(f"Leading Short SMA Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]} (Total Capture: {short_capture:.4f}%)", className="mb-1"),
+                html.P(f"Leading Buy SMA Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}", className="mb-1"),
+                html.P(f"  • Total Capture: {buy_capture:.4f}% | Sharpe: {buy_leader_sharpe:.2f} | Max DD: {buy_leader_max_dd:.2f}%", className="mb-1", style={'marginLeft': '20px'}),
+                html.P(f"Leading Short SMA Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}", className="mb-1"),
+                html.P(f"  • Total Capture: {short_capture:.4f}% | Sharpe: {short_leader_sharpe:.2f} | Max DD: {short_leader_max_dd:.2f}%", className="mb-1", style={'marginLeft': '20px'}),
                 html.P(f"Current Buy Signal: {'TRUE' if buy_signal else 'FALSE'}", className="mb-1"),
                 html.P(f"Current Short Signal: {'TRUE' if short_signal else 'FALSE'}", className="mb-1"),
-                html.P(f"Recommendation: {'Enter Short Position' if short_signal else 'Enter Buy Position' if buy_signal else 'Hold Cash Position'}", className="mb-3"),
+                html.P(f"Recommendation: {'Enter Short Position' if short_signal else 'Enter Buy Position' if buy_signal else 'All Cash'}", className="mb-3"),
                 
                 html.H5(f"For Next Trading Session ({next_trading_day.strftime('%Y-%m-%d')}):", className="mb-2"),
                 html.P(f"Next Buy Signal: {'TRUE' if next_buy_signal else 'FALSE'}", className="mb-1"),
                 html.P(f"Next Short Signal: {'TRUE' if next_short_signal else 'FALSE'}", className="mb-1"),
-                html.P(f"Recommendation: {'Enter Buy Position' if next_buy_signal else 'Enter Short Position' if next_short_signal else 'Hold Cash Position'} before EOD ({current_date.strftime('%Y-%m-%d')})", className="mb-1"),
+                html.P(f"Recommendation: {'Enter Buy Position' if next_buy_signal else 'Enter Short Position' if next_short_signal else 'All Cash'} before EOD ({current_date.strftime('%Y-%m-%d')})", className="mb-1"),
             ], className="mb-4"),
             
             html.Div([
@@ -4456,7 +5399,288 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     results['last_recommendation_time'] = time.time()
     save_precomputed_results(ticker, results)
 
+    # Calculate the time period in years for the data
+    if dates:
+        first_date = dates[0]
+        last_date = dates[-1]
+        time_delta = last_date - first_date
+        years = time_delta.days / 365.25  # Account for leap years
+    else:
+        years = 1  # Default to 1 year if no dates
+    
+    # Use centralized grading function with dynamic strategy metrics and time period
+    # Note: win_ratio is already calculated from the full dynamic strategy
+    grade, grade_color = PerformanceMetrics.calculate_grade(
+        sharpe_ratio, 
+        win_rate=win_ratio, 
+        total_capture=total_capture,
+        years=years
+    )
+    
+    # Create grade badge with tooltip
+    grade_badge = html.Div([
+        html.H4([
+            html.Span("Strategy Grade: ", style={"color": "#80ff00"}),
+            html.Span(grade, 
+                      id="dynamic-grade-tooltip-target",
+                      style={
+                "backgroundColor": grade_color,
+                "color": "black" if grade_color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
+                "padding": "8px 20px",
+                "borderRadius": "25px",
+                "fontWeight": "bold",
+                "fontSize": "1.5rem",
+                "boxShadow": f"0 0 15px {grade_color}",
+                "cursor": "help"
+            }),
+        ], style={"textAlign": "center"}),
+        dbc.Tooltip(
+            f"Overall grade based on: Sharpe Ratio ({sharpe_ratio:.2f}), Win Rate ({win_ratio:.1f}%), "
+            f"Total Return ({total_capture:.1f}%), Annualized Return ({annualized_return:.1f}%) over {years:.1f} years. "
+            f"This reflects the ENTIRE historical performance across ALL dynamic pair switches, not just current leaders.",
+            target="dynamic-grade-tooltip-target",
+            placement="bottom"
+        )
+    ])
+    
+    # Create progress bars showing dynamic strategy performance
+    progress_bars = html.Div([
+        # Current Buy Leader Win Ratio Progress Bar
+        html.Div([
+            html.Label("Current Buy Leader Win Rate", style={"color": "#00ff41", "fontSize": "0.9rem"}),
+            dbc.Progress(
+                value=buy_win_ratio * 100,
+                max=100,
+                color=PerformanceMetrics.get_progress_bar_color(buy_win_ratio),
+                striped=True,
+                animated=buy_win_ratio > PerformanceMetrics.THRESHOLDS['win_rate']['moderate'] / 100,
+                label=f"{buy_win_ratio * 100:.1f}%",
+                style={"height": "25px"}
+            )
+        ], className="mb-2"),
+        
+        # Current Short Leader Win Ratio Progress Bar
+        html.Div([
+            html.Label("Current Short Leader Win Rate", style={"color": "#ff0040", "fontSize": "0.9rem"}),
+            dbc.Progress(
+                value=short_win_ratio * 100,
+                max=100,
+                color=PerformanceMetrics.get_progress_bar_color(short_win_ratio),
+                striped=True,
+                animated=short_win_ratio > PerformanceMetrics.THRESHOLDS['win_rate']['moderate'] / 100,
+                label=f"{short_win_ratio * 100:.1f}%",
+                style={"height": "25px"}
+            )
+        ], className="mb-2"),
+        
+        # Dynamic Strategy Overall Performance Progress Bar
+        html.Div([
+            html.Label("Dynamic Strategy Win Rate (Historical Performance for ALL pairs)", style={"color": "#80ff00", "fontSize": "0.9rem"}),
+            dbc.Progress(
+                value=win_ratio,  # Use the dynamic strategy win_ratio directly
+                max=100,
+                color=PerformanceMetrics.get_progress_bar_color(win_ratio / 100),  # Convert back to decimal for color function
+                striped=True,
+                animated=win_ratio > PerformanceMetrics.THRESHOLDS['win_rate']['moderate'],
+                label=f"{win_ratio:.1f}%",
+                style={"height": "25px"}
+            )
+        ])
+    ])
+
+    # Create Risk/Reward Matrix for AI-Optimized strategy
+    risk_reward_matrix = PerformanceMetrics.create_risk_reward_matrix(sharpe_ratio, max_drawdown)
+    
+    # Create Performance Heatmap
+    # For now, create a simple heatmap with the current top pairs
+    top_pairs_data = {}
+    
+    # Add the current top buy pair with a unique key that includes the type
+    if top_buy_pair and isinstance(top_buy_pair, tuple) and len(top_buy_pair) == 2:
+        # Use a tuple that includes the type to ensure uniqueness
+        key = ('Buy', top_buy_pair[0], top_buy_pair[1])
+        top_pairs_data[key] = {
+            'total_capture': buy_capture,
+            'win_rate': buy_win_ratio * 100,
+            'type': 'buy',
+            'original_pair': top_buy_pair
+        }
+    
+    # Add the current top short pair with a unique key that includes the type
+    if top_short_pair and isinstance(top_short_pair, tuple) and len(top_short_pair) == 2:
+        # Use a tuple that includes the type to ensure uniqueness
+        key = ('Short', top_short_pair[0], top_short_pair[1])
+        top_pairs_data[key] = {
+            'total_capture': short_capture,
+            'win_rate': short_win_ratio * 100,
+            'type': 'short',
+            'original_pair': top_short_pair
+        }
+    
+    # Try to get additional pairs from results if available
+    buy_results = results.get('buy_results', {})
+    short_results = results.get('short_results', {})
+    
+    # Add more buy pairs if available
+    if buy_results:
+        for pair, capture in list(buy_results.items())[:3]:
+            if isinstance(pair, tuple) and len(pair) == 2 and pair != top_buy_pair:
+                # Use unique key with type prefix
+                key = ('Buy', pair[0], pair[1])
+                if key not in top_pairs_data:  # Avoid duplicates
+                    top_pairs_data[key] = {
+                        'total_capture': capture,
+                        'win_rate': 0,  # Would need to calculate, but keeping simple for now
+                        'type': 'buy',
+                        'original_pair': pair
+                    }
+    
+    # Add more short pairs if available
+    if short_results:
+        for pair, capture in list(short_results.items())[:3]:
+            if isinstance(pair, tuple) and len(pair) == 2 and pair != top_short_pair:
+                # Use unique key with type prefix
+                key = ('Short', pair[0], pair[1])
+                if key not in top_pairs_data:  # Avoid duplicates
+                    top_pairs_data[key] = {
+                        'total_capture': capture,
+                        'win_rate': 0,  # Would need to calculate, but keeping simple for now
+                        'type': 'short',
+                        'original_pair': pair
+                    }
+    
+    # If still no data, create a placeholder
+    if not top_pairs_data:
+        performance_heatmap = html.Div(
+            "Performance heatmap will appear once analysis is complete", 
+            style={"color": "#888", "fontStyle": "italic"}
+        )
+    else:
+        performance_heatmap = PerformanceMetrics.create_performance_heatmap(top_pairs_data, metric='total_capture')
+    
+    # Create Signal Strength Meters
+    # Calculate signal strength based on how far SMAs are from crossing
+    # IMPORTANT: We use absolute difference because either SMA can be the "fast" or "slow" one
+    # For buy signals: TRUE when SMA1 > SMA2 (regardless of which has fewer days)
+    # For short signals: TRUE when SMA1 < SMA2 (regardless of which has fewer days)
+    
+    if len(sma1_buy_leader) > 0 and len(sma2_buy_leader) > 0:
+        # For buy signal strength: measure the gap when buy signal is TRUE
+        if buy_signal:  # SMA1 > SMA2
+            buy_sma_diff = abs(sma1_buy_leader.iloc[-1] - sma2_buy_leader.iloc[-1])
+        else:
+            buy_sma_diff = 0
+    else:
+        buy_sma_diff = 0
+    
+    if len(sma1_short_leader) > 0 and len(sma2_short_leader) > 0:
+        # For short signal strength: measure the gap when short signal is TRUE
+        if short_signal:  # SMA1 < SMA2
+            short_sma_diff = abs(sma1_short_leader.iloc[-1] - sma2_short_leader.iloc[-1])
+        else:
+            short_sma_diff = 0
+    else:
+        short_sma_diff = 0
+    
+    # Normalize to 0-100 scale (using 5% of price as max difference)
+    current_price = df['Close'].iloc[-1] if len(df) > 0 else 1
+    max_diff = current_price * 0.05
+    
+    buy_signal_strength = min(100, max(0, (buy_sma_diff / max_diff) * 100))
+    short_signal_strength = min(100, max(0, (short_sma_diff / max_diff) * 100))
+    
+    signal_strength_meters = PerformanceMetrics.create_signal_strength_meter(buy_signal_strength, short_signal_strength)
+    
+    # Create Strategy Confidence Badge
+    strategy_confidence_badge = PerformanceMetrics.create_strategy_confidence_badge(p_value, trigger_days)
+    
+    # Create Quick Stats Cards with annualized return
+    annualized_return = PerformanceMetrics.calculate_annualized_return(total_capture, years) if years > 0 else 0
+    quick_stats = {
+        "Total Return": total_capture,
+        "Annual Return": annualized_return,
+        "Win Rate": win_ratio,
+        "Sharpe Ratio": sharpe_ratio
+    }
+    quick_stats_cards = PerformanceMetrics.create_quick_stats_cards(quick_stats)
+    
+    # Create Visual Signal Indicators
+    visual_signal_indicators = PerformanceMetrics.create_visual_signal_indicators(
+        trading_signal_type, next_trading_signal_type
+    )
+    
+    # Create Alert Badges
+    alerts = {}
+    
+    # Check for significant conditions
+    if win_ratio < 45:
+        alerts['low_win_rate'] = {
+            'triggered': True,
+            'severity': 'high',
+            'message': f'Low Win Rate: {win_ratio:.1f}%'
+        }
+    
+    if max_drawdown < -20:
+        alerts['high_drawdown'] = {
+            'triggered': True,
+            'severity': 'high',
+            'message': f'High Drawdown: {max_drawdown:.1f}%'
+        }
+    
+    if sharpe_ratio < 0:
+        alerts['negative_sharpe'] = {
+            'triggered': True,
+            'severity': 'medium',
+            'message': f'Negative Sharpe: {sharpe_ratio:.2f}'
+        }
+    
+    # Signal change alert
+    if trading_signal_type != next_trading_signal_type:
+        alerts['signal_change'] = {
+            'triggered': True,
+            'severity': 'low',
+            'message': f'Signal Change: {trading_signal_type} → {next_trading_signal_type}'
+        }
+    
+    alert_badges = PerformanceMetrics.create_alert_badges(alerts)
+    
+    # Create Strategy Comparison Table
+    strategies_data = [
+        {
+            'name': 'Dynamic Strategy',
+            'capture': total_capture,
+            'win_rate': win_ratio,
+            'sharpe': sharpe_ratio,
+            'max_dd': max_drawdown
+        },
+        {
+            'name': f'Buy Leader ({top_buy_pair[0]}/{top_buy_pair[1]})',
+            'capture': buy_capture,
+            'win_rate': buy_win_ratio * 100,
+            'sharpe': buy_leader_sharpe,
+            'max_dd': buy_leader_max_dd
+        },
+        {
+            'name': f'Short Leader ({top_short_pair[0]}/{top_short_pair[1]})',
+            'capture': short_capture,
+            'win_rate': short_win_ratio * 100,
+            'sharpe': short_leader_sharpe,
+            'max_dd': short_leader_max_dd
+        }
+    ]
+    strategy_comparison_table = PerformanceMetrics.create_strategy_comparison_table(strategies_data)
+    
     return (
+        grade_badge,
+        progress_bars,
+        risk_reward_matrix,
+        performance_heatmap,
+        signal_strength_meters,
+        strategy_confidence_badge,
+        quick_stats_cards,
+        visual_signal_indicators,
+        alert_badges,
+        strategy_comparison_table,
         most_productive_buy_pair_text,
         most_productive_short_pair_text,
         avg_capture_buy_leader,
@@ -4486,7 +5710,8 @@ def update_dynamic_strategy_display(ticker, n_intervals):
      Output('combined-max-drawdown', 'children'),
      Output('combined-calmar-ratio', 'children'),
      Output('combined-total-signals', 'children'),
-     Output('combined-win-rate', 'children')],
+     Output('combined-win-rate', 'children'),
+     Output('manual-risk-reward-matrix', 'children')],
     [Input('ticker-input', 'value'),
      Input('sma-input-1', 'value'),
      Input('sma-input-2', 'value'),
@@ -4504,7 +5729,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --'), html.Div()
 
     df = fetch_data(ticker)
     if df is None or df.empty:
@@ -4521,7 +5746,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --'), html.Div()
         
     # Create base figure with just the price chart
     fig = go.Figure()
@@ -4557,7 +5782,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                 tickfont=dict(color='#80ff00')
             )
         )
-        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
+        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --'), html.Div()
 
     min_date = df.index.min()
     max_date = df.index.max()
@@ -4585,7 +5810,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         return (fig, 'No data available', 'No data available', 'No data available', 'No data available', 
                'No data available', 'No data available', 'No data available', 'No data available',
                'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: N/A'), html.Span('Max Drawdown: N/A'), 
-               html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'))
+               html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'), html.Div())
     
     # Calculate Buy returns on days when Buy signal was active
     buy_returns_on_trigger_days = daily_returns[buy_signals_shifted]
@@ -4679,16 +5904,94 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     # Create header labels with the actual pair values
     buy_pair_header = f"Buy Pair ({sma_day_1}, {sma_day_2}) Results" if sma_day_1 and sma_day_2 else "Buy Pair Results"
     short_pair_header = f"Short Pair ({sma_day_3}, {sma_day_4}) Results" if sma_day_3 and sma_day_4 else "Short Pair Results"
-    combined_header = f"Combined Performance for Buy Pair ({sma_day_1}, {sma_day_2}) and Short Pair ({sma_day_3}, {sma_day_4})" if all([sma_day_1, sma_day_2, sma_day_3, sma_day_4]) else "Combined Performance"
     
-    # Calculate combined metrics
-    combined_returns = buy_returns_full + short_returns_full
+    # Calculate combined metrics following the leader based on cumulative captures
+    # Track running cumulative captures for decision making
+    buy_cumulative = 0
+    short_cumulative = 0
+    combined_returns = pd.Series(index=daily_returns.index, dtype=float)
+    manual_sma_combined_capture = pd.Series(index=daily_returns.index, dtype=float).fillna(0)  # Initialize for Manual SMA chart trace
+    
+    # Track which signal was followed for accurate statistics and visualization
+    signals_followed = []
+    signal_switches = []  # Track when we switch between buy/short
+    
+    for i, date in enumerate(daily_returns.index):
+        if i == 0:
+            combined_returns[date] = 0
+            continue
+        
+        # Check current signals
+        buy_active = buy_signals_shifted[date] if date in buy_signals_shifted.index else False
+        short_active = short_signals_shifted[date] if date in short_signals_shifted.index else False
+        
+        # Decide which signal to follow based on cumulative captures
+        current_signal = 'none'
+        if buy_active and short_active:
+            # Both signals active - follow the leader (tie goes to short)
+            if buy_cumulative > short_cumulative:
+                combined_returns[date] = daily_returns[date]  # Follow buy
+                current_signal = 'buy'
+            else:
+                combined_returns[date] = -daily_returns[date]  # Follow short (includes tie case)
+                current_signal = 'short'
+        elif buy_active:
+            combined_returns[date] = daily_returns[date]  # Buy only
+            current_signal = 'buy'
+        elif short_active:
+            combined_returns[date] = -daily_returns[date]  # Short only
+            current_signal = 'short'
+        else:
+            combined_returns[date] = 0  # No signal
+            current_signal = 'none'
+        
+        signals_followed.append(current_signal)
+        
+        # Track switches for annotation (when both signals are active and we switch)
+        if buy_active and short_active and i > 1:
+            prev_signal = signals_followed[-2] if len(signals_followed) > 1 else 'none'
+            if current_signal != prev_signal and prev_signal != 'none':
+                signal_switches.append({
+                    'date': date,
+                    'from': prev_signal,
+                    'to': current_signal,
+                    'buy_cum': buy_cumulative,
+                    'short_cum': short_cumulative
+                })
+        
+        # Update cumulative captures for next decision
+        if buy_active:
+            buy_cumulative += daily_returns[date] * 100
+        if short_active:
+            short_cumulative += -daily_returns[date] * 100
+    
     # Remove NaN values to prevent calculation errors
     combined_returns = combined_returns.dropna()
     
-    total_signals = int(buy_trigger_days + short_trigger_days)
-    total_wins = int(buy_wins + short_wins)
-    overall_win_rate = (total_wins / total_signals * 100) if total_signals > 0 else 0
+    # Calculate cumulative combined capture for Manual SMA chart display (overwrite initialization)
+    if len(combined_returns) > 0:
+        manual_sma_combined_capture = combined_returns.cumsum() * 100  # Convert to percentage for Manual SMA pairs
+    # else: keep the initialized empty series
+    
+    # Add Manual SMA Combined Pair Capture trace to chart only when all SMA values are provided and we have data
+    if all([sma_day_1, sma_day_2, sma_day_3, sma_day_4]) and len(combined_returns) > 0:
+        fig.add_trace(go.Scatter(
+            x=manual_sma_combined_capture.index, 
+            y=manual_sma_combined_capture, 
+            mode='lines', 
+            name='Combined Pair Capture', 
+            line=dict(color='#ffff00', width=2, dash='dot'),  # Yellow dotted line for visibility
+            hovertemplate='Date: %{x}<br>Combined Pair Capture: %{y:.2f}%<extra></extra>'
+        ))
+    
+    # Count actual trading days and wins from combined strategy
+    # Only count days where we had an active signal (not 'none')
+    total_signals = len([s for s in signals_followed if s != 'none'])
+    # Count wins: positive returns on signal days (returns are 0 on non-signal days)
+    combined_wins = (combined_returns > 0).sum()
+    overall_win_rate = (combined_wins / total_signals * 100) if total_signals > 0 else 0
+    
+    # Use centralized grading function
     
     # Calculate Sharpe Ratio (assuming 252 trading days per year)
     risk_free_rate = 0.05  # 5% annual, matching other parts of the codebase
@@ -4699,18 +6002,46 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     else:
         sharpe_ratio = 0
     
-    # Calculate Maximum Drawdown
+    # Calculate Maximum Drawdown from equity curve with date range
+    max_drawdown_start_date = None
+    max_drawdown_end_date = None
+    
     if len(combined_returns) > 0:
-        # Calculate cumulative returns
-        cumulative_returns = (1 + combined_returns).cumprod()
-        # Calculate running maximum
-        running_max = cumulative_returns.expanding().max()
-        # Calculate drawdown with division by zero protection
-        drawdown = np.where(running_max != 0, 
-                           (cumulative_returns - running_max) / running_max, 
-                           0)
-        # Get maximum drawdown
-        max_drawdown = np.min(drawdown) * 100  # Convert to percentage
+        # Create equity curve starting at 1.0 (100%)
+        equity_curve = (1 + combined_returns).cumprod()
+        
+        # Handle case where equity curve might be all NaN or empty
+        if equity_curve.notna().any():
+            # Calculate running maximum (peak equity)
+            running_max = equity_curve.expanding().max()
+            
+            # Calculate drawdown from peak
+            drawdown_series = (equity_curve - running_max) / running_max
+            
+            # Get maximum drawdown (most negative value) and its date
+            max_drawdown = drawdown_series.min() * 100  # Convert to percentage
+            
+            if max_drawdown < 0:  # Only if there was an actual drawdown
+                # Find the trough date (where max drawdown occurred)
+                max_drawdown_end_date = drawdown_series.idxmin()
+                
+                # Find the peak date before this trough
+                # Look for the date where running_max last changed before the trough
+                dates_before_trough = equity_curve.index[equity_curve.index <= max_drawdown_end_date]
+                peak_value_at_trough = running_max[max_drawdown_end_date]
+                
+                # Find where equity curve equals this peak value (the start of drawdown)
+                peak_dates = dates_before_trough[equity_curve[dates_before_trough] == peak_value_at_trough]
+                if len(peak_dates) > 0:
+                    max_drawdown_start_date = peak_dates[0]
+                else:
+                    # Fallback: find the actual peak before trough
+                    max_drawdown_start_date = equity_curve[:max_drawdown_end_date].idxmax()
+            else:
+                # If no drawdown occurred (always increasing), set to 0
+                max_drawdown = 0
+        else:
+            max_drawdown = 0
     else:
         max_drawdown = 0
     
@@ -4720,20 +6051,125 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     else:
         calmar_ratio = 0
     
-    # Color code performance metrics
-    sharpe_color = "#00ff41" if sharpe_ratio > 1 else "#ffff00" if sharpe_ratio > 0 else "#ff0040"
-    dd_color = "#00ff41" if max_drawdown > -10 else "#ffff00" if max_drawdown > -20 else "#ff0040"
-    calmar_color = "#00ff41" if calmar_ratio > 3 else "#ffff00" if calmar_ratio > 1 else "#ff0040"
-    win_color = "#00ff41" if overall_win_rate > 55 else "#ffff00" if overall_win_rate > 45 else "#ff0040"
+    # Calculate years for the data period
+    if len(df) > 1:
+        years = (df.index[-1] - df.index[0]).days / 365.25
+    else:
+        years = 1
     
-    # Format summary outputs with color styling
-    combined_sharpe = html.Span(f"Sharpe Ratio: {sharpe_ratio:.3f}", style={"color": sharpe_color})
-    combined_max_dd = html.Span(f"Max Drawdown: {max_drawdown:.2f}%", style={"color": dd_color})
-    combined_calmar = html.Span(f"Calmar Ratio: {calmar_ratio:.3f}", style={"color": calmar_color})
+    # Get the grade for manual SMA performance with time period
+    manual_grade, _ = PerformanceMetrics.calculate_grade(
+        sharpe_ratio, 
+        win_rate=overall_win_rate, 
+        max_drawdown=max_drawdown,
+        total_capture=manual_sma_combined_capture.iloc[-1] if len(manual_sma_combined_capture) > 0 else 0,
+        years=years
+    )
+    
+    # Create combined header with grade and help tooltip
+    if all([sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
+        combined_header = html.Span([
+            f"Combined Performance ",
+            html.Span(f"[Grade: {manual_grade}]", 
+                      id="manual-grade-tooltip-target",
+                      style={
+                "backgroundColor": PerformanceMetrics.COLORS['excellent'] if manual_grade in ["A+", "A"] else PerformanceMetrics.COLORS['good'] if manual_grade in ["B+", "B"] else PerformanceMetrics.COLORS['moderate'] if manual_grade in ["C+", "C"] else PerformanceMetrics.COLORS['poor'],
+                "color": "black" if manual_grade in ["A+", "A", "B+", "B", "C+", "C"] else "white",
+                "padding": "2px 8px",
+                "borderRadius": "12px",
+                "fontSize": "0.9rem",
+                "marginLeft": "10px",
+                "cursor": "help"
+            }),
+            html.Span(" 💡", 
+                      id="manual-strategy-help",
+                      style={"fontSize": "0.9rem", "marginLeft": "10px", "cursor": "help"}),
+            dbc.Tooltip(
+                "Strategy follows the leader: When both Buy and Short signals are TRUE, we trade the pair with higher cumulative capture. "
+                "If captures are equal, Short wins. This ensures only ONE position at a time.",
+                target="manual-strategy-help",
+                placement="top"
+            ),
+            dbc.Tooltip(
+                f"Grade based on Sharpe ({sharpe_ratio:.2f}), Win Rate ({overall_win_rate:.1f}%), Max DD ({max_drawdown:.1f}%)",
+                target="manual-grade-tooltip-target",
+                placement="top"
+            )
+        ])
+    else:
+        combined_header = "Combined Performance"
+    
+    # Color code performance metrics using centralized thresholds
+    sharpe_color = PerformanceMetrics.get_color_for_metric('sharpe', sharpe_ratio)
+    dd_color = PerformanceMetrics.get_color_for_metric('max_drawdown', max_drawdown)
+    calmar_color = PerformanceMetrics.get_color_for_metric('calmar', calmar_ratio)
+    win_color = PerformanceMetrics.get_color_for_metric('win_rate', overall_win_rate)
+    
+    # Format summary outputs with color styling and tooltips
+    combined_sharpe = html.Div([
+        html.Span(f"Sharpe Ratio: {sharpe_ratio:.3f}", 
+                  id="manual-sharpe-tooltip-target",
+                  style={"color": sharpe_color, "cursor": "help", "textDecoration": "underline dotted"}),
+        dbc.Tooltip(
+            "Risk-adjusted return metric. >1.0 is good, >2.0 is excellent. Measures excess return per unit of risk.",
+            target="manual-sharpe-tooltip-target",
+            placement="top"
+        )
+    ], style={"display": "inline-block"})
+    
+    # Format Max Drawdown with date range if available
+    if max_drawdown_start_date and max_drawdown_end_date and max_drawdown < 0:
+        dd_date_range = f" ({max_drawdown_start_date.strftime('%Y-%m-%d')} to {max_drawdown_end_date.strftime('%Y-%m-%d')})"
+        combined_max_dd = html.Div([
+            html.Span(f"Max Drawdown: {max_drawdown:.2f}%{dd_date_range}", 
+                      id="manual-dd-tooltip-target",
+                      style={"color": dd_color, "cursor": "help", "textDecoration": "underline dotted"}),
+            dbc.Tooltip(
+                f"Largest peak-to-trough decline. Occurred from {max_drawdown_start_date.strftime('%b %d, %Y')} to {max_drawdown_end_date.strftime('%b %d, %Y')}. Smaller (less negative) is better.",
+                target="manual-dd-tooltip-target",
+                placement="top"
+            )
+        ], style={"display": "inline-block"})
+    else:
+        combined_max_dd = html.Div([
+            html.Span(f"Max Drawdown: {max_drawdown:.2f}%", 
+                      id="manual-dd-tooltip-target",
+                      style={"color": dd_color, "cursor": "help", "textDecoration": "underline dotted"}),
+            dbc.Tooltip(
+                "Largest peak-to-trough decline in equity. Smaller (less negative) is better. <-20% indicates high risk.",
+                target="manual-dd-tooltip-target",
+                placement="top"
+            )
+        ], style={"display": "inline-block"})
+    
+    combined_calmar = html.Div([
+        html.Span(f"Calmar Ratio: {calmar_ratio:.3f}", 
+                  id="manual-calmar-tooltip-target",
+                  style={"color": calmar_color, "cursor": "help", "textDecoration": "underline dotted"}),
+        dbc.Tooltip(
+            "Annual return divided by max drawdown. >3.0 is excellent, >1.0 is good. Higher means better risk-adjusted returns.",
+            target="manual-calmar-tooltip-target",
+            placement="top"
+        )
+    ], style={"display": "inline-block"})
     combined_signals = f"Total Signals: {total_signals} (Buy: {int(buy_trigger_days)}, Short: {int(short_trigger_days)})"
-    combined_win_rate_text = html.Span(f"Overall Win Rate: {overall_win_rate:.2f}% ({total_wins}/{total_signals})", style={"color": win_color})
     
-    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text
+    # Add win rate with tooltip
+    combined_win_rate_text = html.Div([
+        html.Span(f"Overall Win Rate: {overall_win_rate:.2f}% ({int(combined_wins)}/{total_signals})", 
+                  id="manual-winrate-tooltip-target",
+                  style={"color": win_color, "cursor": "help", "textDecoration": "underline dotted"}),
+        dbc.Tooltip(
+            f"Percentage of signals that resulted in profit. Based on {total_signals} total signals. >55% is good, >60% is excellent.",
+            target="manual-winrate-tooltip-target",
+            placement="top"
+        )
+    ], style={"display": "inline-block"})
+    
+    # Create Risk/Reward Matrix
+    risk_reward_matrix = PerformanceMetrics.create_risk_reward_matrix(sharpe_ratio, max_drawdown)
+    
+    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text, risk_reward_matrix
 
 @app.callback(
     Output('update-interval', 'disabled'),
@@ -5001,8 +6437,16 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         if not metrics_list:
             return empty_fig, [], [], 'No valid data available for processing'
 
-        # Prepare metrics table
+        # Prepare metrics table with performance indicators
         metrics_df = pd.DataFrame(metrics_list)
+        
+        # Add status column using centralized performance metrics
+        metrics_df['Status'] = metrics_df['Win Ratio (%)'].apply(PerformanceMetrics.get_status_emoji)
+        
+        # Reorder columns to put Status first
+        cols = ['Status', 'Ticker'] + [col for col in metrics_df.columns if col not in ['Status', 'Ticker']]
+        metrics_df = metrics_df[cols]
+        
         metrics_df.sort_values(by='Avg Daily Capture (%)', ascending=False, inplace=True)
         columns = [{'name': col, 'id': col} for col in metrics_df.columns]
         data = metrics_df.to_dict('records')
