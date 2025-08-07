@@ -2284,24 +2284,49 @@ app.layout = dbc.Container(
                         ])
                     ]),
                     dbc.CardBody([
+                            # Buy Pair Section - normal text size with better spacing
                             html.Div([
                                 html.I(className="fas fa-arrow-trend-up me-2", style={"color": "#00ff41"}),
-                                html.Span(id='buy-pair-header', children='Buy Pair', style={"fontWeight": "bold", "fontSize": "1.1rem"})
-                            ], className='mt-3 mb-2'),
-                            html.Div(id='trigger-days-buy'),
-                            html.Div(id='win-ratio-buy'),
-                            html.Div(id='avg-daily-capture-buy'),
-                            html.Div(id='total-capture-buy'),
+                                html.Span(id='buy-pair-header', children='Buy Pair', style={"fontWeight": "bold"})
+                            ], className='mb-2'),
+                            html.Div(id='trigger-days-buy', className='mb-1'),
+                            html.Div(id='win-ratio-buy', className='mb-1'),
+                            html.Div(id='avg-daily-capture-buy', className='mb-1'),
+                            html.Div(id='total-capture-buy', className='mb-3'),
+                            
+                            # Visual separator
+                            html.Hr(style={"borderColor": "#80ff00", "opacity": "0.3", "margin": "0.75rem 0"}),
+                            
+                            # Short Pair Section - normal text size with better spacing
                             html.Div([
                                 html.I(className="fas fa-arrow-trend-down me-2", style={"color": "#ff0040"}),
-                                html.Span(id='short-pair-header', children='Short Pair', style={"fontWeight": "bold", "fontSize": "1.1rem"})
-                            ], className='mt-3 mb-2'),
-                            html.Div(id='trigger-days-short'),
-                            html.Div(id='win-ratio-short'),
-                            html.Div(id='avg-daily-capture-short'),
-                            html.Div(id='total-capture-short')
-                        ])
-                ])
+                                html.Span(id='short-pair-header', children='Short Pair', style={"fontWeight": "bold"})
+                            ], className='mb-2'),
+                            html.Div(id='trigger-days-short', className='mb-1'),
+                            html.Div(id='win-ratio-short', className='mb-1'),
+                            html.Div(id='avg-daily-capture-short', className='mb-1'),
+                            html.Div(id='total-capture-short', className='mb-3'),
+                            
+                            # Visual separator
+                            html.Hr(style={"borderColor": "#80ff00", "opacity": "0.3", "margin": "0.75rem 0"}),
+                            
+                            # Combined Summary Section - normal text size with better spacing
+                            html.Div([
+                                html.I(className="fas fa-chart-line me-2", style={"color": "#80ff00"}),
+                                html.Span(id='combined-performance-header', children='Combined Performance', style={"fontWeight": "bold"})
+                            ], className='mb-2'),
+                            html.Div(id='combined-sharpe-ratio', children='Sharpe Ratio: --', className='mb-1'),
+                            html.Div(id='combined-max-drawdown', children='Max Drawdown: --', className='mb-1'),
+                            html.Div(id='combined-calmar-ratio', children='Calmar Ratio: --', className='mb-1'),
+                            html.Div(id='combined-total-signals', children='Total Signals: --', className='mb-1'),
+                            html.Div(id='combined-win-rate', children='Overall Win Rate: --')
+                        ], style={
+                            "height": "100%",
+                            "display": "flex",
+                            "flexDirection": "column",
+                            "justifyContent": "space-between"
+                        })
+                ], style={"height": "calc(100% - 16px)"})
             ], width=6)
         ])  # End of input cards row
                     ]),  # End of CardBody
@@ -4455,7 +4480,13 @@ def update_dynamic_strategy_display(ticker, n_intervals):
      Output('avg-daily-capture-short', 'children'),
      Output('total-capture-short', 'children'),
      Output('buy-pair-header', 'children'),
-     Output('short-pair-header', 'children')],
+     Output('short-pair-header', 'children'),
+     Output('combined-performance-header', 'children'),
+     Output('combined-sharpe-ratio', 'children'),
+     Output('combined-max-drawdown', 'children'),
+     Output('combined-calmar-ratio', 'children'),
+     Output('combined-total-signals', 'children'),
+     Output('combined-win-rate', 'children')],
     [Input('ticker-input', 'value'),
      Input('sma-input-1', 'value'),
      Input('sma-input-2', 'value'),
@@ -4473,7 +4504,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results'
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
 
     df = fetch_data(ticker)
     if df is None or df.empty:
@@ -4490,7 +4521,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results'
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
         
     # Create base figure with just the price chart
     fig = go.Figure()
@@ -4526,7 +4557,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                 tickfont=dict(color='#80ff00')
             )
         )
-        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results'
+        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
 
     min_date = df.index.min()
     max_date = df.index.max()
@@ -4548,6 +4579,14 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     buy_signals_shifted = buy_signals.shift(1, fill_value=False)
     short_signals_shifted = short_signals.shift(1, fill_value=False)
 
+    # Validate that we have data to work with
+    if daily_returns.empty:
+        # Return empty results if no data
+        return (fig, 'No data available', 'No data available', 'No data available', 'No data available', 
+               'No data available', 'No data available', 'No data available', 'No data available',
+               'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: N/A'), html.Span('Max Drawdown: N/A'), 
+               html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'))
+    
     # Calculate Buy returns on days when Buy signal was active
     buy_returns_on_trigger_days = daily_returns[buy_signals_shifted]
     buy_trigger_days = buy_signals_shifted.sum()
@@ -4640,8 +4679,61 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     # Create header labels with the actual pair values
     buy_pair_header = f"Buy Pair ({sma_day_1}, {sma_day_2}) Results" if sma_day_1 and sma_day_2 else "Buy Pair Results"
     short_pair_header = f"Short Pair ({sma_day_3}, {sma_day_4}) Results" if sma_day_3 and sma_day_4 else "Short Pair Results"
+    combined_header = f"Combined Performance for Buy Pair ({sma_day_1}, {sma_day_2}) and Short Pair ({sma_day_3}, {sma_day_4})" if all([sma_day_1, sma_day_2, sma_day_3, sma_day_4]) else "Combined Performance"
     
-    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header
+    # Calculate combined metrics
+    combined_returns = buy_returns_full + short_returns_full
+    # Remove NaN values to prevent calculation errors
+    combined_returns = combined_returns.dropna()
+    
+    total_signals = int(buy_trigger_days + short_trigger_days)
+    total_wins = int(buy_wins + short_wins)
+    overall_win_rate = (total_wins / total_signals * 100) if total_signals > 0 else 0
+    
+    # Calculate Sharpe Ratio (assuming 252 trading days per year)
+    risk_free_rate = 0.05  # 5% annual, matching other parts of the codebase
+    if len(combined_returns) > 0:
+        annualized_return = combined_returns.mean() * 252  # Keep in decimal form
+        annualized_std = combined_returns.std() * np.sqrt(252)  # Keep in decimal form
+        sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std > 0 else 0
+    else:
+        sharpe_ratio = 0
+    
+    # Calculate Maximum Drawdown
+    if len(combined_returns) > 0:
+        # Calculate cumulative returns
+        cumulative_returns = (1 + combined_returns).cumprod()
+        # Calculate running maximum
+        running_max = cumulative_returns.expanding().max()
+        # Calculate drawdown with division by zero protection
+        drawdown = np.where(running_max != 0, 
+                           (cumulative_returns - running_max) / running_max, 
+                           0)
+        # Get maximum drawdown
+        max_drawdown = np.min(drawdown) * 100  # Convert to percentage
+    else:
+        max_drawdown = 0
+    
+    # Calculate Calmar Ratio (annual return / max drawdown)
+    if max_drawdown != 0 and len(combined_returns) > 0:
+        calmar_ratio = (annualized_return * 100) / abs(max_drawdown)  # Convert annualized_return to percentage
+    else:
+        calmar_ratio = 0
+    
+    # Color code performance metrics
+    sharpe_color = "#00ff41" if sharpe_ratio > 1 else "#ffff00" if sharpe_ratio > 0 else "#ff0040"
+    dd_color = "#00ff41" if max_drawdown > -10 else "#ffff00" if max_drawdown > -20 else "#ff0040"
+    calmar_color = "#00ff41" if calmar_ratio > 3 else "#ffff00" if calmar_ratio > 1 else "#ff0040"
+    win_color = "#00ff41" if overall_win_rate > 55 else "#ffff00" if overall_win_rate > 45 else "#ff0040"
+    
+    # Format summary outputs with color styling
+    combined_sharpe = html.Span(f"Sharpe Ratio: {sharpe_ratio:.3f}", style={"color": sharpe_color})
+    combined_max_dd = html.Span(f"Max Drawdown: {max_drawdown:.2f}%", style={"color": dd_color})
+    combined_calmar = html.Span(f"Calmar Ratio: {calmar_ratio:.3f}", style={"color": calmar_color})
+    combined_signals = f"Total Signals: {total_signals} (Buy: {int(buy_trigger_days)}, Short: {int(short_trigger_days)})"
+    combined_win_rate_text = html.Span(f"Overall Win Rate: {overall_win_rate:.2f}% ({total_wins}/{total_signals})", style={"color": win_color})
+    
+    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text
 
 @app.callback(
     Output('update-interval', 'disabled'),
