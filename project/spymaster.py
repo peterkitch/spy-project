@@ -471,9 +471,9 @@ class PerformanceMetrics:
                 ])
             else:
                 return html.Span([
-                    html.I(className="fas fa-pause-circle fa-2x", 
+                    html.I(className="fas fa-dollar-sign fa-2x", 
                           style={"color": "#ffff00", "marginRight": "10px"}),
-                    html.Span("HOLD", style={
+                    html.Span("CASH", style={
                         "color": "#ffff00",
                         "fontWeight": "bold",
                         "fontSize": "1.2rem",
@@ -745,6 +745,214 @@ class PerformanceMetrics:
                 target=matrix_id,
                 placement="bottom"
             )
+        ])
+    
+    @classmethod
+    def create_position_status_card(cls, current_position, entry_date, current_return, sma_pair):
+        """
+        Create a card showing current position status
+        """
+        if current_position == "Buy":
+            icon = "📈"
+            color = "#00ff41"
+            bg_color = "rgba(0, 255, 65, 0.1)"
+        elif current_position == "Short":
+            icon = "📉"
+            color = "#ff0040"
+            bg_color = "rgba(255, 0, 64, 0.1)"
+        else:
+            icon = "💵"
+            color = "#ffff00"
+            bg_color = "rgba(255, 255, 0, 0.1)"
+        
+        return dbc.Card([
+            dbc.CardBody([
+                html.H4("Current Position", className="mb-3"),
+                html.Div([
+                    html.Span(icon, style={"fontSize": "2rem", "marginRight": "10px"}),
+                    html.Span(current_position.upper(), style={
+                        "fontSize": "1.8rem",
+                        "fontWeight": "bold",
+                        "color": color
+                    })
+                ], style={"display": "flex", "alignItems": "center", "marginBottom": "15px"}),
+                html.P(f"Entered: {entry_date}", className="mb-1"),
+                html.P(f"Using: SMA {sma_pair[0]}/{sma_pair[1]}", className="mb-1"),
+                html.P(f"Performance: {current_return:+.2f}%", 
+                      style={"color": "#00ff41" if current_return > 0 else "#ff0040"})
+            ])
+        ], style={
+            "backgroundColor": bg_color,
+            "border": f"2px solid {color}",
+            "marginBottom": "20px"
+        })
+    
+    @classmethod
+    def create_action_required_card(cls, action_date, signal_type, sma_pair, confidence, hold_until):
+        """
+        Create a prominent card showing action required at close
+        """
+        if signal_type == "Buy":
+            action_color = "#00ff41"
+            action_text = "ENTER BUY POSITION"
+            icon = "▲"
+        elif signal_type == "Short":
+            action_color = "#ff0040"
+            action_text = "ENTER SHORT POSITION"
+            icon = "▼"
+        else:
+            action_color = "#ffff00"
+            action_text = "MOVE TO CASH"
+            icon = "■"
+        
+        return dbc.Card([
+            dbc.CardBody([
+                html.H3(["📍 ACTION AT TODAY'S CLOSE"], className="mb-3", style={"color": action_color}),
+                html.Hr(),
+                html.H5(f"{action_date} at 4:00 PM ET", className="mb-3"),
+                html.Div([
+                    html.H2([icon, " ", action_text], style={"color": action_color, "marginBottom": "15px"}),
+                    html.P(f"Based on: SMA {sma_pair[0]}/{sma_pair[1]} Signal", className="mb-2"),
+                    dbc.Progress(
+                        value=confidence,
+                        max=100,
+                        label=f"Confidence: {confidence:.0f}%",
+                        color="success" if confidence > 70 else "warning" if confidence > 50 else "danger",
+                        style={"height": "25px", "marginBottom": "10px"}
+                    ),
+                    html.P(f"Hold Until: {hold_until} Close", style={"fontWeight": "bold"})
+                ])
+            ])
+        ], style={
+            "border": f"3px solid {action_color}",
+            "backgroundColor": "rgba(0, 0, 0, 0.8)",
+            "boxShadow": f"0 0 20px {action_color}",
+            "marginBottom": "20px"
+        })
+    
+    @classmethod
+    def create_price_threshold_visual(cls, thresholds, current_price, ticker):
+        """
+        Create a visual price ladder showing signal change thresholds
+        """
+        rows = []
+        
+        # Header
+        header = html.Div([
+            html.H4(f"Signal Change Thresholds at Today's Close", className="mb-3"),
+            html.P(f"Current {ticker} Price: ${current_price:.2f}", 
+                  style={"fontSize": "1.1rem", "marginBottom": "15px"})
+        ])
+        
+        # Create visual ladder
+        for threshold in thresholds:
+            if threshold.get('is_current', False):
+                row_style = {
+                    "backgroundColor": "rgba(128, 255, 0, 0.2)",
+                    "border": "2px solid #80ff00",
+                    "padding": "10px",
+                    "marginBottom": "5px",
+                    "borderRadius": "5px"
+                }
+                arrow = "← YOU ARE HERE"
+            else:
+                row_style = {
+                    "backgroundColor": "rgba(255, 255, 255, 0.05)",
+                    "padding": "10px",
+                    "marginBottom": "5px",
+                    "borderRadius": "5px"
+                }
+                arrow = ""
+            
+            color = "#00ff41" if threshold['signal'] == 'Buy' else "#ff0040" if threshold['signal'] == 'Short' else "#ffff00"
+            
+            row = html.Div([
+                html.Span(threshold['range'], style={"width": "40%", "display": "inline-block"}),
+                html.Span("→", style={"width": "5%", "display": "inline-block", "textAlign": "center"}),
+                html.Span(threshold['signal'], style={"width": "35%", "display": "inline-block", "color": color, "fontWeight": "bold"}),
+                html.Span(arrow, style={"width": "20%", "display": "inline-block", "color": "#80ff00"})
+            ], style=row_style)
+            
+            rows.append(row)
+        
+        return html.Div([
+            header,
+            html.Div(rows, style={
+                "backgroundColor": "rgba(0, 0, 0, 0.5)",
+                "padding": "15px",
+                "borderRadius": "10px",
+                "border": "1px solid #444"
+            })
+        ])
+    
+    @classmethod
+    def create_position_timeline(cls, yesterday_position, today_position, tomorrow_position, dates):
+        """
+        Create a visual timeline showing position progression
+        """
+        def get_position_style(position):
+            if position == "Buy":
+                return {"color": "#00ff41", "symbol": "↗"}
+            elif position == "Short":
+                return {"color": "#ff0040", "symbol": "↘"}
+            else:
+                return {"color": "#ffff00", "symbol": "─"}
+        
+        yesterday_style = get_position_style(yesterday_position)
+        today_style = get_position_style(today_position)
+        tomorrow_style = get_position_style(tomorrow_position)
+        
+        return html.Div([
+            html.H5("Position Timeline", className="mb-3"),
+            html.Div([
+                # Yesterday
+                html.Div([
+                    html.Small(dates['yesterday'], style={"display": "block", "marginBottom": "5px"}),
+                    html.Div(yesterday_style['symbol'], style={
+                        "fontSize": "2rem",
+                        "color": yesterday_style['color']
+                    }),
+                    html.Small(f"Entered {yesterday_position}", style={"display": "block", "marginTop": "5px"})
+                ], style={"width": "25%", "display": "inline-block", "textAlign": "center"}),
+                
+                # Arrow
+                html.Div("→", style={"width": "12.5%", "display": "inline-block", "textAlign": "center", "fontSize": "1.5rem"}),
+                
+                # Today
+                html.Div([
+                    html.Small(dates['today'], style={"display": "block", "marginBottom": "5px"}),
+                    html.Div(today_style['symbol'], style={
+                        "fontSize": "2rem",
+                        "color": today_style['color']
+                    }),
+                    html.Small(f"Holding {today_position}", style={"display": "block", "marginTop": "5px"})
+                ], style={
+                    "width": "25%",
+                    "display": "inline-block",
+                    "textAlign": "center",
+                    "backgroundColor": "rgba(128, 255, 0, 0.1)",
+                    "padding": "10px",
+                    "borderRadius": "10px"
+                }),
+                
+                # Arrow
+                html.Div("→", style={"width": "12.5%", "display": "inline-block", "textAlign": "center", "fontSize": "1.5rem"}),
+                
+                # Tomorrow
+                html.Div([
+                    html.Small(dates['tomorrow'], style={"display": "block", "marginBottom": "5px"}),
+                    html.Div(tomorrow_style['symbol'], style={
+                        "fontSize": "2rem",
+                        "color": tomorrow_style['color']
+                    }),
+                    html.Small(f"Enter {tomorrow_position}", style={"display": "block", "marginTop": "5px"})
+                ], style={"width": "25%", "display": "inline-block", "textAlign": "center"})
+            ], style={
+                "backgroundColor": "rgba(0, 0, 0, 0.3)",
+                "padding": "20px",
+                "borderRadius": "10px",
+                "marginBottom": "20px"
+            })
         ])
 
 # Initialize the Dash app with a dark theme and custom styles
@@ -2774,16 +2982,16 @@ app.layout = dbc.Container(
                                     # Strategy Comparison Table
                                     html.Div(id='strategy-comparison-table', className='mb-3'),
                                     
-                                    # Original content
-                                    html.Div(id='most-productive-buy-pair'),
-                                    html.Div(id='most-productive-short-pair'),
-                                    html.Div(id='avg-capture-buy-leader'),
-                                    html.Div(id='total-capture-buy-leader'),
-                                    html.Div(id='avg-capture-short-leader'),
-                                    html.Div(id='total-capture-short-leader'),
-                                    html.Div(id='trading-direction'),
-                                    html.Div(id='performance-expectation'),
-                                    html.Div(id='confidence-percentage'),
+                                    # Original content (hidden - info now shown in new components)
+                                    html.Div(id='most-productive-buy-pair', style={'display': 'none'}),
+                                    html.Div(id='most-productive-short-pair', style={'display': 'none'}),
+                                    html.Div(id='avg-capture-buy-leader', style={'display': 'none'}),
+                                    html.Div(id='total-capture-buy-leader', style={'display': 'none'}),
+                                    html.Div(id='avg-capture-short-leader', style={'display': 'none'}),
+                                    html.Div(id='total-capture-short-leader', style={'display': 'none'}),
+                                    html.Div(id='trading-direction', style={'display': 'none'}),
+                                    html.Div(id='performance-expectation', style={'display': 'none'}),
+                                    html.Div(id='confidence-percentage', style={'display': 'none'}),
                                     html.Div(id='trading-recommendations'),
                                     html.Div(id='processing-status'),  # For showing processing status
                                     dbc.Progress(
@@ -5283,116 +5491,257 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         logger.info(f"  💵 {pred['price_range']:<20} → {pred['signal']:<12} [{pred['recommendation']}]")
     logger.info("")  # Clean line break
 
+    # Prepare data for new components
+    # Boolean flags to reduce redundant calculations
+    buy_signal_active = buy_signal and not short_signal
+    short_signal_active = short_signal and not buy_signal
+    both_signals_active = buy_signal and short_signal
+    no_signals_active = not buy_signal and not short_signal
+    
+    # Determine current position (what was entered at yesterday's close)
+    yesterday_date = (current_date - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    # Current position is based on yesterday's signals
+    if both_signals_active:
+        # Both signals active - follow leader
+        if buy_capture > short_capture:
+            current_position = "Buy"
+            current_sma_pair = top_buy_pair
+        else:
+            current_position = "Short"
+            current_sma_pair = top_short_pair
+    elif buy_signal_active:
+        current_position = "Buy"
+        current_sma_pair = top_buy_pair
+    elif short_signal_active:
+        current_position = "Short"
+        current_sma_pair = top_short_pair
+    else:  # no_signals_active
+        current_position = "Cash"
+        current_sma_pair = (0, 0)
+    
+    # Boolean flags for next signals
+    next_buy_signal_active = next_buy_signal and not next_short_signal
+    next_short_signal_active = next_short_signal and not next_buy_signal
+    next_both_signals_active = next_buy_signal and next_short_signal
+    next_no_signals_active = not next_buy_signal and not next_short_signal
+    
+    # Next position (to enter at today's close)
+    if next_both_signals_active:
+        if buy_capture > short_capture:
+            next_position = "Buy"
+            next_sma_pair = top_buy_pair
+        else:
+            next_position = "Short"
+            next_sma_pair = top_short_pair
+    elif next_buy_signal_active:
+        next_position = "Buy"
+        next_sma_pair = top_buy_pair
+    elif next_short_signal_active:
+        next_position = "Short"
+        next_sma_pair = top_short_pair
+    else:  # next_no_signals_active
+        next_position = "Cash"
+        next_sma_pair = (0, 0)
+    
+    # Enhanced confidence calculation using multiple factors
+    confidence = (
+        win_ratio * 0.4 +  # 40% weight on win rate
+        min(100, (trigger_days / 100) * 100) * 0.3 +  # 30% on sample size (100+ days ideal)
+        (50 if p_value and p_value < 0.05 else 25 if p_value and p_value < 0.10 else 0) * 0.3  # 30% on significance
+    )
+    
+    # Calculate actual position return from yesterday's close to today
+    if current_position != "Cash" and len(df) > 1:
+        yesterday_close = df['Close'].iloc[-2]
+        today_close = df['Close'].iloc[-1]
+        if current_position == "Buy":
+            current_position_return = ((today_close - yesterday_close) / yesterday_close) * 100
+        else:  # Short position
+            current_position_return = ((yesterday_close - today_close) / yesterday_close) * 100
+    else:
+        current_position_return = 0
+    
+    # Prepare threshold data
+    threshold_data = []
+    current_price_val = df['Close'].iloc[-1] if len(df) > 0 else 0
+    
+    for pred in predictions:
+        is_current = False
+        # Robust price threshold parsing with error handling
+        if "$" in pred['price_range']:
+            try:
+                price_text = pred['price_range'].replace("$", "").strip()
+                
+                if "above" in price_text.lower():
+                    # Handle "$X and above" format
+                    low = float(price_text.split()[0])
+                    high = float('inf')
+                elif "below" in price_text.lower():
+                    # Handle "below $X" format
+                    low = 0
+                    high = float(price_text.split()[0])
+                else:
+                    # Handle "$X - $Y" format
+                    parts = price_text.split(" - ")
+                    if len(parts) == 2:
+                        low = float(parts[0])
+                        high = float(parts[1]) if "above" not in parts[1].lower() else float('inf')
+                    else:
+                        logger.warning(f"Unexpected price range format: {pred['price_range']}")
+                        continue
+                
+                if low <= current_price_val <= high:
+                    is_current = True
+                    
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Failed to parse price range: {pred['price_range']} - Error: {str(e)}")
+                continue
+        
+        threshold_data.append({
+            'range': pred['price_range'],
+            'signal': pred['signal'].split(' ')[0] if ' ' in pred['signal'] else pred['signal'],
+            'is_current': is_current
+        })
+    
+    # Prepare dates for timeline
+    timeline_dates = {
+        'yesterday': yesterday_date,
+        'today': current_date.strftime('%Y-%m-%d'),
+        'tomorrow': next_trading_day.strftime('%Y-%m-%d')
+    }
+    
+    # Calculate years for display
+    years_of_data = len(df) / 252 if len(df) > 0 else 0
+    
+    # Build the new structured layout
     trading_recommendations = [
         html.Div([
-            html.H2("Dynamic Master Trading Strategy", className="mb-4"),
+            html.H2("Dynamic Master Trading Strategy", className="mb-4", style={"textAlign": "center"}),
             
+            # SECTION 1: CURRENT STATUS & ACTION REQUIRED
             html.Div([
-                html.H4("1. Summary of Top Performing Pairs", className="mb-3"),
-                html.P(f"{most_productive_buy_pair_text} (Total Capture: {buy_capture:.4f}%)", className="mb-2"),
-                html.P(f"{most_productive_short_pair_text} (Total Capture: {short_capture:.4f}%)", className="mb-2"),
-            ], className="mb-4"),
-            
-            html.Div([
-                html.H4("2. Current Top Performing Pair Metrics", className="mb-3"),
-                html.H5("Buy Leader Performance:", className="mb-2"),
-                html.P(f"Average Daily Capture (%): {avg_capture_buy:.4f}%", className="mb-1"),
-                html.P(f"Total Capture (%): {buy_capture:.4f}%", className="mb-1"),
-                html.P(f"Trigger Days: {int(buy_trigger_days):,}", className="mb-1"),
-                html.P(f"Wins: {int(buy_wins):,}", className="mb-1"),
-                html.P(f"Losses: {int(buy_losses):,}", className="mb-1"),
-                html.P(f"Win Ratio: {buy_win_ratio * 100:.2f}%", className="mb-3"),
+                html.H3("📊 Position Status & Required Action", className="mb-3"),
                 
-                html.H5("Short Leader Performance:", className="mb-2"),
-                html.P(f"Average Daily Capture (%): {avg_capture_short:.4f}%", className="mb-1"),
-                html.P(f"Total Capture (%): {short_capture:.4f}%", className="mb-1"),
-                html.P(f"Trigger Days: {int(short_trigger_days):,}", className="mb-1"),
-                html.P(f"Wins: {int(short_wins):,}", className="mb-1"),
-                html.P(f"Losses: {int(short_losses):,}", className="mb-1"),
-                html.P(f"Win Ratio: {short_win_ratio * 100:.2f}%", className="mb-1"),
-            ], className="mb-4"),
-            
-            html.Div([
-                html.H4("3. Trading Signals", className="mb-3"),
-                html.P(
-                    f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
-                    f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" 
-                    if trading_signal_type == "Buy" else 
-                    f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type} "
-                    f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})",
-                    className="mb-2"
-                ),
-                html.P(
-                    f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
-                    f"(SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]})" 
-                    if next_trading_signal_type == "Buy" else 
-                    f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type} "
-                    f"(SMA {top_short_pair[0]} / SMA {top_short_pair[1]})",
-                    className="mb-2"
-                ),
-            ], className="mb-4"),
-            
-            html.Div([
-                html.H4("4. Combined Strategy Performance", className="mb-3"),
-                html.P(f"Total Capture (%): {total_capture:.4f}%", className="mb-1"),
-                html.P(f"Average Daily Capture (%): {avg_daily_capture:.4f}%", className="mb-1"),
-                html.P(f"Daily Standard Deviation (%): {std_dev:.4f}%", className="mb-1"),
-                html.P(f"Annualized Sharpe Ratio: {sharpe_ratio:.2f}", className="mb-1"),
+                # Position Status and Action Cards in a row
+                dbc.Row([
+                    dbc.Col([
+                        PerformanceMetrics.create_position_status_card(
+                            current_position,
+                            f"{yesterday_date} at Close",
+                            current_position_return,
+                            current_sma_pair
+                        )
+                    ], width=6),
+                    dbc.Col([
+                        PerformanceMetrics.create_action_required_card(
+                            current_date.strftime('%Y-%m-%d'),
+                            next_position,
+                            next_sma_pair,
+                            confidence,
+                            next_trading_day.strftime('%Y-%m-%d')
+                        )
+                    ], width=6)
+                ]),
+                
+                # Position Transition Warning (if position change required)
                 html.Div([
-                    html.H5("Statistical Significance Analysis:", className="mb-2"),
-                    html.P(f"t-Statistic: {t_statistic:.4f}" if t_statistic is not None else "t-Statistic: N/A", className="mb-1"),
-                    html.P(f"p-Value: {p_value:.4f}" if p_value is not None else "p-Value: N/A", className="mb-1"),
-                    html.P("Confidence Levels:", className="mb-1"),
-                    html.Ul([
-                        html.Li(f"90% Confidence: {'Significant' if p_value is not None and p_value < 0.10 else 'Not Significant'}", 
-                            style={'color': 'green' if p_value is not None and p_value < 0.10 else 'red'}),
-                        html.Li(f"95% Confidence: {'Significant' if p_value is not None and p_value < 0.05 else 'Not Significant'}", 
-                            style={'color': 'green' if p_value is not None and p_value < 0.05 else 'red'}),
-                        html.Li(f"99% Confidence: {'Significant' if p_value is not None and p_value < 0.01 else 'Not Significant'}", 
-                            style={'color': 'green' if p_value is not None and p_value < 0.01 else 'red'}),
-                    ], className="mb-2"),
-                ], className="mb-3"),
-                # Use trigger_days, wins, losses directly
-                html.P(f"Trigger Days: {trigger_days:,}", className="mb-1"),
-                html.P(f"Wins: {wins:,}", className="mb-1"),
-                html.P(f"Losses: {losses:,}", className="mb-1"),
-                html.P(f"Win Ratio: {win_ratio:.2f}%", className="mb-1"),
-            ], className="mb-4"),
-            
-            html.Div([
-                html.H4("5. Trading Recommendations", className="mb-3"),
-                html.H5(f"For Current Trading Session ({current_date.strftime('%Y-%m-%d')}):", className="mb-2"),
-                html.P(f"Leading Buy SMA Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}", className="mb-1"),
-                html.P(f"  • Total Capture: {buy_capture:.4f}% | Sharpe: {buy_leader_sharpe:.2f} | Max DD: {buy_leader_max_dd:.2f}%", className="mb-1", style={'marginLeft': '20px'}),
-                html.P(f"Leading Short SMA Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}", className="mb-1"),
-                html.P(f"  • Total Capture: {short_capture:.4f}% | Sharpe: {short_leader_sharpe:.2f} | Max DD: {short_leader_max_dd:.2f}%", className="mb-1", style={'marginLeft': '20px'}),
-                html.P(f"Current Buy Signal: {'TRUE' if buy_signal else 'FALSE'}", className="mb-1"),
-                html.P(f"Current Short Signal: {'TRUE' if short_signal else 'FALSE'}", className="mb-1"),
-                html.P(f"Recommendation: {'Enter Short Position' if short_signal else 'Enter Buy Position' if buy_signal else 'All Cash'}", className="mb-3"),
+                    html.Div([
+                        html.I(className="fas fa-exclamation-triangle me-2"),
+                        html.Strong(f"POSITION CHANGE REQUIRED: {current_position} → {next_position}"),
+                        html.Br(),
+                        html.Small(f"Execute at market close (4:00 PM ET) on {current_date.strftime('%Y-%m-%d')}")
+                    ], style={
+                        "backgroundColor": "#ff8800",
+                        "color": "white",
+                        "padding": "15px",
+                        "borderRadius": "8px",
+                        "marginTop": "15px",
+                        "marginBottom": "15px",
+                        "border": "2px solid #ff6600",
+                        "fontSize": "1.1rem"
+                    })
+                ] if current_position != next_position else []),
                 
-                html.H5(f"For Next Trading Session ({next_trading_day.strftime('%Y-%m-%d')}):", className="mb-2"),
-                html.P(f"Next Buy Signal: {'TRUE' if next_buy_signal else 'FALSE'}", className="mb-1"),
-                html.P(f"Next Short Signal: {'TRUE' if next_short_signal else 'FALSE'}", className="mb-1"),
-                html.P(f"Recommendation: {'Enter Buy Position' if next_buy_signal else 'Enter Short Position' if next_short_signal else 'All Cash'} before EOD ({current_date.strftime('%Y-%m-%d')})", className="mb-1"),
+                # Position Timeline
+                PerformanceMetrics.create_position_timeline(
+                    current_position,
+                    current_position,
+                    next_position,
+                    timeline_dates
+                ),
+                
+                html.Hr()
             ], className="mb-4"),
             
+            # SECTION 2: PERFORMANCE OVERVIEW
             html.Div([
-                html.H4("6. Forecast Recommendations", className="mb-3"),
-                html.P(f"Recommendations for IMMEDIATELY BEFORE EOD on ({next_trading_day.strftime('%Y-%m-%d')}):", className="mb-2"),
-                html.Table([
-                    html.Thead(html.Tr([html.Th("Price Range"), html.Th("Predicted Signal"), html.Th("Active Pair"), html.Th("Recommendation")])),
-                    html.Tbody([
-                        html.Tr([
-                            html.Td(prediction['price_range']),
-                            html.Td(prediction['signal']),
-                            html.Td(prediction['active_pair']),
-                            html.Td(prediction['recommendation'])
-                        ]) for prediction in predictions
-                    ])
-                ], className="table table-striped table-bordered")
+                html.H3("📈 Performance Overview", className="mb-3"),
+                
+                # Key metrics cards
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H4(f"{total_capture:.1f}%", style={"color": "#00ff41" if total_capture > 0 else "#ff0040"}),
+                                html.P(f"Total Return", className="mb-0"),
+                                html.Small(f"({years_of_data:.1f} years)")
+                            ], style={"textAlign": "center"})
+                        ])
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H4(f"{PerformanceMetrics.calculate_annualized_return(total_capture, years_of_data):.1f}%", 
+                                       style={"color": "#00ff41" if total_capture > 0 else "#ff0040"}),
+                                html.P("Annual Return", className="mb-0")
+                            ], style={"textAlign": "center"})
+                        ])
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H4(f"{sharpe_ratio:.2f}", 
+                                       style={"color": PerformanceMetrics.get_color_for_metric('sharpe', sharpe_ratio)}),
+                                html.P("Sharpe Ratio", className="mb-0")
+                            ], style={"textAlign": "center"})
+                        ])
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H4(f"{win_ratio:.1f}%", 
+                                       style={"color": PerformanceMetrics.get_color_for_metric('win_rate', win_ratio)}),
+                                html.P("Win Rate", className="mb-0")
+                            ], style={"textAlign": "center"})
+                        ])
+                    ], width=3)
+                ], className="mb-4"),
+                
+                # Strategy Comparison Table (already exists in output)
+                # Will be displayed from strategy_comparison_table variable
+                
+                html.Hr()
             ], className="mb-4"),
             
-        ], className="p-4 bg-light rounded")
+            # SECTION 3: PRICE THRESHOLD GUIDE
+            html.Div([
+                html.H3("🎯 Signal Change Thresholds", className="mb-3"),
+                
+                PerformanceMetrics.create_price_threshold_visual(
+                    threshold_data,
+                    current_price_val,
+                    ticker
+                ),
+                
+                html.Div([
+                    html.Small("Note: All position changes occur at market close (4:00 PM ET). "
+                             "Positions are held from close to close.", 
+                             style={"color": "#888", "fontStyle": "italic"})
+                ], className="mt-3")
+            ], className="mb-4")
+            
+        ], className="p-3")
     ]
 
     # After Forecast Recommendations are complete, update results
