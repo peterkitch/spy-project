@@ -62,9 +62,55 @@ class PerformanceMetrics:
         'calmar': {'excellent': 3.0, 'good': 2.0, 'moderate': 1.0, 'warning': 0.5, 'poor': 0}
     }
     
+    # Position configuration dictionary for consistent styling
+    POSITION_CONFIGS = {
+        "Buy": {
+            "icon": "📈",
+            "color": "#00ff41",
+            "bg": "rgba(0, 255, 65, 0.1)",
+            "symbol": "↗",
+            "action_text": "ENTER BUY POSITION",
+            "action_icon": "▲"
+        },
+        "Short": {
+            "icon": "📉",
+            "color": "#ff0040",
+            "bg": "rgba(255, 0, 64, 0.1)",
+            "symbol": "↘",
+            "action_text": "ENTER SHORT POSITION",
+            "action_icon": "▼"
+        },
+        "Cash": {
+            "icon": "💵",
+            "color": "#ffff00",
+            "bg": "rgba(255, 255, 0, 0.1)",
+            "symbol": "─",
+            "action_text": "MOVE TO CASH",
+            "action_icon": "■"
+        }
+    }
+    
     @classmethod
     def get_color_for_metric(cls, metric_type, value):
         """Get color based on metric type and value"""
+        # Handle complex numbers, NaN, None, or invalid values
+        if value is None or pd.isna(value):
+            return cls.COLORS['poor']
+        
+        # If value is complex, use the real part
+        if isinstance(value, complex):
+            value = value.real
+        
+        # Convert to float if possible
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return cls.COLORS['poor']
+        
+        # Handle NaN or infinite values
+        if pd.isna(value) or not np.isfinite(value):
+            return cls.COLORS['poor']
+        
         thresholds = cls.THRESHOLDS.get(metric_type, {})
         
         if value >= thresholds.get('excellent', float('inf')):
@@ -122,6 +168,20 @@ class PerformanceMetrics:
         
         # Sharpe ratio contribution (0-40 points)
         if sharpe is not None:
+            # Handle complex numbers - use real part
+            if isinstance(sharpe, complex):
+                sharpe = sharpe.real
+            
+            # Convert to float if possible
+            try:
+                sharpe = float(sharpe)
+            except (TypeError, ValueError):
+                sharpe = 0
+            
+            # Check for NaN or infinite
+            if pd.isna(sharpe) or not np.isfinite(sharpe):
+                sharpe = 0
+            
             metrics_used += 1
             if sharpe > cls.THRESHOLDS['sharpe']['excellent']:
                 score += 40
@@ -339,32 +399,60 @@ class PerformanceMetrics:
             short_signal_strength = 0
             
         def create_meter(strength, signal_type, color):
-            # Determine conviction level
+            # Determine conviction level and visual indicators
             if strength >= 80:
                 conviction = "STRONG"
                 meter_color = "#00ff41"
+                emoji = "🔥"
+                bar_color = "success"
             elif strength >= 60:
                 conviction = "MODERATE"
                 meter_color = "#ffff00"
+                emoji = "⚡"
+                bar_color = "warning"
             elif strength >= 40:
                 conviction = "WEAK"
                 meter_color = "#ff8800"
+                emoji = "⚠️"
+                bar_color = "warning"
             else:
                 conviction = "VERY WEAK"
                 meter_color = "#ff0040"
+                emoji = "❄️"
+                bar_color = "danger"
             
             return html.Div([
-                html.Label(f"{signal_type} Signal Strength", 
-                          style={"fontSize": "0.9rem", "color": color}),
+                html.Div([
+                    html.Span(f"{emoji} ", style={"fontSize": "1.2rem"}),
+                    html.Label(f"{signal_type} Signal Strength", 
+                              style={"fontSize": "0.9rem", "color": color, "marginLeft": "5px"})
+                ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
                 dbc.Progress(
                     value=strength,
                     max=100,
-                    color="success" if strength >= 60 else "warning" if strength >= 40 else "danger",
+                    color=bar_color,
                     striped=True,
                     animated=strength >= 60,
                     label=f"{strength:.1f}% ({conviction})",
-                    style={"height": "25px", "marginBottom": "5px"}
-                )
+                    style={"height": "30px", "marginBottom": "5px", "fontSize": "0.9rem"}
+                ),
+                # Add visual strength indicator bar
+                html.Div([
+                    html.Div(style={
+                        "width": f"{strength}%",
+                        "height": "4px",
+                        "backgroundColor": meter_color,
+                        "borderRadius": "2px",
+                        "transition": "width 0.3s ease",
+                        "boxShadow": f"0 0 10px {meter_color}" if strength >= 60 else "none"
+                    })
+                ], style={
+                    "width": "100%",
+                    "height": "4px",
+                    "backgroundColor": "rgba(128, 128, 128, 0.2)",
+                    "borderRadius": "2px",
+                    "marginBottom": "10px"
+                })
             ])
         
         return html.Div([
@@ -748,39 +836,171 @@ class PerformanceMetrics:
         ])
     
     @classmethod
-    def create_position_status_card(cls, current_position, entry_date, current_return, sma_pair):
+    def calculate_risk_metrics(cls, df, position_type, lookback_days=60):
         """
-        Create a card showing current position status
+        Calculate risk metrics based on historical data
+        
+        Args:
+            df: DataFrame with price data
+            position_type: "Buy" or "Short"
+            lookback_days: Number of days to look back for statistics
+        
+        Returns:
+            dict with risk metrics
         """
-        if current_position == "Buy":
-            icon = "📈"
-            color = "#00ff41"
-            bg_color = "rgba(0, 255, 65, 0.1)"
-        elif current_position == "Short":
-            icon = "📉"
-            color = "#ff0040"
-            bg_color = "rgba(255, 0, 64, 0.1)"
-        else:
-            icon = "💵"
-            color = "#ffff00"
-            bg_color = "rgba(255, 255, 0, 0.1)"
+        if len(df) < lookback_days:
+            lookback_days = len(df)
+        
+        if lookback_days < 2:
+            return None
+        
+        recent_data = df.tail(lookback_days)
+        daily_returns = recent_data['Close'].pct_change().dropna() * 100
+        
+        # Calculate statistics
+        mean_return = daily_returns.mean()
+        std_return = daily_returns.std()
+        
+        # Calculate percentiles for risk estimates
+        if position_type == "Buy":
+            max_loss = daily_returns.quantile(0.05)  # 5th percentile (worst 5% of days)
+            max_gain = daily_returns.quantile(0.95)  # 95th percentile (best 5% of days)
+            expected_return = mean_return
+        elif position_type == "Short":
+            # For short positions, losses come from price increases
+            max_loss = -daily_returns.quantile(0.95)  # Price going up is a loss
+            max_gain = -daily_returns.quantile(0.05)  # Price going down is a gain
+            expected_return = -mean_return
+        else:  # Cash position
+            return {
+                'expected_return': 0,
+                'max_loss': 0,
+                'max_gain': 0,
+                'risk_reward_ratio': 0
+            }
+        
+        # Calculate risk/reward ratio
+        risk_reward_ratio = abs(max_gain / max_loss) if max_loss != 0 else 0
+        
+        return {
+            'expected_return': expected_return,
+            'max_loss': max_loss,
+            'max_gain': max_gain,
+            'risk_reward_ratio': risk_reward_ratio
+        }
+    
+    @classmethod
+    def create_position_status_card(cls, current_position, entry_date, current_return, sma_pair, risk_metrics=None):
+        """
+        Create a card showing current position status with optional risk metrics
+        """
+        # Use position configs for consistent styling
+        config = cls.POSITION_CONFIGS.get(current_position, cls.POSITION_CONFIGS["Cash"])
+        icon = config["icon"]
+        color = config["color"]
+        bg_color = config["bg"]
+        
+        card_body_content = [
+            html.H4("Current Position", className="mb-3"),
+            html.Div([
+                html.Span(icon, style={"fontSize": "2rem", "marginRight": "10px"}),
+                html.Span(current_position.upper(), style={
+                    "fontSize": "1.8rem",
+                    "fontWeight": "bold",
+                    "color": color
+                })
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "15px"}),
+            html.P(f"Entered: {entry_date}", className="mb-1"),
+            html.P(f"Using: SMA {sma_pair[0]}/{sma_pair[1]}", className="mb-1"),
+            html.P(f"Performance: {current_return:+.2f}%", 
+                  style={"color": "#00ff41" if current_return > 0 else "#ff0040"})
+        ]
+        
+        # Add risk metrics if provided
+        if risk_metrics:
+            # Determine risk/reward quality
+            rr_ratio = risk_metrics['risk_reward_ratio']
+            if rr_ratio >= 3:
+                rr_emoji = "🎯"
+                rr_color = "#00ff41"
+                rr_text = "Excellent"
+            elif rr_ratio >= 2:
+                rr_emoji = "✅"
+                rr_color = "#80ff00"
+                rr_text = "Good"
+            elif rr_ratio >= 1:
+                rr_emoji = "⚠️"
+                rr_color = "#ffff00"
+                rr_text = "Fair"
+            else:
+                rr_emoji = "⛔"
+                rr_color = "#ff0040"
+                rr_text = "Poor"
+            
+            card_body_content.extend([
+                html.Hr(style={"margin": "10px 0"}),
+                html.H6(["📊 Risk Analysis"], className="mb-3", style={"color": "#80ff00"}),
+                
+                # Risk/Reward visual indicator
+                html.Div([
+                    html.Span(f"{rr_emoji} ", style={"fontSize": "2rem"}),
+                    html.Span(f"Risk/Reward: {rr_text}", style={
+                        "color": rr_color,
+                        "fontWeight": "bold",
+                        "fontSize": "1.2rem"
+                    })
+                ], style={"textAlign": "center", "marginBottom": "10px"}),
+                
+                # Visual risk/reward bar
+                html.Div([
+                    html.Div([
+                        html.Div("Risk", style={
+                            "width": f"{100/(1+rr_ratio):.0f}%",
+                            "backgroundColor": "#ff0040",
+                            "padding": "5px",
+                            "textAlign": "center",
+                            "display": "inline-block",
+                            "color": "white"
+                        }),
+                        html.Div("Reward", style={
+                            "width": f"{(rr_ratio*100)/(1+rr_ratio):.0f}%",
+                            "backgroundColor": "#00ff41",
+                            "padding": "5px",
+                            "textAlign": "center",
+                            "display": "inline-block",
+                            "color": "black"
+                        })
+                    ], style={"width": "100%", "marginBottom": "15px", "borderRadius": "5px", "overflow": "hidden"})
+                ]),
+                
+                # Detailed metrics with icons
+                html.Div([
+                    html.Div([
+                        html.Span("📈 ", style={"fontSize": "1.2rem"}),
+                        html.Span(f"Expected: {risk_metrics['expected_return']:+.2f}%", style={
+                            "color": "#00ff41" if risk_metrics['expected_return'] > 0 else "#ff0040"
+                        })
+                    ], className="mb-1"),
+                    html.Div([
+                        html.Span("⬆️ ", style={"fontSize": "1.2rem"}),
+                        html.Span(f"Max Gain: {risk_metrics['max_gain']:+.2f}%", style={"color": "#00ff41"})
+                    ], className="mb-1"),
+                    html.Div([
+                        html.Span("⬇️ ", style={"fontSize": "1.2rem"}),
+                        html.Span(f"Max Loss: {risk_metrics['max_loss']:.2f}%", style={"color": "#ff0040"})
+                    ], className="mb-1"),
+                    html.Div([
+                        html.Span("⚖️ ", style={"fontSize": "1.2rem"}),
+                        html.Span(f"Ratio: 1:{rr_ratio:.2f}", style={
+                            "color": rr_color,
+                            "fontWeight": "bold"
+                        })
+                    ])
+                ])
+            ])
         
         return dbc.Card([
-            dbc.CardBody([
-                html.H4("Current Position", className="mb-3"),
-                html.Div([
-                    html.Span(icon, style={"fontSize": "2rem", "marginRight": "10px"}),
-                    html.Span(current_position.upper(), style={
-                        "fontSize": "1.8rem",
-                        "fontWeight": "bold",
-                        "color": color
-                    })
-                ], style={"display": "flex", "alignItems": "center", "marginBottom": "15px"}),
-                html.P(f"Entered: {entry_date}", className="mb-1"),
-                html.P(f"Using: SMA {sma_pair[0]}/{sma_pair[1]}", className="mb-1"),
-                html.P(f"Performance: {current_return:+.2f}%", 
-                      style={"color": "#00ff41" if current_return > 0 else "#ff0040"})
-            ])
+            dbc.CardBody(card_body_content)
         ], style={
             "backgroundColor": bg_color,
             "border": f"2px solid {color}",
@@ -788,41 +1008,54 @@ class PerformanceMetrics:
         })
     
     @classmethod
-    def create_action_required_card(cls, action_date, signal_type, sma_pair, confidence, hold_until):
+    def create_action_required_card(cls, action_date, signal_type, sma_pair, confidence, hold_until, signal_strength=None):
         """
-        Create a prominent card showing action required at close
+        Create a prominent card showing action required at close with signal strength
         """
-        if signal_type == "Buy":
-            action_color = "#00ff41"
-            action_text = "ENTER BUY POSITION"
-            icon = "▲"
-        elif signal_type == "Short":
-            action_color = "#ff0040"
-            action_text = "ENTER SHORT POSITION"
-            icon = "▼"
-        else:
-            action_color = "#ffff00"
-            action_text = "MOVE TO CASH"
-            icon = "■"
+        # Use position configs for consistent styling
+        config = cls.POSITION_CONFIGS.get(signal_type, cls.POSITION_CONFIGS["Cash"])
+        action_color = config["color"]
+        action_text = config["action_text"]
+        icon = config["action_icon"]
+        
+        card_body_content = [
+            html.H3(["📍 ACTION AT TODAY'S CLOSE"], className="mb-3", style={"color": action_color}),
+            html.Hr(),
+            html.H5(f"{action_date} at 4:00 PM ET", className="mb-3"),
+            html.Div([
+                html.H2([icon, " ", action_text], style={"color": action_color, "marginBottom": "15px"}),
+                html.P(f"Based on: SMA {sma_pair[0]}/{sma_pair[1]} Signal", className="mb-2"),
+                dbc.Progress(
+                    value=confidence,
+                    max=100,
+                    label=f"Confidence: {confidence:.0f}%",
+                    color="success" if confidence > 70 else "warning" if confidence > 50 else "danger",
+                    style={"height": "25px", "marginBottom": "10px"}
+                )
+            ])
+        ]
+        
+        # Add signal strength visualization if provided
+        if signal_strength is not None:
+            card_body_content[-1].children.append(
+                html.Div([
+                    html.P("Signal Strength", className="mb-1"),
+                    dbc.Progress(
+                        value=min(100, signal_strength * 10),
+                        max=100,
+                        label=f"{signal_strength:.2f}%",
+                        color="success" if signal_strength > 5 else "warning" if signal_strength > 2 else "danger",
+                        style={"height": "20px", "marginBottom": "10px"}
+                    )
+                ])
+            )
+        
+        card_body_content[-1].children.append(
+            html.P(f"Hold Until: {hold_until} Close", style={"fontWeight": "bold"})
+        )
         
         return dbc.Card([
-            dbc.CardBody([
-                html.H3(["📍 ACTION AT TODAY'S CLOSE"], className="mb-3", style={"color": action_color}),
-                html.Hr(),
-                html.H5(f"{action_date} at 4:00 PM ET", className="mb-3"),
-                html.Div([
-                    html.H2([icon, " ", action_text], style={"color": action_color, "marginBottom": "15px"}),
-                    html.P(f"Based on: SMA {sma_pair[0]}/{sma_pair[1]} Signal", className="mb-2"),
-                    dbc.Progress(
-                        value=confidence,
-                        max=100,
-                        label=f"Confidence: {confidence:.0f}%",
-                        color="success" if confidence > 70 else "warning" if confidence > 50 else "danger",
-                        style={"height": "25px", "marginBottom": "10px"}
-                    ),
-                    html.P(f"Hold Until: {hold_until} Close", style={"fontWeight": "bold"})
-                ])
-            ])
+            dbc.CardBody(card_body_content)
         ], style={
             "border": f"3px solid {action_color}",
             "backgroundColor": "rgba(0, 0, 0, 0.8)",
@@ -886,17 +1119,217 @@ class PerformanceMetrics:
         ])
     
     @classmethod
+    def create_position_history_table(cls, position_history):
+        """
+        Create a table showing position history with P&L tracking
+        
+        Args:
+            position_history: List of dicts with position history data
+        """
+        if not position_history:
+            return html.Div([
+                html.H5("📜 Position History", className="mb-3"),
+                html.P("No position history available", style={"color": "#808080"})
+            ])
+        
+        # Get all positions to display (completed and current open)
+        positions_to_display = []
+        
+        # Add completed positions (those with exit prices)
+        completed_positions = [entry for entry in position_history if entry.get('exit_price') is not None]
+        positions_to_display.extend(completed_positions)
+        
+        # Check if there's a current open position
+        if position_history:
+            last_position = position_history[-1]
+            if last_position.get('exit_price') is None and last_position.get('position') != 'Cash':
+                # Add the current open position to display
+                positions_to_display.append(last_position)
+        
+        if not positions_to_display:
+            return html.Div([
+                html.H5("📜 Position History", className="mb-3"),
+                html.P("No trades to display.", style={"color": "#808080", "fontStyle": "italic"})
+            ])
+        
+        # Show last 10 positions (including current open if applicable)
+        recent_positions = positions_to_display[-10:]
+        
+        # Calculate performance summary statistics
+        completed_trades = [p for p in recent_positions if p.get('exit_price') is not None]
+        if completed_trades:
+            wins = [t for t in completed_trades if t.get('pnl', 0) > 0]
+            losses = [t for t in completed_trades if t.get('pnl', 0) < 0]
+            
+            # Calculate streaks
+            current_streak = 0
+            streak_type = None
+            for trade in reversed(completed_trades):
+                pnl = trade.get('pnl', 0)
+                if current_streak == 0:
+                    if pnl > 0:
+                        current_streak = 1
+                        streak_type = "win"
+                    elif pnl < 0:
+                        current_streak = 1
+                        streak_type = "loss"
+                else:
+                    if (pnl > 0 and streak_type == "win") or (pnl < 0 and streak_type == "loss"):
+                        current_streak += 1
+                    else:
+                        break
+            
+            # Find best and worst trades
+            best_trade = max(completed_trades, key=lambda x: x.get('pnl', 0)) if completed_trades else None
+            worst_trade = min(completed_trades, key=lambda x: x.get('pnl', 0)) if completed_trades else None
+            
+            # Calculate average hold time
+            avg_hold = sum(t.get('holding_days', 0) for t in completed_trades) / len(completed_trades) if completed_trades else 0
+            
+            # Calculate position-specific success rates
+            buy_trades = [t for t in completed_trades if t.get('position') == 'Buy']
+            short_trades = [t for t in completed_trades if t.get('position') == 'Short']
+            
+            buy_success = (len([t for t in buy_trades if t.get('pnl', 0) > 0]) / len(buy_trades) * 100) if buy_trades else 0
+            short_success = (len([t for t in short_trades if t.get('pnl', 0) > 0]) / len(short_trades) * 100) if short_trades else 0
+        else:
+            current_streak = 0
+            streak_type = None
+            best_trade = None
+            worst_trade = None
+            avg_hold = 0
+            buy_success = 0
+            short_success = 0
+        
+        # Create table rows
+        table_rows = []
+        for entry in reversed(recent_positions):  # Show most recent first
+            is_open = entry.get('exit_price') is None
+            pnl_value = entry.get('pnl', 0) if not is_open else None
+            
+            if is_open:
+                row_color = "#ffff00"  # Yellow for open positions
+                pnl_display = "Open"
+            elif pnl_value is not None and pnl_value > 0:
+                row_color = "#00ff41"
+                pnl_display = f"{pnl_value:+.2f}%"
+            elif pnl_value is not None and pnl_value < 0:
+                row_color = "#ff0040"
+                pnl_display = f"{pnl_value:+.2f}%"
+            else:
+                row_color = "#808080"
+                pnl_display = "0.00%"
+                
+            config = cls.POSITION_CONFIGS.get(entry['position'], cls.POSITION_CONFIGS["Cash"])
+            
+            table_rows.append(
+                html.Tr([
+                    html.Td(entry['date'], style={"color": "#80ff00", "fontSize": "0.9rem"}),
+                    html.Td([config['icon'], " ", entry['position']], 
+                           style={"color": config['color'], "fontWeight": "bold"}),
+                    html.Td(f"${entry['entry_price']:.2f}" if entry.get('entry_price') else "-",
+                           style={"textAlign": "right"}),
+                    html.Td(f"${entry['exit_price']:.2f}" if entry.get('exit_price') else "-",
+                           style={"textAlign": "right"}),
+                    html.Td(f"{entry.get('holding_days', 0)}d" if entry.get('holding_days') else "-",
+                           style={"textAlign": "center"}),
+                    html.Td(pnl_display, 
+                           style={"color": row_color, "fontWeight": "bold", "textAlign": "right"})
+                ])
+            )
+        
+        # Create performance summary cards
+        summary_cards = []
+        if completed_trades:
+            # Streak card
+            if current_streak > 0:
+                streak_emoji = "🔥" if streak_type == "win" else "❄️"
+                streak_color = "#00ff41" if streak_type == "win" else "#ff0040"
+                summary_cards.append(
+                    dbc.Col([
+                        html.Div([
+                            html.Span(f"{streak_emoji} ", style={"fontSize": "1.5rem"}),
+                            html.Span(f"{current_streak} {streak_type}s in a row", 
+                                    style={"color": streak_color, "fontWeight": "bold"})
+                        ], style={"textAlign": "center"})
+                    ], width=3)
+                )
+            
+            # Best/Worst trade card
+            if best_trade and worst_trade:
+                summary_cards.append(
+                    dbc.Col([
+                        html.Div([
+                            html.Small("Best: ", style={"color": "#80ff00"}),
+                            html.Span(f"{best_trade.get('pnl', 0):+.1f}%", 
+                                    style={"color": "#00ff41", "fontWeight": "bold"}),
+                            html.Span(" | ", style={"color": "#80ff00"}),
+                            html.Small("Worst: ", style={"color": "#80ff00"}),
+                            html.Span(f"{worst_trade.get('pnl', 0):+.1f}%", 
+                                    style={"color": "#ff0040", "fontWeight": "bold"})
+                        ], style={"textAlign": "center"})
+                    ], width=3)
+                )
+            
+            # Average hold time
+            summary_cards.append(
+                dbc.Col([
+                    html.Div([
+                        html.Small("Avg Hold: ", style={"color": "#80ff00"}),
+                        html.Span(f"{avg_hold:.1f} days", style={"fontWeight": "bold"})
+                    ], style={"textAlign": "center"})
+                ], width=3)
+            )
+            
+            # Position success rates
+            summary_cards.append(
+                dbc.Col([
+                    html.Div([
+                        html.Small("Buy Win%: ", style={"color": "#80ff00"}),
+                        html.Span(f"{buy_success:.0f}%", 
+                                style={"color": "#00ff41" if buy_success >= 50 else "#ff0040", "fontWeight": "bold"}),
+                        html.Span(" | ", style={"color": "#80ff00"}),
+                        html.Small("Short Win%: ", style={"color": "#80ff00"}),
+                        html.Span(f"{short_success:.0f}%", 
+                                style={"color": "#00ff41" if short_success >= 50 else "#ff0040", "fontWeight": "bold"})
+                    ], style={"textAlign": "center"})
+                ], width=3)
+            )
+        
+        return html.Div([
+            html.H5("📜 Position History", className="mb-3"),
+            
+            # Performance summary row
+            dbc.Row(summary_cards, className="mb-3") if summary_cards else None,
+            
+            dbc.Table([
+                html.Thead([
+                    html.Tr([
+                        html.Th("Date", style={"color": "#80ff00", "fontSize": "0.85rem"}),
+                        html.Th("Position", style={"color": "#80ff00", "fontSize": "0.85rem"}),
+                        html.Th("Entry", style={"color": "#80ff00", "fontSize": "0.85rem", "textAlign": "right"}),
+                        html.Th("Exit", style={"color": "#80ff00", "fontSize": "0.85rem", "textAlign": "right"}),
+                        html.Th("Days", style={"color": "#80ff00", "fontSize": "0.85rem", "textAlign": "center"}),
+                        html.Th("P&L", style={"color": "#80ff00", "fontSize": "0.85rem", "textAlign": "right"})
+                    ])
+                ]),
+                html.Tbody(table_rows)
+            ], bordered=True, dark=True, hover=True, responsive=True, striped=True,
+            size="sm", style={"marginTop": "10px"}),
+            
+            # Note about what's being shown
+            html.Small(f"Showing last {len(recent_positions)} trade{'s' if len(recent_positions) != 1 else ''}", 
+                      style={"color": "#808080", "fontStyle": "italic"})
+        ])
+    
+    @classmethod
     def create_position_timeline(cls, yesterday_position, today_position, tomorrow_position, dates):
         """
         Create a visual timeline showing position progression
         """
         def get_position_style(position):
-            if position == "Buy":
-                return {"color": "#00ff41", "symbol": "↗"}
-            elif position == "Short":
-                return {"color": "#ff0040", "symbol": "↘"}
-            else:
-                return {"color": "#ffff00", "symbol": "─"}
+            config = cls.POSITION_CONFIGS.get(position, cls.POSITION_CONFIGS["Cash"])
+            return {"color": config["color"], "symbol": config["symbol"]}
         
         yesterday_style = get_position_style(yesterday_position)
         today_style = get_position_style(today_position)
@@ -2952,6 +3385,9 @@ app.layout = dbc.Container(
                             ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
                             dbc.Collapse(
                                 dbc.CardBody([
+                                    # Store for position tracking
+                                    dcc.Store(id='position-history-store', storage_type='session'),
+                                    
                                     # Strategy Grade Badge
                                     html.Div(id='strategy-grade-badge', className='mb-3'),
                                     
@@ -4978,6 +5414,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
      Output('visual-signal-indicators', 'children'),
      Output('alert-badges', 'children'),
      Output('strategy-comparison-table', 'children'),
+     Output('position-history-store', 'data'),
      Output('most-productive-buy-pair', 'children'),
      Output('most-productive-short-pair', 'children'),
      Output('avg-capture-buy-leader', 'children'),
@@ -4989,48 +5426,63 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
      Output('confidence-percentage', 'children'),
      Output('trading-recommendations', 'children')],
     [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')]
+     Input('update-interval', 'n_intervals')],
+    [State('position-history-store', 'data')]
 )
-def update_dynamic_strategy_display(ticker, n_intervals):
+def update_dynamic_strategy_display(ticker, n_intervals, position_history_store):
     if not ticker:
-        return [""] * 20
+        return [""] * 21  # Updated for new outputs (removed position-history-table)
+    
+    # Initialize or get ticker-specific position history
+    if position_history_store is None or not isinstance(position_history_store, dict):
+        position_history_store = {}
+    
+    # Get the history for this specific ticker
+    position_history_data = position_history_store.get(ticker, [])
+    
+    # Ensure position_history_data is always a list
+    if not isinstance(position_history_data, list):
+        position_history_data = []
 
     results = load_precomputed_results(ticker)
     
     if results is None:
-        return ["", "", "", "", "", "", "", "", "", "", "Data not available. Please wait..."] + [""] * 9
+        return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data not available. Please wait..."] + [""] * 9
     
     if 'status' in results:
         if results['status'] == 'processing':
-            return ["", "", "", "", "", "", "", "", "", "", "Data is currently being processed."] + [""] * 9
+            return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data is currently being processed."] + [""] * 9
         elif results['status'] == 'complete':
             if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                return ["", "", "", "", "", "", "", "", "", "", "Processing complete, but top pairs not found. Please check data integrity."] + [""] * 9
+                return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Processing complete, but top pairs not found. Please check data integrity."] + [""] * 9
         elif results['status'] == 'failed':
-            return ["", "", "", "", "", "", "", "", "", "", f"Processing failed for {ticker}. Please check the error message."] + [""] * 9
+            return ["", "", "", "", "", "", "", "", "", "", position_history_store, f"Processing failed for {ticker}. Please check the error message."] + [""] * 9
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
     
+    # Get the existing position data that's already calculated correctly for charts
+    active_pairs = results.get('active_pairs', [])
+    
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return ["", "", "", "", "", "", "", "", "", "", "Data integrity issue - missing top pairs"] + [""] * 9
+        return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data integrity issue - missing top pairs"] + [""] * 9
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return ["", "", "", "", "", "", "", "", "", "", "Data integrity issue - missing preprocessed data"] + [""] * 9
+        return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data integrity issue - missing preprocessed data"] + [""] * 9
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return [no_update, no_update] + ["Data integrity issue - invalid pair format"] * 18
+        return [no_update, no_update] + ["Data integrity issue - invalid pair format"] * 8 + [position_history_store] + ["Data integrity issue - invalid pair format"] * 10
 
     try:
         # Validate top pairs data
         if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [top_buy_pair, top_short_pair]):
             logger.error(f"Invalid pair format detected for {ticker}")
-            return [no_update] + ["Invalid pair format detected. Please reprocess data."] * 9
+            return [no_update] + ["Invalid pair format detected. Please reprocess data."] * 9 + [position_history_store] + ["Invalid pair format detected. Please reprocess data."] * 10
 
         # Validate that all required SMA columns exist
         required_smas = [
@@ -5041,7 +5493,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         missing_smas = [sma for sma in required_smas if sma not in df.columns]
         if missing_smas:
             logger.error(f"Missing SMA columns for {ticker}: {missing_smas}")
-            return [no_update] + ["Missing required SMA columns. Please reprocess data."] * 9
+            return [no_update] + ["Missing required SMA columns. Please reprocess data."] * 9 + [position_history_store] + ["Missing required SMA columns. Please reprocess data."] * 10
 
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
@@ -5054,10 +5506,12 @@ def update_dynamic_strategy_display(ticker, n_intervals):
 
     except KeyError:
         logger.error(f"Required SMA columns not found in the DataFrame for {ticker}")
-        return [no_update] + ["Data not available or processing not yet complete. Please wait..."] * 9
+        return [no_update] + ["Data not available or processing not yet complete. Please wait..."] * 9 + [position_history_store] + ["Data not available or processing not yet complete. Please wait..."] * 10
 
     current_date = df.index[-1]
     previous_date = df.index[-2]
+    # Get the date from two days ago if available (needed to determine current position)
+    two_days_ago = df.index[-3] if len(df) > 2 else None
 
     def predict_signal(close_price):
         # Create a copy of the Close series with the new close_price
@@ -5096,7 +5550,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     # Validate dates exist in the index
     if previous_date not in df.index or current_date not in df.index:
         logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
-        return [no_update] + ["Missing required dates in data. Please reprocess data."] * 9
+        return [no_update] + ["Missing required dates in data. Please reprocess data."] * 9 + [position_history_store] + ["Missing required dates in data. Please reprocess data."] * 10
 
     try:
         # Calculate signals for today based on yesterday's close
@@ -5112,7 +5566,24 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
-        return [no_update] + ["Error calculating signals. Please check the data."] * 9
+        return [no_update] + ["Error calculating signals. Please check the data."] * 9 + [position_history_store] + ["Error calculating signals. Please check the data."] * 10
+
+    # Calculate yesterday's signals (which determined the position entered at yesterday's close)
+    # This is our CURRENT position
+    if two_days_ago is not None and two_days_ago in df.index:
+        try:
+            yesterday_buy_signal = (sma1_buy_leader.loc[two_days_ago] > sma2_buy_leader.loc[two_days_ago]) if all(
+                pd.notna([sma1_buy_leader.loc[two_days_ago], sma2_buy_leader.loc[two_days_ago]])) else False
+            yesterday_short_signal = (sma1_short_leader.loc[two_days_ago] < sma2_short_leader.loc[two_days_ago]) if all(
+                pd.notna([sma1_short_leader.loc[two_days_ago], sma2_short_leader.loc[two_days_ago]])) else False
+        except:
+            # If there's any issue accessing the data, assume no position
+            yesterday_buy_signal = False
+            yesterday_short_signal = False
+    else:
+        # Edge case: not enough data, assume no position
+        yesterday_buy_signal = False
+        yesterday_short_signal = False
 
     # Determine the current trading signal type
     if buy_signal and not short_signal:
@@ -5492,31 +5963,37 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     logger.info("")  # Clean line break
 
     # Prepare data for new components
-    # Boolean flags to reduce redundant calculations
+    # Boolean flags for today's signals (what to do at today's close)
     buy_signal_active = buy_signal and not short_signal
     short_signal_active = short_signal and not buy_signal
     both_signals_active = buy_signal and short_signal
     no_signals_active = not buy_signal and not short_signal
     
-    # Determine current position (what was entered at yesterday's close)
+    # Boolean flags for yesterday's signals (which determined current position)
+    yesterday_buy_signal_active = yesterday_buy_signal and not yesterday_short_signal
+    yesterday_short_signal_active = yesterday_short_signal and not yesterday_buy_signal
+    yesterday_both_signals_active = yesterday_buy_signal and yesterday_short_signal
+    yesterday_no_signals_active = not yesterday_buy_signal and not yesterday_short_signal
+    
+    # Determine current position (what was entered at yesterday's close based on signals from two days ago)
     yesterday_date = (current_date - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # Current position is based on yesterday's signals
-    if both_signals_active:
-        # Both signals active - follow leader
+    # Current position is based on yesterday's signals (calculated from two days ago data)
+    if yesterday_both_signals_active:
+        # Both signals were active yesterday - follow leader
         if buy_capture > short_capture:
             current_position = "Buy"
             current_sma_pair = top_buy_pair
         else:
             current_position = "Short"
             current_sma_pair = top_short_pair
-    elif buy_signal_active:
+    elif yesterday_buy_signal_active:
         current_position = "Buy"
         current_sma_pair = top_buy_pair
-    elif short_signal_active:
+    elif yesterday_short_signal_active:
         current_position = "Short"
         current_sma_pair = top_short_pair
-    else:  # no_signals_active
+    else:  # yesterday_no_signals_active
         current_position = "Cash"
         current_sma_pair = (0, 0)
     
@@ -5614,6 +6091,149 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     # Calculate years for display
     years_of_data = len(df) / 252 if len(df) > 0 else 0
     
+    # Calculate signal strength (percentage divergence between SMAs)
+    signal_strength = None
+    if next_position != "Cash" and next_sma_pair[0] != 0 and next_sma_pair[1] != 0:
+        try:
+            # Get current SMA values for the next position
+            if next_position == "Buy":
+                sma1_current = sma1_buy_leader.loc[current_date] if current_date in sma1_buy_leader.index else None
+                sma2_current = sma2_buy_leader.loc[current_date] if current_date in sma2_buy_leader.index else None
+            else:  # Short
+                sma1_current = sma1_short_leader.loc[current_date] if current_date in sma1_short_leader.index else None
+                sma2_current = sma2_short_leader.loc[current_date] if current_date in sma2_short_leader.index else None
+            
+            if sma1_current and sma2_current and sma2_current != 0:
+                signal_strength = abs(sma1_current - sma2_current) / sma2_current * 100
+        except Exception as e:
+            logger.warning(f"Could not calculate signal strength: {e}")
+    
+    # Calculate risk metrics for current position
+    risk_metrics = PerformanceMetrics.calculate_risk_metrics(df, current_position)
+    
+    # Build position history from active_pairs (the same data used for charts)
+    if active_pairs and len(active_pairs) == len(df) and not position_history_data:
+        df_dates = df.index
+        new_position_history = []
+        
+        # Look back up to 90 days for position changes
+        lookback_days = min(90, len(active_pairs) - 1)
+        start_idx = max(0, len(active_pairs) - lookback_days)
+        
+        # Track the last open position
+        last_position_entry = None
+        
+        # Check if we're starting with an open position
+        if start_idx > 0:
+            # Look at the position just before our window
+            initial_pos = active_pairs[start_idx - 1]
+            initial_type = "Cash"
+            if initial_pos.startswith("Buy"):
+                initial_type = "Buy"
+            elif initial_pos.startswith("Short"):
+                initial_type = "Short"
+            
+            # If we start with an open position, record it (without an entry date/price since we don't know when it started)
+            if initial_type != "Cash":
+                last_position_entry = {
+                    'date': df_dates[start_idx - 1].strftime('%Y-%m-%d'),  # Approximate entry date
+                    'position': initial_type,
+                    'entry_price': float(df['Close'].iloc[start_idx - 1]),  # Approximate entry price
+                    'exit_price': None,
+                    'holding_days': 0,
+                    'pnl': None
+                }
+        
+        for i in range(start_idx, len(active_pairs)):
+            curr_pos = active_pairs[i]
+            prev_pos = active_pairs[i-1] if i > start_idx else "None"
+            
+            # Extract position type (Buy, Short, or None/Cash)
+            curr_type = "Cash"
+            if curr_pos.startswith("Buy"):
+                curr_type = "Buy"
+            elif curr_pos.startswith("Short"):
+                curr_type = "Short"
+            elif curr_pos == "None":
+                curr_type = "Cash"
+                
+            prev_type = "Cash"
+            if prev_pos.startswith("Buy"):
+                prev_type = "Buy"
+            elif prev_pos.startswith("Short"):
+                prev_type = "Short"
+            elif prev_pos == "None":
+                prev_type = "Cash"
+            
+            # Check if position changed
+            if prev_type != curr_type:
+                # When position changes from active_pairs[i-1] to active_pairs[i]:
+                # - Old position (active_pairs[i-1]) exits at close of dates[i-1]  
+                # - New position (active_pairs[i]) enters at close of dates[i-1]
+                # - New position is held during dates[i] (from open to close)
+                
+                # Close previous position if it wasn't Cash
+                if last_position_entry and last_position_entry.get('exit_price') is None:
+                    # Position exits at close of dates[i-1]
+                    last_position_entry['exit_date'] = df_dates[i-1].strftime('%Y-%m-%d')
+                    last_position_entry['exit_price'] = float(df['Close'].iloc[i-1])
+                    
+                    # Calculate holding days
+                    try:
+                        entry_date = pd.to_datetime(last_position_entry['date'])
+                        exit_date = df_dates[i-1]
+                        last_position_entry['holding_days'] = (exit_date - entry_date).days
+                    except:
+                        last_position_entry['holding_days'] = 0
+                    
+                    # Calculate P&L
+                    if last_position_entry['position'] in ['Buy', 'Short']:
+                        entry_price = last_position_entry['entry_price']
+                        exit_price = last_position_entry['exit_price']
+                        if last_position_entry['position'] == 'Buy':
+                            last_position_entry['pnl'] = ((exit_price - entry_price) / entry_price) * 100
+                        else:  # Short
+                            last_position_entry['pnl'] = ((entry_price - exit_price) / entry_price) * 100
+                    
+                    # Add the completed trade to history
+                    new_position_history.append(last_position_entry)
+                
+                # Open new position if not Cash
+                # The new position enters at close of dates[i-1]
+                if curr_type != "Cash":
+                    new_entry = {
+                        'date': df_dates[i-1].strftime('%Y-%m-%d'),  # Entry date
+                        'position': curr_type,
+                        'entry_price': float(df['Close'].iloc[i-1]),  # Entry price
+                        'exit_price': None,
+                        'holding_days': 0,
+                        'pnl': None
+                    }
+                    # Don't add to history yet - it's not complete
+                    last_position_entry = new_entry
+                else:
+                    last_position_entry = None
+        
+        # Add the last open position if it exists
+        if last_position_entry and last_position_entry.get('exit_price') is None:
+            # This is an open position - include it in the history
+            new_position_history.append(last_position_entry)
+        
+        # Use the new position history
+        if new_position_history:
+            position_history_data = new_position_history
+    
+    # Ensure position_history_data is always a list
+    if position_history_data is None or not isinstance(position_history_data, list):
+        position_history_data = []
+    
+    # Keep only last 20 entries (to ensure we have enough for display)
+    if position_history_data:
+        position_history_data = position_history_data[-20:]
+    
+    # Create position history table
+    position_history_table = PerformanceMetrics.create_position_history_table(position_history_data)
+    
     # Build the new structured layout
     trading_recommendations = [
         html.Div([
@@ -5630,7 +6250,8 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                             current_position,
                             f"{yesterday_date} at Close",
                             current_position_return,
-                            current_sma_pair
+                            current_sma_pair,
+                            risk_metrics
                         )
                     ], width=6),
                     dbc.Col([
@@ -5639,7 +6260,8 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                             next_position,
                             next_sma_pair,
                             confidence,
-                            next_trading_day.strftime('%Y-%m-%d')
+                            next_trading_day.strftime('%Y-%m-%d'),
+                            signal_strength
                         )
                     ], width=6)
                 ]),
@@ -5721,6 +6343,9 @@ def update_dynamic_strategy_display(ticker, n_intervals):
                 # Strategy Comparison Table (already exists in output)
                 # Will be displayed from strategy_comparison_table variable
                 
+                # Position History Section
+                position_history_table,
+                
                 html.Hr()
             ], className="mb-4"),
             
@@ -5749,7 +6374,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     save_precomputed_results(ticker, results)
 
     # Calculate the time period in years for the data
-    if dates:
+    if dates is not None and len(dates) > 0:
         first_date = dates[0]
         last_date = dates[-1]
         time_delta = last_date - first_date
@@ -5976,11 +6601,24 @@ def update_dynamic_strategy_display(ticker, n_intervals):
             'message': f'High Drawdown: {max_drawdown:.1f}%'
         }
     
-    if sharpe_ratio < 0:
+    # Handle complex/invalid sharpe_ratio values
+    sharpe_check = sharpe_ratio
+    if isinstance(sharpe_check, complex):
+        sharpe_check = sharpe_check.real
+    
+    try:
+        sharpe_check = float(sharpe_check)
+    except (TypeError, ValueError):
+        sharpe_check = 0
+    
+    if pd.isna(sharpe_check) or not np.isfinite(sharpe_check):
+        sharpe_check = 0
+    
+    if sharpe_check < 0:
         alerts['negative_sharpe'] = {
             'triggered': True,
             'severity': 'medium',
-            'message': f'Negative Sharpe: {sharpe_ratio:.2f}'
+            'message': f'Negative Sharpe: {sharpe_check:.2f}'
         }
     
     # Signal change alert
@@ -6019,6 +6657,9 @@ def update_dynamic_strategy_display(ticker, n_intervals):
     ]
     strategy_comparison_table = PerformanceMetrics.create_strategy_comparison_table(strategies_data)
     
+    # Update the ticker-specific position history in the store
+    position_history_store[ticker] = position_history_data
+    
     return (
         grade_badge,
         progress_bars,
@@ -6030,6 +6671,7 @@ def update_dynamic_strategy_display(ticker, n_intervals):
         visual_signal_indicators,
         alert_badges,
         strategy_comparison_table,
+        position_history_store,
         most_productive_buy_pair_text,
         most_productive_short_pair_text,
         avg_capture_buy_leader,
