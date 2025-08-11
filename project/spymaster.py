@@ -142,11 +142,37 @@ class PerformanceMetrics:
         # Convert percentage to decimal for calculation
         total_return_decimal = total_return / 100
         
-        # Calculate annualized return: (1 + total_return) ^ (1/years) - 1
-        annualized_return_decimal = (1 + total_return_decimal) ** (1 / years) - 1
+        # Handle negative returns properly
+        # For negative returns, we need to handle the calculation differently
+        # to avoid NaN from taking the root of a negative number
+        if total_return_decimal <= -1:
+            # Total loss scenario
+            return -100
         
-        # Convert back to percentage
-        return annualized_return_decimal * 100
+        # Calculate annualized return: (1 + total_return) ^ (1/years) - 1
+        # This works for both positive and negative returns (as long as > -100%)
+        try:
+            if total_return_decimal < 0:
+                # For negative returns, calculate the annualized loss rate
+                # Using the formula that handles negative returns properly
+                remaining_value = 1 + total_return_decimal  # This is positive if total_return > -100%
+                annualized_multiplier = remaining_value ** (1 / years)
+                annualized_return_decimal = annualized_multiplier - 1
+            else:
+                # Standard calculation for positive returns
+                annualized_return_decimal = (1 + total_return_decimal) ** (1 / years) - 1
+            
+            # Convert back to percentage
+            result = annualized_return_decimal * 100
+            
+            # Check for NaN or infinite values
+            if not np.isfinite(result):
+                return 0
+            
+            return result
+        except:
+            # If any calculation error occurs, return 0
+            return 0
     
     @classmethod
     def calculate_grade(cls, sharpe, win_rate=None, max_drawdown=None, total_capture=None, years=None):
@@ -358,22 +384,44 @@ class PerformanceMetrics:
                 color = "#80ff00"
                 display_value = str(value)
             
+            # Calculate bar width percentage
+            bar_width = min(100, abs(value))
+            
             rows.append(
                 html.Div([
                     html.Span(pair_str, style={"width": "40%", "display": "inline-block"}),
                     html.Div([
-                        html.Div(
-                            display_value,
-                            style={
+                        html.Div([
+                            # The colored bar (fixed height to prevent distortion)
+                            html.Div(style={
                                 "backgroundColor": color,
-                                "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
-                                "padding": "2px 8px",
+                                "height": "24px",
+                                "width": f"{bar_width}%",
+                                "minWidth": "2px",
                                 "borderRadius": "4px",
-                                "textAlign": "center",
-                                "width": f"{min(100, abs(value))}%",
-                                "minWidth": "60px"
-                            }
-                        )
+                                "position": "relative",
+                                "display": "inline-block"
+                            }, children=[
+                                # Text inside bar only if it fits (width > 15%)
+                                html.Span(display_value, style={
+                                    "position": "absolute",
+                                    "left": "50%",
+                                    "top": "50%",
+                                    "transform": "translate(-50%, -50%)",
+                                    "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
+                                    "fontSize": "0.85rem",
+                                    "fontWeight": "bold",
+                                    "whiteSpace": "nowrap"
+                                }) if bar_width > 15 else None
+                            ]),
+                            # Text outside bar if it doesn't fit
+                            html.Span(f" {display_value}", style={
+                                "marginLeft": "8px",
+                                "color": color,
+                                "fontSize": "0.85rem",
+                                "fontWeight": "bold"
+                            }) if bar_width <= 15 else None
+                        ])
                     ], style={"width": "60%", "display": "inline-block"})
                 ], className="mb-1")
             )
@@ -951,26 +999,69 @@ class PerformanceMetrics:
                     })
                 ], style={"textAlign": "center", "marginBottom": "10px"}),
                 
-                # Visual risk/reward bar
+                # Visual risk/reward bar with smart text handling
                 html.Div([
                     html.Div([
-                        html.Div("Risk", style={
+                        # Risk bar
+                        html.Div(style={
                             "width": f"{100/(1+rr_ratio):.0f}%",
                             "backgroundColor": "#ff0040",
-                            "padding": "5px",
-                            "textAlign": "center",
+                            "height": "30px",
                             "display": "inline-block",
-                            "color": "white"
-                        }),
-                        html.Div("Reward", style={
+                            "position": "relative",
+                            "verticalAlign": "top"
+                        }, children=[
+                            html.Span("Risk", style={
+                                "position": "absolute",
+                                "left": "50%",
+                                "top": "50%",
+                                "transform": "translate(-50%, -50%)",
+                                "color": "white",
+                                "fontSize": "0.9rem" if 100/(1+rr_ratio) < 30 else "1rem",
+                                "fontWeight": "bold",
+                                "whiteSpace": "nowrap"
+                            })
+                        ] if 100/(1+rr_ratio) > 15 else []),  # Only show text if bar is wide enough
+                        # Reward bar
+                        html.Div(style={
                             "width": f"{(rr_ratio*100)/(1+rr_ratio):.0f}%",
                             "backgroundColor": "#00ff41",
-                            "padding": "5px",
-                            "textAlign": "center",
+                            "height": "30px",
                             "display": "inline-block",
-                            "color": "black"
-                        })
-                    ], style={"width": "100%", "marginBottom": "15px", "borderRadius": "5px", "overflow": "hidden"})
+                            "position": "relative",
+                            "verticalAlign": "top"
+                        }, children=[
+                            html.Span("Reward", style={
+                                "position": "absolute",
+                                "left": "50%",
+                                "top": "50%",
+                                "transform": "translate(-50%, -50%)",
+                                "color": "black",
+                                "fontSize": "0.9rem" if (rr_ratio*100)/(1+rr_ratio) < 30 else "1rem",
+                                "fontWeight": "bold",
+                                "whiteSpace": "nowrap"
+                            })
+                        ] if (rr_ratio*100)/(1+rr_ratio) > 15 else [])  # Only show text if bar is wide enough
+                    ], style={
+                        "width": "100%", 
+                        "marginBottom": "5px", 
+                        "borderRadius": "5px", 
+                        "overflow": "hidden",
+                        "backgroundColor": "#333",  # Background for contrast
+                        "fontSize": "0"  # Prevent whitespace between inline-blocks
+                    }),
+                    # Add labels below the bar when text doesn't fit inside
+                    html.Div([
+                        html.Small("Risk", style={
+                            "color": "#ff0040",
+                            "marginRight": "10px",
+                            "fontWeight": "bold"
+                        }) if 100/(1+rr_ratio) <= 15 else None,
+                        html.Small("Reward", style={
+                            "color": "#00ff41",
+                            "fontWeight": "bold"
+                        }) if (rr_ratio*100)/(1+rr_ratio) <= 15 else None
+                    ], style={"textAlign": "center", "marginBottom": "10px"})
                 ]),
                 
                 # Detailed metrics with icons
@@ -1000,12 +1091,13 @@ class PerformanceMetrics:
             ])
         
         return dbc.Card([
-            dbc.CardBody(card_body_content)
+            dbc.CardBody(card_body_content, style={"height": "100%"})
         ], style={
             "backgroundColor": bg_color,
             "border": f"2px solid {color}",
-            "marginBottom": "20px"
-        })
+            "height": "100%",
+            "minHeight": "350px"  # Ensure minimum height
+        }, className="h-100")
     
     @classmethod
     def create_action_required_card(cls, action_date, signal_type, sma_pair, confidence, hold_until, signal_strength=None):
@@ -1055,13 +1147,14 @@ class PerformanceMetrics:
         )
         
         return dbc.Card([
-            dbc.CardBody(card_body_content)
+            dbc.CardBody(card_body_content, style={"height": "100%"})
         ], style={
             "border": f"3px solid {action_color}",
             "backgroundColor": "rgba(0, 0, 0, 0.8)",
             "boxShadow": f"0 0 20px {action_color}",
-            "marginBottom": "20px"
-        })
+            "height": "100%",
+            "minHeight": "350px"  # Match the position card minimum height
+        }, className="h-100")
     
     @classmethod
     def create_price_threshold_visual(cls, thresholds, current_price, ticker):
@@ -1128,7 +1221,7 @@ class PerformanceMetrics:
         """
         if not position_history:
             return html.Div([
-                html.H5("📜 Position History", className="mb-3"),
+                html.H3("📜 Position History", className="mb-3"),
                 html.P("No position history available", style={"color": "#808080"})
             ])
         
@@ -1148,7 +1241,7 @@ class PerformanceMetrics:
         
         if not positions_to_display:
             return html.Div([
-                html.H5("📜 Position History", className="mb-3"),
+                html.H3("📜 Position History", className="mb-3"),
                 html.P("No trades to display.", style={"color": "#808080", "fontStyle": "italic"})
             ])
         
@@ -1222,18 +1315,24 @@ class PerformanceMetrics:
                 
             config = cls.POSITION_CONFIGS.get(entry['position'], cls.POSITION_CONFIGS["Cash"])
             
+            # Check if this is an open position
+            is_open = entry.get('status') == 'OPEN' or entry.get('exit_price') is None
+            
             table_rows.append(
                 html.Tr([
                     html.Td(entry['date'], style={"color": "#80ff00", "fontSize": "0.9rem"}),
-                    html.Td([config['icon'], " ", entry['position']], 
+                    html.Td([config['icon'], " ", entry['position'], 
+                            html.Span(" [OPEN]", style={"color": "#ffff00", "fontSize": "0.8rem"}) if is_open else ""], 
                            style={"color": config['color'], "fontWeight": "bold"}),
                     html.Td(f"${entry['entry_price']:.2f}" if entry.get('entry_price') else "-",
                            style={"textAlign": "right"}),
-                    html.Td(f"${entry['exit_price']:.2f}" if entry.get('exit_price') else "-",
+                    html.Td(f"${entry['exit_price']:.2f}" if entry.get('exit_price') else 
+                           html.Span("OPEN", style={"color": "#ffff00", "fontStyle": "italic"}) if is_open else "-",
                            style={"textAlign": "right"}),
                     html.Td(f"{entry.get('holding_days', 0)}d" if entry.get('holding_days') else "-",
                            style={"textAlign": "center"}),
-                    html.Td(pnl_display, 
+                    html.Td(pnl_display if not is_open or entry.get('pnl') is not None else 
+                           html.Span(f"{entry.get('pnl', 0):.2f}%*", style={"color": row_color, "fontStyle": "italic"}), 
                            style={"color": row_color, "fontWeight": "bold", "textAlign": "right"})
                 ])
             )
@@ -1296,11 +1395,26 @@ class PerformanceMetrics:
                 ], width=3)
             )
         
+        # Count number of trades being displayed
+        num_trades_shown = len(recent_positions)
+        
         return html.Div([
-            html.H5("📜 Position History", className="mb-3"),
+            html.H3([
+                "📜 Position History",
+                html.Span(
+                    f" (Last {num_trades_shown} trades)",
+                    style={"fontSize": "0.9rem", "color": "#808080", "fontWeight": "normal"}
+                )
+            ], className="mb-3"),
             
-            # Performance summary row
-            dbc.Row(summary_cards, className="mb-3") if summary_cards else None,
+            # Performance summary row with label
+            html.Div([
+                html.Small(
+                    f"Performance metrics based on last {len(completed_trades)} completed trades",
+                    style={"color": "#808080", "fontStyle": "italic", "marginBottom": "10px", "display": "block"}
+                ) if completed_trades else None,
+                dbc.Row(summary_cards, className="mb-3") if summary_cards else None
+            ]),
             
             dbc.Table([
                 html.Thead([
@@ -1345,27 +1459,28 @@ class PerformanceMetrics:
                         "fontSize": "2rem",
                         "color": yesterday_style['color']
                     }),
-                    html.Small(f"Entered {yesterday_position}", style={"display": "block", "marginTop": "5px"})
+                    html.Small(f"Held {yesterday_position}", style={"display": "block", "marginTop": "5px"})
                 ], style={"width": "25%", "display": "inline-block", "textAlign": "center"}),
                 
                 # Arrow
                 html.Div("→", style={"width": "12.5%", "display": "inline-block", "textAlign": "center", "fontSize": "1.5rem"}),
                 
-                # Today
+                # Today (CURRENT)
                 html.Div([
-                    html.Small(dates['today'], style={"display": "block", "marginBottom": "5px"}),
+                    html.Small(dates['today'] + " (NOW)", style={"display": "block", "marginBottom": "5px", "fontWeight": "bold"}),
                     html.Div(today_style['symbol'], style={
                         "fontSize": "2rem",
                         "color": today_style['color']
                     }),
-                    html.Small(f"Holding {today_position}", style={"display": "block", "marginTop": "5px"})
+                    html.Small(f"Holding {today_position}", style={"display": "block", "marginTop": "5px", "fontWeight": "bold"})
                 ], style={
                     "width": "25%",
                     "display": "inline-block",
                     "textAlign": "center",
                     "backgroundColor": "rgba(128, 255, 0, 0.1)",
                     "padding": "10px",
-                    "borderRadius": "10px"
+                    "borderRadius": "10px",
+                    "border": "2px solid rgba(128, 255, 0, 0.3)"
                 }),
                 
                 # Arrow
@@ -1378,7 +1493,8 @@ class PerformanceMetrics:
                         "fontSize": "2rem",
                         "color": tomorrow_style['color']
                     }),
-                    html.Small(f"Enter {tomorrow_position}", style={"display": "block", "marginTop": "5px"})
+                    html.Small(f"Will hold {tomorrow_position}", style={"display": "block", "marginTop": "5px"}),
+                    html.Small("(enter at today's close)", style={"display": "block", "fontSize": "0.8rem", "color": "#888", "marginTop": "2px"})
                 ], style={"width": "25%", "display": "inline-block", "textAlign": "center"})
             ], style={
                 "backgroundColor": "rgba(0, 0, 0, 0.3)",
@@ -1387,6 +1503,555 @@ class PerformanceMetrics:
                 "marginBottom": "20px"
             })
         ])
+    
+    @classmethod
+    def create_market_countdown_timer(cls):
+        """Create a countdown timer to market close"""
+        from datetime import datetime, timedelta
+        eastern = pytz.timezone('US/Eastern')
+        now = datetime.now(eastern)
+        
+        # Market close time (4:00 PM ET)
+        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        # Check if market is closed (after 4 PM or weekend)
+        is_weekend = now.weekday() >= 5
+        is_after_close = now >= market_close
+        
+        if is_weekend or is_after_close:
+            # Calculate time until next market open (9:30 AM)
+            if is_after_close and now.weekday() == 4:  # Friday after close
+                next_open = now + timedelta(days=3)
+            elif is_weekend:
+                days_until_monday = 7 - now.weekday()
+                next_open = now + timedelta(days=days_until_monday)
+            else:
+                next_open = now + timedelta(days=1)
+            
+            next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
+            time_until_open = next_open - now
+            hours = int(time_until_open.total_seconds() // 3600)
+            minutes = int((time_until_open.total_seconds() % 3600) // 60)
+            
+            return dbc.Card([
+                dbc.CardBody([
+                    html.Div([
+                        html.I(className="fas fa-moon fa-2x mb-2", style={"color": "#808080"}),
+                        html.H5("MARKET CLOSED", style={"color": "#ff0040", "marginBottom": "10px"}),
+                        html.P(f"Opens in {hours}h {minutes}m", style={"fontSize": "1.2rem", "marginBottom": "5px"}),
+                        html.Small(f"Next: {next_open.strftime('%a %b %d, 9:30 AM ET')}", style={"color": "#808080"})
+                    ], style={"textAlign": "center"})
+                ])
+            ], style={
+                "backgroundColor": "rgba(255, 0, 64, 0.1)",
+                "border": "2px solid #ff0040",
+                "marginBottom": "20px"
+            })
+        else:
+            # Calculate time until market close
+            time_until_close = market_close - now
+            hours = int(time_until_close.total_seconds() // 3600)
+            minutes = int((time_until_close.total_seconds() % 3600) // 60)
+            seconds = int(time_until_close.total_seconds() % 60)
+            
+            # Determine urgency color
+            if hours == 0 and minutes < 30:
+                color = "#ff0040"  # Red for last 30 minutes
+                icon = "fa-exclamation-triangle"
+                urgency = "CLOSING SOON"
+            elif hours < 2:
+                color = "#ff8800"  # Orange for last 2 hours
+                icon = "fa-clock"
+                urgency = "TIME SENSITIVE"
+            else:
+                color = "#00ff41"  # Green for normal trading hours
+                icon = "fa-chart-line"
+                urgency = "MARKET OPEN"
+            
+            return dbc.Card([
+                dbc.CardBody([
+                    html.Div([
+                        html.I(className=f"fas {icon} fa-2x mb-2", style={"color": color}),
+                        html.H5(urgency, style={"color": color, "marginBottom": "10px"}),
+                        html.H3(f"{hours:02d}:{minutes:02d}:{seconds:02d}", 
+                               id="countdown-display",
+                               style={"fontSize": "2rem", "fontFamily": "monospace", "color": color}),
+                        html.P("Until Market Close (4:00 PM ET)", style={"marginBottom": "0"})
+                    ], style={"textAlign": "center"})
+                ])
+            ], style={
+                "backgroundColor": f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)",
+                "border": f"2px solid {color}",
+                "marginBottom": "20px"
+            }, id="countdown-timer-card")
+    
+    @classmethod
+    def create_price_zone_visualization(cls, current_price, thresholds):
+        """Create a comprehensive price zone bar chart showing ALL signal zones"""
+        import plotly.graph_objects as go
+        import re
+        
+        # Parse ALL threshold ranges into zones
+        zones = []
+        
+        for item in thresholds:
+            if isinstance(item, dict):
+                price_range = item.get('range', '')
+                signal = item.get('signal', '')
+                is_current = item.get('is_current', False)
+                
+                # Match EXACTLY the logic from line 1126 in threshold table
+                # color = "#00ff41" if threshold['signal'] == 'Buy' else "#ff0040" if threshold['signal'] == 'Short' else "#ffff00"
+                if signal == 'Buy':
+                    color = "#00ff41"  # Exact green from table
+                    glow_color = "rgba(0, 255, 65, 0.5)"
+                elif signal == 'Short':
+                    color = "#ff0040"  # Exact red from table  
+                    glow_color = "rgba(255, 0, 64, 0.5)"
+                else:
+                    # Everything else (Cash, Hold, None, etc.) gets yellow
+                    color = "#ffff00"  # Exact yellow from table
+                    glow_color = "rgba(255, 255, 0, 0.5)"
+                
+                # Parse the price range to get numeric bounds
+                if "above" in price_range.lower():
+                    # Format: "above $X" - goes from X to a high value
+                    numbers = re.findall(r'[\d,]+\.?\d*', price_range)
+                    if numbers:
+                        low_price = float(numbers[0].replace(',', ''))
+                        # Extend to show the zone continues upward
+                        high_price = current_price * 2 if current_price > low_price else low_price * 1.5
+                        zones.append({
+                            'low': low_price,
+                            'high': high_price,
+                            'signal': signal,
+                            'color': color,
+                            'glow': glow_color,
+                            'range_text': price_range,
+                            'is_current': is_current,
+                            'label': signal.split()[0] if ' ' in signal else signal
+                        })
+                elif "below" in price_range.lower():
+                    # Format: "below $X" - goes from 0 to X
+                    numbers = re.findall(r'[\d,]+\.?\d*', price_range)
+                    if numbers:
+                        high_price = float(numbers[0].replace(',', ''))
+                        # Always start from 0 for "below" zones
+                        low_price = 0
+                        zones.append({
+                            'low': low_price,
+                            'high': high_price,
+                            'signal': signal,
+                            'color': color,
+                            'glow': glow_color,
+                            'range_text': price_range,
+                            'is_current': is_current,
+                            'label': signal.split()[0] if ' ' in signal else signal
+                        })
+                elif "-" in price_range:
+                    # Format: "$X - $Y" - specific range
+                    numbers = re.findall(r'[\d,]+\.?\d*', price_range)
+                    if len(numbers) >= 2:
+                        low_price = float(numbers[0].replace(',', ''))
+                        high_price = float(numbers[1].replace(',', ''))
+                        zones.append({
+                            'low': low_price,
+                            'high': high_price,
+                            'signal': signal,
+                            'color': color,
+                            'glow': glow_color,
+                            'range_text': price_range,
+                            'is_current': is_current,
+                            'label': signal.split()[0] if ' ' in signal else signal
+                        })
+        
+        # Sort zones by low price
+        zones.sort(key=lambda x: x['low'])
+        
+        # Consolidate adjacent zones with the same signal
+        consolidated = []
+        for zone in zones:
+            if consolidated and consolidated[-1]['signal'] == zone['signal']:
+                # Extend the previous zone instead of adding a new one
+                consolidated[-1]['high'] = zone['high']
+                # Keep current status if any zone is current
+                if zone['is_current']:
+                    consolidated[-1]['is_current'] = True
+                # Don't append range_text, we'll rebuild it later
+            else:
+                # Add as new zone
+                consolidated.append(zone.copy())
+        
+        zones = consolidated
+        
+        # Rebuild clean range text for consolidated zones
+        for zone in zones:
+            # Check if this is the lowest zone (extends to the bottom)
+            is_lowest = zone == zones[0] if zones else False
+            # Check if this is the highest zone (extends to the top)
+            is_highest = zone == zones[-1] if zones else False
+            
+            if is_lowest and zone['low'] < current_price * 0.5:
+                # This zone extends to the bottom
+                zone['range_text'] = f"below ${zone['high']:.2f}"
+            elif is_highest and zone['high'] >= current_price * 1.5:
+                # This zone extends to the top
+                zone['range_text'] = f"${zone['low']:.2f} and above"
+            else:
+                # Normal bounded zone
+                zone['range_text'] = f"${zone['low']:.2f} - ${zone['high']:.2f}"
+        
+        # If no zones found, return a message
+        if not zones:
+            return dbc.Card([
+                dbc.CardBody([
+                    html.P("No threshold data available", style={"textAlign": "center", "color": "#808080"})
+                ])
+            ], style={"marginBottom": "15px"})
+        
+        # CENTER the view around current price with TIGHT ZOOM
+        # Focus on the area immediately around the current price
+        # Only show enough to see where we are relative to nearest thresholds
+        
+        threshold_prices = []
+        for zone in zones:
+            if zone['low'] > 0:
+                threshold_prices.append(zone['low'])
+            if zone['high'] < float('inf'):
+                threshold_prices.append(zone['high'])
+        
+        if threshold_prices:
+            # Find closest thresholds below and above current price
+            below_prices = [p for p in threshold_prices if p < current_price]
+            above_prices = [p for p in threshold_prices if p > current_price]
+            
+            closest_below = max(below_prices) if below_prices else current_price * 0.95
+            closest_above = min(above_prices) if above_prices else current_price * 1.05
+            
+            # Calculate distances to nearest thresholds
+            distance_below = current_price - closest_below
+            distance_above = closest_above - current_price
+            
+            # LIMIT the zoom to a reasonable range
+            # Don't show more than 10% of price on each side, even if thresholds are farther
+            max_zoom_distance = current_price * 0.1  # Maximum 10% on each side
+            
+            # Use the smaller of: actual threshold distance or max zoom distance
+            distance_below = min(distance_below, max_zoom_distance)
+            distance_above = min(distance_above, max_zoom_distance)
+            
+            # Make symmetric for centering
+            view_distance = max(distance_below, distance_above) * 1.2  # Small padding
+            
+            # Set symmetric range around current price
+            min_price = max(0, current_price - view_distance)
+            max_price = current_price + view_distance
+            
+            # If min_price was clamped to 0, adjust max_price to keep current price centered
+            if min_price == 0 and current_price - view_distance < 0:
+                max_price = current_price * 2
+        else:
+            # No thresholds found - show ±5% around current price (tighter)
+            view_distance = current_price * 0.05
+            min_price = max(0, current_price - view_distance)
+            max_price = current_price + view_distance
+        
+        # Create the bar chart
+        fig = go.Figure()
+        
+        zone_height = 1
+        
+        # Add each zone as a colored rectangle - extend to chart edges if zone continues
+        for zone in zones:
+            # Extend zones to chart edges if they continue beyond view
+            x0 = max(zone['low'], min_price) if zone['low'] > min_price else min_price
+            x1 = min(zone['high'], max_price) if zone['high'] < max_price else max_price
+            
+            # Add main zone rectangle with higher opacity for more vibrant colors
+            fig.add_shape(
+                type="rect",
+                x0=x0, x1=x1,
+                y0=0, y1=zone_height,
+                fillcolor=zone['color'],
+                opacity=0.8 if zone['is_current'] else 0.6,  # Increased opacity for vibrant colors
+                line=dict(width=2 if zone['is_current'] else 0, color=zone['glow'] if zone['is_current'] else zone['color'])
+            )
+            
+            # Add glow effect for current zone
+            if zone['is_current']:
+                fig.add_shape(
+                    type="rect",
+                    x0=zone['low'], x1=zone['high'],
+                    y0=0, y1=zone_height,
+                    fillcolor=zone['glow'],
+                    opacity=0.3,  # Slightly increased for better visibility
+                    line=dict(width=0)
+                )
+            
+            # Add zone label or < > indicators for zones extending beyond view
+            zone_visible_start = max(zone['low'], min_price)
+            zone_visible_end = min(zone['high'], max_price)
+            zone_visible_width = zone_visible_end - zone_visible_start
+            
+            # Determine label based on zone visibility
+            if zone['low'] < min_price and zone['high'] > min_price:
+                # Zone extends below the view
+                fig.add_annotation(
+                    x=min_price + (max_price - min_price) * 0.05,
+                    y=zone_height / 2,
+                    text=f"◄ {zone['label'].upper()}",
+                    showarrow=False,
+                    font=dict(size=11, color="white", family="Arial Black"),
+                )
+            elif zone['high'] > max_price and zone['low'] < max_price:
+                # Zone extends above the view
+                fig.add_annotation(
+                    x=max_price - (max_price - min_price) * 0.05,
+                    y=zone_height / 2,
+                    text=f"{zone['label'].upper()} ►",
+                    showarrow=False,
+                    font=dict(size=11, color="white", family="Arial Black"),
+                )
+            elif zone_visible_width > (max_price - min_price) * 0.05:
+                # Zone is visible and wide enough for label
+                label_x = (zone_visible_start + zone_visible_end) / 2
+                fig.add_annotation(
+                    x=label_x,
+                    y=zone_height / 2,
+                    text=zone['label'].upper(),
+                    showarrow=False,
+                    font=dict(size=12, color="white", family="Arial Black"),
+                )
+            
+            # Add threshold price at boundaries (only if visible in current zoom)
+            if zone['low'] > 0 and min_price <= zone['low'] <= max_price:
+                fig.add_annotation(
+                    x=zone['low'],
+                    y=0.1,
+                    text=f"${zone['low']:.2f}",
+                    showarrow=False,
+                    font=dict(size=9, color=zone['color']),
+                    textangle=0
+                )
+        
+        # Add current price marker with glow
+        fig.add_shape(
+            type="line",
+            x0=current_price, x1=current_price,
+            y0=0, y1=zone_height,
+            line=dict(color="#ffff00", width=4)
+        )
+        
+        # Add glow effect for current price
+        fig.add_shape(
+            type="rect",
+            x0=current_price - (max_price - min_price) * 0.005,
+            x1=current_price + (max_price - min_price) * 0.005,
+            y0=0, y1=zone_height,
+            fillcolor="rgba(255, 255, 0, 0.3)",
+            line=dict(width=0)
+        )
+        
+        # Add current price annotation
+        fig.add_annotation(
+            x=current_price,
+            y=zone_height * 1.15,
+            text=f"NOW<br>${current_price:.2f}",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1,
+            arrowwidth=3,
+            arrowcolor="#ffff00",
+            font=dict(size=11, color="#ffff00", family="Arial Black"),
+            align="center",
+            bgcolor="rgba(0,0,0,0.7)",
+            bordercolor="#ffff00",
+            borderwidth=1
+        )
+        
+        # Update layout with better styling
+        fig.update_layout(
+            height=180,
+            margin=dict(l=40, r=20, t=50, b=50),
+            xaxis=dict(
+                range=[min_price, max_price],
+                showgrid=True,
+                gridcolor="rgba(128,128,128,0.2)",
+                zeroline=True,
+                zerolinecolor="rgba(128,128,128,0.3)",
+                visible=True,
+                tickformat="$,.0f",
+                tickfont=dict(size=10, color="#c0c0c0"),
+                title="Price",
+                titlefont=dict(size=10, color="#808080")
+            ),
+            yaxis=dict(
+                range=[0, zone_height * 1.3],
+                showgrid=False,
+                zeroline=False,
+                visible=False
+            ),
+            plot_bgcolor="rgba(0,0,0,0.5)",
+            paper_bgcolor="rgba(0,0,0,0.3)",
+            showlegend=False
+        )
+        
+        # Build legend text dynamically based on actual zones
+        legend_items = []
+        for i, zone in enumerate(zones):
+            # Use simpler indicator for current zone
+            if zone['is_current']:
+                indicator = "▶"
+                weight = "bold"
+            else:
+                indicator = "●"
+                weight = "normal"
+            
+            # Add separator between items (but not after last)
+            separator = " | " if i < len(zones) - 1 else ""
+            
+            legend_items.append(
+                html.Span([
+                    html.Span(f"{indicator} ", style={"color": zone['color']}),
+                    html.Span(f"{zone['label'].upper()}: ", style={"fontWeight": weight}),
+                    html.Span(f"{zone['range_text']}", style={"color": "#c0c0c0"}),
+                    html.Span(separator, style={"color": "#606060", "margin": "0 10px"})
+                ])
+            )
+        
+        return dbc.Card([
+            dbc.CardBody([
+                dcc.Graph(
+                    figure=fig,
+                    config={'displayModeBar': False}
+                ),
+                html.Div([
+                    html.Small(legend_items, style={"color": "#c0c0c0"})
+                ], style={"textAlign": "center", "marginTop": "10px"})
+            ])
+        ], style={
+            "marginBottom": "15px", 
+            "border": "2px solid #444",
+            "backgroundColor": "rgba(0,0,0,0.4)",
+            "boxShadow": "0 0 10px rgba(255,255,0,0.2)"  # Subtle glow
+        })
+    
+    @classmethod
+    def create_interactive_threshold_slider_deprecated(cls, current_price, thresholds):
+        """Create an interactive price threshold slider"""
+        # Parse thresholds to get numeric values
+        threshold_values = []
+        threshold_labels = []
+        
+        # Handle both list and dict formats
+        if isinstance(thresholds, list):
+            # thresholds is a list of dicts with 'range' and 'signal' keys
+            for item in thresholds:
+                try:
+                    price_range = item.get('range', '')
+                    signal = item.get('signal', '')
+                    
+                    # Extract numeric value from price range
+                    if "$" in price_range:
+                        price_text = price_range.replace("$", "").replace(",", "").strip()
+                        
+                        if "above" in price_text.lower():
+                            numeric_val = float(price_text.split()[0])
+                        elif "below" in price_text.lower():
+                            numeric_val = float(price_text.split()[0])
+                        elif " - " in price_text:
+                            parts = price_text.split(" - ")
+                            # Use the midpoint of the range
+                            low = float(parts[0])
+                            high_text = parts[1] if len(parts) > 1 else parts[0]
+                            if "above" in high_text.lower():
+                                numeric_val = low  # Use the lower bound for "X and above"
+                            else:
+                                high = float(high_text)
+                                numeric_val = (low + high) / 2  # Midpoint
+                        else:
+                            numeric_val = float(price_text.split()[0])
+                        
+                        threshold_values.append(numeric_val)
+                        threshold_labels.append(f"{signal}: {price_range}")
+                except Exception as e:
+                    continue
+        elif isinstance(thresholds, dict):
+            # Original dict format
+            for desc, value in thresholds.items():
+                try:
+                    if isinstance(value, str):
+                        # Extract numeric value from string like "$123.45"
+                        numeric_val = float(value.replace('$', '').replace(',', ''))
+                    else:
+                        numeric_val = float(value)
+                    threshold_values.append(numeric_val)
+                    threshold_labels.append(desc)
+                except:
+                    continue
+        
+        if not threshold_values:
+            return html.Div("No valid thresholds available")
+        
+        min_price = min(threshold_values) * 0.98
+        max_price = max(threshold_values) * 1.02
+        
+        # Create marks for the slider
+        marks = {}
+        for val, label in zip(threshold_values, threshold_labels):
+            position = ((val - min_price) / (max_price - min_price)) * 100
+            color = "#00ff41" if "Buy" in label else "#ff0040" if "Short" in label else "#ffff00"
+            marks[val] = {
+                'label': f'${val:.2f}',
+                'style': {'color': color, 'fontSize': '10px'}
+            }
+        
+        # Add current price mark
+        marks[current_price] = {
+            'label': f'Current: ${current_price:.2f}',
+            'style': {'color': '#00ffff', 'fontSize': '12px', 'fontWeight': 'bold'}
+        }
+        
+        return dbc.Card([
+            dbc.CardHeader([
+                html.I(className="fas fa-sliders-h me-2"),
+                "Interactive Price Thresholds"
+            ]),
+            dbc.CardBody([
+                html.Div([
+                    html.H5(f"Current Price: ${current_price:.2f}", 
+                           style={"textAlign": "center", "color": "#00ffff", "marginBottom": "20px"}),
+                    
+                    dcc.Slider(
+                        id="threshold-slider",
+                        min=min_price,
+                        max=max_price,
+                        value=current_price,
+                        marks=marks,
+                        step=0.01,
+                        included=False,
+                        tooltip={"placement": "bottom", "always_visible": True}
+                    ),
+                    
+                    html.Div(id="threshold-slider-output", style={"marginTop": "20px"}),
+                    
+                    html.Hr(),
+                    
+                    # Distance from thresholds
+                    html.Div([
+                        html.H6("Distance from Thresholds:", style={"marginBottom": "10px"}),
+                        *[
+                            html.Div([
+                                html.Span(label + ": ", style={"fontWeight": "bold"}),
+                                html.Span(f"${abs(current_price - val):.2f} ({abs((current_price - val) / current_price * 100):.2f}%)",
+                                         style={"color": "#00ff41" if "Buy" in label else "#ff0040" if "Short" in label else "#ffff00"})
+                            ], style={"marginBottom": "5px"})
+                            for val, label in zip(threshold_values, threshold_labels)
+                        ]
+                    ])
+                ])
+            ])
+        ], style={"marginBottom": "20px"})
 
 # Initialize the Dash app with a dark theme and custom styles
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY, "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"])
@@ -3428,6 +4093,7 @@ app.layout = dbc.Container(
                                     html.Div(id='trading-direction', style={'display': 'none'}),
                                     html.Div(id='performance-expectation', style={'display': 'none'}),
                                     html.Div(id='confidence-percentage', style={'display': 'none'}),
+                                    html.Div(id='countdown-timer-container'),  # Separate countdown timer
                                     html.Div(id='trading-recommendations'),
                                     html.Div(id='processing-status'),  # For showing processing status
                                     dbc.Progress(
@@ -4222,9 +4888,10 @@ app.layout = dbc.Container(
         ]),
         # Interval components for periodic updates
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
-        dcc.Interval(id='update-interval', interval=5000, n_intervals=0, disabled=False),  # Decreased to 5 seconds from 30 seconds
-        dcc.Interval(id='loading-interval', interval=5000, n_intervals=0),  # Update every 5 seconds
-        dcc.Interval(id='optimization-update-interval', interval=5000, n_intervals=0, disabled=True),
+        dcc.Interval(id='update-interval', interval=3000, n_intervals=0, disabled=False),  # Reduced to 3 seconds
+        dcc.Interval(id='loading-interval', interval=3000, n_intervals=0),  # Update every 3 seconds
+        dcc.Interval(id='optimization-update-interval', interval=3000, n_intervals=0, disabled=True),
+        dcc.Interval(id='countdown-interval', interval=1000, n_intervals=0),  # Re-enabled with proper target
         # Loading spinner output (if needed)
         dcc.Loading(
             id="loading-spinner",
@@ -5430,6 +6097,15 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
     [State('position-history-store', 'data')]
 )
 def update_dynamic_strategy_display(ticker, n_intervals, position_history_store):
+    # Check if this is an interval update or a ticker change
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        trigger_id = None
+    else:
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Only log if the ticker changed, not on interval updates
+    should_log = trigger_id == 'ticker-input'
     if not ticker:
         return [""] * 21  # Updated for new outputs (removed position-history-table)
     
@@ -5570,12 +6246,13 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
 
     # Calculate yesterday's signals (which determined the position entered at yesterday's close)
     # This is our CURRENT position
-    if two_days_ago is not None and two_days_ago in df.index:
+    # IMPORTANT: Use yesterday's signals (not two_days_ago) to determine what position we entered at yesterday's close
+    if previous_date is not None and previous_date in df.index:
         try:
-            yesterday_buy_signal = (sma1_buy_leader.loc[two_days_ago] > sma2_buy_leader.loc[two_days_ago]) if all(
-                pd.notna([sma1_buy_leader.loc[two_days_ago], sma2_buy_leader.loc[two_days_ago]])) else False
-            yesterday_short_signal = (sma1_short_leader.loc[two_days_ago] < sma2_short_leader.loc[two_days_ago]) if all(
-                pd.notna([sma1_short_leader.loc[two_days_ago], sma2_short_leader.loc[two_days_ago]])) else False
+            yesterday_buy_signal = (sma1_buy_leader.loc[previous_date] > sma2_buy_leader.loc[previous_date]) if all(
+                pd.notna([sma1_buy_leader.loc[previous_date], sma2_buy_leader.loc[previous_date]])) else False
+            yesterday_short_signal = (sma1_short_leader.loc[previous_date] < sma2_short_leader.loc[previous_date]) if all(
+                pd.notna([sma1_short_leader.loc[previous_date], sma2_short_leader.loc[previous_date]])) else False
         except:
             # If there's any issue accessing the data, assume no position
             yesterday_buy_signal = False
@@ -5590,6 +6267,10 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         trading_signal_type = "Buy"
     elif short_signal and not buy_signal:
         trading_signal_type = "Short"
+    elif buy_signal and short_signal:
+        # Both signals active - choose based on capture (need to calculate captures first)
+        # This will be fixed after captures are calculated
+        trading_signal_type = "Cash (No active triggers)"  # Temporary - will be updated below
     else:
         trading_signal_type = "Cash (No active triggers)"
 
@@ -5600,6 +6281,10 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         next_trading_signal_type = "Buy"
     elif next_short_signal and not next_buy_signal:
         next_trading_signal_type = "Short"
+    elif next_buy_signal and next_short_signal:
+        # Both signals active - choose based on capture (need to calculate captures first)
+        # This will be fixed after captures are calculated
+        next_trading_signal_type = "Cash (No active triggers)"  # Temporary - will be updated below
     else:
         next_trading_signal_type = "Cash (No active triggers)"
 
@@ -5716,6 +6401,23 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     total_capture_buy_leader = f"Total Capture for Buy Leader: {buy_capture:.4f}% | Sharpe: {buy_leader_sharpe:.2f} | Max DD: {buy_leader_max_dd:.2f}%"
     total_capture_short_leader = f"Total Capture for Short Leader: {short_capture:.4f}% | Sharpe: {short_leader_sharpe:.2f} | Max DD: {short_leader_max_dd:.2f}%"
 
+    # Now that we have captures, update signal types when both signals are active
+    if buy_signal and short_signal:
+        # Both signals active - choose based on capture
+        if buy_capture > short_capture:
+            trading_signal_type = "Buy (Leader)"
+        else:
+            trading_signal_type = "Short (Leader)"
+        trading_signal = f"Current Trading Signal ({current_date.strftime('%Y-%m-%d')}): {trading_signal_type}"
+    
+    if next_buy_signal and next_short_signal:
+        # Both signals active - choose based on capture
+        if buy_capture > short_capture:
+            next_trading_signal_type = "Buy (Leader)"
+        else:
+            next_trading_signal_type = "Short (Leader)"
+        next_trading_signal = f"Next Trading Signal ({next_trading_day.strftime('%Y-%m-%d')}): {next_trading_signal_type}"
+
     # Recalculate the dynamic cumulative performance for combined strategy
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
     daily_top_short_pairs = results.get('daily_top_short_pairs', {})
@@ -5798,7 +6500,13 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                 losses = trigger_days - wins  # Ensure wins + losses equals trigger days
                 win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0.0
                 avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0.0
-                total_capture = signal_captures.sum() if trigger_days > 0 else 0.0
+                # IMPORTANT: Use the final cumulative combined capture value, not the sum of daily captures
+                # The cumulative_combined_captures already tracks the cumulative performance
+                if 'cumulative_combined_captures' in results and len(results['cumulative_combined_captures']) > 0:
+                    total_capture = float(results['cumulative_combined_captures'].iloc[-1])
+                else:
+                    # Fallback to sum of daily captures if cumulative not available
+                    total_capture = signal_captures.sum() if trigger_days > 0 else 0.0
 
                 # Calculate standard deviation using ddof=1 for sample standard deviation
                 if trigger_days > 1:
@@ -5820,21 +6528,23 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                     '95%': p_value < 0.05,
                     '99%': p_value < 0.01
                 }
-                log_subsection("Statistical Significance Analysis")
-                log_metric("t-Statistic", f"{t_statistic:.4f}")
-                log_metric("p-Value", f"{p_value:.4f}")
-                log_metric("Degrees of Freedom", degrees_of_freedom)
-                logger.info("")
-                logger.info(f"{Colors.CYAN}Confidence Levels:{Colors.ENDC}")
-                for level, significant in confidence_levels.items():
-                    status = 'Significant' if significant else 'Not Significant'
-                    color = Colors.BRIGHT_GREEN if significant else Colors.ORANGE
-                    logger.info(f"  {Colors.OKBLUE}{level} Confidence:{Colors.ENDC} {color}{status}{Colors.ENDC}")
+                if should_log:
+                    log_subsection("Statistical Significance Analysis")
+                    log_metric("t-Statistic", f"{t_statistic:.4f}")
+                    log_metric("p-Value", f"{p_value:.4f}")
+                    log_metric("Degrees of Freedom", degrees_of_freedom)
+                    logger.info("")
+                    logger.info(f"{Colors.CYAN}Confidence Levels:{Colors.ENDC}")
+                    for level, significant in confidence_levels.items():
+                        status = 'Significant' if significant else 'Not Significant'
+                        color = Colors.BRIGHT_GREEN if significant else Colors.ORANGE
+                        logger.info(f"  {Colors.OKBLUE}{level} Confidence:{Colors.ENDC} {color}{status}{Colors.ENDC}")
             else:
                 t_statistic = None
                 p_value = None
-                logger.info("\nStatistical Significance Analysis:")
-                logger.info("Insufficient data to perform statistical significance analysis.\n")
+                if should_log:
+                    logger.info("\nStatistical Significance Analysis:")
+                    logger.info("Insufficient data to perform statistical significance analysis.\n")
 
             # Annualized Sharpe Ratio logic consistent with other sections
             risk_free_rate = 5.0
@@ -5931,36 +6641,52 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     if price_points[-1] < float('inf'):
         price_ranges.append({'low': price_points[-1], 'high': float('inf')})
 
-    predictions = []
-    for pr in price_ranges:
-        low = pr['low']
-        high = pr['high']
-        sample_price = low + (high - low) * 0.01 if high != float('inf') else low * 1.01
-        signal, active_pair = predict_signal(sample_price)
-        recommendations = {
-            'Buy': 'Enter Buy',
-            'Short': 'Enter Short',
-            'Cash': 'All Cash'
-        }
-        recommendation = recommendations.get(signal, 'All Cash')
-        price_range_str = f"${low:.2f} - ${high:.2f}" if high != float('inf') else f"${low:.2f} and above"
-        if signal in ['Buy', 'Short']:
-            signal_display = f"{signal} ({top_buy_pair[0]},{top_buy_pair[1]})" if signal == 'Buy' else f"{signal} ({top_short_pair[0]},{top_short_pair[1]})"
-        else:
-            signal_display = signal
-            
-        predictions.append({
-            'price_range': price_range_str,
-            'signal': signal_display,
-            'active_pair': active_pair,
-            'recommendation': recommendation
-        })
+    # Check if we've already computed predictions for this ticker
+    # and they're still fresh (within last minute)
+    cached_predictions = results.get('cached_predictions', None)
+    cached_predictions_time = results.get('cached_predictions_time', 0)
+    
+    if cached_predictions and (time.time() - cached_predictions_time) < 60:
+        # Use cached predictions if they're fresh
+        predictions = cached_predictions
+    else:
+        # Compute new predictions
+        predictions = []
+        for pr in price_ranges:
+            low = pr['low']
+            high = pr['high']
+            sample_price = low + (high - low) * 0.01 if high != float('inf') else low * 1.01
+            signal, active_pair = predict_signal(sample_price)
+            recommendations = {
+                'Buy': 'Enter Buy',
+                'Short': 'Enter Short',
+                'Cash': 'All Cash'
+            }
+            recommendation = recommendations.get(signal, 'All Cash')
+            price_range_str = f"${low:.2f} - ${high:.2f}" if high != float('inf') else f"${low:.2f} and above"
+            if signal in ['Buy', 'Short']:
+                signal_display = f"{signal} ({top_buy_pair[0]},{top_buy_pair[1]})" if signal == 'Buy' else f"{signal} ({top_short_pair[0]},{top_short_pair[1]})"
+            else:
+                signal_display = signal
+                
+            predictions.append({
+                'price_range': price_range_str,
+                'signal': signal_display,
+                'active_pair': active_pair,
+                'recommendation': recommendation
+            })
+        
+        # Cache the predictions
+        results['cached_predictions'] = predictions
+        results['cached_predictions_time'] = time.time()
 
-    logger.info("")  # Line break before section
-    log_section("Forecast Recommendations")
-    for pred in predictions:
-        logger.info(f"  💵 {pred['price_range']:<20} → {pred['signal']:<12} [{pred['recommendation']}]")
-    logger.info("")  # Clean line break
+    # Only log if this is a ticker change, not an interval update
+    if should_log:
+        logger.info("")  # Line break before section
+        log_section("Forecast Recommendations")
+        for pred in predictions:
+            logger.info(f"  💵 {pred['price_range']:<20} → {pred['signal']:<12} [{pred['recommendation']}]")
+        logger.info("")  # Clean line break
 
     # Prepare data for new components
     # Boolean flags for today's signals (what to do at today's close)
@@ -5975,27 +6701,62 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     yesterday_both_signals_active = yesterday_buy_signal and yesterday_short_signal
     yesterday_no_signals_active = not yesterday_buy_signal and not yesterday_short_signal
     
-    # Determine current position (what was entered at yesterday's close based on signals from two days ago)
+    # Determine current position (what was entered at yesterday's close)
     yesterday_date = (current_date - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # Current position is based on yesterday's signals (calculated from two days ago data)
-    if yesterday_both_signals_active:
-        # Both signals were active yesterday - follow leader
-        if buy_capture > short_capture:
+    # Get current position from active_pairs (source of truth)
+    # active_pairs[-1] represents what we're holding today
+    if active_pairs and len(active_pairs) > 0:
+        current_pair_str = active_pairs[-1]
+        if current_pair_str.startswith("Buy"):
+            current_position = "Buy"
+            current_sma_pair = top_buy_pair  # Use the current top buy pair
+        elif current_pair_str.startswith("Short"):
+            current_position = "Short"
+            current_sma_pair = top_short_pair  # Use the current top short pair
+        elif current_pair_str == "None" or current_pair_str == "Cash":
+            current_position = "Cash"
+            current_sma_pair = (0, 0)
+        else:
+            current_position = "Cash"
+            current_sma_pair = (0, 0)
+    else:
+        # Fallback: Calculate based on yesterday's signals if active_pairs not available
+        if yesterday_both_signals_active:
+            # Both signals were active yesterday - follow leader
+            if buy_capture > short_capture:
+                current_position = "Buy"
+                current_sma_pair = top_buy_pair
+            else:
+                current_position = "Short"
+                current_sma_pair = top_short_pair
+        elif yesterday_buy_signal_active:
             current_position = "Buy"
             current_sma_pair = top_buy_pair
-        else:
+        elif yesterday_short_signal_active:
             current_position = "Short"
             current_sma_pair = top_short_pair
-    elif yesterday_buy_signal_active:
-        current_position = "Buy"
-        current_sma_pair = top_buy_pair
-    elif yesterday_short_signal_active:
-        current_position = "Short"
-        current_sma_pair = top_short_pair
-    else:  # yesterday_no_signals_active
-        current_position = "Cash"
-        current_sma_pair = (0, 0)
+        else:  # yesterday_no_signals_active
+            current_position = "Cash"
+            current_sma_pair = (0, 0)
+    
+    # Determine yesterday's position (what was held yesterday, entered at close two days ago)
+    # We need to look at the active_pairs list to find this
+    previous_position = "Cash"  # Default
+    if active_pairs and len(active_pairs) >= 2:
+        # Get the position from 2 days ago (what was held yesterday)
+        # active_pairs[-1] is the most recent (today's position)
+        # active_pairs[-2] would be yesterday's position
+        try:
+            yesterday_pair = active_pairs[-2] if len(active_pairs) >= 2 else "None"
+            if yesterday_pair.startswith("Buy"):
+                previous_position = "Buy"
+            elif yesterday_pair.startswith("Short"):
+                previous_position = "Short"
+            else:
+                previous_position = "Cash"
+        except:
+            previous_position = "Cash"
     
     # Boolean flags for next signals
     next_buy_signal_active = next_buy_signal and not next_short_signal
@@ -6028,14 +6789,57 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         (50 if p_value and p_value < 0.05 else 25 if p_value and p_value < 0.10 else 0) * 0.3  # 30% on significance
     )
     
-    # Calculate actual position return from yesterday's close to today
-    if current_position != "Cash" and len(df) > 1:
-        yesterday_close = df['Close'].iloc[-2]
-        today_close = df['Close'].iloc[-1]
-        if current_position == "Buy":
-            current_position_return = ((today_close - yesterday_close) / yesterday_close) * 100
-        else:  # Short position
-            current_position_return = ((yesterday_close - today_close) / yesterday_close) * 100
+    # Calculate actual position return since entry (not just 1-day return)
+    # IMPORTANT: We use the cumulative combined capture to track actual P&L since position entry
+    position_entry_date = yesterday_date  # Default to yesterday (1-day position)
+    position_days_held = 1
+    
+    if current_position != "Cash" and len(df) > 1 and active_pairs:
+        # Find when the current position type was entered by looking back through active_pairs
+        position_entry_idx = len(active_pairs) - 1
+        current_pos_type = active_pairs[-1]
+        
+        # Look backwards to find when this position started
+        for i in range(len(active_pairs) - 2, -1, -1):
+            # Check if position type changed (Buy->Short, Short->Buy, etc.)
+            prev_pos = active_pairs[i]
+            # Extract position types for comparison
+            prev_type = "Buy" if prev_pos.startswith("Buy") else "Short" if prev_pos.startswith("Short") else "Cash"
+            curr_type = "Buy" if current_pos_type.startswith("Buy") else "Short" if current_pos_type.startswith("Short") else "Cash"
+            
+            if prev_type != curr_type:
+                position_entry_idx = i + 1
+                break
+        else:
+            # Position has been held since the beginning
+            position_entry_idx = 0
+        
+        # Calculate days held
+        position_days_held = len(active_pairs) - position_entry_idx
+        
+        # Get the entry date (position enters at close of dates[position_entry_idx-1])
+        if 'cumulative_combined_captures' in results and position_entry_idx > 0 and position_entry_idx <= len(results['cumulative_combined_captures']):
+            # Position entered at close of the previous day
+            position_entry_date = results['cumulative_combined_captures'].index[position_entry_idx - 1].strftime('%Y-%m-%d')
+        elif position_entry_idx == 0 and 'cumulative_combined_captures' in results:
+            # Position held since beginning
+            position_entry_date = results['cumulative_combined_captures'].index[0].strftime('%Y-%m-%d')
+        
+        # If we found the entry point and have cumulative captures
+        if 'cumulative_combined_captures' in results and len(results['cumulative_combined_captures']) > position_entry_idx:
+            # Get capture at entry and current capture
+            entry_capture = results['cumulative_combined_captures'].iloc[position_entry_idx - 1] if position_entry_idx > 0 else 0
+            current_capture = results['cumulative_combined_captures'].iloc[-1]
+            # The position return is the difference in cumulative capture since entry
+            current_position_return = current_capture - entry_capture
+        else:
+            # Fallback to 1-day return if we can't determine entry point
+            yesterday_close = df['Close'].iloc[-2]
+            today_close = df['Close'].iloc[-1]
+            if current_position == "Buy":
+                current_position_return = ((today_close - yesterday_close) / yesterday_close) * 100
+            else:  # Short position
+                current_position_return = ((yesterday_close - today_close) / yesterday_close) * 100
     else:
         current_position_return = 0
     
@@ -6146,7 +6950,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         
         for i in range(start_idx, len(active_pairs)):
             curr_pos = active_pairs[i]
-            prev_pos = active_pairs[i-1] if i > start_idx else "None"
+            prev_pos = active_pairs[i-1] if i > start_idx else initial_pos
             
             # Extract position type (Buy, Short, or None/Cash)
             curr_type = "Cash"
@@ -6182,9 +6986,9 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                     try:
                         entry_date = pd.to_datetime(last_position_entry['date'])
                         exit_date = df_dates[i-1]
-                        last_position_entry['holding_days'] = (exit_date - entry_date).days
+                        last_position_entry['holding_days'] = max(1, (exit_date - entry_date).days)
                     except:
-                        last_position_entry['holding_days'] = 0
+                        last_position_entry['holding_days'] = 1
                     
                     # Calculate P&L
                     if last_position_entry['position'] in ['Buy', 'Short']:
@@ -6216,7 +7020,26 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         
         # Add the last open position if it exists
         if last_position_entry and last_position_entry.get('exit_price') is None:
-            # This is an open position - include it in the history
+            # This is an open position - update it with current date for proper display
+            # Update holding days to current
+            try:
+                entry_date = pd.to_datetime(last_position_entry['date'])
+                current_date = df_dates[-1]
+                last_position_entry['holding_days'] = max(1, (current_date - entry_date).days)
+                # Add current unrealized P&L
+                if last_position_entry['position'] in ['Buy', 'Short']:
+                    entry_price = last_position_entry['entry_price']
+                    current_price = float(df['Close'].iloc[-1])
+                    if last_position_entry['position'] == 'Buy':
+                        last_position_entry['pnl'] = ((current_price - entry_price) / entry_price) * 100
+                    else:  # Short
+                        last_position_entry['pnl'] = ((entry_price - current_price) / entry_price) * 100
+                    # Mark as open position (no exit price means it's still open)
+                    last_position_entry['status'] = 'OPEN'
+            except Exception as e:
+                logger.warning(f"Could not update open position metrics: {e}")
+            
+            # Include the open position in the history
             new_position_history.append(last_position_entry)
         
         # Use the new position history
@@ -6248,7 +7071,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                     dbc.Col([
                         PerformanceMetrics.create_position_status_card(
                             current_position,
-                            f"{yesterday_date} at Close",
+                            f"{position_entry_date} at Close ({position_days_held} day{'s' if position_days_held != 1 else ''} held)",
                             current_position_return,
                             current_sma_pair,
                             risk_metrics
@@ -6287,78 +7110,44 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                 
                 # Position Timeline
                 PerformanceMetrics.create_position_timeline(
-                    current_position,
-                    current_position,
-                    next_position,
+                    previous_position,  # What we held yesterday
+                    current_position,   # What we're holding today
+                    next_position,      # What we'll hold tomorrow
                     timeline_dates
                 ),
                 
                 html.Hr()
             ], className="mb-4"),
             
-            # SECTION 2: PERFORMANCE OVERVIEW
+            # SECTION 2: POSITION HISTORY
             html.Div([
-                html.H3("📈 Performance Overview", className="mb-3"),
-                
-                # Key metrics cards
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Card([
-                            dbc.CardBody([
-                                html.H4(f"{total_capture:.1f}%", style={"color": "#00ff41" if total_capture > 0 else "#ff0040"}),
-                                html.P(f"Total Return", className="mb-0"),
-                                html.Small(f"({years_of_data:.1f} years)")
-                            ], style={"textAlign": "center"})
-                        ])
-                    ], width=3),
-                    dbc.Col([
-                        dbc.Card([
-                            dbc.CardBody([
-                                html.H4(f"{PerformanceMetrics.calculate_annualized_return(total_capture, years_of_data):.1f}%", 
-                                       style={"color": "#00ff41" if total_capture > 0 else "#ff0040"}),
-                                html.P("Annual Return", className="mb-0")
-                            ], style={"textAlign": "center"})
-                        ])
-                    ], width=3),
-                    dbc.Col([
-                        dbc.Card([
-                            dbc.CardBody([
-                                html.H4(f"{sharpe_ratio:.2f}", 
-                                       style={"color": PerformanceMetrics.get_color_for_metric('sharpe', sharpe_ratio)}),
-                                html.P("Sharpe Ratio", className="mb-0")
-                            ], style={"textAlign": "center"})
-                        ])
-                    ], width=3),
-                    dbc.Col([
-                        dbc.Card([
-                            dbc.CardBody([
-                                html.H4(f"{win_ratio:.1f}%", 
-                                       style={"color": PerformanceMetrics.get_color_for_metric('win_rate', win_ratio)}),
-                                html.P("Win Rate", className="mb-0")
-                            ], style={"textAlign": "center"})
-                        ])
-                    ], width=3)
-                ], className="mb-4"),
+                # Position History Section (now the main header)
+                position_history_table,
                 
                 # Strategy Comparison Table (already exists in output)
                 # Will be displayed from strategy_comparison_table variable
                 
-                # Position History Section
-                position_history_table,
-                
                 html.Hr()
             ], className="mb-4"),
             
-            # SECTION 3: PRICE THRESHOLD GUIDE
+            # SECTION 3: SIGNAL CHANGE THRESHOLDS
             html.Div([
                 html.H3("🎯 Signal Change Thresholds", className="mb-3"),
                 
+                # Show the detailed threshold table
                 PerformanceMetrics.create_price_threshold_visual(
                     threshold_data,
                     current_price_val,
                     ticker
                 ),
                 
+                # Add the price zone bar visualization after metrics
+                PerformanceMetrics.create_price_zone_visualization(
+                    current_price_val,
+                    threshold_data
+                ),
+                
+                # Note at the bottom
                 html.Div([
                     html.Small("Note: All position changes occur at market close (4:00 PM ET). "
                              "Positions are held from close to close.", 
@@ -6370,6 +7159,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     ]
 
     # After Forecast Recommendations are complete, update results
+    # Always save results to ensure charts can load properly
     results['last_recommendation_time'] = time.time()
     save_precomputed_results(ticker, results)
 
@@ -6538,23 +7328,34 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # For buy signals: TRUE when SMA1 > SMA2 (regardless of which has fewer days)
     # For short signals: TRUE when SMA1 < SMA2 (regardless of which has fewer days)
     
-    if len(sma1_buy_leader) > 0 and len(sma2_buy_leader) > 0:
-        # For buy signal strength: measure the gap when buy signal is TRUE
-        if buy_signal:  # SMA1 > SMA2
-            buy_sma_diff = abs(sma1_buy_leader.iloc[-1] - sma2_buy_leader.iloc[-1])
+    # Use current_date values for signal strength (matches next signals)
+    if len(sma1_buy_leader) > 0 and len(sma2_buy_leader) > 0 and current_date in sma1_buy_leader.index:
+        # Check if buy signal is active TODAY (for tomorrow's position)
+        buy_signal_today = sma1_buy_leader.loc[current_date] > sma2_buy_leader.loc[current_date]
+        if buy_signal_today:
+            buy_sma_diff = abs(sma1_buy_leader.loc[current_date] - sma2_buy_leader.loc[current_date])
         else:
             buy_sma_diff = 0
     else:
         buy_sma_diff = 0
     
-    if len(sma1_short_leader) > 0 and len(sma2_short_leader) > 0:
-        # For short signal strength: measure the gap when short signal is TRUE
-        if short_signal:  # SMA1 < SMA2
-            short_sma_diff = abs(sma1_short_leader.iloc[-1] - sma2_short_leader.iloc[-1])
+    if len(sma1_short_leader) > 0 and len(sma2_short_leader) > 0 and current_date in sma1_short_leader.index:
+        # Check if short signal is active TODAY (for tomorrow's position)
+        short_signal_today = sma1_short_leader.loc[current_date] < sma2_short_leader.loc[current_date]
+        if short_signal_today:
+            short_sma_diff = abs(sma1_short_leader.loc[current_date] - sma2_short_leader.loc[current_date])
         else:
             short_sma_diff = 0
     else:
         short_sma_diff = 0
+    
+    # When buy and short pairs are the same, ensure only one can have strength
+    if top_buy_pair == top_short_pair and top_buy_pair != (0,0):
+        # Only one signal can be true when pairs are identical
+        if buy_sma_diff > 0:
+            short_sma_diff = 0  # Buy is active, short must be 0
+        elif short_sma_diff > 0:
+            buy_sma_diff = 0  # Short is active, buy must be 0
     
     # Normalize to 0-100 scale (using 5% of price as max difference)
     current_price = df['Close'].iloc[-1] if len(df) > 0 else 1
@@ -6632,24 +7433,27 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     alert_badges = PerformanceMetrics.create_alert_badges(alerts)
     
     # Create Strategy Comparison Table
+    # NOTE: All capture values should represent cumulative performance, not daily sums
+    # - Dynamic Strategy: Uses cumulative_combined_captures final value
+    # - Buy/Short Leaders: Use their individual cumulative captures
     strategies_data = [
         {
             'name': 'Dynamic Strategy',
-            'capture': total_capture,
+            'capture': total_capture,  # From cumulative_combined_captures.iloc[-1]
             'win_rate': win_ratio,
             'sharpe': sharpe_ratio,
             'max_dd': max_drawdown
         },
         {
             'name': f'Buy Leader ({top_buy_pair[0]}/{top_buy_pair[1]})',
-            'capture': buy_capture,
+            'capture': buy_capture,  # Individual buy leader cumulative capture
             'win_rate': buy_win_ratio * 100,
             'sharpe': buy_leader_sharpe,
             'max_dd': buy_leader_max_dd
         },
         {
             'name': f'Short Leader ({top_short_pair[0]}/{top_short_pair[1]})',
-            'capture': short_capture,
+            'capture': short_capture,  # Individual short leader cumulative capture
             'win_rate': short_win_ratio * 100,
             'sharpe': short_leader_sharpe,
             'max_dd': short_leader_max_dd
@@ -8915,6 +9719,25 @@ def console_input_handler():
             break
         except Exception as e:
             logger.error(f"Console input error: {str(e)}")
+
+# -----------------------------------------------------------------------------
+# Phase 3: Interactive Component Callbacks
+# -----------------------------------------------------------------------------
+
+# Countdown timer update callback (separate from main display)
+@app.callback(
+    Output('countdown-timer-container', 'children'),
+    Input('countdown-interval', 'n_intervals'),
+    prevent_initial_call=False
+)
+def update_countdown_timer(n):
+    """Update the market countdown timer every second - independent of main display"""
+    # This runs separately and doesn't trigger loading states for other components
+    return PerformanceMetrics.create_market_countdown_timer()
+
+# Removed position sizing calculator callback - no longer needed
+
+# Removed interactive threshold slider callback - replaced with static visualization
 
 # ============================================================================
 # MAIN EXECUTION

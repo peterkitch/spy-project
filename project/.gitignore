@@ -39,9 +39,6 @@ status/
 *.xlsx
 *.xls
 
-# Ignore Claude AI context file
-CLAUDE.md
-
 # Python cache files
 __pycache__/
 *.pyc
@@ -62,5 +59,6 @@ misc.xml
 *.csv
 *.zip
 
-# Ignore all Markdown files
+# Ignore all Markdown files except CLAUDE.md
 *.md
+!CLAUDE.md
