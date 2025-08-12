@@ -432,13 +432,15 @@ class PerformanceMetrics:
         ])
     
     @classmethod
-    def create_signal_strength_meter(cls, buy_signal_strength, short_signal_strength):
+    def create_signal_strength_meter(cls, buy_signal_strength, short_signal_strength, buy_pair=None, short_pair=None):
         """
         Create signal strength meters showing conviction levels
         
         Args:
             buy_signal_strength: Float 0-100 representing buy signal strength
             short_signal_strength: Float 0-100 representing short signal strength
+            buy_pair: Tuple of (sma1, sma2) for buy signal
+            short_pair: Tuple of (sma1, sma2) for short signal
         """
         # Handle None or NaN values
         if buy_signal_strength is None or pd.isna(buy_signal_strength):
@@ -446,67 +448,160 @@ class PerformanceMetrics:
         if short_signal_strength is None or pd.isna(short_signal_strength):
             short_signal_strength = 0
             
-        def create_meter(strength, signal_type, color):
-            # Determine conviction level and visual indicators
+        def create_meter(strength, signal_type, color, sma_pair=None):
+            # Determine conviction level and visual indicators with enhanced effects
             if strength >= 80:
-                conviction = "STRONG"
+                conviction = "EXTREME"
                 meter_color = "#00ff41"
+                emoji = "🔥🔥🔥"
+                bar_color = "success"
+                glow_intensity = "25px"
+                border_width = "3px"
+                pulse_effect = True
+            elif strength >= 60:
+                conviction = "STRONG"
+                meter_color = "#80ff00"
                 emoji = "🔥"
                 bar_color = "success"
-            elif strength >= 60:
+                glow_intensity = "15px"
+                border_width = "2px"
+                pulse_effect = True
+            elif strength >= 40:
                 conviction = "MODERATE"
                 meter_color = "#ffff00"
                 emoji = "⚡"
                 bar_color = "warning"
-            elif strength >= 40:
+                glow_intensity = "8px"
+                border_width = "1px"
+                pulse_effect = False
+            elif strength >= 20:
                 conviction = "WEAK"
                 meter_color = "#ff8800"
                 emoji = "⚠️"
                 bar_color = "warning"
+                glow_intensity = "0px"
+                border_width = "1px"
+                pulse_effect = False
             else:
                 conviction = "VERY WEAK"
-                meter_color = "#ff0040"
+                meter_color = "#808080"
                 emoji = "❄️"
-                bar_color = "danger"
+                bar_color = "secondary"
+                glow_intensity = "0px"
+                border_width = "1px"
+                pulse_effect = False
+            
+            # Container with enhanced styling based on strength
+            container_style = {
+                "padding": "15px",
+                "marginBottom": "15px",
+                "backgroundColor": "rgba(0, 0, 0, 0.6)",
+                "borderRadius": "12px",
+                "border": f"{border_width} solid {meter_color if strength >= 40 else '#444'}",
+                "position": "relative",
+                "overflow": "hidden"
+            }
+            
+            # Add glow effect for strong signals
+            if strength >= 60:
+                container_style["boxShadow"] = f"0 0 {glow_intensity} {meter_color}, inset 0 0 10px rgba(0,0,0,0.5)"
             
             return html.Div([
+                # Header with enhanced emoji and label
                 html.Div([
-                    html.Span(f"{emoji} ", style={"fontSize": "1.2rem"}),
-                    html.Label(f"{signal_type} Signal Strength", 
-                              style={"fontSize": "0.9rem", "color": color, "marginLeft": "5px"})
-                ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
+                    html.Span(f"{emoji} ", style={
+                        "fontSize": "1.5rem" if strength >= 60 else "1.2rem",
+                        "filter": f"drop-shadow(0 0 5px {meter_color})" if strength >= 60 else "none"
+                    }),
+                    html.Label(f"{signal_type} Signal" + (f" (SMA {sma_pair[0]}{'>' if signal_type == 'Buy' else '<'}{sma_pair[1]})" if sma_pair else ""), 
+                              style={
+                                  "fontSize": "1.1rem", 
+                                  "color": color, 
+                                  "marginLeft": "8px",
+                                  "fontWeight": "bold" if strength >= 60 else "normal",
+                                  "textTransform": "uppercase" if strength >= 80 else "none",
+                                  "letterSpacing": "1px" if strength >= 60 else "0px"
+                              })
+                ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px"}),
+                
+                # Main progress bar with enhanced styling
                 dbc.Progress(
                     value=strength,
                     max=100,
                     color=bar_color,
                     striped=True,
-                    animated=strength >= 60,
-                    label=f"{strength:.1f}% ({conviction})",
-                    style={"height": "30px", "marginBottom": "5px", "fontSize": "0.9rem"}
+                    animated=pulse_effect,
+                    label=f"{strength:.1f}%",
+                    style={
+                        "height": "35px" if strength >= 60 else "30px", 
+                        "marginBottom": "8px", 
+                        "fontSize": "1rem" if strength >= 60 else "0.9rem",
+                        "fontWeight": "bold" if strength >= 60 else "normal",
+                        "borderRadius": "8px",
+                        "overflow": "hidden",
+                        "backgroundColor": "rgba(255,255,255,0.05)"
+                    }
                 ),
-                # Add visual strength indicator bar
+                
+                # Conviction badge with enhanced styling
+                html.Div([
+                    dbc.Badge(
+                        conviction,
+                        color="light" if strength < 20 else bar_color,
+                        pill=True,
+                        style={
+                            "fontSize": "0.9rem",
+                            "padding": "6px 12px",
+                            "fontWeight": "bold" if strength >= 40 else "normal",
+                            "boxShadow": f"0 0 10px {meter_color}" if strength >= 60 else "none"
+                        }
+                    ),
+                    html.Span(
+                        " - Maximum divergence!" if strength >= 80 else
+                        " - Strong divergence" if strength >= 60 else
+                        " - Moderate divergence" if strength >= 40 else
+                        " - Weak divergence" if strength >= 20 else
+                        " - Minimal divergence",
+                        style={
+                            "marginLeft": "10px",
+                            "fontSize": "0.85rem",
+                            "color": meter_color if strength >= 40 else "#888",
+                            "fontStyle": "italic"
+                        }
+                    )
+                ], style={"marginBottom": "10px"}),
+                
+                # Enhanced visual strength indicator bar
                 html.Div([
                     html.Div(style={
                         "width": f"{strength}%",
-                        "height": "4px",
+                        "height": "6px" if strength >= 60 else "4px",
                         "backgroundColor": meter_color,
-                        "borderRadius": "2px",
-                        "transition": "width 0.3s ease",
-                        "boxShadow": f"0 0 10px {meter_color}" if strength >= 60 else "none"
+                        "borderRadius": "3px",
+                        "transition": "all 0.5s ease",
+                        "boxShadow": f"0 0 {glow_intensity} {meter_color}, inset 0 0 5px rgba(255,255,255,0.3)" if strength >= 60 else "none",
+                        "background": f"linear-gradient(90deg, {meter_color}, {color})" if strength >= 60 else meter_color
                     })
                 ], style={
                     "width": "100%",
-                    "height": "4px",
+                    "height": "6px" if strength >= 60 else "4px",
                     "backgroundColor": "rgba(128, 128, 128, 0.2)",
-                    "borderRadius": "2px",
-                    "marginBottom": "10px"
+                    "borderRadius": "3px",
+                    "marginTop": "5px"
                 })
-            ])
+            ], style=container_style)
         
         return html.Div([
-            create_meter(buy_signal_strength, "Buy", "#00ff41"),
-            create_meter(short_signal_strength, "Short", "#ff0040")
-        ])
+            html.H4("📊 Signal Strength Analysis", 
+                   style={"marginBottom": "20px", "color": "#80ff00", "textAlign": "center"}),
+            create_meter(buy_signal_strength, "Buy", "#00ff41", buy_pair),
+            create_meter(short_signal_strength, "Short", "#ff0040", short_pair)
+        ], style={
+            "padding": "20px",
+            "backgroundColor": "rgba(0,0,0,0.3)",
+            "borderRadius": "15px",
+            "border": "1px solid #333"
+        })
     
     @classmethod
     def create_quick_stats_cards(cls, stats_dict):
@@ -561,7 +656,7 @@ class PerformanceMetrics:
                                  style={"color": "#aaa"})
                     ], style={"textAlign": "center", "padding": "15px"})
                 ], style={"backgroundColor": "#1a1a1a", "border": f"1px solid {color}"})
-            ], width=3, className="mb-3")
+            ], width=6, className="mb-3")  # Changed from width=3 to width=6 for 2x2 grid
             
             cards.append(card)
         
@@ -660,18 +755,19 @@ class PerformanceMetrics:
                     color = "#ffff00"
                     icon = "fas fa-info-circle"
                 
-                badge = html.Span([
+                badge = html.Div([
                     html.I(className=f"{icon} me-2"),
                     alert_info['message']
                 ], style={
                     "backgroundColor": color,
                     "color": "black" if color == "#ffff00" else "white",
-                    "padding": "4px 12px",
+                    "padding": "6px 12px",
                     "borderRadius": "12px",
                     "fontSize": "0.85rem",
-                    "marginRight": "10px",
-                    "marginBottom": "5px",
-                    "display": "inline-block"
+                    "marginBottom": "8px",
+                    "width": "100%",
+                    "textAlign": "center",
+                    "display": "block"
                 })
                 badges.append(badge)
         
@@ -784,31 +880,33 @@ class PerformanceMetrics:
             icon = "fas fa-question-circle"
             tooltip = f"Results not statistically significant (p={p_value:.4f}, n={sample_size})"
         
-        badge = html.Div([
-            html.Span([
-                html.I(className=f"{icon} me-2"),
-                f"Strategy Confidence: {confidence}"
-            ], id="confidence-badge-target",
-               style={
-                "backgroundColor": color,
-                "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
-                "padding": "8px 16px",
-                "borderRadius": "20px",
-                "fontSize": "1rem",
-                "fontWeight": "bold",
-                "display": "inline-block",
-                "cursor": "help"
-            }),
-            dbc.Tooltip(tooltip, target="confidence-badge-target", placement="bottom")
-        ])
+        badge = html.Span([
+            html.I(className=f"{icon} me-2"),
+            f"Confidence: {confidence}"
+        ], id="confidence-badge-target",
+           style={
+            "backgroundColor": color,
+            "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
+            "padding": "8px 16px",
+            "borderRadius": "20px",
+            "fontSize": "1rem",
+            "fontWeight": "bold",
+            "display": "inline-block",
+            "cursor": "help"
+        })
         
-        return badge
+        badge_with_tooltip = html.Div([
+            badge,
+            dbc.Tooltip(tooltip, target="confidence-badge-target", placement="bottom")
+        ], style={"display": "inline-block"})
+        
+        return badge_with_tooltip
     
     @classmethod
     def create_risk_reward_matrix(cls, sharpe, max_drawdown):
         """
-        Create risk/reward matrix badge based on Sharpe ratio and Max Drawdown
-        Returns an HTML component showing risk/reward positioning
+        Create enhanced risk/reward matrix with visual quality indicators
+        Returns an HTML component showing risk/reward positioning with advanced visuals
         """
         # Handle None or NaN values
         if sharpe is None or pd.isna(sharpe):
@@ -816,72 +914,205 @@ class PerformanceMetrics:
         if max_drawdown is None or pd.isna(max_drawdown):
             max_drawdown = 0
             
+        # Calculate risk and reward scores (0-100 scale)
+        # Risk score: Higher drawdown = higher risk score (0-100)
+        # max_drawdown of 0% = risk_score of 0
+        # max_drawdown of -50% = risk_score of 100
+        risk_score = min(100, max(0, abs(max_drawdown) * 2))  # Higher drawdown = higher risk score
+        reward_score = min(100, max(0, sharpe * 33.33))  # Sharpe of 3 = 100
+        
         # Determine risk level based on max drawdown
         low_risk = max_drawdown > cls.THRESHOLDS['max_drawdown']['good']  # > -10%
         
         # Determine reward level based on Sharpe ratio
         high_reward = sharpe > cls.THRESHOLDS['sharpe']['good']  # > 1.5
         
-        # Create matrix positioning
+        # Create matrix positioning with enhanced visuals
         if high_reward and low_risk:
-            icon = "🌟"
+            icon = "🎯"
+            quality = "EXCELLENT"
             text = "LOW RISK / HIGH REWARD"
             color = cls.COLORS['excellent']
-            bg_color = "rgba(0, 255, 65, 0.1)"
+            bg_color = "rgba(0, 255, 65, 0.2)"
+            border_style = "3px solid"
+            glow_effect = "0 0 20px rgba(0, 255, 65, 0.5)"
             description = "Optimal positioning - Strong returns with controlled risk"
+            quality_emoji = "🌟🌟🌟"
         elif high_reward and not low_risk:
             icon = "🔥"
+            quality = "GOOD"
             text = "HIGH RISK / HIGH REWARD"
             color = cls.COLORS['moderate']
-            bg_color = "rgba(255, 255, 0, 0.1)"
+            bg_color = "rgba(255, 255, 0, 0.2)"
+            border_style = "2px solid"
+            glow_effect = "0 0 15px rgba(255, 255, 0, 0.4)"
             description = "Aggressive positioning - Strong returns but elevated risk"
+            quality_emoji = "⭐⭐"
         elif not high_reward and low_risk:
             icon = "✅"
+            quality = "FAIR"
             text = "LOW RISK / LOW REWARD"
             color = cls.COLORS['good']
-            bg_color = "rgba(128, 255, 0, 0.1)"
+            bg_color = "rgba(128, 255, 0, 0.2)"
+            border_style = "2px solid"
+            glow_effect = "0 0 10px rgba(128, 255, 0, 0.3)"
             description = "Conservative positioning - Limited returns but protected capital"
+            quality_emoji = "⭐"
         else:
-            icon = "⚠️"
+            icon = "⛔"
+            quality = "POOR"
             text = "HIGH RISK / LOW REWARD"
             color = cls.COLORS['poor']
-            bg_color = "rgba(255, 0, 64, 0.1)"
+            bg_color = "rgba(255, 0, 64, 0.2)"
+            border_style = "2px dashed"
+            glow_effect = "0 0 10px rgba(255, 0, 64, 0.3)"
             description = "Unfavorable positioning - Poor risk-adjusted returns"
+            quality_emoji = "⚠️"
         
         # Use a simple unique ID based on the component type and values
         matrix_id = f"risk-reward-matrix-{abs(hash(f'{sharpe:.3f}-{max_drawdown:.1f}')) % 10000}"
         
         return html.Div([
+            # Title with tooltip explanation
             html.Div([
-                html.Span(icon, style={"fontSize": "1.5rem", "marginRight": "8px"}),
-                html.Span(text, style={
-                    "fontWeight": "bold",
-                    "fontSize": "0.9rem",
-                    "letterSpacing": "1px"
-                })
-            ], id=matrix_id, style={
-                "backgroundColor": bg_color,
-                "color": color,
-                "padding": "8px 16px",
-                "borderRadius": "20px",
-                "border": f"2px solid {color}",
-                "display": "inline-flex",
-                "alignItems": "center",
-                "cursor": "help",
-                "boxShadow": f"0 0 10px {bg_color}",
-                "marginTop": "10px",
-                "marginBottom": "10px"
+                html.H4([
+                    "📈 Risk/Reward Analysis ",
+                    html.Span("ⓘ", id="risk-reward-tooltip-target", 
+                             style={"fontSize": "0.8rem", "cursor": "help", "color": "#00ffff"})
+                ], style={"marginBottom": "15px", "color": "#80ff00", "textAlign": "center"}),
+                dbc.Tooltip(
+                    "Risk/Reward positioning based on Sharpe Ratio (reward) vs Max Drawdown (risk). "
+                    "High Reward: Sharpe > 1.5 | Low Risk: Drawdown > -10%. "
+                    "This matrix helps assess the quality of risk-adjusted returns.",
+                    target="risk-reward-tooltip-target",
+                    placement="bottom"
+                )
+            ]),
+            
+            # Main risk/reward card with enhanced visuals
+            html.Div([
+                # Quality indicator
+                html.Div([
+                    html.Span(quality_emoji, style={"fontSize": "1.2rem", "marginRight": "8px"}),
+                    html.Span(f"Quality: {quality}", style={
+                        "fontWeight": "bold",
+                        "fontSize": "0.85rem",
+                        "color": color,
+                        "textTransform": "uppercase"
+                    })
+                ], style={"marginBottom": "10px", "textAlign": "center"}),
+                
+                # Main badge
+                html.Div([
+                    html.Span(icon, style={
+                        "fontSize": "2rem", 
+                        "marginRight": "12px",
+                        "filter": f"drop-shadow(0 0 5px {color})" if high_reward else "none"
+                    }),
+                    html.Span(text, style={
+                        "fontWeight": "bold",
+                        "fontSize": "1rem",
+                        "letterSpacing": "1px"
+                    })
+                ], id=matrix_id, style={
+                    "backgroundColor": bg_color,
+                    "color": color,
+                    "padding": "12px 20px",
+                    "borderRadius": "25px",
+                    "border": f"{border_style} {color}",
+                    "display": "inline-flex",
+                    "alignItems": "center",
+                    "cursor": "help",
+                    "boxShadow": glow_effect,
+                    "marginBottom": "15px",
+                    "width": "100%",
+                    "justifyContent": "center"
+                }),
+                
+                # Visual risk/reward bars
+                html.Div([
+                    html.Div([
+                        html.Label("Risk Level", style={"fontSize": "0.8rem", "color": "#888", "marginBottom": "3px"}),
+                        dbc.Progress(
+                            value=risk_score,  # High risk = full red bar
+                            max=100,
+                            color="danger" if risk_score > 75 else "warning" if risk_score > 50 else "success",
+                            style={"height": "15px", "marginBottom": "10px"}
+                        )
+                    ]),
+                    html.Div([
+                        html.Label("Reward Level", style={"fontSize": "0.8rem", "color": "#888", "marginBottom": "3px"}),
+                        dbc.Progress(
+                            value=reward_score,
+                            max=100,
+                            color="success" if reward_score > 50 else "warning" if reward_score > 25 else "danger",
+                            style={"height": "15px"}
+                        )
+                    ])
+                ], style={"marginTop": "10px"})
+            ], style={
+                "padding": "20px",
+                "backgroundColor": "rgba(0, 0, 0, 0.5)",
+                "borderRadius": "15px",
+                "border": "1px solid #444"
             }),
+            
             dbc.Tooltip(
                 [
-                    html.Div(description, style={"marginBottom": "8px"}),
-                    html.Div(f"Sharpe Ratio: {sharpe:.3f} | Max Drawdown: {max_drawdown:.1f}%", 
-                            style={"fontSize": "0.85rem", "opacity": "0.9"})
+                    html.Div(description, style={"marginBottom": "8px", "fontWeight": "bold"}),
+                    html.Hr(style={"margin": "8px 0", "opacity": "0.3"}),
+                    html.Div([
+                        html.Div(f"Risk Score: {risk_score:.0f}/100", style={"marginBottom": "4px"}),
+                        html.Div(f"Reward Score: {reward_score:.0f}/100")
+                    ], style={"fontSize": "0.85rem", "opacity": "0.9"})
                 ],
                 target=matrix_id,
                 placement="bottom"
-            )
+            ),
+            
+            # Clear English Summary
+            html.Hr(style={"margin": "20px 0", "opacity": "0.3"}),
+            html.Div([
+                html.H6("Summary", style={"color": "#80ff00", "marginBottom": "10px"}),
+                html.Div([
+                    html.P([
+                        "This strategy shows ",
+                        html.Span(quality, style={"color": color, "fontWeight": "bold"}),
+                        " risk/reward characteristics. ",
+                        
+                        # Risk explanation
+                        "The risk level is ",
+                        html.Span("LOW" if risk_score < 30 else "MODERATE" if risk_score < 70 else "HIGH", 
+                                 style={"color": "#00ff41" if risk_score < 30 else "#ffff00" if risk_score < 70 else "#ff0040", 
+                                        "fontWeight": "bold"}),
+                        f" ({risk_score:.0f}/100) based on a maximum drawdown of {max_drawdown:.1f}%. ",
+                        
+                        # Reward explanation  
+                        "The reward potential is ",
+                        html.Span("HIGH" if reward_score > 66 else "MODERATE" if reward_score > 33 else "LOW",
+                                 style={"color": "#00ff41" if reward_score > 66 else "#ffff00" if reward_score > 33 else "#ff0040",
+                                        "fontWeight": "bold"}),
+                        f" ({reward_score:.0f}/100) with a Sharpe ratio of {sharpe:.2f}. ",
+                        
+                        # Practical interpretation
+                        "In practical terms: ",
+                        cls._get_risk_reward_interpretation(high_reward, low_risk, max_drawdown, sharpe)
+                    ], style={"fontSize": "0.9rem", "color": "#ccc", "lineHeight": "1.5"})
+                ])
+            ], style={"padding": "10px", "backgroundColor": "rgba(0, 0, 0, 0.3)", "borderRadius": "8px"})
         ])
+    
+    @classmethod
+    def _get_risk_reward_interpretation(cls, high_reward, low_risk, max_drawdown, sharpe):
+        """Helper method to get risk/reward interpretation text"""
+        if high_reward and low_risk:
+            return f"You can expect solid returns with minimal risk. The worst historical drawdown was only {max_drawdown:.1f}%, making this suitable for conservative investors."
+        elif high_reward and not low_risk:
+            return f"You may see strong returns, but be prepared for volatility. The {max_drawdown:.1f}% maximum drawdown means you need to tolerate significant swings."
+        elif not high_reward and low_risk:
+            return f"This offers capital preservation with limited upside. The {max_drawdown:.1f}% drawdown is manageable, but returns may lag market benchmarks."
+        else:
+            return f"This positioning is suboptimal with limited returns and elevated risk. The {max_drawdown:.1f}% drawdown is concerning given the low Sharpe ratio of {sharpe:.2f}."
     
     @classmethod
     def calculate_risk_metrics(cls, df, position_type, lookback_days=60):
@@ -935,6 +1166,175 @@ class PerformanceMetrics:
             'max_loss': max_loss,
             'max_gain': max_gain,
             'risk_reward_ratio': risk_reward_ratio
+        }
+    
+    @classmethod
+    def calculate_signal_flip_probability(cls, current_price, threshold_data, df, current_signal):
+        """
+        Calculate the probability of signal flip based on volatility and threshold proximity
+        
+        Args:
+            current_price: Current stock price
+            threshold_data: List of threshold dictionaries with range and signal
+            df: DataFrame with historical price data
+            current_signal: Current signal type (Buy/Short/Cash)
+        
+        Returns:
+            dict with flip probability metrics
+        """
+        # Calculate recent volatility (10-day and 30-day)
+        if len(df) < 2:
+            return {
+                'risk_level': 'Unknown',
+                'probability_pct': 0,
+                'closest_threshold_pct': None,
+                'avg_daily_move': 0,
+                'message': 'Insufficient data for analysis'
+            }
+        
+        # Calculate daily percentage moves
+        recent_10d = df.tail(min(10, len(df)))['Close'].pct_change().dropna() * 100
+        recent_30d = df.tail(min(30, len(df)))['Close'].pct_change().dropna() * 100
+        
+        # Get volatility metrics
+        avg_daily_move_10d = recent_10d.abs().mean() if len(recent_10d) > 0 else 0
+        avg_daily_move_30d = recent_30d.abs().mean() if len(recent_30d) > 0 else 0
+        std_daily_move = recent_30d.std() if len(recent_30d) > 1 else avg_daily_move_30d
+        
+        # Use weighted average favoring recent volatility
+        avg_daily_move = (avg_daily_move_10d * 0.7 + avg_daily_move_30d * 0.3)
+        
+        # Find closest threshold that would change the signal
+        closest_flip_distance = float('inf')
+        closest_flip_price = None
+        flip_to_signal = None
+        
+        for threshold in threshold_data:
+            # Skip if this is the current signal range
+            if threshold.get('is_current', False):
+                continue
+            
+            # Parse the price range
+            price_range = threshold.get('range', '')
+            target_signal = threshold.get('signal', '')
+            
+            # Skip if signal wouldn't change
+            if target_signal == current_signal:
+                continue
+            
+            # Extract price boundaries
+            if '-' in price_range and '$' in price_range:
+                try:
+                    # Format: "$X - $Y"
+                    parts = price_range.split('-')
+                    low_price = float(parts[0].replace('$', '').strip())
+                    high_price = float(parts[1].replace('$', '').strip())
+                    
+                    # Calculate distance to this range
+                    if current_price < low_price:
+                        distance_pct = ((low_price - current_price) / current_price) * 100
+                        flip_price = low_price
+                    elif current_price > high_price:
+                        distance_pct = ((current_price - high_price) / current_price) * 100
+                        flip_price = high_price
+                    else:
+                        # We're already in this range (shouldn't happen if is_current works)
+                        continue
+                    
+                    if abs(distance_pct) < abs(closest_flip_distance):
+                        closest_flip_distance = distance_pct
+                        closest_flip_price = flip_price
+                        flip_to_signal = target_signal
+                        
+                except (ValueError, IndexError):
+                    continue
+            elif 'above' in price_range.lower():
+                try:
+                    # Format: "above $X"
+                    flip_price = float(price_range.lower().replace('above', '').replace('$', '').strip())
+                    if current_price < flip_price:
+                        distance_pct = ((flip_price - current_price) / current_price) * 100
+                        if abs(distance_pct) < abs(closest_flip_distance):
+                            closest_flip_distance = distance_pct
+                            closest_flip_price = flip_price
+                            flip_to_signal = target_signal
+                except ValueError:
+                    continue
+            elif 'below' in price_range.lower():
+                try:
+                    # Format: "below $X"
+                    flip_price = float(price_range.lower().replace('below', '').replace('$', '').strip())
+                    if current_price > flip_price:
+                        distance_pct = ((current_price - flip_price) / current_price) * 100
+                        if abs(distance_pct) < abs(closest_flip_distance):
+                            closest_flip_distance = distance_pct
+                            closest_flip_price = flip_price
+                            flip_to_signal = target_signal
+                except ValueError:
+                    continue
+        
+        # Calculate probability based on distance vs volatility
+        if closest_flip_price is None:
+            return {
+                'risk_level': 'Low',
+                'probability_pct': 0,
+                'closest_threshold_pct': None,
+                'avg_daily_move': avg_daily_move,
+                'message': 'No signal change thresholds nearby'
+            }
+        
+        # Calculate how many "typical days" away the threshold is
+        moves_needed = abs(closest_flip_distance) / avg_daily_move if avg_daily_move > 0 else float('inf')
+        
+        # Calculate probability based on standard deviations
+        if std_daily_move > 0:
+            z_score = abs(closest_flip_distance) / std_daily_move
+            
+            # Rough probability mapping
+            if z_score < 0.5:  # Within 0.5 standard deviations
+                probability_pct = 70
+                risk_level = 'Critical'
+            elif z_score < 1.0:  # Within 1 standard deviation
+                probability_pct = 50
+                risk_level = 'High'
+            elif z_score < 1.5:  # Within 1.5 standard deviations
+                probability_pct = 30
+                risk_level = 'Medium'
+            elif z_score < 2.0:  # Within 2 standard deviations
+                probability_pct = 15
+                risk_level = 'Low'
+            else:  # Beyond 2 standard deviations
+                probability_pct = 5
+                risk_level = 'Very Low'
+        else:
+            # Fallback to simple distance-based calculation
+            if moves_needed < 0.5:
+                probability_pct = 70
+                risk_level = 'Critical'
+            elif moves_needed < 1.0:
+                probability_pct = 50
+                risk_level = 'High'
+            elif moves_needed < 2.0:
+                probability_pct = 30
+                risk_level = 'Medium'
+            else:
+                probability_pct = 10
+                risk_level = 'Low'
+        
+        # Create descriptive message
+        direction = "rise" if closest_flip_distance > 0 else "fall"
+        message = f"Price needs to {direction} {abs(closest_flip_distance):.1f}% to flip to {flip_to_signal} (avg daily move: {avg_daily_move:.1f}%)"
+        
+        return {
+            'risk_level': risk_level,
+            'probability_pct': probability_pct,
+            'closest_threshold_pct': abs(closest_flip_distance),
+            'closest_threshold_price': closest_flip_price,
+            'flip_to_signal': flip_to_signal,
+            'avg_daily_move': avg_daily_move,
+            'std_daily_move': std_daily_move,
+            'moves_needed': moves_needed,
+            'message': message
         }
     
     @classmethod
@@ -1100,9 +1500,9 @@ class PerformanceMetrics:
         }, className="h-100")
     
     @classmethod
-    def create_action_required_card(cls, action_date, signal_type, sma_pair, confidence, hold_until, signal_strength=None):
+    def create_action_required_card(cls, action_date, signal_type, sma_pair, confidence, hold_until, signal_strength=None, flip_probability=None):
         """
-        Create a prominent card showing action required at close with signal strength
+        Create a prominent card showing action required at close with signal strength and flip probability warning
         """
         # Use position configs for consistent styling
         config = cls.POSITION_CONFIGS.get(signal_type, cls.POSITION_CONFIGS["Cash"])
@@ -1142,7 +1542,103 @@ class PerformanceMetrics:
                 ])
             )
         
-        card_body_content[-1].children.append(
+        # Add signal flip probability warning if provided
+        if flip_probability is not None:
+            risk_level = flip_probability.get('risk_level', 'Unknown')
+            probability_pct = flip_probability.get('probability_pct', 0)
+            message = flip_probability.get('message', '')
+            avg_daily_move = flip_probability.get('avg_daily_move', 0)
+            closest_threshold_pct = flip_probability.get('closest_threshold_pct', None)
+            flip_to_signal = flip_probability.get('flip_to_signal', '')
+            
+            # Determine warning color and icon based on risk level
+            risk_configs = {
+                'Very Low': {'icon': '🟢', 'color': '#00ff41', 'bg': 'rgba(0, 255, 65, 0.1)'},
+                'Low': {'icon': '🟢', 'color': '#00ff41', 'bg': 'rgba(0, 255, 65, 0.1)'},
+                'Medium': {'icon': '🟡', 'color': '#ffcc00', 'bg': 'rgba(255, 204, 0, 0.1)'},
+                'High': {'icon': '🟠', 'color': '#ff8800', 'bg': 'rgba(255, 136, 0, 0.15)'},
+                'Critical': {'icon': '🔴', 'color': '#ff0040', 'bg': 'rgba(255, 0, 64, 0.2)'}
+            }
+            
+            risk_config = risk_configs.get(risk_level, risk_configs['Low'])
+            
+            # Create the flip warning section
+            flip_warning = html.Div([
+                html.Hr(style={"margin": "15px 0"}),
+                html.H5([
+                    risk_config['icon'], 
+                    f" Signal Flip Risk: {risk_level} ({probability_pct}%)"
+                ], style={"color": risk_config['color'], "marginBottom": "10px"}),
+                
+                # Risk assessment message
+                html.Div([
+                    html.P(message, style={
+                        "backgroundColor": risk_config['bg'],
+                        "padding": "10px",
+                        "borderRadius": "5px",
+                        "border": f"1px solid {risk_config['color']}",
+                        "marginBottom": "10px"
+                    })
+                ]),
+                
+                # Additional context based on risk level
+                html.Div([
+                    # High/Critical risk warning
+                    (html.Div([
+                        html.P([
+                            html.I(className="fas fa-exclamation-triangle me-2"),
+                            html.Strong("WARNING: "),
+                            f"Signal may flip to {flip_to_signal} with normal market movement!"
+                        ], style={"color": risk_config['color'], "fontWeight": "bold", "marginBottom": "5px"}),
+                        html.P([
+                            "📊 Check Signal Change Thresholds below for exact trigger prices"
+                        ], style={"fontSize": "0.95rem", "marginBottom": "5px"}),
+                        html.P([
+                            f"💡 Consider position sizing based on {avg_daily_move:.1f}% typical daily volatility"
+                        ], style={"fontSize": "0.95rem"})
+                    ], style={
+                        "backgroundColor": "rgba(255, 0, 0, 0.05)",
+                        "padding": "10px",
+                        "borderRadius": "5px",
+                        "marginTop": "10px"
+                    }) if risk_level in ['High', 'Critical'] else None),
+                    
+                    # Medium risk notice
+                    (html.Div([
+                        html.P([
+                            "⚠️ ",
+                            html.Strong("CAUTION: "),
+                            f"Signal could change to {flip_to_signal} with moderate price movement"
+                        ], style={"color": risk_config['color'], "marginBottom": "5px"}),
+                        html.P([
+                            "📊 Review Signal Change Thresholds section for trigger prices"
+                        ], style={"fontSize": "0.95rem"})
+                    ], style={
+                        "backgroundColor": "rgba(255, 204, 0, 0.05)",
+                        "padding": "10px",
+                        "borderRadius": "5px",
+                        "marginTop": "10px"
+                    }) if risk_level == 'Medium' else None),
+                    
+                    # Low risk confirmation
+                    (html.Div([
+                        html.P([
+                            "✅ Signal appears stable - thresholds are well outside typical daily movement"
+                        ], style={"color": risk_config['color'], "marginBottom": "5px"}),
+                        html.P([
+                            "📊 See Signal Change Thresholds for details"
+                        ], style={"fontSize": "0.9rem", "color": "#888"})
+                    ], style={
+                        "padding": "10px",
+                        "borderRadius": "5px",
+                        "marginTop": "10px"
+                    }) if risk_level in ['Low', 'Very Low'] else None)
+                ])
+            ])
+            
+            card_body_content.append(flip_warning)
+        
+        card_body_content[-1 if flip_probability is None else -2].children.append(
             html.P(f"Hold Until: {hold_until} Close", style={"fontWeight": "bold"})
         )
         
@@ -1347,8 +1843,8 @@ class PerformanceMetrics:
                 summary_cards.append(
                     dbc.Col([
                         html.Div([
-                            html.Span(f"{streak_emoji} ", style={"fontSize": "1.5rem"}),
-                            html.Span(f"{current_streak} {streak_type}s in a row", 
+                            html.Small("Streak: ", style={"color": "#80ff00"}),
+                            html.Span(f"{streak_emoji} {current_streak} {streak_type}s in a row", 
                                     style={"color": streak_color, "fontWeight": "bold"})
                         ], style={"textAlign": "center"})
                     ], width=3)
@@ -1532,13 +2028,16 @@ class PerformanceMetrics:
             time_until_open = next_open - now
             hours = int(time_until_open.total_seconds() // 3600)
             minutes = int((time_until_open.total_seconds() % 3600) // 60)
+            seconds = int(time_until_open.total_seconds() % 60)
             
             return dbc.Card([
                 dbc.CardBody([
                     html.Div([
                         html.I(className="fas fa-moon fa-2x mb-2", style={"color": "#808080"}),
                         html.H5("MARKET CLOSED", style={"color": "#ff0040", "marginBottom": "10px"}),
-                        html.P(f"Opens in {hours}h {minutes}m", style={"fontSize": "1.2rem", "marginBottom": "5px"}),
+                        html.H3(f"{hours:02d}:{minutes:02d}:{seconds:02d}", 
+                               style={"fontSize": "2rem", "fontFamily": "monospace", "color": "#ff0040"}),
+                        html.P("Until Market Opens (9:30 AM ET)", style={"marginBottom": "5px"}),
                         html.Small(f"Next: {next_open.strftime('%a %b %d, 9:30 AM ET')}", style={"color": "#808080"})
                     ], style={"textAlign": "center"})
                 ])
@@ -1875,6 +2374,8 @@ class PerformanceMetrics:
             margin=dict(l=40, r=20, t=50, b=50),
             xaxis=dict(
                 range=[min_price, max_price],
+                autorange=False,  # Prevent auto-scaling beyond our range
+                fixedrange=False,  # Allow zooming but control the reset behavior
                 showgrid=True,
                 gridcolor="rgba(128,128,128,0.2)",
                 zeroline=True,
@@ -1883,17 +2384,23 @@ class PerformanceMetrics:
                 tickformat="$,.0f",
                 tickfont=dict(size=10, color="#c0c0c0"),
                 title="Price",
-                titlefont=dict(size=10, color="#808080")
+                titlefont=dict(size=10, color="#808080"),
+                # Store the initial range for double-click reset
+                rangeslider=dict(visible=False),  # Hide rangeslider but maintain range
+                constrain='domain'  # Constrain panning to the domain
             ),
             yaxis=dict(
                 range=[0, zone_height * 1.3],
                 showgrid=False,
                 zeroline=False,
-                visible=False
+                visible=False,
+                fixedrange=True  # Y-axis should be fixed
             ),
             plot_bgcolor="rgba(0,0,0,0.5)",
             paper_bgcolor="rgba(0,0,0,0.3)",
-            showlegend=False
+            showlegend=False,
+            uirevision='constant',  # Maintain zoom/pan state between updates
+            dragmode='zoom'  # Default to zoom mode for box selection
         )
         
         # Build legend text dynamically based on actual zones
@@ -1923,7 +2430,17 @@ class PerformanceMetrics:
             dbc.CardBody([
                 dcc.Graph(
                     figure=fig,
-                    config={'displayModeBar': False}
+                    config={
+                        'displayModeBar': 'hover',  # Show mode bar on hover for zoom/pan tools
+                        'displaylogo': False,  # Hide Plotly logo
+                        'modeBarButtonsToRemove': [
+                            'toImage', 'sendDataToCloud', 'autoScale2d', 
+                            'hoverClosestCartesian', 'hoverCompareCartesian',
+                            'toggleSpikelines', 'select2d', 'lasso2d'
+                        ],  # Keep only zoom, pan, and reset
+                        'doubleClick': 'reset',  # Double-click resets to our defined range
+                        'showTips': False  # Hide tooltips on mode bar
+                    }
                 ),
                 html.Div([
                     html.Small(legend_items, style={"color": "#c0c0c0"})
@@ -2668,13 +3185,19 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
     logging.error(f"Failed to load results from {pkl_file} after {max_retries} retries.")
     return None
 
-def load_precomputed_results(ticker, load_full_data=False):
+def load_precomputed_results(ticker, load_full_data=False, from_callback=False, should_log=True):
     global _precomputed_results_cache, _loading_in_progress
     
     with _loading_lock:
         if ticker in _precomputed_results_cache:
-            # Only log debug info for cached results to prevent duplicate headers
-            logger.debug(f"Using cached results for {ticker.upper()}")
+            # Log when called from callback with should_log=True (ticker change)
+            if from_callback and should_log:
+                logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
+                log_ticker_section(ticker.upper(), "LOADING CACHED DATA")
+                logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker.upper()}{Colors.ENDC}")
+            else:
+                # Only log debug info for interval updates
+                logger.debug(f"Using cached results for {ticker.upper()}")
             return _precomputed_results_cache[ticker]
 
         if ticker in _loading_in_progress:
@@ -2682,7 +3205,8 @@ def load_precomputed_results(ticker, load_full_data=False):
             return None  # Return None immediately if loading is in progress
 
         # Log ticker input for new requests
-        logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
+        if should_log:
+            logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
         
         # Attempt to load from file if not in cache and not currently loading
         pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
@@ -2800,11 +3324,52 @@ def write_status(ticker, status):
 def save_precomputed_results(ticker, results):
     ticker = normalize_ticker(ticker)
     final_name = f'cache/results/{ticker}_precomputed_results.pkl'
+    
+    # Create a temporary file and write data
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tf:
         pickle.dump(results, tf)
         temp_name = tf.name
-
-    shutil.move(temp_name, final_name)
+    
+    # Try to move the file with retry logic for Windows file locking
+    max_retries = 3
+    retry_delay = 0.5
+    
+    for attempt in range(max_retries):
+        try:
+            # On Windows, if file exists, remove it first
+            if os.path.exists(final_name):
+                try:
+                    os.remove(final_name)
+                except (OSError, PermissionError):
+                    # File might be in use, wait and retry
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+            
+            # Now move the temp file
+            shutil.move(temp_name, final_name)
+            break  # Success!
+            
+        except (PermissionError, FileExistsError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                # Last attempt failed, try copy and delete instead
+                try:
+                    shutil.copy2(temp_name, final_name)
+                    os.remove(temp_name)
+                except Exception:
+                    # If all else fails, just warn and continue
+                    logger.warning(f"Could not save results for {ticker}: {e}")
+                    
+    # Clean up temp file if it still exists
+    if os.path.exists(temp_name):
+        try:
+            os.remove(temp_name)
+        except:
+            pass
+    
     # Don't log here - it disrupts progress bar output
     return results
 
@@ -2993,9 +3558,30 @@ def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chun
             top_short_values = short_values[max_short_indices, np.arange(num_days)]
 
         # Save the results in compressed format to reduce file size
-        np.savez_compressed(chunk_file,
+        # Use temp file approach for Windows compatibility
+        temp_chunk_file = chunk_file + '.tmp'
+        np.savez_compressed(temp_chunk_file,
                             buy_pairs=top_buy_pairs, buy_values=top_buy_values,
                             short_pairs=top_short_pairs, short_values=top_short_values)
+        
+        # Move temp file to final location with retry logic
+        for attempt in range(3):
+            try:
+                if os.path.exists(chunk_file):
+                    os.remove(chunk_file)
+                os.rename(temp_chunk_file, chunk_file)
+                break
+            except (OSError, PermissionError):
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                else:
+                    # Final attempt - just copy
+                    shutil.copy2(temp_chunk_file, chunk_file)
+                    if os.path.exists(temp_chunk_file):
+                        try:
+                            os.remove(temp_chunk_file)
+                        except:
+                            pass
 
         file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)
         logger.info(f"Chunk {chunk_index} saved successfully for {ticker}: {file_size:.2f} GB")
@@ -3961,6 +4547,7 @@ app.layout = dbc.Container(
                         ], className='mb-3'),
                         # Store for timing summary flag
                         dcc.Store(id='timing-summary-printed', data=False),
+                        dcc.Store(id='charts-loaded-state', data={}),  # Track which charts have loaded
                         # Combined Capture Chart with MAX_SMA_DAY display
                         html.Div([
                             html.Div(id='max-sma-day-display', style={'font-size': '16px', 'margin-bottom': '10px', 'text-align': 'left'}),
@@ -4039,6 +4626,9 @@ app.layout = dbc.Container(
                         is_open=False  # Hidden by default
                     )
                 ], className='mb-3'),
+                        # Market Countdown Timer - Positioned above AI-Optimized Trading Signals
+                        html.Div(id='countdown-timer-container', className='mb-3'),
+                        
                         # Dynamic Master Trading Strategy - Now part of Single-Ticker section
                         dbc.Card([
                             dbc.CardHeader([
@@ -4053,35 +4643,99 @@ app.layout = dbc.Container(
                                     # Store for position tracking
                                     dcc.Store(id='position-history-store', storage_type='session'),
                                     
-                                    # Strategy Grade Badge
-                                    html.Div(id='strategy-grade-badge', className='mb-3'),
+                                    # TWO-COLUMN LAYOUT: Historical Performance (left) and Risk/Reward (right)
+                                    dbc.Row([
+                                        # LEFT COLUMN: Historical Performance
+                                        dbc.Col([
+                                            html.Div([
+                                                # Header matching Risk/Reward style
+                                                html.H4("📊 Historical Performance", 
+                                                       style={"marginBottom": "15px", "color": "#80ff00", "textAlign": "center"}),
+                                                
+                                                # Row for Strategy Grade/Confidence (left) and Alerts (right)
+                                                dbc.Row([
+                                                    # Left side: Strategy Grade and Confidence
+                                                    dbc.Col([
+                                                        # Strategy Grade Badge
+                                                        html.Div(id='strategy-grade-badge', className='mb-2'),
+                                                        
+                                                        # Strategy Confidence Badge - hidden (integrated above)
+                                                        html.Div(id='strategy-confidence-badge', style={'display': 'none'}),
+                                                    ], md=6),
+                                                    
+                                                    # Right side: Alert Badges
+                                                    dbc.Col([
+                                                        html.Div(id='alert-badges', 
+                                                                style={"textAlign": "center"}),
+                                                    ], md=6),
+                                                ], className="mb-3"),
+                                                
+                                                # Quick Stats Cards in 2x2 grid
+                                                html.Div(id='quick-stats-cards', className='mb-3'),
+                                                
+                                                # Historical Performance Progress Bar
+                                                html.Div(id='performance-progress-bars', className='mb-3'),
+                                            ], style={
+                                                "padding": "20px",
+                                                "backgroundColor": "rgba(0, 0, 0, 0.5)",
+                                                "borderRadius": "10px",
+                                                "border": "1px solid #333",
+                                                "height": "100%"
+                                            })
+                                        ], md=6, className="mb-4"),
+                                        
+                                        # RIGHT COLUMN: Risk/Reward Analysis
+                                        dbc.Col([
+                                            html.Div([
+                                                # Risk/Reward Matrix (moved to its own column)
+                                                html.Div(id='ai-risk-reward-matrix', style={"height": "100%"}),
+                                            ], style={
+                                                "padding": "20px",
+                                                "backgroundColor": "rgba(0, 0, 0, 0.5)",
+                                                "borderRadius": "10px",
+                                                "border": "1px solid #333",
+                                                "height": "100%"
+                                            })
+                                        ], md=6, className="mb-4"),
+                                    ], className="d-flex align-items-stretch"),
                                     
-                                    # Performance Progress Bars
-                                    html.Div(id='performance-progress-bars', className='mb-3'),
+                                    # Hidden placeholders for signal components (actual display in Dynamic section)
+                                    html.Div(id='visual-signal-indicators', style={'display': 'none'}),
+                                    html.Div(id='signal-strength-meters', style={'display': 'none'}),
                                     
-                                    # Risk/Reward Matrix
-                                    html.Div(id='ai-risk-reward-matrix', className='mb-3'),
+                                    # Toggle button for Current Leaders section - moved before collapsible content
+                                    html.Div([
+                                        dbc.Button(
+                                            "Show Current Top Pair Leaders Analysis",
+                                            id="toggle-current-leaders",
+                                            color="success",
+                                            size="md",
+                                            className="mb-3",
+                                            style={
+                                                "fontWeight": "bold",
+                                                "boxShadow": "0 2px 4px rgba(0,0,0,0.2)",
+                                                "border": "2px solid #00ff41",
+                                                "backgroundColor": "#1a1a1a",
+                                                "color": "#00ff41",
+                                                "padding": "10px 20px"
+                                            }
+                                        )
+                                    ], style={"textAlign": "center"}),
                                     
-                                    # Performance Heatmap
-                                    html.Div(id='performance-heatmap', className='mb-3'),
-                                    
-                                    # Signal Strength Meters
-                                    html.Div(id='signal-strength-meters', className='mb-3'),
-                                    
-                                    # Strategy Confidence Badge
-                                    html.Div(id='strategy-confidence-badge', className='mb-3'),
-                                    
-                                    # Quick Stats Cards
-                                    html.Div(id='quick-stats-cards', className='mb-3'),
-                                    
-                                    # Visual Signal Indicators
-                                    html.Div(id='visual-signal-indicators', className='mb-3'),
-                                    
-                                    # Alert Badges
-                                    html.Div(id='alert-badges', className='mb-3'),
-                                    
-                                    # Strategy Comparison Table
-                                    html.Div(id='strategy-comparison-table', className='mb-3'),
+                                    # GROUP 2: CURRENT LEADERS (Today's Top Performers) - Hidden by default
+                                    dbc.Collapse([
+                                        html.H5("📈 Current Leader Analysis", 
+                                               style={"color": "#ffff00", "marginBottom": "15px", "borderBottom": "2px solid #ffff00", "paddingBottom": "5px"}),
+                                        
+                                        # Signal Analysis Section
+                                        html.Div(id='dynamic-signal-analysis', className='mb-3'),
+                                        
+                                        # Performance Heatmap
+                                        html.Div(id='performance-heatmap', className='mb-3'),
+                                        
+                                        # Strategy Comparison Table
+                                        html.Div(id='strategy-comparison-table', className='mb-3'),
+                                    ], id='current-leaders-collapse', is_open=False, className='mb-4'),
                                     
                                     # Original content (hidden - info now shown in new components)
                                     html.Div(id='most-productive-buy-pair', style={'display': 'none'}),
@@ -4093,7 +4747,6 @@ app.layout = dbc.Container(
                                     html.Div(id='trading-direction', style={'display': 'none'}),
                                     html.Div(id='performance-expectation', style={'display': 'none'}),
                                     html.Div(id='confidence-percentage', style={'display': 'none'}),
-                                    html.Div(id='countdown-timer-container'),  # Separate countdown timer
                                     html.Div(id='trading-recommendations'),
                                     html.Div(id='processing-status'),  # For showing processing status
                                     dbc.Progress(
@@ -4468,8 +5121,6 @@ app.layout = dbc.Container(
                                 html.I(className="fas fa-chart-line me-2", style={"color": "#80ff00"}),
                                 html.Span(id='combined-performance-header', children='Combined Performance', style={"fontWeight": "bold"})
                             ], className='mb-2'),
-                            # Risk/Reward Matrix placeholder
-                            html.Div(id='manual-risk-reward-matrix', className='mb-2'),
                             html.Div(id='combined-sharpe-ratio', children='Sharpe Ratio: --', className='mb-1'),
                             html.Div(id='combined-max-drawdown', children='Max Drawdown: --', className='mb-1'),
                             html.Div(id='combined-calmar-ratio', children='Calmar Ratio: --', className='mb-1'),
@@ -5101,6 +5752,18 @@ def toggle_multi_primary_collapse(n_clicks, is_open):
         return not is_open, 'Hide' if not is_open else 'Show'
     return is_open, 'Hide' if is_open else 'Show'
 
+# Callback to toggle the Current Leaders section in AI-Optimized Trading Signals
+@app.callback(
+    [Output('current-leaders-collapse', 'is_open'),
+     Output('toggle-current-leaders', 'children')],
+    [Input('toggle-current-leaders', 'n_clicks')],
+    [State('current-leaders-collapse', 'is_open')],
+)
+def toggle_current_leaders_collapse(n_clicks, is_open):
+    if n_clicks:
+        return not is_open, 'Hide Current Top Pair Leaders Analysis' if not is_open else 'Show Current Top Pair Leaders Analysis'
+    return is_open, 'Hide Current Top Pair Leaders Analysis' if is_open else 'Show Current Top Pair Leaders Analysis'
+
 # Callback to update Primary Ticker status
 @app.callback(
     Output('primary-ticker-status', 'children'),
@@ -5241,11 +5904,20 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, tick
      Output('sma-input-4', 'value')],
     [Input('ticker-input', 'value'),
      Input('update-interval', 'n_intervals')],
+    [State('sma-input-1', 'value'),
+     State('sma-input-2', 'value'),
+     State('sma-input-3', 'value'),
+     State('sma-input-4', 'value')],
     prevent_initial_call=True
 )
-def auto_populate_sma_inputs(ticker, n_intervals):
+def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, current_sma3, current_sma4):
     """Auto-populate SMA input fields with top-performing pairs when data is ready."""
     if not ticker:
+        return no_update, no_update, no_update, no_update
+    
+    # If SMA inputs already have values, don't update them
+    # This prevents the chart from constantly reloading
+    if all([current_sma1, current_sma2, current_sma3, current_sma4]):
         return no_update, no_update, no_update, no_update
     
     # Check if data processing is complete
@@ -5272,14 +5944,12 @@ def auto_populate_sma_inputs(ticker, n_intervals):
     if len(top_buy_pair) != 2 or len(top_short_pair) != 2:
         return no_update, no_update, no_update, no_update
     
-    # Return the SMA values for auto-population
-    # Only update if the current values are None (empty)
-    # This prevents overwriting user-entered values
+    # Only populate if fields are empty (prevent constant updates)
     return (
-        top_buy_pair[0],    # Buy pair first SMA
-        top_buy_pair[1],    # Buy pair second SMA
-        top_short_pair[0],  # Short pair first SMA
-        top_short_pair[1]   # Short pair second SMA
+        top_buy_pair[0] if not current_sma1 else no_update,    # Buy pair first SMA
+        top_buy_pair[1] if not current_sma2 else no_update,    # Buy pair second SMA
+        top_short_pair[0] if not current_sma3 else no_update,  # Short pair first SMA
+        top_short_pair[1] if not current_sma4 else no_update   # Short pair second SMA
     )
 
 def get_existing_max_sma_day(df):
@@ -5544,29 +6214,46 @@ def load_and_prepare_data(ticker):
 # Chart Update Callbacks
 # -----------------------------------------------------------------------------
 @app.callback(
-    Output('combined-capture-chart', 'figure'),
+    [Output('combined-capture-chart', 'figure'),
+     Output('charts-loaded-state', 'data')],
     [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')]
+     Input('update-interval', 'n_intervals')],
+    [State('charts-loaded-state', 'data')]
 )
-def update_combined_capture_chart(ticker, n_intervals):
+def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
     if not ticker:
-        return no_update  # Do not update the chart
+        return no_update, no_update
+    
+    # Initialize charts_loaded if needed
+    if charts_loaded is None:
+        charts_loaded = {}
+    
+    # Check if this chart has already been loaded for this ticker
+    chart_key = f'combined_capture_{ticker}'
+    if chart_key in charts_loaded and charts_loaded[chart_key]:
+        # Chart already loaded, check if this is just an interval update
+        ctx = dash.callback_context
+        if ctx.triggered:
+            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+            if trigger_id == 'update-interval':
+                # This is just an interval update, don't refresh the chart
+                return no_update, no_update
 
     status = read_status(ticker)
     if status['status'] != 'complete':
         # Data is not ready yet
-        return no_update  # Do not update the chart
+        return no_update, no_update
 
     results = load_precomputed_results(ticker)
     if results is None:
-        return no_update  # Do not update the chart
+        return no_update, no_update
 
     results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs = load_and_prepare_data(ticker)
     if results is None or df is None or daily_top_buy_pairs is None or daily_top_short_pairs is None or cumulative_combined_captures is None or active_pairs is None:
-        return no_update  # Do not update the chart
+        return no_update, no_update
 
     if len(cumulative_combined_captures) == 1 and active_pairs == ['None']:
-        return no_update  # Do not update the chart
+        return no_update, no_update
 
     data = pd.DataFrame({
         'date': cumulative_combined_captures.index,
@@ -5714,18 +6401,37 @@ def update_combined_capture_chart(ticker, n_intervals):
         )
     )
 
-    return fig
+    # Mark this chart as loaded for this ticker
+    charts_loaded[chart_key] = True
+    
+    return fig, charts_loaded
 
 @app.callback(
     Output('historical-top-pairs-chart', 'figure'),
     [Input('ticker-input', 'value'),
      Input('show-annotations-toggle', 'value'),
      Input('display-top-pairs-toggle', 'value'),
-     Input('update-interval', 'n_intervals')]
+     Input('update-interval', 'n_intervals')],
+    [State('charts-loaded-state', 'data')]
 )
-def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pairs, n_intervals):
+def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pairs, n_intervals, charts_loaded):
     if not ticker:
-        return no_update  # Do not update the chart
+        return no_update
+    
+    # Initialize charts_loaded if needed
+    if charts_loaded is None:
+        charts_loaded = {}
+    
+    # Check if this chart has already been loaded for this ticker
+    # Only prevent refresh if toggles haven't changed
+    ctx = dash.callback_context
+    if ctx.triggered:
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        chart_key = f'historical_{ticker}_{show_annotations}_{display_top_pairs}'
+        
+        # If it's just an interval update and chart is loaded, skip
+        if trigger_id == 'update-interval' and chart_key in charts_loaded:
+            return no_update
 
     # Check if data processing is complete
     status = read_status(ticker)
@@ -6091,7 +6797,8 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
      Output('trading-direction', 'children'),
      Output('performance-expectation', 'children'),
      Output('confidence-percentage', 'children'),
-     Output('trading-recommendations', 'children')],
+     Output('trading-recommendations', 'children'),
+     Output('dynamic-signal-analysis', 'children')],
     [Input('ticker-input', 'value'),
      Input('update-interval', 'n_intervals')],
     [State('position-history-store', 'data')]
@@ -6107,7 +6814,8 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Only log if the ticker changed, not on interval updates
     should_log = trigger_id == 'ticker-input'
     if not ticker:
-        return [""] * 21  # Updated for new outputs (removed position-history-table)
+        # Return 22 items: 10 empty + empty dict for position store + 11 empty
+        return [""] * 10 + [{}] + [""] * 11
     
     # Initialize or get ticker-specific position history
     if position_history_store is None or not isinstance(position_history_store, dict):
@@ -6120,19 +6828,21 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     if not isinstance(position_history_data, list):
         position_history_data = []
 
-    results = load_precomputed_results(ticker)
+    # Call with callback parameters to ensure proper logging
+    results = load_precomputed_results(ticker, from_callback=True, should_log=should_log)
     
     if results is None:
-        return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data not available. Please wait..."] + [""] * 9
+        # Return 22 items with error message in trading-recommendations (position 21)
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data not available. Please wait..."] + [""]
     
     if 'status' in results:
         if results['status'] == 'processing':
-            return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data is currently being processed."] + [""] * 9
+            return [""] * 10 + [position_history_store] + [""] * 9 + ["Data is currently being processed."] + [""]
         elif results['status'] == 'complete':
             if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Processing complete, but top pairs not found. Please check data integrity."] + [""] * 9
+                return [""] * 10 + [position_history_store] + [""] * 9 + ["Processing complete, but top pairs not found. Please check data integrity."] + [""]
         elif results['status'] == 'failed':
-            return ["", "", "", "", "", "", "", "", "", "", position_history_store, f"Processing failed for {ticker}. Please check the error message."] + [""] * 9
+            return [""] * 10 + [position_history_store] + [""] * 9 + [f"Processing failed for {ticker}. Please check the error message."] + [""]
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
@@ -6142,23 +6852,23 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data integrity issue - missing top pairs"] + [""] * 9
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing top pairs"] + [""]
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return ["", "", "", "", "", "", "", "", "", "", position_history_store, "Data integrity issue - missing preprocessed data"] + [""] * 9
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing preprocessed data"] + [""]
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return [no_update, no_update] + ["Data integrity issue - invalid pair format"] * 8 + [position_history_store] + ["Data integrity issue - invalid pair format"] * 10
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data integrity issue - invalid pair format"] + [""]
 
     try:
         # Validate top pairs data
         if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [top_buy_pair, top_short_pair]):
             logger.error(f"Invalid pair format detected for {ticker}")
-            return [no_update] + ["Invalid pair format detected. Please reprocess data."] * 9 + [position_history_store] + ["Invalid pair format detected. Please reprocess data."] * 10
+            return [""] * 10 + [position_history_store] + [""] * 9 + ["Invalid pair format detected. Please reprocess data."] + [""]
 
         # Validate that all required SMA columns exist
         required_smas = [
@@ -6169,7 +6879,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         missing_smas = [sma for sma in required_smas if sma not in df.columns]
         if missing_smas:
             logger.error(f"Missing SMA columns for {ticker}: {missing_smas}")
-            return [no_update] + ["Missing required SMA columns. Please reprocess data."] * 9 + [position_history_store] + ["Missing required SMA columns. Please reprocess data."] * 10
+            return [""] * 10 + [position_history_store] + [""] * 9 + ["Missing required SMA columns. Please reprocess data."] + [""]
 
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
@@ -6180,14 +6890,20 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         sma2_short_leader = df[f'SMA_{top_short_pair[1]}']
         short_signals_leader = sma1_short_leader < sma2_short_leader
 
-    except KeyError:
-        logger.error(f"Required SMA columns not found in the DataFrame for {ticker}")
-        return [no_update] + ["Data not available or processing not yet complete. Please wait..."] * 9 + [position_history_store] + ["Data not available or processing not yet complete. Please wait..."] * 10
+    except KeyError as e:
+        logger.error(f"Required SMA columns not found in the DataFrame for {ticker}: {str(e)}")
+        if should_log:
+            logger.error(f"Error details: Missing column {str(e)}")
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data not available or processing not yet complete. Please wait..."] + [""]
 
     current_date = df.index[-1]
     previous_date = df.index[-2]
     # Get the date from two days ago if available (needed to determine current position)
     two_days_ago = df.index[-3] if len(df) > 2 else None
+    
+    # Get buy and short capture values from results
+    buy_capture = results.get('top_buy_capture', 0)
+    short_capture = results.get('top_short_capture', 0)
 
     def predict_signal(close_price):
         # Create a copy of the Close series with the new close_price
@@ -6226,7 +6942,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Validate dates exist in the index
     if previous_date not in df.index or current_date not in df.index:
         logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
-        return [no_update] + ["Missing required dates in data. Please reprocess data."] * 9 + [position_history_store] + ["Missing required dates in data. Please reprocess data."] * 10
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Missing required dates in data. Please reprocess data."] + [""]
 
     try:
         # Calculate signals for today based on yesterday's close
@@ -6242,7 +6958,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
-        return [no_update] + ["Error calculating signals. Please check the data."] * 9 + [position_history_store] + ["Error calculating signals. Please check the data."] * 10
+        return [""] * 10 + [position_history_store] + [""] * 9 + ["Error calculating signals. Please check the data."] + [""]
 
     # Calculate yesterday's signals (which determined the position entered at yesterday's close)
     # This is our CURRENT position
@@ -6915,6 +7631,14 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Calculate risk metrics for current position
     risk_metrics = PerformanceMetrics.calculate_risk_metrics(df, current_position)
     
+    # Calculate signal flip probability
+    flip_probability = PerformanceMetrics.calculate_signal_flip_probability(
+        current_price_val,
+        threshold_data,
+        df,
+        next_position  # We want to know if the next position might flip
+    )
+    
     # Build position history from active_pairs (the same data used for charts)
     if active_pairs and len(active_pairs) == len(df) and not position_history_data:
         df_dates = df.index
@@ -7084,7 +7808,8 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                             next_sma_pair,
                             confidence,
                             next_trading_day.strftime('%Y-%m-%d'),
-                            signal_strength
+                            signal_strength,
+                            flip_probability
                         )
                     ], width=6)
                 ]),
@@ -7132,7 +7857,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             
             # SECTION 3: SIGNAL CHANGE THRESHOLDS
             html.Div([
-                html.H3("🎯 Signal Change Thresholds", className="mb-3"),
+                html.H3("📊 Signal Change Thresholds", className="mb-3"),
                 
                 # Show the detailed threshold table
                 PerformanceMetrics.create_price_threshold_visual(
@@ -7181,10 +7906,16 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         years=years
     )
     
-    # Create grade badge with tooltip
+    # Create Strategy Confidence Badge first
+    strategy_confidence_badge = PerformanceMetrics.create_strategy_confidence_badge(p_value, trigger_days)
+    
+    # Create grade badge with header and centered badge
     grade_badge = html.Div([
-        html.H4([
-            html.Span("Strategy Grade: ", style={"color": "#80ff00"}),
+        # Strategy Grade header (matching Alerts style)
+        html.H6("Strategy Grade", style={"color": "#80ff00", "marginBottom": "10px", "textAlign": "center"}),
+        
+        # Grade badge centered below
+        html.Div([
             html.Span(grade, 
                       id="dynamic-grade-tooltip-target",
                       style={
@@ -7195,9 +7926,21 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                 "fontWeight": "bold",
                 "fontSize": "1.5rem",
                 "boxShadow": f"0 0 15px {grade_color}",
-                "cursor": "help"
-            }),
-        ], style={"textAlign": "center"}),
+                "cursor": "help",
+                "display": "inline-block"
+            })
+        ], style={
+            "textAlign": "center",
+            "marginBottom": "15px"
+        }),
+        
+        # Confidence Badge below
+        html.Div([
+            strategy_confidence_badge
+        ], style={
+            "textAlign": "center",
+            "marginBottom": "20px"
+        }),
         dbc.Tooltip(
             f"Overall grade based on: Sharpe Ratio ({sharpe_ratio:.2f}), Win Rate ({win_ratio:.1f}%), "
             f"Total Return ({total_capture:.1f}%), Annualized Return ({annualized_return:.1f}%) over {years:.1f} years. "
@@ -7207,8 +7950,12 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         )
     ])
     
-    # Create progress bars showing dynamic strategy performance
-    progress_bars = html.Div([
+    # Create progress bars - now separated into historical and current
+    # Remove duplicate win rate bar since it's already shown in the cards above
+    progress_bars = html.Div([])  # Empty div - win rate already displayed in cards
+    
+    # Create separate current leader progress bars for the collapsed section
+    current_leader_bars = html.Div([
         # Current Buy Leader Win Ratio Progress Bar
         html.Div([
             html.Label("Current Buy Leader Win Rate", style={"color": "#00ff41", "fontSize": "0.9rem"}),
@@ -7235,21 +7982,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                 label=f"{short_win_ratio * 100:.1f}%",
                 style={"height": "25px"}
             )
-        ], className="mb-2"),
-        
-        # Dynamic Strategy Overall Performance Progress Bar
-        html.Div([
-            html.Label("Dynamic Strategy Win Rate (Historical Performance for ALL pairs)", style={"color": "#80ff00", "fontSize": "0.9rem"}),
-            dbc.Progress(
-                value=win_ratio,  # Use the dynamic strategy win_ratio directly
-                max=100,
-                color=PerformanceMetrics.get_progress_bar_color(win_ratio / 100),  # Convert back to decimal for color function
-                striped=True,
-                animated=win_ratio > PerformanceMetrics.THRESHOLDS['win_rate']['moderate'],
-                label=f"{win_ratio:.1f}%",
-                style={"height": "25px"}
-            )
-        ])
+        ], className="mb-2")
     ])
 
     # Create Risk/Reward Matrix for AI-Optimized strategy
@@ -7320,7 +8053,12 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             style={"color": "#888", "fontStyle": "italic"}
         )
     else:
-        performance_heatmap = PerformanceMetrics.create_performance_heatmap(top_pairs_data, metric='total_capture')
+        # Combine current leader bars with the heatmap for the collapsed section
+        performance_heatmap = html.Div([
+            current_leader_bars,
+            html.Hr(style={"borderColor": "#666", "margin": "20px 0"}),
+            PerformanceMetrics.create_performance_heatmap(top_pairs_data, metric='total_capture')
+        ])
     
     # Create Signal Strength Meters
     # Calculate signal strength based on how far SMAs are from crossing
@@ -7364,10 +8102,12 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     buy_signal_strength = min(100, max(0, (buy_sma_diff / max_diff) * 100))
     short_signal_strength = min(100, max(0, (short_sma_diff / max_diff) * 100))
     
-    signal_strength_meters = PerformanceMetrics.create_signal_strength_meter(buy_signal_strength, short_signal_strength)
+    # Create signal strength meters with SMA pair labels
+    signal_strength_meters = PerformanceMetrics.create_signal_strength_meter(
+        buy_signal_strength, short_signal_strength, top_buy_pair, top_short_pair
+    )
     
-    # Create Strategy Confidence Badge
-    strategy_confidence_badge = PerformanceMetrics.create_strategy_confidence_badge(p_value, trigger_days)
+    # Strategy Confidence Badge already created earlier for grade badge
     
     # Create Quick Stats Cards with annualized return
     annualized_return = PerformanceMetrics.calculate_annualized_return(total_capture, years) if years > 0 else 0
@@ -7381,8 +8121,26 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     
     # Create Visual Signal Indicators
     visual_signal_indicators = PerformanceMetrics.create_visual_signal_indicators(
-        trading_signal_type, next_trading_signal_type
+        current_position, next_position
     )
+    
+    # Create the Signal Analysis section for Dynamic Master Trading Strategy
+    dynamic_signal_analysis = html.Div([
+        html.H4("📊 Signal Analysis", className="mb-3", 
+               style={"color": "#80ff00", "borderBottom": "1px solid #80ff00", "paddingBottom": "8px"}),
+        
+        # Visual Signal Indicators
+        visual_signal_indicators,
+        
+        # Signal Strength Meters
+        signal_strength_meters,
+    ], className="mb-3", style={
+        "backgroundColor": "rgba(128, 255, 0, 0.05)",
+        "padding": "15px",
+        "borderRadius": "8px",
+        "border": "1px solid rgba(128, 255, 0, 0.3)",
+        "marginTop": "20px"
+    })
     
     # Create Alert Badges
     alerts = {}
@@ -7485,7 +8243,8 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         trading_signal,
         performance_expectation_text,
         confidence_percentage_text,
-        html.Div(trading_recommendations)
+        html.Div(trading_recommendations),
+        dynamic_signal_analysis
     )
 
 @app.callback(
@@ -7505,8 +8264,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
      Output('combined-max-drawdown', 'children'),
      Output('combined-calmar-ratio', 'children'),
      Output('combined-total-signals', 'children'),
-     Output('combined-win-rate', 'children'),
-     Output('manual-risk-reward-matrix', 'children')],
+     Output('combined-win-rate', 'children')],
     [Input('ticker-input', 'value'),
      Input('sma-input-1', 'value'),
      Input('sma-input-2', 'value'),
@@ -7524,7 +8282,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --'), html.Div()
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
 
     df = fetch_data(ticker)
     if df is None or df.empty:
@@ -7541,7 +8299,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             yaxis=dict(visible=False),
             template='plotly_dark'
         )
-        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --'), html.Div()
+        return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
         
     # Create base figure with just the price chart
     fig = go.Figure()
@@ -7577,7 +8335,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                 tickfont=dict(color='#80ff00')
             )
         )
-        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --'), html.Div()
+        return fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
 
     min_date = df.index.min()
     max_date = df.index.max()
@@ -7605,7 +8363,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         return (fig, 'No data available', 'No data available', 'No data available', 'No data available', 
                'No data available', 'No data available', 'No data available', 'No data available',
                'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: N/A'), html.Span('Max Drawdown: N/A'), 
-               html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'), html.Div())
+               html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'))
     
     # Calculate Buy returns on days when Buy signal was active
     buy_returns_on_trigger_days = daily_returns[buy_signals_shifted]
@@ -7961,25 +8719,46 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         )
     ], style={"display": "inline-block"})
     
-    # Create Risk/Reward Matrix
-    risk_reward_matrix = PerformanceMetrics.create_risk_reward_matrix(sharpe_ratio, max_drawdown)
-    
-    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text, risk_reward_matrix
+    return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text
 
 @app.callback(
     Output('update-interval', 'disabled'),
     [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')]
+     Input('update-interval', 'n_intervals')],
+    [State('trading-recommendations', 'children')]
 )
-def disable_interval_when_data_loaded(ticker, n_intervals):
+def disable_interval_when_data_loaded(ticker, n_intervals, recommendations_loaded):
     if not ticker:
         return True  # Disable interval when no ticker is entered
-
+    
+    # Check if processing is complete
     status = read_status(ticker)
-    if status['status'] == 'complete' or status['status'] == 'failed':
-        return True  # Disable interval once data is loaded or if processing failed
-    else:
-        return False  # Keep interval running while processing
+    
+    # If processing failed, stop the interval
+    if status['status'] == 'failed':
+        return True
+    
+    # Check if we have cached results
+    results = load_precomputed_results(ticker)
+    has_cached_data = (results is not None and 
+                      results.get('status') == 'complete' and
+                      'top_buy_pair' in results and 
+                      'top_short_pair' in results)
+    
+    # For cached tickers, ensure charts are loaded (need a few intervals)
+    if has_cached_data:
+        # Give cached tickers time to load their charts
+        if n_intervals and n_intervals >= 3:  # After ~9 seconds for cached data
+            return True
+        return False  # Keep running for a few intervals to load charts
+    
+    # For new tickers being processed, wait for recommendations to be loaded
+    if status['status'] == 'complete' and recommendations_loaded and len(str(recommendations_loaded)) > 100:
+        # Give it a few more intervals to ensure everything is fully loaded
+        if n_intervals and n_intervals > 5:  # After ~15 seconds of updates
+            return True  # Now safe to disable interval
+    
+    return False  # Keep interval running while loading
     
 # Removed duplicate print_timing_summary - using the one defined earlier
 
