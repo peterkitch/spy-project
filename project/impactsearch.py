@@ -3,24 +3,71 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import logging
+import random
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, dash_table, callback_context, ALL, MATCH
 import dash_bootstrap_components as dbc
+import plotly.graph_objs as go
+import plotly.express as px
+import plotly.figure_factory as ff
 import yfinance as yf
 from tqdm import tqdm
+import pickle
+import json
+from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import threading
+import multiprocessing
+from threading import Lock
+import re
+
+# Canonical crypto bases we normalize to Yahoo's '-USD' pairs
+CRYPTO_BASES = {
+    'BTC','ETH','SOL','DOGE','ADA','XRP','LTC','BNB','DOT','AVAX','LINK','MATIC',
+    'ETC','BCH','FIL','UNI','APT','ARB','OP','NEAR','XLM','HBAR','INJ','SUI',
+    'PEPE','SHIB','ATOM','ALGO','FTM','XMR','EOS','XTZ','AAVE','EGLD','RUNE','KAS','TIA','SEI'
+}
+SAFE_BARE_CRYPTO_BASES = {'BTC','ETH'}  # bare inputs we auto-map to '-USD'
+
+# Global lock for yfinance (not thread-safe)
+SMA_CACHE = {}  # Global SMA cache
+yfinance_lock = Lock()
+progress_lock = Lock()  # Thread-safe progress updates
+import base64
+import io
+try:
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+    # Dummy classes to prevent errors if reportlab is not installed
+    class colors:
+        HexColor = lambda x: None
+        whitesmoke = None
+    class ParagraphStyle:
+        pass
+import warnings
+warnings.filterwarnings('ignore')
 
 # Remove all handlers from the root logger
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # <-- CHANGED from INFO to DEBUG
+logger.setLevel(logging.DEBUG)
 
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  # Keep console at INFO to avoid too many prints
+console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
+# Ensure logs directory exists before creating FileHandler
+os.makedirs('logs', exist_ok=True)
 file_handler = logging.FileHandler('logs/impactsearch.log', mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -31,23 +78,882 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 logger.propagate = False
 
+# Log reportlab status
+if not REPORTLAB_AVAILABLE:
+    logger.info("ReportLab not installed. PDF export will be disabled. Install with: pip install reportlab")
+
 # Constants
-MAX_SMA_DAY = 114  # Set fixed window for SMA calculations
+MAX_SMA_DAY = 114
+
+# Precompute pairs once at module level for efficiency
+PAIR_DTYPE = np.uint16 if MAX_SMA_DAY > 255 else np.uint8
+PAIRS = np.array([(i, j) for i in range(1, MAX_SMA_DAY+1)
+                  for j in range(1, MAX_SMA_DAY+1) if i != j], dtype=PAIR_DTYPE)
+I_IDX = PAIRS[:, 0] - 1
+J_IDX = PAIRS[:, 1] - 1  # Set fixed window for SMA calculations
+CACHE_DIR = 'cache/impact_analysis'
+CACHE_EXPIRY_DAYS = 7
+
+# Global progress tracking
+progress_tracker = {
+    'current_ticker': '',
+    'current_index': 0,
+    'total_tickers': 0,
+    'start_time': None,
+    'results': [],
+    'status': 'idle'
+}
+
+def safe_divide(numerator, denominator, default=0):
+    """Safe division with default value"""
+    if denominator == 0 or not np.isfinite(denominator):
+        return default
+    result = numerator / denominator
+    if not np.isfinite(result):
+        return default
+    return result
+
+
+class VisualMetrics:
+    """Class for creating visual metric components similar to spymaster.py"""
+    
+    @staticmethod
+    def create_performance_card(title, value, subtitle="", icon="📊", color="#00ff41", glow=False):
+        """Create a performance metric card with consistent styling"""
+        
+        # Determine glow intensity based on value
+        glow_effect = ""
+        if glow:
+            if isinstance(value, (int, float)):
+                if value > 2:
+                    glow_effect = "0 0 20px rgba(0, 255, 65, 0.5)"
+                elif value > 1:
+                    glow_effect = "0 0 15px rgba(0, 255, 65, 0.3)"
+                elif value > 0:
+                    glow_effect = "0 0 10px rgba(255, 255, 0, 0.3)"
+                else:
+                    glow_effect = "0 0 10px rgba(255, 0, 64, 0.3)"
+        
+        card_style = {
+            'backgroundColor': 'rgba(0, 0, 0, 0.6)',
+            'border': f'1px solid {color}',
+            'borderRadius': '10px',
+            'padding': '20px',
+            'height': '100%',
+            'boxShadow': glow_effect
+        }
+        
+        return dbc.Card([
+            dbc.CardBody([
+                html.Div([
+                    html.Span(icon, style={'fontSize': '2rem', 'marginRight': '10px'}),
+                    html.Span(title, style={'fontSize': '0.9rem', 'color': '#888'})
+                ], style={'marginBottom': '10px'}),
+                html.H3(str(value), style={'color': color, 'marginBottom': '5px'}),
+                html.P(subtitle, style={'fontSize': '0.8rem', 'color': '#aaa', 'marginBottom': '0'})
+            ])
+        ], style=card_style)
+    
+    @staticmethod
+    def create_sharpe_gauge(sharpe_ratio):
+        """Create a gauge chart for Sharpe ratio visualization"""
+        
+        # Determine color based on Sharpe ratio
+        if sharpe_ratio >= 2:
+            color = "#00ff41"
+            rating = "Excellent"
+        elif sharpe_ratio >= 1:
+            color = "#80ff00"
+            rating = "Good"
+        elif sharpe_ratio >= 0:
+            color = "#ffff00"
+            rating = "Fair"
+        else:
+            color = "#ff0040"
+            rating = "Poor"
+        
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=sharpe_ratio,
+            title={'text': f"Sharpe Ratio - {rating}"},
+            domain={'x': [0, 1], 'y': [0, 1]},
+            gauge={
+                'axis': {'range': [None, 3], 'tickwidth': 1, 'tickcolor': "darkgray"},
+                'bar': {'color': color},
+                'bgcolor': "rgba(0,0,0,0.1)",
+                'borderwidth': 2,
+                'bordercolor': "gray",
+                'steps': [
+                    {'range': [0, 1], 'color': 'rgba(255, 255, 0, 0.1)'},
+                    {'range': [1, 2], 'color': 'rgba(128, 255, 0, 0.1)'},
+                    {'range': [2, 3], 'color': 'rgba(0, 255, 65, 0.1)'}
+                ],
+                'threshold': {
+                    'line': {'color': "white", 'width': 4},
+                    'thickness': 0.75,
+                    'value': 1
+                }
+            }
+        ))
+        
+        fig.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font={'color': '#00ff41'},
+            height=250
+        )
+        
+        return fig
+    
+    @staticmethod
+    def create_significance_meter(p_value):
+        """Create a significance level meter"""
+        
+        if p_value == 'N/A':
+            significance_level = 0
+            status = "No Data"
+            color = "#808080"
+        else:
+            p_val = float(p_value) if isinstance(p_value, str) else p_value
+            if p_val < 0.01:
+                significance_level = 99
+                status = "99% Significant"
+                color = "#00ff41"
+            elif p_val < 0.05:
+                significance_level = 95
+                status = "95% Significant"
+                color = "#80ff00"
+            elif p_val < 0.10:
+                significance_level = 90
+                status = "90% Significant"
+                color = "#ffff00"
+            else:
+                significance_level = 0
+                status = "Not Significant"
+                color = "#ff0040"
+        
+        return html.Div([
+            html.Label(f"Statistical Significance: {status}", 
+                      style={'fontSize': '0.9rem', 'color': color, 'marginBottom': '10px'}),
+            dbc.Progress(
+                value=significance_level,
+                color="success" if significance_level >= 95 else "warning" if significance_level >= 90 else "danger",
+                style={'height': '25px'},
+                className="mb-3",
+                animated=significance_level > 0,
+                striped=significance_level > 0
+            ),
+            html.P(f"p-value: {p_value}", style={'fontSize': '0.8rem', 'color': '#aaa'})
+        ])
+    
+    @staticmethod
+    def create_win_rate_visual(wins, losses):
+        """Create a visual representation of win rate"""
+        total = wins + losses
+        if total == 0:
+            win_rate = 0
+        else:
+            win_rate = (wins / total) * 100
+        
+        # Determine emoji and color
+        if win_rate >= 60:
+            emoji = "🎯"
+            color = "#00ff41"
+            status = "Strong"
+        elif win_rate >= 50:
+            emoji = "✅"
+            color = "#80ff00"
+            status = "Positive"
+        elif win_rate >= 40:
+            emoji = "⚠️"
+            color = "#ffff00"
+            status = "Weak"
+        else:
+            emoji = "❌"
+            color = "#ff0040"
+            status = "Poor"
+        
+        return html.Div([
+            html.Div([
+                html.Span(f"{emoji} ", style={'fontSize': '1.5rem'}),
+                html.Span(f"Win Rate: {win_rate:.1f}% ({status})", 
+                         style={'fontSize': '1rem', 'color': color, 'fontWeight': 'bold'})
+            ], style={'marginBottom': '10px'}),
+            html.Div([
+                html.Div([
+                    html.Span("Wins", style={'color': '#00ff41', 'marginRight': '10px'}),
+                    html.Span(str(wins), style={'fontWeight': 'bold', 'color': '#00ff41'})
+                ], style={'display': 'inline-block', 'marginRight': '30px'}),
+                html.Div([
+                    html.Span("Losses", style={'color': '#ff0040', 'marginRight': '10px'}),
+                    html.Span(str(losses), style={'fontWeight': 'bold', 'color': '#ff0040'})
+                ], style={'display': 'inline-block'})
+            ])
+        ])
+    
+    @staticmethod
+    def create_correlation_heatmap(results_df):
+        """Create a correlation heatmap for key metrics"""
+        if len(results_df) < 3:
+            return html.Div("Need at least 3 tickers for correlation analysis", 
+                          style={'color': '#aaa', 'textAlign': 'center', 'padding': '20px'})
+        
+        # Select numeric columns for correlation
+        numeric_cols = ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
+                       'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
+                       'Total Capture (%)']
+        
+        # Filter to existing columns
+        available_cols = [col for col in numeric_cols if col in results_df.columns]
+        
+        if len(available_cols) < 2:
+            return html.Div("Insufficient numeric data for correlation", 
+                          style={'color': '#aaa', 'textAlign': 'center'})
+        
+        # Calculate correlation matrix
+        corr_matrix = results_df[available_cols].corr()
+        
+        # Create heatmap
+        fig = ff.create_annotated_heatmap(
+            z=corr_matrix.values,
+            x=list(corr_matrix.columns),
+            y=list(corr_matrix.index),
+            colorscale='Viridis',
+            showscale=True,
+            reversescale=False
+        )
+        
+        fig.update_layout(
+            title="Metrics Correlation Heatmap",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            height=500,
+            xaxis={'side': 'bottom'},
+            yaxis={'autorange': 'reversed'}
+        )
+        
+        # Update annotation text color
+        for i in range(len(fig.layout.annotations)):
+            fig.layout.annotations[i].font.color = '#fff'
+        
+        return dcc.Graph(figure=fig)
+    
+    @staticmethod
+    def create_advanced_scatter_matrix(results_df):
+        """Create an advanced scatter matrix plot"""
+        if len(results_df) < 3:
+            return html.Div("Need at least 3 tickers for scatter matrix", 
+                          style={'color': '#aaa', 'textAlign': 'center'})
+        
+        # Select key metrics
+        metrics = ['Sharpe Ratio', 'Win Ratio (%)', 'Total Capture (%)']
+        available_metrics = [m for m in metrics if m in results_df.columns]
+        
+        if len(available_metrics) < 2:
+            return html.Div("Insufficient metrics for scatter matrix", 
+                          style={'color': '#aaa', 'textAlign': 'center'})
+        
+        fig = px.scatter_matrix(
+            results_df,
+            dimensions=available_metrics,
+            color='Sharpe Ratio',
+            color_continuous_scale='Viridis',
+            title="Metrics Scatter Matrix",
+            labels={col: col.replace(' (%)', '') for col in available_metrics},
+            hover_data=['Primary Ticker']
+        )
+        
+        fig.update_traces(diagonal_visible=False, showupperhalf=False)
+        
+        fig.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            height=600,
+            showlegend=False
+        )
+        
+        return dcc.Graph(figure=fig)
+
+class SummaryAnalyzer:
+    """Generate intelligent summary and recommendations from analysis results"""
+    
+    @staticmethod
+    def analyze_key_findings(results_df):
+        """Extract key findings from results"""
+        findings = []
+        
+        if len(results_df) == 0:
+            return findings
+        
+        # Top performers
+        top_sharpe = results_df.nlargest(3, 'Sharpe Ratio')
+        if len(top_sharpe) > 0:
+            findings.append({
+                'type': 'top_performers',
+                'title': '🏆 Top Performers by Sharpe Ratio',
+                'description': f"Best performers: {', '.join(top_sharpe['Primary Ticker'].tolist())}",
+                'details': f"Sharpe ratios ranging from {top_sharpe['Sharpe Ratio'].min():.2f} to {top_sharpe['Sharpe Ratio'].max():.2f}"
+            })
+        
+        # Statistical significance findings
+        sig_95 = results_df[results_df['Significant 95%'] == 'Yes']
+        if len(sig_95) > 0:
+            findings.append({
+                'type': 'statistical_significance',
+                'title': '📊 Statistically Significant Relationships',
+                'description': f"{len(sig_95)} tickers show 95% statistical significance",
+                'details': f"Tickers: {', '.join(sig_95['Primary Ticker'].head(5).tolist())}" + 
+                          (" and more..." if len(sig_95) > 5 else "")
+            })
+        
+        # Win rate analysis
+        high_win_rate = results_df[results_df['Win Ratio (%)'] > 60]
+        if len(high_win_rate) > 0:
+            findings.append({
+                'type': 'win_rate',
+                'title': '🎯 High Win Rate Tickers',
+                'description': f"{len(high_win_rate)} tickers with >60% win rate",
+                'details': f"Best win rate: {results_df['Win Ratio (%)'].max():.1f}% ({results_df.loc[results_df['Win Ratio (%)'].idxmax(), 'Primary Ticker']})"
+            })
+        
+        # Volatility patterns
+        low_vol = results_df[results_df['Std Dev (%)'] < results_df['Std Dev (%)'].quantile(0.25)]
+        if len(low_vol) > 0:
+            findings.append({
+                'type': 'volatility',
+                'title': '🛡️ Low Volatility Performers',
+                'description': f"{len(low_vol)} tickers with below-average volatility",
+                'details': f"Most stable: {low_vol.nsmallest(1, 'Std Dev (%)')['Primary Ticker'].iloc[0]} ({low_vol['Std Dev (%)'].min():.2f}% std dev)"
+            })
+        
+        return findings
+    
+    @staticmethod
+    def detect_patterns(results_df):
+        """Detect interesting patterns and correlations"""
+        patterns = []
+        
+        if len(results_df) < 3:
+            return patterns
+        
+        # Sector clustering (if we can infer from ticker names)
+        tech_tickers = ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA', 'AMD', 'INTC', 'CSCO', 'ORCL', 'CRM']
+        tech_in_results = results_df[results_df['Primary Ticker'].isin(tech_tickers)]
+        
+        if len(tech_in_results) >= 3:
+            avg_sharpe_tech = tech_in_results['Sharpe Ratio'].mean()
+            avg_sharpe_all = results_df['Sharpe Ratio'].mean()
+            if avg_sharpe_tech > avg_sharpe_all * 1.2:
+                patterns.append({
+                    'type': 'sector_trend',
+                    'title': '💻 Technology Sector Outperformance',
+                    'description': f"Tech stocks showing {((avg_sharpe_tech/avg_sharpe_all - 1) * 100):.1f}% better Sharpe ratio",
+                    'recommendation': 'Consider analyzing more technology sector stocks'
+                })
+        
+        # Market cap patterns
+        mega_caps = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'BRK-B', 'LLY', 'TSM', 'V']
+        mega_in_results = results_df[results_df['Primary Ticker'].isin(mega_caps)]
+        
+        if len(mega_in_results) >= 2:
+            if mega_in_results['Win Ratio (%)'].mean() > 55:
+                patterns.append({
+                    'type': 'market_cap_trend',
+                    'title': '🏢 Mega-Cap Stability',
+                    'description': f"Large-cap stocks showing consistent win rates (avg: {mega_in_results['Win Ratio (%)'].mean():.1f}%)",
+                    'recommendation': 'Mega-caps may provide more stable signals'
+                })
+        
+        # Correlation clusters
+        if 'Total Capture (%)' in results_df.columns and 'Sharpe Ratio' in results_df.columns:
+            correlation = results_df['Total Capture (%)'].corr(results_df['Sharpe Ratio'])
+            if abs(correlation) > 0.7:
+                patterns.append({
+                    'type': 'correlation',
+                    'title': '🔗 Strong Metric Correlation',
+                    'description': f"Total Capture and Sharpe Ratio correlation: {correlation:.2f}",
+                    'recommendation': 'Focus on maximizing total capture for better risk-adjusted returns'
+                })
+        
+        return patterns
+    
+    @staticmethod
+    def generate_recommendations(results_df, secondary_ticker):
+        """Generate actionable recommendations for follow-up analysis"""
+        recommendations = []
+        
+        if len(results_df) == 0:
+            return recommendations
+        
+        # Recommendation 1: Deep dive on top performers
+        top_performers = results_df.nlargest(3, 'Sharpe Ratio')['Primary Ticker'].tolist()
+        if top_performers:
+            recommendations.append({
+                'id': 'deep_dive_top',
+                'title': '🔍 Deep Dive Analysis',
+                'description': f"Perform detailed backtesting on top performers: {', '.join(top_performers)}",
+                'action': 'deep_dive',
+                'params': {
+                    'tickers': top_performers,
+                    'secondary': secondary_ticker,
+                    'analysis_type': 'detailed_backtest'
+                }
+            })
+        
+        # Recommendation 2: Explore similar tickers
+        if len(results_df) > 0:
+            best_ticker = results_df.loc[results_df['Sharpe Ratio'].idxmax(), 'Primary Ticker']
+            recommendations.append({
+                'id': 'explore_similar',
+                'title': '🔄 Find Similar Tickers',
+                'description': f"Find tickers with similar characteristics to {best_ticker}",
+                'action': 'find_similar',
+                'params': {
+                    'reference_ticker': best_ticker,
+                    'secondary': secondary_ticker,
+                    'metric': 'correlation'
+                }
+            })
+        
+        # Recommendation 3: Outlier investigation
+        outliers = results_df[
+            (results_df['Sharpe Ratio'] > results_df['Sharpe Ratio'].quantile(0.95)) |
+            (results_df['Sharpe Ratio'] < results_df['Sharpe Ratio'].quantile(0.05))
+        ]
+        if len(outliers) > 0:
+            recommendations.append({
+                'id': 'investigate_outliers',
+                'title': '⚠️ Investigate Outliers',
+                'description': f"Analyze {len(outliers)} outlier tickers for special patterns",
+                'action': 'outlier_analysis',
+                'params': {
+                    'outlier_tickers': outliers['Primary Ticker'].tolist(),
+                    'secondary': secondary_ticker
+                }
+            })
+        
+        # Recommendation 4: Time period analysis
+        if len(results_df) >= 5:
+            recommendations.append({
+                'id': 'time_period_analysis',
+                'title': '📅 Time Period Optimization',
+                'description': "Test different time periods to find optimal holding periods",
+                'action': 'time_analysis',
+                'params': {
+                    'top_tickers': results_df.nlargest(5, 'Sharpe Ratio')['Primary Ticker'].tolist(),
+                    'secondary': secondary_ticker,
+                    'periods': [30, 60, 90, 180, 365]
+                }
+            })
+        
+        # Recommendation 5: Sector rotation analysis
+        recommendations.append({
+            'id': 'sector_rotation',
+            'title': '🔄 Sector Rotation Analysis',
+            'description': "Analyze sector rotation patterns for better timing",
+            'action': 'sector_analysis',
+            'params': {
+                'secondary': secondary_ticker,
+                'sectors': ['XLK', 'XLF', 'XLV', 'XLE', 'XLI', 'XLY', 'XLP', 'XLRE', 'XLB', 'XLU']
+            }
+        })
+        
+        return recommendations
+    
+    @staticmethod
+    def create_summary_visualizations(results_df):
+        """Create summary visualizations"""
+        visualizations = []
+        
+        if len(results_df) < 3:
+            return visualizations
+        
+        # Performance distribution chart
+        fig_dist = go.Figure()
+        fig_dist.add_trace(go.Histogram(
+            x=results_df['Sharpe Ratio'],
+            nbinsx=20,
+            name='Sharpe Ratio Distribution',
+            marker_color='#00ff41',
+            opacity=0.7
+        ))
+        fig_dist.update_layout(
+            title="Sharpe Ratio Distribution",
+            xaxis_title="Sharpe Ratio",
+            yaxis_title="Count",
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            height=300
+        )
+        visualizations.append(('distribution', fig_dist))
+        
+        # Risk-Return scatter
+        fig_scatter = go.Figure()
+        fig_scatter.add_trace(go.Scatter(
+            x=results_df['Std Dev (%)'],
+            y=results_df['Total Capture (%)'],
+            mode='markers+text',
+            text=results_df['Primary Ticker'],
+            textposition='top center',
+            marker=dict(
+                size=results_df['Win Ratio (%)'] / 5,  # Size based on win ratio
+                color=results_df['Sharpe Ratio'],
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(title="Sharpe<br>Ratio"),
+                line=dict(width=1, color='#00ff41')
+            ),
+            hovertemplate='<b>%{text}</b><br>' +
+                         'Risk (Std): %{x:.2f}%<br>' +
+                         'Return: %{y:.2f}%<br>' +
+                         '<extra></extra>'
+        ))
+        fig_scatter.update_layout(
+            title="Risk-Return Profile",
+            xaxis_title="Risk (Std Dev %)",
+            yaxis_title="Return (Total Capture %)",
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            height=400
+        )
+        visualizations.append(('risk_return', fig_scatter))
+        
+        return visualizations
+
+class AnalysisTemplates:
+    """Manage analysis templates and configurations"""
+    
+    TEMPLATES_DIR = 'cache/templates'
+    
+    @staticmethod
+    def save_template(name, config):
+        """Save an analysis template"""
+        os.makedirs(AnalysisTemplates.TEMPLATES_DIR, exist_ok=True)
+        template_path = os.path.join(AnalysisTemplates.TEMPLATES_DIR, f"{name}.json")
+        
+        try:
+            with open(template_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            logger.info(f"Saved template: {name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save template {name}: {e}")
+            return False
+    
+    @staticmethod
+    def load_template(name):
+        """Load an analysis template"""
+        template_path = os.path.join(AnalysisTemplates.TEMPLATES_DIR, f"{name}.json")
+        
+        if not os.path.exists(template_path):
+            return None
+        
+        try:
+            with open(template_path, 'r') as f:
+                config = json.load(f)
+            logger.info(f"Loaded template: {name}")
+            return config
+        except Exception as e:
+            logger.error(f"Failed to load template {name}: {e}")
+            return None
+    
+    @staticmethod
+    def list_templates():
+        """List all available templates"""
+        if not os.path.exists(AnalysisTemplates.TEMPLATES_DIR):
+            return []
+        
+        templates = []
+        for file in os.listdir(AnalysisTemplates.TEMPLATES_DIR):
+            if file.endswith('.json'):
+                templates.append(file[:-5])  # Remove .json extension
+        
+        return sorted(templates)
+    
+    @staticmethod
+    def delete_template(name):
+        """Delete a template"""
+        template_path = os.path.join(AnalysisTemplates.TEMPLATES_DIR, f"{name}.json")
+        
+        if os.path.exists(template_path):
+            try:
+                os.remove(template_path)
+                logger.info(f"Deleted template: {name}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to delete template {name}: {e}")
+                return False
+        return False
+
+class ReportGenerator:
+    """Generate PDF reports from analysis results"""
+    
+    @staticmethod
+    def generate_pdf_report(results_data, secondary_ticker, filename=None):
+        """Generate a comprehensive PDF report"""
+        if not REPORTLAB_AVAILABLE:
+            logger.warning("PDF generation skipped - ReportLab not installed")
+            return None
+        
+        # Convert to DataFrame if needed
+        if isinstance(results_data, list):
+            results_df = pd.DataFrame(results_data)
+        else:
+            results_df = results_data
+            
+        if filename is None:
+            # Ensure output directory exists
+            output_dir = 'output/impactsearch'
+            os.makedirs(output_dir, exist_ok=True)
+            filename = f"{output_dir}/{secondary_ticker}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        
+        # Create the PDF document
+        doc = SimpleDocTemplate(filename, pagesize=landscape(letter))
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#00ff41'),
+            spaceAfter=30,
+            alignment=1  # Center
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=16,
+            textColor=colors.HexColor('#00ff41'),
+            spaceAfter=12
+        )
+        
+        # Title
+        story.append(Paragraph(f"Impact Analysis Report - {secondary_ticker}", title_style))
+        story.append(Spacer(1, 0.2*inch))
+        
+        # Summary statistics
+        story.append(Paragraph("Executive Summary", heading_style))
+        
+        summary_data = [
+            ['Metric', 'Value'],
+            ['Total Tickers Analyzed', str(len(results_df))],
+            ['Average Sharpe Ratio', f"{results_df['Sharpe Ratio'].mean():.2f}"],
+            ['Best Performer', results_df.loc[results_df['Sharpe Ratio'].idxmax(), 'Primary Ticker']],
+            ['Worst Performer', results_df.loc[results_df['Sharpe Ratio'].idxmin(), 'Primary Ticker']],
+            ['95% Significant Count', str(len(results_df[results_df['Significant 95%'] == 'Yes']))],
+            ['Average Win Ratio', f"{results_df['Win Ratio (%)'].mean():.1f}%"]
+        ]
+        
+        summary_table = Table(summary_data, colWidths=[3*inch, 2*inch])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003300')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#1a1a1a')),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#00ff41')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#00ff41'))
+        ]))
+        
+        story.append(summary_table)
+        story.append(PageBreak())
+        
+        # Detailed results table
+        story.append(Paragraph("Detailed Results", heading_style))
+        
+        # Prepare data for table
+        table_columns = ['Primary Ticker', 'Sharpe Ratio', 'Win Ratio (%)', 
+                        'Total Capture (%)', 'p-Value', 'Significant 95%']
+        table_data = [table_columns]
+        
+        for _, row in results_df.iterrows():
+            row_data = [str(row[col]) if col in row else 'N/A' for col in table_columns]
+            table_data.append(row_data)
+        
+        results_table = Table(table_data, repeatRows=1)
+        results_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003300')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#1a1a1a')),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#80ff00')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#00ff41')),
+            ('FONTSIZE', (0, 1), (-1, -1), 8)
+        ]))
+        
+        story.append(results_table)
+        
+        # Build the PDF
+        doc.build(story)
+        logger.info(f"PDF report generated: {filename}")
+        return filename
+
+class CacheManager:
+    """Manage caching for ticker data and calculations"""
+    
+    @staticmethod
+    def get_cache_path(ticker, data_type='data'):
+        """Generate cache file path"""
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        return os.path.join(CACHE_DIR, f"{ticker}_{data_type}.pkl")
+    
+    @staticmethod
+    def is_cache_valid(cache_path):
+        """Check if cache file exists and is recent"""
+        if not os.path.exists(cache_path):
+            return False
+        
+        file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+        if datetime.now() - file_time > timedelta(days=CACHE_EXPIRY_DAYS):
+            return False
+        
+        return True
+    
+    @staticmethod
+    def save_to_cache(data, ticker, data_type='data'):
+        """Save data to cache"""
+        cache_path = CacheManager.get_cache_path(ticker, data_type)
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(data, f)
+            logger.debug(f"Cached {data_type} for {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to cache {data_type} for {ticker}: {e}")
+    
+    @staticmethod
+    def load_from_cache(ticker, data_type='data'):
+        """Load data from cache"""
+        cache_path = CacheManager.get_cache_path(ticker, data_type)
+        
+        if not CacheManager.is_cache_valid(cache_path):
+            return None
+        
+        try:
+            with open(cache_path, 'rb') as f:
+                data = pickle.load(f)
+            logger.debug(f"Loaded {data_type} from cache for {ticker}")
+            return data
+        except Exception as e:
+            logger.error(f"Failed to load cache for {ticker}: {e}")
+            return None
+
+def deduplicate_tickers(tickers):
+    """Remove duplicates after normalization"""
+    if not tickers:
+        return []
+    
+    normalized = []
+    seen = set()
+    
+    for ticker in tickers:
+        norm_ticker = normalize_ticker(ticker)
+        if norm_ticker and norm_ticker not in seen:
+            seen.add(norm_ticker)
+            normalized.append(norm_ticker)
+    
+    logger.info(f"Deduplicated {len(tickers)} tickers to {len(normalized)} unique tickers")
+    return normalized
 
 def normalize_ticker(ticker):
-    return ticker.strip().upper() if ticker else ticker
+    """
+    Normalize user-entered symbols to Yahoo Finance format.
+    - Crypto: 'BTC', 'BTCUSD', 'BTC.USD' => 'BTC-USD' (and similar for other bases)
+      * Bare auto-map only for SAFE_BARE_CRYPTO_BASES to avoid equity collisions (e.g., SOL).
+    - Indices: keep '^GSPC' form unchanged.
+    - Equities with dot suffix: BRK.B/BF.B => BRK-B/BF-B (Yahoo style).
+    """
+    if not ticker:
+        return ticker
+    t = ticker.strip().upper()
 
-def fetch_data(ticker):
+    # Leave index-style tickers as-is (e.g., ^GSPC)
+    if t.startswith('^'):
+        return t
+
+    # Convert Yahoo dot-suffix equities to dash (e.g., BRK.B -> BRK-B, BF.B -> BF-B)
+    if re.match(r'^[A-Z]{1,5}\.[A-Z0-9]{1,3}$', t):
+        t = t.replace('.', '-')
+
+    # Crypto normalization with explicit USD suffix (BTCUSD / BTC.USD / BTC-USD)
+    m = re.fullmatch(r'([A-Z0-9]+)[.\-]?USD', t)
+    if m:
+        base = m.group(1)
+        if base == 'XBT':  # alias for BTC
+            base = 'BTC'
+        if base in CRYPTO_BASES:
+            return f'{base}-USD'
+        # If it's not a known base, fall through to return t as-is
+
+    # Bare crypto base (safe subset only)
+    if t == 'XBT':
+        return 'BTC-USD'
+    if t in SAFE_BARE_CRYPTO_BASES:
+        return f'{t}-USD'
+
+    return t
+
+def fetch_data(ticker, use_cache=True, max_retries=3):
+    """Fetch data with optional caching support"""
     if not ticker or not ticker.strip():
         return pd.DataFrame()
+
+    original = ticker
     ticker = normalize_ticker(ticker)
+    if original and original.strip().upper() != ticker:
+        logger.info(f"Normalized ticker: {original.strip()} -> {ticker}")
+    
+    # Try to load from cache first (only if caching is enabled)
+    if use_cache:
+        cached_data = CacheManager.load_from_cache(ticker, 'data')
+        if cached_data is not None:
+            logger.info(f"Using cached data for {ticker}")
+            return cached_data
+    
+    # Enhanced retry logic with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Fetching fresh data for {ticker} (attempt {attempt+1}/{max_retries})...")
+            # Use lock for yfinance download (not thread-safe)
+            with yfinance_lock:
+                df = yf.download(ticker, period='max', interval='1d', progress=False, 
+                               auto_adjust=False, timeout=10, threads=False)
+            if df.empty:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                    logger.warning(f"No data returned for {ticker}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
+                    return pd.DataFrame()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            break  # Success, exit retry loop
+            
+        except Exception as e:
+            wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+            logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"All retries exhausted for {ticker}: {e}")
+                return pd.DataFrame()
+    
     try:
-        logger.info(f"Fetching data for {ticker}...")
-        df = yf.download(ticker, period='max', interval='1d', progress=False, auto_adjust=False)
-        if df.empty:
-            logger.warning(f"No data returned for {ticker}.")
-            return pd.DataFrame()
-        df.index = pd.to_datetime(df.index).tz_localize(None)
 
         if 'Adj Close' in df.columns:
             df = df[['Adj Close']]
@@ -58,6 +964,9 @@ def fetch_data(ticker):
             logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
             return pd.DataFrame()
 
+        # Don't cache for impact analysis to avoid multiprocessing corruption
+        # CacheManager.save_to_cache(df, ticker, 'data')
+        
         logger.info(f"Successfully fetched {len(df)} days of data for {ticker}.")
         return df
     except Exception as e:
@@ -155,10 +1064,16 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df)
         annualized_return = avg_daily_capture * 252
         annualized_std = std_dev * np.sqrt(252)
         sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std != 0 else 0.0
+        # Ensure Sharpe ratio is real
+        if isinstance(sharpe_ratio, complex):
+            sharpe_ratio = sharpe_ratio.real
         
         # Calculate t-statistic and p-value
-        t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
-        p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=trigger_days - 1))
+        if std_dev == 0:
+            t_statistic, p_value = None, None
+        else:
+            t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
+            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=trigger_days - 1))
     else:
         std_dev = 0.0
         sharpe_ratio = 0.0
@@ -185,6 +1100,7 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df)
     )
 
     return {
+        'Primary Ticker': '',  # Will be filled later
         'Trigger Days': trigger_days,
         'Wins': int(wins),
         'Losses': int(losses),
@@ -201,6 +1117,10 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df)
     }
 
 def export_results_to_excel(output_filename, metrics_list):
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_filename)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Exporting results to {output_filename}...")
 
     # Define your desired column order
@@ -254,9 +1174,153 @@ def export_results_to_excel(output_filename, metrics_list):
 
     logger.info("Results successfully exported.")
 
-def process_primary_tickers(secondary_ticker, primary_tickers):
+def process_single_ticker_wrapper(args):
+    """Wrapper for multiprocessing compatibility"""
+    return process_single_ticker(*args)
+
+def process_single_ticker(prim_ticker, sec_df, sma_cache=None):
+    """Process a single primary ticker"""
+    prim_ticker = normalize_ticker(prim_ticker)
+    logger.info(f"Processing {prim_ticker}...")
+    
+    # Always fetch fresh data for primary tickers (no caching to avoid corruption)
+    df = fetch_data(prim_ticker, use_cache=False)
+    if df.empty:
+        logger.warning(f"No data for primary ticker {prim_ticker}, skipping.")
+        return None
+
+    close_values = df['Close'].values
+    num_days = len(df)
+    if num_days < 2:
+        logger.warning(f"Insufficient days of data for {prim_ticker}, skipping.")
+        return None
+    
+    # Debug: Verify unique data per ticker
+    logger.info(f"Ticker {prim_ticker}: {num_days} days, Close[0]={close_values[0]:.2f}, Close[-1]={close_values[-1]:.2f}")
+
+    # Check for cached SMA calculations
+    cache_key = f"{prim_ticker}_sma"
+    if sma_cache and cache_key in sma_cache:
+        sma_matrix = sma_cache[cache_key]
+        logger.debug(f"Using cached SMA for {prim_ticker}")
+    else:
+        logger.info("Computing SMAs...")
+        cumsum = np.cumsum(np.insert(close_values, 0, 0))
+        sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float32)
+        sma_matrix.fill(np.nan)
+        for i in range(1, MAX_SMA_DAY + 1):
+            valid_indices = np.arange(i-1, num_days)
+            sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
+        
+        if sma_cache is not None:
+            sma_cache[cache_key] = sma_matrix
+
+    # Compute returns once (converted to float32 for efficiency)
+    logger.info("Computing returns using pct_change()...")
+    returns_pct = df['Close'].pct_change().fillna(0).to_numpy(dtype=np.float32) * 100
+    
+    logger.info("Computing daily top pairs using fully-streaming algorithm...")
+    # True streaming: no O(days × pairs) arrays at all
+    daily_top_buy_pairs = {}
+    daily_top_short_pairs = {}
+    
+    # Use float64 for accumulators to prevent precision loss over long periods
+    buy_cum = np.zeros(len(PAIRS), dtype=np.float64)
+    short_cum = np.zeros(len(PAIRS), dtype=np.float64)
+    
+    for idx, date in enumerate(df.index):
+        # Get this day's SMA vector
+        sma_t = sma_matrix[idx]  # shape (MAX_SMA_DAY,)
+        
+        # Compute day-only signals: +1 buy, -1 short, 0 none
+        # This replaces the huge sma_i/sma_j/signals arrays
+        valid_mask = np.isfinite(sma_t[I_IDX]) & np.isfinite(sma_t[J_IDX])
+        cmp = np.zeros(len(PAIRS), dtype=np.int8)
+        cmp[valid_mask] = np.sign(sma_t[I_IDX[valid_mask]] - sma_t[J_IDX[valid_mask]]).astype(np.int8)
+        
+        # Get this day's return
+        r = float(returns_pct[idx])
+        
+        # In-place masked updates (avoids temporary arrays)
+        if r != 0.0:
+            buy_mask = (cmp == 1)
+            if buy_mask.any():
+                buy_cum[buy_mask] += r
+            short_mask = (cmp == -1)
+            if short_mask.any():
+                short_cum[short_mask] += -r
+        
+        # Find top pairs with reverse tie-breaking
+        max_buy_idx = len(buy_cum) - 1 - np.argmax(buy_cum[::-1])
+        max_short_idx = len(short_cum) - 1 - np.argmax(short_cum[::-1])
+        
+        # Store results (converting back to Python types for consistency)
+        daily_top_buy_pairs[date] = (
+            (int(PAIRS[max_buy_idx, 0]), int(PAIRS[max_buy_idx, 1])),
+            float(buy_cum[max_buy_idx])
+        )
+        daily_top_short_pairs[date] = (
+            (int(PAIRS[max_short_idx, 0]), int(PAIRS[max_short_idx, 1])),
+            float(short_cum[max_short_idx])
+        )
+
+    logger.info("Deriving primary signals from previous day's top pairs...")
+    primary_dates = df.index
+    primary_signals = []
+    previous_date = None
+
+    for date in primary_dates:
+        if previous_date is None:
+            primary_signals.append('None')
+            previous_date = date
+            continue
+
+        buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((1,2),0.0))
+        short_pair, short_val = daily_top_short_pairs.get(previous_date, ((1,2),0.0))
+
+        # Get previous day's SMA values
+        sma1_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[0]-1]
+        sma2_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[1]-1]
+        sma1_short = sma_matrix[df.index.get_loc(previous_date), short_pair[0]-1]
+        sma2_short = sma_matrix[df.index.get_loc(previous_date), short_pair[1]-1]
+
+        buy_signal = sma1_buy > sma2_buy
+        short_signal = sma1_short < sma2_short
+
+        if buy_signal and short_signal:
+            current_signal = 'Buy' if buy_val > short_val else 'Short'
+        elif buy_signal:
+            current_signal = 'Buy'
+        elif short_signal:
+            current_signal = 'Short'
+        else:
+            current_signal = 'None'
+
+        primary_signals.append(current_signal)
+        previous_date = date
+
+    logger.info("Calculating final metrics for this primary ticker...")
+    logger.info(f"Signal distribution before metrics calculation:")
+    signal_counts = pd.Series(primary_signals).value_counts()
+    logger.info(f"Buy signals: {signal_counts.get('Buy', 0)}")
+    logger.info(f"Short signals: {signal_counts.get('Short', 0)}")
+    logger.info(f"None signals: {signal_counts.get('None', 0)}")
+    
+    result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
+    if result is not None:
+        result['Primary Ticker'] = prim_ticker
+    
+    return result
+
+def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing=False):
+    """Process primary tickers with progress tracking and optional multiprocessing"""
+    global progress_tracker
+    
+    # Deduplicate primary tickers after normalization
+    primary_tickers = deduplicate_tickers(primary_tickers)
+    
     secondary_ticker = normalize_ticker(secondary_ticker)
-    sec_df = fetch_data(secondary_ticker)
+    sec_df = fetch_data(secondary_ticker, use_cache=False)
     if sec_df.empty:
         logger.error(f"No data for secondary ticker {secondary_ticker}, cannot proceed.")
         return []
@@ -265,256 +1329,1085 @@ def process_primary_tickers(secondary_ticker, primary_tickers):
     sec_df = sec_df.sort_index()
 
     metrics_list = []
-    MAX_SMA_DAY = 114
+    sma_cache = {}  # Cache for SMA calculations
 
     logger.info(f"Starting analysis for Secondary Ticker: {secondary_ticker}")
-    logger.info("Verifying logic alignment with main script and ensuring correct computation steps...")
-    logger.info("We will compute SMAs, generate signals, identify top pairs daily, and then derive the final metrics.")
-
-    for prim_ticker in tqdm(primary_tickers, desc="Processing Primary Tickers", unit="ticker"):
-        prim_ticker = normalize_ticker(prim_ticker)
-        logger.info(f"Processing {prim_ticker}...")
-        df = fetch_data(prim_ticker)
-        if df.empty:
-            logger.warning(f"No data for primary ticker {prim_ticker}, skipping.")
-            continue
-
-        close_values = df['Close'].values
-        num_days = len(df)
-        if num_days < 2:
-            logger.warning(f"Insufficient days of data for {prim_ticker}, skipping.")
-            continue
-
-        logger.info("Computing SMAs...")
-        cumsum = np.cumsum(np.insert(close_values, 0, 0))
-        sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=float)
-        sma_matrix.fill(np.nan)
-        for i in range(1, MAX_SMA_DAY + 1):
-            valid_indices = np.arange(i-1, num_days)
-            sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
-
-        # Use pct_change to get returns aligned properly
-        logger.info("Computing returns using pct_change() to avoid broadcast issues...")
-        returns = df['Close'].pct_change().fillna(0).values * 100
-
-        # Generate all pairs
-        i_array = np.arange(1, MAX_SMA_DAY+1)
-        j_array = np.arange(1, MAX_SMA_DAY+1)
-        pairs = np.array([(i, j) for i in i_array for j in j_array if i != j], dtype=int)
-        i_indices = pairs[:,0] - 1
-        j_indices = pairs[:,1] - 1
-
-        logger.info("Generating signals from SMA comparisons...")
-        sma_i = sma_matrix[:, i_indices]
-        sma_j = sma_matrix[:, j_indices]
-
-        buy_signals = (sma_i > sma_j)
-        short_signals = (sma_i < sma_j)
-
-        signals = np.full((num_days, len(pairs)), 0)
-        valid_sma = np.isfinite(sma_i) & np.isfinite(sma_j)
-        signals[1:][valid_sma[:-1]] = np.where(buy_signals[:-1][valid_sma[:-1]], 1, 
-                                            np.where(short_signals[:-1][valid_sma[:-1]], -1, 0))
+    
+    # Update progress tracker
+    progress_tracker['total_tickers'] = len(primary_tickers)
+    progress_tracker['start_time'] = time.time()
+    progress_tracker['status'] = 'processing'
+    
+    if use_multiprocessing and len(primary_tickers) > 3:
+        # Use multiprocessing for large batches
+        logger.info("Using multiprocessing for faster analysis...")
+        
+        # Pass sec_df by reference (read-only in workers, no need to copy)
+        process_args = [(ticker, sec_df, None) for ticker in primary_tickers]
+        
+        # Use ThreadPoolExecutor (ProcessPoolExecutor has pickle issues with DataFrames)
+        max_workers = max(1, min(multiprocessing.cpu_count() - 1, 8))
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks with isolated data copies
+            futures = {executor.submit(process_single_ticker, *args): args[0] 
+                      for args in process_args}
             
-        logger.info("Computing buy/short captures and cumulative sums...")
-        buy_captures = np.where(signals == 1, returns[:,None], 0)
-        short_captures = np.where(signals == -1, returns[:,None]*(-1), 0)
+            completed_count = 0
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    result = future.result()  # No timeout
+                    if result:
+                        result['Secondary Ticker'] = secondary_ticker
+                        metrics_list.append(result)
+                        progress_tracker['results'] = metrics_list.copy()
+                except Exception as e:
+                    logger.error(f"Error processing {ticker}: {e}")
+                finally:
+                    completed_count += 1
+                    progress_tracker['current_index'] = completed_count  # Not -1
+                    progress_tracker['current_ticker'] = ticker
+                    logger.info(f"Completed {completed_count}/{len(primary_tickers)}: {ticker}")
+    else:
+        # Sequential processing for small batches (with TQDM console bar)
+        for idx, prim_ticker in enumerate(tqdm(primary_tickers, desc="Processing Primary Tickers", unit="ticker")):
+            with progress_lock:
+                progress_tracker['current_ticker'] = prim_ticker
+            
+            result = process_single_ticker(prim_ticker, sec_df, sma_cache)
+            if result:
+                result['Secondary Ticker'] = secondary_ticker
+                metrics_list.append(result)
+                progress_tracker['results'] = metrics_list.copy()
+            
+            progress_tracker['current_index'] = idx + 1  # Mark as completed
+            logger.info(f"Completed {idx+1}/{len(primary_tickers)}: {prim_ticker}")
 
-        buy_cumulative = np.nancumsum(buy_captures, axis=0)
-        short_cumulative = np.nancumsum(short_captures, axis=0)
-
-        logger.info("Selecting daily top pairs based on cumulative captures...")
-        daily_top_buy_pairs = {}
-        daily_top_short_pairs = {}
-        for idx, date in enumerate(df.index):
-            buy_day = buy_cumulative[idx]
-            short_day = short_cumulative[idx]
-
-            # Reverse priority tie-breaking logic
-            max_buy_idx = len(buy_day) - 1 - np.argmax(buy_day[::-1])
-            max_short_idx = len(short_day) - 1 - np.argmax(short_day[::-1])
-
-            # Only assign valid signals if we have enough data
-            if np.isfinite(buy_day[max_buy_idx]):
-                top_buy_pair = (pairs[max_buy_idx,0], pairs[max_buy_idx,1])
-                buy_value = buy_day[max_buy_idx]
-            else:
-                top_buy_pair = (1,2)
-                buy_value = 0.0
-
-            if np.isfinite(short_day[max_short_idx]):
-                top_short_pair = (pairs[max_short_idx,0], pairs[max_short_idx,1])
-                short_value = short_day[max_short_idx]
-            else:
-                top_short_pair = (1,2)
-                short_value = 0.0
-
-            daily_top_buy_pairs[date] = (top_buy_pair, buy_value)
-            daily_top_short_pairs[date] = (top_short_pair, short_value)
-
-        logger.info("Deriving primary signals from previous day's top pairs...")
-        primary_dates = df.index
-        primary_signals = []
-        previous_date = None
-
-
-        for date in primary_dates:
-            if previous_date is None:
-                primary_signals.append('None')
-                previous_date = date
-                continue
-
-            buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((1,2),0.0))
-            short_pair, short_val = daily_top_short_pairs.get(previous_date, ((1,2),0.0))
-
-            # Get previous day's SMA values
-            sma1_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[0]-1]
-            sma2_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[1]-1]
-            sma1_short = sma_matrix[df.index.get_loc(previous_date), short_pair[0]-1]
-            sma2_short = sma_matrix[df.index.get_loc(previous_date), short_pair[1]-1]
-
-            buy_signal = sma1_buy > sma2_buy
-            short_signal = sma1_short < sma2_short
-
-            if buy_signal and short_signal:
-                current_signal = 'Buy' if buy_val > short_val else 'Short'
-            elif buy_signal:
-                current_signal = 'Buy'
-            elif short_signal:
-                current_signal = 'Short'
-            else:
-                current_signal = 'None'
-
-            primary_signals.append(current_signal)
-            previous_date = date
-
-        logger.info("Calculating final metrics for this primary ticker...")
-        logger.info(f"Signal distribution before metrics calculation:")
-        signal_counts = pd.Series(primary_signals).value_counts()
-        logger.info(f"Buy signals: {signal_counts.get('Buy', 0)}")
-        logger.info(f"Short signals: {signal_counts.get('Short', 0)}")
-        logger.info(f"None signals: {signal_counts.get('None', 0)}")
-        result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
-        if result is not None:
-            result['Primary Ticker'] = prim_ticker
-            result['Secondary Ticker'] = secondary_ticker
-            metrics_list.append(result)
-        else:
-            logger.info(f"No valid triggers or insufficient overlap for {prim_ticker}, skipping.")
-
-        logger.info(f"Completed processing for {prim_ticker}.")
-
+    progress_tracker['status'] = 'complete'
     return metrics_list
 
+# Create Dash app
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 
+# Define the layout
 app.layout = dbc.Container([
-    html.H1("Impact Analysis Tool", style={'color': '#80ff00'}),
-    html.P("Use this tool to analyze the impact of various primary tickers against a single secondary ticker. "
-           "Enter one or multiple primary tickers separated by commas, and a single secondary ticker. Then click 'Process'."),
-    html.P("If you have a large number of primary tickers, processing will take time. We have enabled vectorization, "
-           "logging, and a TQDM console progress bar to provide insight. Check the console and logs/impactsearch.log for details."),
+    # Header
+    dbc.Row([
+        dbc.Col([
+            html.H1("Impact Analysis Tool", 
+                   style={'color': '#00ff41', 'textShadow': '0 0 10px rgba(0, 255, 65, 0.5)'}),
+            html.P("Analyze the impact of primary tickers on secondary ticker performance using SMA-based signals",
+                  style={'color': '#aaa'})
+        ])
+    ], className='mb-4'),
+    
+    # Input Section
     dbc.Row([
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader("Primary Tickers"),
+                dbc.CardHeader(html.H5("Analysis Configuration", style={'color': '#00ff41'})),
                 dbc.CardBody([
-                    html.P("Example: AAPL, MSFT, AMZN"),
-                    dbc.Textarea(
-                        id='primary-tickers-input',
-                        placeholder='Enter primary tickers separated by commas...',
-                        style={'height': '100px'}
-                    )
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("Primary Tickers", style={'color': '#00ff41'}),
+                            html.P("Enter comma-separated tickers (e.g., AAPL, MSFT, GOOGL)", 
+                                  style={'fontSize': '0.8rem', 'color': '#888'}),
+                            dbc.Textarea(
+                                id='primary-tickers-input',
+                                placeholder='Enter primary tickers...',
+                                style={'height': '100px', 'backgroundColor': 'rgba(0, 0, 0, 0.3)',
+                                      'border': '1px solid #00ff41', 'color': '#fff'},
+                                className='mb-3'
+                            ),
+                            # Preset ticker lists - consistent styling
+                            dbc.ButtonGroup([
+                                dbc.Button("Tech Giants", id='preset-tech', color='primary', size='sm', outline=True),
+                                dbc.Button("S&P Top 10", id='preset-sp10', color='primary', size='sm', outline=True),
+                                dbc.Button("Crypto Top 10", id='preset-crypto', color='success', size='sm', outline=True),
+                                dbc.Button("Random Mix (20)", id='preset-random', color='info', size='sm'),
+                                dbc.Button("Clear", id='preset-clear', color='danger', size='sm'),
+                                dbc.Button("Clear Cache", id='clear-cache-btn', color='warning', size='sm')
+                            ], className='mb-2'),
+                            
+                            # Market cap category presets - consistent styling
+                            dbc.ButtonGroup([
+                                dbc.Button("Mega Cap ($200B+)", id='preset-mega', color='primary', size='sm', outline=True),
+                                dbc.Button("Large Cap ($10-200B)", id='preset-large', color='primary', size='sm', outline=True),
+                                dbc.Button("Mid Cap ($2-10B)", id='preset-mid', color='primary', size='sm', outline=True),
+                                dbc.Button("Small Cap ($300M-2B)", id='preset-small', color='primary', size='sm', outline=True),
+                                dbc.Button("Micro Cap (<$300M)", id='preset-micro', color='primary', size='sm', outline=True)
+                            ], className='mb-3'),
+                            
+                            # File upload
+                            html.Hr(style={'borderColor': '#444'}),
+                            html.Label("Or Upload Ticker List", style={'color': '#00ff41', 'fontSize': '0.9rem'}),
+                            dcc.Upload(
+                                id='upload-tickers',
+                                children=html.Div([
+                                    'Drag and Drop or ',
+                                    html.A('Select CSV/TXT File', style={'color': '#00ff41', 'textDecoration': 'underline'})
+                                ]),
+                                style={
+                                    'width': '100%',
+                                    'height': '60px',
+                                    'lineHeight': '60px',
+                                    'borderWidth': '1px',
+                                    'borderStyle': 'dashed',
+                                    'borderRadius': '5px',
+                                    'borderColor': '#00ff41',
+                                    'textAlign': 'center',
+                                    'margin': '10px 0',
+                                    'backgroundColor': 'rgba(0, 255, 65, 0.05)'
+                                },
+                                multiple=False
+                            )
+                        ], width=6),
+                        dbc.Col([
+                            html.Label("Secondary Ticker", style={'color': '#00ff41'}),
+                            html.P("Enter the ticker to analyze impact against (e.g., SPY)", 
+                                  style={'fontSize': '0.8rem', 'color': '#888'}),
+                            dbc.Input(
+                                id='secondary-ticker-input',
+                                placeholder='Enter secondary ticker...',
+                                type='text',
+                                style={'backgroundColor': 'rgba(0, 0, 0, 0.3)',
+                                      'border': '1px solid #00ff41', 'color': '#fff'},
+                                className='mb-3'
+                            ),
+                            html.Hr(style={'borderColor': '#444', 'marginTop': '20px'}),
+                            html.Label("Analysis Options", style={'color': '#00ff41', 'fontSize': '0.9rem'}),
+                            dbc.Checklist(
+                                id='analysis-options',
+                                options=[
+                                    {'label': ' Use Multiprocessing (Faster for >3 tickers)', 'value': 'multiprocessing'},
+                                    {'label': ' Export Excel File', 'value': 'export_excel'},
+                                    {'label': ' Generate PDF Report' + (' (Requires ReportLab)' if not REPORTLAB_AVAILABLE else ''), 
+                                     'value': 'pdf', 'disabled': not REPORTLAB_AVAILABLE},
+                                    {'label': ' Save as Template', 'value': 'save_template'}
+                                ],
+                                value=['multiprocessing', 'export_excel'],
+                                inline=False,
+                                style={'color': '#aaa', 'fontSize': '0.85rem'}
+                            ),
+                            dbc.Button(
+                                "Start Analysis",
+                                id='process-button',
+                                color='success',
+                                size='lg',
+                                style={'width': '100%', 'marginTop': '20px'},
+                                className='pulse-animation'
+                            )
+                        ], width=6)
+                    ])
                 ])
-            ], className='mb-3')
-        ], width=6),
+            ], style={'backgroundColor': 'rgba(0, 0, 0, 0.6)', 'border': '1px solid #00ff41'})
+        ])
+    ], className='mb-4'),
+    
+    # Progress Section
+    dbc.Row([
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader("Secondary Ticker"),
                 dbc.CardBody([
-                    html.P("Example: ^GSPC"),
-                    dbc.Input(id='secondary-ticker-input', placeholder='Enter a secondary ticker', type='text'),
-                    html.Br(),
-                    dbc.Button("Process", id='process-button', color='primary', style={'width': '100%'})
+                    html.Div(id='progress-section', children=[
+                        html.H5("Ready to analyze", style={'color': '#00ff41'}),
+                        dbc.Progress(value=0, id='progress-bar', striped=True, animated=True, 
+                                   style={'height': '30px'}, color='success')
+                    ])
                 ])
-            ], className='mb-3')
-        ], width=6)
+            ], style={'backgroundColor': 'rgba(0, 0, 0, 0.6)', 'border': '1px solid #444'})
+        ])
+    ], className='mb-4', id='progress-row', style={'display': 'none'}),
+    
+    # Summary Cards Row
+    dbc.Row([
+        dbc.Col([html.Div(id='summary-cards')], width=12)
+    ], className='mb-4'),
+    
+    # Results Section with Tabs
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader(html.H5("Analysis Results", style={'color': '#00ff41'})),
+                dbc.CardBody([
+                    dbc.Tabs([
+                        dbc.Tab(label="📋 Summary", tab_id="tab-summary", 
+                               label_style={'color': '#00ff41', 'fontWeight': 'bold'}),
+                        dbc.Tab(label="Results Table", tab_id="tab-table"),
+                        dbc.Tab(label="Performance Charts", tab_id="tab-charts"),
+                        dbc.Tab(label="Statistical Analysis", tab_id="tab-stats"),
+                        dbc.Tab(label="Correlation Analysis", tab_id="tab-correlation"),
+                        dbc.Tab(label="Advanced Analytics", tab_id="tab-advanced")
+                    ], id='result-tabs', active_tab='tab-summary'),
+                    html.Div(id='tab-content', className='mt-3')
+                ])
+            ], style={'backgroundColor': 'rgba(0, 0, 0, 0.6)', 'border': '1px solid #00ff41',
+                     'display': 'none'}, id='results-card')
+        ])
     ]),
-    html.Div(id='process-status', style={'color': '#80ff00', 'marginTop': '20px'}),
-    dbc.Progress(id='progress-bar', value=0, striped=True, animated=True, style={'marginTop': '20px', 'height': '30px'}, color='success'),
-    html.P("After processing, results are exported to an Excel file named after the secondary ticker. "
-           "You can re-run analysis with different sets of primary tickers to append results.")
-], fluid=True)
+    
+    # Interval component for real-time updates
+    dcc.Interval(id='interval-component', interval=1000, n_intervals=0, disabled=True),
+    
+    # Store components for data persistence
+    dcc.Store(id='analysis-results-store'),
+    dcc.Store(id='processing-state-store', data={'status': 'idle'}),
+    dcc.Store(id='follow-up-action-store'),
+    dcc.Store(id='secondary-ticker-store')
+    
+], fluid=True, style={'backgroundColor': '#0a0a0a', 'minHeight': '100vh', 'padding': '20px'})
 
+# File upload callback
 @app.callback(
-    [Output('process-status', 'children'),
-     Output('progress-bar', 'value'),
-     Output('progress-bar', 'style')],
-    [Input('process-button', 'n_clicks')],
-    [State('secondary-ticker-input', 'value'),
-     State('primary-tickers-input', 'value')]
+    Output('primary-tickers-input', 'value', allow_duplicate=True),
+    [Input('upload-tickers', 'contents')],
+    [State('upload-tickers', 'filename')],
+    prevent_initial_call=True
 )
-def run_analysis(n_clicks, secondary_ticker, primary_tickers_input):
-    """
-    NOTE:
-      This approach simulates incremental progress updates within a single callback. 
-      However, due to Dash's single-round callback execution, the UI will only fully refresh 
-      once the entire process finishes. For truly "live" updates, you'll need 
-      a multi-callback approach with dcc.Interval or background tasks.
-    """
+def parse_uploaded_file(contents, filename):
+    if contents is None:
+        raise dash.exceptions.PreventUpdate
+    
+    try:
+        content_type, content_string = contents.split(',')
+        decoded = base64.b64decode(content_string)
+        
+        # Try to decode as text
+        try:
+            text_content = decoded.decode('utf-8')
+        except:
+            text_content = decoded.decode('latin-1')
+        
+        # Parse tickers from the content
+        # Handle both CSV and plain text formats
+        tickers = []
+        
+        if filename.endswith('.csv'):
+            # Parse as CSV
+            df = pd.read_csv(io.StringIO(text_content))
+            # Look for a column that might contain tickers
+            for col in df.columns:
+                if 'ticker' in col.lower() or 'symbol' in col.lower() or col.lower() == 'ticker':
+                    tickers = df[col].dropna().tolist()
+                    break
+            if not tickers and len(df.columns) > 0:
+                # Use first column if no ticker column found
+                tickers = df.iloc[:, 0].dropna().tolist()
+        else:
+            # Parse as plain text (comma or newline separated)
+            # Replace common separators with commas
+            text_content = text_content.replace('\n', ',').replace('\r', ',').replace(';', ',')
+            tickers = [t.strip() for t in text_content.split(',') if t.strip()]
+        
+        # Clean and validate tickers
+        tickers = [t.upper().strip() for t in tickers if t.strip() and len(t.strip()) <= 10]
+        
+        if tickers:
+            return ', '.join(tickers[:100])  # Limit to 100 tickers
+        else:
+            return dash.no_update
+            
+    except Exception as e:
+        logger.error(f"Error parsing uploaded file: {e}")
+        return dash.no_update
+
+# Define market cap category ticker lists
+MEGA_CAP_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'BRK-B', 'LLY', 'TSM', 'V',
+                    'JPM', 'WMT', 'JNJ', 'XOM', 'UNH', 'MA', 'PG', 'HD', 'CVX', 'MRK']
+
+LARGE_CAP_TICKERS = ['CRM', 'AMD', 'ORCL', 'NFLX', 'COST', 'PEP', 'KO', 'BA', 'GS', 'IBM',
+                     'INTC', 'DIS', 'CSCO', 'TMO', 'ABT', 'VZ', 'NKE', 'WFC', 'MS', 'QCOM']
+
+MID_CAP_TICKERS = ['SNAP', 'ROKU', 'ZM', 'PINS', 'PLTR', 'DOCU', 'TWLO', 'NET', 'DDOG', 'CRWD',
+                   'PATH', 'U', 'RBLX', 'COIN', 'HOOD', 'AFRM', 'SOFI', 'UPST', 'BILL', 'MARA']
+
+SMALL_CAP_TICKERS = ['FSLY', 'FVRR', 'APPS', 'FUBO', 'SKLZ', 'VERI', 'SPCE', 'RKT', 'OPEN', 'ASTS',
+                     'CLOV', 'STEM', 'GOEV', 'WKHS', 'HYLN', 'CHPT', 'BLNK', 'EVGO', 'QS', 'PAYO']
+
+MICRO_CAP_TICKERS = ['TBLT', 'SYTA', 'PRPO', 'EDBL', 'SOUN', 'PETZ', 'TKLF', 'MBOT', 'GMBL', 'ACHR',
+                     'GEVO', 'DAVE', 'SNGX', 'BTAI', 'BTBT', 'IONQ', 'NUKK', 'ADTX', 'BOXL', 'VERB']
+
+# Popular crypto tickers for analysis
+CRYPTO_TICKERS = ['BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
+                  'ADA-USD', 'DOGE-USD', 'AVAX-USD', 'DOT-USD', 'MATIC-USD',
+                  'LINK-USD', 'LTC-USD', 'UNI-USD', 'ATOM-USD', 'ETC-USD']
+
+def get_random_mix():
+    """Generate a random mix of 20 tickers from all categories"""
+    all_categories = [
+        MEGA_CAP_TICKERS,
+        LARGE_CAP_TICKERS,
+        MID_CAP_TICKERS,
+        SMALL_CAP_TICKERS,
+        MICRO_CAP_TICKERS
+    ]
+    
+    selected = []
+    for category in all_categories:
+        # Select 4 tickers from each category
+        selected.extend(random.sample(category, min(4, len(category))))
+    
+    # Shuffle the selected tickers
+    random.shuffle(selected)
+    return selected[:20]
+
+# Callback for clearing cache
+@app.callback(
+    Output('progress-section', 'children', allow_duplicate=True),
+    Input('clear-cache-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def clear_cache(n_clicks):
+    if n_clicks:
+        import shutil
+        cache_cleared = False
+        
+        # Clear the cache/impact_analysis directory
+        impact_cache_dir = CACHE_DIR  # CACHE_DIR already == 'cache/impact_analysis'
+        if os.path.exists(impact_cache_dir):
+            try:
+                shutil.rmtree(impact_cache_dir)
+                os.makedirs(impact_cache_dir, exist_ok=True)
+                cache_cleared = True
+                logger.info("Cache cleared successfully")
+            except Exception as e:
+                logger.error(f"Failed to clear cache: {e}")
+                return html.Div([
+                    html.H5("Failed to clear cache", style={'color': '#ff4141'}),
+                    dbc.Progress(value=0, striped=True, animated=True, style={'height': '30px'}, color='danger')
+                ])
+        
+        if cache_cleared:
+            return html.Div([
+                html.H5("Cache cleared successfully! Ready to analyze", style={'color': '#00ff41'}),
+                dbc.Progress(value=0, striped=True, animated=True, style={'height': '30px'}, color='success')
+            ])
+    
+    raise dash.exceptions.PreventUpdate
+
+# Callbacks for preset buttons
+@app.callback(
+    Output('primary-tickers-input', 'value', allow_duplicate=True),
+    [Input('preset-tech', 'n_clicks'),
+     Input('preset-sp10', 'n_clicks'),
+     Input('preset-crypto', 'n_clicks'),
+     Input('preset-clear', 'n_clicks'),
+     Input('preset-mega', 'n_clicks'),
+     Input('preset-large', 'n_clicks'),
+     Input('preset-mid', 'n_clicks'),
+     Input('preset-small', 'n_clicks'),
+     Input('preset-micro', 'n_clicks'),
+     Input('preset-random', 'n_clicks')],
+    [State('primary-tickers-input', 'value')],
+    prevent_initial_call=True
+)
+def handle_presets(tech_clicks, sp10_clicks, crypto_clicks, clear_clicks, mega_clicks, large_clicks, 
+                  mid_clicks, small_clicks, micro_clicks, random_clicks, current_value):
+    ctx = callback_context
+    if not ctx.triggered:
+        raise dash.exceptions.PreventUpdate
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Define preset lists
+    preset_lists = {
+        'preset-tech': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA'],
+        'preset-sp10': ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'BRK-B', 'LLY', 'AVGO', 'JPM'],
+        'preset-crypto': ['BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
+                         'ADA-USD', 'DOGE-USD', 'AVAX-USD', 'DOT-USD', 'MATIC-USD'],
+        'preset-mega': MEGA_CAP_TICKERS,
+        'preset-large': LARGE_CAP_TICKERS,
+        'preset-mid': MID_CAP_TICKERS,
+        'preset-small': SMALL_CAP_TICKERS,
+        'preset-micro': MICRO_CAP_TICKERS,
+        'preset-random': get_random_mix()
+    }
+    
+    # Handle clear button
+    if button_id == 'preset-clear':
+        return ''
+    
+    # Get the new tickers to add
+    if button_id in preset_lists:
+        new_tickers = preset_lists[button_id]
+        
+        # Parse existing tickers
+        existing_tickers = []
+        if current_value:
+            existing_tickers = [t.strip().upper() for t in current_value.split(',') if t.strip()]
+        
+        # Combine and deduplicate (preserving order, new tickers at end)
+        combined_tickers = existing_tickers.copy()
+        for ticker in new_tickers:
+            if ticker.upper() not in [t.upper() for t in combined_tickers]:
+                combined_tickers.append(ticker)
+        
+        return ', '.join(combined_tickers)
+    
+    raise dash.exceptions.PreventUpdate
+
+# Main processing callback
+@app.callback(
+    [Output('interval-component', 'disabled'),
+     Output('processing-state-store', 'data'),
+     Output('progress-row', 'style'),
+     Output('results-card', 'style'),
+     Output('secondary-ticker-store', 'data')],
+    [Input('process-button', 'n_clicks')],
+    [State('primary-tickers-input', 'value'),
+     State('secondary-ticker-input', 'value'),
+     State('analysis-options', 'value')]
+)
+def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis_options):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
-
+    
     if not secondary_ticker or not primary_tickers_input:
-        return "Please enter a secondary ticker and at least one primary ticker.", 0, {'marginTop': '20px', 'height': '30px'}
-
-    secondary_ticker = normalize_ticker(secondary_ticker)
+        raise dash.exceptions.PreventUpdate
+    
+    # Parse tickers
     primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+    
+    # Reset progress tracker
+    global progress_tracker
+    progress_tracker = {
+        'current_ticker': '',
+        'current_index': 0,
+        'total_tickers': len(primary_tickers),
+        'start_time': time.time(),
+        'results': [],
+        'status': 'starting'
+    }
+    
+    # Determine options
+    if analysis_options is None:
+        analysis_options = []
+    
+    use_multiprocessing = 'multiprocessing' in analysis_options
+    export_excel = 'export_excel' in analysis_options
+    generate_pdf = 'pdf' in analysis_options
+    save_template = 'save_template' in analysis_options
+    
+    # Start processing in a separate thread
+    def process_async():
+        results = process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing)
+        if results:
+            # Export Excel if requested
+            if export_excel:
+                output_filename = f"output/impactsearch/{secondary_ticker}_analysis.xlsx"
+                export_results_to_excel(output_filename, results)
+                logger.info(f"Excel file exported to {output_filename}")
+            
+            # Generate PDF if requested
+            if generate_pdf:
+                results_df = pd.DataFrame(results)
+                ReportGenerator.generate_pdf_report(results_df, secondary_ticker)
+            
+            # Save template if requested
+            if save_template:
+                template_config = {
+                    'primary_tickers': primary_tickers,
+                    'secondary_ticker': secondary_ticker,
+                    'options': analysis_options,
+                    'timestamp': datetime.now().isoformat()
+                }
+                template_name = f"{secondary_ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                AnalysisTemplates.save_template(template_name, template_config)
+    
+    thread = threading.Thread(target=process_async)
+    thread.start()
+    
+    # Enable interval updates and show progress
+    return False, {'status': 'processing'}, {'display': 'block'}, \
+           {'backgroundColor': 'rgba(0, 0, 0, 0.6)', 'border': '1px solid #00ff41', 'display': 'block'}, \
+           secondary_ticker
 
-    if not primary_tickers:
-        return "Please enter at least one valid primary ticker.", 0, {'marginTop': '20px', 'height': '30px'}
-
-    logger.info("----- STARTING ANALYSIS -----")
-    logger.info(f"Secondary Ticker: {secondary_ticker}")
-    logger.info(f"Primary Tickers: {primary_tickers}")
-    logger.info("Processing started. Please wait...")
-
-    total_tickers = len(primary_tickers)
-    progress_value = 0
-    message = "Processing in progress..."
-
-    # Manually loop through each ticker to simulate small step updates
-    processed_metrics = []
-    for i, ticker in enumerate(primary_tickers, start=1):
-        # Process each ticker individually
-        single_metrics_list = process_primary_tickers(secondary_ticker, [ticker])
-
-        if single_metrics_list:
-            processed_metrics.extend(single_metrics_list)
-
-        # Compute incremental progress (not fully "live" in a single callback)
-        progress_value = int((i / total_tickers) * 100)
-        message = f"Processed {i} of {total_tickers} tickers ({progress_value}%)..."
-
-        # OPTIONAL: Sleep or pass here
-        # time.sleep(0.2)
-
-    # Once done, export if we have any results
-    if processed_metrics:
-        output_filename = f"output/{secondary_ticker}_analysis.xlsx"
-        export_results_to_excel(output_filename, processed_metrics)
-        message = f"Processing complete. Check {output_filename} for results."
-        progress_value = 100
+# Progress update callback
+@app.callback(
+    [Output('progress-section', 'children'),
+     Output('summary-cards', 'children'),
+     Output('analysis-results-store', 'data'),
+     Output('interval-component', 'disabled', allow_duplicate=True),
+     Output('processing-state-store', 'data', allow_duplicate=True)],
+    [Input('interval-component', 'n_intervals')],
+    [State('processing-state-store', 'data')],
+    prevent_initial_call=True
+)
+def update_progress(n_intervals, processing_state):
+    global progress_tracker
+    
+    if not processing_state or processing_state.get('status') != 'processing':
+        raise dash.exceptions.PreventUpdate
+    
+    # Calculate progress
+    if progress_tracker['total_tickers'] > 0:
+        done = min(progress_tracker['current_index'], progress_tracker['total_tickers'])
+        progress_pct = (done / progress_tracker['total_tickers']) * 100
     else:
-        message = "No valid results to export."
-        progress_value = 100
+        progress_pct = 0
+    
+    # Estimate time remaining
+    if progress_tracker['start_time'] and progress_tracker['current_index'] > 0:
+        elapsed = time.time() - progress_tracker['start_time']
+        rate = elapsed / progress_tracker['current_index']
+        remaining = rate * (progress_tracker['total_tickers'] - progress_tracker['current_index'])
+        time_str = f"~{int(remaining)}s remaining"
+    else:
+        time_str = "Calculating..."
+    
+    # Create progress display
+    progress_display = html.Div([
+        html.H5(f"Processing: {progress_tracker['current_ticker']}", style={'color': '#00ff41'}),
+        html.P(f"Ticker {progress_tracker['current_index'] + 1} of {progress_tracker['total_tickers']} | {time_str}",
+              style={'color': '#aaa'}),
+        dbc.Progress(value=progress_pct, striped=True, animated=True, 
+                    style={'height': '30px'}, color='success')
+    ])
+    
+    # Create summary cards if we have results
+    summary_cards = []
+    if progress_tracker['results']:
+        results_df = pd.DataFrame(progress_tracker['results'])
+        
+        # Calculate summary metrics
+        avg_sharpe = results_df['Sharpe Ratio'].mean()
+        best_performer = results_df.loc[results_df['Sharpe Ratio'].idxmax()]
+        significant_count = len(results_df[results_df['Significant 95%'] == 'Yes'])
+        
+        summary_cards = dbc.Row([
+            dbc.Col([
+                VisualMetrics.create_performance_card(
+                    "Analyzed", 
+                    len(results_df),
+                    f"of {progress_tracker['total_tickers']} tickers",
+                    "📊", "#00ff41", glow=True
+                )
+            ], width=3),
+            dbc.Col([
+                VisualMetrics.create_performance_card(
+                    "Avg Sharpe", 
+                    f"{avg_sharpe:.2f}",
+                    "Risk-adjusted return",
+                    "📈", "#80ff00" if avg_sharpe > 0 else "#ff0040", glow=True
+                )
+            ], width=3),
+            dbc.Col([
+                VisualMetrics.create_performance_card(
+                    "Best Performer", 
+                    best_performer['Primary Ticker'],
+                    f"Sharpe: {best_performer['Sharpe Ratio']:.2f}",
+                    "🏆", "#00ff41", glow=True
+                )
+            ], width=3),
+            dbc.Col([
+                VisualMetrics.create_performance_card(
+                    "Significant", 
+                    significant_count,
+                    "95% confidence level",
+                    "✅", "#00ff41" if significant_count > 0 else "#ff0040", glow=True
+                )
+            ], width=3)
+        ])
+    
+    # Check if processing is complete
+    if progress_tracker['status'] == 'complete':
+        progress_display = html.Div([
+            html.H5("Analysis Complete! ✅", style={'color': '#00ff41'}),
+            html.P(f"Processed {progress_tracker['total_tickers']} tickers successfully",
+                  style={'color': '#aaa'}),
+            dbc.Progress(value=100, striped=False, style={'height': '30px'}, color='success')
+        ])
+        # Stop the interval and update state when complete
+        return progress_display, summary_cards, progress_tracker['results'], True, {'status': 'complete'}
+    
+    # Continue updating while processing
+    return progress_display, summary_cards, progress_tracker['results'], False, processing_state
 
-    logger.info("----- ANALYSIS COMPLETE -----")
-    return message, progress_value, {'marginTop': '20px', 'height': '30px'}
+# Tab content callback
+@app.callback(
+    Output('tab-content', 'children'),
+    [Input('result-tabs', 'active_tab'),
+     Input('analysis-results-store', 'data')],
+)
+def render_tab_content(active_tab, results_data):
+    if not results_data:
+        return html.Div("No results to display yet.", style={'color': '#aaa'})
+    
+    df = pd.DataFrame(results_data)
+    
+    if active_tab == 'tab-summary':
+        # Generate intelligent summary
+        summary_content = []
+        
+        # Get secondary ticker from the first result (they all have the same)
+        secondary_ticker = df.iloc[0]['Secondary Ticker'] if 'Secondary Ticker' in df.columns else 'N/A'
+        
+        # Title section
+        summary_content.append(
+            html.Div([
+                html.H3("📊 Analysis Summary", style={'color': '#00ff41', 'marginBottom': '20px'}),
+                html.P(f"Impact analysis of {len(df)} tickers against {secondary_ticker}", 
+                      style={'color': '#aaa', 'fontSize': '1.1rem'})
+            ])
+        )
+        
+        # Key Findings Section
+        findings = SummaryAnalyzer.analyze_key_findings(df)
+        if findings:
+            findings_cards = []
+            for finding in findings:
+                card = dbc.Card([
+                    dbc.CardBody([
+                        html.H5(finding['title'], style={'color': '#00ff41', 'marginBottom': '10px'}),
+                        html.P(finding['description'], style={'fontSize': '1rem', 'marginBottom': '5px'}),
+                        html.P(finding['details'], style={'fontSize': '0.9rem', 'color': '#888'})
+                    ])
+                ], style={'backgroundColor': 'rgba(0, 0, 0, 0.4)', 'border': '1px solid #444', 
+                         'marginBottom': '15px'})
+                findings_cards.append(card)
+            
+            summary_content.append(html.Div([
+                html.H4("🎯 Key Findings", style={'color': '#80ff00', 'marginTop': '30px', 'marginBottom': '15px'}),
+                html.Div(findings_cards)
+            ]))
+        
+        # Pattern Detection Section
+        patterns = SummaryAnalyzer.detect_patterns(df)
+        if patterns:
+            pattern_cards = []
+            for pattern in patterns:
+                card = dbc.Card([
+                    dbc.CardBody([
+                        html.H5(pattern['title'], style={'color': '#ffff00', 'marginBottom': '10px'}),
+                        html.P(pattern['description'], style={'fontSize': '1rem', 'marginBottom': '5px'}),
+                        html.P(f"💡 {pattern['recommendation']}", 
+                              style={'fontSize': '0.9rem', 'color': '#00ff41', 'fontStyle': 'italic'})
+                    ])
+                ], style={'backgroundColor': 'rgba(255, 255, 0, 0.05)', 'border': '1px solid #ffff00', 
+                         'marginBottom': '15px'})
+                pattern_cards.append(card)
+            
+            summary_content.append(html.Div([
+                html.H4("🔍 Detected Patterns", style={'color': '#ffff00', 'marginTop': '30px', 'marginBottom': '15px'}),
+                html.Div(pattern_cards)
+            ]))
+        
+        # Summary Visualizations
+        visualizations = SummaryAnalyzer.create_summary_visualizations(df)
+        if visualizations:
+            summary_content.append(html.Div([
+                html.H4("📈 Visual Summary", style={'color': '#00ff41', 'marginTop': '30px', 'marginBottom': '15px'}),
+                html.Div([dcc.Graph(figure=fig, config={'displayModeBar': False}) 
+                         for _, fig in visualizations])
+            ]))
+        
+        # Recommendations Section with Action Buttons
+        recommendations = SummaryAnalyzer.generate_recommendations(df, secondary_ticker)
+        if recommendations:
+            rec_cards = []
+            for rec in recommendations:
+                card = dbc.Card([
+                    dbc.CardBody([
+                        html.H5(rec['title'], style={'color': '#00ff41', 'marginBottom': '10px'}),
+                        html.P(rec['description'], style={'fontSize': '1rem', 'marginBottom': '15px'}),
+                        dbc.Button(
+                            "🚀 Run This Analysis",
+                            id={'type': 'follow-up-btn', 'index': rec['id']},
+                            color='success',
+                            size='sm',
+                            className='me-2',
+                            n_clicks=0,
+                            style={'backgroundColor': '#00ff41', 'border': 'none', 'color': '#000'}
+                        ),
+                        html.Div(id={'type': 'follow-up-status', 'index': rec['id']}, 
+                                style={'marginTop': '10px', 'color': '#aaa', 'fontSize': '0.9rem'})
+                    ])
+                ], style={'backgroundColor': 'rgba(0, 255, 65, 0.05)', 'border': '1px solid #00ff41', 
+                         'marginBottom': '15px', 'boxShadow': '0 0 10px rgba(0, 255, 65, 0.2)'})
+                rec_cards.append(card)
+            
+            summary_content.append(html.Div([
+                html.H4("🎯 Recommended Follow-Up Analyses", 
+                       style={'color': '#00ff41', 'marginTop': '30px', 'marginBottom': '15px'}),
+                html.P("Click any button below to automatically run deeper analysis based on your results:", 
+                      style={'color': '#aaa', 'marginBottom': '20px'}),
+                html.Div(rec_cards)
+            ]))
+        
+        return html.Div(summary_content, style={'padding': '20px'})
+    
+    elif active_tab == 'tab-table':
+        # Create interactive data table
+        return dash_table.DataTable(
+            id='results-table',
+            columns=[{"name": i, "id": i} for i in df.columns],
+            data=df.to_dict('records'),
+            sort_action="native",
+            filter_action="native",
+            page_action="native",
+            page_size=10,
+            style_cell={
+                'backgroundColor': 'rgba(0, 0, 0, 0.6)',
+                'color': '#fff',
+                'border': '1px solid #444'
+            },
+            style_header={
+                'backgroundColor': 'rgba(0, 255, 65, 0.1)',
+                'color': '#00ff41',
+                'fontWeight': 'bold'
+            },
+            style_data_conditional=[
+                {
+                    'if': {'column_id': 'Sharpe Ratio', 'filter_query': '{Sharpe Ratio} > 1'},
+                    'color': '#00ff41',
+                    'fontWeight': 'bold'
+                },
+                {
+                    'if': {'column_id': 'Sharpe Ratio', 'filter_query': '{Sharpe Ratio} < 0'},
+                    'color': '#ff0040'
+                },
+                {
+                    'if': {'column_id': 'Significant 95%', 'filter_query': '{Significant 95%} = Yes'},
+                    'backgroundColor': 'rgba(0, 255, 65, 0.1)'
+                }
+            ]
+        )
+    
+    elif active_tab == 'tab-charts':
+        # Create performance charts
+        charts = []
+        
+        # Sharpe Ratio Distribution
+        fig_sharpe = px.histogram(df, x='Sharpe Ratio', nbins=20,
+                                  title='Sharpe Ratio Distribution',
+                                  color_discrete_sequence=['#00ff41'])
+        fig_sharpe.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            xaxis={'gridcolor': '#333'},
+            yaxis={'gridcolor': '#333'}
+        )
+        charts.append(dcc.Graph(figure=fig_sharpe))
+        
+        # Win Rate vs Total Capture Scatter
+        fig_scatter = px.scatter(df, x='Win Ratio (%)', y='Total Capture (%)',
+                                 text='Primary Ticker', 
+                                 size='Trigger Days',
+                                 color='Sharpe Ratio',
+                                 color_continuous_scale='Viridis',
+                                 title='Win Rate vs Total Capture')
+        fig_scatter.update_traces(textposition='top center')
+        fig_scatter.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            xaxis={'gridcolor': '#333'},
+            yaxis={'gridcolor': '#333'}
+        )
+        charts.append(dcc.Graph(figure=fig_scatter))
+        
+        # Top 10 Performers Bar Chart
+        top_10 = df.nlargest(10, 'Sharpe Ratio')
+        fig_bar = px.bar(top_10, x='Primary Ticker', y='Sharpe Ratio',
+                         title='Top 10 Performers by Sharpe Ratio',
+                         color='Sharpe Ratio',
+                         color_continuous_scale='Viridis')
+        fig_bar.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0.1)',
+            font={'color': '#00ff41'},
+            xaxis={'gridcolor': '#333'},
+            yaxis={'gridcolor': '#333'}
+        )
+        charts.append(dcc.Graph(figure=fig_bar))
+        
+        return html.Div(charts)
+    
+    elif active_tab == 'tab-stats':
+        # Statistical analysis display
+        stats_cards = []
+        
+        for _, row in df.iterrows():
+            # Handle numeric conversion safely
+            try:
+                sharpe_ratio = float(row['Sharpe Ratio']) if row['Sharpe Ratio'] != 'N/A' else 0.0
+                p_value = row['p-Value']
+                wins = int(row['Wins']) if pd.notna(row['Wins']) else 0
+                losses = int(row['Losses']) if pd.notna(row['Losses']) else 0
+            except (ValueError, TypeError) as e:
+                logger.error(f"Error converting values for {row.get('Primary Ticker', 'Unknown')}: {e}")
+                continue
+                
+            # Create the Sharpe gauge figure and wrap it in dcc.Graph
+            sharpe_fig = VisualMetrics.create_sharpe_gauge(sharpe_ratio)
+            
+            # Ensure the figure is wrapped in dcc.Graph
+            if hasattr(sharpe_fig, 'data') and hasattr(sharpe_fig, 'layout'):
+                # This is a Plotly figure object, wrap it
+                sharpe_component = dcc.Graph(
+                    figure=sharpe_fig, 
+                    config={'displayModeBar': False},
+                    style={'height': '250px'}
+                )
+            else:
+                # Fallback in case it's already a component
+                sharpe_component = sharpe_fig
+            
+            card = dbc.Card([
+                dbc.CardHeader(html.H5(row['Primary Ticker'], style={'color': '#00ff41'})),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            sharpe_component
+                        ], width=6),
+                        dbc.Col([
+                            VisualMetrics.create_significance_meter(p_value),
+                            html.Hr(),
+                            VisualMetrics.create_win_rate_visual(wins, losses)
+                        ], width=6)
+                    ])
+                ])
+            ], style={'backgroundColor': 'rgba(0, 0, 0, 0.6)', 'border': '1px solid #444',
+                     'marginBottom': '20px'})
+            stats_cards.append(card)
+        
+        return html.Div(stats_cards)
+    
+    elif active_tab == 'tab-correlation':
+        # Correlation analysis
+        return html.Div([
+            VisualMetrics.create_correlation_heatmap(df),
+            html.Hr(style={'borderColor': '#444', 'margin': '30px 0'}),
+            VisualMetrics.create_advanced_scatter_matrix(df)
+        ])
+    
+    elif active_tab == 'tab-advanced':
+        # Advanced analytics
+        advanced_content = []
+        
+        # Risk-Return Quadrant Analysis
+        if 'Sharpe Ratio' in df.columns and 'Std Dev (%)' in df.columns:
+            # Create a copy of df with absolute values for size (Plotly requires non-negative)
+            df_plot = df.copy()
+            df_plot['Abs Total Capture (%)'] = df['Total Capture (%)'].abs()
+            
+            fig_quadrant = px.scatter(df_plot, x='Std Dev (%)', y='Sharpe Ratio',
+                                     text='Primary Ticker',
+                                     size='Abs Total Capture (%)',
+                                     color='Win Ratio (%)',
+                                     color_continuous_scale='RdYlGn',
+                                     title='Risk-Return Quadrant Analysis',
+                                     labels={'Std Dev (%)': 'Risk (Std Dev %)',
+                                            'Sharpe Ratio': 'Return (Sharpe Ratio)',
+                                            'Abs Total Capture (%)': 'Magnitude of Total Capture (%)'})
+            
+            # Add custom hover data to show actual capture values (including negatives)
+            fig_quadrant.update_traces(
+                customdata=df[['Total Capture (%)']],
+                hovertemplate='<b>%{text}</b><br>' +
+                             'Risk (Std Dev): %{x:.2f}%<br>' +
+                             'Sharpe Ratio: %{y:.2f}<br>' +
+                             'Win Ratio: %{marker.color:.1f}%<br>' +
+                             'Total Capture: %{customdata[0]:.2f}%<br>' +
+                             '<extra></extra>'
+            )
+            
+            # Add quadrant lines
+            fig_quadrant.add_hline(y=df['Sharpe Ratio'].median(), line_dash="dash", 
+                                  line_color="#444", annotation_text="Median Sharpe")
+            fig_quadrant.add_vline(x=df['Std Dev (%)'].median(), line_dash="dash", 
+                                  line_color="#444", annotation_text="Median Risk")
+            
+            fig_quadrant.update_traces(textposition='top center')
+            fig_quadrant.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0.1)',
+                font={'color': '#00ff41'},
+                xaxis={'gridcolor': '#333'},
+                yaxis={'gridcolor': '#333'},
+                height=500
+            )
+            advanced_content.append(dcc.Graph(figure=fig_quadrant))
+        
+        # Time Series of Cumulative Performance (if we have date data)
+        if len(df) > 5:
+            # Performance ranking visualization
+            df_sorted = df.sort_values('Sharpe Ratio', ascending=True)
+            fig_ranking = px.bar(df_sorted, y='Primary Ticker', x='Sharpe Ratio',
+                               orientation='h',
+                               color='Sharpe Ratio',
+                               color_continuous_scale='Viridis',
+                               title='Performance Ranking - All Tickers')
+            
+            fig_ranking.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0.1)',
+                font={'color': '#00ff41'},
+                xaxis={'gridcolor': '#333'},
+                yaxis={'gridcolor': '#333'},
+                height=max(400, len(df) * 25)
+            )
+            advanced_content.append(dcc.Graph(figure=fig_ranking))
+        
+        # Distribution analysis
+        if 'Total Capture (%)' in df.columns:
+            fig_dist = go.Figure()
+            
+            # Add histogram
+            fig_dist.add_trace(go.Histogram(
+                x=df['Total Capture (%)'],
+                name='Distribution',
+                marker_color='#00ff41',
+                opacity=0.7
+            ))
+            
+            # Add box plot
+            fig_dist.add_trace(go.Box(
+                x=df['Total Capture (%)'],
+                name='Box Plot',
+                marker_color='#80ff00',
+                y=['Total Capture'] * len(df)
+            ))
+            
+            fig_dist.update_layout(
+                title='Total Capture Distribution Analysis',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0.1)',
+                font={'color': '#00ff41'},
+                xaxis={'gridcolor': '#333', 'title': 'Total Capture (%)'},
+                yaxis={'gridcolor': '#333'},
+                showlegend=False,
+                height=400
+            )
+            advanced_content.append(dcc.Graph(figure=fig_dist))
+        
+        if advanced_content:
+            return html.Div(advanced_content)
+        else:
+            return html.Div("Insufficient data for advanced analytics", 
+                          style={'color': '#aaa', 'textAlign': 'center', 'padding': '20px'})
+    
+    return html.Div("Select a tab to view results.", style={'color': '#aaa'})
+
+# Callback for follow-up analysis buttons
+@app.callback(
+    [Output({'type': 'follow-up-status', 'index': ALL}, 'children'),
+     Output('primary-tickers-input', 'value', allow_duplicate=True),
+     Output('secondary-ticker-input', 'value', allow_duplicate=True),
+     Output('follow-up-action-store', 'data')],
+    [Input({'type': 'follow-up-btn', 'index': ALL}, 'n_clicks')],
+    [State('analysis-results-store', 'data'),
+     State('secondary-ticker-input', 'value')],
+    prevent_initial_call=True
+)
+def handle_follow_up_analysis(n_clicks_list, results_data, secondary_ticker):
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_list):
+        raise dash.exceptions.PreventUpdate
+    
+    # Get which button was clicked
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    button_dict = json.loads(button_id)
+    action_id = button_dict['index']
+    
+    # Create status messages for all buttons
+    status_messages = ["" for _ in n_clicks_list]
+    
+    # Get the index of the clicked button
+    for idx, clicks in enumerate(n_clicks_list):
+        if clicks and clicks > 0:
+            # This button was clicked
+            status_messages[idx] = "🔄 Preparing analysis..."
+    
+    # Generate the recommendations to get the action details
+    df = pd.DataFrame(results_data)
+    recommendations = SummaryAnalyzer.generate_recommendations(df, secondary_ticker)
+    
+    # Find the matching recommendation
+    action = None
+    for rec in recommendations:
+        if rec['id'] == action_id:
+            action = rec
+            break
+    
+    if not action:
+        return status_messages, dash.no_update, dash.no_update, dash.no_update
+    
+    # Prepare new analysis based on action type
+    new_primary_tickers = ""
+    new_secondary_ticker = secondary_ticker
+    
+    if action['action'] == 'deep_dive':
+        # Set up for deep dive on top performers
+        new_primary_tickers = ', '.join(action['params']['tickers'])
+        status_messages[n_clicks_list.index(max(n_clicks_list))] = f"✅ Ready! Loaded {len(action['params']['tickers'])} top performers for detailed analysis."
+    
+    elif action['action'] == 'find_similar':
+        # Find similar tickers (example implementation)
+        reference = action['params']['reference_ticker']
+        # In a real implementation, you'd have a similarity function
+        similar_tickers = ['AAPL', 'MSFT', 'GOOGL'] if reference != 'AAPL' else ['META', 'NVDA', 'AMD']
+        new_primary_tickers = ', '.join(similar_tickers)
+        status_messages[n_clicks_list.index(max(n_clicks_list))] = f"✅ Ready! Found {len(similar_tickers)} similar tickers to {reference}."
+    
+    elif action['action'] == 'outlier_analysis':
+        # Set up for outlier analysis
+        new_primary_tickers = ', '.join(action['params']['outlier_tickers'])
+        status_messages[n_clicks_list.index(max(n_clicks_list))] = f"✅ Ready! Loaded {len(action['params']['outlier_tickers'])} outlier tickers for investigation."
+    
+    elif action['action'] == 'time_analysis':
+        # For time analysis, use top tickers
+        new_primary_tickers = ', '.join(action['params']['top_tickers'])
+        status_messages[n_clicks_list.index(max(n_clicks_list))] = "✅ Ready! Loaded top tickers for time period optimization."
+    
+    elif action['action'] == 'sector_analysis':
+        # Load sector ETFs
+        new_primary_tickers = ', '.join(action['params']['sectors'])
+        status_messages[n_clicks_list.index(max(n_clicks_list))] = "✅ Ready! Loaded sector ETFs for rotation analysis."
+    
+    # Return the updates
+    return status_messages, new_primary_tickers, new_secondary_ticker, action
+
+# Add custom CSS for animations
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            @keyframes pulse {
+                0% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0.7); }
+                70% { box-shadow: 0 0 0 10px rgba(0, 255, 65, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0); }
+            }
+            .pulse-animation {
+                animation: pulse 2s infinite;
+            }
+            body {
+                background-color: #0a0a0a;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 if __name__ == "__main__":
     # Ensure all required directories exist
-    required_dirs = ['cache', 'cache/results', 'cache/status', 'cache/sma_cache', 'output', 'logs']
+    required_dirs = ['cache', 'cache/impact_analysis', 'cache/results', 'cache/status', 
+                    'cache/sma_cache', 'cache/templates', 'output', 'logs']
     for directory in required_dirs:
         os.makedirs(directory, exist_ok=True)
     
@@ -527,4 +2420,5 @@ if __name__ == "__main__":
             except:
                 pass
                 
-    app.run_server(debug=True, port=8051)
+    # Use debug=False or use_reloader=False to prevent hanging processes
+    app.run_server(debug=True, port=8051, use_reloader=False)
