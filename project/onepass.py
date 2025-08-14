@@ -1051,97 +1051,633 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
     return metrics_list
 
 ##################
+# THREADING SUPPORT
+##################
+
+from dash import callback_context
+import base64
+import io as _io
+import threading
+from threading import Lock
+import random
+import time
+
+# Thread-safe progress tracker
+progress_lock = Lock()
+progress_tracker = {
+    'status': 'idle',        # 'idle' | 'processing' | 'complete'
+    'current_ticker': '',
+    'current_index': 0,
+    'total': 0,
+    'start_time': None,
+    'created_count': 0,
+    'updated_count': 0,
+    'failed_count': 0,
+    'elapsed_time': 0,
+    'results': []
+}
+
+# Preset ticker lists
+SP500_LEADERS = ['SPY', 'VOO', 'IVV', 'SPLG', 'SSO', 'UPRO', 'SH', 'SDS', 'SPXU', 'SPXL']
+TECH_GIANTS = ['QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'AVGO', 'ORCL']
+CRYPTO_TOP = ['BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD', 'ADA-USD', 'AVAX-USD', 'DOT-USD', 'MATIC-USD']
+ETF_CORE = ['SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO', 'EFA', 'EEM', 'GLD', 'TLT']
+
+def get_random_mix():
+    """Get random mix of 20 tickers"""
+    all_tickers = list(set(SP500_LEADERS + TECH_GIANTS + CRYPTO_TOP + ETF_CORE))
+    random.shuffle(all_tickers)
+    return all_tickers[:20]
+
+##################
 # DASH APP LAYOUT
 ##################
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+
 app.layout = dbc.Container([
-    html.H1("One-Pass Primary Analysis", style={'color': '#80ff00'}),
-    html.P("Enter multiple primary tickers separated by commas, then click Process. "
-           "Results will be exported to output/onepass/onepass.xlsx."),
+    # Header
+    dbc.Row([
+        dbc.Col([
+            html.H1("OnePass", 
+                   style={'color': '#00ff41', 'fontFamily': 'monospace', 
+                          'textShadow': '0 0 10px rgba(0,255,65,0.5)', 'marginBottom': '10px'}),
+            html.H3("Signal Library Builder",
+                   style={'color': '#888', 'fontSize': '24px', 'fontFamily': 'monospace', 'marginBottom': '5px'}),
+            html.P("Step 1: Build your trading signal database.",
+                   style={'color': '#666', 'fontSize': '14px'}),
+            html.Hr(style={'borderColor': '#333', 'opacity': '0.3', 'marginTop': '20px', 'marginBottom': '20px'})
+        ])
+    ]),
+    
+    # Welcome message
     dbc.Row([
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader("Primary Tickers"),
                 dbc.CardBody([
-                    html.P("Example: AAPL, MSFT, AMZN"),
+                    html.P([
+                        "Thank you for using OnePass! ",
+                        html.Br(),
+                        html.Br(),
+                        "This tool builds our single-ticker signal database for use in the ImpactSearch. ",
+                        "Enter as many tickers as you would like to process below (using the yahoo finance ticker format) ",
+                        "and click 'Build Signal Libraries' to start creating the database. Once built, these libraries ",
+                        "accelerate the performance in ImpactSearch."
+                    ], style={'color': '#aaa', 'fontSize': '14px', 'lineHeight': '1.6'})
+                ], style={'padding': '15px'})
+            ], style={'backgroundColor': 'rgba(0,255,65,0.03)', 'border': '1px solid rgba(0,255,65,0.15)', 'marginBottom': '20px'})
+        ])
+    ]),
+    
+    # Main Input Area
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.H5("Enter Tickers", style={'color': '#00ff41', 'marginBottom': '0'})
+                ]),
+                dbc.CardBody([
+                    # Presets
+                    html.Div([
+                        dbc.ButtonGroup([
+                            dbc.Button("📈 S&P Leaders", id='preset-sp500', size='sm', outline=True, color='success'),
+                            dbc.Button("💻 Tech Giants", id='preset-tech', size='sm', outline=True, color='success'),
+                            dbc.Button("🪙 Top Crypto", id='preset-crypto', size='sm', outline=True, color='success'),
+                            dbc.Button("📊 ETF Core", id='preset-etf', size='sm', outline=True, color='success'),
+                            dbc.Button("🎲 Random 20", id='preset-random', size='sm', outline=True, color='info'),
+                            dbc.Button("Clear", id='preset-clear', size='sm', outline=True, color='danger'),
+                        ], className='mb-3', style={'width': '100%'})
+                    ]),
+                    
+                    # Main textarea
                     dbc.Textarea(
                         id='primary-tickers-input',
-                        placeholder='Enter primary tickers separated by commas...',
-                        style={'height': '100px'}
+                        placeholder='Enter tickers separated by commas (e.g., SPY, QQQ, AAPL, BTC-USD)',
+                        style={
+                            'height': '120px',
+                            'backgroundColor': 'rgba(0,0,0,0.5)',
+                            'border': '1px solid #00ff41',
+                            'color': '#fff',
+                            'fontFamily': 'monospace',
+                            'fontSize': '14px'
+                        }
                     ),
-                    html.Br(),
-                    dbc.Button("Process", id='process-button', color='primary', style={'width': '100%'})
+                    
+                    # Ticker counter
+                    html.Div(id='ticker-count', style={'marginTop': '5px', 'color': '#666', 'fontSize': '12px'}),
+                    
+                    # Upload option (collapsible)
+                    html.Details([
+                        html.Summary("📁 Or upload CSV/TXT", style={'color': '#00ff41', 'cursor': 'pointer', 'marginTop': '10px'}),
+                        dcc.Upload(
+                            id='upload-tickers',
+                            children=html.Div(['Drag & Drop or Click']),
+                            style={
+                                'width': '100%', 'height': '50px', 'lineHeight': '50px',
+                                'borderWidth': '1px', 'borderStyle': 'dashed',
+                                'borderRadius': '5px', 'borderColor': '#00ff41',
+                                'textAlign': 'center', 'marginTop': '10px',
+                                'backgroundColor': 'rgba(0,255,65,0.05)'
+                            }
+                        )
+                    ]),
                 ])
-            ], className='mb-3')
-        ], width=12),
+            ], style={'backgroundColor': 'rgba(0,0,0,0.7)', 'border': '1px solid #333'})
+        ], width=8),
+        
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader(html.H5("Quick Settings", style={'color': '#00ff41', 'marginBottom': '0'})),
+                dbc.CardBody([
+                    dbc.Checklist(
+                        id='onepass-options',
+                        options=[
+                            {'label': ' Use existing libraries (only fetch new data)', 'value': 'reuse'},
+                            {'label': ' Export Excel summary', 'value': 'excel'}
+                        ],
+                        value=['reuse', 'excel'],
+                        style={'color': '#aaa', 'fontSize': '14px'}
+                    ),
+                    
+                    html.Hr(style={'borderColor': '#333', 'opacity': '0.3'}),
+                    
+                    # THE button
+                    dbc.Button(
+                        ["🚀 Build Signal Libraries"],
+                        id='process-button',
+                        color='success',
+                        size='lg',
+                        style={'width': '100%', 'height': '60px', 'fontSize': '18px'},
+                        className='pulse-animation'
+                    )
+                ])
+            ], style={'backgroundColor': 'rgba(0,0,0,0.7)', 'border': '1px solid #333'})
+        ], width=4)
     ]),
-    html.Div(id='process-status', style={'color': '#80ff00', 'marginTop': '20px'}),
-    dbc.Progress(id='progress-bar', value=0, striped=True, animated=True,
-                 style={'marginTop': '20px', 'height': '30px'}, color='success'),
-], fluid=True)
+    
+    # Progress Section (hidden initially)
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    # Live ticker display
+                    html.Div(id='current-status', children=[
+                        html.H5("Ready to process", style={'color': '#00ff41'})
+                    ]),
+                    
+                    # Progress bar
+                    dbc.Progress(
+                        id='progress-bar',
+                        value=0,
+                        label="",
+                        striped=True,
+                        animated=True,
+                        style={'height': '35px', 'fontSize': '14px'},
+                        color='success'
+                    ),
+                    
+                    # Stats row
+                    html.Div(id='progress-stats', children=[
+                        dbc.Row([
+                            dbc.Col([
+                                html.Div("⏱️ Elapsed: --:--", id='elapsed-time', style={'color': '#666'})
+                            ], width=3),
+                            dbc.Col([
+                                html.Div("✅ Created: 0", id='created-count', style={'color': '#666'})
+                            ], width=3),
+                            dbc.Col([
+                                html.Div("🔄 Updated: 0", id='updated-count', style={'color': '#666'})
+                            ], width=3),
+                            dbc.Col([
+                                html.Div("⚡ Speed: -- /sec", id='speed-stat', style={'color': '#666'})
+                            ], width=3),
+                        ], style={'marginTop': '15px'})
+                    ]),
+                    
+                    # Results summary (shows on complete)
+                    html.Div(id='results-summary', style={'marginTop': '20px'})
+                ])
+            ], style={'backgroundColor': 'rgba(0,0,0,0.7)', 'border': '1px solid #333'})
+        ])
+    ], id='progress-section', style={'display': 'none', 'marginTop': '20px'}),
+    
+    # Interval for real-time updates
+    dcc.Interval(id='interval-update', interval=500, disabled=True),
+    dcc.Store(id='processing-state'),
+    
+], fluid=True, style={'backgroundColor': '#0a0a0a', 'minHeight': '100vh', 'padding': '30px'})
+
+# CSS for pulse animation
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            @keyframes pulse {
+                0% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0.7); }
+                70% { box-shadow: 0 0 0 10px rgba(0, 255, 65, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0); }
+            }
+            .pulse-animation:not(:disabled) { 
+                animation: pulse 2s infinite; 
+            }
+            body { 
+                background-color: #0a0a0a; 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;
+            }
+            .progress-bar-animated {
+                background-image: linear-gradient(
+                    45deg,
+                    rgba(255,255,255,.15) 25%,
+                    transparent 25%,
+                    transparent 50%,
+                    rgba(255,255,255,.15) 50%,
+                    rgba(255,255,255,.15) 75%,
+                    transparent 75%,
+                    transparent
+                ) !important;
+                background-size: 1rem 1rem !important;
+                animation: progress-bar-stripes 1s linear infinite !important;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 
 ##################
-# DASH CALLBACK
+# DASH CALLBACKS
 ##################
 
+# Ticker counter callback
 @app.callback(
-    [Output('process-status', 'children'),
-     Output('progress-bar', 'value'),
-     Output('progress-bar', 'style')],
-    [Input('process-button', 'n_clicks')],
-    [State('primary-tickers-input', 'value')]
+    Output('ticker-count', 'children'),
+    Input('primary-tickers-input', 'value')
 )
-def run_onepass_analysis(n_clicks, primary_tickers_input):
-    """
-    Single-run "onepass" script. 
-    Accept user input of multiple tickers, run the entire logic for each ticker, 
-    then export results to onepass.xlsx. 
-    """
+def update_ticker_count(value):
+    if not value:
+        return "0 tickers"
+    tickers = [t.strip() for t in value.split(',') if t.strip()]
+    count = len(tickers)
+    return f"{count} ticker{'s' if count != 1 else ''}"
+
+# Preset callbacks
+@app.callback(
+    Output('primary-tickers-input', 'value', allow_duplicate=True),
+    [Input('preset-sp500', 'n_clicks'),
+     Input('preset-tech', 'n_clicks'),
+     Input('preset-crypto', 'n_clicks'),
+     Input('preset-etf', 'n_clicks'),
+     Input('preset-random', 'n_clicks'),
+     Input('preset-clear', 'n_clicks')],
+    [State('primary-tickers-input', 'value')],
+    prevent_initial_call=True
+)
+def handle_presets(sp500, tech, crypto, etf, random_btn, clear, current):
+    ctx = callback_context
+    if not ctx.triggered:
+        raise dash.exceptions.PreventUpdate
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if button_id == 'preset-clear':
+        return ''
+    
+    preset_map = {
+        'preset-sp500': SP500_LEADERS,
+        'preset-tech': TECH_GIANTS,
+        'preset-crypto': CRYPTO_TOP,
+        'preset-etf': ETF_CORE,
+        'preset-random': get_random_mix()
+    }
+    
+    add_tickers = preset_map.get(button_id, [])
+    
+    # Parse existing tickers
+    existing = []
+    if current:
+        existing = [t.strip().upper() for t in current.split(',') if t.strip()]
+    
+    # Combine without duplicates
+    combined = existing[:]
+    for t in add_tickers:
+        if t.upper() not in [x.upper() for x in combined]:
+            combined.append(t)
+    
+    return ', '.join(combined)
+
+# Upload callback
+@app.callback(
+    Output('primary-tickers-input', 'value', allow_duplicate=True),
+    Input('upload-tickers', 'contents'),
+    [State('upload-tickers', 'filename'),
+     State('primary-tickers-input', 'value')],
+    prevent_initial_call=True
+)
+def parse_upload(contents, filename, current):
+    if contents is None:
+        raise dash.exceptions.PreventUpdate
+    
+    content_type, content_string = contents.split(',')
+    decoded = base64.b64decode(content_string)
+    
+    try:
+        text = decoded.decode('utf-8')
+    except:
+        text = decoded.decode('latin-1')
+    
+    tickers = []
+    if filename and filename.lower().endswith('.csv'):
+        df = pd.read_csv(_io.StringIO(text))
+        # Look for ticker/symbol column
+        for col in df.columns:
+            if 'ticker' in col.lower() or 'symbol' in col.lower():
+                tickers = df[col].dropna().astype(str).tolist()
+                break
+        # If no ticker column, use first column
+        if not tickers and len(df.columns) > 0:
+            tickers = df.iloc[:, 0].dropna().astype(str).tolist()
+    else:
+        # Plain text
+        for sep in ['\n', '\r', ';']:
+            text = text.replace(sep, ',')
+        tickers = [t.strip() for t in text.split(',') if t.strip()]
+    
+    # Clean and validate
+    tickers = [t.upper().strip() for t in tickers if len(t.strip()) <= 12]
+    
+    # Combine with existing
+    existing = [t.strip().upper() for t in (current or '').split(',') if t.strip()]
+    combined = existing[:]
+    for t in tickers:
+        if t not in combined:
+            combined.append(t)
+    
+    return ', '.join(combined[:200])  # Limit to 200 tickers
+
+# Main processing callback - starts background thread
+@app.callback(
+    [Output('interval-update', 'disabled'),
+     Output('progress-section', 'style'),
+     Output('processing-state', 'data'),
+     Output('process-button', 'disabled')],
+    Input('process-button', 'n_clicks'),
+    [State('primary-tickers-input', 'value'),
+     State('onepass-options', 'value')],
+    prevent_initial_call=True
+)
+def start_processing(n_clicks, primary_tickers_input, options):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
+    
+    # Parse tickers
+    tickers = [t.strip().upper() for t in (primary_tickers_input or '').split(',') if t.strip()]
+    if not tickers:
+        return True, {'display': 'none'}, None, False
+    
+    # Get options
+    reuse_existing = 'reuse' in (options or [])
+    export_excel = 'excel' in (options or [])
+    
+    # Reset progress tracker
+    with progress_lock:
+        progress_tracker.update({
+            'status': 'processing',
+            'current_ticker': '',
+            'current_index': 0,
+            'total': len(tickers),
+            'start_time': time.time(),
+            'created_count': 0,
+            'updated_count': 0,
+            'failed_count': 0,
+            'elapsed_time': 0,
+            'results': []
+        })
+    
+    # Background worker function
+    def worker():
+        logger.info("----- STARTING ONE-PASS ANALYSIS -----")
+        logger.info(f"Processing {len(tickers)} tickers")
+        
+        processed_metrics = []
+        
+        for i, ticker in enumerate(tickers, start=1):
+            try:
+                # Update current ticker
+                with progress_lock:
+                    progress_tracker['current_ticker'] = ticker
+                    progress_tracker['current_index'] = i - 1
+                
+                # Check if Signal Library exists
+                library_exists = check_signal_library_exists(ticker)
+                
+                # Process ticker
+                result = process_onepass_tickers([ticker], use_existing_signals=reuse_existing)
+                
+                if result:
+                    processed_metrics.extend(result)
+                    with progress_lock:
+                        if library_exists:
+                            progress_tracker['updated_count'] += 1
+                        else:
+                            progress_tracker['created_count'] += 1
+                else:
+                    with progress_lock:
+                        progress_tracker['failed_count'] += 1
+                
+                # Update progress
+                with progress_lock:
+                    progress_tracker['current_index'] = i
+                    progress_tracker['elapsed_time'] = time.time() - progress_tracker['start_time']
+                    
+            except Exception as e:
+                logger.error(f"Error processing {ticker}: {e}")
+                with progress_lock:
+                    progress_tracker['failed_count'] += 1
+        
+        # Export to Excel if requested
+        if export_excel and processed_metrics:
+            try:
+                os.makedirs("output/onepass", exist_ok=True)
+                out_file = "output/onepass/onepass.xlsx"
+                export_results_to_excel(out_file, processed_metrics)
+                logger.info(f"Results exported to {out_file}")
+            except Exception as e:
+                logger.error(f"Failed to export results: {e}")
+        
+        # Mark complete
+        with progress_lock:
+            progress_tracker['status'] = 'complete'
+            progress_tracker['results'] = processed_metrics
+        
+        logger.info("----- ONE-PASS ANALYSIS COMPLETE -----")
+    
+    # Start worker thread
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    
+    # Enable interval updates, show progress section, disable button
+    return False, {'display': 'block', 'marginTop': '20px'}, \
+           {'status': 'processing', 'total': len(tickers)}, True
 
-    if not primary_tickers_input:
-        return "Please enter at least one primary ticker.", 0, {'marginTop': '20px', 'height': '30px'}
-
-    tickers_list = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
-    if not tickers_list:
-        return "Please enter valid ticker symbols.", 0, {'marginTop': '20px', 'height': '30px'}
-
-    logger.info("----- STARTING ONE-PASS ANALYSIS -----")
-    logger.info(f"Primary Tickers: {tickers_list}")
-    logger.info("Processing started. Please wait...")
-
-    total_tickers = len(tickers_list)
-    progress_value = 0
-    message = "Processing in progress..."
-
-    processed_metrics = []
-    # We'll do a manual loop to simulate incremental progress
-    for i, tk in enumerate(tickers_list, start=1):
-        # Enable incremental/library reuse for Phase 2 speedups
-        single_result = process_onepass_tickers([tk], use_existing_signals=True)
-        if single_result:
-            processed_metrics.extend(single_result)
-
-        progress_value = int((i / total_tickers) * 100)
-        message = f"Processed {i} of {total_tickers} tickers ({progress_value}%)..."
-
-    # Once done, export if we have any results
-    if processed_metrics:
-        # Ensure output directory exists
-        os.makedirs("output/onepass", exist_ok=True)
-        out_file = "output/onepass/onepass.xlsx"
-        export_results_to_excel(out_file, processed_metrics)
-        message = f"Processing complete. Check {out_file} for results."
-        progress_value = 100
+# Interval callback - updates UI from progress tracker
+@app.callback(
+    [Output('current-status', 'children'),
+     Output('progress-bar', 'value'),
+     Output('progress-bar', 'label'),
+     Output('elapsed-time', 'children'),
+     Output('created-count', 'children'),
+     Output('updated-count', 'children'),
+     Output('speed-stat', 'children'),
+     Output('results-summary', 'children'),
+     Output('interval-update', 'disabled', allow_duplicate=True),
+     Output('process-button', 'disabled', allow_duplicate=True)],
+    Input('interval-update', 'n_intervals'),
+    State('processing-state', 'data'),
+    prevent_initial_call=True
+)
+def update_progress(n_intervals, state):
+    if not state or state.get('status') != 'processing':
+        raise dash.exceptions.PreventUpdate
+    
+    with progress_lock:
+        status = progress_tracker['status']
+        current_ticker = progress_tracker['current_ticker']
+        current_index = progress_tracker['current_index']
+        total = progress_tracker['total']
+        elapsed = progress_tracker['elapsed_time']
+        created = progress_tracker['created_count']
+        updated = progress_tracker['updated_count']
+        failed = progress_tracker['failed_count']
+    
+    # Calculate progress
+    progress_pct = int((current_index / total * 100)) if total > 0 else 0
+    
+    # Format elapsed time
+    if elapsed > 0:
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        elapsed_str = f"{mins}:{secs:02d}" if mins > 0 else f"{secs}s"
+        speed = current_index / elapsed if elapsed > 0 else 0
+        speed_str = f"{speed:.1f} /sec" if speed > 0 else "-- /sec"
     else:
-        message = "No valid results to export."
-        progress_value = 100
-
-    logger.info("----- ONE-PASS ANALYSIS COMPLETE -----")
-    return message, progress_value, {'marginTop': '20px', 'height': '30px'}
+        elapsed_str = "--:--"
+        speed_str = "-- /sec"
+    
+    # Update UI elements
+    if status == 'complete':
+        # Processing complete
+        status_div = html.H5("Processing Complete!", style={'color': '#00ff41'})
+        
+        # Find top Sharpe ratio ticker
+        top_sharpe_ticker = None
+        top_sharpe_value = -999
+        with progress_lock:
+            results = progress_tracker.get('results', [])
+            for result in results:
+                if result and 'Combined Sharpe' in result:
+                    sharpe = result.get('Combined Sharpe', -999)
+                    if sharpe > top_sharpe_value:
+                        top_sharpe_value = sharpe
+                        top_sharpe_ticker = result.get('Primary Ticker', 'Unknown')
+        
+        summary = html.Div([
+            # Success header
+            dbc.Alert([
+                html.H5("✅ Success!", style={'color': '#00ff41', 'marginBottom': '15px'}),
+            ], color="success", style={'padding': '10px', 'marginBottom': '15px'}),
+            
+            # Processing stats in separate card
+            dbc.Card([
+                dbc.CardBody([
+                    html.H6("Processing Summary", style={'color': '#00ff41', 'marginBottom': '10px'}),
+                    html.P(f"Processed {total} tickers in {elapsed_str}", style={'color': '#aaa'}),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Div(f"✅ Created: {created}", style={'color': '#4ade80'})
+                        ], width=4),
+                        dbc.Col([
+                            html.Div(f"🔄 Updated: {updated}", style={'color': '#60a5fa'})
+                        ], width=4),
+                        dbc.Col([
+                            html.Div(f"❌ Failed: {failed}", style={'color': '#f87171' if failed > 0 else '#666'})
+                        ], width=4),
+                    ])
+                ], style={'padding': '15px'})
+            ], style={'backgroundColor': 'rgba(0,0,0,0.5)', 'border': '1px solid #333', 'marginBottom': '15px'}),
+            
+            # File locations
+            html.P("Signal Libraries saved to: signal_library/data/", 
+                  style={'color': '#888', 'fontSize': '13px'}),
+            html.P("Excel summary: output/onepass/onepass.xlsx", 
+                  style={'color': '#888', 'fontSize': '13px', 'marginBottom': '15px'}),
+            
+            # Next steps guidance
+            dbc.Card([
+                dbc.CardBody([
+                    html.H6("📊 Ready for Analysis!", style={'color': '#00ff41', 'marginBottom': '10px'}),
+                    html.P([
+                        "Your Signal Libraries are now available in ",
+                        html.Span("ImpactSearch", style={'color': '#00ff41', 'fontWeight': 'bold'}),
+                        " for advanced analysis."
+                    ], style={'color': '#aaa', 'fontSize': '14px', 'marginBottom': '10px'}),
+                    html.P([
+                        "Open ImpactSearch at ",
+                        html.A("http://localhost:8051", href="http://localhost:8051", target="_blank",
+                              style={'color': '#00ff41', 'textDecoration': 'underline'}),
+                        " to explore relationships between your tickers with lightning-fast analysis."
+                    ], style={'color': '#aaa', 'fontSize': '13px', 'marginBottom': '0'})
+                ], style={'padding': '15px'})
+            ], style={'backgroundColor': 'rgba(0,255,65,0.05)', 'border': '1px solid rgba(0,255,65,0.2)', 
+                     'marginBottom': '20px'}),
+            
+            # Top Sharpe ticker (secret treat)
+            html.Div([
+                html.Hr(style={'borderColor': '#333', 'opacity': '0.3', 'marginTop': '20px', 'marginBottom': '15px'}),
+                html.P([
+                    html.Span("🏆 Top Performer: ", style={'color': '#666', 'fontSize': '12px'}),
+                    html.Span(f"{top_sharpe_ticker}", style={'color': '#fbbf24', 'fontSize': '14px', 'fontWeight': 'bold'}),
+                    html.Span(f" (Sharpe: {top_sharpe_value:.4f})" if top_sharpe_value > -999 else "", 
+                             style={'color': '#888', 'fontSize': '12px'})
+                ] if top_sharpe_ticker else "", style={'textAlign': 'center'})
+            ] if top_sharpe_ticker else "")
+        ])
+        
+        # Disable interval, enable button
+        return status_div, 100, "100%", \
+               f"⏱️ Total: {elapsed_str}", \
+               f"✅ Created: {created}", \
+               f"🔄 Updated: {updated}", \
+               f"⚡ Avg: {speed_str}", \
+               summary, \
+               True, False
+    
+    else:
+        # Still processing
+        status_div = html.Div([
+            html.H5(f"Processing: {current_ticker or '...'}", style={'color': '#ffff00'}),
+            html.P(f"{current_index} of {total} completed", style={'color': '#888'})
+        ])
+        
+        return status_div, progress_pct, f"{progress_pct}%", \
+               f"⏱️ Elapsed: {elapsed_str}", \
+               f"✅ Created: {created}", \
+               f"🔄 Updated: {updated}", \
+               f"⚡ Speed: {speed_str}", \
+               "", \
+               False, True
 
 ##################
 # MAIN
