@@ -22,13 +22,24 @@ import multiprocessing
 from threading import Lock
 import re
 
-# Canonical crypto bases we normalize to Yahoo's '-USD' pairs
-CRYPTO_BASES = {
-    'BTC','ETH','SOL','DOGE','ADA','XRP','LTC','BNB','DOT','AVAX','LINK','MATIC',
-    'ETC','BCH','FIL','UNI','APT','ARB','OP','NEAR','XLM','HBAR','INJ','SUI',
-    'PEPE','SHIB','ATOM','ALGO','FTM','XMR','EOS','XTZ','AAVE','EGLD','RUNE','KAS','TIA','SEI'
-}
-SAFE_BARE_CRYPTO_BASES = {'BTC','ETH'}  # bare inputs we auto-map to '-USD'
+# Import shared modules for parity with onepass
+from signal_library.shared_symbols import normalize_ticker, detect_ticker_type
+from signal_library.shared_integrity import (
+    compute_stable_fingerprint,
+    compute_quantized_fingerprint,
+    check_head_tail_match,
+    check_head_tail_match_fuzzy,
+    evaluate_library_acceptance,
+    verify_data_integrity,
+    HEAD_TAIL_SNAPSHOT_SIZE,
+    QUANTIZED_FINGERPRINT_PRECISION,
+    HEAD_TAIL_ATOL_EQUITY,
+    HEAD_TAIL_ATOL_CRYPTO,
+    HEAD_TAIL_RTOL,
+    HEAD_TAIL_MIN_MATCH_FRAC
+)
+
+# Note: CRYPTO_BASES and SAFE_BARE_CRYPTO_BASES now imported from shared_symbols module
 
 # Global lock for yfinance (not thread-safe)
 SMA_CACHE = {}  # Global SMA cache
@@ -52,7 +63,26 @@ except ImportError:
     class ParagraphStyle:
         pass
 import warnings
+import hashlib
 warnings.filterwarnings('ignore')
+
+# Import parity configuration
+try:
+    from signal_library.parity_config import (
+        STRICT_PARITY_MODE, apply_strict_parity, get_tiebreak_signal,
+        log_parity_status,
+        EQUITY_SESSION_BUFFER_MINUTES, CRYPTO_STABILITY_MINUTES, LOG_ACCEPTANCE_TIER
+    )
+except ImportError:
+    # Fallback if config not available
+    STRICT_PARITY_MODE = False
+    EQUITY_SESSION_BUFFER_MINUTES = 10
+    CRYPTO_STABILITY_MINUTES = 60
+    LOG_ACCEPTANCE_TIER = True
+    def apply_strict_parity(df): return df
+    def get_tiebreak_signal(buy_val, short_val):
+        return 'Buy' if buy_val > short_val else 'Short' if short_val > buy_val else 'Short'
+    def log_parity_status(): pass
 
 # Remove all handlers from the root logger
 for handler in logging.root.handlers[:]:
@@ -84,6 +114,8 @@ if not REPORTLAB_AVAILABLE:
 
 # Constants
 MAX_SMA_DAY = 114
+ENGINE_VERSION = "1.0.0"  # Version for Signal Library compatibility
+SIGNAL_LIBRARY_DIR = "signal_library/data"  # Directory where onepass.py saves signals
 
 # Precompute pairs once at module level for efficiency
 PAIR_DTYPE = np.uint16 if MAX_SMA_DAY > 255 else np.uint8
@@ -868,43 +900,98 @@ def deduplicate_tickers(tickers):
     logger.info(f"Deduplicated {len(tickers)} tickers to {len(normalized)} unique tickers")
     return normalized
 
-def normalize_ticker(ticker):
+# Note: fingerprint and integrity functions now imported from shared_integrity module
+
+def load_signal_library(ticker):
     """
-    Normalize user-entered symbols to Yahoo Finance format.
-    - Crypto: 'BTC', 'BTCUSD', 'BTC.USD' => 'BTC-USD' (and similar for other bases)
-      * Bare auto-map only for SAFE_BARE_CRYPTO_BASES to avoid equity collisions (e.g., SOL).
-    - Indices: keep '^GSPC' form unchanged.
-    - Equities with dot suffix: BRK.B/BF.B => BRK-B/BF-B (Yahoo style).
+    Load Signal Library for a ticker from onepass.py's saved signals.
+    Returns the signal data if found, None otherwise.
     """
-    if not ticker:
-        return ticker
-    t = ticker.strip().upper()
+    try:
+        stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
+        filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
+        filepath = os.path.join(stable_dir, filename)
+        
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, 'rb') as f:
+                    signal_data = pickle.load(f)
+            except (pickle.UnpicklingError, EOFError) as e:
+                logger.error(f"Corrupt Signal Library for {ticker}: {e}")
+                # Quarantine corrupt file for debugging
+                corrupt_filepath = filepath + '.corrupt'
+                os.replace(filepath, corrupt_filepath)
+                logger.info(f"Renamed corrupt file to {corrupt_filepath}")
+                return None
+            
+            # Verify version compatibility with detailed logging
+            stored_version = signal_data.get('engine_version')
+            stored_max_sma = signal_data.get('max_sma_day')
+            
+            if stored_version != ENGINE_VERSION:
+                logger.warning(f"Version mismatch for {ticker}: stored={stored_version}, current={ENGINE_VERSION}")
+            if stored_max_sma != MAX_SMA_DAY:
+                logger.warning(f"MAX_SMA_DAY mismatch for {ticker}: stored={stored_max_sma}, current={MAX_SMA_DAY}")
+            
+            if stored_version == ENGINE_VERSION and stored_max_sma == MAX_SMA_DAY:
+                logger.info(f"Signal Library loaded for {ticker} from {filepath}")
+                
+                # Check if this is the enhanced V2 format with primary_signals
+                if 'primary_signals' in signal_data:
+                    logger.info(f"  Enhanced V2 format detected with {len(signal_data['primary_signals'])} signals")
+                
+                return signal_data
+            else:
+                logger.warning(f"Version mismatch for {ticker} Signal Library")
+                return None
+        else:
+            logger.debug(f"No Signal Library found for {ticker} at {filepath}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error loading Signal Library for {ticker}: {e}")
+        return None
 
-    # Leave index-style tickers as-is (e.g., ^GSPC)
-    if t.startswith('^'):
-        return t
+# Note: normalize_ticker is now imported from shared_symbols module
 
-    # Convert Yahoo dot-suffix equities to dash (e.g., BRK.B -> BRK-B, BF.B -> BF-B)
-    if re.match(r'^[A-Z]{1,5}\.[A-Z0-9]{1,3}$', t):
-        t = t.replace('.', '-')
-
-    # Crypto normalization with explicit USD suffix (BTCUSD / BTC.USD / BTC-USD)
-    m = re.fullmatch(r'([A-Z0-9]+)[.\-]?USD', t)
-    if m:
-        base = m.group(1)
-        if base == 'XBT':  # alias for BTC
-            base = 'BTC'
-        if base in CRYPTO_BASES:
-            return f'{base}-USD'
-        # If it's not a known base, fall through to return t as-is
-
-    # Bare crypto base (safe subset only)
-    if t == 'XBT':
-        return 'BTC-USD'
-    if t in SAFE_BARE_CRYPTO_BASES:
-        return f'{t}-USD'
-
-    return t
+def is_session_complete(df, ticker_type='equity'):
+    """
+    Mirror onepass.py behavior (equity cutoff 16:10 ET, crypto stability window)
+    """
+    from datetime import datetime, time, timedelta
+    import pytz
+    
+    if df.empty:
+        return True
+    
+    tz = pytz.timezone('America/New_York')
+    now = datetime.now(tz)
+    last_date = df.index[-1]
+    
+    if ticker_type == 'equity':
+        # Use same formulation as onepass for consistency
+        cutoff_dt = tz.localize(datetime.combine(now.date(), time(16, 0))) + timedelta(minutes=EQUITY_SESSION_BUFFER_MINUTES)
+        if last_date.date() == now.date() and now < cutoff_dt:
+            return False
+    elif ticker_type == 'crypto':
+        # For crypto daily bars: check if stamped with today's UTC date (match onepass.py)
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
+        # Treat naive index as UTC midnight for daily bars
+        last_ts_utc = pd.Timestamp(last_date).tz_localize('UTC') if last_date.tzinfo is None else last_date.tz_convert('UTC')
+        
+        # Daily bar still forming if stamped with today's UTC date
+        if last_ts_utc.date() == now_utc.date():
+            logger.debug("Crypto daily bar for today is incomplete. Dropping it.")
+            return False
+        
+        # Optional extra guard (mostly relevant if you add intraday later)
+        minutes_old = (now_utc - last_ts_utc).total_seconds() / 60
+        if minutes_old < CRYPTO_STABILITY_MINUTES:
+            logger.debug(f"Crypto bar only {minutes_old:.1f} min old (<{CRYPTO_STABILITY_MINUTES}). Dropping it.")
+            return False
+    
+    return True
 
 def fetch_data(ticker, use_cache=True, max_retries=3):
     """Fetch data with optional caching support"""
@@ -964,6 +1051,15 @@ def fetch_data(ticker, use_cache=True, max_retries=3):
             logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
             return pd.DataFrame()
 
+        # Apply the very same detector as onepass (parity)
+        ticker_type = detect_ticker_type(ticker)
+        if not is_session_complete(df, ticker_type):
+            logger.debug(f"Dropping incomplete session for {ticker}")
+            df = df.iloc[:-1]
+        
+        # NEW: Apply strict parity transform if enabled (e.g., rounding/normalization)
+        df = apply_strict_parity(df)
+        
         # Don't cache for impact analysis to avoid multiprocessing corruption
         # CacheManager.save_to_cache(df, ticker, 'data')
         
@@ -981,8 +1077,13 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df)
     logger.debug(f"Initial primary_dates range: {primary_dates[0]} to {primary_dates[-1]} (len={len(primary_dates)})")
     logger.debug(f"secondary_df index range: {secondary_df.index[0]} to {secondary_df.index[-1]} (len={len(secondary_df)})")
     
-    # Create signals series with original dates (no reindexing yet)
-    signals = pd.Series(primary_signals, index=primary_dates)
+    # Guard against length mismatches (parity with onepass)
+    if len(primary_signals) != len(primary_dates):
+        n = min(len(primary_signals), len(primary_dates))
+        logger.warning(f"Signal/date length mismatch: signals={len(primary_signals)}, dates={len(primary_dates)}. Truncating to {n}.")
+        signals = pd.Series(primary_signals[:n], index=primary_dates[:n])
+    else:
+        signals = pd.Series(primary_signals, index=primary_dates)
 
     logger.debug(f"Signals head (unshifted):\n{signals.head(5)}")
     logger.debug(f"Signals tail (unshifted):\n{signals.tail(5)}")
@@ -1010,13 +1111,13 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df)
     
     logger.debug(f"Daily returns head (pre-shift alignment):\n{daily_returns.head(5)}")
     
-    # If we need to capture on the same day a signal appears (no one-day delay),
-    # remove the shift and keep all dates from the start.
+    # NEW: Drop days where pct_change is NaN (first aligned day) - PARITY CRITICAL
+    valid = daily_returns.notna()
+    signals = signals.loc[valid]
+    daily_returns = daily_returns.loc[valid]
+    
+    logger.debug(f"After dropping NaN returns: {len(signals)} signals remaining")
     logger.debug(f"Signals head (NO SHIFT):\n{signals.head(5)}")
-
-    valid_dates = signals.index  # Keep all valid dates without dropping the first
-    signals = signals.loc[valid_dates]
-    daily_returns = daily_returns.loc[valid_dates]
 
     logger.debug(f"Signals index after dropping first date: {signals.index[0]} ... {signals.index[-1]}")
     logger.debug(f"Daily returns index after dropping first date: {daily_returns.index[0]} ... {daily_returns.index[-1]}")
@@ -1045,6 +1146,9 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df)
 
     logger.debug(f"Sample of signal_captures:\n{signal_captures.head(10)}\n...\n{signal_captures.tail(10)}")
 
+    # Defensive math: explicitly drop NaN values (redundant after Patch #1, but safe)
+    signal_captures = signal_captures.dropna()
+    
     # Calculate basic metrics
     wins = (signal_captures > 0).sum()
     losses = trigger_days - wins
@@ -1183,6 +1287,13 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None):
     prim_ticker = normalize_ticker(prim_ticker)
     logger.info(f"Processing {prim_ticker}...")
     
+    # If Signal Library is available, use precomputed signals
+    primary_signals = None
+    primary_dates = None
+    
+    # Try to load Signal Library first for massive speedup
+    signal_data = load_signal_library(prim_ticker)
+    
     # Always fetch fresh data for primary tickers (no caching to avoid corruption)
     df = fetch_data(prim_ticker, use_cache=False)
     if df.empty:
@@ -1198,106 +1309,229 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None):
     # Debug: Verify unique data per ticker
     logger.info(f"Ticker {prim_ticker}: {num_days} days, Close[0]={close_values[0]:.2f}, Close[-1]={close_values[-1]:.2f}")
 
-    # Check for cached SMA calculations
-    cache_key = f"{prim_ticker}_sma"
-    if sma_cache and cache_key in sma_cache:
-        sma_matrix = sma_cache[cache_key]
-        logger.debug(f"Using cached SMA for {prim_ticker}")
-    else:
-        logger.info("Computing SMAs...")
-        cumsum = np.cumsum(np.insert(close_values, 0, 0))
-        sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float32)
-        sma_matrix.fill(np.nan)
-        for i in range(1, MAX_SMA_DAY + 1):
-            valid_indices = np.arange(i-1, num_days)
-            sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
+    # If Signal Library is available, use precomputed signals
+    if signal_data:
+        # Evaluate library acceptance using multi-tier ladder
+        acceptance_level, integrity_status, message = evaluate_library_acceptance(signal_data, df)
         
-        if sma_cache is not None:
-            sma_cache[cache_key] = sma_matrix
-
-    # Compute returns once (converted to float32 for efficiency)
-    logger.info("Computing returns using pct_change()...")
-    returns_pct = df['Close'].pct_change().fillna(0).to_numpy(dtype=np.float32) * 100
-    
-    logger.info("Computing daily top pairs using fully-streaming algorithm...")
-    # True streaming: no O(days × pairs) arrays at all
-    daily_top_buy_pairs = {}
-    daily_top_short_pairs = {}
-    
-    # Use float64 for accumulators to prevent precision loss over long periods
-    buy_cum = np.zeros(len(PAIRS), dtype=np.float64)
-    short_cum = np.zeros(len(PAIRS), dtype=np.float64)
-    
-    for idx, date in enumerate(df.index):
-        # Get this day's SMA vector
-        sma_t = sma_matrix[idx]  # shape (MAX_SMA_DAY,)
+        logger.info(f"Signal Library acceptance for {prim_ticker}: {acceptance_level} - {message}")
         
-        # Compute day-only signals: +1 buy, -1 short, 0 none
-        # This replaces the huge sma_i/sma_j/signals arrays
-        valid_mask = np.isfinite(sma_t[I_IDX]) & np.isfinite(sma_t[J_IDX])
-        cmp = np.zeros(len(PAIRS), dtype=np.int8)
-        cmp[valid_mask] = np.sign(sma_t[I_IDX[valid_mask]] - sma_t[J_IDX[valid_mask]]).astype(np.int8)
+        # Log parity status if configured
+        if LOG_ACCEPTANCE_TIER and acceptance_level != 'STRICT':
+            logger.debug(f"  Acceptance tier: {acceptance_level}, Integrity: {integrity_status}")
         
-        # Get this day's return
-        r = float(returns_pct[idx])
-        
-        # In-place masked updates (avoids temporary arrays)
-        if r != 0.0:
-            buy_mask = (cmp == 1)
-            if buy_mask.any():
-                buy_cum[buy_mask] += r
-            short_mask = (cmp == -1)
-            if short_mask.any():
-                short_cum[short_mask] += -r
-        
-        # Find top pairs with reverse tie-breaking
-        max_buy_idx = len(buy_cum) - 1 - np.argmax(buy_cum[::-1])
-        max_short_idx = len(short_cum) - 1 - np.argmax(short_cum[::-1])
-        
-        # Store results (converting back to Python types for consistency)
-        daily_top_buy_pairs[date] = (
-            (int(PAIRS[max_buy_idx, 0]), int(PAIRS[max_buy_idx, 1])),
-            float(buy_cum[max_buy_idx])
-        )
-        daily_top_short_pairs[date] = (
-            (int(PAIRS[max_short_idx, 0]), int(PAIRS[max_short_idx, 1])),
-            float(short_cum[max_short_idx])
-        )
-
-    logger.info("Deriving primary signals from previous day's top pairs...")
-    primary_dates = df.index
-    primary_signals = []
-    previous_date = None
-
-    for date in primary_dates:
-        if previous_date is None:
-            primary_signals.append('None')
-            previous_date = date
-            continue
-
-        buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((1,2),0.0))
-        short_pair, short_val = daily_top_short_pairs.get(previous_date, ((1,2),0.0))
-
-        # Get previous day's SMA values
-        sma1_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[0]-1]
-        sma2_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[1]-1]
-        sma1_short = sma_matrix[df.index.get_loc(previous_date), short_pair[0]-1]
-        sma2_short = sma_matrix[df.index.get_loc(previous_date), short_pair[1]-1]
-
-        buy_signal = sma1_buy > sma2_buy
-        short_signal = sma1_short < sma2_short
-
-        if buy_signal and short_signal:
-            current_signal = 'Buy' if buy_val > short_val else 'Short'
-        elif buy_signal:
-            current_signal = 'Buy'
-        elif short_signal:
-            current_signal = 'Short'
+        # Only rebuild if absolutely necessary
+        if acceptance_level == 'REBUILD':
+            logger.warning(f"Signal Library rebuild required for {prim_ticker}: {message}")
+            signal_data = None
         else:
-            current_signal = 'None'
+            # Accept the library under all other tiers
+            if acceptance_level != 'STRICT':
+                logger.info(f"Accepting Signal Library with {acceptance_level} match - {message}")
+            
+            # Phase 2: Handle incremental updates
+            if integrity_status == 'NEW_DATA':
+                logger.info(f"New data available for {prim_ticker} but library still usable")
+                # Check if library was incrementally updated
+                if signal_data.get('incremental_update'):
+                    logger.info(f"Signal Library was incrementally updated by onepass.py")
+                else:
+                    logger.info(f"Consider running onepass.py to append new days")
+        
+    if signal_data and 'primary_signals' in signal_data:
+        # BEST CASE: Use pre-computed primary_signals directly!
+        logger.info(f"Using enhanced Signal Library V2 for {prim_ticker} - ULTIMATE SPEEDUP!")
+        primary_signals = signal_data['primary_signals']
+        daily_top_buy_pairs = signal_data['daily_top_buy_pairs']
+        daily_top_short_pairs = signal_data['daily_top_short_pairs']
+        
+        # Align signals with current data - O(N) using dict
+        if 'dates' in signal_data:
+            stored_dates = signal_data['dates']
+            primary_dates = df.index
+            
+            # Build dict once for O(1) lookups - fixes O(N²) issue
+            signal_map = {date: signal for date, signal in zip(stored_dates, primary_signals)}
+            
+            # Map signals in O(N) total time
+            primary_signals_aligned = []
+            for date in primary_dates:
+                date_str = str(date.date())
+                primary_signals_aligned.append(signal_map.get(date_str, 'None'))
+            
+            primary_signals = primary_signals_aligned
+            
+            # NO SMA COMPUTATION NEEDED AT ALL!
+            logger.info(f"Skipping ALL SMA computation - using {len(primary_signals)} pre-computed signals")
+            
+            # Jump directly to metrics calculation
+            logger.info("Calculating metrics from pre-computed signals...")
+            # The rest of the function will handle metrics calculation
+            sma_matrix = None  # We don't need it!
+        else:
+            # Fallback if dates not available
+            logger.warning("Signal Library V2 missing dates - falling back to regular processing")
+            primary_signals = None
+            signal_data = None
+    
+    elif signal_data and primary_signals is None:
+        # V1 format - has daily pairs but not primary_signals
+        logger.info(f"Using Signal Library V1 for {prim_ticker} - partial speedup")
+        daily_top_buy_pairs = signal_data['daily_top_buy_pairs']
+        daily_top_short_pairs = signal_data['daily_top_short_pairs']
+        
+        # Normalize V1 library keys to Timestamp (future-proof for string keys)
+        def _normalize_pair_keys_to_timestamp(d):
+            out = {}
+            for k, v in d.items():
+                try:
+                    kt = pd.Timestamp(k) if not isinstance(k, pd.Timestamp) else k
+                except Exception:
+                    kt = k
+                out[kt] = v
+            return out
+        
+        daily_top_buy_pairs = _normalize_pair_keys_to_timestamp(daily_top_buy_pairs)
+        daily_top_short_pairs = _normalize_pair_keys_to_timestamp(daily_top_short_pairs)
+        
+        # Still need SMA matrix for signal derivation
+        cache_key = f"{prim_ticker}_sma"
+        if sma_cache and cache_key in sma_cache:
+            sma_matrix = sma_cache[cache_key]
+            logger.debug(f"Using cached SMA for {prim_ticker}")
+        else:
+            logger.info("Computing SMAs for signal derivation (V1 format)...")
+            cumsum = np.cumsum(np.insert(close_values, 0, 0))
+            sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float32)
+            sma_matrix.fill(np.nan)
+            for i in range(1, MAX_SMA_DAY + 1):
+                valid_indices = np.arange(i-1, num_days)
+                sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
+            
+            if sma_cache is not None:
+                sma_cache[cache_key] = sma_matrix
+    else:
+        # No Signal Library - compute from scratch
+        logger.info(f"No Signal Library found for {prim_ticker}, computing from scratch...")
+        
+        # Check for cached SMA calculations
+        cache_key = f"{prim_ticker}_sma"
+        if sma_cache and cache_key in sma_cache:
+            sma_matrix = sma_cache[cache_key]
+            logger.debug(f"Using cached SMA for {prim_ticker}")
+        else:
+            logger.info("Computing SMAs...")
+            cumsum = np.cumsum(np.insert(close_values, 0, 0))
+            sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float32)
+            sma_matrix.fill(np.nan)
+            for i in range(1, MAX_SMA_DAY + 1):
+                valid_indices = np.arange(i-1, num_days)
+                sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
+            
+            if sma_cache is not None:
+                sma_cache[cache_key] = sma_matrix
 
-        primary_signals.append(current_signal)
-        previous_date = date
+        # Compute returns once (converted to float32 for efficiency)
+        logger.info("Computing returns using pct_change()...")
+        returns_pct = df['Close'].pct_change().fillna(0).to_numpy(dtype=np.float32) * 100
+        
+        logger.info("Computing daily top pairs using fully-streaming algorithm...")
+        # True streaming: no O(days × pairs) arrays at all
+        daily_top_buy_pairs = {}
+        daily_top_short_pairs = {}
+        
+        # Use float64 for accumulators to prevent precision loss over long periods
+        buy_cum = np.zeros(len(PAIRS), dtype=np.float64)
+        short_cum = np.zeros(len(PAIRS), dtype=np.float64)
+        
+        for idx, date in enumerate(df.index):
+            # Skip first day - can't trade without previous day's signals
+            if idx == 0:
+                daily_top_buy_pairs[date] = ((1, 2), 0.0)
+                daily_top_short_pairs[date] = ((1, 2), 0.0)
+                continue
+            
+            # Use PREVIOUS day's SMAs to generate signals
+            sma_t_prev = sma_matrix[idx - 1]  # Yesterday's SMAs
+            
+            # Compute signals based on yesterday's SMAs
+            valid_mask = np.isfinite(sma_t_prev[I_IDX]) & np.isfinite(sma_t_prev[J_IDX])
+            cmp = np.zeros(len(PAIRS), dtype=np.int8)
+            cmp[valid_mask] = np.sign(sma_t_prev[I_IDX[valid_mask]] - sma_t_prev[J_IDX[valid_mask]]).astype(np.int8)
+            
+            # Apply to TODAY's return
+            r = float(returns_pct[idx])
+            
+            # Update cumulative captures
+            if r != 0.0:
+                buy_mask = (cmp == 1)
+                if buy_mask.any():
+                    buy_cum[buy_mask] += r
+                
+                short_mask = (cmp == -1)
+                if short_mask.any():
+                    short_cum[short_mask] += -r  # Gain from shorting = negative of market return
+            
+            # Find top pairs with reverse tie-breaking
+            max_buy_idx = len(buy_cum) - 1 - np.argmax(buy_cum[::-1])
+            max_short_idx = len(short_cum) - 1 - np.argmax(short_cum[::-1])
+            
+            # Store results
+            daily_top_buy_pairs[date] = (
+                (int(PAIRS[max_buy_idx, 0]), int(PAIRS[max_buy_idx, 1])),
+                float(buy_cum[max_buy_idx])
+            )
+            daily_top_short_pairs[date] = (
+                (int(PAIRS[max_short_idx, 0]), int(PAIRS[max_short_idx, 1])),
+                float(short_cum[max_short_idx])
+            )
+
+    # Derive signals if we still don't have them pre-computed
+    if primary_signals is None:
+        # Need to derive signals - we don't have them pre-computed
+        logger.info("Deriving primary signals from previous day's top pairs...")
+        primary_dates = df.index
+        primary_signals = []
+        previous_date = None
+
+        for date in primary_dates:
+            if previous_date is None:
+                primary_signals.append('None')
+                previous_date = date
+                continue
+
+            buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((1,2),0.0))
+            short_pair, short_val = daily_top_short_pairs.get(previous_date, ((1,2),0.0))
+
+            # Get previous day's SMA values
+            sma1_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[0]-1]
+            sma2_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[1]-1]
+            sma1_short = sma_matrix[df.index.get_loc(previous_date), short_pair[0]-1]
+            sma2_short = sma_matrix[df.index.get_loc(previous_date), short_pair[1]-1]
+
+            buy_signal = sma1_buy > sma2_buy
+            short_signal = sma1_short < sma2_short
+
+            if buy_signal and short_signal:
+                current_signal = get_tiebreak_signal(buy_val, short_val)
+            elif buy_signal:
+                current_signal = 'Buy'
+            elif short_signal:
+                current_signal = 'Short'
+            else:
+                current_signal = 'None'
+
+            primary_signals.append(current_signal)
+            previous_date = date
+        
+        # Memory hygiene: release SMA matrix after signal derivation
+        if 'sma_matrix' in locals():
+            del sma_matrix
+            logger.debug("Released SMA matrix memory")
+    else:
+        # We already have pre-computed signals (V2 path)
+        logger.info(f"Using {len(primary_signals)} pre-computed signals from Signal Library V2")
+        primary_dates = df.index
 
     logger.info("Calculating final metrics for this primary ticker...")
     logger.info(f"Signal distribution before metrics calculation:")
@@ -2405,20 +2639,28 @@ app.index_string = '''
 '''
 
 if __name__ == "__main__":
-    # Ensure all required directories exist
-    required_dirs = ['cache', 'cache/impact_analysis', 'cache/results', 'cache/status', 
-                    'cache/sma_cache', 'cache/templates', 'output', 'logs']
-    for directory in required_dirs:
-        os.makedirs(directory, exist_ok=True)
+    # Optional: log parity status once at boot (no-op if fallback)
+    try:
+        log_parity_status()
+    except Exception:
+        pass
     
-    # Clean up old log files
-    log_files = ['logs/analysis.log', 'logs/debug.log', 'logs/impactsearch.log']
-    for file in log_files:
-        if os.path.exists(file):
-            try:
-                os.remove(file)
-            except:
-                pass
+    # Skip initialization in reloader subprocess (prevent double execution)
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        # Ensure all required directories exist
+        required_dirs = ['cache', 'cache/impact_analysis', 'cache/results', 'cache/status', 
+                        'cache/sma_cache', 'cache/templates', 'output', 'logs']
+        for directory in required_dirs:
+            os.makedirs(directory, exist_ok=True)
+        
+        # Clean up old log files
+        log_files = ['logs/analysis.log', 'logs/debug.log', 'logs/impactsearch.log']
+        for file in log_files:
+            if os.path.exists(file):
+                try:
+                    os.remove(file)
+                except:
+                    pass
                 
     # Use debug=False or use_reloader=False to prevent hanging processes
     app.run_server(debug=True, port=8051, use_reloader=False)
