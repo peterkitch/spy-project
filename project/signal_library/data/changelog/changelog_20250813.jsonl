@@ -1,0 +1,10 @@
+{"timestamp": "2025-08-13T12:54:03.102013", "ticker": "SPY", "action": "full_rebuild", "version": "3.0.0", "reason": "Significant differences require rebuild", "acceptance_level": "REBUILD"}
+{"timestamp": "2025-08-13T13:00:33.065027", "ticker": "SPY", "action": "full_rebuild", "version": "3.0.0", "reason": "Significant differences require rebuild", "acceptance_level": "REBUILD", "retries": 0}
+{"timestamp": "2025-08-13T13:00:36.549044", "ticker": "QQQ", "action": "full_rebuild", "version": "3.0.0", "reason": "Fuzzy head/tail match (head=100%, tail=100%)", "acceptance_level": "HEADTAIL_FUZZY", "retries": 1}
+{"timestamp": "2025-08-13T13:00:39.174169", "ticker": "AAPL", "action": "full_rebuild", "version": "3.0.0", "reason": "Fuzzy head/tail match (head=100%, tail=100%)", "acceptance_level": "HEADTAIL_FUZZY", "retries": 0}
+{"timestamp": "2025-08-13T13:40:02.762969", "ticker": "QQQ", "action": "full_rebuild", "version": "3.0.0", "reason": "Fuzzy head/tail match (head=100%, tail=100%)", "acceptance_level": "HEADTAIL_FUZZY", "retries": 0}
+{"timestamp": "2025-08-13T13:40:06.519285", "ticker": "SPY", "action": "full_rebuild", "version": "3.0.0", "reason": "Significant differences require rebuild", "acceptance_level": "REBUILD", "retries": 1}
+{"timestamp": "2025-08-13T13:40:09.341008", "ticker": "AAPL", "action": "full_rebuild", "version": "3.0.0", "reason": "Fuzzy head/tail match (head=100%, tail=100%)", "acceptance_level": "HEADTAIL_FUZZY", "retries": 0}
+{"timestamp": "2025-08-13T15:06:31.867840", "ticker": "SPY", "action": "full_rebuild", "version": "3.0.0", "reason": "Significant differences require rebuild", "acceptance_level": "REBUILD", "retries": 0}
+{"timestamp": "2025-08-13T15:06:35.198746", "ticker": "QQQ", "action": "full_rebuild", "version": "3.0.0", "reason": "Fuzzy head/tail match (head=100%, tail=100%)", "acceptance_level": "HEADTAIL_FUZZY", "retries": 1}
+{"timestamp": "2025-08-13T15:06:37.888557", "ticker": "AAPL", "action": "full_rebuild", "version": "3.0.0", "reason": "Fuzzy head/tail match (head=100%, tail=100%)", "acceptance_level": "HEADTAIL_FUZZY", "retries": 0}
