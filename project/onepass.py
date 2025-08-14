@@ -504,25 +504,58 @@ def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60):
 
 # Note: detect_ticker_type is now imported from shared_symbols module
 
+def _coerce_to_close_frame(df):
+    """
+    Helper function to handle various column structures from yfinance.
+    Ensures we always get a clean DataFrame with a single 'Close' column.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Handle MultiIndex columns (occurs with some tickers like CTM)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Try to extract the Close column from the MultiIndex
+        if 'Adj Close' in df.columns.get_level_values(0):
+            # Get the ticker symbol from the second level
+            ticker_col = df.columns.get_level_values(1)[0] if len(df.columns.get_level_values(1)) > 0 else None
+            if ticker_col and ('Adj Close', ticker_col) in df.columns:
+                result = pd.DataFrame(df[('Adj Close', ticker_col)])
+                result.columns = ['Close']
+                return result
+        if 'Close' in df.columns.get_level_values(0):
+            ticker_col = df.columns.get_level_values(1)[0] if len(df.columns.get_level_values(1)) > 0 else None
+            if ticker_col and ('Close', ticker_col) in df.columns:
+                result = pd.DataFrame(df[('Close', ticker_col)])
+                result.columns = ['Close']
+                return result
+    
+    # Handle regular columns
+    if 'Adj Close' in df.columns:
+        return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
+    elif 'Close' in df.columns:
+        return pd.DataFrame(df[['Close']])
+    
+    # If we can't find a close column, return empty
+    logger.error(f"No Close/Adj Close data found in DataFrame")
+    return pd.DataFrame()
+
 def fetch_data(ticker):
     if not ticker or not ticker.strip():
         return pd.DataFrame()
     ticker = normalize_ticker(ticker)
     try:
         logger.info(f"Fetching data for {ticker}...")
+        # Add group_by='column' to ensure consistent column structure
         df = yf.download(ticker, period='max', interval='1d', progress=False, 
-                        auto_adjust=False, timeout=10, threads=False)
+                        auto_adjust=False, timeout=10, threads=False, group_by='column')
         if df.empty:
             logger.warning(f"No data returned for {ticker}.")
             return pd.DataFrame()
         df.index = pd.to_datetime(df.index).tz_localize(None)
 
-        if 'Adj Close' in df.columns:
-            df = df[['Adj Close']]
-            df.columns = ['Close']
-        elif 'Close' in df.columns:
-            df = df[['Close']]
-        else:
+        # Use the helper function to handle all column structures
+        df = _coerce_to_close_frame(df)
+        if df.empty:
             logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
             return pd.DataFrame()
         
