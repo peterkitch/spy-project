@@ -1,0 +1,1 @@
+# Utils for impactsearch.py script
