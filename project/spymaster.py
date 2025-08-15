@@ -2987,9 +2987,84 @@ cache_dir = '.cache'
 os.makedirs(cache_dir, exist_ok=True)
 memory = Memory(cache_dir, verbose=0)
 
+# ===== Adaptive interval helpers =====
+MIN_INTERVAL_MS = 1000  # 1 second minimum to prevent flashing
+MAX_INTERVAL_MS = 6000
+SAFETY_MULTIPLIER = 1.25  # modest headroom over measured time
+
+def _load_last_results_for(ticker):
+    """Return last results dict for ticker from RAM cache or pkl, else None (no I/O loops)."""
+    t = normalize_ticker(ticker)  # uses your existing helper
+    res = _precomputed_results_cache.get(t)  # in-memory first
+    if res is None:
+        pkl = f'cache/results/{t}_precomputed_results.pkl'
+        if os.path.exists(pkl):
+            res = load_precomputed_results_from_file(pkl)  # cheap, once on change
+    return res
+
+def predicted_seconds_from_results(results):
+    """Sum heavy sections; resilient to missing keys."""
+    if not results:
+        return None
+    st = results.get('section_times', {}) or {}
+    parts = [
+        st.get('SMA Pairs Processing', 0),
+        st.get('Cumulative Combined Captures', 0),
+        st.get('Daily Top Pairs Calculation', 0),
+        st.get('Data Processing', 0),
+        st.get('Data Preprocessing', 0),
+        results.get('chunk_processing_time', 0),  # present in some paths
+    ]
+    s = sum(x for x in parts if x and x > 0)
+    return s or None
+
+def interval_from_measured_secs(s):
+    """Piecewise map measured seconds → polling interval (ms)."""
+    if s is None: return None
+    if s <= 2:   return 1000  # MIN_INTERVAL_MS
+    if s <= 8:   return 1000  # Keep at 1 second for small tickers
+    if s <= 20:  return 1500  # Slightly faster for medium
+    if s <= 45:  return 2000
+    if s <= 90:  return 4000
+    return 6000
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
+
+# Windowed secondary fetch with small in-process cache
+_secondary_df_cache = {}
+_SECONDARY_TTL = 900  # 15 minutes
+
+def fetch_secondary_window(ticker, start, end):
+    """Download only the needed window for a secondary ticker."""
+    import time
+    key = (normalize_ticker(ticker), pd.to_datetime(start).date(), pd.to_datetime(end).date())
+    cached = _secondary_df_cache.get(key)
+    if cached and (time.time() - cached["t"] < _SECONDARY_TTL):
+        return cached["df"]
+    
+    try:
+        import yfinance as yf
+        # Keep it simple and robust
+        df = yf.download(
+            ticker,
+            start=pd.to_datetime(start).strftime("%Y-%m-%d"),
+            end=pd.to_datetime(end).strftime("%Y-%m-%d"),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=15
+        )
+        if df is not None and not df.empty:
+            df.index = pd.to_datetime(df.index)  # ensure DateTimeIndex
+            _secondary_df_cache[key] = {"df": df, "t": time.time()}
+            return df
+    except Exception as e:
+        logger.error(f"Secondary download failed for {ticker}: {e}")
+    
+    return None
+
 def normalize_ticker(ticker):
     """Normalize ticker to uppercase if it exists"""
     return ticker.strip().upper() if ticker else ticker
@@ -3668,6 +3743,9 @@ def precompute_results(ticker, event):
                         cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs)
                         results['cumulative_combined_captures'] = cumulative_combined_captures
                         results['active_pairs'] = active_pairs
+                        # Set section_times BEFORE saving for cached results too
+                        results['section_times'] = section_times
+                        results['start_time'] = master_stopwatch_start
                         save_precomputed_results(ticker, results)
                     else:
                         logger.warning(f"Missing daily top pairs for {ticker}, unable to recalculate 'active_pairs'.")
@@ -3689,10 +3767,12 @@ def precompute_results(ticker, event):
                         _loading_in_progress[ticker].set()
                         del _loading_in_progress[ticker]
 
-                logger.info("Updating Dash app layout...")
-                app.layout = app.layout
-                logger.info("Dash app layout updated.")
+                # Commented out to prevent layout re-mounts causing chart flash
+                # logger.info("Updating Dash app layout...")
+                # app.layout = app.layout
+                # logger.info("Dash app layout updated.")
 
+                # Keep section_times in memory cache too
                 results['section_times'] = section_times
                 results['start_time'] = master_stopwatch_start
 
@@ -3926,6 +4006,10 @@ def precompute_results(ticker, event):
             logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture}")
             logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture}")
 
+            # Set section_times BEFORE saving so it's available for next session
+            results['section_times'] = section_times
+            results['start_time'] = master_stopwatch_start
+
             logger.info(f"Saving final results to {pkl_file}")
             with tqdm(total=1, desc="Saving final results", unit="file", leave=True, position=0) as pbar_save:
                 save_precomputed_results(ticker, results)
@@ -3945,12 +4029,10 @@ def precompute_results(ticker, event):
                     _loading_in_progress[ticker].set()
                     del _loading_in_progress[ticker]
 
-            logger.info("Updating Dash app layout...")
-            app.layout = app.layout
-            logger.info("Dash app layout updated.")
-
-            results['section_times'] = section_times
-            results['start_time'] = master_stopwatch_start
+            # Commented out to prevent layout re-mounts causing chart flash
+            # logger.info("Updating Dash app layout...")
+            # app.layout = app.layout
+            # logger.info("Dash app layout updated.")
 
         except Exception as e:
             logger.error(f"Error in precompute_results for {ticker}: {str(e)}")
@@ -5539,10 +5621,12 @@ app.layout = dbc.Container(
         ]),
         # Interval components for periodic updates
         dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
-        dcc.Interval(id='update-interval', interval=3000, n_intervals=0, disabled=False),  # Reduced to 3 seconds
+        dcc.Interval(id='update-interval', interval=1000, n_intervals=0, disabled=False),  # Adaptive starting at 1000ms
         dcc.Interval(id='loading-interval', interval=3000, n_intervals=0),  # Update every 3 seconds
         dcc.Interval(id='optimization-update-interval', interval=3000, n_intervals=0, disabled=True),
         dcc.Interval(id='countdown-interval', interval=1000, n_intervals=0),  # Re-enabled with proper target
+        # Store adaptive interval state per session (no cross-session leakage)
+        dcc.Store(id='interval-adaptive-state', storage_type='memory'),
         # Loading spinner output (if needed)
         dcc.Loading(
             id="loading-spinner",
@@ -5913,7 +5997,15 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, tick
 def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, current_sma3, current_sma4):
     """Auto-populate SMA input fields with top-performing pairs when data is ready."""
     if not ticker:
-        return no_update, no_update, no_update, no_update
+        return None, None, None, None  # Clear when no ticker
+    
+    # Use context to check if ticker changed
+    ctx = dash.callback_context
+    if ctx.triggered:
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        if trigger_id == 'ticker-input':
+            # Ticker changed - clear values first
+            return None, None, None, None
     
     # If SMA inputs already have values, don't update them
     # This prevents the chart from constantly reloading
@@ -6379,6 +6471,7 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
         xaxis_title='Trading Day',
         yaxis_title='Cumulative Combined Capture (%)',
         hovermode='x',
+        uirevision={'ticker': normalize_ticker(ticker), 'chart': 'combined'},
         template='plotly_dark',
         font=dict(color='#80ff00'),
         plot_bgcolor='black',
@@ -6746,6 +6839,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
             xaxis_title='Trading Day',
             yaxis_title='Cumulative Combined Capture (%)',
             hovermode='x unified',
+            uirevision={'ticker': normalize_ticker(ticker), 'chart': 'historical'},
             template='plotly_dark',
             showlegend=False,
             font=dict(color='#80ff00'),
@@ -8431,7 +8525,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         xaxis_title='Trading Day',
         yaxis_title=f'{ticker.upper()} Closing Price',
         hovermode='x',
-        uirevision='static',
+        uirevision={'ticker': normalize_ticker(ticker), 'chart': 'primary'},
         template='plotly_dark',
         font=dict(color='#80ff00'),
         plot_bgcolor='black',
@@ -8721,46 +8815,167 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     
     return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text
 
-@app.callback(
-    Output('update-interval', 'disabled'),
-    [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')],
-    [State('trading-recommendations', 'children')]
-)
-def disable_interval_when_data_loaded(ticker, n_intervals, recommendations_loaded):
-    if not ticker:
-        return True  # Disable interval when no ticker is entered
-    
-    # Check if processing is complete
-    status = read_status(ticker)
-    
-    # If processing failed, stop the interval
-    if status['status'] == 'failed':
-        return True
-    
-    # Check if we have cached results
-    results = load_precomputed_results(ticker)
-    has_cached_data = (results is not None and 
-                      results.get('status') == 'complete' and
-                      'top_buy_pair' in results and 
-                      'top_short_pair' in results)
-    
-    # For cached tickers, ensure charts are loaded (need a few intervals)
-    if has_cached_data:
-        # Give cached tickers time to load their charts
-        if n_intervals and n_intervals >= 3:  # After ~9 seconds for cached data
-            return True
-        return False  # Keep running for a few intervals to load charts
-    
-    # For new tickers being processed, wait for recommendations to be loaded
-    if status['status'] == 'complete' and recommendations_loaded and len(str(recommendations_loaded)) > 100:
-        # Give it a few more intervals to ensure everything is fully loaded
-        if n_intervals and n_intervals > 5:  # After ~15 seconds of updates
-            return True  # Now safe to disable interval
-    
-    return False  # Keep interval running while loading
+# OLD CALLBACK - Replaced by adaptive_interval_and_disable above
+# @app.callback(
+#     Output('update-interval', 'disabled'),
+#     [Input('ticker-input', 'value'),
+#      Input('update-interval', 'n_intervals')],
+#     [State('trading-recommendations', 'children')]
+# )
+# def disable_interval_when_data_loaded(ticker, n_intervals, recommendations_loaded):
+#     if not ticker:
+#         return True  # Disable interval when no ticker is entered
+#     
+#     # Check if processing is complete
+#     status = read_status(ticker)
+#     
+#     # If processing failed, stop the interval
+#     if status['status'] == 'failed':
+#         return True
+#     
+#     # Check if we have cached results
+#     results = load_precomputed_results(ticker)
+#     has_cached_data = (results is not None and 
+#                       results.get('status') == 'complete' and
+#                       'top_buy_pair' in results and 
+#                       'top_short_pair' in results)
+#     
+#     # For cached tickers, ensure charts are loaded (need a few intervals)
+#     if has_cached_data:
+#         # Give cached tickers time to load their charts
+#         if n_intervals and n_intervals >= 3:  # After ~18 seconds for cached data (3 * 6s)
+#             return True
+#         return False  # Keep running for a few intervals to load charts
+#     
+#     # For new tickers being processed, wait for recommendations to be loaded
+#     if status['status'] == 'complete' and recommendations_loaded and len(str(recommendations_loaded)) > 100:
+#         # Give it a few more intervals to ensure everything is fully loaded
+#         if n_intervals and n_intervals > 5:  # After ~30 seconds of updates (5 * 6s)
+#             return True  # Now safe to disable interval
+#     
+#     return False  # Keep interval running while loading
     
 # Removed duplicate print_timing_summary - using the one defined earlier
+
+# Split callbacks to prevent interval start/stop thrashing
+
+# Callback 1: Adaptive interval (only changes frequency, no disabling)
+@app.callback(
+    [Output('update-interval', 'interval'),
+     Output('interval-adaptive-state', 'data'),
+     Output('update-interval', 'n_intervals')],
+    [Input('ticker-input', 'value'),
+     Input('update-interval', 'n_intervals')],
+    [State('interval-adaptive-state', 'data')],
+    prevent_initial_call=False
+)
+def adapt_update_interval(ticker, n, state):
+    """Only adapts interval frequency based on ticker and elapsed time"""
+    import time
+    from dash.exceptions import PreventUpdate
+    
+    if not ticker:
+        raise PreventUpdate
+    
+    tnorm = normalize_ticker(ticker)
+    
+    # Init / on ticker change: seed store once, reset n_intervals so ramp starts fresh
+    if state is None or state.get('ticker') != tnorm:
+        results = _load_last_results_for(tnorm)
+        predicted = predicted_seconds_from_results(results) if results else None
+        t0 = time.perf_counter()
+        base_ms = interval_from_measured_secs(predicted) or MIN_INTERVAL_MS
+        
+        # Start computation on ticker change
+        load_precomputed_results(tnorm)
+        
+        return int(MIN_INTERVAL_MS), {
+            'ticker': tnorm,
+            't0': t0,
+            'predicted': predicted,
+            'last_interval_ms': base_ms
+        }, 0
+    
+    # Normal ticks: time-based ramp with gentle backoff if we've exceeded the prediction
+    t0 = state.get('t0', time.perf_counter())
+    predicted = state.get('predicted')
+    elapsed = max(0.0, time.perf_counter() - t0)
+    
+    if predicted is not None:
+        base_ms = interval_from_measured_secs(predicted)
+        if elapsed > predicted * SAFETY_MULTIPLIER and base_ms < MAX_INTERVAL_MS:
+            base_ms = min(MAX_INTERVAL_MS, base_ms * 2)
+        state['last_interval_ms'] = base_ms
+        return int(base_ms), state, n
+    
+    # First-ever run without prediction: time-based ramp
+    if elapsed < 1.0:
+        base_ms = 1000  # MIN_INTERVAL_MS
+    elif elapsed < 4.0:
+        base_ms = 1000  # Keep at 1 second initially
+    elif elapsed < 18.0:
+        base_ms = 1500
+    elif elapsed < 48.0:
+        base_ms = 2000
+    elif elapsed < 192.0:
+        base_ms = 4000
+    else:
+        base_ms = 6000
+    
+    state['last_interval_ms'] = base_ms
+    return int(base_ms), state, n
+
+# Callback 2: Disable when data is ready (no frequency changes)
+@app.callback(
+    Output('update-interval', 'disabled'),
+    [Input('update-interval', 'n_intervals'),
+     Input('update-interval', 'interval')],
+    [State('ticker-input', 'value'),
+     State('interval-adaptive-state', 'data'),
+     State('trading-recommendations', 'children')]
+)
+def disable_interval_when_data_loaded(n_intervals, interval_ms, ticker, state, recommendations_loaded):
+    """Only decides when to stop polling, no frequency changes"""
+    import time
+    
+    if not ticker:
+        return True
+    
+    tnorm = normalize_ticker(ticker)
+    status = read_status(tnorm)
+    
+    if status.get('status') == 'failed':
+        return True
+    
+    # If data is ready and UI shows content, stop polling
+    results = load_precomputed_results(tnorm)  # RAM cache or file
+    has_cached = (results is not None and
+                  (results.get('status') == 'complete' or
+                   ('top_buy_pair' in results and 'top_short_pair' in results)))
+    
+    if has_cached:
+        # Small grace period for secondary chart to render
+        t0 = (state or {}).get('t0', time.perf_counter())
+        if time.perf_counter() - t0 > 3.0:
+            return True
+    
+    # Fallback: when recommendations block is populated enough
+    if recommendations_loaded and len(str(recommendations_loaded)) > 100:
+        # Small grace to allow secondary chart to render
+        t0 = (state or {}).get('t0', time.perf_counter())
+        if time.perf_counter() - t0 > 3.0:
+            return True
+    
+    # Time-aware guardrail
+    t0 = (state or {}).get('t0')
+    predicted = (state or {}).get('predicted')
+    elapsed = (time.perf_counter() - t0) if t0 else (n_intervals * (interval_ms / 1000.0))
+    
+    if predicted is not None:
+        budget = max(4.0, min(60.0, predicted * SAFETY_MULTIPLIER))
+        return elapsed >= budget
+    else:
+        return elapsed >= 120.0
 
 @app.callback(
     [Output("loading-spinner-output", "children"),
@@ -8798,7 +9013,7 @@ from dash import dash_table
      Input('secondary-ticker-input', 'value'),
      Input('invert-signals-toggle', 'value'),
      Input('show-secondary-annotations-toggle', 'value'),
-     Input('update-interval', 'n_intervals'),
+     Input('update-interval', 'n_intervals'),  # Re-added with guards
      Input('trading-recommendations', 'children')],
     prevent_initial_call=True
 )
@@ -8820,11 +9035,22 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             zeroline=False,
             showticklabels=False
         ),
-        title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00'))
+        title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00')),
+        uirevision="secondary-static"  # Keep interactions stable
     )
 
     if not primary_ticker or not secondary_tickers_input:
         return empty_fig, [], [], ''
+    
+    # NEW: Ignore interval ticks until primary is ready
+    ctx = dash.callback_context
+    if ctx.triggered:
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        if trigger_id == 'update-interval':
+            status = read_status(normalize_ticker(primary_ticker))
+            ui_ready = bool(trading_recommendations and len(str(trading_recommendations)) > 100)
+            if status.get('status') != 'complete' or not ui_ready:
+                return empty_fig, [], [], 'Waiting for primary ticker data...'
 
     # Load and verify primary ticker results
     results = load_precomputed_results(primary_ticker)
@@ -8851,11 +9077,24 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         logger.info(f"Processing secondary tickers: {', '.join(secondary_tickers)}")
         logger.info(f"{'-' * 80}\n")
 
-        # Fetch secondary ticker data
+        # Get primary date range for windowed fetching
+        primary_df = results.get('preprocessed_data')
+        if primary_df is None or primary_df.empty:
+            return empty_fig, [], [], 'Primary ticker data not preprocessed'
+        
+        date_min, date_max = primary_df.index.min(), primary_df.index.max()
+        
+        # Fetch secondary ticker data with windowed approach
         secondary_dfs = {}
         for ticker in secondary_tickers:
-            df = fetch_data(ticker, is_secondary=True)
+            # Try windowed fetch first (much faster for large tickers)
+            df = fetch_secondary_window(ticker, start=date_min, end=date_max)
+            if df is None:  # Fallback to existing fetch
+                df = fetch_data(ticker, is_secondary=True)
+            
             if df is not None and not df.empty:
+                # Align to primary window to reduce downstream work
+                df = df.loc[(df.index >= date_min) & (df.index <= date_max)].copy()
                 secondary_dfs[ticker] = df
             else:
                 logger.warning(f"Unable to fetch data for {ticker.upper()}")
@@ -8884,7 +9123,25 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             # Align signals and prices
             signals = pd.Series(active_pairs, index=dates).loc[common_dates]
             signals = signals.astype(str)
-            prices = secondary_df['Close'].loc[common_dates]
+            
+            # Extract Close prices robustly (handle both single and multi-level columns)
+            if 'Close' in secondary_df.columns:
+                prices = secondary_df['Close'].loc[common_dates]
+            elif isinstance(secondary_df.columns, pd.MultiIndex):
+                # Handle multi-level columns from yfinance
+                close_cols = [col for col in secondary_df.columns if col[0] == 'Close' or col == 'Close']
+                if close_cols:
+                    prices = secondary_df[close_cols[0]].loc[common_dates]
+                else:
+                    # Fallback to first column
+                    prices = secondary_df.iloc[:, 0].loc[common_dates]
+            else:
+                # Fallback to first column if Close not found
+                prices = secondary_df.iloc[:, 0].loc[common_dates]
+            
+            # Ensure prices is a Series
+            if isinstance(prices, pd.DataFrame):
+                prices = prices.iloc[:, 0]
 
             # Apply inversion if necessary
             if invert_signals:
@@ -8904,8 +9161,16 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             signals = signals.reindex(common_index).fillna('None')
             prices = prices.reindex(common_index).ffill()
 
+            # Ensure prices is a Series (not DataFrame) before computing returns
+            if isinstance(prices, pd.DataFrame):
+                prices = prices.iloc[:, 0] if len(prices.columns) > 0 else pd.Series(dtype=float)
+            
             # Compute daily returns
             daily_returns = prices.pct_change().fillna(0)
+            
+            # Ensure daily_returns is also a Series
+            if isinstance(daily_returns, pd.DataFrame):
+                daily_returns = daily_returns.iloc[:, 0] if len(daily_returns.columns) > 0 else pd.Series(dtype=float)
 
             # Ensure signals and daily_returns have the same index
             signals = signals.loc[daily_returns.index]
@@ -8915,8 +9180,8 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             short_mask = signals == 'Short'
 
             daily_captures = pd.Series(0.0, index=signals.index)
-            daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-            daily_captures[short_mask] = -daily_returns[short_mask] * 100
+            daily_captures.loc[buy_mask] = daily_returns.loc[buy_mask].values * 100
+            daily_captures.loc[short_mask] = -daily_returns.loc[short_mask].values * 100
 
             cumulative_captures = daily_captures.cumsum()
 
@@ -9034,6 +9299,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             xaxis_title='Date',
             yaxis_title='Cumulative Capture (%)',
             hovermode='x unified',
+            uirevision={'ticker': normalize_ticker(primary_ticker), 'chart': 'secondary'},
             template='plotly_dark',
             showlegend=True,
             font=dict(color='#80ff00'),

@@ -7,3 +7,15 @@ debug.log
 !devbox.json
 !devbox.lock
 mcp-server/
+
+# Documentation drafts
+md_library/**/draft_*.md
+md_library/**/temp_*.md
+
+# Test files
+test_*.py
+*_test.py
+
+# Temporary outputs
+*.txt
+!requirements.txt

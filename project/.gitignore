@@ -59,6 +59,8 @@ misc.xml
 *.csv
 *.zip
 
-# Ignore all Markdown files except CLAUDE.md
+# Ignore all Markdown files except CLAUDE.md and md_library
 *.md
 !CLAUDE.md
+!md_library/
+!md_library/**/*.md
