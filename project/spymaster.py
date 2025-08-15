@@ -1,12 +1,10 @@
 import yfinance as yf
 import plotly.graph_objects as go
 import dash
-from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, dash_table
+from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, dash_table, ALL
 import dash_bootstrap_components as dbc
-from dash.dependencies import Input, Output, State, ALL
 import pandas as pd
-from functools import lru_cache
-from functools import partial
+from utils.spymaster.logging_config import setup_logging, Colors, print_startup_banner, print_server_info
 import pickle
 from tqdm import tqdm
 import os
@@ -23,7 +21,6 @@ from threading import Lock
 import signal
 import atexit
 import sys
-from joblib import Memory
 import logging
 from tqdm.contrib.logging import logging_redirect_tqdm
 import traceback
@@ -2452,128 +2449,25 @@ class PerformanceMetrics:
             "backgroundColor": "rgba(0,0,0,0.4)",
             "boxShadow": "0 0 10px rgba(255,255,0,0.2)"  # Subtle glow
         })
-    
-    @classmethod
-    def create_interactive_threshold_slider_deprecated(cls, current_price, thresholds):
-        """Create an interactive price threshold slider"""
-        # Parse thresholds to get numeric values
-        threshold_values = []
-        threshold_labels = []
-        
-        # Handle both list and dict formats
-        if isinstance(thresholds, list):
-            # thresholds is a list of dicts with 'range' and 'signal' keys
-            for item in thresholds:
-                try:
-                    price_range = item.get('range', '')
-                    signal = item.get('signal', '')
-                    
-                    # Extract numeric value from price range
-                    if "$" in price_range:
-                        price_text = price_range.replace("$", "").replace(",", "").strip()
-                        
-                        if "above" in price_text.lower():
-                            numeric_val = float(price_text.split()[0])
-                        elif "below" in price_text.lower():
-                            numeric_val = float(price_text.split()[0])
-                        elif " - " in price_text:
-                            parts = price_text.split(" - ")
-                            # Use the midpoint of the range
-                            low = float(parts[0])
-                            high_text = parts[1] if len(parts) > 1 else parts[0]
-                            if "above" in high_text.lower():
-                                numeric_val = low  # Use the lower bound for "X and above"
-                            else:
-                                high = float(high_text)
-                                numeric_val = (low + high) / 2  # Midpoint
-                        else:
-                            numeric_val = float(price_text.split()[0])
-                        
-                        threshold_values.append(numeric_val)
-                        threshold_labels.append(f"{signal}: {price_range}")
-                except Exception as e:
-                    continue
-        elif isinstance(thresholds, dict):
-            # Original dict format
-            for desc, value in thresholds.items():
-                try:
-                    if isinstance(value, str):
-                        # Extract numeric value from string like "$123.45"
-                        numeric_val = float(value.replace('$', '').replace(',', ''))
-                    else:
-                        numeric_val = float(value)
-                    threshold_values.append(numeric_val)
-                    threshold_labels.append(desc)
-                except:
-                    continue
-        
-        if not threshold_values:
-            return html.Div("No valid thresholds available")
-        
-        min_price = min(threshold_values) * 0.98
-        max_price = max(threshold_values) * 1.02
-        
-        # Create marks for the slider
-        marks = {}
-        for val, label in zip(threshold_values, threshold_labels):
-            position = ((val - min_price) / (max_price - min_price)) * 100
-            color = "#00ff41" if "Buy" in label else "#ff0040" if "Short" in label else "#ffff00"
-            marks[val] = {
-                'label': f'${val:.2f}',
-                'style': {'color': color, 'fontSize': '10px'}
-            }
-        
-        # Add current price mark
-        marks[current_price] = {
-            'label': f'Current: ${current_price:.2f}',
-            'style': {'color': '#00ffff', 'fontSize': '12px', 'fontWeight': 'bold'}
-        }
-        
-        return dbc.Card([
-            dbc.CardHeader([
-                html.I(className="fas fa-sliders-h me-2"),
-                "Interactive Price Thresholds"
-            ]),
-            dbc.CardBody([
-                html.Div([
-                    html.H5(f"Current Price: ${current_price:.2f}", 
-                           style={"textAlign": "center", "color": "#00ffff", "marginBottom": "20px"}),
-                    
-                    dcc.Slider(
-                        id="threshold-slider",
-                        min=min_price,
-                        max=max_price,
-                        value=current_price,
-                        marks=marks,
-                        step=0.01,
-                        included=False,
-                        tooltip={"placement": "bottom", "always_visible": True}
-                    ),
-                    
-                    html.Div(id="threshold-slider-output", style={"marginTop": "20px"}),
-                    
-                    html.Hr(),
-                    
-                    # Distance from thresholds
-                    html.Div([
-                        html.H6("Distance from Thresholds:", style={"marginBottom": "10px"}),
-                        *[
-                            html.Div([
-                                html.Span(label + ": ", style={"fontWeight": "bold"}),
-                                html.Span(f"${abs(current_price - val):.2f} ({abs((current_price - val) / current_price * 100):.2f}%)",
-                                         style={"color": "#00ff41" if "Buy" in label else "#ff0040" if "Short" in label else "#ffff00"})
-                            ], style={"marginBottom": "5px"})
-                            for val, label in zip(threshold_values, threshold_labels)
-                        ]
-                    ])
-                ])
-            ])
-        ], style={"marginBottom": "20px"})
+
+
+# Function to check if ticker is crypto
+def is_crypto_ticker(ticker_symbol):
+    """Check if a ticker symbol represents a cryptocurrency."""
+    # Common crypto suffixes used by Yahoo Finance
+    crypto_suffixes = ['-USD', '-USDT', '-BTC', '-ETH', '-CAD', '-JPY']
+    # Check if ticker ends with any crypto suffix
+    return any(ticker_symbol.endswith(suffix) for suffix in crypto_suffixes)
+
 
 # Initialize the Dash app with a dark theme and custom styles
-app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY, "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"])
+app = Dash(__name__, external_stylesheets=[
+    dbc.themes.DARKLY,
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+    # Custom styles are now loaded from /assets/spymaster/spymaster_styles.css automatically
+])
 
-# Add custom styles with spin animation
+# Custom index string simplified - CSS moved to external file  
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -2582,200 +2476,6 @@ app.index_string = '''
         <title>PRJCT9 - Advanced Trading Analysis</title>
         {%favicon%}
         {%css%}
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;700&family=Share+Tech+Mono&family=Exo+2:wght@300;400;700;900&display=swap');
-            
-            /* Global font hierarchy */
-            body {
-                font-family: 'Rajdhani', monospace;
-                font-weight: 400;
-                letter-spacing: 0.5px;
-            }
-            
-            h1 { 
-                font-family: 'Orbitron', monospace !important;
-                font-weight: 900 !important;
-                text-transform: uppercase;
-            }
-            
-            h2, h3, h4, h5 {
-                font-family: 'Exo 2', sans-serif !important;
-                font-weight: 700 !important;
-                text-transform: uppercase;
-                letter-spacing: 1.5px;
-            }
-            
-            .btn {
-                font-family: 'Share Tech Mono', monospace !important;
-                text-transform: uppercase;
-                letter-spacing: 1.2px;
-                font-weight: 600;
-            }
-            
-            input, .form-control {
-                font-family: 'Share Tech Mono', monospace !important;
-                letter-spacing: 0.8px;
-            }
-            
-            .card-header {
-                font-family: 'Exo 2', sans-serif !important;
-                font-weight: 600;
-                letter-spacing: 1px;
-            }
-            
-            /* Table headers */
-            th {
-                font-family: 'Orbitron', monospace !important;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }
-            
-            /* Animations - slowed down by 50% */
-            @keyframes spin {
-                from { transform: rotate(0deg); }
-                to { transform: rotate(360deg); }
-            }
-            
-            @keyframes pulse-glow {
-                0% { 
-                    text-shadow: 0 0 20px rgba(128, 255, 0, 0.8);
-                    filter: brightness(1);
-                }
-                50% { 
-                    text-shadow: 0 0 40px rgba(128, 255, 0, 1), 0 0 60px rgba(128, 255, 0, 0.8);
-                    filter: brightness(1.2);
-                }
-                100% { 
-                    text-shadow: 0 0 20px rgba(128, 255, 0, 0.8);
-                    filter: brightness(1);
-                }
-            }
-            
-            .pulsating-header {
-                animation: pulse-glow 4s ease-in-out infinite;
-            }
-            .card {
-                transition: all 0.3s ease;
-                border: 1px solid rgba(128, 255, 0, 0.3);
-            }
-            .card:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 5px 30px rgba(128, 255, 0, 0.5);
-                border-color: rgba(128, 255, 0, 0.8);
-            }
-            .btn {
-                transition: all 0.3s ease;
-                position: relative;
-                overflow: hidden;
-            }
-            .btn:hover {
-                box-shadow: 0 0 20px rgba(128, 255, 0, 0.6);
-                filter: brightness(1.1);
-            }
-            .btn::after {
-                content: '';
-                position: absolute;
-                top: 50%;
-                left: 50%;
-                width: 0;
-                height: 0;
-                border-radius: 50%;
-                background: rgba(255, 255, 255, 0.3);
-                transform: translate(-50%, -50%);
-                transition: width 0.6s, height 0.6s;
-            }
-            .btn:active::after {
-                width: 300px;
-                height: 300px;
-            }
-            input.form-control:focus {
-                box-shadow: 0 0 10px rgba(128, 255, 0, 0.5);
-                border-color: #80ff00;
-            }
-            
-            /* Custom Progress Bar Colors - Theme Aligned */
-            .progress-bar.bg-success {
-                background-color: #00ff41 !important;
-                box-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
-            }
-            .progress-bar.bg-warning {
-                background-color: #ffff00 !important;
-                box-shadow: 0 0 10px rgba(255, 255, 0, 0.5);
-                color: #000 !important;
-            }
-            .progress-bar.bg-danger {
-                background-color: #ff0040 !important;
-                box-shadow: 0 0 10px rgba(255, 0, 64, 0.5);
-            }
-            .progress-bar.bg-info {
-                background-color: #80ff00 !important;
-                box-shadow: 0 0 10px rgba(128, 255, 0, 0.5);
-                color: #000 !important;
-            }
-            .progress {
-                background-color: rgba(0, 0, 0, 0.8);
-                border: 1px solid rgba(128, 255, 0, 0.2);
-            }
-            
-            .loading-text {
-                animation: pulse 3s ease-in-out infinite;
-            }
-            @keyframes pulse {
-                0% { opacity: 1; }
-                50% { opacity: 0.5; }
-                100% { opacity: 1; }
-            }
-            .processing-overlay {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(0, 0, 0, 0.8);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                z-index: 9999;
-            }
-            .processing-content {
-                text-align: center;
-                color: #80ff00;
-            }
-            .processing-spinner {
-                border: 3px solid rgba(128, 255, 0, 0.3);
-                border-top: 3px solid #80ff00;
-                border-radius: 50%;
-                width: 60px;
-                height: 60px;
-                animation: spin 1s linear infinite;
-                margin: 0 auto 20px;
-            }
-            @keyframes fadeIn {
-                from { opacity: 0; transform: translateY(20px); }
-                to { opacity: 1; transform: translateY(0); }
-            }
-            .fade-in {
-                animation: fadeIn 0.5s ease-out;
-            }
-            .glow-border {
-                animation: border-glow 4s ease-in-out infinite;
-            }
-            @keyframes border-glow {
-                0% { box-shadow: 0 0 5px rgba(128, 255, 0, 0.5); }
-                50% { box-shadow: 0 0 20px rgba(128, 255, 0, 0.8), 0 0 30px rgba(128, 255, 0, 0.6); }
-                100% { box-shadow: 0 0 5px rgba(128, 255, 0, 0.5); }
-            }
-            .nav-link:hover {
-                color: #00ff41 !important;
-                text-shadow: 0 0 10px rgba(128, 255, 0, 0.8);
-                transform: translateY(-2px);
-                transition: all 0.3s ease;
-            }
-            .nav-link {
-                transition: all 0.3s ease;
-            }
-        </style>
     </head>
     <body>
         {%app_entry%}
@@ -2792,38 +2492,8 @@ master_stopwatch_start = None
 
 status_lock = threading.Lock()
 
-# Remove any existing handlers
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
-
-# Create a custom logger for your application
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# Suppress various library logs
-logging.getLogger('werkzeug').setLevel(logging.ERROR)  # HTTP requests
-logging.getLogger('flask.app').setLevel(logging.ERROR)  # Flask logs
-logging.getLogger('yfinance').setLevel(logging.ERROR)  # yfinance logs
-
-# Color codes for terminal
-class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    # Custom colors for PROJECT 9
-    NEON_GREEN = '\033[38;5;82m'
-    BRIGHT_GREEN = '\033[38;5;46m'
-    DIM_GREEN = '\033[38;5;22m'
-    YELLOW = '\033[38;5;226m'
-    ORANGE = '\033[38;5;208m'
-    PURPLE = '\033[38;5;141m'
-    CYAN = '\033[38;5;51m'
+# Setup logging using the external configuration
+logger = setup_logging(__name__, logging.INFO)
 
 # Track which tickers have had their price data logged
 _logged_price_tickers = set()
@@ -2845,7 +2515,6 @@ class ColoredFormatter(logging.Formatter):
 
 # Force UTF-8 encoding for Windows
 import sys
-import io
 import os
 
 # Set console to UTF-8 mode on Windows
@@ -2975,17 +2644,12 @@ _precomputed_results_cache = {}
 _loading_in_progress = {}
 _loading_lock = threading.Lock()
 
-status_lock = Lock()
-
 optimization_lock = threading.Lock()
 optimization_in_progress = False
 optimization_results_cache = {}  # Add this line to store results
 optimization_progress = None  # Track optimization progress
 
 # Set up persistent cache
-cache_dir = '.cache'
-os.makedirs(cache_dir, exist_ok=True)
-memory = Memory(cache_dir, verbose=0)
 
 # ===== Adaptive interval helpers =====
 MIN_INTERVAL_MS = 1000  # 1 second minimum to prevent flashing
@@ -3069,7 +2733,9 @@ def normalize_ticker(ticker):
     """Normalize ticker to uppercase if it exists"""
     return ticker.strip().upper() if ticker else ticker
 
-def fetch_data(ticker, is_secondary=False):
+def fetch_data(ticker, is_secondary=False, max_retries=4):
+    """Fetch ticker data with improved timeout handling for large tickers."""
+    import random
     try:
         # Check if we've already determined this is an invalid ticker
         status_file = f"cache/status/{ticker}_status.json"
@@ -3092,27 +2758,38 @@ def fetch_data(ticker, is_secondary=False):
         # Normalize ticker
         ticker = normalize_ticker(ticker)
         
-        # Add retries for network issues
-        max_retries = 3
-        retry_delay = 2
+        # Determine timeout based on ticker characteristics
+        base_timeout = 30 if (ticker.startswith('^') or len(ticker) > 4) else 15
+        
         df = pd.DataFrame()
-        for attempt in range(max_retries):
+        for attempt in range(1, max_retries + 1):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     # auto_adjust=False to ensure we get both Adj Close and Close columns
-                    df = yf.download(ticker, period='max', interval='1d', progress=False, 
-                                   auto_adjust=False)
+                    # threads=False for stability, especially with large tickers
+                    df = yf.download(
+                        ticker, 
+                        period='max', 
+                        interval='1d', 
+                        progress=False,
+                        auto_adjust=False,
+                        threads=False,  # Important for stability
+                        timeout=base_timeout
+                    )
                 if not df.empty:
                     break
+                else:
+                    raise ValueError("No data returned")
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}. Retrying...")
-                time.sleep(retry_delay)
-        else:
-            # If df is empty after all retries
-            logger.error(f"No data fetched for {ticker}")
-            write_status(ticker, {"status": "failed", "message": "No data"})
-            return pd.DataFrame()
+                logger.warning(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
+                if attempt == max_retries:
+                    logger.error(f"No data fetched for {ticker} after {max_retries} retries")
+                    if not is_secondary:
+                        write_status(ticker, {"status": "failed", "message": "No data"})
+                    return pd.DataFrame()
+                # Exponential backoff with jitter
+                time.sleep(0.75 * (2 ** (attempt - 1)) + random.uniform(0, 0.5))
 
         # Ensure the index is datetime and timezone naive
         df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -3176,14 +2853,7 @@ def fetch_data(ticker, is_secondary=False):
             return pd.DataFrame()
         
         if not is_secondary:
-            logging.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
-            
-            # Function to check if ticker is crypto
-            def is_crypto_ticker(ticker_symbol):
-                # Common crypto suffixes used by Yahoo Finance
-                crypto_suffixes = ['-USD', '-USDT', '-BTC', '-ETH', '-CAD', '-JPY']
-                # Check if ticker ends with any crypto suffix
-                return any(ticker_symbol.endswith(suffix) for suffix in crypto_suffixes)
+            logger.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
             
             # Check if we should add today's date
             today = pd.Timestamp.now().normalize().tz_localize(None)
@@ -3227,7 +2897,7 @@ def fetch_data(ticker, is_secondary=False):
                         logger.debug("Conditions not met for adding current date")      
         return df
     except Exception as e:
-        logging.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
+        logger.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
         return pd.DataFrame()
 
 # ============================================================================
@@ -3248,31 +2918,31 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
                 data = pickle.load(f)
             return data
         except PermissionError:
-            logging.error(f"Permission denied when loading results from {pkl_file}. Retrying...")
+            logger.error(f"Permission denied when loading results from {pkl_file}. Retrying...")
             time.sleep(delay)
             retries += 1
         except FileNotFoundError:
-            logging.warning(f"Results file not found: {pkl_file}")
+            logger.warning(f"Results file not found: {pkl_file}")
             break
         except Exception as e:
-            logging.error(f"Error loading results from {pkl_file}: {str(e)}")
+            logger.error(f"Error loading results from {pkl_file}: {str(e)}")
             break
-    logging.error(f"Failed to load results from {pkl_file} after {max_retries} retries.")
+    logger.error(f"Failed to load results from {pkl_file} after {max_retries} retries.")
     return None
 
-def load_precomputed_results(ticker, load_full_data=False, from_callback=False, should_log=True):
+def load_precomputed_results(ticker, from_callback=False, should_log=True):
     global _precomputed_results_cache, _loading_in_progress
     
     with _loading_lock:
         if ticker in _precomputed_results_cache:
             # Log when called from callback with should_log=True (ticker change)
             if from_callback and should_log:
-                logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
-                log_ticker_section(ticker.upper(), "LOADING CACHED DATA")
-                logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker.upper()}{Colors.ENDC}")
+                logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
+                log_ticker_section(ticker, "LOADING CACHED DATA")
+                logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker}{Colors.ENDC}")
             else:
                 # Only log debug info for interval updates
-                logger.debug(f"Using cached results for {ticker.upper()}")
+                logger.debug(f"Using cached results for {ticker}")
             return _precomputed_results_cache[ticker]
 
         if ticker in _loading_in_progress:
@@ -3281,54 +2951,29 @@ def load_precomputed_results(ticker, load_full_data=False, from_callback=False, 
 
         # Log ticker input for new requests
         if should_log:
-            logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker.upper()}{Colors.ENDC}")
+            logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
         
         # Attempt to load from file if not in cache and not currently loading
         pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
         if os.path.exists(pkl_file):
-            log_ticker_section(ticker.upper(), "LOADING EXISTING DATA")
-            log_processing(f"Loading precomputed results from file for {ticker.upper()}")
+            log_ticker_section(ticker, "LOADING EXISTING DATA")
+            log_processing(f"Loading precomputed results from file for {ticker}")
             load_start_time = time.time()
             results = load_precomputed_results_from_file(pkl_file)
             if results:
-                if load_full_data:
-                    # Load buy and short results incrementally
-                    buy_results = {}
-                    short_results = {}
-                    chunk_files = sorted(glob.glob(f'cache/sma_cache/{ticker}_results_chunk_*.npz'))
-                    
-                    chunk_load_start = time.time()
-
-                    with tqdm(total=len(chunk_files), desc=f"Loading chunks", unit="chunk") as pbar:
-                        for chunk_file in chunk_files:
-                            data = np.load(chunk_file, allow_pickle=True)
-                            buy_pairs = data['buy_pairs']
-                            buy_values = data['buy_values']
-                            short_pairs = data['short_pairs']
-                            short_values = data['short_values']
-
-                            # Reconstruct dictionaries
-                            buy_results.update(zip(map(tuple, buy_pairs), buy_values))
-                            short_results.update(zip(map(tuple, short_pairs), short_values))
-
-                            pbar.update(1)
-                    
-                    results['buy_results'] = buy_results
-                    results['short_results'] = short_results
-
                 _precomputed_results_cache[ticker] = results
-                logger.debug(f"Loaded results from file for {ticker.upper()}")
+                logger.debug(f"Loaded results from file for {ticker}")
                 return results
             else:
-               logger.warning(f"Failed to load results from file for {ticker.upper()}")
+               logger.warning(f"Failed to load results from file for {ticker}")
 
         # Check if we've already tried and failed due to insufficient data
         status = read_status(ticker)
         if status.get('message') == "Insufficient trading history":
             return None
 
-        log_ticker_section(ticker.upper(), "COMPUTING NEW DATA")
-        log_processing(f"Starting to precompute results for {ticker.upper()}...")
+        log_ticker_section(ticker, "COMPUTING NEW DATA")
+        log_processing(f"Starting to precompute results for {ticker}...")
         event = threading.Event()
         _loading_in_progress[ticker] = event
         # Set daemon=True so the thread doesn't prevent program exit
@@ -3448,222 +3093,6 @@ def save_precomputed_results(ticker, results):
     # Don't log here - it disrupts progress bar output
     return results
 
-def process_chunk_for_top_pairs(chunk_file, total_days):
-    data = np.load(chunk_file, allow_pickle=True)
-    buy_pairs = data['buy_pairs']
-    buy_values = data['buy_values']
-    short_pairs = data['short_pairs']
-    short_values = data['short_values']
-
-    buy_values = np.array(buy_values)
-    short_values = np.array(short_values)
-
-    max_buy_captures = np.full(total_days, -np.inf)
-    max_short_captures = np.full(total_days, -np.inf)
-    max_buy_pairs = [None] * total_days
-    max_short_pairs = [None] * total_days
-
-    num_pairs = len(buy_pairs)
-    for i in range(num_pairs):
-        buy_capture = buy_values[i]
-        short_capture = short_values[i]
-        buy_pair = tuple(buy_pairs[i])
-        short_pair = tuple(short_pairs[i])
-
-        # Update buy captures
-        better_buy = buy_capture > max_buy_captures
-        max_buy_captures = np.where(better_buy, buy_capture, max_buy_captures)
-        max_buy_pairs = [buy_pair if better_buy[j] else max_buy_pairs[j] for j in range(total_days)]
-
-        # Update short captures
-        better_short = short_capture > max_short_captures
-        max_short_captures = np.where(better_short, short_capture, max_short_captures)
-        max_short_pairs = [short_pair if better_short[j] else max_short_pairs[j] for j in range(total_days)]
-
-    return max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs
-
-# ============================================================================
-# SIGNAL CALCULATION AND OPTIMIZATION FUNCTIONS
-# ============================================================================
-def calculate_daily_top_pairs(df, ticker):
-    section_start = time.time()
-    log_processing("Calculating daily top pairs...")
-    total_days = len(df.index)
-    dates = df.index
-
-    # Get list of chunk files
-    chunk_files = sorted(glob.glob(f'cache/sma_cache/{ticker}_results_chunk_*.npz'))
-    logger.info(f"Found {len(chunk_files)} chunk files to process.")
-
-    if not chunk_files:
-        logger.warning("No chunk files found. Cannot calculate daily top pairs.")
-        return {date: ((1, 2), 0.0) for date in dates}, {date: ((1, 2), 0.0) for date in dates}, 0
-
-    # Initialize arrays to store max captures and corresponding pairs
-    max_buy_captures_global = np.full(total_days, -np.inf)
-    max_short_captures_global = np.full(total_days, -np.inf)
-    max_buy_pairs_global = [None] * total_days
-    max_short_pairs_global = [None] * total_days
-
-    chunk_processing_times = []
-    with tqdm(total=len(chunk_files), desc="Processing top pairs", unit="chunk") as pbar:
-        for chunk_file in chunk_files:
-            tqdm.write(f"Processing chunk file: {chunk_file}")
-            chunk_start_time = time.time()
-            try:
-                max_buy_captures, max_buy_pairs, max_short_captures, max_short_pairs = process_chunk_for_top_pairs(chunk_file, total_days)
-                tqdm.write(f"Finished processing {chunk_file}")
-
-                # Update global max captures and pairs
-                better_buy = max_buy_captures > max_buy_captures_global
-                max_buy_captures_global = np.where(better_buy, max_buy_captures, max_buy_captures_global)
-                max_buy_pairs_global = [max_buy_pairs[i] if better_buy[i] else max_buy_pairs_global[i] for i in range(total_days)]
-
-                better_short = max_short_captures > max_short_captures_global
-                max_short_captures_global = np.where(better_short, max_short_captures, max_short_captures_global)
-                max_short_pairs_global = [max_short_pairs[i] if better_short[i] else max_short_pairs_global[i] for i in range(total_days)]
-
-            except Exception as exc:
-                logger.error(f'Chunk {chunk_file} generated an exception: {exc}')
-            chunk_end_time = time.time()
-            chunk_processing_times.append(chunk_end_time - chunk_start_time)
-            pbar.update(1)
-
-    # Build the daily top pairs dictionaries
-    daily_top_buy_pairs = {}
-    daily_top_short_pairs = {}
-    for i, date in enumerate(dates):
-        daily_top_buy_pairs[date] = (max_buy_pairs_global[i], float(max_buy_captures_global[i]))
-        daily_top_short_pairs[date] = (max_short_pairs_global[i], float(max_short_captures_global[i]))
-
-    logger.info(f"Number of daily top pairs: Buy: {len(daily_top_buy_pairs)}, Short: {len(daily_top_short_pairs)}")
-    logger.info("Daily top pairs calculation completed.")
-
-    total_chunk_processing_time = sum(chunk_processing_times)
-    logger.info(f"Total time for processing chunks: {total_chunk_processing_time:.2f} seconds")
-
-    section_time = time.time() - section_start
-    logger.info(f"Total time for Daily Top Pairs Calculation: {section_time:.2f} seconds")
-
-    return daily_top_buy_pairs, daily_top_short_pairs, total_chunk_processing_time
-
-def calculate_captures_vectorized(sma1, sma2, returns):
-    """Calculate captures using adjusted price returns."""
-    try:
-        # Ensure inputs are numpy arrays (returns are based on adjusted prices)
-        sma1 = np.asarray(sma1)
-        sma2 = np.asarray(sma2)
-        returns = np.asarray(returns)
-        
-        # Calculate signals with proper handling of NaN values
-        buy_signals = np.logical_and(np.isfinite(sma1), np.isfinite(sma2))
-        buy_signals = np.logical_and(buy_signals, (sma1 > sma2))
-        
-        short_signals = np.logical_and(np.isfinite(sma1), np.isfinite(sma2))
-        short_signals = np.logical_and(short_signals, (sma1 < sma2))
-
-        # Shift signals to align with returns
-        buy_signals_shifted = np.roll(buy_signals, 1, axis=1)
-        short_signals_shifted = np.roll(short_signals, 1, axis=1)
-
-        # Replace NaN signals with False
-        buy_signals_shifted[:, 0] = False
-        short_signals_shifted[:, 0] = False
-
-        # Calculate captures
-        buy_returns = buy_signals_shifted * returns
-        short_returns = short_signals_shifted * -returns
-
-        # Use cumulative sum
-        buy_capture = np.nancumsum(buy_returns, axis=1)
-        short_capture = np.nancumsum(short_returns, axis=1)
-
-        return buy_capture, short_capture
-        
-    except Exception as e:
-        logger.error(f"Error in calculate_captures_vectorized: {str(e)}")
-        return np.zeros_like(returns), np.zeros_like(returns)
-
-def save_precomputed_results_chunk(ticker, buy_results_chunk, short_results_chunk, chunk_index):
-    ticker = normalize_ticker(ticker)
-    chunk_file = f'cache/sma_cache/{ticker}_results_chunk_{chunk_index}.npz'
-    try:
-        # Validate input data types
-        if not isinstance(buy_results_chunk, dict) or not isinstance(short_results_chunk, dict):
-            logger.error(f"Invalid chunk data types for {ticker}: expected dicts but got {type(buy_results_chunk)} and {type(short_results_chunk)}")
-            np.savez(chunk_file, buy_pairs=np.array([]), buy_values=np.array([]),
-                     short_pairs=np.array([]), short_values=np.array([]))
-            return
-
-        # Attempt to extract a sample array of values to determine the number of days
-        combined_dict = {**buy_results_chunk, **short_results_chunk}
-        example_values = next(iter(combined_dict.values()), None)
-        
-        # Check if we have valid data
-        if example_values is None or not isinstance(example_values, np.ndarray):
-            logger.info(f"No valid arrays found in chunk {chunk_index} for {ticker}. Saving empty results.")
-            np.savez(chunk_file, buy_pairs=np.array([]), buy_values=np.array([]),
-                     short_pairs=np.array([]), short_values=np.array([]))
-            return
-
-        num_days = len(example_values)
-
-        # Convert dictionaries to numpy arrays for vectorized operations
-        buy_pairs = np.array(list(buy_results_chunk.keys()), dtype=object)
-        buy_values = np.array(list(buy_results_chunk.values()), dtype=np.float64)
-        short_pairs = np.array(list(short_results_chunk.keys()), dtype=object)
-        short_values = np.array(list(short_results_chunk.values()), dtype=np.float64)
-
-        # Handle the case where we might have no data (empty arrays)
-        if buy_values.size == 0:
-            top_buy_pairs = np.array([], dtype=object)
-            top_buy_values = np.array([], dtype=np.float64)
-        else:
-            # Use nanargmax to handle any potential NaN values
-            max_buy_indices = np.nanargmax(buy_values, axis=0)
-            top_buy_pairs = buy_pairs[max_buy_indices]
-            top_buy_values = buy_values[max_buy_indices, np.arange(num_days)]
-
-        if short_values.size == 0:
-            top_short_pairs = np.array([], dtype=object)
-            top_short_values = np.array([], dtype=np.float64)
-        else:
-            max_short_indices = np.nanargmax(short_values, axis=0)
-            top_short_pairs = short_pairs[max_short_indices]
-            top_short_values = short_values[max_short_indices, np.arange(num_days)]
-
-        # Save the results in compressed format to reduce file size
-        # Use temp file approach for Windows compatibility
-        temp_chunk_file = chunk_file + '.tmp'
-        np.savez_compressed(temp_chunk_file,
-                            buy_pairs=top_buy_pairs, buy_values=top_buy_values,
-                            short_pairs=top_short_pairs, short_values=top_short_values)
-        
-        # Move temp file to final location with retry logic
-        for attempt in range(3):
-            try:
-                if os.path.exists(chunk_file):
-                    os.remove(chunk_file)
-                os.rename(temp_chunk_file, chunk_file)
-                break
-            except (OSError, PermissionError):
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                else:
-                    # Final attempt - just copy
-                    shutil.copy2(temp_chunk_file, chunk_file)
-                    if os.path.exists(temp_chunk_file):
-                        try:
-                            os.remove(temp_chunk_file)
-                        except:
-                            pass
-
-        file_size = os.path.getsize(chunk_file) / (1024 * 1024 * 1024)
-        logger.info(f"Chunk {chunk_index} saved successfully for {ticker}: {file_size:.2f} GB")
-
-    except Exception as e:
-        logger.error(f"Error saving chunk {chunk_index} for {ticker}: {str(e)}")
-        logger.error(traceback.format_exc())
 
 # ============================================================================
 # PRECOMPUTATION AND CACHING FUNCTIONS
@@ -3697,13 +3126,13 @@ def precompute_results(ticker, event):
             # Check for minimum required trading days
             if len(df) < 2:  # Minimum 2 days needed for calculations
                 write_status(ticker, {"status": "failed", "message": "Insufficient trading history"})
-                logger.warning(f"Unable to process {ticker.upper()}: Found only {len(df)} trading day(s). Min. 2 trading days required.")
+                logger.warning(f"Unable to process {ticker}: Found only {len(df)} trading day(s). Min. 2 trading days required.")
                 logger.warning("Please enter a different ticker symbol.")
                 return None
             
             logger.info("")  # Line break before section
             log_section("Data Preprocessing")
-            log_processing(f"Data loading initiated for {ticker.upper()}")
+            log_processing(f"Data loading initiated for {ticker}")
             section_times['Data Preprocessing'] = time.time() - section_start
             section_start = time.time()
 
@@ -3767,10 +3196,6 @@ def precompute_results(ticker, event):
                         _loading_in_progress[ticker].set()
                         del _loading_in_progress[ticker]
 
-                # Commented out to prevent layout re-mounts causing chart flash
-                # logger.info("Updating Dash app layout...")
-                # app.layout = app.layout
-                # logger.info("Dash app layout updated.")
 
                 # Keep section_times in memory cache too
                 results['section_times'] = section_times
@@ -4003,8 +3428,8 @@ def precompute_results(ticker, event):
             if 'top_short_pair' not in results:
                 results['top_short_pair'] = (0,0)
 
-            logger.info(f"Current Top Buy Pair for {ticker.upper()}: {top_buy_pair} with total capture {top_buy_capture}")
-            logger.info(f"Current Top Short Pair for {ticker.upper()}: {top_short_pair} with total capture {top_short_capture}")
+            logger.info(f"Current Top Buy Pair for {ticker}: {top_buy_pair} with total capture {top_buy_capture}")
+            logger.info(f"Current Top Short Pair for {ticker}: {top_short_pair} with total capture {top_short_capture}")
 
             # Set section_times BEFORE saving so it's available for next session
             results['section_times'] = section_times
@@ -4028,11 +3453,6 @@ def precompute_results(ticker, event):
                 if ticker in _loading_in_progress:
                     _loading_in_progress[ticker].set()
                     del _loading_in_progress[ticker]
-
-            # Commented out to prevent layout re-mounts causing chart flash
-            # logger.info("Updating Dash app layout...")
-            # app.layout = app.layout
-            # logger.info("Dash app layout updated.")
 
         except Exception as e:
             logger.error(f"Error in precompute_results for {ticker}: {str(e)}")
@@ -4074,7 +3494,7 @@ def print_timing_summary(ticker):
         hours, rem = divmod(load_time, 3600)
         minutes, seconds = divmod(rem, 60)
         log_separator("═", Colors.DIM_GREEN)
-        logger.info(f"Loading time for existing {ticker.upper()} data: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
+        logger.info(f"Loading time for existing {ticker} data: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
         log_separator("═", Colors.DIM_GREEN)
         logger.info("Load complete. Data is now available in the Dash app.")
 
@@ -4090,17 +3510,6 @@ def read_status(ticker):
                 except json.JSONDecodeError:
                     print(f"Empty JSON file: {status_path}")
         return {"status": "not started", "progress": 0}
-
-def inspect_pkl_file(ticker, sample_size=5):
-    pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
-    if os.path.exists(pkl_file):
-        with open(pkl_file, 'rb') as f:
-            results = pickle.load(f)
-        keys = list(results.keys())
-        sample_keys = random.sample(keys, min(sample_size, len(keys)))
-        logger.info(f"Sample keys in {pkl_file}: {sample_keys}")
-    else:
-        logger.warning(f"{pkl_file} does not exist.")
 
 # ============================================================================
 # APPLICATION LAYOUT
@@ -5679,7 +5088,7 @@ def update_max_sma_day_display(ticker):
         return 'Loading data...'
 
     MAX_SMA_DAY = results.get('existing_max_sma_day', 'N/A')
-    return f"Current MAX_SMA_DAY for {ticker.upper()}: {MAX_SMA_DAY}"
+    return f"Current MAX_SMA_DAY for {ticker}: {MAX_SMA_DAY}"
 
 @app.callback(
     [Output('sma-input-1', 'max'),
@@ -6084,7 +5493,7 @@ def validate_ticker_input(ticker):
         # Data loading message already shown in precompute_results
         return 'Loading data...', False, False
     else:
-        logger.info(f"{Colors.OKGREEN}[✅] Data ready for {ticker.upper()}{Colors.ENDC}")
+        logger.info(f"{Colors.OKGREEN}[✅] Data ready for {ticker}{Colors.ENDC}")
 
     return '', True, False
 
@@ -6465,7 +5874,7 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
 
     fig.update_layout(
         title=dict(
-            text=f'{ticker.upper()} Cumulative Combined Capture Chart',
+            text=f'{ticker} Cumulative Combined Capture Chart',
             font=dict(color='#80ff00')
         ),
         xaxis_title='Trading Day',
@@ -6833,7 +6242,7 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 
         fig.update_layout(
             title=dict(
-                text=f'{ticker.upper()} Color-Coded Cumulative Combined Capture Chart',
+                text=f'{ticker} Color-Coded Cumulative Combined Capture Chart',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
@@ -8403,11 +7812,11 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     if any(sma_day is None for sma_day in [sma_day_1, sma_day_2, sma_day_3, sma_day_4]):
         fig.update_layout(
             title=dict(
-                text=f'{ticker.upper()} Closing Prices',
+                text=f'{ticker} Closing Prices',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
-            yaxis_title=f'{ticker.upper()} Closing Price',
+            yaxis_title=f'{ticker} Closing Price',
             template='plotly_dark',
             font=dict(color='#80ff00'),
             plot_bgcolor='black',
@@ -8519,11 +7928,11 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     # Customize layout
     fig.update_layout(
         title=dict(
-            text=f'{ticker.upper()} Closing Prices, SMAs, and Total Capture (Start Date: {start_date}, Last Date: {last_date})',
+            text=f'{ticker} Closing Prices, SMAs, and Total Capture (Start Date: {start_date}, Last Date: {last_date})',
             font=dict(color='#80ff00')
         ),
         xaxis_title='Trading Day',
-        yaxis_title=f'{ticker.upper()} Closing Price',
+        yaxis_title=f'{ticker} Closing Price',
         hovermode='x',
         uirevision={'ticker': normalize_ticker(ticker), 'chart': 'primary'},
         template='plotly_dark',
@@ -8815,47 +8224,6 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     
     return fig, trigger_days_buy, win_ratio_buy, avg_daily_capture_buy, total_capture_buy, trigger_days_short, win_ratio_short, avg_daily_capture_short, total_capture_short, buy_pair_header, short_pair_header, combined_header, combined_sharpe, combined_max_dd, combined_calmar, combined_signals, combined_win_rate_text
 
-# OLD CALLBACK - Replaced by adaptive_interval_and_disable above
-# @app.callback(
-#     Output('update-interval', 'disabled'),
-#     [Input('ticker-input', 'value'),
-#      Input('update-interval', 'n_intervals')],
-#     [State('trading-recommendations', 'children')]
-# )
-# def disable_interval_when_data_loaded(ticker, n_intervals, recommendations_loaded):
-#     if not ticker:
-#         return True  # Disable interval when no ticker is entered
-#     
-#     # Check if processing is complete
-#     status = read_status(ticker)
-#     
-#     # If processing failed, stop the interval
-#     if status['status'] == 'failed':
-#         return True
-#     
-#     # Check if we have cached results
-#     results = load_precomputed_results(ticker)
-#     has_cached_data = (results is not None and 
-#                       results.get('status') == 'complete' and
-#                       'top_buy_pair' in results and 
-#                       'top_short_pair' in results)
-#     
-#     # For cached tickers, ensure charts are loaded (need a few intervals)
-#     if has_cached_data:
-#         # Give cached tickers time to load their charts
-#         if n_intervals and n_intervals >= 3:  # After ~18 seconds for cached data (3 * 6s)
-#             return True
-#         return False  # Keep running for a few intervals to load charts
-#     
-#     # For new tickers being processed, wait for recommendations to be loaded
-#     if status['status'] == 'complete' and recommendations_loaded and len(str(recommendations_loaded)) > 100:
-#         # Give it a few more intervals to ensure everything is fully loaded
-#         if n_intervals and n_intervals > 5:  # After ~30 seconds of updates (5 * 6s)
-#             return True  # Now safe to disable interval
-#     
-#     return False  # Keep interval running while loading
-    
-# Removed duplicate print_timing_summary - using the one defined earlier
 
 # Split callbacks to prevent interval start/stop thrashing
 
@@ -9042,12 +8410,24 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
     if not primary_ticker or not secondary_tickers_input:
         return empty_fig, [], [], ''
     
+    # Gate secondary processing until primary is ready
+    primary_ticker_norm = normalize_ticker(primary_ticker)
+    status = read_status(primary_ticker_norm)
+    results = load_precomputed_results(primary_ticker_norm)
+    
+    # Don't process secondaries until primary is complete with data
+    if not (status.get('status') == 'complete' and 
+            results and 
+            results.get('cumulative_combined_captures') is not None):
+        raise PreventUpdate
+    
     # NEW: Ignore interval ticks until primary is ready
     ctx = dash.callback_context
     if ctx.triggered:
         trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
         if trigger_id == 'update-interval':
-            status = read_status(normalize_ticker(primary_ticker))
+            # Already checked above, but keep for additional logic if needed
+            pass
             ui_ready = bool(trading_recommendations and len(str(trading_recommendations)) > 100)
             if status.get('status') != 'complete' or not ui_ready:
                 return empty_fig, [], [], 'Waiting for primary ticker data...'
@@ -9066,7 +8446,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
     try:
         logger.info(f"\n{'-' * 80}")
         logger.info("INITIATING SECONDARY ANALYSIS")
-        logger.info(f"Primary Ticker: {primary_ticker.upper()}")
+        logger.info(f"Primary Ticker: {primary_ticker}")
 
         secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
         if not secondary_tickers:
@@ -9097,7 +8477,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 df = df.loc[(df.index >= date_min) & (df.index <= date_max)].copy()
                 secondary_dfs[ticker] = df
             else:
-                logger.warning(f"Unable to fetch data for {ticker.upper()}")
+                logger.warning(f"Unable to fetch data for {ticker}")
 
         if not secondary_dfs:
             return empty_fig, [], [], 'No valid data available for secondary tickers'
@@ -9112,12 +8492,14 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         # Initialize containers
         fig = go.Figure()
         metrics_list = []
+        all_shapes = []  # Accumulate shapes from all tickers
+        all_annotations = []  # Accumulate annotations from all tickers
 
         # Process each secondary ticker
         for ticker, secondary_df in secondary_dfs.items():
             common_dates = dates.intersection(secondary_df.index)
             if len(common_dates) < 2:
-                logger.warning(f"Insufficient data overlap for {ticker.upper()}")
+                logger.warning(f"Insufficient data overlap for {ticker}")
                 continue
 
             # Align signals and prices
@@ -9272,6 +8654,43 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 ),
                 customdata=signals.values
             ))
+            
+            # Add annotations for this ticker if enabled
+            if show_annotations:
+                # Identify signal changes for this ticker
+                signal_changes = signals[signals != signals.shift(1)]
+                for date, signal in signal_changes.iteritems():
+                    all_shapes.append(dict(
+                        type="line",
+                        xref="x",
+                        yref="paper",
+                        x0=date,
+                        x1=date,
+                        y0=0,
+                        y1=1,
+                        line=dict(
+                            color="#80ff00",
+                            width=1,
+                            dash="dash"
+                        ),
+                        opacity=0.5
+                    ))
+                    
+                    all_annotations.append(dict(
+                        x=date,
+                        y=1,
+                        xref="x",
+                        yref="paper",
+                        text=f"{ticker}: {signal}",  # Include ticker name in annotation
+                        showarrow=False,
+                        font=dict(
+                            color="#80ff00",
+                            size=10
+                        ),
+                        bgcolor="rgba(0,0,0,0.5)",
+                        xanchor='left',
+                        yanchor='top'
+                    ))
 
         if not metrics_list:
             return empty_fig, [], [], 'No valid data available for processing'
@@ -9293,7 +8712,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         # Configure chart layout
         fig.update_layout(
             title=dict(
-                text=f'{", ".join(secondary_dfs.keys())} Following {primary_ticker.upper()} {"(Inverted)" if invert_signals else ""} Signals',
+                text=f'{", ".join(secondary_dfs.keys())} Following {primary_ticker} {"(Inverted)" if invert_signals else ""} Signals',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Date',
@@ -9323,47 +8742,9 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             )
         )
 
-        # Add annotations if enabled
-        if show_annotations:
-            shapes = []
-            annotations = []
-
-            # Identify signal changes
-            signal_changes = signals[signals != signals.shift(1)]
-            for date, signal in signal_changes.iteritems():
-                shapes.append(dict(
-                    type="line",
-                    xref="x",
-                    yref="paper",
-                    x0=date,
-                    x1=date,
-                    y0=0,
-                    y1=1,
-                    line=dict(
-                        color="#80ff00",
-                        width=1,
-                        dash="dash"
-                    ),
-                    opacity=0.5
-                ))
-
-                annotations.append(dict(
-                    x=date,
-                    y=1,
-                    xref="x",
-                    yref="paper",
-                    text=signal,
-                    showarrow=False,
-                    font=dict(
-                        color="#80ff00",
-                        size=10
-                    ),
-                    bgcolor="rgba(0,0,0,0.5)",
-                    xanchor='left',
-                    yanchor='top'
-                ))
-
-            fig.update_layout(shapes=shapes, annotations=annotations)
+        # Add accumulated annotations if enabled
+        if show_annotations and (all_shapes or all_annotations):
+            fig.update_layout(shapes=all_shapes, annotations=all_annotations)
 
         return fig, data, columns, ''
 
@@ -9705,7 +9086,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
             p_value = None
 
         metrics_data.append({
-            'Secondary Ticker': secondary_ticker.upper(),
+            'Secondary Ticker': secondary_ticker,
             'Trigger Days': int(trigger_days),
             'Wins': int(wins),
             'Losses': int(losses),
@@ -9726,7 +9107,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
             x=cumulative_captures.index,
             y=cumulative_captures.values,
             mode='lines',
-            name=secondary_ticker.upper(),
+            name=secondary_ticker,
             line=dict(width=2),
         ))
 
@@ -10649,7 +10030,6 @@ def toggle_help_modal(n1, n2, is_open):
         return not is_open
     return is_open
 
-# Navigation callbacks removed - using static navigation bar now
 
 # Note: For the jump buttons, we'll use clientside JavaScript instead
 # since Dash doesn't support direct navigation with Location component
@@ -10668,7 +10048,6 @@ def copy_tickers(n_clicks, tickers):
         return "Copied!"
     return "Copy"
 
-# Removed redundant test callback - ticker submission is already logged in validate_ticker_input
 
 # ============================================================================
 # CONSOLE INPUT HANDLER
@@ -10780,9 +10159,6 @@ def update_countdown_timer(n):
     # This runs separately and doesn't trigger loading states for other components
     return PerformanceMetrics.create_market_countdown_timer()
 
-# Removed position sizing calculator callback - no longer needed
-
-# Removed interactive threshold slider callback - replaced with static visualization
 
 # ============================================================================
 # MAIN EXECUTION
@@ -10817,25 +10193,8 @@ if __name__ == "__main__":
     import os
     if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         # This is the parent process, show the header
-        logger.info(Colors.NEON_GREEN + Colors.BOLD + "\n" + "═" * 80 + Colors.ENDC)
-        logger.info("")
-        # Cool box-drawing art for PRJCT9
-        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ██████╗ ██████╗      ██╗ ██████╗████████╗ █████╗ ".center(80) + Colors.ENDC)
-        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ██╔══██╗██╔══██╗     ██║██╔════╝╚══██╔══╝██╔══██╗".center(80) + Colors.ENDC)
-        logger.info(Colors.NEON_GREEN + Colors.BOLD + "    ██████╔╝██████╔╝     ██║██║        ██║   ╚██████║".center(80) + Colors.ENDC)
-        logger.info(Colors.NEON_GREEN + Colors.BOLD + "    ██╔═══╝ ██╔══██╗██   ██║██║        ██║    ╚═══██║".center(80) + Colors.ENDC)
-        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ██║     ██║  ██║╚█████╔╝╚██████╗   ██║    █████╔╝".center(80) + Colors.ENDC)
-        logger.info(Colors.BRIGHT_GREEN + Colors.BOLD + "    ╚═╝     ╚═╝  ╚═╝ ╚════╝  ╚═════╝   ╚═╝    ╚════╝ ".center(80) + Colors.ENDC)
-        logger.info("")
-        logger.info(Colors.YELLOW + "Advanced Trading Analysis Platform".center(80) + Colors.ENDC)
-        logger.info(Colors.CYAN + "Built by Rebel Atom LLC".center(80) + Colors.ENDC)
-        logger.info("")
-        logger.info(Colors.NEON_GREEN + Colors.BOLD + "═" * 80 + "\n" + Colors.ENDC)
-        
-        log_processing("Starting Dash server...")
-        logger.info(f"{Colors.CYAN}[🌐] Server URL: {Colors.YELLOW}http://127.0.0.1:8050{Colors.ENDC}")
-        logger.info(f"{Colors.CYAN}[🛑] Stop server: {Colors.YELLOW}Press Ctrl+C{Colors.ENDC}")
-        logger.info(Colors.DIM_GREEN + "─" * 80 + Colors.ENDC + "\n")
+        print_startup_banner()
+        print_server_info(port=8050)
     
     # Run with debug=False to see console output properly
     # Set debug=True if you need hot reloading

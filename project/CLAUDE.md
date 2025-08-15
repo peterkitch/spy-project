@@ -318,6 +318,19 @@ Note: Machine learning integration, advanced analytics, and institutional featur
 
 ## Development Guidelines & Best Practices
 
+### Documentation Organization
+- **NEVER place new markdown files in the root project folder** (except CLAUDE.md)
+- All documentation should be organized in the `md_library/` directory structure:
+  - `md_library/spymaster/` - Spymaster-specific documentation
+    - `/bugs/` - Bug reports and fixes
+    - `/refactoring/` - Refactoring summaries and changes
+    - `/performance/` - Performance improvements
+    - `/adaptive_interval/` - Adaptive interval related docs
+  - `md_library/impactsearch/` - Impactsearch documentation
+  - `md_library/onepass/` - Onepass documentation
+  - `md_library/shared/` - Shared documentation across scripts
+- Text files (.txt) for quick changes/notes can remain in root temporarily
+
 ### Testing Guidelines
 - **NEVER use Unicode characters in test scripts or console output**
   - Causes `UnicodeEncodeError` on Windows systems
