@@ -19,12 +19,23 @@ from signal_library.shared_integrity import (
     compute_stable_fingerprint,
     compute_quantized_fingerprint,
     check_head_tail_match,
-    check_head_tail_match_fuzzy,
     evaluate_library_acceptance,
     verify_data_integrity,
     HEAD_TAIL_SNAPSHOT_SIZE,
-    QUANTIZED_FINGERPRINT_PRECISION
+    QUANTIZED_FINGERPRINT_PRECISION,
+    HEAD_TAIL_ATOL_EQUITY,
+    HEAD_TAIL_ATOL_CRYPTO,
+    HEAD_TAIL_RTOL,
+    HEAD_TAIL_MIN_MATCH_FRAC
 )
+
+# Try to import check_head_tail_match_fuzzy with fallback
+try:
+    from signal_library.shared_integrity import check_head_tail_match_fuzzy
+except Exception:
+    # Fallback: disable fuzzy check if function not available
+    def check_head_tail_match_fuzzy(*args, **kwargs):
+        return False, {}
 
 # Import parity configuration
 try:
@@ -33,13 +44,18 @@ try:
         TIEBREAK_RULE, CRYPTO_STABILITY_MINUTES, EQUITY_SESSION_BUFFER_MINUTES,
         log_parity_status
     )
-except ImportError:
-    # Fallback if config not available
+    # Log successful import
+    print(f"[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE={STRICT_PARITY_MODE})")
+except ImportError as e:
+    # Fallback if config not available - LOUD WARNING
+    print(f"[ERROR] parity_config NOT loaded: {e}")
+    print("[WARNING] This will affect fingerprint consistency with impactsearch.py!")
     STRICT_PARITY_MODE = False
     TIEBREAK_RULE = 'short_on_equality'
     CRYPTO_STABILITY_MINUTES = 60
     EQUITY_SESSION_BUFFER_MINUTES = 10
-    def apply_strict_parity(df): return df
+    def apply_strict_parity(df):  # safe no-op fallback
+        return df
     def get_tiebreak_signal(buy_val, short_val):
         return 'Buy' if buy_val > short_val else 'Short' if short_val > buy_val else 'Short'
     def log_parity_status(): pass
@@ -85,6 +101,91 @@ J_INDICES = PAIRS[:, 1] - 1
 # Note: fingerprint and integrity functions now imported from shared_integrity module
 
 # V1 save function removed - using only V2
+
+def perform_rewarm_append(ticker, signal_data, new_df, rewarm_days=7):
+    """
+    Rewarm append: Recompute the last N days to handle minor restatements,
+    then append new data. This avoids full rebuilds for small tail differences.
+    
+    Args:
+        ticker: The ticker symbol
+        signal_data: Existing signal library data
+        new_df: Current DataFrame with all data
+        rewarm_days: Number of tail days to recompute (default 7)
+    
+    Returns:
+        Updated signal_data or None if rewarm fails
+    """
+    try:
+        # Require a usable accumulator checkpoint at the rewarm boundary
+        acc = signal_data.get('accumulator_state')
+        if not acc or not isinstance(acc, dict):
+            logger.info("Rewarm append skipped: no accumulator state in library.")
+            return None
+        
+        # Check for required accumulator fields
+        if 'buy_cum_vector' not in acc or 'short_cum_vector' not in acc:
+            logger.info("Rewarm append skipped: no accumulator vectors stored in library.")
+            return None
+        
+        logger.info(f"Attempting rewarm append for {ticker} (last {rewarm_days} days)...")
+        
+        # Get the stored data range
+        stored_dates = pd.to_datetime(signal_data.get('dates', []))
+        if len(stored_dates) < rewarm_days:
+            logger.warning(f"Not enough historical data for rewarm (have {len(stored_dates)} days, need {rewarm_days})")
+            return None
+        
+        # Find the rewarm start point
+        rewarm_start_idx = max(0, len(stored_dates) - rewarm_days)
+        rewarm_start_date = stored_dates[rewarm_start_idx]
+        
+        # Find the corresponding index in new_df
+        new_df_dates = pd.to_datetime(new_df.index)
+        try:
+            new_start_idx = new_df_dates.get_loc(rewarm_start_date)
+        except KeyError:
+            logger.warning(f"Rewarm start date {rewarm_start_date} not found in current data")
+            return None
+        
+        # Extract the data we need to recompute
+        recompute_df = new_df[new_start_idx:]
+        
+        if len(recompute_df) < rewarm_days:
+            logger.warning(f"Not enough data to rewarm (have {len(recompute_df)} days)")
+            return None
+        
+        # Keep the pre-rewarm portion from the library
+        kept_buy_pairs = {}
+        kept_short_pairs = {}
+        kept_signals = []
+        
+        for i, date in enumerate(stored_dates[:rewarm_start_idx]):
+            date_key = pd.Timestamp(date)
+            if date_key in signal_data['daily_top_buy_pairs']:
+                kept_buy_pairs[date_key] = signal_data['daily_top_buy_pairs'][date_key]
+            if date_key in signal_data['daily_top_short_pairs']:
+                kept_short_pairs[date_key] = signal_data['daily_top_short_pairs'][date_key]
+            if i < len(signal_data.get('primary_signals', [])):
+                kept_signals.append(signal_data['primary_signals'][i])
+        
+        # Get the accumulator state from just before rewarm point
+        accumulator_state = signal_data.get('accumulator_state')
+        if accumulator_state and rewarm_start_idx > 0:
+            # We would need to restore accumulators to the state at rewarm_start_idx-1
+            # For simplicity, we'll do a partial recompute from rewarm point
+            logger.info(f"Recomputing from index {rewarm_start_idx} ({rewarm_start_date.date()})")
+        
+        # Note: Full recomputation logic for the rewarm period would go here
+        # For now, return None to trigger standard rebuild
+        # This is a placeholder for the actual rewarm logic
+        logger.info(f"Rewarm append placeholder - full implementation pending")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Rewarm append failed for {ticker}: {e}")
+        return None
+
 def perform_incremental_update(ticker, signal_data, new_df):
     """
     Phase 2: Perform incremental update for NEW_DATA scenario.
@@ -304,8 +405,34 @@ def perform_incremental_update(ticker, signal_data, new_df):
         logger.error(f"Incremental update failed for {ticker}: {e}")
         return None
 
+def compute_parity_hash(price_source='Adj Close', group_by_mode='column'):
+    """
+    Compute a hash of all configuration parameters that affect signal generation.
+    This ensures libraries are rebuilt when configuration changes.
+    """
+    import hashlib
+    import json
+    
+    payload = {
+        'ENGINE_VERSION': ENGINE_VERSION,
+        'MAX_SMA_DAY': MAX_SMA_DAY,
+        'STRICT_PARITY_MODE': STRICT_PARITY_MODE,
+        'EQUITY_SESSION_BUFFER_MINUTES': EQUITY_SESSION_BUFFER_MINUTES,
+        'CRYPTO_STABILITY_MINUTES': CRYPTO_STABILITY_MINUTES,
+        'TIEBREAK_RULE': TIEBREAK_RULE,
+        'price_source': price_source,
+        'group_by_mode': group_by_mode,
+        'auto_adjust': False,  # We always use False
+        # Include tolerance settings
+        'HEAD_TAIL_ATOL_EQUITY': HEAD_TAIL_ATOL_EQUITY,
+        'HEAD_TAIL_ATOL_CRYPTO': HEAD_TAIL_ATOL_CRYPTO,
+        'HEAD_TAIL_RTOL': HEAD_TAIL_RTOL,
+        'HEAD_TAIL_MIN_MATCH_FRAC': HEAD_TAIL_MIN_MATCH_FRAC,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
 def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs, 
-                           primary_signals, df, accumulator_state=None):
+                           primary_signals, df, accumulator_state=None, price_source='Adj Close', resolved_symbol=None):
     """
     Enhanced Signal Library save with primary_signals and accumulator state.
     This version stores everything needed for impactsearch to skip SMA computation.
@@ -352,6 +479,11 @@ def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs,
             'start_date': str(df.index[0].date()) if len(df) > 0 else None,
             'end_date': str(df.index[-1].date()) if len(df) > 0 else None,
             'num_days': len(df),
+            # Price basis configuration
+            'price_source': price_source,
+            'group_by_mode': 'ticker',
+            'resolved_symbol': resolved_symbol or ticker,  # Store resolved symbol for transparency
+            'parity_hash': compute_parity_hash(price_source, 'ticker'),
             # Original data
             'daily_top_buy_pairs': daily_top_buy_pairs,
             'daily_top_short_pairs': daily_top_short_pairs,
@@ -452,7 +584,7 @@ def check_signal_library_exists(ticker):
     filepath = os.path.join(stable_dir, filename)
     return os.path.exists(filepath)
 
-def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60):
+def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60, reference_now=None):
     """
     Check if last row is a complete trading session.
     For equities: Apply 16:10 ET cutoff (10 minute buffer per user requirement)
@@ -461,12 +593,13 @@ def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60):
     if df.empty or len(df) == 0:
         return True
     
-    from datetime import datetime, time, timezone, timedelta
+    from datetime import datetime, time, timedelta, timezone
     import pytz
     
     last_date = df.index[-1]
-    now_et = datetime.now(pytz.timezone('America/New_York'))
-    now_utc = datetime.now(timezone.utc)
+    tz = pytz.timezone('America/New_York')
+    now_et = reference_now if reference_now is not None else datetime.now(tz)
+    now_utc = now_et.astimezone(timezone.utc) if reference_now is not None else datetime.now(timezone.utc)
     
     if ticker_type == 'equity':
         # Equity market closes at 4 PM ET; use the same configurable buffer as impactsearch
@@ -476,7 +609,7 @@ def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60):
         if last_date.date() == now_et.date():
             # Only drop today's row if we're still before 4PM + buffer
             cutoff_dt = datetime.combine(now_et.date(), market_close) + timedelta(minutes=EQUITY_SESSION_BUFFER_MINUTES)
-            cutoff_dt = pytz.timezone('America/New_York').localize(cutoff_dt)
+            cutoff_dt = tz.localize(cutoff_dt)
             if now_et < cutoff_dt:
                 logger.info(f"Last row is today's incomplete session (before 16:00 + {EQUITY_SESSION_BUFFER_MINUTES}min). Dropping it.")
                 return False
@@ -504,79 +637,165 @@ def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60):
 
 # Note: detect_ticker_type is now imported from shared_symbols module
 
-def _coerce_to_close_frame(df):
+def _extract_resolved_symbol(df_raw, requested):
+    """
+    Robustly extract the resolved ticker from a yfinance MultiIndex frame (either orientation).
+    Falls back to `requested` if detection fails.
+    """
+    resolved = requested
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        lvl0 = list(map(str, df_raw.columns.get_level_values(0)))
+        lvl1 = list(map(str, df_raw.columns.get_level_values(1)))
+        fields = {'Adj Close', 'Close', 'Open', 'High', 'Low', 'Volume'}
+        # Orientation A: (field, ticker)
+        if any(f in lvl0 for f in fields) and len(set(lvl1)) == 1:
+            resolved = list(set(lvl1))[0].upper()
+        # Orientation B: (ticker, field)
+        elif any(f in lvl1 for f in fields) and len(set(lvl0)) == 1:
+            resolved = list(set(lvl0))[0].upper()
+    return resolved
+
+def fetch_data_raw(ticker, max_retries=3):
+    """
+    Single yfinance download (group_by='ticker') that exposes the resolved symbol.
+    Returns (df_raw, resolved_symbol).
+    """
+    if not ticker or not ticker.strip():
+        return pd.DataFrame(), ticker
+    ticker = normalize_ticker(ticker)
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Fetching data for {ticker} (attempt {attempt+1}/{max_retries})...")
+            df_raw = yf.download(
+                ticker, period='max', interval='1d', progress=False,
+                auto_adjust=False, timeout=10, threads=False, group_by='ticker'
+            )
+            if df_raw.empty:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logger.warning(f"No data returned for {ticker}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
+                    return pd.DataFrame(), ticker
+            df_raw.index = pd.to_datetime(df_raw.index).tz_localize(None)
+            resolved = _extract_resolved_symbol(df_raw, ticker)
+            if resolved != ticker:
+                logger.info(f"Yahoo Finance resolved {ticker} to {resolved}")
+            return df_raw, resolved
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
+            if attempt == max_retries - 1:
+                logger.error(f"All retries exhausted for {ticker}: {e}")
+                return pd.DataFrame(), ticker
+    return pd.DataFrame(), ticker
+
+def _coerce_to_close_frame(df, preferred='Adj Close'):
     """
     Helper function to handle various column structures from yfinance.
     Ensures we always get a clean DataFrame with a single 'Close' column.
+    
+    Args:
+        df: DataFrame from yfinance
+        preferred: 'Adj Close' or 'Close' - which price basis to prefer
     """
     if df.empty:
         return pd.DataFrame()
     
     # Handle MultiIndex columns (occurs with some tickers like CTM)
     if isinstance(df.columns, pd.MultiIndex):
-        # Try to extract the Close column from the MultiIndex
-        if 'Adj Close' in df.columns.get_level_values(0):
-            # Get the ticker symbol from the second level
-            ticker_col = df.columns.get_level_values(1)[0] if len(df.columns.get_level_values(1)) > 0 else None
-            if ticker_col and ('Adj Close', ticker_col) in df.columns:
-                result = pd.DataFrame(df[('Adj Close', ticker_col)])
-                result.columns = ['Close']
-                return result
-        if 'Close' in df.columns.get_level_values(0):
-            ticker_col = df.columns.get_level_values(1)[0] if len(df.columns.get_level_values(1)) > 0 else None
-            if ticker_col and ('Close', ticker_col) in df.columns:
-                result = pd.DataFrame(df[('Close', ticker_col)])
-                result.columns = ['Close']
-                return result
+        lvl0 = list(df.columns.get_level_values(0))
+        lvl1 = list(df.columns.get_level_values(1))
+        
+        # Orientation A: (field, ticker) - group_by='column'
+        if preferred in lvl0 and len(set(lvl1)) >= 1:
+            tk = df.columns.get_level_values(1)[0]
+            result = pd.DataFrame(df[(preferred, tk)])
+            result.columns = ['Close']
+            return result
+        
+        # Fallback to other field if preferred not available
+        fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
+        if fallback in lvl0 and len(set(lvl1)) >= 1:
+            tk = df.columns.get_level_values(1)[0]
+            result = pd.DataFrame(df[(fallback, tk)])
+            result.columns = ['Close']
+            return result
+            
+        # Orientation B: (ticker, field) - group_by='ticker'
+        if preferred in lvl1 and len(set(lvl0)) >= 1:
+            tk = df.columns.get_level_values(0)[0]
+            result = pd.DataFrame(df[(tk, preferred)])
+            result.columns = ['Close']
+            return result
+            
+        # Fallback for orientation B
+        if fallback in lvl1 and len(set(lvl0)) >= 1:
+            tk = df.columns.get_level_values(0)[0]
+            result = pd.DataFrame(df[(tk, fallback)])
+            result.columns = ['Close']
+            return result
     
-    # Handle regular columns
-    if 'Adj Close' in df.columns:
-        return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
-    elif 'Close' in df.columns:
-        return pd.DataFrame(df[['Close']])
+    # Handle regular columns - prefer the requested field
+    if preferred in df.columns:
+        if preferred == 'Adj Close':
+            return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
+        else:
+            return pd.DataFrame(df[['Close']])
     
-    # If we can't find a close column, return empty
+    # Fallback to other field if preferred not available
+    fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
+    if fallback in df.columns:
+        if fallback == 'Adj Close':
+            return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
+        else:
+            return pd.DataFrame(df[['Close']])
+    
+    # If we can't find any close column, return empty
     logger.error(f"No Close/Adj Close data found in DataFrame")
     return pd.DataFrame()
 
-def fetch_data(ticker):
+def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
+    """
+    Single-download path: grab raw once, coerce, then session-guard.
+    
+    Args:
+        ticker: The ticker symbol to fetch
+        reference_now: Frozen analysis clock for consistent session checks
+        price_source: 'Adj Close' or 'Close' - which price basis to use
+    """
     if not ticker or not ticker.strip():
         return pd.DataFrame()
     ticker = normalize_ticker(ticker)
-    try:
-        logger.info(f"Fetching data for {ticker}...")
-        # Add group_by='column' to ensure consistent column structure
-        df = yf.download(ticker, period='max', interval='1d', progress=False, 
-                        auto_adjust=False, timeout=10, threads=False, group_by='column')
-        if df.empty:
-            logger.warning(f"No data returned for {ticker}.")
-            return pd.DataFrame()
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-
-        # Use the helper function to handle all column structures
-        df = _coerce_to_close_frame(df)
-        if df.empty:
-            logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
-            return pd.DataFrame()
-        
-        # Apply session guard to drop incomplete sessions
-        ticker_type = detect_ticker_type(ticker)
-        if not is_session_complete(df, ticker_type, CRYPTO_STABILITY_MINUTES):
-            # Drop the last row if it's an incomplete session
-            df = df[:-1]
-            logger.info(f"Dropped incomplete session. Now have {len(df)} days of data.")
-        else:
-            logger.info(f"Successfully fetched {len(df)} days of data for {ticker}.")
-        
-        # Apply strict parity transformations if enabled
-        df = apply_strict_parity(df)
-        if STRICT_PARITY_MODE:
-            logger.info(f"Applied strict parity mode transformations")
-        
-        return df
-    except Exception as e:
-        logger.error(f"Error fetching data for {ticker}: {str(e)}")
+    
+    logger.info(f"Fetching data for {ticker} (price_source={price_source})...")
+    df_raw, resolved = fetch_data_raw(ticker)
+    if df_raw.empty:
         return pd.DataFrame()
+    
+    # Coerce according to requested price basis (no second download)
+    df = _coerce_to_close_frame(df_raw, preferred=price_source)
+    # De-dup & sort to avoid rare vendor duplicate rows
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    if df.empty:
+        logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
+        return pd.DataFrame()
+    
+    # Apply session guard to drop incomplete sessions (use resolved type)
+    ticker_type = detect_ticker_type(resolved)
+    if not is_session_complete(df, ticker_type, CRYPTO_STABILITY_MINUTES, reference_now=reference_now):
+        df = df[:-1]
+        logger.info(f"Dropped incomplete session for {resolved}. Now have {len(df)} days of data.")
+    else:
+        logger.info(f"Successfully fetched {len(df)} days of data for {resolved}.")
+    
+    # Apply strict parity transformations if enabled
+    df = apply_strict_parity(df)
+    if STRICT_PARITY_MODE:
+        logger.info(f"Applied strict parity mode transformations")
+    
+    return df
 
 def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_returns):
     """
@@ -748,6 +967,12 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
       6) measure performance using the same data as returns
     Return a list of metric dictionaries.
     """
+    # Freeze the analysis clock for consistent session checks across all tickers
+    import pytz
+    from datetime import datetime
+    analysis_clock = datetime.now(pytz.timezone('America/New_York'))
+    logger.info(f"Analysis clock frozen at: {analysis_clock.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    
     metrics_list = []
     for ticker in tqdm(tickers_list, desc="Processing One-Pass Tickers", unit="ticker"):
         ticker = normalize_ticker(ticker)
@@ -755,15 +980,53 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         
         # Check if we can use existing signals or perform incremental update
         existing_signal_data = None
+        price_source = 'Adj Close'  # Default
         if check_signal_library_exists(ticker):
             logger.info(f"Signal Library exists for {ticker}, checking for updates...")
             existing_signal_data = load_signal_library(ticker)
+            # Honor the price_source from existing library
+            if existing_signal_data and 'price_source' in existing_signal_data:
+                price_source = existing_signal_data['price_source']
+                logger.debug(f"Using price_source from library: {price_source}")
             
-        # Always fetch current data
-        df = fetch_data(ticker)
-        if df.empty:
+            # Enforce parity hash to prevent config drift
+            if existing_signal_data:
+                lib_hash = existing_signal_data.get('parity_hash')
+                current_hash = compute_parity_hash(price_source, 'ticker')
+                if not lib_hash or lib_hash != current_hash:
+                    logger.warning(
+                        f"Parity hash mismatch for {ticker} "
+                        f"(lib={str(lib_hash)[:8] if lib_hash else 'None'} vs current={current_hash[:8]}). "
+                        "Forcing rebuild."
+                    )
+                    existing_signal_data = None  # skip incremental/reuse path
+            
+        # Single-download path for current data (frozen clock + price_source)
+        df_raw, resolved = fetch_data_raw(ticker)
+        if df_raw.empty:
             logger.warning(f"No data for ticker {ticker}, skipping.")
             continue
+        if resolved != ticker:
+            logger.info(f"One-pass resolved {ticker} -> {resolved}")
+        
+        # Coerce to requested price basis
+        df = _coerce_to_close_frame(df_raw, preferred=price_source)
+        # De-dup & sort to avoid rare vendor duplicate rows
+        df = df[~df.index.duplicated(keep='last')].sort_index()
+        if df.empty:
+            logger.warning(f"No {price_source} data for ticker {ticker}, skipping.")
+            continue
+        
+        # Apply session guard
+        ttype = detect_ticker_type(resolved)
+        if not is_session_complete(df, ttype, CRYPTO_STABILITY_MINUTES, reference_now=analysis_clock):
+            df = df[:-1]
+            logger.debug(f"Dropped incomplete session for {resolved}. Days now: {len(df)}")
+        
+        # Apply strict parity transformations if enabled
+        df = apply_strict_parity(df)
+        if STRICT_PARITY_MODE:
+            logger.info(f"Applied strict parity mode transformations")
             
         # Phase 2: Check if we can do incremental update
         if existing_signal_data and use_existing_signals:
@@ -788,8 +1051,23 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                 if acceptance_level in ['STRICT', 'LOOSE', 'HEADTAIL_FUZZY', 'HEADTAIL', 'ALL_BUT_LAST']:
                     logger.info(f"Data integrity acceptable for incremental update ({acceptance_level})")
                 else:
-                    logger.warning(f"Data integrity too poor for incremental ({acceptance_level}). Doing full rebuild.")
-                    existing_signal_data = None
+                    # Try rewarm append before full rebuild
+                    logger.warning(f"Data integrity too poor for incremental ({acceptance_level}).")
+                    
+                    # Check if we're close enough for rewarm (fuzzy match fraction)
+                    ok_fuzzy, fuzzy_stats = check_head_tail_match_fuzzy(existing_signal_data, df)
+                    if fuzzy_stats.get('tail_frac', 0) >= 0.90:  # 90% tail match threshold
+                        logger.info(f"Tail match {fuzzy_stats['tail_frac']:.1%} - attempting rewarm append...")
+                        rewarm_result = perform_rewarm_append(ticker, existing_signal_data, df, rewarm_days=7)
+                        if rewarm_result:
+                            existing_signal_data = rewarm_result
+                            logger.info("Rewarm append successful, avoiding full rebuild")
+                        else:
+                            logger.info("Rewarm append failed, proceeding with full rebuild")
+                            existing_signal_data = None
+                    else:
+                        logger.info(f"Tail match too poor ({fuzzy_stats.get('tail_frac', 0):.1%}), doing full rebuild")
+                        existing_signal_data = None
                 
                 # Try incremental update if data integrity is acceptable
                 updated_signal_data = None
@@ -804,7 +1082,9 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                                       updated_signal_data['daily_top_short_pairs'],
                                       updated_signal_data['primary_signals'],
                                       df,
-                                      updated_signal_data.get('accumulator_state'))
+                                      updated_signal_data.get('accumulator_state'),
+                                      price_source,
+                                      resolved)
                     
                     # Use updated signals for metrics
                     signal_data = updated_signal_data
@@ -1059,7 +1339,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
             'num_pairs': len(pairs)
         }
         save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs, 
-                              primary_signals, df, accumulator_state)
+                              primary_signals, df, accumulator_state, price_source, resolved)
         
         # No need to derive signals again - already computed in streaming loop!
 
