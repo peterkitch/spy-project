@@ -73,13 +73,19 @@ try:
         log_parity_status,
         EQUITY_SESSION_BUFFER_MINUTES, CRYPTO_STABILITY_MINUTES, LOG_ACCEPTANCE_TIER
     )
-except ImportError:
-    # Fallback if config not available
+    # Log successful import (print for now, logger not yet initialized)
+    print(f"[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE={STRICT_PARITY_MODE})")
+except ImportError as e:
+    # Fallback if config not available - LOUD WARNING
+    print(f"[ERROR] parity_config NOT loaded: {e}")
+    print("[WARNING] This will likely cause fingerprint mismatches vs onepass.py!")
+    print("[WARNING] Signal libraries may be rejected unnecessarily.")
     STRICT_PARITY_MODE = False
     EQUITY_SESSION_BUFFER_MINUTES = 10
     CRYPTO_STABILITY_MINUTES = 60
     LOG_ACCEPTANCE_TIER = True
-    def apply_strict_parity(df): return df
+    def apply_strict_parity(df):  # safe no-op fallback with better formatting
+        return df
     def get_tiebreak_signal(buy_val, short_val):
         return 'Buy' if buy_val > short_val else 'Short' if short_val > buy_val else 'Short'
     def log_parity_status(): pass
@@ -111,6 +117,12 @@ logger.propagate = False
 # Log reportlab status
 if not REPORTLAB_AVAILABLE:
     logger.info("ReportLab not installed. PDF export will be disabled. Install with: pip install reportlab")
+
+# Log parity configuration status
+if 'log_parity_status' in globals():
+    log_parity_status()
+else:
+    logger.info("Parity configuration not available - using defaults")
 
 # Constants
 MAX_SMA_DAY = 114
@@ -805,7 +817,8 @@ class ReportGenerator:
         story.append(Paragraph("Detailed Results", heading_style))
         
         # Prepare data for table
-        table_columns = ['Primary Ticker', 'Sharpe Ratio', 'Win Ratio (%)', 
+        table_columns = ['Primary Ticker', 'Resolved/Fetched', 'Library Source',
+                        'Sharpe Ratio', 'Win Ratio (%)', 
                         'Total Capture (%)', 'p-Value', 'Significant 95%']
         table_data = [table_columns]
         
@@ -954,9 +967,14 @@ def load_signal_library(ticker):
 
 # Note: normalize_ticker is now imported from shared_symbols module
 
-def is_session_complete(df, ticker_type='equity'):
+def is_session_complete(df, ticker_type='equity', reference_now=None):
     """
     Mirror onepass.py behavior (equity cutoff 16:10 ET, crypto stability window)
+    
+    Args:
+        df: DataFrame with price data
+        ticker_type: 'equity' or 'crypto'
+        reference_now: Optional fixed timestamp for consistent checks across all tickers
     """
     from datetime import datetime, time, timedelta
     import pytz
@@ -965,7 +983,7 @@ def is_session_complete(df, ticker_type='equity'):
         return True
     
     tz = pytz.timezone('America/New_York')
-    now = datetime.now(tz)
+    now = reference_now if reference_now is not None else datetime.now(tz)
     last_date = df.index[-1]
     
     if ticker_type == 'equity':
@@ -993,44 +1011,145 @@ def is_session_complete(df, ticker_type='equity'):
     
     return True
 
-def _coerce_to_close_frame(df):
+def _extract_resolved_symbol(df_raw, requested):
+    """
+    Robustly extract the resolved ticker from a yfinance MultiIndex frame (either orientation).
+    Falls back to `requested` if detection fails.
+    """
+    resolved = requested
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        lvl0 = list(map(str, df_raw.columns.get_level_values(0)))
+        lvl1 = list(map(str, df_raw.columns.get_level_values(1)))
+        fields = {'Adj Close', 'Close', 'Open', 'High', 'Low', 'Volume'}
+        # Orientation A: (field, ticker)
+        if any(f in lvl0 for f in fields) and len(set(lvl1)) == 1:
+            resolved = list(set(lvl1))[0].upper()
+        # Orientation B: (ticker, field)
+        elif any(f in lvl1 for f in fields) and len(set(lvl0)) == 1:
+            resolved = list(set(lvl0))[0].upper()
+    return resolved
+
+def fetch_data_raw(ticker, max_retries=3, reference_now=None):
+    """
+    Single yfinance download in group_by='ticker' so the resolved symbol is present.
+    Returns (df_raw, resolved_symbol); caller is responsible for coercion and session-guard.
+    Note: `reference_now` is reserved for future use (kept for API symmetry).
+    """
+    if not ticker or not ticker.strip():
+        return pd.DataFrame(), ticker
+    ticker = normalize_ticker(ticker)
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Fetching data for {ticker} (attempt {attempt+1}/{max_retries})...")
+            with yfinance_lock:
+                df_raw = yf.download(
+                    ticker, period='max', interval='1d', progress=False,
+                    auto_adjust=False, timeout=10, threads=False, group_by='ticker'
+                )
+            if df_raw.empty:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"No data returned for {ticker}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
+                    return pd.DataFrame(), ticker
+            df_raw.index = pd.to_datetime(df_raw.index).tz_localize(None)
+            resolved = _extract_resolved_symbol(df_raw, ticker)
+            if resolved != ticker:
+                logger.info(f"Yahoo Finance resolved {ticker} to {resolved}")
+            return df_raw, resolved
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
+            if attempt == max_retries - 1:
+                logger.error(f"All retries exhausted for {ticker}: {e}")
+                return pd.DataFrame(), ticker
+            wait_time = 2 ** attempt
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+    return pd.DataFrame(), ticker
+
+def _coerce_to_close_frame(df, preferred='Adj Close'):
     """
     Helper function to handle various column structures from yfinance.
     Ensures we always get a clean DataFrame with a single 'Close' column.
+    
+    Args:
+        df: DataFrame from yfinance
+        preferred: 'Adj Close' or 'Close' - which price basis to prefer
     """
     if df.empty:
         return pd.DataFrame()
     
-    # Handle MultiIndex columns (occurs with some tickers like CTM)
+    # Handle MultiIndex columns (both orientations from yfinance)
     if isinstance(df.columns, pd.MultiIndex):
-        # Try to extract the Close column from the MultiIndex
-        if 'Adj Close' in df.columns.get_level_values(0):
-            # Get the ticker symbol from the second level
-            ticker_col = df.columns.get_level_values(1)[0] if len(df.columns.get_level_values(1)) > 0 else None
-            if ticker_col and ('Adj Close', ticker_col) in df.columns:
-                result = pd.DataFrame(df[('Adj Close', ticker_col)])
-                result.columns = ['Close']
-                return result
-        if 'Close' in df.columns.get_level_values(0):
-            ticker_col = df.columns.get_level_values(1)[0] if len(df.columns.get_level_values(1)) > 0 else None
-            if ticker_col and ('Close', ticker_col) in df.columns:
-                result = pd.DataFrame(df[('Close', ticker_col)])
-                result.columns = ['Close']
-                return result
+        lvl0 = list(df.columns.get_level_values(0))
+        lvl1 = list(df.columns.get_level_values(1))
+        
+        # Orientation A: (field, ticker) - group_by='column'
+        if preferred in lvl0 and len(set(lvl1)) >= 1:
+            tk = df.columns.get_level_values(1)[0]
+            result = df[(preferred, tk)].to_frame(name='Close')
+            return result
+        
+        # Fallback to other field if preferred not available
+        fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
+        if fallback in lvl0 and len(set(lvl1)) >= 1:
+            tk = df.columns.get_level_values(1)[0]
+            result = df[(fallback, tk)].to_frame(name='Close')
+            return result
+            
+        # Orientation B: (ticker, field) - group_by='ticker'
+        if preferred in lvl1 and len(set(lvl0)) >= 1:
+            tk = df.columns.get_level_values(0)[0]
+            result = df[(tk, preferred)].to_frame(name='Close')
+            return result
+            
+        # Fallback for orientation B
+        if fallback in lvl1 and len(set(lvl0)) >= 1:
+            tk = df.columns.get_level_values(0)[0]
+            result = df[(tk, fallback)].to_frame(name='Close')
+            return result
     
-    # Handle regular columns
-    if 'Adj Close' in df.columns:
-        return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
-    elif 'Close' in df.columns:
-        return pd.DataFrame(df[['Close']])
+    # Handle regular columns - prefer the requested field
+    if preferred in df.columns:
+        if preferred == 'Adj Close':
+            return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
+        else:
+            return pd.DataFrame(df[['Close']])
     
-    # If we can't find a close column, return empty
+    # Fallback to other field if preferred not available
+    fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
+    if fallback in df.columns:
+        if fallback == 'Adj Close':
+            return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
+        else:
+            return pd.DataFrame(df[['Close']])
+    
+    # If we can't find any close column, return empty
     logger.error(f"No Close/Adj Close data found in DataFrame")
     return pd.DataFrame()
 
-def fetch_data(ticker, use_cache=True, max_retries=3):
-    """Fetch data with optional caching support"""
+def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, reference_now=None, price_source='Adj Close'):
+    """
+    Fetch data with optional caching support
+    
+    Args:
+        ticker: The ticker symbol to fetch
+        use_cache: Whether to use cached data if available
+        max_retries: Number of retry attempts
+        return_symbol: If True, return tuple (df, resolved_ticker)
+        reference_now: Optional fixed timestamp for consistent session checks
+        price_source: 'Adj Close' or 'Close' - which price basis to use
+    
+    Returns:
+        DataFrame or tuple (DataFrame, resolved_ticker) if return_symbol=True
+    """
     if not ticker or not ticker.strip():
+        if return_symbol:
+            return pd.DataFrame(), ticker
         return pd.DataFrame()
 
     original = ticker
@@ -1043,6 +1162,8 @@ def fetch_data(ticker, use_cache=True, max_retries=3):
         cached_data = CacheManager.load_from_cache(ticker, 'data')
         if cached_data is not None:
             logger.info(f"Using cached data for {ticker}")
+            if return_symbol:
+                return cached_data, ticker  # Return cached data with original ticker
             return cached_data
     
     # Enhanced retry logic with exponential backoff
@@ -1051,9 +1172,11 @@ def fetch_data(ticker, use_cache=True, max_retries=3):
             logger.info(f"Fetching fresh data for {ticker} (attempt {attempt+1}/{max_retries})...")
             # Use lock for yfinance download (not thread-safe)
             with yfinance_lock:
-                # Add group_by='column' to ensure consistent column structure
+                # If caller wants resolved symbol, use 'ticker' mode to get MultiIndex with actual symbol
+                # Otherwise use 'column' mode for simpler structure
+                group_mode = 'ticker' if return_symbol else 'column'
                 df = yf.download(ticker, period='max', interval='1d', progress=False, 
-                               auto_adjust=False, timeout=10, threads=False, group_by='column')
+                               auto_adjust=False, timeout=10, threads=False, group_by=group_mode)
             if df.empty:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
@@ -1062,7 +1185,27 @@ def fetch_data(ticker, use_cache=True, max_retries=3):
                     continue
                 else:
                     logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
+                    if return_symbol:
+                        return pd.DataFrame(), ticker
                     return pd.DataFrame()
+            
+            # Detect the resolved ticker robustly for both MultiIndex orientations
+            resolved_ticker = ticker  # Default to requested ticker
+            if isinstance(df.columns, pd.MultiIndex):
+                lvl0 = set(map(str, df.columns.get_level_values(0)))
+                lvl1 = set(map(str, df.columns.get_level_values(1)))
+                fields = {'Adj Close', 'Close', 'Open', 'High', 'Low', 'Volume'}
+                
+                # Orientation A: (field, ticker) ← group_by='column'
+                if (fields & lvl0) and len(lvl1) == 1:
+                    resolved_ticker = list(lvl1)[0].upper()
+                # Orientation B: (ticker, field) ← group_by='ticker'
+                elif (fields & lvl1) and len(lvl0) == 1:
+                    resolved_ticker = list(lvl0)[0].upper()
+                    
+                if resolved_ticker != ticker:
+                    logger.info(f"Yahoo Finance resolved {ticker} to {resolved_ticker}")
+            
             df.index = pd.to_datetime(df.index).tz_localize(None)
             break  # Success, exit retry loop
             
@@ -1074,18 +1217,25 @@ def fetch_data(ticker, use_cache=True, max_retries=3):
                 time.sleep(wait_time)
             else:
                 logger.error(f"All retries exhausted for {ticker}: {e}")
+                if return_symbol:
+                    return pd.DataFrame(), ticker
                 return pd.DataFrame()
     
     try:
-        # Use the helper function to handle all column structures
-        df = _coerce_to_close_frame(df)
+        # Use the helper function to handle all column structures with price_source preference
+        df = _coerce_to_close_frame(df, preferred=price_source)
+        # De-dup & sort to avoid rare vendor duplicate rows
+        df = df[~df.index.duplicated(keep='last')].sort_index()
         if df.empty:
             logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
+            if return_symbol:
+                return pd.DataFrame(), ticker
             return pd.DataFrame()
 
         # Apply the very same detector as onepass (parity)
-        ticker_type = detect_ticker_type(ticker)
-        if not is_session_complete(df, ticker_type):
+        # Use the RESOLVED symbol for type detection to avoid misclassifying aliases
+        ticker_type = detect_ticker_type(resolved_ticker)
+        if not is_session_complete(df, ticker_type, reference_now=reference_now):
             logger.debug(f"Dropping incomplete session for {ticker}")
             df = df.iloc[:-1]
         
@@ -1095,10 +1245,14 @@ def fetch_data(ticker, use_cache=True, max_retries=3):
         # Don't cache for impact analysis to avoid multiprocessing corruption
         # CacheManager.save_to_cache(df, ticker, 'data')
         
-        logger.info(f"Successfully fetched {len(df)} days of data for {ticker}.")
+        logger.info(f"Successfully fetched {len(df)} days of data for {resolved_ticker}.")
+        if return_symbol:
+            return df, resolved_ticker
         return df
     except Exception as e:
         logger.error(f"Error fetching data for {ticker}: {str(e)}")
+        if return_symbol:
+            return pd.DataFrame(), ticker
         return pd.DataFrame()
 
 def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df):
@@ -1262,6 +1416,8 @@ def export_results_to_excel(output_filename, metrics_list):
     # Define your desired column order
     desired_order = [
         'Primary Ticker',
+        'Resolved/Fetched',  # Transparency: What Yahoo returned
+        'Library Source',    # Transparency: Which library was used
         'Trigger Days',
         'Wins',
         'Losses',
@@ -1277,34 +1433,42 @@ def export_results_to_excel(output_filename, metrics_list):
         'Total Capture (%)'
     ]
 
+    # Normalize rows to ensure all keys exist; prevents KeyErrors on older runs
+    normalized_rows = []
+    for m in metrics_list:
+        row = {}
+        for col in desired_order:
+            row[col] = m.get(col, '')  # Use empty string for missing values
+        # Add any extra columns that aren't in desired_order
+        for key, value in m.items():
+            if key not in desired_order:
+                row[key] = value
+        normalized_rows.append(row)
+    
     if os.path.exists(output_filename):
         existing_df = pd.read_excel(output_filename)
-        new_df = pd.DataFrame(metrics_list)
+        new_df = pd.DataFrame(normalized_rows)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
 
         # Optionally sort by Sharpe Ratio
         if 'Sharpe Ratio' in combined_df.columns:
             combined_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True)
 
-        # Reorder columns if they exist
-        for col in desired_order:
-            if col not in combined_df.columns:
-                combined_df[col] = np.nan
-        combined_df = combined_df[[col for col in desired_order if col in combined_df.columns]]
+        # Ensure column order
+        combined_df = combined_df.reindex(columns=desired_order + 
+                                         [col for col in combined_df.columns if col not in desired_order])
 
         combined_df.to_excel(output_filename, index=False)
     else:
-        df = pd.DataFrame(metrics_list)
+        df = pd.DataFrame(normalized_rows)
 
         # Optionally sort by Sharpe Ratio
         if 'Sharpe Ratio' in df.columns:
             df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True)
 
-        # Reorder columns if they exist
-        for col in desired_order:
-            if col not in df.columns:
-                df[col] = np.nan
-        df = df[[col for col in desired_order if col in df.columns]]
+        # Ensure column order
+        df = df.reindex(columns=desired_order + 
+                       [col for col in df.columns if col not in desired_order])
 
         df.to_excel(output_filename, index=False)
 
@@ -1314,8 +1478,38 @@ def process_single_ticker_wrapper(args):
     """Wrapper for multiprocessing compatibility"""
     return process_single_ticker(*args)
 
-def process_single_ticker(prim_ticker, sec_df, sma_cache=None):
-    """Process a single primary ticker"""
+def _pick_best_library(requested_sym, fetched_sym, df):
+    """Return (signal_data, chosen_symbol, acceptance) for the best-fitting library, or (None, 'None', None)."""
+    candidates = []
+    seen = []
+    for sym in {requested_sym, fetched_sym}:
+        if not sym:
+            continue
+        lib = load_signal_library(sym)
+        if lib:
+            acc, integ, msg = evaluate_library_acceptance(lib, df)
+            candidates.append((sym, lib, acc, msg, integ))
+            seen.append(f"{sym}:{acc}")
+    
+    if not candidates:
+        return None, "None", None
+    
+    # Rank acceptance tiers (higher is better)
+    rank = {'STRICT': 3, 'HEADTAIL_FUZZY': 2, 'LOOSE': 1, 'REBUILD': 0}
+    chosen_sym, chosen_lib, chosen_acc, _, _ = max(candidates, key=lambda x: rank.get(x[2], -1))
+    
+    if len(candidates) > 1:
+        logger.info(f"Library candidates {seen} -> selected {chosen_sym}:{chosen_acc}")
+    
+    # If we selected a REBUILD library, treat as no library (force compute)
+    if chosen_acc == 'REBUILD':
+        return None, "None", None
+        
+    return chosen_lib, chosen_sym, chosen_acc
+
+def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=None):
+    """Process a single primary ticker with optional frozen analysis clock (single-download path)"""
+    requested_ticker = prim_ticker  # Keep original for transparency
     prim_ticker = normalize_ticker(prim_ticker)
     logger.info(f"Processing {prim_ticker}...")
     
@@ -1323,14 +1517,43 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None):
     primary_signals = None
     primary_dates = None
     
-    # Try to load Signal Library first for massive speedup
-    signal_data = load_signal_library(prim_ticker)
+    # Check if we have a library to get price_source from
+    price_source = 'Adj Close'  # Default
+    temp_lib = load_signal_library(prim_ticker)
+    if temp_lib and 'price_source' in temp_lib:
+        price_source = temp_lib['price_source']
+        logger.debug(f"Using price_source from library: {price_source}")
     
-    # Always fetch fresh data for primary tickers (no caching to avoid corruption)
-    df = fetch_data(prim_ticker, use_cache=False)
-    if df.empty:
+    # Single download: get raw frame & resolved symbol once
+    df_raw, fetched_symbol = fetch_data_raw(prim_ticker, reference_now=analysis_clock)
+    if df_raw.empty:
         logger.warning(f"No data for primary ticker {prim_ticker}, skipping.")
         return None
+    
+    # Coerce to the price basis (no second download)
+    df = _coerce_to_close_frame(df_raw, preferred=price_source)
+    # De-dup & sort to avoid rare vendor duplicate rows
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    if df.empty:
+        logger.warning(f"No {price_source} series for {prim_ticker}, skipping.")
+        return None
+    
+    # Apply session guard with the resolved type
+    ttype = detect_ticker_type(fetched_symbol)
+    if not is_session_complete(df, ttype, reference_now=analysis_clock):
+        df = df.iloc[:-1]
+        logger.debug(f"Dropped incomplete session for {fetched_symbol}. Days now: {len(df)}")
+    
+    # Apply strict parity transformations if enabled
+    df = apply_strict_parity(df)
+    
+    # Decide which library (requested vs resolved) fits best
+    signal_data, library_ticker, preselected_acc = _pick_best_library(prim_ticker, fetched_symbol, df)
+    
+    # Use the fetched symbol for downstream data naming and logs
+    if fetched_symbol != prim_ticker:
+        logger.info(f"Ticker resolved: {prim_ticker} -> {fetched_symbol}")
+    prim_ticker = fetched_symbol
 
     close_values = df['Close'].values
     num_days = len(df)
@@ -1574,7 +1797,10 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None):
     
     result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
     if result is not None:
-        result['Primary Ticker'] = prim_ticker
+        # Track all ticker names for transparency
+        result['Primary Ticker'] = requested_ticker  # What user asked for
+        result['Resolved/Fetched'] = fetched_symbol   # What Yahoo returned
+        result['Library Source'] = library_ticker      # Which library was used
     
     return result
 
@@ -1582,17 +1808,40 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     """Process primary tickers with progress tracking and optional multiprocessing"""
     global progress_tracker
     
+    # Freeze the analysis clock for consistent session checks across all tickers
+    import pytz
+    from datetime import datetime
+    analysis_clock = datetime.now(pytz.timezone('America/New_York'))
+    logger.info(f"Analysis clock frozen at: {analysis_clock.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    
     # Deduplicate primary tickers after normalization
     primary_tickers = deduplicate_tickers(primary_tickers)
     
     secondary_ticker = normalize_ticker(secondary_ticker)
-    sec_df = fetch_data(secondary_ticker, use_cache=False)
-    if sec_df.empty:
+    # Single download for the secondary too
+    sec_raw, sec_resolved = fetch_data_raw(secondary_ticker, reference_now=analysis_clock)
+    if sec_raw.empty:
         logger.error(f"No data for secondary ticker {secondary_ticker}, cannot proceed.")
         return []
-        
-    # Ensure proper data alignment from the start
-    sec_df = sec_df.sort_index()
+    if sec_resolved != secondary_ticker:
+        logger.info(f"Secondary ticker resolved {secondary_ticker} -> {sec_resolved}")
+    
+    # Coerce secondary once (we use it read-only everywhere)
+    sec_df = _coerce_to_close_frame(sec_raw, preferred='Adj Close')
+    # De-dup & sort to avoid rare vendor duplicate rows
+    sec_df = sec_df[~sec_df.index.duplicated(keep='last')].sort_index()
+    if sec_df.empty:
+        logger.error(f"No Adj Close series for secondary {sec_resolved}, cannot proceed.")
+        return []
+    
+    # Session guard for secondary too
+    sec_type = detect_ticker_type(sec_resolved)
+    if not is_session_complete(sec_df, sec_type, reference_now=analysis_clock):
+        sec_df = sec_df.iloc[:-1]
+        logger.debug(f"Dropped incomplete session for secondary {sec_resolved}. Days now: {len(sec_df)}")
+    
+    # Apply strict parity transformations if enabled
+    sec_df = apply_strict_parity(sec_df)
 
     metrics_list = []
     sma_cache = {}  # Cache for SMA calculations
@@ -1609,7 +1858,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
         logger.info("Using multiprocessing for faster analysis...")
         
         # Pass sec_df by reference (read-only in workers, no need to copy)
-        process_args = [(ticker, sec_df, None) for ticker in primary_tickers]
+        # Include the frozen analysis_clock for consistent session checks
+        process_args = [(ticker, sec_df, None, analysis_clock) for ticker in primary_tickers]
         
         # Use ThreadPoolExecutor (ProcessPoolExecutor has pickle issues with DataFrames)
         max_workers = max(1, min(multiprocessing.cpu_count() - 1, 8))
@@ -1641,7 +1891,7 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
             with progress_lock:
                 progress_tracker['current_ticker'] = prim_ticker
             
-            result = process_single_ticker(prim_ticker, sec_df, sma_cache)
+            result = process_single_ticker(prim_ticker, sec_df, sma_cache, analysis_clock)
             if result:
                 result['Secondary Ticker'] = secondary_ticker
                 metrics_list.append(result)
