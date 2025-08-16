@@ -320,6 +320,15 @@ Note: Machine learning integration, advanced analytics, and institutional featur
 
 ### Documentation Organization
 - **NEVER place new markdown files in the root project folder** (except CLAUDE.md)
+- **ALWAYS use date prefix and descriptive uppercase title for markdown filenames**: `YYYY-MM-DD_DESCRIPTION_IN_CAPS.md`
+  - Date format: YYYY-MM-DD (ISO 8601)
+  - Description: Use UPPERCASE with underscores, be specific about the content
+  - Include action words like: INVESTIGATION, FIX, ENHANCEMENT, REFACTOR, IMPLEMENTATION, ANALYSIS
+  - Good examples:
+    - `2025-01-16_UNICODE_AND_SELENIUM_TEST_ISSUE_INVESTIGATIONS.md` (investigation into problems)
+    - `2025-01-14_ADAPTIVE_INTERVAL_PERFORMANCE_6X_FASTER.md` (performance improvement)
+    - `2025-01-15_CODE_CLEANUP_667_LINES_REMOVED.md` (refactoring work)
+  - Avoid vague terms like: FINDINGS, NOTES, CHANGES, UPDATE
 - All documentation should be organized in the `md_library/` directory structure:
   - `md_library/spymaster/` - Spymaster-specific documentation
     - `/bugs/` - Bug reports and fixes
@@ -328,12 +337,33 @@ Note: Machine learning integration, advanced analytics, and institutional featur
     - `/adaptive_interval/` - Adaptive interval related docs
   - `md_library/impactsearch/` - Impactsearch documentation
   - `md_library/onepass/` - Onepass documentation
-  - `md_library/shared/` - Shared documentation across scripts
+  - `md_library/shared/` - Shared documentation across scripts (testing, tools, environment)
 - Text files (.txt) for quick changes/notes can remain in root temporarily
+
+### Git Branch Naming Conventions
+- **Be specific about scope and purpose** - branches should clearly indicate what they affect
+- **Use descriptive prefixes** to identify the area of work:
+  - `claude-` for CLAUDE.md or Claude behavior updates
+  - `spymaster-` for spymaster.py changes
+  - `impactsearch-` for impactsearch.py changes
+  - `onepass-` for onepass.py changes
+  - `docs-` for general documentation (but be specific about which docs)
+- **Good branch name examples**:
+  - `claude-testing-guidelines` - Updates to Claude's testing behavior
+  - `spymaster-unicode-fix` - Fixing Unicode issues in spymaster.py
+  - `impactsearch-performance-optimization` - Performance improvements
+  - `onepass-sma-calculation-bug` - Specific bug fix in onepass
+- **Avoid vague branch names**:
+  - `docs/testing-guidelines` - Whose testing guidelines?
+  - `fix/bug` - Which bug? Where?
+  - `update/readme` - Which readme? What update?
+  - `feature/new` - What feature? For which component?
+- **Use hyphens**, not underscores or slashes (except for feature/ or bugfix/ prefixes if using git flow)
 
 ### Testing Guidelines
 - **NEVER use Unicode characters in test scripts or console output**
-  - Causes `UnicodeEncodeError` on Windows systems
+  - Windows console uses cp1252 encoding which cannot display Unicode characters
+  - This causes `UnicodeEncodeError` when Python tries to print Unicode to the Windows terminal
   - Use ASCII alternatives: [OK], [FAIL], [WARNING] instead of ✅, ❌, ⚠️
   - Use simple separators: ===, ---, ### instead of fancy Unicode boxes
 - All tests should include verification of newly implemented metrics, visuals, functions, or other components
