@@ -360,12 +360,46 @@ Note: Machine learning integration, advanced analytics, and institutional featur
   - `feature/new` - What feature? For which component?
 - **Use hyphens**, not underscores or slashes (except for feature/ or bugfix/ prefixes if using git flow)
 
+### Git Diff Request Guidelines
+When handling git diff requests, pay attention to whether the user wants a file or just output:
+
+**CREATE a .txt file when user says:**
+- "Create a git diff file"
+- "Provide a git diff .txt file"  
+- "Generate a git diff and save it"
+- "Produce a git diff text file"
+- Any request explicitly mentioning ".txt", "file", or "document"
+
+**DO NOT create files when user says:**
+- "Run a git diff and provide a summary"
+- "Show me the git diff"
+- "What are the changes?"
+- "Run git diff" (without mentioning a file)
+
+**If creating a file:**
+1. **Always create ONE single .txt file** - No multiple attempts or versions
+2. **Include full file contents** - Use standard git diff format showing all changes
+3. **For untracked files** - Use `git add -N` temporarily to include them in diff, then `git reset HEAD` after
+4. **Naming convention** - Use descriptive names like `global_ticker_library_full_diff.txt`
+
+**If just displaying output:**
+- Run git diff and show results in terminal/chat
+- Provide summary or highlights as requested
+- No files should be created
+
 ### Testing Guidelines
 - **NEVER use Unicode characters in test scripts or console output**
   - Windows console uses cp1252 encoding which cannot display Unicode characters
   - This causes `UnicodeEncodeError` when Python tries to print Unicode to the Windows terminal
   - Use ASCII alternatives: [OK], [FAIL], [WARNING] instead of ✅, ❌, ⚠️
   - Use simple separators: ===, ---, ### instead of fancy Unicode boxes
+  - Use ASCII arrows: -> instead of → (U+2192)
+- **Unicode IS safe to use in:**
+  - Dash web interfaces (HTML/browser handles Unicode perfectly)
+  - Log files written with UTF-8 encoding
+  - Internal Python string processing
+  - Web-based outputs (JSON, HTML, etc.)
+- **The issue is ONLY with Windows console output (cmd.exe, PowerShell)**
 - All tests should include verification of newly implemented metrics, visuals, functions, or other components
 - It is not enough that the app compiles - verify actual functionality
 
