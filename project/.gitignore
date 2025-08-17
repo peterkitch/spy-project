@@ -64,3 +64,9 @@ misc.xml
 !CLAUDE.md
 !md_library/
 !md_library/**/*.md
+
+# Global Ticker Library data files
+global_ticker_library/data/*.db
+global_ticker_library/data/*.db-*
+global_ticker_library/data/*.txt
+global_ticker_library/data/*.json
