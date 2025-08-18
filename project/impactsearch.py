@@ -21,6 +21,81 @@ import threading
 import multiprocessing
 from threading import Lock
 import re
+import contextlib
+
+# ---------- Max-period capability registry ----------
+PERIOD_CAPABILITY_CACHE_PATH = os.path.join('cache', 'period_capabilities.json')
+PERIOD_RECHECK_DAYS = 30  # 30-day hold period as requested
+
+class PeriodCapabilityCache:
+    """Cache for tracking which tickers support period='max' in yfinance"""
+    def __init__(self, path=PERIOD_CAPABILITY_CACHE_PATH, recheck_days=PERIOD_RECHECK_DAYS):
+        self.path = path
+        self.recheck_days = recheck_days
+        self.data = {}
+        self._load()
+
+    def _load(self):
+        """Load cache from JSON file"""
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, 'r') as f:
+                    self.data = json.load(f)
+        except Exception as e:
+            logging.error(f"Failed to load period capabilities cache: {e}")
+            self.data = {}
+
+    def _save(self):
+        """Save cache to JSON file"""
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, 'w') as f:
+                json.dump(self.data, f, indent=2)
+        except Exception as e:
+            logging.error(f"Failed to save period capabilities cache: {e}")
+
+    def _expired(self, iso_ts):
+        """Check if a cached entry has expired"""
+        try:
+            last = datetime.fromisoformat(iso_ts)
+            return (datetime.now() - last) > timedelta(days=self.recheck_days)
+        except Exception:
+            return True
+
+    def get_status(self, ticker: str) -> str:
+        """Get cached status: 'unknown', 'no_max', or 'supports'"""
+        if not ticker:
+            return 'unknown'
+        t = normalize_ticker(ticker)
+        rec = self.data.get(t)
+        if not rec:
+            return 'unknown'
+        if rec.get('supports_max') is False:
+            return 'unknown' if self._expired(rec.get('last_checked', '1970-01-01T00:00:00')) else 'no_max'
+        if rec.get('supports_max') is True:
+            return 'supports'
+        return 'unknown'
+
+    def set_status(self, ticker: str, supports: bool, reason: str = ""):
+        """Mark a ticker as supporting or not supporting period='max'"""
+        if not ticker:
+            return
+        t = normalize_ticker(ticker)
+        self.data[t] = {
+            'supports_max': bool(supports),
+            'last_checked': datetime.now().isoformat(),
+            'reason': reason or ""
+        }
+        self._save()
+
+    def get_last_checked(self, ticker: str):
+        """Get the last time this ticker was checked"""
+        rec = self.data.get(normalize_ticker(ticker))
+        return rec.get('last_checked') if rec else None
+
+# Initialize global cache instance
+PERIOD_REGISTRY = PeriodCapabilityCache()
+PERIOD_FORCE_RECHECK = os.environ.get('IMPACTSEARCH_FORCE_RECHECK_MAX', '').lower() in ('1', 'true', 'yes')
 
 # Import shared modules for parity with onepass
 from signal_library.shared_symbols import normalize_ticker, detect_ticker_type
@@ -1038,14 +1113,37 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
     if not ticker or not ticker.strip():
         return pd.DataFrame(), ticker
     ticker = normalize_ticker(ticker)
+    
+    # Fast-skip if we've recently confirmed 'max' is unsupported (unless override)
+    if PERIOD_REGISTRY.get_status(ticker) == 'no_max' and not PERIOD_FORCE_RECHECK:
+        last = PERIOD_REGISTRY.get_last_checked(ticker)
+        logger.info(f"Skipping {ticker}: 'max' period unsupported (cached as of {last}). "
+                    f"Recheck after {PERIOD_REGISTRY.recheck_days}d or set IMPACTSEARCH_FORCE_RECHECK_MAX=1.")
+        return pd.DataFrame(), ticker
+    
     for attempt in range(max_retries):
         try:
             logger.info(f"Fetching data for {ticker} (attempt {attempt+1}/{max_retries})...")
             with yfinance_lock:
-                df_raw = yf.download(
-                    ticker, period='max', interval='1d', progress=False,
-                    auto_adjust=False, timeout=10, threads=False, group_by='ticker'
-                )
+                # Capture noisy stdout/stderr from yfinance to detect InvalidPeriod fast
+                _buf_out, _buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(_buf_out), contextlib.redirect_stderr(_buf_err):
+                    df_raw = yf.download(
+                        ticker, period='max', interval='1d', progress=False,
+                        auto_adjust=False, timeout=10, threads=False, group_by='ticker'
+                    )
+                noisy = (_buf_out.getvalue().strip() or _buf_err.getvalue().strip())
+                
+                # Check for InvalidPeriod error specifically
+                if noisy and ("YFInvalidPeriodError" in noisy or "Period 'max' is invalid" in noisy or "period 'max' is invalid" in noisy.lower()):
+                    logger.warning(noisy)
+                    PERIOD_REGISTRY.set_status(ticker, supports=False, reason='YFInvalidPeriodError')
+                    logger.info(f"Detected unsupported 'max' for {ticker}. Marked in cache for {PERIOD_REGISTRY.recheck_days}d.")
+                    return pd.DataFrame(), ticker
+                elif noisy:
+                    # Surface other warnings as normal
+                    logger.warning(noisy)
+                    
             if df_raw.empty:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
@@ -1055,10 +1153,13 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
                 else:
                     logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
                     return pd.DataFrame(), ticker
+            # Success! Mark as supporting 'max' period
             df_raw.index = pd.to_datetime(df_raw.index).tz_localize(None)
             resolved = _extract_resolved_symbol(df_raw, ticker)
             if resolved != ticker:
                 logger.info(f"Yahoo Finance resolved {ticker} to {resolved}")
+            # Mark successful fetch in cache
+            PERIOD_REGISTRY.set_status(ticker, supports=True, reason='successful_fetch')
             return df_raw, resolved
         except Exception as e:
             logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
@@ -1157,6 +1258,16 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
     if original and original.strip().upper() != ticker:
         logger.info(f"Normalized ticker: {original.strip()} -> {ticker}")
     
+    # Fast-skip if we've recently confirmed 'max' is unsupported (unless override)
+    if PERIOD_REGISTRY.get_status(ticker) == 'no_max' and not PERIOD_FORCE_RECHECK:
+        last = PERIOD_REGISTRY.get_last_checked(ticker)
+        msg = (f"Skipping {ticker}: 'max' period unsupported (cached as of {last}). "
+               f"Recheck after {PERIOD_REGISTRY.recheck_days}d or set IMPACTSEARCH_FORCE_RECHECK_MAX=1.")
+        logger.info(msg)
+        if return_symbol:
+            return pd.DataFrame(), ticker
+        return pd.DataFrame()
+    
     # Try to load from cache first (only if caching is enabled)
     if use_cache:
         cached_data = CacheManager.load_from_cache(ticker, 'data')
@@ -1175,8 +1286,23 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
                 # If caller wants resolved symbol, use 'ticker' mode to get MultiIndex with actual symbol
                 # Otherwise use 'column' mode for simpler structure
                 group_mode = 'ticker' if return_symbol else 'column'
-                df = yf.download(ticker, period='max', interval='1d', progress=False, 
-                               auto_adjust=False, timeout=10, threads=False, group_by=group_mode)
+                _buf_out, _buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(_buf_out), contextlib.redirect_stderr(_buf_err):
+                    df = yf.download(ticker, period='max', interval='1d', progress=False, 
+                                     auto_adjust=False, timeout=10, threads=False, group_by=group_mode)
+                noisy = (_buf_out.getvalue().strip() or _buf_err.getvalue().strip())
+                
+                # Check for InvalidPeriod error specifically
+                if noisy and ("YFInvalidPeriodError" in noisy or "Period 'max' is invalid" in noisy or "period 'max' is invalid" in noisy.lower()):
+                    logger.warning(noisy)
+                    PERIOD_REGISTRY.set_status(ticker, supports=False, reason='YFInvalidPeriodError')
+                    logger.info(f"Detected unsupported 'max' for {ticker}. Marked in cache for {PERIOD_REGISTRY.recheck_days}d.")
+                    if return_symbol:
+                        return pd.DataFrame(), ticker
+                    return pd.DataFrame()
+                elif noisy:
+                    logger.warning(noisy)
+                    
             if df.empty:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
@@ -1207,6 +1333,8 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
                     logger.info(f"Yahoo Finance resolved {ticker} to {resolved_ticker}")
             
             df.index = pd.to_datetime(df.index).tz_localize(None)
+            # Mark successful fetch in cache
+            PERIOD_REGISTRY.set_status(ticker, supports=True, reason='successful_fetch')
             break  # Success, exit retry loop
             
         except Exception as e:
@@ -1667,7 +1795,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                 sma_cache[cache_key] = sma_matrix
     else:
         # No Signal Library - compute from scratch
-        logger.info(f"No Signal Library found for {prim_ticker}, computing from scratch...")
+        logger.info(f"No usable Signal Library for {prim_ticker} (missing or rejected), computing from scratch...")
         
         # Check for cached SMA calculations
         cache_key = f"{prim_ticker}_sma"
@@ -1744,7 +1872,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     # Derive signals if we still don't have them pre-computed
     if primary_signals is None:
         # Need to derive signals - we don't have them pre-computed
-        logger.info("Deriving primary signals from previous day's top pairs...")
+        logger.info(f"Deriving primary signals for {prim_ticker} from previous day's top pairs...")
         primary_dates = df.index
         primary_signals = []
         previous_date = None
@@ -1788,7 +1916,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         logger.info(f"Using {len(primary_signals)} pre-computed signals from Signal Library V2")
         primary_dates = df.index
 
-    logger.info("Calculating final metrics for this primary ticker...")
+    logger.info(f"Calculating final metrics for {prim_ticker}...")
     logger.info(f"Signal distribution before metrics calculation:")
     signal_counts = pd.Series(primary_signals).value_counts()
     logger.info(f"Buy signals: {signal_counts.get('Buy', 0)}")
@@ -1816,6 +1944,21 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     
     # Deduplicate primary tickers after normalization
     primary_tickers = deduplicate_tickers(primary_tickers)
+    
+    # Filter out tickers known to lack 'max' (unless operator override)
+    if not PERIOD_FORCE_RECHECK:
+        kept, dropped = [], []
+        for t in primary_tickers:
+            if PERIOD_REGISTRY.get_status(t) == 'no_max':
+                dropped.append(t)
+            else:
+                kept.append(t)
+        if dropped:
+            sample = ', '.join(dropped[:10])
+            more = '...' if len(dropped) > 10 else ''
+            logger.info(f"Max-period filter: skipping {len(dropped)} tickers with cached unsupported 'max' "
+                        f"(recheck every {PERIOD_REGISTRY.recheck_days}d). Examples: {sample}{more}")
+        primary_tickers = kept
     
     secondary_ticker = normalize_ticker(secondary_ticker)
     # Single download for the secondary too
