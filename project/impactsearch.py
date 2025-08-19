@@ -66,8 +66,8 @@ class PeriodCapabilityCache:
         """Get cached status: 'unknown', 'no_max', or 'supports'"""
         if not ticker:
             return 'unknown'
-        t = normalize_ticker(ticker)
-        rec = self.data.get(t)
+        vendor_symbol, _ = resolve_symbol(ticker)
+        rec = self.data.get(vendor_symbol)
         if not rec:
             return 'unknown'
         if rec.get('supports_max') is False:
@@ -80,8 +80,8 @@ class PeriodCapabilityCache:
         """Mark a ticker as supporting or not supporting period='max'"""
         if not ticker:
             return
-        t = normalize_ticker(ticker)
-        self.data[t] = {
+        vendor_symbol, _ = resolve_symbol(ticker)
+        self.data[vendor_symbol] = {
             'supports_max': bool(supports),
             'last_checked': datetime.now().isoformat(),
             'reason': reason or ""
@@ -90,7 +90,8 @@ class PeriodCapabilityCache:
 
     def get_last_checked(self, ticker: str):
         """Get the last time this ticker was checked"""
-        rec = self.data.get(normalize_ticker(ticker))
+        vendor_symbol, _ = resolve_symbol(ticker)
+        rec = self.data.get(vendor_symbol)
         return rec.get('last_checked') if rec else None
 
 # Initialize global cache instance
@@ -98,7 +99,7 @@ PERIOD_REGISTRY = PeriodCapabilityCache()
 PERIOD_FORCE_RECHECK = os.environ.get('IMPACTSEARCH_FORCE_RECHECK_MAX', '').lower() in ('1', 'true', 'yes')
 
 # Import shared modules for parity with onepass
-from signal_library.shared_symbols import normalize_ticker, detect_ticker_type
+from signal_library.shared_symbols import resolve_symbol, detect_ticker_type
 from signal_library.shared_integrity import (
     compute_stable_fingerprint,
     compute_quantized_fingerprint,
@@ -980,67 +981,77 @@ def deduplicate_tickers(tickers):
     seen = set()
     
     for ticker in tickers:
-        norm_ticker = normalize_ticker(ticker)
-        if norm_ticker and norm_ticker not in seen:
-            seen.add(norm_ticker)
-            normalized.append(norm_ticker)
+        vendor_symbol, _ = resolve_symbol(ticker)
+        if vendor_symbol and vendor_symbol not in seen:
+            seen.add(vendor_symbol)
+            normalized.append(vendor_symbol)
     
     logger.info(f"Deduplicated {len(tickers)} tickers to {len(normalized)} unique tickers")
     return normalized
 
 # Note: fingerprint and integrity functions now imported from shared_integrity module
 
+def _lib_path_for(ticker):
+    """Generate library path for a ticker."""
+    stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
+    filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
+    return os.path.join(stable_dir, filename)
+
 def load_signal_library(ticker):
     """
     Load Signal Library for a ticker from onepass.py's saved signals.
     Returns the signal data if found, None otherwise.
+    Tries both new (dot) and old (dash) naming conventions for backward compatibility.
     """
     try:
-        stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
-        filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
-        filepath = os.path.join(stable_dir, filename)
+        # Try both new naming (with dots) and old naming (with dashes)
+        candidates = [ticker]
+        if '.' in ticker:
+            candidates.append(ticker.replace('.', '-'))  # Old naming convention
         
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'rb') as f:
-                    signal_data = pickle.load(f)
-            except (pickle.UnpicklingError, EOFError) as e:
-                logger.error(f"Corrupt Signal Library for {ticker}: {e}")
-                # Quarantine corrupt file for debugging
-                corrupt_filepath = filepath + '.corrupt'
-                os.replace(filepath, corrupt_filepath)
-                logger.info(f"Renamed corrupt file to {corrupt_filepath}")
-                return None
+        for candidate in candidates:
+            filepath = _lib_path_for(candidate)
             
-            # Verify version compatibility with detailed logging
-            stored_version = signal_data.get('engine_version')
-            stored_max_sma = signal_data.get('max_sma_day')
-            
-            if stored_version != ENGINE_VERSION:
-                logger.warning(f"Version mismatch for {ticker}: stored={stored_version}, current={ENGINE_VERSION}")
-            if stored_max_sma != MAX_SMA_DAY:
-                logger.warning(f"MAX_SMA_DAY mismatch for {ticker}: stored={stored_max_sma}, current={MAX_SMA_DAY}")
-            
-            if stored_version == ENGINE_VERSION and stored_max_sma == MAX_SMA_DAY:
-                logger.info(f"Signal Library loaded for {ticker} from {filepath}")
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'rb') as f:
+                        signal_data = pickle.load(f)
+                except (pickle.UnpicklingError, EOFError) as e:
+                    logger.error(f"Corrupt Signal Library for {ticker}: {e}")
+                    # Quarantine corrupt file for debugging
+                    corrupt_filepath = filepath + '.corrupt'
+                    os.replace(filepath, corrupt_filepath)
+                    logger.info(f"Renamed corrupt file to {corrupt_filepath}")
+                    continue  # Try next candidate
                 
-                # Check if this is the enhanced V2 format with primary_signals
-                if 'primary_signals' in signal_data:
-                    logger.info(f"  Enhanced V2 format detected with {len(signal_data['primary_signals'])} signals")
+                # Verify version compatibility with detailed logging
+                stored_version = signal_data.get('engine_version')
+                stored_max_sma = signal_data.get('max_sma_day')
                 
-                return signal_data
-            else:
-                logger.warning(f"Version mismatch for {ticker} Signal Library")
-                return None
-        else:
-            logger.debug(f"No Signal Library found for {ticker} at {filepath}")
-            return None
+                if stored_version != ENGINE_VERSION:
+                    logger.warning(f"Version mismatch for {ticker}: stored={stored_version}, current={ENGINE_VERSION}")
+                if stored_max_sma != MAX_SMA_DAY:
+                    logger.warning(f"MAX_SMA_DAY mismatch for {ticker}: stored={stored_max_sma}, current={MAX_SMA_DAY}")
+                
+                if stored_version == ENGINE_VERSION and stored_max_sma == MAX_SMA_DAY:
+                    logger.info(f"Signal Library loaded for {ticker} from {filepath}")
+                    
+                    # Check if this is the enhanced V2 format with primary_signals
+                    if 'primary_signals' in signal_data:
+                        logger.info(f"  Enhanced V2 format detected with {len(signal_data['primary_signals'])} signals")
+                    
+                    return signal_data
+                else:
+                    logger.warning(f"Signal Library rejected for {ticker} due to version/config mismatch")
+                    return None
+        
+        # No library found in any location
+        logger.debug(f"No Signal Library found for {ticker}")
+        return None
             
     except Exception as e:
         logger.error(f"Error loading Signal Library for {ticker}: {e}")
         return None
-
-# Note: normalize_ticker is now imported from shared_symbols module
 
 def is_session_complete(df, ticker_type='equity', reference_now=None):
     """
@@ -1112,7 +1123,8 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
     """
     if not ticker or not ticker.strip():
         return pd.DataFrame(), ticker
-    ticker = normalize_ticker(ticker)
+    vendor_symbol, _ = resolve_symbol(ticker)
+    ticker = vendor_symbol  # Use resolved symbol for all operations
     
     # Fast-skip if we've recently confirmed 'max' is unsupported (unless override)
     if PERIOD_REGISTRY.get_status(ticker) == 'no_max' and not PERIOD_FORCE_RECHECK:
@@ -1254,9 +1266,10 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
         return pd.DataFrame()
 
     original = ticker
-    ticker = normalize_ticker(ticker)
-    if original and original.strip().upper() != ticker:
-        logger.info(f"Normalized ticker: {original.strip()} -> {ticker}")
+    vendor_symbol, _ = resolve_symbol(ticker)
+    if original and original.strip().upper() != vendor_symbol:
+        logger.info(f"Resolved ticker: {original.strip()} -> {vendor_symbol}")
+    ticker = vendor_symbol  # Use vendor symbol for all operations
     
     # Fast-skip if we've recently confirmed 'max' is unsupported (unless override)
     if PERIOD_REGISTRY.get_status(ticker) == 'no_max' and not PERIOD_FORCE_RECHECK:
@@ -1638,7 +1651,8 @@ def _pick_best_library(requested_sym, fetched_sym, df):
 def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=None):
     """Process a single primary ticker with optional frozen analysis clock (single-download path)"""
     requested_ticker = prim_ticker  # Keep original for transparency
-    prim_ticker = normalize_ticker(prim_ticker)
+    vendor_symbol, _ = resolve_symbol(prim_ticker)
+    prim_ticker = vendor_symbol
     logger.info(f"Processing {prim_ticker}...")
     
     # If Signal Library is available, use precomputed signals
@@ -1960,7 +1974,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
                         f"(recheck every {PERIOD_REGISTRY.recheck_days}d). Examples: {sample}{more}")
         primary_tickers = kept
     
-    secondary_ticker = normalize_ticker(secondary_ticker)
+    vendor_symbol_sec, _ = resolve_symbol(secondary_ticker)
+    secondary_ticker = vendor_symbol_sec
     # Single download for the secondary too
     sec_raw, sec_resolved = fetch_data_raw(secondary_ticker, reference_now=analysis_clock)
     if sec_raw.empty:

@@ -31,6 +31,9 @@ from tqdm.auto import tqdm
 
 TOKEN_RE = re.compile(r"[A-Z0-9.^=\-]+", re.ASCII | re.IGNORECASE)
 
+# Chunked validation settings
+_VALIDATE_CHUNK = 2000  # Commit every 2000 symbols to avoid losing work
+
 class _SilentIO(io.StringIO):
     def write(self, *args, **kwargs):
         # swallow
@@ -38,6 +41,11 @@ class _SilentIO(io.StringIO):
 
 def _silence_yf():
     return redirect_stdout(_SilentIO())
+
+def _chunked(seq, n):
+    """Split sequence into chunks of size n"""
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
 
 def _normalize_tokens(text: str) -> List[str]:
     """Extract and normalize potential ticker symbols from text"""
@@ -77,6 +85,152 @@ def load_manual() -> List[str]:
         return []
     text = MANUAL_FILE.read_text(encoding="utf-8")
     return _normalize_tokens(text)
+
+def validate_and_commit_chunked(symbols: List[str], gentle: bool = False) -> None:
+    """
+    Validate in chunks and commit after each chunk so work is never lost.
+    Also emits progress that the Dash UI can consume.
+    """
+    import time
+    total = len(symbols)
+    if total == 0:
+        print("No symbols to validate.", flush=True)
+        return
+
+    print(f"\nValidating {total} symbols via Yahoo Finance (chunked {_VALIDATE_CHUNK}s)...", flush=True)
+
+    # running totals for the CLI summary and progress
+    agg_total = {"rate_limit": 0, "timeout": 0, "no_price_data": 0, "not_found": 0, "other": 0}
+    n_active = n_stale = n_invalid = n_unknown = 0
+    committed = 0
+    chunks = list(_chunked(symbols, _VALIDATE_CHUNK))
+    start_time = time.time()
+    
+    # Get initial DB counts
+    from global_ticker_library.registry import counts
+    initial_counts = counts()
+
+    try:
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk_start = time.time()
+            
+            # Validate chunk
+            results, agg = validate_symbols(chunk, gentle=gentle, progress=False)
+            
+            # merge aggregates
+            for k, v in (agg or {}).items():
+                agg_total[k] = agg_total.get(k, 0) + int(v or 0)
+
+            # commit results immediately
+            a, s, i, u, additions, removals = upsert_validation_results(results)
+            n_active += a
+            n_stale += s
+            n_invalid += i
+            n_unknown += u
+            committed += len(chunk)
+            
+            # Get current DB counts after commit
+            current_counts = counts()
+            
+            # Calculate progress and time estimates
+            percent = (committed / total) * 100
+            elapsed = time.time() - start_time
+            if committed > 0:
+                rate = committed / elapsed  # symbols per second
+                remaining = total - committed
+                est_remaining_secs = remaining / rate if rate > 0 else 0
+                est_remaining_mins = int(est_remaining_secs / 60)
+            else:
+                est_remaining_mins = 0
+
+            # Write comprehensive progress
+            if write_progress:
+                write_progress({
+                    "status": "running",
+                    "phase": "validation",
+                    # Overall progress
+                    "overall_total": total,
+                    "overall_done": committed,
+                    "current_chunk": idx,
+                    "total_chunks": len(chunks),
+                    # Cumulative validation results
+                    "cumulative_active": n_active,
+                    "cumulative_stale": n_stale,
+                    "cumulative_invalid": n_invalid,
+                    "cumulative_unknown": n_unknown,
+                    # Current DB state
+                    "db_candidates": current_counts.get('candidate', 0),
+                    "db_active": current_counts.get('active', 0),
+                    "db_stale": current_counts.get('stale', 0),
+                    "db_invalid": current_counts.get('invalid', 0),
+                    "db_unknown": current_counts.get('unknown', 0),
+                    # Progress metrics
+                    "percent_complete": round(percent, 1),
+                    "estimated_time_remaining": f"{est_remaining_mins} minutes" if est_remaining_mins > 0 else "calculating...",
+                    # Clear message
+                    "message": f"Chunk {idx}/{len(chunks)}: Validated {committed:,}/{total:,} symbols ({percent:.1f}%)",
+                    # Error tracking
+                    "rate_limits": agg_total.get("rate_limit", 0),
+                    "timeouts": agg_total.get("timeout", 0),
+                    "no_price_data": agg_total.get("no_price_data", 0),
+                    "other_errors": agg_total.get("other", 0),
+                })
+            
+            # Better console output
+            chunk_time = time.time() - chunk_start
+            print(f"  Chunk {idx}/{len(chunks)} complete ({chunk_time:.1f}s): "
+                  f"{committed:,}/{total:,} symbols ({percent:.1f}%) | "
+                  f"This chunk: {a} active, {s} stale, {i} invalid, {u} unknown | "
+                  f"DB now has {current_counts.get('unknown', 0):,} unknown", 
+                  flush=True)
+
+        # success summary
+        print("\n" + "="*60, flush=True)
+        print("Validation Results:", flush=True)
+        print(f"  Active:  {n_active}", flush=True)
+        print(f"  Stale:   {n_stale}", flush=True)
+        print(f"  Invalid: {n_invalid}", flush=True)
+        if n_unknown:
+            print(f"  Unknown: {n_unknown}", flush=True)
+        print("="*60, flush=True)
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Stopping after last committed chunk.", flush=True)
+        # fall through to finally; progress will say 'complete' with partial results
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        if write_progress:
+            write_progress({"status": "error", "message": str(e)[:200]})
+        raise
+
+    finally:
+        # Always mark completion/cancel so UI never shows 'running' forever
+        if write_progress:
+            final_counts = counts()
+            write_progress({
+                "status": "complete",
+                "phase": "done",
+                "overall_total": total,
+                "overall_done": committed,
+                "cumulative_active": n_active,
+                "cumulative_stale": n_stale,
+                "cumulative_invalid": n_invalid,
+                "cumulative_unknown": n_unknown,
+                "db_candidates": final_counts.get('candidate', 0),
+                "db_active": final_counts.get('active', 0),
+                "db_stale": final_counts.get('stale', 0),
+                "db_invalid": final_counts.get('invalid', 0),
+                "db_unknown": final_counts.get('unknown', 0),
+                "rate_limits": agg_total.get("rate_limit", 0),
+                "timeouts": agg_total.get("timeout", 0),
+                "message": f"Validation complete: {n_active} active, {n_stale} stale, {n_invalid} invalid, {n_unknown} unknown",
+            })
+        
+        # Export active symbols
+        n_exported = export_active()
+        print(f"\nExported {n_exported} active symbols to {MASTER_FILE.name}", flush=True)
 
 def validate_and_commit(symbols: List[str]) -> None:
     """Validate symbols and update registry with robust summary."""
@@ -222,9 +376,9 @@ def cmd_full(force_revalidate: bool = False, only_status: List[str] = None):
         to_validate = get_symbols_to_validate(force=force_revalidate, only_status=only_status_set)
         tqdm.write(f"\nSymbols requiring validation: {len(to_validate)}")
         
-        # Validate
+        # Validate using chunked approach
         if to_validate:
-            validate_and_commit(to_validate)
+            validate_and_commit_chunked(to_validate, gentle=False)
         
         # Export active list
         n = export_active()
@@ -237,18 +391,25 @@ def cmd_full(force_revalidate: bool = False, only_status: List[str] = None):
         traceback.print_exc()
     
     finally:
-        tqdm.write(f"{'='*60}\n")
+        print("="*60)
         
-        # Always show summary
+        # Always show final summary
         c = counts()
-        print("\nRegistry Summary:")
-        print(f"  Active: {c['active']}")
-        print(f"  Stale: {c['stale']}")
-        print(f"  Invalid: {c['invalid']}")
-        print(f"  Candidates: {c['candidate']}")
+        print("\nFINAL REGISTRY STATUS:")
+        print(f"  Active:     {c['active']:,}")
+        print(f"  Stale:      {c['stale']:,}")
+        print(f"  Invalid:    {c['invalid']:,}")
         if c.get('unknown', 0) > 0:
-            print(f"  Unknown: {c['unknown']}")
-        print(f"  Total: {c['total']}")
+            print(f"  Unknown:    {c['unknown']:,}")
+        print(f"  Candidates: {c['candidate']:,}")
+        print(f"  Total:      {c['total']:,}")
+        
+        # Show master file status
+        if MASTER_FILE.exists():
+            master_count = len(MASTER_FILE.read_text().split(','))
+            print(f"\n✓ Master file contains {master_count:,} active symbols")
+        
+        print("="*60)
         
         # Clear progress after delay so Dashboard can see final status
         import time
@@ -302,22 +463,53 @@ def cmd_validate_manual():
     
     init_db()
     
-    manual = load_manual()
-    if not manual:
-        tqdm.write("\nNo symbols found in manual_input.txt")
+    # Get initial counts for comparison
+    before_counts = counts()
+    
+    # Get all candidates that need validation
+    to_validate = get_symbols_to_validate()
+    
+    if not to_validate:
+        print("\nNo symbols need validation")
+        print("\nCurrent Registry Status:")
+        print(f"  Active:     {before_counts['active']:,}")
+        print(f"  Stale:      {before_counts['stale']:,}")
+        print(f"  Invalid:    {before_counts['invalid']:,}")
+        print(f"  Unknown:    {before_counts.get('unknown', 0):,}")
+        print(f"  Candidates: {before_counts['candidate']:,}")
+        print(f"  Total:      {before_counts['total']:,}")
         return
     
-    tqdm.write(f"\nFound {len(manual)} symbols in manual input")
+    print(f"\nFound {len(to_validate):,} symbols to validate")
     
-    # Add as candidates
-    upsert_candidates(manual, "MANUAL:CLI")
+    # Use chunked validation (it will print progress)
+    validate_and_commit_chunked(to_validate, gentle=True)
     
-    # Validate
-    validate_and_commit(manual)
+    # Get final counts for summary
+    after_counts = counts()
     
-    # Export
+    # Calculate changes
+    active_change = after_counts['active'] - before_counts['active']
+    stale_change = after_counts['stale'] - before_counts['stale']
+    invalid_change = after_counts['invalid'] - before_counts['invalid']
+    unknown_change = after_counts.get('unknown', 0) - before_counts.get('unknown', 0)
+    candidate_change = after_counts['candidate'] - before_counts['candidate']
+    
+    # Show changes summary
+    print("\n" + "="*60)
+    print("VALIDATION SUMMARY - Database Changes:")
+    print("="*60)
+    print(f"  Active:     {before_counts['active']:,} → {after_counts['active']:,} ({active_change:+,})")
+    print(f"  Stale:      {before_counts['stale']:,} → {after_counts['stale']:,} ({stale_change:+,})")
+    print(f"  Invalid:    {before_counts['invalid']:,} → {after_counts['invalid']:,} ({invalid_change:+,})")
+    print(f"  Unknown:    {before_counts.get('unknown', 0):,} → {after_counts.get('unknown', 0):,} ({unknown_change:+,})")
+    print(f"  Candidates: {before_counts['candidate']:,} → {after_counts['candidate']:,} ({candidate_change:+,})")
+    print(f"  Total:      {before_counts['total']:,} → {after_counts['total']:,}")
+    
+    # Export active symbols
     n = export_active()
-    tqdm.write(f"\nExported {n} ACTIVE symbols to {MASTER_FILE.name}")
+    print(f"\n✓ Exported {n:,} ACTIVE symbols to {MASTER_FILE.name}")
+    print("="*60)
 
 def cmd_stats():
     """Show current statistics"""
@@ -330,6 +522,7 @@ def cmd_stats():
     print(f"\nActive symbols: {c['active']:,}")
     print(f"Stale symbols: {c['stale']:,}")
     print(f"Invalid symbols: {c['invalid']:,}")
+    print(f"Unknown symbols: {c.get('unknown', 0):,}")
     print(f"Pending candidates: {c['candidate']:,}")
     print(f"Total in registry: {c['total']:,}")
     

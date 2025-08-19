@@ -5,22 +5,40 @@ This library contains all documentation for the SPY Project trading analysis pla
 ## Structure
 
 ### Core Applications
-- **[spymaster/](spymaster/)** - Main trading analysis dashboard documentation
-- **[impactsearch/](impactsearch/)** - Impact search analysis tool documentation  
-- **[onepass/](onepass/)** - Single-pass analysis module documentation
+
+#### **[spymaster/](spymaster/)** - Main Trading Dashboard
+- `bugs/` - Bug fixes and issue resolutions
+- `performance/` - Performance optimizations
+- `refactoring/` - Code cleanup and refactoring
+
+#### **[impactsearch/](impactsearch/)** - Impact Analysis Tool
+- Statistical relationship analysis between tickers
+
+#### **[onepass/](onepass/)** - Single-Pass Analysis
+- Rapid ticker analysis and signal generation
+
+#### **[global_ticker_library/](global_ticker_library/)** - Ticker Database System
+- `analysis/` - System analysis and investigations
+- `cleanup/` - Database cleanup operations  
+- `features/` - New features and enhancements
+
+### Cross-Script Documentation
+- **[shared/](shared/)** - Issues affecting multiple scripts
+  - `symbols/` - Symbol and ticker handling
+  - `testing/` - Testing issues and investigations
 
 ### QuantConnect Algorithms
 - **[qc/](qc/)** - QuantConnect algorithm documentation
   - [Clone of Project 9](qc/Clone%20of%20Project%209/) - SMA optimization strategy
 
-### Shared Documentation
-- **[shared/](shared/)** - Cross-application documentation and architecture notes
+## Recent Major Work (August 2025)
 
-## Quick Links
+### Ticker Resolution Fix
+- [International Symbol Fix](shared/symbols/2025-08-19_TICKER_RESOLUTION_FIX_INTERNATIONAL_SYMBOLS.md) - Fixed dot/dash handling for international tickers
 
-### Recent Updates
-- [Adaptive Interval System](spymaster/adaptive_interval/ADAPTIVE_INTERVAL_REPORT.md)
-- [Adaptive Fixes Summary](spymaster/adaptive_interval/ADAPTIVE_FIXES_SUMMARY.md)
+### Global Ticker Library Cleanup
+- [Root Cause Analysis](global_ticker_library/analysis/2025-08-18_ROOT_CAUSE_ANALYSIS_11752_STUCK_SYMBOLS.md) - Why 11,752 symbols were stuck
+- [Final Cleanup](global_ticker_library/cleanup/2025-08-18_FINAL_CLEANUP_ZERO_UNKNOWN_SYMBOLS_ACHIEVED.md) - Achieved 0 unknown symbols
 
 ### Key Topics
 - Performance optimization strategies

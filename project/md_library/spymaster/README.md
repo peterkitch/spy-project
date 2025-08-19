@@ -4,15 +4,16 @@ Main trading analysis dashboard documentation.
 
 ## Categories
 
-### [adaptive_interval/](adaptive_interval/)
-- [ADAPTIVE_FIXES_SUMMARY.md](adaptive_interval/ADAPTIVE_FIXES_SUMMARY.md) - Summary of all adaptive interval fixes
-- [ADAPTIVE_INTERVAL_REPORT.md](adaptive_interval/ADAPTIVE_INTERVAL_REPORT.md) - Comprehensive test report
+### [bugs/](bugs/)
+- **2025-01-14_ADAPTIVE_INTERVAL_FIXES_6_ISSUES.md** - Fixed 6 issues with adaptive interval system
+- **2025-01-15_LOGGER_MODULE_FIX_DETAILS.md** - Logger module configuration fixes
+- **2025-01-15_LOGGING_AND_FETCH_FIXES.md** - Logging and data fetching improvements
 
 ### [performance/](performance/)
-Performance optimization notes and strategies.
+- **2025-01-14_ADAPTIVE_INTERVAL_PERFORMANCE_6X_FASTER.md** - 6x performance improvement via adaptive intervals
 
-### [bugs/](bugs/)
-Bug reports and fixes.
+### [refactoring/](refactoring/)
+- **2025-01-15_CODE_CLEANUP_667_LINES_REMOVED.md** - Major code cleanup removing 667 lines
 
 ## Key Features
 
