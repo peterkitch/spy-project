@@ -31,9 +31,27 @@ SCRAPED_ACTIVE_FILE = None  # No longer needed
 BATCH_SIZE = 200           # Yahoo quote batch size (optimal for API)
 REQUEST_TIMEOUT = 12       # seconds
 INTER_BATCH_SLEEP = 0.25   # seconds between quote batches (0.2-0.3 range)
-STALE_DAYS = 30            # consider stale if no market time within N days
+STALE_DAYS = 30            # consider stale if no market time within N days (default/fallback)
 REMOVAL_CONFIRMATIONS = 2  # stale strikes required before invalidation
-CACHE_TTL_HOURS = 24       # Don't re-validate ACTIVE symbols within this period
+CACHE_TTL_HOURS = 720      # Don't re-validate ACTIVE symbols within this period (30 days)
+
+# Type-aware freshness windows (in days) - used to determine if a ticker is stale
+STALE_DAYS_BY_TYPE = {
+    "CRYPTOCURRENCY": 2,     # Very active markets, expect frequent updates
+    "CURRENCY": 3,           # Forex markets active weekdays
+    "EQUITY": 7,             # Stocks - OK with weekends/holidays
+    "ETF": 10,               # Exchange-traded funds
+    "MUTUALFUND": 45,        # Monthly updates are typical
+    "INDEX": 30,             # Market indices update less frequently
+    "FUTURE": 5,             # Time-sensitive contracts
+    "OPTION": 2,             # Very time-sensitive, expire quickly
+    "BOND": 30,              # Less frequent updates
+    # Add more as needed
+}
+
+# Quote API configuration
+QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+QUOTE_BATCH_SIZE = 175     # Safe batch size for quote endpoint
 
 # Retry windows (as per external help recommendations)
 UNKNOWN_RETRY_MINUTES = 60      # Retry unknown status after 60 minutes
@@ -52,11 +70,23 @@ DEFAULT_UA = (
     "contact=provendelusion@gmail.com"
 )
 
-# International support
-VALID_SUFFIXES = {
-    '.L', '.TO', '.V', '.AX', '.HK', '.NS', '.BO', '.PA', '.AS', 
-    '.DE', '.SW', '.MI', '.SA', '.KS', '.KQ', '.SS', '.SZ', '.NZ'
-}
+
+# International support - comprehensive exchange suffix list
+VALID_SUFFIXES = [
+    # North America
+    ".TO", ".V", ".CN", ".NE", ".MX", 
+    # South America
+    ".SA", ".BA",
+    # UK & Europe
+    ".L", ".PA", ".AS", ".BR", ".MC", ".LS", ".MI", ".SW",
+    ".DE", ".F", ".BE", ".DU", ".HM", ".HA", ".MU", ".SG",  # German floors
+    ".ST", ".CO", ".OL", ".HE", ".IC", ".VI", ".AT",
+    # APAC
+    ".HK", ".T", ".KS", ".KQ", ".TW", ".TWO", ".SZ", ".SS",
+    ".SI", ".JK", ".KL", ".BK", ".NZ", ".AX", ".NS", ".BO", ".PS",
+    # MENA / Africa
+    ".TA", ".JO", ".SR", ".IS", ".CA",
+]
 
 # Special namespaces
 SPECIAL_PREFIXES = {'^', '='}  # Indices and futures/FX

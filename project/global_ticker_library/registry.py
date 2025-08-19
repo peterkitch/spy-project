@@ -95,13 +95,35 @@ def init_db(db_path: Path = DB_PATH) -> None:
             con.execute("ALTER TABLE tickers ADD COLUMN canonical TEXT")
         if 'original' not in columns:
             con.execute("ALTER TABLE tickers ADD COLUMN original TEXT")
+        if 'activated_utc' not in columns:
+            con.execute("ALTER TABLE tickers ADD COLUMN activated_utc TEXT")
+        if 'invalidated_utc' not in columns:
+            con.execute("ALTER TABLE tickers ADD COLUMN invalidated_utc TEXT")
+        
+        # Backfill activation/invalidation timestamps for existing data (idempotent)
+        con.execute("""
+            UPDATE tickers
+               SET activated_utc = COALESCE(activated_utc, last_verified_utc, first_seen_utc)
+             WHERE status='active' AND activated_utc IS NULL
+        """)
+        con.execute("""
+            UPDATE tickers
+               SET invalidated_utc = COALESCE(invalidated_utc, last_verified_utc, first_seen_utc)
+             WHERE status='invalid' AND invalidated_utc IS NULL
+        """)
+        
+        # Add indexes for the new columns if they don't exist
+        cur.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_activated_utc'")
+        if not cur.fetchone():
+            con.execute("CREATE INDEX idx_activated_utc ON tickers(activated_utc)")
+        cur.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_invalidated_utc'")
+        if not cur.fetchone():
+            con.execute("CREATE INDEX idx_invalidated_utc ON tickers(invalidated_utc)")
+        
         con.commit()
 
 def upsert_candidates(symbols: Iterable[str], source_tag: str, db_path: Path = DB_PATH) -> int:
     """Insert symbols as candidates if missing; keep existing status unchanged"""
-    # Import canonicalize locally to avoid circular import
-    from global_ticker_library.validator_yahoo import canonicalize
-    
     payload = _source_blob(source_tag)
     now = _now_iso()
     inserted = 0
@@ -112,13 +134,11 @@ def upsert_candidates(symbols: Iterable[str], source_tag: str, db_path: Path = D
             if not orig:
                 continue
             
-            # Canonicalize the symbol
-            s = canonicalize(orig)
-            if not s:
-                continue
+            # Use the symbol as-is (no canonicalization)
+            s = orig
             
             try:
-                # Store both original and canonical forms
+                # Store both original and canonical forms (now identical)
                 cur.execute(
                     """INSERT OR IGNORE INTO tickers(symbol, first_seen_utc, source_json, original, canonical)
                        VALUES(?,?,?,?,?)""",
@@ -272,11 +292,13 @@ def upsert_validation_results(
             curr = r.get("currency")
             lmt = r.get("regularMarketTime_iso")
             
-            # Get current status and retry count - lookup by ORIGINAL symbol
-            cur.execute("SELECT status, retry_count FROM tickers WHERE symbol=?", (original,))
+            # Get current status, retry count, and activation timestamps - lookup by ORIGINAL symbol
+            cur.execute("SELECT status, retry_count, activated_utc, invalidated_utc FROM tickers WHERE symbol=?", (original,))
             row = cur.fetchone()
             old_status = row[0] if row else None
             retry_count = row[1] if row else 0
+            old_activated = row[2] if row else None
+            old_invalidated = row[3] if row else None
             
             # Ensure row exists - use ORIGINAL as the primary key
             cur.execute(
@@ -289,16 +311,24 @@ def upsert_validation_results(
             is_active = bool(r.get("active"))
             
             if status == "unknown" or error_code in ("rate_limit", "timeout"):
-                # Transient error - mark as unknown for retry
+                # Transient error - but preserve active status!
                 retry_count += 1
                 cur.execute(
                     """UPDATE tickers
-                       SET status='unknown', retry_count=?, last_error_code=?, 
-                           last_error_msg=?, last_verified_utc=?
+                       SET status = CASE 
+                                      WHEN status = 'active' THEN 'active'  -- Preserve active status
+                                      ELSE 'unknown'                         -- Others become unknown
+                                    END,
+                           retry_count=?, 
+                           last_error_code=?, 
+                           last_error_msg=?, 
+                           last_verified_utc=?
                        WHERE symbol=?""",
                     (retry_count, error_code, error_msg, now, original)
                 )
-                n_unknown += 1
+                # Only count as unknown if it wasn't already active
+                if old_status != 'active':
+                    n_unknown += 1
                 
             elif status == "active" or (meta_exists and has_price and is_active):
                 # ACTIVE only when either validator says so, or both flags are true AND active=True
@@ -306,9 +336,10 @@ def upsert_validation_results(
                     """UPDATE tickers
                        SET status='active', quote_type=?, exchange=?, currency=?,
                            last_verified_utc=?, last_market_time_utc=?, stale_strikes=0,
-                           retry_count=0, last_error_code=NULL, last_error_msg=NULL, canonical=?
+                           retry_count=0, last_error_code=NULL, last_error_msg=NULL, canonical=?,
+                           activated_utc = COALESCE(activated_utc, ?)
                        WHERE symbol=?""",
-                    (qtype, exch, curr, now, lmt, sym, original)
+                    (qtype, exch, curr, now, lmt, sym, now, original)
                 )
                 n_active += 1
                 if old_status != 'active':
@@ -334,29 +365,52 @@ def upsert_validation_results(
                     removals.append(sym)
                     
             elif not meta_exists and retry_count >= 2:
-                # No metadata after retries - mark as invalid
-                cur.execute(
-                    """UPDATE tickers
-                       SET status='invalid', last_verified_utc=?, 
-                           last_error_code=?, last_error_msg=?
-                       WHERE symbol=?""",
-                    (now, error_code or "not_found", error_msg, original)
-                )
-                n_invalid += 1
-                if old_status == 'active':
-                    removals.append(sym)
+                # No metadata after retries - but be extra careful with active symbols
+                # Active symbols need more failures before invalidation (protect against temporary delistings)
+                required_retries = 4 if old_status == 'active' else 2
+                
+                if retry_count >= required_retries:
+                    cur.execute(
+                        """UPDATE tickers
+                           SET status='invalid', last_verified_utc=?, 
+                               last_error_code=?, last_error_msg=?,
+                               invalidated_utc = COALESCE(invalidated_utc, ?)
+                           WHERE symbol=?""",
+                        (now, error_code or "not_found", error_msg, now, original)
+                    )
+                    n_invalid += 1
+                    if old_status == 'active':
+                        removals.append(sym)
+                else:
+                    # Not enough retries yet - keep as unknown
+                    cur.execute(
+                        """UPDATE tickers
+                           SET status='unknown', retry_count=?, last_error_code=?, 
+                               last_error_msg=?, last_verified_utc=?
+                           WHERE symbol=?""",
+                        (retry_count + 1, error_code, error_msg, now, original)
+                    )
+                    n_unknown += 1
                     
             else:
-                # Ambiguous - mark as unknown for retry
+                # Ambiguous - preserve active status here too
                 retry_count += 1
                 cur.execute(
                     """UPDATE tickers
-                       SET status='unknown', retry_count=?, last_error_code=?, 
-                           last_error_msg=?, last_verified_utc=?
+                       SET status = CASE 
+                                      WHEN status = 'active' THEN 'active'  -- Preserve active
+                                      ELSE 'unknown'                         -- Others unknown
+                                    END,
+                           retry_count=?, 
+                           last_error_code=?, 
+                           last_error_msg=?, 
+                           last_verified_utc=?
                        WHERE symbol=?""",
                     (retry_count, error_code, error_msg, now, original)
                 )
-                n_unknown += 1
+                # Only count as unknown if not active
+                if old_status != 'active':
+                    n_unknown += 1
         
         con.commit()
     
@@ -370,6 +424,7 @@ def cleanup_stale(db_path: Path = DB_PATH, dry_run: bool = False) -> Tuple[int, 
     """
     invalidated: List[str] = []
     affected = 0
+    now = _now_iso()
 
     with sqlite3.connect(db_path) as con, closing(con.cursor()) as cur:
         # Compute candidates
@@ -381,9 +436,12 @@ def cleanup_stale(db_path: Path = DB_PATH, dry_run: bool = False) -> Tuple[int, 
 
         if not dry_run and invalidated:
             cur.execute(
-                "UPDATE tickers SET status='invalid' "
-                "WHERE status='stale' AND stale_strikes >= ?",
-                (REMOVAL_CONFIRMATIONS,),
+                """UPDATE tickers 
+                   SET status='invalid',
+                       invalidated_utc = COALESCE(invalidated_utc, ?),
+                       last_verified_utc = COALESCE(last_verified_utc, ?)
+                   WHERE status='stale' AND stale_strikes >= ?""",
+                (now, now, REMOVAL_CONFIRMATIONS,),
             )
             affected = cur.rowcount or 0
             con.commit()
@@ -443,25 +501,25 @@ def counts(db_path: Path = DB_PATH) -> Dict[str, int]:
     return out
 
 def get_recent_changes(limit: int = 100, db_path: Path = DB_PATH) -> Dict[str, List[str]]:
-    """Get recently added and removed symbols"""
+    """Get recently added and removed symbols - tracks first-time transitions only"""
     out = {"additions": [], "removals": []}
     
     with sqlite3.connect(db_path) as con, closing(con.cursor()) as cur:
-        # Recent additions (became active)
+        # First-time promotions to ACTIVE
         cur.execute(
             """SELECT symbol FROM tickers 
-               WHERE status='active' 
-               ORDER BY last_verified_utc DESC 
+               WHERE activated_utc IS NOT NULL
+               ORDER BY activated_utc DESC 
                LIMIT ?""",
             (limit,)
         )
         out["additions"] = [r[0] for r in cur.fetchall()]
         
-        # Recent removals (became invalid)
+        # First-time transitions to INVALID
         cur.execute(
             """SELECT symbol FROM tickers 
-               WHERE status='invalid' 
-               ORDER BY last_verified_utc DESC 
+               WHERE invalidated_utc IS NOT NULL
+               ORDER BY invalidated_utc DESC 
                LIMIT ?""",
             (limit,)
         )
@@ -508,3 +566,9 @@ def clear_progress() -> None:
     except Exception:
         # Silently fail - progress tracking is optional
         pass
+
+def get_all_symbols(db_path: Path = DB_PATH) -> Set[str]:
+    """Return all known symbols in the registry (any status)."""
+    with sqlite3.connect(db_path) as con, closing(con.cursor()) as cur:
+        cur.execute("SELECT symbol FROM tickers")
+        return {row[0] for row in cur.fetchall()}

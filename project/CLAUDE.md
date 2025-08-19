@@ -6,6 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a quantitative trading analysis web application built with Python and Dash. It implements an adaptive simple moving average (SMA) pair optimization system for systematic trading analysis and mean reversion strategies.
 
+## Important Principles
+
+### Symbol Validity
+- **There is no such thing as a "junk symbol" if it has a 'max' period that we can download**
+- Any symbol that returns data from Yahoo Finance is valid and valuable
+- Symbols ending in MM (money market), X (mutual funds), or with dots are legitimate
+- Do not dismiss symbols as "obscure" or "junk" based on their format
+- The system should give all symbols equal opportunity for validation
+
+## Development Environment
+
+**Operating System**: Windows (platform: win32)
+**Shell**: Windows Command Prompt (CMD)
+**Python Environment**: Conda (spyproject2)
+
+### Important Windows CMD Notes:
+- Environment variables: Use `set VAR=value && command` syntax
+- File paths: Use backslashes or raw strings
+- Console encoding: cp1252 (avoid Unicode characters in output)
+- Working directory: C:\Users\sport\Documents\PythonProjects\spy-project\project
+
 ## Development Commands
 
 ### Environment Setup
@@ -25,6 +46,10 @@ python impactsearch.py
 
 # Single-pass analysis
 python onepass.py
+
+# Global Ticker Library validation
+cd global_ticker_library
+python run.py --validate-manual
 ```
 
 ### Building Executable

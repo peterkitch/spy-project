@@ -297,17 +297,85 @@ def create_cli_progress():
             
             if status == "running":
                 phase = p.get("phase", "")
-                done = p.get("done", 0)
-                total = p.get("total", 0)
-                message = p.get("message", "CLI run in progress...")
                 
-                if total > 0:
-                    progress_pct = int((done / total) * 100)
-                    progress_msg = f"{message} ({done}/{total} - {progress_pct}%)"
+                # Check for new format
+                if "overall_total" in p:
+                    # New comprehensive format
+                    done = p.get("overall_done", 0)
+                    total = p.get("overall_total", 0)
+                    message = p.get("message", "CLI run in progress...")
+                    progress_pct = p.get("percent_complete", 0)
+                    est_time = p.get("estimated_time_remaining", "")
+                    
+                    # Add time estimate to message if available
+                    if est_time and est_time != "calculating...":
+                        message = f"{message} - Est. {est_time} remaining"
                 else:
-                    progress_msg = message
+                    # Old format compatibility
+                    done = p.get("done", 0)
+                    total = p.get("total", 0)
+                    message = p.get("message", "CLI run in progress...")
+                    if total > 0:
+                        progress_pct = int((done / total) * 100)
+                    else:
+                        progress_pct = 0
                 
-                return dbc.Alert([
+                # Extract error metrics
+                rate_limits = p.get("rate_limits", 0)
+                timeouts = p.get("timeouts", 0)
+                no_price = p.get("no_price_data", 0)
+                other_errors = p.get("other_errors", 0)
+                
+                # For new format, use current_chunk/total_chunks
+                if "current_chunk" in p:
+                    batch_num = p.get("current_chunk", 0)
+                    total_batches = p.get("total_chunks", 0)
+                else:
+                    batch_num = p.get("batch_number", 0)
+                    total_batches = p.get("total_batches", 0)
+                
+                # Build comprehensive metrics display
+                metrics_parts = []
+                
+                # Show cumulative results if available (new format)
+                if "cumulative_active" in p:
+                    cum_parts = []
+                    cum_active = p.get("cumulative_active", 0)
+                    cum_stale = p.get("cumulative_stale", 0)
+                    cum_invalid = p.get("cumulative_invalid", 0)
+                    cum_unknown = p.get("cumulative_unknown", 0)
+                    
+                    if cum_active > 0: cum_parts.append(f"✅ {cum_active:,} active")
+                    if cum_stale > 0: cum_parts.append(f"⚠️ {cum_stale:,} stale")
+                    if cum_invalid > 0: cum_parts.append(f"❌ {cum_invalid:,} invalid")
+                    if cum_unknown > 0: cum_parts.append(f"❓ {cum_unknown:,} unknown")
+                    
+                    if cum_parts:
+                        metrics_parts.append("Found: " + ", ".join(cum_parts))
+                
+                # Show error counts
+                error_parts = []
+                if rate_limits > 0:
+                    error_parts.append(f"🚫 {rate_limits} rate limits")
+                if timeouts > 0:
+                    error_parts.append(f"⏱️ {timeouts} timeouts")
+                if no_price > 0:
+                    error_parts.append(f"📉 {no_price} no price")
+                if other_errors > 0:
+                    error_parts.append(f"❌ {other_errors} errors")
+                
+                if error_parts:
+                    metrics_parts.append("Issues: " + ", ".join(error_parts))
+                
+                # Show batch progress
+                if batch_num > 0 and total_batches > 0:
+                    metrics_parts.append(f"📦 Chunk {batch_num}/{total_batches}")
+                elif "current_chunk" in p and "total_chunks" in p:
+                    metrics_parts.append(f"📦 Chunk {p['current_chunk']}/{p['total_chunks']}")
+                
+                metrics_display = " | ".join(metrics_parts) if metrics_parts else ""
+                
+                alert_content = [
                     html.Div([
                         html.Span("🔄 ", style={"fontSize": "1.2em"}),
                         html.B("CLI Running: "),
@@ -315,14 +383,34 @@ def create_cli_progress():
                     ]),
                     dbc.Progress(value=progress_pct if total > 0 else 50, 
                                animated=True, striped=True, className="mt-2")
-                ], color="info", dismissable=False)
+                ]
+                
+                if metrics_display:
+                    alert_content.append(html.Div(metrics_display, className="mt-2", 
+                                                 style={"fontSize": "0.9em", "color": "#666"}))
+                
+                return dbc.Alert(alert_content, color="info", dismissable=False)
                 
             elif status == "complete":
-                active = p.get("active", 0)
-                stale = p.get("stale", 0)
-                invalid = p.get("invalid", 0)
-                unknown = p.get("unknown", 0)
+                # Use cumulative results if available (new format)
+                if "cumulative_active" in p:
+                    active = p.get("cumulative_active", 0)
+                    stale = p.get("cumulative_stale", 0)
+                    invalid = p.get("cumulative_invalid", 0)
+                    unknown = p.get("cumulative_unknown", 0)
+                else:
+                    # Fall back to old format
+                    active = p.get("active", 0)
+                    stale = p.get("stale", 0)
+                    invalid = p.get("invalid", 0)
+                    unknown = p.get("unknown", 0)
+                    
                 message = p.get("message", "Validation complete")
+                
+                # Add database status if available
+                status_parts = []
+                if "db_active" in p:
+                    status_parts.append(f"Database now has {p['db_active']:,} active, {p.get('db_unknown', 0):,} unknown")
                 
                 return dbc.Alert([
                     html.Div([
@@ -331,11 +419,12 @@ def create_cli_progress():
                         message
                     ]),
                     html.Div([
-                        dbc.Badge(f"Active: {active}", color="success", className="me-1"),
-                        dbc.Badge(f"Stale: {stale}", color="warning", className="me-1"),
-                        dbc.Badge(f"Invalid: {invalid}", color="danger", className="me-1"),
-                        dbc.Badge(f"Unknown: {unknown}", color="secondary", className="me-1"),
-                    ], className="mt-2")
+                        dbc.Badge(f"Processed: {active:,} active", color="success", className="me-1"),
+                        dbc.Badge(f"{stale:,} stale", color="warning", className="me-1"),
+                        dbc.Badge(f"{invalid:,} invalid", color="danger", className="me-1"),
+                        dbc.Badge(f"{unknown:,} unknown", color="secondary", className="me-1"),
+                    ], className="mt-2"),
+                    html.Div(status_parts[0], className="mt-2", style={"fontSize": "0.9em"}) if status_parts else None
                 ], color="success", dismissable=True)
                 
             elif status == "error":
@@ -353,7 +442,31 @@ def create_cli_progress():
 
 def create_stats_cards():
     """Create statistics display cards"""
-    c = counts()
+    import json
+    
+    # Try to read live counts from progress file first
+    try:
+        if PROGRESS_FILE.exists():
+            with open(PROGRESS_FILE) as f:
+                progress = json.load(f)
+                if progress.get("status") == "running" and "db_candidates" in progress:
+                    # Use live database counts from progress
+                    c = {
+                        'candidate': progress.get('db_candidates', 0),
+                        'active': progress.get('db_active', 0),
+                        'stale': progress.get('db_stale', 0),
+                        'invalid': progress.get('db_invalid', 0),
+                        'unknown': progress.get('db_unknown', 0),
+                    }
+                else:
+                    c = counts()
+        else:
+            c = counts()
+    except:
+        c = counts()
+    
+    if 'unknown' not in c:
+        c['unknown'] = 0
     
     return dbc.Row([
         dbc.Col([
@@ -363,7 +476,7 @@ def create_stats_cards():
                     html.P("Candidates", className="mb-0")
                 ])
             ])
-        ], width=3),
+        ], width=2),
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
@@ -371,7 +484,7 @@ def create_stats_cards():
                     html.P("Active Symbols", className="mb-0")
                 ])
             ])
-        ], width=3),
+        ], width=2),
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
@@ -379,7 +492,7 @@ def create_stats_cards():
                     html.P("Stale Symbols", className="mb-0")
                 ])
             ])
-        ], width=3),
+        ], width=2),
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
@@ -387,8 +500,16 @@ def create_stats_cards():
                     html.P("Invalid Symbols", className="mb-0")
                 ])
             ])
-        ], width=3),
-    ], className="mb-4")
+        ], width=2),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.H4(f"{c.get('unknown', 0):,}", className="text-secondary"),
+                    html.P("Unknown Symbols", className="mb-0")
+                ])
+            ])
+        ], width=2),
+    ], className="mb-4", justify="center")
 
 def create_manual_input_section():
     """Create manual input interface"""
@@ -414,30 +535,63 @@ def create_manual_input_section():
     ])
 
 def create_recent_changes_section():
-    """Create recent changes display"""
-    changes = get_recent_changes(limit=20)
+    """Create recent changes display with scrollable lists"""
+    # Fetch up to 1000 recent changes
+    changes = get_recent_changes(limit=1000)
     
-    additions_items = [html.Li(sym) for sym in changes.get("additions", [])[:10]]
-    removals_items = [html.Li(sym) for sym in changes.get("removals", [])[:10]]
+    # Get the full lists (up to 1000 each)
+    additions = changes.get("additions", [])
+    removals = changes.get("removals", [])
+    
+    # Create list items for all symbols
+    additions_items = [html.Li(sym, style={"fontSize": "0.9em"}) for sym in additions]
+    removals_items = [html.Li(sym, style={"fontSize": "0.9em"}) for sym in removals]
     
     return dbc.Row([
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader(html.H6("Recent Additions")),
+                dbc.CardHeader([
+                    html.H6("Recent Additions"),
+                    html.Small(f" ({len(additions)} symbols)", className="text-muted")
+                ]),
                 dbc.CardBody([
                     html.Div([
-                        html.Ul(additions_items if additions_items else [html.Li("None")])
-                    ], style={"height": "250px", "overflowY": "auto"})
+                        html.Ul(
+                            additions_items if additions_items else [html.Li("None")],
+                            style={"paddingLeft": "20px", "marginBottom": "0"}
+                        )
+                    ], style={
+                        "height": "250px", 
+                        "overflowY": "auto",  # Changed from "hidden" to "auto" for scrollbar
+                        "overflowX": "hidden",
+                        "border": "1px solid #dee2e6",
+                        "borderRadius": "4px",
+                        "padding": "10px",
+                        "backgroundColor": "#f8f9fa"
+                    })
                 ])
             ])
         ], width=6),
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader(html.H6("Recent Removals")),
+                dbc.CardHeader([
+                    html.H6("Recent Removals"),
+                    html.Small(f" ({len(removals)} symbols)", className="text-muted")
+                ]),
                 dbc.CardBody([
                     html.Div([
-                        html.Ul(removals_items if removals_items else [html.Li("None")])
-                    ], style={"height": "250px", "overflowY": "auto"})
+                        html.Ul(
+                            removals_items if removals_items else [html.Li("None")],
+                            style={"paddingLeft": "20px", "marginBottom": "0"}
+                        )
+                    ], style={
+                        "height": "250px",
+                        "overflowY": "auto",  # Changed from "hidden" to "auto" for scrollbar
+                        "overflowX": "hidden",
+                        "border": "1px solid #dee2e6",
+                        "borderRadius": "4px",
+                        "padding": "10px"
+                    })
                 ])
             ])
         ], width=6),
@@ -451,6 +605,9 @@ app.layout = dbc.Container([
             html.Hr(),
         ])
     ]),
+    
+    # Global validation progress bar (shows when validation is running)
+    html.Div(id="global-progress-bar", children=[]),
     
     # CLI Progress (if running)
     html.Div(id="cli-progress", children=create_cli_progress()),
@@ -524,12 +681,52 @@ def handle_manual_input(validate_clicks, clear_clicks, text):
 @app.callback(
     [Output("cli-progress", "children"),
      Output("stats-cards", "children"),
-     Output("recent-changes", "children")],
+     Output("recent-changes", "children"),
+     Output("global-progress-bar", "children")],
     Input("refresh-interval", "n_intervals")
 )
 def refresh_display(n):
-    """Refresh CLI progress, statistics and recent changes"""
-    return create_cli_progress(), create_stats_cards(), create_recent_changes_section()
+    """Refresh CLI progress, statistics, recent changes, and progress bar"""
+    import json
+    
+    # Create progress bar if validation is running
+    progress_bar = []
+    try:
+        if PROGRESS_FILE.exists():
+            with open(PROGRESS_FILE) as f:
+                p = json.load(f)
+                if p.get("status") == "running":
+                    # Use new format if available
+                    if "percent_complete" in p:
+                        percent = p.get("percent_complete", 0)
+                        message = p.get("message", "Processing...")
+                        est_time = p.get("estimated_time_remaining", "")
+                    else:
+                        # Old format
+                        done = p.get("done", 0)
+                        total = p.get("total", 1)
+                        percent = (done / total * 100) if total > 0 else 0
+                        message = p.get("message", "Processing...")
+                        est_time = ""
+                    
+                    # Build progress label
+                    label = f"{percent:.1f}%"
+                    if est_time and est_time != "calculating...":
+                        label += f" - {est_time} remaining"
+                    
+                    progress_bar = dbc.Progress(
+                        value=percent,
+                        label=label,
+                        striped=True,
+                        animated=True,
+                        color="success" if percent >= 75 else "warning" if percent >= 50 else "info",
+                        style={"height": "30px", "fontSize": "14px"},
+                        className="mb-3"
+                    )
+    except:
+        pass
+    
+    return create_cli_progress(), create_stats_cards(), create_recent_changes_section(), progress_bar
 
 @app.callback(
     [Output("progress-bar", "value"),

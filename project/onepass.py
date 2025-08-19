@@ -14,7 +14,7 @@ import yfinance as yf
 from tqdm import tqdm
 
 # Import shared modules for parity with impactsearch
-from signal_library.shared_symbols import normalize_ticker, detect_ticker_type
+from signal_library.shared_symbols import normalize_ticker, detect_ticker_type, resolve_symbol
 from signal_library.shared_integrity import (
     compute_stable_fingerprint,
     compute_quantized_fingerprint,
@@ -537,39 +537,51 @@ def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs,
         logger.error(f"Error saving Signal Library for {ticker}: {e}")
         return False
 
+def _lib_path_for(ticker):
+    """Generate library path for a ticker."""
+    stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
+    filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
+    return os.path.join(stable_dir, filename)
+
 def load_signal_library(ticker):
     """
     Load existing Signal Library for a ticker from disk.
     Returns the signal data if found, None otherwise.
+    Tries both new (dot) and old (dash) naming conventions for backward compatibility.
     """
     try:
-        stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
-        filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
-        filepath = os.path.join(stable_dir, filename)
+        # Try both new naming (with dots) and old naming (with dashes)
+        candidates = [ticker]
+        if '.' in ticker:
+            candidates.append(ticker.replace('.', '-'))  # Old naming convention
         
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'rb') as f:
-                    signal_data = pickle.load(f)
-            except (pickle.UnpicklingError, EOFError) as e:
-                logger.error(f"Corrupt Signal Library for {ticker}: {e}")
-                # Rename corrupt file for debugging
-                corrupt_filepath = filepath + '.corrupt'
-                os.replace(filepath, corrupt_filepath)
-                logger.info(f"Renamed corrupt file to {corrupt_filepath}")
-                return None
+        for candidate in candidates:
+            filepath = _lib_path_for(candidate)
             
-            # Verify version compatibility
-            if signal_data.get('engine_version') == ENGINE_VERSION and \
-               signal_data.get('max_sma_day') == MAX_SMA_DAY:
-                logger.info(f"Signal Library loaded for {ticker} from {filepath}")
-                return signal_data
-            else:
-                logger.warning(f"Version mismatch for {ticker} Signal Library")
-                return None
-        else:
-            logger.debug(f"No Signal Library found for {ticker} at {filepath}")
-            return None
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'rb') as f:
+                        signal_data = pickle.load(f)
+                except (pickle.UnpicklingError, EOFError) as e:
+                    logger.error(f"Corrupt Signal Library for {ticker}: {e}")
+                    # Rename corrupt file for debugging
+                    corrupt_filepath = filepath + '.corrupt'
+                    os.replace(filepath, corrupt_filepath)
+                    logger.info(f"Renamed corrupt file to {corrupt_filepath}")
+                    continue  # Try next candidate
+                
+                # Verify version compatibility
+                if signal_data.get('engine_version') == ENGINE_VERSION and \
+                   signal_data.get('max_sma_day') == MAX_SMA_DAY:
+                    logger.info(f"Signal Library loaded for {ticker} from {filepath}")
+                    return signal_data
+                else:
+                    logger.warning(f"Version mismatch for {ticker} Signal Library")
+                    return None
+        
+        # No library found in any location
+        logger.debug(f"No Signal Library found for {ticker}")
+        return None
             
     except Exception as e:
         logger.error(f"Error loading Signal Library for {ticker}: {e}")
@@ -578,11 +590,13 @@ def load_signal_library(ticker):
 def check_signal_library_exists(ticker):
     """
     Check if Signal Library exists for a ticker.
+    Checks both new (dot) and old (dash) naming conventions.
     """
-    stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
-    filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
-    filepath = os.path.join(stable_dir, filename)
-    return os.path.exists(filepath)
+    candidates = [ticker]
+    if '.' in ticker:
+        candidates.append(ticker.replace('.', '-'))  # Old naming convention
+    
+    return any(os.path.exists(_lib_path_for(candidate)) for candidate in candidates)
 
 def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60, reference_now=None):
     """
@@ -662,7 +676,8 @@ def fetch_data_raw(ticker, max_retries=3):
     """
     if not ticker or not ticker.strip():
         return pd.DataFrame(), ticker
-    ticker = normalize_ticker(ticker)
+    # Don't normalize - just uppercase and trim to preserve dots/dashes for Yahoo
+    ticker = (ticker or "").strip().upper()
     for attempt in range(max_retries):
         try:
             logger.info(f"Fetching data for {ticker} (attempt {attempt+1}/{max_retries})...")
@@ -767,10 +782,11 @@ def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
     """
     if not ticker or not ticker.strip():
         return pd.DataFrame()
-    ticker = normalize_ticker(ticker)
+    # Use resolve_symbol to get correct vendor format
+    vendor_symbol, _ = resolve_symbol(ticker)
     
-    logger.info(f"Fetching data for {ticker} (price_source={price_source})...")
-    df_raw, resolved = fetch_data_raw(ticker)
+    logger.info(f"Fetching data for {vendor_symbol} (price_source={price_source})...")
+    df_raw, resolved = fetch_data_raw(vendor_symbol)
     if df_raw.empty:
         return pd.DataFrame()
     
@@ -975,15 +991,16 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
     
     metrics_list = []
     for ticker in tqdm(tickers_list, desc="Processing One-Pass Tickers", unit="ticker"):
-        ticker = normalize_ticker(ticker)
-        logger.info(f"Processing {ticker}...")
+        # Use resolver to get correct Yahoo symbol
+        vendor_symbol, _ = resolve_symbol(ticker)
+        logger.info(f"Processing {vendor_symbol}...")
         
         # Check if we can use existing signals or perform incremental update
         existing_signal_data = None
         price_source = 'Adj Close'  # Default
-        if check_signal_library_exists(ticker):
-            logger.info(f"Signal Library exists for {ticker}, checking for updates...")
-            existing_signal_data = load_signal_library(ticker)
+        if check_signal_library_exists(vendor_symbol):
+            logger.info(f"Signal Library exists for {vendor_symbol}, checking for updates...")
+            existing_signal_data = load_signal_library(vendor_symbol)
             # Honor the price_source from existing library
             if existing_signal_data and 'price_source' in existing_signal_data:
                 price_source = existing_signal_data['price_source']
@@ -995,26 +1012,26 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                 current_hash = compute_parity_hash(price_source, 'ticker')
                 if not lib_hash or lib_hash != current_hash:
                     logger.warning(
-                        f"Parity hash mismatch for {ticker} "
+                        f"Parity hash mismatch for {vendor_symbol} "
                         f"(lib={str(lib_hash)[:8] if lib_hash else 'None'} vs current={current_hash[:8]}). "
                         "Forcing rebuild."
                     )
                     existing_signal_data = None  # skip incremental/reuse path
             
         # Single-download path for current data (frozen clock + price_source)
-        df_raw, resolved = fetch_data_raw(ticker)
+        df_raw, resolved = fetch_data_raw(vendor_symbol)
         if df_raw.empty:
-            logger.warning(f"No data for ticker {ticker}, skipping.")
+            logger.warning(f"No data for ticker {vendor_symbol}, skipping.")
             continue
-        if resolved != ticker:
-            logger.info(f"One-pass resolved {ticker} -> {resolved}")
+        if resolved != vendor_symbol:
+            logger.info(f"One-pass resolved {vendor_symbol} -> {resolved}")
         
         # Coerce to requested price basis
         df = _coerce_to_close_frame(df_raw, preferred=price_source)
         # De-dup & sort to avoid rare vendor duplicate rows
         df = df[~df.index.duplicated(keep='last')].sort_index()
         if df.empty:
-            logger.warning(f"No {price_source} data for ticker {ticker}, skipping.")
+            logger.warning(f"No {price_source} data for ticker {vendor_symbol}, skipping.")
             continue
         
         # Apply session guard
@@ -1072,12 +1089,12 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                 # Try incremental update if data integrity is acceptable
                 updated_signal_data = None
                 if existing_signal_data:
-                    updated_signal_data = perform_incremental_update(ticker, existing_signal_data, df)
+                    updated_signal_data = perform_incremental_update(vendor_symbol, existing_signal_data, df)
                 
                 if updated_signal_data:
-                    logger.info(f"Incremental update successful for {ticker}")
+                    logger.info(f"Incremental update successful for {vendor_symbol}")
                     # Save the updated library
-                    save_signal_library(ticker, 
+                    save_signal_library(vendor_symbol, 
                                       updated_signal_data['daily_top_buy_pairs'],
                                       updated_signal_data['daily_top_short_pairs'],
                                       updated_signal_data['primary_signals'],
@@ -1095,7 +1112,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                     # Proceed to metrics calculation
                     metrics = calculate_metrics_from_signals(primary_signals, df.index, df)
                     if metrics:
-                        metrics['Primary Ticker'] = ticker
+                        metrics['Primary Ticker'] = vendor_symbol
                         metrics_list.append(metrics)
                     continue
                 else:
@@ -1195,12 +1212,12 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                 primary_dates = df.index  # Define primary_dates for metrics calculation
                 result = calculate_metrics_from_signals(primary_signals, primary_dates, df)
                 if result is not None:
-                    result['Primary Ticker'] = ticker
+                    result['Primary Ticker'] = vendor_symbol
                     metrics_list.append(result)
                 else:
-                    logger.info(f"No valid triggers for {ticker}, skipping metrics.")
+                    logger.info(f"No valid triggers for {vendor_symbol}, skipping metrics.")
                 
-                logger.info(f"Completed processing for {ticker} using Signal Library.")
+                logger.info(f"Completed processing for {vendor_symbol} using Signal Library.")
                 continue
         
         # If no existing signals or not using them, compute from scratch
@@ -1338,7 +1355,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
             'last_date_processed': str(df.index[-1].date()) if len(df) > 0 else None,
             'num_pairs': len(pairs)
         }
-        save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs, 
+        save_signal_library(vendor_symbol, daily_top_buy_pairs, daily_top_short_pairs, 
                               primary_signals, df, accumulator_state, price_source, resolved)
         
         # No need to derive signals again - already computed in streaming loop!
@@ -1354,12 +1371,12 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         primary_dates = df.index  # Define primary_dates
         result = calculate_metrics_from_signals(primary_signals, primary_dates, df)
         if result is not None:
-            result['Primary Ticker'] = ticker
+            result['Primary Ticker'] = vendor_symbol
             metrics_list.append(result)
         else:
-            logger.info(f"No valid triggers for {ticker}, skipping metrics.")
+            logger.info(f"No valid triggers for {vendor_symbol}, skipping metrics.")
 
-        logger.info(f"Completed processing for {ticker}.")
+        logger.info(f"Completed processing for {vendor_symbol}.")
 
     return metrics_list
 
