@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 # Import shared modules for parity with impactsearch
 from signal_library.shared_symbols import normalize_ticker, detect_ticker_type, resolve_symbol
+# T-1 policy: shared_market_hours no longer needed - we can fetch anytime
 from signal_library.shared_integrity import (
     compute_stable_fingerprint,
     compute_quantized_fingerprint,
@@ -84,10 +85,281 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 logger.propagate = False
 
+# === One-Pass Run Report ======================================================
+from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+import time, json, math
+
+RUN_REPORT = None  # module-global (used by helpers without import cycles)
+
+def _q(vals, p):
+    if not vals:
+        return 0.0
+    vals = sorted(vals)
+    k = (len(vals)-1) * (p/100.0)
+    f = math.floor(k)
+    c = min(f+1, len(vals)-1)
+    if f == c:
+        return float(vals[int(k)])
+    return float(vals[f] * (c-k) + vals[c] * (k-f))
+
+def _fmt(n): return f"{n:,}"
+def _pct(n, d): return ("0.00%" if not d else f"{(n*100.0/d):.2f}%")
+def _now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+@dataclass
+class TickerOutcome:
+    ticker: str
+    resolved: str = ""
+    acceptance: str = "UNKNOWN"
+    suggested_action: str = "UNKNOWN"
+    executed_action: str = "UNKNOWN"
+    bars_before: int = 0
+    bars_after: int = 0
+    bars_added: int = 0
+    persist_skip_bars: int = 0
+    persist_dropped_bars: int = 0
+    new_rows_scaled: int = 0
+    scale_factor: float | None = None
+    partial_session: bool = False
+    had_library: bool = False
+    error: str | None = None
+    t0: float = field(default_factory=time.perf_counter)
+    dt: float = 0.0
+
+class OnepassRunReport:
+    def __init__(self):
+        self.started = time.perf_counter()
+        self.started_at = _now_str()
+        self.analysis_clock = None
+        self.timezone = None
+        self.persist_skip_bars = None  # e.g., 1 for T-1
+
+        self.outcomes: list[TickerOutcome] = []
+        self.acceptance = Counter()
+        self.actions = Counter()
+        self.errors = []
+        self.scale_factors = []
+        self.persist_dropped_total = 0
+        self.persist_events = 0
+        self.total_bars_appended = 0
+
+    def set_context(self, analysis_clock=None, timezone_str=None, persist_skip_bars=None):
+        self.analysis_clock = analysis_clock
+        self.timezone = timezone_str
+        if persist_skip_bars is not None:
+            self.persist_skip_bars = int(persist_skip_bars)
+
+    def start_ticker(self, ticker) -> TickerOutcome:
+        return TickerOutcome(ticker=ticker)
+
+    def note_acceptance(self, o: TickerOutcome, acceptance_level, suggested_action="UNKNOWN"):
+        o.acceptance = acceptance_level or "UNKNOWN"
+        o.suggested_action = suggested_action or "UNKNOWN"
+        self.acceptance[o.acceptance] += 1
+        if o.suggested_action == "REBUILD":
+            self.actions['rebuilds_suggested'] += 1
+
+    def note_scale_reconcile(self, o: TickerOutcome, factor: float, rows_scaled: int):
+        o.scale_factor = float(factor)
+        o.new_rows_scaled = int(rows_scaled)
+        self.scale_factors.append(o.scale_factor)
+
+    def end_ticker(self, o: TickerOutcome, executed_action: str,
+                   bars_before=0, bars_after=0, bars_added=0,
+                   persist_dropped_bars=0, had_library=False,
+                   resolved=None, partial_session=False, error=None):
+        o.dt = time.perf_counter() - o.t0
+        o.executed_action = executed_action
+        o.bars_before = int(bars_before or 0)
+        o.bars_after = int(bars_after or bars_before)
+        o.bars_added = int(bars_added or (o.bars_after - o.bars_before))
+        o.persist_dropped_bars = int(persist_dropped_bars or 0)
+        o.had_library = bool(had_library)
+        o.partial_session = bool(partial_session)
+        if resolved:
+            o.resolved = resolved
+        if error:
+            o.error = str(error)
+            self.errors.append(f"{o.ticker}: {o.error}")
+
+        self.outcomes.append(o)
+        self.actions[executed_action] += 1
+        self.persist_dropped_total += o.persist_dropped_bars
+        if o.persist_dropped_bars:
+            self.persist_events += 1
+        if o.bars_added > 0:
+            self.total_bars_appended += o.bars_added
+
+    def _aggregate_perf(self):
+        dts = [o.dt for o in self.outcomes if o.dt > 0]
+        if not dts:
+            return {"avg": 0.0, "p50": 0.0, "p90": 0.0, "max": 0.0}
+        return {
+            "avg": sum(dts) / len(dts),
+            "p50": _q(dts, 50),
+            "p90": _q(dts, 90),
+            "max": max(dts),
+        }
+
+    def to_dict(self):
+        perf = self._aggregate_perf()
+        return {
+            "started_at": self.started_at,
+            "ended_at": _now_str(),
+            "analysis_clock": str(self.analysis_clock) if self.analysis_clock else None,
+            "timezone": self.timezone,
+            "persist_skip_bars": self.persist_skip_bars,
+            "totals": {
+                "tickers_processed": len(self.outcomes),
+                "created_new": self.actions.get("CREATED_NEW", 0),
+                "incremental_update": self.actions.get("INCREMENTAL_UPDATE", 0),
+                "rewarm_append": self.actions.get("REWARM_APPEND", 0),
+                "repair_from_anchor": self.actions.get("REPAIR_FROM_ANCHOR", 0),
+                "full_rebuilds_executed": self.actions.get("FULL_REBUILD", 0),
+                "rebuilds_suggested": self.actions.get("rebuilds_suggested", 0),
+                "used_existing": self.actions.get("USED_EXISTING", 0),
+                "skipped_no_data": self.actions.get("SKIPPED_NO_DATA", 0),
+                "alignment_fixes": self.actions.get("ALIGNMENT_FIX", 0),
+                "errors": len(self.errors),
+            },
+            "acceptance": dict(self.acceptance),
+            "persistence": {
+                "skip_bars_policy": self.persist_skip_bars,
+                "bars_dropped_total": self.persist_dropped_total,
+                "save_events": self.persist_events,
+            },
+            "scale_reconcile": {
+                "count": len(self.scale_factors),
+                "min": min(self.scale_factors) if self.scale_factors else None,
+                "median": _q(self.scale_factors, 50) if self.scale_factors else None,
+                "mean": (sum(self.scale_factors)/len(self.scale_factors)) if self.scale_factors else None,
+                "max": max(self.scale_factors) if self.scale_factors else None,
+                "rows_scaled_total": sum(o.new_rows_scaled for o in self.outcomes),
+            },
+            "data_movement": {
+                "total_bars_appended": self.total_bars_appended,
+            },
+            "performance": {
+                "runtime_seconds": time.perf_counter() - self.started,
+                **perf
+            },
+            "outcomes": [
+                {
+                    "ticker": o.ticker,
+                    "resolved": o.resolved,
+                    "acceptance": o.acceptance,
+                    "suggested_action": o.suggested_action,
+                    "executed_action": o.executed_action,
+                    "bars_before": o.bars_before,
+                    "bars_after": o.bars_after,
+                    "bars_added": o.bars_added,
+                    "persist_dropped_bars": o.persist_dropped_bars,
+                    "scale_factor": o.scale_factor,
+                    "new_rows_scaled": o.new_rows_scaled,
+                    "had_library": o.had_library,
+                    "partial_session": o.partial_session,
+                    "duration_seconds": o.dt,
+                    "error": o.error,
+                } for o in self.outcomes
+            ]
+        }
+
+    def print_summary(self, logger=None):
+        d = self.to_dict()
+        l = (logger.info if logger else print)
+
+        l("")
+        l("="*78)
+        l(" ONEPASS SUMMARY REPORT ".center(78, "="))
+        l("="*78)
+        l(f"Started:   {self.started_at}")
+        l(f"Finished:  {_now_str()}")
+        if d["analysis_clock"]:
+            l(f"Clock:     {d['analysis_clock']} ({self.timezone or 'local tz'})")
+        if self.persist_skip_bars is not None:
+            l(f"Policy:    T-{self.persist_skip_bars} persistence (skip last bar)")
+
+        totals = d["totals"]
+        l("")
+        l(f"Tickers processed: {_fmt(totals['tickers_processed'])}   "
+          f"Errors: {_fmt(totals['errors'])}")
+        l(f"  Created new:          {_fmt(totals['created_new'])}")
+        l(f"  Incremental updates:  {_fmt(totals['incremental_update'])}")
+        l(f"  Rewarm append:        {_fmt(totals['rewarm_append'])}")
+        l(f"  Repair from anchor:   {_fmt(totals['repair_from_anchor'])}")
+        l(f"  Full rebuilds EXEC:   {_fmt(totals['full_rebuilds_executed'])}")
+        l(f"  Rebuilds suggested:   {_fmt(totals['rebuilds_suggested'])}")
+        l(f"  Used existing:        {_fmt(totals['used_existing'])}")
+        l(f"  Skipped (no data):    {_fmt(totals['skipped_no_data'])}")
+        l(f"  Alignment fixes:      {_fmt(totals['alignment_fixes'])}")
+
+        l("")
+        l("Acceptance levels:")
+        for k in ["STRICT","LOOSE","RETURNS_MATCH","HEADTAIL_FUZZY","SCALE_RECONCILE",
+                  "HEADTAIL","ALL_BUT_LAST","REBUILD","UNKNOWN"]:
+            if d["acceptance"].get(k,0):
+                l(f"  {k:<18} {_fmt(d['acceptance'][k])}")
+
+        l("")
+        p = d["persistence"]
+        l(f"Persistence: dropped {_fmt(p['bars_dropped_total'])} bar(s) across "
+          f"{_fmt(p['save_events'])} save event(s) [policy skip={p['skip_bars_policy']}]")
+
+        sc = d["scale_reconcile"]
+        if sc["count"]:
+            l("")
+            l("Scale reconcile:")
+            l(f"  events={_fmt(sc['count'])}  rows_scaled={_fmt(sc['rows_scaled_total'])}  "
+              f"factor[min/median/mean/max]=[{sc['min']:.6f}/{sc['median']:.6f}/{sc['mean']:.6f}/{sc['max']:.6f}]")
+
+        l("")
+        l(f"Data movement: total bars appended = {_fmt(d['data_movement']['total_bars_appended'])}")
+
+        perf = d["performance"]
+        l("")
+        l(f"Runtime: {perf['runtime_seconds']:.2f}s  |  per-ticker avg={perf['avg']:.3f}s  "
+          f"p50={perf['p50']:.3f}s  p90={perf['p90']:.3f}s  max={perf['max']:.3f}s")
+
+        # Top talkers
+        if self.outcomes:
+            slow = sorted(self.outcomes, key=lambda o: o.dt, reverse=True)[:5]
+            growth = sorted(self.outcomes, key=lambda o: o.bars_added, reverse=True)[:5]
+            l("")
+            l("Slowest 5 tickers:")
+            for o in slow:
+                l(f"  {o.ticker:<14} {o.dt:.3f}s  [{o.executed_action} | {o.acceptance}]")
+            l("")
+            l("Top 5 by bars appended:")
+            for o in growth:
+                if o.bars_added > 0:
+                    l(f"  {o.ticker:<14} +{_fmt(o.bars_added)}  [{o.executed_action}]")
+
+        if self.errors:
+            l("")
+            l("Errors:")
+            for e in self.errors[:10]:
+                l(f"  - {e}")
+            if len(self.errors) > 10:
+                l(f"  ... and {len(self.errors)-10} more")
+
+        l("="*78)
+        l("")
+
+    def write_json(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+# ==============================================================================
+
 # Constants
 MAX_SMA_DAY = 114  # Same logic as impactsearch.py
 ENGINE_VERSION = "1.0.0"  # Version for Signal Library
 SIGNAL_LIBRARY_DIR = "signal_library/data"  # Base directory for Signal Library
+
+# --- Persistence policy (T-1) -----------------------------------------------
+# Single source of truth used across compute, persist, and comparisons
+PERSIST_SKIP_BARS = 1  # skip last N bars when persisting
 
 # Precompute PAIRS once at module level for efficiency
 PAIR_DTYPE = np.uint16 if MAX_SMA_DAY > 255 else np.uint8
@@ -186,12 +458,200 @@ def perform_rewarm_append(ticker, signal_data, new_df, rewarm_days=7):
         logger.error(f"Rewarm append failed for {ticker}: {e}")
         return None
 
+def _is_empty(x):
+    """Helper to check if an object is empty, handling various types."""
+    if x is None:
+        return True
+    if hasattr(x, 'empty'):   # pandas DataFrame/Series
+        return bool(x.empty)
+    try:
+        return len(x) == 0    # lists, tuples, arrays
+    except Exception:
+        return False
+
+def _ensure_signal_alignment_and_persist(ticker, signal_data):
+    """
+    If primary signals length != dates length, truncate to the shorter length
+    and persist immediately (even when there is no NEW_DATA), so subsequent runs are clean.
+    Returns True if alignment was fixed and persisted.
+    """
+    try:
+        sigs = signal_data.get('primary_signals')
+        dates = signal_data.get('dates') or signal_data.get('date_index')
+        if sigs is None or dates is None:
+            return False
+        slen, dlen = len(sigs), len(dates)
+        if slen == dlen:
+            return False
+        
+        # Mismatch found - fix it
+        n = min(slen, dlen)
+        signal_data['primary_signals'] = sigs[:n]
+        if isinstance(dates, list):
+            signal_data['dates'] = dates[:n]
+        else:
+            # pandas index/series
+            signal_data['dates'] = list(dates[:n])
+        
+        logger.warning(f"{ticker}: Signal/date length mismatch: signals={slen}, dates={dlen}. Truncated to {n} and will persist.")
+        
+        # Extract what we need to save
+        daily_top_buy_pairs = signal_data.get('daily_top_buy_pairs', {})
+        daily_top_short_pairs = signal_data.get('daily_top_short_pairs', {})
+        primary_signals = signal_data.get('primary_signals', [])
+        dates = signal_data.get('dates', [])
+        fingerprint = signal_data.get('data_fingerprint')
+        accumulator_state = signal_data.get('accumulator_state')
+        
+        # Persist to the same path save_signal_library uses, so loaders find it
+        vendor_symbol, _ = resolve_symbol(ticker)
+        library_path = _lib_path_for(vendor_symbol)
+        os.makedirs(os.path.dirname(library_path), exist_ok=True)
+        with open(library_path, 'wb') as f:
+            pickle.dump(signal_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        saved_signal_data = signal_data
+        
+        if saved_signal_data:
+            logger.info(f"{ticker}: Alignment fix persisted to library")
+            return True
+        else:
+            logger.error(f"{ticker}: Failed to persist alignment fix")
+            return False
+            
+    except Exception as e:
+        logger.exception(f"{ticker}: Failed to normalize & persist signal/date alignment: {e}")
+        return False
+
+def perform_repair_from_anchor(ticker, signal_data, current_df, anchor_days=60):
+    """
+    REPAIR_FROM_ANCHOR mode: When tail match is 50-90%, repair from a stable anchor point
+    instead of doing a full rebuild. This is much faster and preserves most historical signals.
+    
+    Args:
+        ticker: Ticker symbol
+        signal_data: Existing signal library data
+        current_df: Current market data DataFrame  
+        anchor_days: Number of days from end to use as anchor (default 60)
+    
+    Returns:
+        Repaired signal_data or None if repair failed
+    """
+    try:
+        logger.info(f"[REPAIR_FROM_ANCHOR] Starting anchor-based repair for {ticker}")
+        
+        # Extract stored signals and dates
+        stored_dates = signal_data.get('dates', [])
+        stored_signals = signal_data.get('primary_signals', [])
+        stored_buy_pairs = signal_data.get('daily_top_buy_pairs', {})
+        stored_short_pairs = signal_data.get('daily_top_short_pairs', {})
+        
+        if not stored_dates or not stored_signals:
+            logger.warning(f"[REPAIR_FROM_ANCHOR] Missing signals/dates for {ticker}")
+            return None
+            
+        # Find the anchor point (60 days from end of current data)
+        if len(current_df) < anchor_days + 10:  # Need some buffer
+            logger.warning(f"[REPAIR_FROM_ANCHOR] Insufficient data for anchor repair ({len(current_df)} < {anchor_days + 10})")
+            return None
+            
+        anchor_date = current_df.index[-anchor_days]
+        anchor_idx = len(current_df) - anchor_days
+        
+        logger.info(f"[REPAIR_FROM_ANCHOR] Using anchor date {anchor_date} (index {anchor_idx})")
+        
+        # Find matching point in stored data
+        stored_dates_pd = pd.DatetimeIndex(stored_dates)
+        if anchor_date not in stored_dates_pd:
+            # Find nearest date
+            diffs = abs(stored_dates_pd - anchor_date)
+            nearest_idx = diffs.argmin()
+            if diffs[nearest_idx] > pd.Timedelta(days=5):  # Too far
+                logger.warning(f"[REPAIR_FROM_ANCHOR] No close match for anchor date in stored data")
+                return None
+            anchor_stored_idx = nearest_idx
+        else:
+            anchor_stored_idx = stored_dates_pd.get_loc(anchor_date)
+            
+        # Preserve signals up to anchor point
+        preserved_dates = stored_dates[:anchor_stored_idx]
+        preserved_signals = stored_signals[:anchor_stored_idx]
+        preserved_buy_pairs = {k: v for k, v in stored_buy_pairs.items() 
+                              if pd.Timestamp(k) < anchor_date}
+        preserved_short_pairs = {k: v for k, v in stored_short_pairs.items()
+                                if pd.Timestamp(k) < anchor_date}
+        
+        logger.info(f"[REPAIR_FROM_ANCHOR] Preserving {len(preserved_signals)} signals up to anchor")
+        
+        # Get accumulator state at anchor if available
+        accumulator_state = signal_data.get('accumulator_state')
+        if accumulator_state:
+            # We'll start fresh from anchor - could optimize to snapshot at anchor
+            logger.info(f"[REPAIR_FROM_ANCHOR] Will rebuild from anchor with fresh accumulators")
+        
+        # Rebuild only from anchor point forward
+        repair_df = current_df.iloc[anchor_idx:]
+        logger.info(f"[REPAIR_FROM_ANCHOR] Recomputing {len(repair_df)} days from anchor")
+        
+        # Run signal generation for repair window (simplified version)
+        # This would ideally call a focused compute function
+        # For now, we'll mark this as needing the actual repair logic
+        
+        # TODO: Implement actual signal recomputation from anchor
+        # This requires extracting the core signal generation logic
+        # For now, return None to fall back to other methods
+        
+        logger.info(f"[REPAIR_FROM_ANCHOR] Repair logic not yet fully implemented, falling back")
+        return None
+        
+    except Exception as e:
+        logger.exception(f"[REPAIR_FROM_ANCHOR] Failed for {ticker}: {e}")
+        return None
+
 def perform_incremental_update(ticker, signal_data, new_df):
     """
     Phase 2: Perform incremental update for NEW_DATA scenario.
     Instead of full recomputation, append only the new days.
     Returns updated signal_data or None if full rebuild needed.
     """
+    # If SCALE_RECONCILE set a scale to bring current vendor data onto library's scale.
+    scale = None
+    try:
+        scale = signal_data.pop('pending_scale_factor', None)
+    except Exception:
+        scale = None
+    
+    # Identify the last stored date to isolate NEW rows only
+    last_stored_date = None
+    try:
+        dates = signal_data.get('dates') or signal_data.get('date_index')
+        if dates:
+            last_stored_date = pd.to_datetime(dates[-1]) if isinstance(dates[-1], str) else dates[-1]
+    except Exception:
+        pass
+    
+    if scale is not None and scale != 1.0 and last_stored_date is not None:
+        if not new_df.empty:
+            try:
+                # Only scale rows AFTER the last stored date (the truly new rows)
+                new_mask = new_df.index > last_stored_date
+                new_count = new_mask.sum()
+                
+                if new_count > 0:
+                    rescale_cols = [c for c in ['Adj Close', 'Close', 'Open', 'High', 'Low'] if c in new_df.columns]
+                    if rescale_cols:
+                        new_df = new_df.copy()
+                        new_df.loc[new_mask, rescale_cols] = new_df.loc[new_mask, rescale_cols] * float(scale)
+                        logger.info(f"perform_incremental_update: applied SCALE_RECONCILE x{float(scale):.6f} to {new_count} NEW rows for {ticker}")
+                        
+                        # Track in metadata for observability
+                        meta = signal_data.setdefault('meta', {})
+                        history = meta.setdefault('scale_reconciles', [])
+                        history.append({'applied_factor': float(scale), 'rows_scaled': new_count})
+                else:
+                    logger.debug(f"No new rows to scale for {ticker} (all data <= {last_stored_date})")
+            except Exception as e:
+                logger.exception(f"Failed applying SCALE_RECONCILE factor for {ticker}: {e}")
+    
     try:
         # Extract existing data
         stored_end_date = signal_data.get('end_date')
@@ -384,7 +844,29 @@ def perform_incremental_update(ticker, signal_data, new_df):
                 'num_pairs': len(pairs)
             }
             
-            # Update fingerprints for new data
+            # Apply persistence skip before updating fingerprints
+            if PERSIST_SKIP_BARS > 0 and len(new_df) > PERSIST_SKIP_BARS:
+                # Skip last bars for persistence
+                new_df_to_save = new_df.iloc[:-PERSIST_SKIP_BARS].copy()
+                bars_to_keep = len(new_df_to_save)
+                
+                # Truncate updated signals and dates
+                signal_data['primary_signals'] = primary_signals[:bars_to_keep]
+                signal_data['dates'] = signal_data['dates'][:bars_to_keep]
+                signal_data['end_date'] = str(new_df_to_save.index[-1].date())
+                signal_data['num_days'] = bars_to_keep
+                
+                # Truncate daily pairs to match
+                dates_to_keep = set(new_df_to_save.index)
+                signal_data['daily_top_buy_pairs'] = {k: v for k, v in daily_top_buy_pairs.items() 
+                                                      if pd.Timestamp(k) in dates_to_keep}
+                signal_data['daily_top_short_pairs'] = {k: v for k, v in daily_top_short_pairs.items() 
+                                                        if pd.Timestamp(k) in dates_to_keep}
+                
+                logger.info(f"{ticker}: Incremental update with T-1 persistence - keeping {bars_to_keep} of {len(new_df)} bars")
+                new_df = new_df_to_save
+            
+            # Update fingerprints for new data (now using potentially truncated df)
             signal_data['data_fingerprint'] = compute_stable_fingerprint(new_df)
             signal_data['all_but_last_fingerprint'] = compute_stable_fingerprint(new_df[:-1]) if len(new_df) > 1 else ""
             
@@ -393,6 +875,12 @@ def perform_incremental_update(ticker, signal_data, new_df):
             head = (new_df['Close'].iloc[:size] if len(new_df) >= size else new_df['Close']).round(4).astype('float32').tolist()
             tail = (new_df['Close'].iloc[-size:] if len(new_df) >= size else new_df['Close']).round(4).astype('float32').tolist()
             signal_data['head_tail_snapshot'] = {'head': head, 'tail': tail}
+            signal_data['head_snapshot'] = head  # Compatibility
+            signal_data['tail_snapshot'] = tail  # Compatibility
+            
+            # Store persistence policy in metadata
+            meta = signal_data.setdefault('meta', {})
+            meta['persist_skip_bars'] = PERSIST_SKIP_BARS
             
             # Update build timestamp
             signal_data['build_timestamp'] = datetime.now().isoformat()
@@ -431,18 +919,66 @@ def compute_parity_hash(price_source='Adj Close', group_by_mode='column'):
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
+def _persist_library_metadata(ticker, signal_data):
+    """
+    Helper to persist updated library metadata (e.g., detected persist_skip_bars).
+    Mirrors what's done in _ensure_signal_alignment_and_persist.
+    """
+    try:
+        vendor_symbol, _ = resolve_symbol(ticker)
+        lib_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable", vendor_symbol[:2].upper())
+        os.makedirs(lib_dir, exist_ok=True)
+        path = os.path.join(lib_dir, f"{vendor_symbol}_signal_library.pkl")
+        with open(path, 'wb') as f:
+            pickle.dump(signal_data, f)
+        persist_skip = signal_data.get('meta', {}).get('persist_skip_bars')
+        logger.info(f"{ticker}: persisted library metadata (persist_skip_bars={persist_skip})")
+    except Exception:
+        logger.exception(f"{ticker}: failed to persist library metadata")
+
 def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs, 
                            primary_signals, df, accumulator_state=None, price_source='Adj Close', resolved_symbol=None):
     """
     Enhanced Signal Library save with primary_signals and accumulator state.
     This version stores everything needed for impactsearch to skip SMA computation.
+    NOW WITH PERSISTENCE SKIP: Always drops last bar before saving to avoid provisional prices.
     """
     try:
+        # Always enforce module-level T-1 persistence policy on save
+        if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS:
+            # Skip the last N bars for persistence to avoid provisional/incomplete data
+            df_to_save = df.iloc[:-PERSIST_SKIP_BARS].copy()
+            
+            # Also truncate signals/dates/pairs to match the reduced DataFrame
+            bars_to_keep = len(df_to_save)
+            
+            # Truncate primary signals
+            if primary_signals and len(primary_signals) > bars_to_keep:
+                primary_signals = primary_signals[:bars_to_keep]
+            
+            # Truncate daily pairs dictionaries to match
+            if daily_top_buy_pairs:
+                dates_to_keep = set(df_to_save.index)
+                daily_top_buy_pairs = {k: v for k, v in daily_top_buy_pairs.items() 
+                                      if pd.Timestamp(k) in dates_to_keep}
+            if daily_top_short_pairs:
+                dates_to_keep = set(df_to_save.index)
+                daily_top_short_pairs = {k: v for k, v in daily_top_short_pairs.items() 
+                                       if pd.Timestamp(k) in dates_to_keep}
+            
+            logger.info(f"{ticker}: T-1 persistence - dropping last bar before save. "
+                       f"Saving {bars_to_keep} of {len(df)} bars.")
+            
+            # Use the truncated DataFrame for all downstream operations
+            df = df_to_save
+        elif PERSIST_SKIP_BARS > 0:
+            logger.warning(f"{ticker}: Not enough bars ({len(df)}) to skip last bar. Saving all data.")
+        
         # Create directory structure if it doesn't exist
         stable_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable")
         os.makedirs(stable_dir, exist_ok=True)
         
-        # Compute stable fingerprints
+        # Compute stable fingerprints (now using potentially truncated df)
         full_fingerprint = compute_stable_fingerprint(df)
         all_but_last_fingerprint = compute_stable_fingerprint(df[:-1]) if len(df) > 1 else ""
         
@@ -514,6 +1050,15 @@ def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs,
                 'tiebreak_rule': TIEBREAK_RULE  # Configured tiebreak rule
             }
         }
+        
+        # Store separate head/tail snapshots for onepass compatibility
+        signal_data['head_snapshot'] = head
+        signal_data['tail_snapshot'] = tail
+        
+        # CRITICAL: Store the persistence policy used when creating this library
+        # This ensures comparison logic uses the same policy
+        meta = signal_data.setdefault('meta', {})
+        meta['persist_skip_bars'] = PERSIST_SKIP_BARS
         
         # Save to pickle file (will switch to Parquet/NPZ in Phase 2)
         filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
@@ -598,55 +1143,14 @@ def check_signal_library_exists(ticker):
     
     return any(os.path.exists(_lib_path_for(candidate)) for candidate in candidates)
 
-def is_session_complete(df, ticker_type='equity', crypto_stability_minutes=60, reference_now=None):
+# Note: get_exchange_close_time is now imported from shared_market_hours module
+
+def is_session_complete(*args, **kwargs):
     """
-    Check if last row is a complete trading session.
-    For equities: Apply 16:10 ET cutoff (10 minute buffer per user requirement)
-    For crypto: Apply stability window to avoid in-flight bars
+    T-1 policy: we never pre-trim the working DataFrame. We always persist-skip
+    the most recent bar, and acceptance/NEW_DATA compare against T-1 as well.
+    This stub remains only for call-site compatibility.
     """
-    if df.empty or len(df) == 0:
-        return True
-    
-    from datetime import datetime, time, timedelta, timezone
-    import pytz
-    
-    last_date = df.index[-1]
-    tz = pytz.timezone('America/New_York')
-    now_et = reference_now if reference_now is not None else datetime.now(tz)
-    now_utc = now_et.astimezone(timezone.utc) if reference_now is not None else datetime.now(timezone.utc)
-    
-    if ticker_type == 'equity':
-        # Equity market closes at 4 PM ET; use the same configurable buffer as impactsearch
-        market_close = time(16, 0)  # 4:00 PM ET
-        
-        # Check if last data point is today
-        if last_date.date() == now_et.date():
-            # Only drop today's row if we're still before 4PM + buffer
-            cutoff_dt = datetime.combine(now_et.date(), market_close) + timedelta(minutes=EQUITY_SESSION_BUFFER_MINUTES)
-            cutoff_dt = tz.localize(cutoff_dt)
-            if now_et < cutoff_dt:
-                logger.info(f"Last row is today's incomplete session (before 16:00 + {EQUITY_SESSION_BUFFER_MINUTES}min). Dropping it.")
-                return False
-    
-    elif ticker_type == 'crypto':
-        # For crypto daily bars: check if stamped with today's UTC date
-        # Treat naive index as UTC midnight for daily bars
-        last_ts_utc = pd.Timestamp(last_date).tz_localize('UTC') if last_date.tzinfo is None else last_date.tz_convert('UTC')
-        
-        # Daily bar still forming if stamped with today's UTC date
-        if last_ts_utc.date() == now_utc.date():
-            logger.info("Crypto daily bar for today is incomplete. Dropping it.")
-            return False
-        
-        # Optional extra guard (mostly relevant if you add intraday later)
-        minutes_old = (now_utc - last_ts_utc).total_seconds() / 60
-        
-        if minutes_old < crypto_stability_minutes:
-            logger.info(f"Crypto bar only {minutes_old:.1f} min old (<{crypto_stability_minutes}). Dropping it.")
-            return False
-        
-        return True
-    
     return True
 
 # Note: detect_ticker_type is now imported from shared_symbols module
@@ -800,7 +1304,7 @@ def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
     
     # Apply session guard to drop incomplete sessions (use resolved type)
     ticker_type = detect_ticker_type(resolved)
-    if not is_session_complete(df, ticker_type, CRYPTO_STABILITY_MINUTES, reference_now=reference_now):
+    if not is_session_complete(df, ticker_type, CRYPTO_STABILITY_MINUTES, reference_now=reference_now, ticker=resolved):
         df = df[:-1]
         logger.info(f"Dropped incomplete session for {resolved}. Now have {len(df)} days of data.")
     else:
@@ -813,11 +1317,25 @@ def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
     
     return df
 
-def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_returns):
+def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_returns, persist_skip_bars=None):
     """
     Matches the logic from impactsearch.py but uses the same DataFrame (df_for_returns)
     for both signals and return calculations.
+    
+    With T-1 policy: Optionally drop in-flight last bar to avoid noisy P&L in metrics.
     """
+    # Use module-level default if not specified
+    if persist_skip_bars is None:
+        persist_skip_bars = PERSIST_SKIP_BARS
+    
+    # Enforce T-1 in metrics: drop in-flight last bar to avoid noisy P&L
+    if persist_skip_bars > 0 and len(df_for_returns) > persist_skip_bars:
+        df_for_returns = df_for_returns.iloc[:-persist_skip_bars].copy()
+        # Trim signals/dates to match if they are longer than df_for_returns
+        if len(primary_signals) > len(df_for_returns):
+            primary_signals = primary_signals[:len(df_for_returns)]
+        if len(primary_dates) > len(df_for_returns.index):
+            primary_dates = primary_dates[:len(df_for_returns.index)]
     logger.debug("Calculating final metrics from generated signals...")
     
     # Guard against empty inputs before logging
@@ -971,7 +1489,8 @@ def export_results_to_excel(output_filename, metrics_list):
 
     logger.info("Results successfully exported.")
 
-def process_onepass_tickers(tickers_list, use_existing_signals=False):
+def process_onepass_tickers(tickers_list, use_existing_signals=False,
+                            *, emit_summary=True, write_report_json=True):
     """
     One-pass logic. 
     For each ticker in 'tickers_list':
@@ -989,18 +1508,40 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
     analysis_clock = datetime.now(pytz.timezone('America/New_York'))
     logger.info(f"Analysis clock frozen at: {analysis_clock.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     
+    # Initialize run report
+    global RUN_REPORT
+    if RUN_REPORT is None:
+        RUN_REPORT = OnepassRunReport()
+    
+    # Set run context
+    RUN_REPORT.set_context(
+        analysis_clock=analysis_clock,
+        timezone_str='America/New_York',
+        persist_skip_bars=1  # T-1 policy hardcoded in onepass
+    )
+    
     metrics_list = []
     for ticker in tqdm(tickers_list, desc="Processing One-Pass Tickers", unit="ticker"):
+        # Start tracking this ticker
+        outcome = RUN_REPORT.start_ticker(ticker)
         # Use resolver to get correct Yahoo symbol
         vendor_symbol, _ = resolve_symbol(ticker)
         logger.info(f"Processing {vendor_symbol}...")
+        outcome.resolved = vendor_symbol
         
         # Check if we can use existing signals or perform incremental update
         existing_signal_data = None
         price_source = 'Adj Close'  # Default
-        if check_signal_library_exists(vendor_symbol):
+        had_library = check_signal_library_exists(vendor_symbol)
+        outcome.had_library = had_library
+        bars_before = 0
+        
+        if had_library:
             logger.info(f"Signal Library exists for {vendor_symbol}, checking for updates...")
             existing_signal_data = load_signal_library(vendor_symbol)
+            # Track bars before update
+            if existing_signal_data:
+                bars_before = existing_signal_data.get('num_days', 0) or len(existing_signal_data.get('primary_signals', [])) or 0
             # Honor the price_source from existing library
             if existing_signal_data and 'price_source' in existing_signal_data:
                 price_source = existing_signal_data['price_source']
@@ -1022,6 +1563,9 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         df_raw, resolved = fetch_data_raw(vendor_symbol)
         if df_raw.empty:
             logger.warning(f"No data for ticker {vendor_symbol}, skipping.")
+            RUN_REPORT.end_ticker(outcome, "SKIPPED_NO_DATA",
+                                 bars_before=0, bars_after=0, bars_added=0,
+                                 persist_dropped_bars=0, resolved=vendor_symbol)
             continue
         if resolved != vendor_symbol:
             logger.info(f"One-pass resolved {vendor_symbol} -> {resolved}")
@@ -1036,7 +1580,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         
         # Apply session guard
         ttype = detect_ticker_type(resolved)
-        if not is_session_complete(df, ttype, CRYPTO_STABILITY_MINUTES, reference_now=analysis_clock):
+        if not is_session_complete(df, ttype, CRYPTO_STABILITY_MINUTES, reference_now=analysis_clock, ticker=resolved):
             df = df[:-1]
             logger.debug(f"Dropped incomplete session for {resolved}. Days now: {len(df)}")
         
@@ -1048,47 +1592,73 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         # Phase 2: Check if we can do incremental update
         if existing_signal_data and use_existing_signals:
             stored_end_date = existing_signal_data.get('end_date')
-            current_end_date = str(df.index[-1].date()) if len(df) > 0 else None
+            
+            # CRITICAL FIX: Use effective end date (T-1) for NEW_DATA detection
+            # This prevents false "new data" triggers every run
+            if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS:
+                effective_end = df.index[-(PERSIST_SKIP_BARS+1)]
+            else:
+                effective_end = df.index[-1] if len(df) > 0 else None
+            
+            current_end_date = str(df.index[-1].date()) if len(df) > 0 else None  # For logging
+            current_end_effective = str(effective_end.date()) if effective_end is not None else None  # For comparison
             
             # Use the full acceptance ladder evaluation (matching impactsearch.py)
             acceptance_level, integrity_status, message = evaluate_library_acceptance(existing_signal_data, df)
-            logger.info(f"Library acceptance for {ticker}: {acceptance_level} ({integrity_status}): {message}")
+            
+            # Track acceptance for reporting
+            suggested = "REBUILD" if acceptance_level == "REBUILD" else "OK"
+            RUN_REPORT.note_acceptance(outcome, acceptance_level, suggested_action=suggested)
+            
+            # Handle detected persist_skip_bars for legacy libraries
+            if isinstance(integrity_status, dict):
+                detected_skip = integrity_status.get('detected_persist_skip_bars')
+                actual_status = integrity_status.get('status', integrity_status)
+                if detected_skip is not None:
+                    # Update the library metadata with detected policy
+                    meta = existing_signal_data.setdefault('meta', {})
+                    if meta.get('persist_skip_bars') is None:
+                        meta['persist_skip_bars'] = int(detected_skip)
+                        # Persist the metadata so future runs are silent
+                        _persist_library_metadata(ticker, existing_signal_data)
+                        logger.info(f"  Detected and saved persist_skip_bars={detected_skip} for legacy library")
+                integrity_status = actual_status  # Use the string status for rest of logic
+            
+            # Improve logging clarity: if NO_NEW_DATA and REBUILD, it's just a review
+            if acceptance_level == 'REBUILD' and stored_end_date and current_end_effective and current_end_effective <= stored_end_date:
+                # No new data, so we won't actually rebuild - clarify this
+                logger.info(f"Library review for {ticker}: NO_NEW_DATA ({integrity_status})")
+                logger.info(f"  Found differences that would require rebuild if updating, but no new data - keeping existing library")
+            else:
+                logger.info(f"Library acceptance for {ticker}: {acceptance_level} ({integrity_status}): {message}")
             
             # Log specifically when using non-strict acceptance (helps diagnose user reports)
             if acceptance_level == 'STRICT':
                 logger.debug(f"  Using STRICT acceptance - perfect fingerprint match")
-            elif acceptance_level in ['LOOSE', 'HEADTAIL_FUZZY', 'HEADTAIL', 'ALL_BUT_LAST']:
+            elif acceptance_level in ['LOOSE', 'HEADTAIL_FUZZY', 'SCALE_RECONCILE', 'HEADTAIL', 'ALL_BUT_LAST']:
                 logger.info(f"  Using {acceptance_level} acceptance - library still valid despite minor differences")
             
-            # Check if we have NEW_DATA (current data extends beyond stored)
-            if stored_end_date and current_end_date and current_end_date > stored_end_date:
+            # SIMPLIFIED LOGIC: Trust the acceptance level (like impactsearch.py)
+            # If acceptance is REBUILD, force rebuild. Otherwise, use or update the library.
+            if acceptance_level == 'REBUILD':
+                logger.warning(f"Library rebuild required for {ticker}: {message}")
+                existing_signal_data = None  # This will trigger full rebuild below
+            
+            # Check if we have NEW_DATA (using effective end date to avoid false triggers)
+            elif stored_end_date and current_end_effective and current_end_effective > stored_end_date:
                 logger.info(f"NEW_DATA detected for {ticker}: stored ends {stored_end_date}, current ends {current_end_date}")
-                
-                # Only do incremental if acceptance level is good enough
-                if acceptance_level in ['STRICT', 'LOOSE', 'HEADTAIL_FUZZY', 'HEADTAIL', 'ALL_BUT_LAST']:
-                    logger.info(f"Data integrity acceptable for incremental update ({acceptance_level})")
-                else:
-                    # Try rewarm append before full rebuild
-                    logger.warning(f"Data integrity too poor for incremental ({acceptance_level}).")
-                    
-                    # Check if we're close enough for rewarm (fuzzy match fraction)
-                    ok_fuzzy, fuzzy_stats = check_head_tail_match_fuzzy(existing_signal_data, df)
-                    if fuzzy_stats.get('tail_frac', 0) >= 0.90:  # 90% tail match threshold
-                        logger.info(f"Tail match {fuzzy_stats['tail_frac']:.1%} - attempting rewarm append...")
-                        rewarm_result = perform_rewarm_append(ticker, existing_signal_data, df, rewarm_days=7)
-                        if rewarm_result:
-                            existing_signal_data = rewarm_result
-                            logger.info("Rewarm append successful, avoiding full rebuild")
-                        else:
-                            logger.info("Rewarm append failed, proceeding with full rebuild")
-                            existing_signal_data = None
-                    else:
-                        logger.info(f"Tail match too poor ({fuzzy_stats.get('tail_frac', 0):.1%}), doing full rebuild")
-                        existing_signal_data = None
+                logger.info(f"Data integrity acceptable for incremental update ({acceptance_level})")
                 
                 # Try incremental update if data integrity is acceptable
                 updated_signal_data = None
                 if existing_signal_data:
+                    # Special handling for SCALE_RECONCILE mode (use structured integrity_status)
+                    if acceptance_level == 'SCALE_RECONCILE':
+                        sf = (integrity_status or {}).get('scale_factor')
+                        if sf and sf > 0:
+                            existing_signal_data['pending_scale_factor'] = 1.0 / float(sf)
+                            logger.info(f"SCALE_RECONCILE: Will rescale current data by x{existing_signal_data['pending_scale_factor']:.6f} before append")
+                    
                     updated_signal_data = perform_incremental_update(vendor_symbol, existing_signal_data, df)
                 
                 if updated_signal_data:
@@ -1103,6 +1673,29 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                                       price_source,
                                       resolved)
                     
+                    # --- Run-report bookkeeping --------------------------------
+                    bars_after = updated_signal_data.get('num_days',
+                                  len(updated_signal_data.get('dates', [])))
+                    persist_dropped = PERSIST_SKIP_BARS if len(df) > PERSIST_SKIP_BARS else 0
+                    RUN_REPORT.end_ticker(
+                        outcome, "INCREMENTAL_UPDATE",
+                        bars_before=bars_before,
+                        bars_after=bars_after,
+                        bars_added=max(0, bars_after - bars_before),
+                        persist_dropped_bars=persist_dropped,
+                        resolved=resolved
+                    )
+                    # Record scale reconcile, if any
+                    try:
+                        scales = updated_signal_data.get('meta', {}).get('scale_reconciles', [])
+                        if scales:
+                            last = scales[-1]
+                            RUN_REPORT.note_scale_reconcile(
+                                outcome, last.get('applied_factor', 1.0), last.get('rows_scaled', 0)
+                            )
+                    except Exception:
+                        pass
+
                     # Use updated signals for metrics
                     signal_data = updated_signal_data
                     daily_top_buy_pairs = signal_data['daily_top_buy_pairs']
@@ -1110,7 +1703,8 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                     primary_signals = signal_data['primary_signals']
                     
                     # Proceed to metrics calculation
-                    metrics = calculate_metrics_from_signals(primary_signals, df.index, df)
+                    df_eff = df.iloc[:-PERSIST_SKIP_BARS].copy() if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS else df
+                    metrics = calculate_metrics_from_signals(primary_signals, df_eff.index, df_eff)
                     if metrics:
                         metrics['Primary Ticker'] = vendor_symbol
                         metrics_list.append(metrics)
@@ -1119,15 +1713,26 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                     logger.warning(f"Incremental update failed for {ticker}, will rebuild")
                     existing_signal_data = None  # Force rebuild
             
-            # If no new data, use existing signals
-            elif stored_end_date == current_end_date and use_existing_signals:
+            # Otherwise (no new data but acceptance is good), use existing signals
+            else:
                 logger.info(f"No new data for {ticker}, using existing signals")
                 signal_data = existing_signal_data
+                
+                # Fix and persist any signal/date alignment issues
+                if _ensure_signal_alignment_and_persist(ticker, signal_data):
+                    RUN_REPORT.actions['ALIGNMENT_FIX'] += 1
+                
+                # Track outcome
+                RUN_REPORT.end_ticker(outcome, "USED_EXISTING",
+                                    bars_before=bars_before, bars_after=bars_before,
+                                    bars_added=0, persist_dropped_bars=0, resolved=resolved)
                 
                 # Use the loaded signals
                 daily_top_buy_pairs = signal_data['daily_top_buy_pairs']
                 daily_top_short_pairs = signal_data['daily_top_short_pairs']
-                
+
+                df_eff = df.iloc[:-PERSIST_SKIP_BARS].copy() if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS else df
+
                 # Initialize primary_signals to prevent UnboundLocalError in v1 library case
                 primary_signals = None
                 
@@ -1209,8 +1814,8 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
                         prev_date = current_date
                 
                 # Calculate metrics
-                primary_dates = df.index  # Define primary_dates for metrics calculation
-                result = calculate_metrics_from_signals(primary_signals, primary_dates, df)
+                primary_dates = df_eff.index
+                result = calculate_metrics_from_signals(primary_signals, primary_dates, df_eff)
                 if result is not None:
                     result['Primary Ticker'] = vendor_symbol
                     metrics_list.append(result)
@@ -1226,8 +1831,10 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
             logger.warning(f"No data for ticker {ticker}, skipping.")
             continue
 
-        close_values = df['Close'].values
-        num_days = len(df)
+        # Use T-1 effective frame for signal generation/accumulators
+        df_eff = df.iloc[:-PERSIST_SKIP_BARS].copy() if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS else df
+        close_values = df_eff['Close'].values
+        num_days = len(df_eff)
         if num_days < 2:
             logger.warning(f"Insufficient days of data for {ticker}, skipping.")
             continue
@@ -1241,7 +1848,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
             sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
 
         logger.info("Computing returns using pct_change()...")
-        returns = df['Close'].pct_change().fillna(0).values * 100
+        returns = df_eff['Close'].pct_change().fillna(0).values * 100
 
         # Use precomputed PAIRS from module level
         pairs = PAIRS
@@ -1265,7 +1872,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         prev_short_pair = (1, 2)
         prev_short_value = 0.0
         
-        for idx, date in enumerate(df.index):
+        for idx, date in enumerate(df_eff.index):
             # STEP 1: Determine TODAY's signal from YESTERDAY's top pairs and SMAs
             if idx == 0:
                 # First day - no signal possible
@@ -1352,11 +1959,14 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         accumulator_state = {
             'buy_cum_vector': buy_cum,
             'short_cum_vector': short_cum,
-            'last_date_processed': str(df.index[-1].date()) if len(df) > 0 else None,
+            'last_date_processed': str(df_eff.index[-1].date()) if len(df_eff) > 0 else None,
             'num_pairs': len(pairs)
         }
-        save_signal_library(vendor_symbol, daily_top_buy_pairs, daily_top_short_pairs, 
-                              primary_signals, df, accumulator_state, price_source, resolved)
+        # Pass the original df to save; the function will persist T-1 (skip last bar)
+        save_signal_library(
+            vendor_symbol, daily_top_buy_pairs, daily_top_short_pairs,
+            primary_signals, df, accumulator_state, price_source, resolved
+        )
         
         # No need to derive signals again - already computed in streaming loop!
 
@@ -1368,8 +1978,8 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
         logger.info(f"None signals: {s_counts.get('None', 0)}")
 
         # Now measure performance using the same df for returns
-        primary_dates = df.index  # Define primary_dates
-        result = calculate_metrics_from_signals(primary_signals, primary_dates, df)
+        primary_dates = df_eff.index
+        result = calculate_metrics_from_signals(primary_signals, primary_dates, df_eff)
         if result is not None:
             result['Primary Ticker'] = vendor_symbol
             metrics_list.append(result)
@@ -1377,6 +1987,25 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False):
             logger.info(f"No valid triggers for {vendor_symbol}, skipping metrics.")
 
         logger.info(f"Completed processing for {vendor_symbol}.")
+        
+        # If we haven't tracked this ticker yet, track it as completed
+        if outcome and outcome.executed_action == "UNKNOWN":
+            # Default to FULL_REBUILD if we got here without tracking
+            bars_after = len(df) if 'df' in locals() else 0
+            RUN_REPORT.end_ticker(outcome, "FULL_REBUILD",
+                                bars_before=bars_before, bars_after=bars_after,
+                                bars_added=max(0, bars_after - bars_before),
+                                persist_dropped_bars=1, resolved=resolved)
+
+    # Print summary report
+    if emit_summary:
+        RUN_REPORT.print_summary(logger)
+    if write_report_json:
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            RUN_REPORT.write_json(os.path.join("signal_library", "run_reports", f"onepass_run_{stamp}.json"))
+        except Exception:
+            logger.exception("Failed to write run report JSON")
 
     return metrics_list
 
@@ -1811,10 +2440,14 @@ def start_processing(n_clicks, primary_tickers_input, options):
                     progress_tracker['current_index'] = i - 1
                 
                 # Check if Signal Library exists
-                library_exists = check_signal_library_exists(ticker)
+                vendor_sym, _ = resolve_symbol(ticker)
+                library_exists = check_signal_library_exists(vendor_sym)
                 
                 # Process ticker
-                result = process_onepass_tickers([ticker], use_existing_signals=reuse_existing)
+                result = process_onepass_tickers(
+                    [ticker], use_existing_signals=reuse_existing,
+                    emit_summary=False, write_report_json=False
+                )
                 
                 if result:
                     processed_metrics.extend(result)
@@ -1917,8 +2550,8 @@ def update_progress(n_intervals, state):
         with progress_lock:
             results = progress_tracker.get('results', [])
             for result in results:
-                if result and 'Combined Sharpe' in result:
-                    sharpe = result.get('Combined Sharpe', -999)
+                if result:
+                    sharpe = result.get('Sharpe Ratio', result.get('Combined Sharpe', -999))
                     if sharpe > top_sharpe_value:
                         top_sharpe_value = sharpe
                         top_sharpe_ticker = result.get('Primary Ticker', 'Unknown')

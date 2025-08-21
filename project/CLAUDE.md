@@ -343,6 +343,16 @@ Note: Machine learning integration, advanced analytics, and institutional featur
 
 ## Development Guidelines & Best Practices
 
+### Repository Cleanliness & Organization
+- **We aim to keep the entire repository clean and organized at all times**
+- **ALL files must follow naming structure rules, regardless of git tracking status**
+- **No temporary files, test scripts, or helper utilities should be left in the root directory**
+- **Clean up after yourself**: Remove any temporary files, test outputs, or debugging artifacts
+- **If a utility script is needed long-term**, place it in an appropriate subdirectory:
+  - `utilities/` - General utility scripts
+  - `scripts/` - Automation and helper scripts
+  - `tools/` - Development tools
+
 ### Documentation Organization
 - **NEVER place new markdown files in the root project folder** (except CLAUDE.md)
 - **ALWAYS use date prefix and descriptive uppercase title for markdown filenames**: `YYYY-MM-DD_DESCRIPTION_IN_CAPS.md`
@@ -363,7 +373,7 @@ Note: Machine learning integration, advanced analytics, and institutional featur
   - `md_library/impactsearch/` - Impactsearch documentation
   - `md_library/onepass/` - Onepass documentation
   - `md_library/shared/` - Shared documentation across scripts (testing, tools, environment)
-- Text files (.txt) for quick changes/notes can remain in root temporarily
+- Text files (.txt) for quick changes/notes can remain in root temporarily but should be cleaned up promptly
 
 ### Git Branch Naming Conventions
 - **Be specific about scope and purpose** - branches should clearly indicate what they affect

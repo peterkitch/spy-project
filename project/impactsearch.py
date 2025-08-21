@@ -100,6 +100,7 @@ PERIOD_FORCE_RECHECK = os.environ.get('IMPACTSEARCH_FORCE_RECHECK_MAX', '').lowe
 
 # Import shared modules for parity with onepass
 from signal_library.shared_symbols import resolve_symbol, detect_ticker_type
+# T-1 policy: shared_market_hours no longer needed - we can fetch anytime
 from signal_library.shared_integrity import (
     compute_stable_fingerprint,
     compute_quantized_fingerprint,
@@ -1053,48 +1054,13 @@ def load_signal_library(ticker):
         logger.error(f"Error loading Signal Library for {ticker}: {e}")
         return None
 
-def is_session_complete(df, ticker_type='equity', reference_now=None):
+def is_session_complete(*args, **kwargs):
     """
-    Mirror onepass.py behavior (equity cutoff 16:10 ET, crypto stability window)
-    
-    Args:
-        df: DataFrame with price data
-        ticker_type: 'equity' or 'crypto'
-        reference_now: Optional fixed timestamp for consistent checks across all tickers
+    T-1 policy: we never pre-trim the working DataFrame. We always persist-skip
+    the most recent bar, and acceptance/NEW_DATA compare against T-1 as well.
+    This stub remains only for call-site compatibility.
     """
-    from datetime import datetime, time, timedelta
-    import pytz
-    
-    if df.empty:
-        return True
-    
-    tz = pytz.timezone('America/New_York')
-    now = reference_now if reference_now is not None else datetime.now(tz)
-    last_date = df.index[-1]
-    
-    if ticker_type == 'equity':
-        # Use same formulation as onepass for consistency
-        cutoff_dt = tz.localize(datetime.combine(now.date(), time(16, 0))) + timedelta(minutes=EQUITY_SESSION_BUFFER_MINUTES)
-        if last_date.date() == now.date() and now < cutoff_dt:
-            return False
-    elif ticker_type == 'crypto':
-        # For crypto daily bars: check if stamped with today's UTC date (match onepass.py)
-        from datetime import timezone
-        now_utc = datetime.now(timezone.utc)
-        # Treat naive index as UTC midnight for daily bars
-        last_ts_utc = pd.Timestamp(last_date).tz_localize('UTC') if last_date.tzinfo is None else last_date.tz_convert('UTC')
-        
-        # Daily bar still forming if stamped with today's UTC date
-        if last_ts_utc.date() == now_utc.date():
-            logger.debug("Crypto daily bar for today is incomplete. Dropping it.")
-            return False
-        
-        # Optional extra guard (mostly relevant if you add intraday later)
-        minutes_old = (now_utc - last_ts_utc).total_seconds() / 60
-        if minutes_old < CRYPTO_STABILITY_MINUTES:
-            logger.debug(f"Crypto bar only {minutes_old:.1f} min old (<{CRYPTO_STABILITY_MINUTES}). Dropping it.")
-            return False
-    
+    # Hard T-1: no pre-trim; we persist/compare on T-1. Stub for compatibility.
     return True
 
 def _extract_resolved_symbol(df_raw, requested):
@@ -1376,7 +1342,8 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
         # Apply the very same detector as onepass (parity)
         # Use the RESOLVED symbol for type detection to avoid misclassifying aliases
         ticker_type = detect_ticker_type(resolved_ticker)
-        if not is_session_complete(df, ticker_type, reference_now=reference_now):
+        # FIX: Pass resolved_ticker (not original ticker) to session checks
+        if not is_session_complete(df, ticker_type, reference_now=reference_now, ticker=resolved_ticker):
             logger.debug(f"Dropping incomplete session for {ticker}")
             df = df.iloc[:-1]
         
@@ -1668,7 +1635,8 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     
     # Single download: get raw frame & resolved symbol once
     df_raw, fetched_symbol = fetch_data_raw(prim_ticker, reference_now=analysis_clock)
-    if df_raw.empty:
+    # FIX: Add None check before accessing df_raw attributes
+    if df_raw is None or df_raw.empty:
         logger.warning(f"No data for primary ticker {prim_ticker}, skipping.")
         return None
     
@@ -1682,7 +1650,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     
     # Apply session guard with the resolved type
     ttype = detect_ticker_type(fetched_symbol)
-    if not is_session_complete(df, ttype, reference_now=analysis_clock):
+    if not is_session_complete(df, ttype, reference_now=analysis_clock, ticker=fetched_symbol):
         df = df.iloc[:-1]
         logger.debug(f"Dropped incomplete session for {fetched_symbol}. Days now: {len(df)}")
     
@@ -1723,7 +1691,17 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             signal_data = None
         else:
             # Accept the library under all other tiers
-            if acceptance_level != 'STRICT':
+            if acceptance_level == 'SCALE_RECONCILE':
+                logger.info(f"Scale change detected but accepting library - {message}")
+                # Extract scale factor from message and set pending_scale_factor for incremental update
+                import re
+                scale_match = re.search(r'factor=([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)', str(message))
+                if scale_match:
+                    scale_factor = float(scale_match.group(1))
+                    # We scale the NEW rows to match existing library scale (inverse of detected factor)
+                    signal_data['pending_scale_factor'] = 1.0 / scale_factor
+                    logger.debug(f"Set pending_scale_factor to {signal_data['pending_scale_factor']:.8f} for {prim_ticker}")
+            elif acceptance_level != 'STRICT':
                 logger.info(f"Accepting Signal Library with {acceptance_level} match - {message}")
             
             # Phase 2: Handle incremental updates
@@ -1994,7 +1972,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     
     # Session guard for secondary too
     sec_type = detect_ticker_type(sec_resolved)
-    if not is_session_complete(sec_df, sec_type, reference_now=analysis_clock):
+    # FIX: Pass sec_resolved (not sec_ticker) to session checks
+    if not is_session_complete(sec_df, sec_type, reference_now=analysis_clock, ticker=sec_resolved):
         sec_df = sec_df.iloc[:-1]
         logger.debug(f"Dropped incomplete session for secondary {sec_resolved}. Days now: {len(sec_df)}")
     
