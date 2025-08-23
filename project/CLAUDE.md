@@ -60,10 +60,52 @@ pyinstaller spymaster.spec
 
 ## Architecture
 
+### CRITICAL: Spymaster.py Standalone Design (Regression Testing Baseline)
+
+**IMPORTANT**: Spymaster.py is **intentionally standalone** by design. This is a FEATURE, not a bug!
+
+#### Key Architectural Principles
+1. **Complete Independence**
+   - NO dependencies on other project modules (signal_library, global_ticker_library, onepass, impactsearch)
+   - Direct yfinance calls for all data fetching
+   - Isolated caching system in `cache/results/` and `cache/status/`
+   - Self-contained calculations for all metrics
+
+2. **Regression Testing Role**
+   - Serves as the **gold standard** for metric verification
+   - Provides baseline metrics for comparison
+   - Ensures new implementations match expected results
+   - Acts as the "source of truth" for trading metrics
+
+3. **Why This Matters**
+   - **Stability**: Changes to signal_library or other modules don't affect spymaster
+   - **Reliability**: Known-good implementation for testing against
+   - **Verification**: Can cross-check results from integrated scripts
+   - **Independence**: Can run without any other project components
+
+#### Development Rules for Spymaster.py
+**DO NOT:**
+- Add imports from signal_library to spymaster.py
+- Integrate global_ticker_library into spymaster.py
+- Create dependencies between spymaster and other scripts
+- Share cache files between spymaster and other modules
+
+**DO:**
+- Keep spymaster.py completely self-contained
+- Use spymaster.py to verify metrics from new scripts
+- Maintain spymaster's direct yfinance implementation
+- Preserve the isolated caching system
+
+#### Testing Workflow
+1. Run analysis in spymaster.py → Get baseline metrics
+2. Run same analysis in new/modified script → Get test metrics
+3. Compare results → Verify accuracy
+4. If discrepancies found → Debug the new script (not spymaster)
+
 ### Core Structure
-- **spymaster.py** (4,971 lines): Main Dash web application serving the trading analysis dashboard
-- **impactsearch.py**: Statistical relationship analysis between different tickers
-- **onepass.py**: Single-pass analysis module for quick computations
+- **spymaster.py** (4,971 lines): Main Dash web application serving the trading analysis dashboard (STANDALONE - Regression Testing Baseline)
+- **impactsearch.py**: Statistical relationship analysis between different tickers (Integrated with signal_library)
+- **onepass.py**: Single-pass analysis module for quick computations (Integrated with signal_library)
 
 ### Data Flow
 1. **Market Data**: Fetched via yfinance API into pandas DataFrames
@@ -99,6 +141,27 @@ pyinstaller spymaster.spec
 - **Status**: `*.json` files tracking analysis progress
 - **Output**: Excel files for detailed analysis exports
 - **Logs**: `debug.log`, `analysis.log` for troubleshooting
+
+## Recent Updates (Session: 2025-01-23)
+
+### Secondary Ticker Signal Following Analysis Fixes
+
+#### Issues Fixed:
+1. **Missing Last Day Data**: Secondary analysis was missing the most recent trading day
+   - Root cause: yfinance's `end` parameter is exclusive
+   - Fix: Added `pd.Timedelta(days=1)` to make end date inclusive (line 2714-2715)
+
+2. **Mismatched Cumulative Captures**: Primary and secondary showed different results for same ticker
+   - Root cause: Secondary used 'Close' while primary used 'Adj Close' prices
+   - Fix: Modified price column selection to prioritize 'Adj Close' (lines 8511-8535)
+
+#### Testing Results:
+All tickers now show perfect matching between primary and secondary analyses:
+- SPY: Primary = 192.80%, Secondary = 192.80% ✅
+- QQQ: Primary = 213.52%, Secondary = 213.52% ✅
+- ^GSPC: Primary = 665.57%, Secondary = 665.57% ✅
+- MSFT: Primary = 216.92%, Secondary = 216.92% ✅
+- AAPL: Primary = 688.01%, Secondary = 688.01% ✅
 
 ## Recent Updates (Session: 2025-01-08)
 

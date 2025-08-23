@@ -2711,10 +2711,12 @@ def fetch_secondary_window(ticker, start, end):
     try:
         import yfinance as yf
         # Keep it simple and robust
+        # IMPORTANT: yf.download's end parameter is exclusive, so add 1 day to include the end date
+        end_inclusive = pd.to_datetime(end) + pd.Timedelta(days=1)
         df = yf.download(
             ticker,
             start=pd.to_datetime(start).strftime("%Y-%m-%d"),
-            end=pd.to_datetime(end).strftime("%Y-%m-%d"),
+            end=end_inclusive.strftime("%Y-%m-%d"),
             auto_adjust=False,
             progress=False,
             threads=False,
@@ -8506,19 +8508,30 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             signals = pd.Series(active_pairs, index=dates).loc[common_dates]
             signals = signals.astype(str)
             
-            # Extract Close prices robustly (handle both single and multi-level columns)
-            if 'Close' in secondary_df.columns:
+            # Extract Close prices robustly (prefer Adj Close like primary analysis)
+            # Check for Adj Close first (to match primary analysis behavior)
+            if 'Adj Close' in secondary_df.columns:
+                prices = secondary_df['Adj Close'].loc[common_dates]
+            elif 'Adj_Close' in secondary_df.columns:
+                prices = secondary_df['Adj_Close'].loc[common_dates]
+            elif 'Close' in secondary_df.columns:
                 prices = secondary_df['Close'].loc[common_dates]
             elif isinstance(secondary_df.columns, pd.MultiIndex):
                 # Handle multi-level columns from yfinance
-                close_cols = [col for col in secondary_df.columns if col[0] == 'Close' or col == 'Close']
-                if close_cols:
-                    prices = secondary_df[close_cols[0]].loc[common_dates]
+                # Try Adj Close first
+                adj_close_cols = [col for col in secondary_df.columns if col[0] == 'Adj Close' or col == 'Adj Close']
+                if adj_close_cols:
+                    prices = secondary_df[adj_close_cols[0]].loc[common_dates]
                 else:
-                    # Fallback to first column
-                    prices = secondary_df.iloc[:, 0].loc[common_dates]
+                    # Then try regular Close
+                    close_cols = [col for col in secondary_df.columns if col[0] == 'Close' or col == 'Close']
+                    if close_cols:
+                        prices = secondary_df[close_cols[0]].loc[common_dates]
+                    else:
+                        # Fallback to first column
+                        prices = secondary_df.iloc[:, 0].loc[common_dates]
             else:
-                # Fallback to first column if Close not found
+                # Fallback to first column if nothing found
                 prices = secondary_df.iloc[:, 0].loc[common_dates]
             
             # Ensure prices is a Series
