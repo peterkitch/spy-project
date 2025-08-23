@@ -4,7 +4,9 @@ import dash
 from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, dash_table, ALL
 import dash_bootstrap_components as dbc
 import pandas as pd
-from utils.spymaster.logging_config import setup_logging, Colors, print_startup_banner, print_server_info
+from utils.spymaster.logging_config import (
+    setup_logging, Colors, print_startup_banner, print_server_info, ensure_utf8_stdio
+)
 import pickle
 from tqdm import tqdm
 import os
@@ -2513,24 +2515,15 @@ class ColoredFormatter(logging.Formatter):
         formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
         return formatter.format(record)
 
-# Force UTF-8 encoding for Windows
-import sys
-import os
+# Ensure UTF-8 stdio early (safe in IDEs/terminals; graceful on failure)
+ensure_utf8_stdio()
 
-# Set console to UTF-8 mode on Windows
-if sys.platform == 'win32':
-    # Set console code page to UTF-8
-    os.system('chcp 65001 > nul 2>&1')
-
-# Create console handler - let logging handle the encoding
-console_handler = logging.StreamHandler()
+# Create console handler with stdout stream
+console_handler = logging.StreamHandler(stream=sys.stdout)
 console_handler.setLevel(logging.INFO)
 
-# Force UTF-8 encoding on the handler's stream
-if sys.platform == 'win32':
-    # This is the key fix - set the encoding on the handler's stream
-    console_handler.stream = open(sys.stdout.fileno(), 'w', encoding='utf-8', closefd=False)
-
+# Ensure logs directory exists
+os.makedirs('logs', exist_ok=True)
 file_handler = logging.FileHandler('logs/spymaster.log', encoding='utf-8')
 file_handler.setLevel(logging.DEBUG)
 
@@ -2700,6 +2693,9 @@ def interval_from_measured_secs(s):
 _secondary_df_cache = {}
 _SECONDARY_TTL = 900  # 15 minutes
 
+# Track which tickers have already logged primary fetch success
+_logged_primary_fetch_success = set()
+
 def fetch_secondary_window(ticker, start, end):
     """Download only the needed window for a secondary ticker."""
     import time
@@ -2854,8 +2850,9 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
             logger.error(f"No valid data found for {ticker}")
             return pd.DataFrame()
         
-        if not is_secondary:
+        if not is_secondary and ticker not in _logged_primary_fetch_success:
             logger.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
+            _logged_primary_fetch_success.add(ticker)
             
             # Check if we should add today's date
             today = pd.Timestamp.now().normalize().tz_localize(None)
@@ -4136,6 +4133,9 @@ app.layout = dbc.Container(
                                     # Store for position tracking
                                     dcc.Store(id='position-history-store', storage_type='session'),
                                     
+                                    # Top-of-card snapshot container
+                                    html.Div(id='ai-master-snapshot', className='mb-3'),
+                                    
                                     # TWO-COLUMN LAYOUT: Historical Performance (left) and Risk/Reward (right)
                                     dbc.Row([
                                         # LEFT COLUMN: Historical Performance
@@ -5108,7 +5108,7 @@ def update_sma_labels(ticker, n_intervals):
     if not ticker:
         trading_days = 1
     else:
-        df = fetch_data(ticker)
+        df = fetch_data(ticker, is_secondary=True)
         if df is None or df.empty:
             trading_days = 1
         else:
@@ -5376,7 +5376,7 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, tick
     error_messages = []
 
     if ticker:
-        df = fetch_data(ticker)
+        df = fetch_data(ticker, is_secondary=True)
         trading_days = len(df) if df is not None and not df.empty else 1
     else:
         trading_days = 1
@@ -5484,7 +5484,7 @@ def validate_ticker_input(ticker):
     
     # Ticker input will be logged when processing starts
     
-    df = fetch_data(ticker)
+    df = fetch_data(ticker, is_secondary=True)
     
     if df is None or df.empty:
         logger.error(f"Invalid ticker '{ticker}' - no data available from yfinance")
@@ -6282,7 +6282,8 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
         return no_update  # Do not update the chart in case of error
 
 @app.callback(
-    [Output('strategy-grade-badge', 'children'),
+    [Output('ai-master-snapshot', 'children'),
+     Output('strategy-grade-badge', 'children'),
      Output('performance-progress-bars', 'children'),
      Output('ai-risk-reward-matrix', 'children'),
      Output('performance-heatmap', 'children'),
@@ -6319,8 +6320,8 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Only log if the ticker changed, not on interval updates
     should_log = trigger_id == 'ticker-input'
     if not ticker:
-        # Return 22 items: 10 empty + empty dict for position store + 11 empty
-        return [""] * 10 + [{}] + [""] * 11
+        # Return 23 items: 1 for snapshot + 10 empty + empty dict for position store + 11 empty
+        return [""] * 11 + [{}] + [""] * 11
     
     # Initialize or get ticker-specific position history
     if position_history_store is None or not isinstance(position_history_store, dict):
@@ -6337,17 +6338,17 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     results = load_precomputed_results(ticker, from_callback=True, should_log=should_log)
     
     if results is None:
-        # Return 22 items with error message in trading-recommendations (position 21)
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data not available. Please wait..."] + [""]
+        # Return 23 items with error message in trading-recommendations (position 22)
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data not available. Please wait..."] + [""]
     
     if 'status' in results:
         if results['status'] == 'processing':
-            return [""] * 10 + [position_history_store] + [""] * 9 + ["Data is currently being processed."] + [""]
+            return [""] * 11 + [position_history_store] + [""] * 9 + ["Data is currently being processed."] + [""]
         elif results['status'] == 'complete':
             if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                return [""] * 10 + [position_history_store] + [""] * 9 + ["Processing complete, but top pairs not found. Please check data integrity."] + [""]
+                return [""] * 11 + [position_history_store] + [""] * 9 + ["Processing complete, but top pairs not found. Please check data integrity."] + [""]
         elif results['status'] == 'failed':
-            return [""] * 10 + [position_history_store] + [""] * 9 + [f"Processing failed for {ticker}. Please check the error message."] + [""]
+            return [""] * 11 + [position_history_store] + [""] * 9 + [f"Processing failed for {ticker}. Please check the error message."] + [""]
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
@@ -6357,23 +6358,23 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing top pairs"] + [""]
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing top pairs"] + [""]
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing preprocessed data"] + [""]
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing preprocessed data"] + [""]
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data integrity issue - invalid pair format"] + [""]
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data integrity issue - invalid pair format"] + [""]
 
     try:
         # Validate top pairs data
         if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [top_buy_pair, top_short_pair]):
             logger.error(f"Invalid pair format detected for {ticker}")
-            return [""] * 10 + [position_history_store] + [""] * 9 + ["Invalid pair format detected. Please reprocess data."] + [""]
+            return [""] * 11 + [position_history_store] + [""] * 9 + ["Invalid pair format detected. Please reprocess data."] + [""]
 
         # Validate that all required SMA columns exist
         required_smas = [
@@ -6384,7 +6385,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         missing_smas = [sma for sma in required_smas if sma not in df.columns]
         if missing_smas:
             logger.error(f"Missing SMA columns for {ticker}: {missing_smas}")
-            return [""] * 10 + [position_history_store] + [""] * 9 + ["Missing required SMA columns. Please reprocess data."] + [""]
+            return [""] * 11 + [position_history_store] + [""] * 9 + ["Missing required SMA columns. Please reprocess data."] + [""]
 
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
@@ -6399,7 +6400,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         logger.error(f"Required SMA columns not found in the DataFrame for {ticker}: {str(e)}")
         if should_log:
             logger.error(f"Error details: Missing column {str(e)}")
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Data not available or processing not yet complete. Please wait..."] + [""]
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data not available or processing not yet complete. Please wait..."] + [""]
 
     current_date = df.index[-1]
     previous_date = df.index[-2]
@@ -6447,7 +6448,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Validate dates exist in the index
     if previous_date not in df.index or current_date not in df.index:
         logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Missing required dates in data. Please reprocess data."] + [""]
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Missing required dates in data. Please reprocess data."] + [""]
 
     try:
         # Calculate signals for today based on yesterday's close
@@ -6463,7 +6464,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
-        return [""] * 10 + [position_history_store] + [""] * 9 + ["Error calculating signals. Please check the data."] + [""]
+        return [""] * 11 + [position_history_store] + [""] * 9 + ["Error calculating signals. Please check the data."] + [""]
 
     # Calculate yesterday's signals (which determined the position entered at yesterday's close)
     # This is our CURRENT position
@@ -6717,7 +6718,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             ])
 
             if signal_captures.size > 0:
-                wins = np.sum(signal_captures > 0)
+                wins = int(np.sum(signal_captures > 0))  # Convert NumPy scalar to Python int
                 losses = trigger_days - wins  # Ensure wins + losses equals trigger days
                 win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0.0
                 avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0.0
@@ -7286,6 +7287,174 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Create position history table
     position_history_table = PerformanceMetrics.create_position_history_table(position_history_data)
     
+    # ---------- Master Strategy Snapshot (top-of-section metrics table) ----------
+    # Uses dynamic strategy metrics computed above in this callback
+    try:
+        # Multi-tier status icon based on statistical significance and Sharpe
+        if p_value is not None and p_value < 0.01 and sharpe_ratio > 0.5:
+            status_icon = "🔥"  # Excellent
+        elif p_value is not None and p_value < 0.05:
+            status_icon = "✅"  # Good
+        elif p_value is not None and p_value < 0.10:
+            status_icon = "⚠️"  # Fair
+        else:
+            status_icon = "❌"  # Poor
+        
+        # Fallback for wins/losses/win_ratio using position_history_data
+        try:
+            if (wins is None or losses is None) and position_history_data:
+                completed = [p for p in position_history_data if p.get('exit_price') is not None]
+                wins_calc = sum(1 for t in completed if (t.get('pnl') or 0) > 0)
+                losses_calc = sum(1 for t in completed if (t.get('pnl') or 0) < 0)
+                if wins is None: wins = wins_calc
+                if losses is None: losses = losses_calc
+                if (win_ratio is None or not isinstance(win_ratio, (int, float))) and (wins + losses) > 0:
+                    win_ratio = 100.0 * wins / (wins + losses)
+        except Exception as _e:
+            pass  # Always degrade gracefully
+            
+        # Build one-row data payload with required ordering/format
+        master_snapshot_columns = [
+            'Status','Ticker','Trigger Days','Wins','Losses','Win Ratio (%)',
+            'Std Dev (%)','Sharpe Ratio','t-Statistic','p-Value',
+            'Significant 90%','Significant 95%','Significant 99%',
+            'Avg Daily Capture (%)','Total Capture (%)'
+        ]
+        
+        # Format trigger days with comma separator
+        formatted_trigger_days = f"{int(trigger_days):,}" if isinstance(trigger_days, (int, float)) else "0"
+        
+        master_snapshot_row = {
+            'Status': status_icon,
+            'Ticker': ticker,
+            'Trigger Days': formatted_trigger_days,
+            'Wins': f"{int(wins):,}" if isinstance(wins, (int, float)) else "0",
+            'Losses': f"{int(losses):,}" if isinstance(losses, (int, float)) else "0",
+            'Win Ratio (%)': f"{float(win_ratio):.2f}" if win_ratio is not None else "0.00",
+            'Std Dev (%)': f"{float(std_dev):.4f}" if std_dev is not None else "0.0000",
+            'Sharpe Ratio': f"{float(sharpe_ratio):.2f}" if sharpe_ratio is not None else "0.00",
+            't-Statistic': f"{float(t_statistic):.4f}" if t_statistic is not None else "N/A",
+            'p-Value': f"{float(p_value):.4f}" if p_value is not None else "N/A",
+            'Significant 90%': 'Yes' if (p_value is not None and p_value < 0.10) else 'No',
+            'Significant 95%': 'Yes' if (p_value is not None and p_value < 0.05) else 'No',
+            'Significant 99%': 'Yes' if (p_value is not None and p_value < 0.01) else 'No',
+            'Avg Daily Capture (%)': f"{float(avg_daily_capture):.4f}" if avg_daily_capture is not None else "0.0000",
+            'Total Capture (%)': f"{float(total_capture):.2f}" if total_capture is not None else "0.00"
+        }
+        
+        master_metrics_table = html.Div(
+            [
+                html.H3([
+                    "Master Strategy Snapshot",
+                    html.Span("ⓘ", 
+                             id="master-snapshot-info",
+                             style={"cursor": "help", "fontSize": "0.9em", "marginLeft": "8px"},
+                             **{"aria-label": "What these metrics mean"})
+                ], className="mb-2", style={"color": "#80ff00"}),
+                dbc.Tooltip(
+                    [
+                        html.Div("What this shows:", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                        html.Ul([
+                            html.Li("Trigger Days – days a trade was active (Buy/Short)"),
+                            html.Li("Wins / Losses – count of completed trades with +/− P&L"),
+                            html.Li("Win Ratio – Wins ÷ (Wins + Losses), %"),
+                            html.Li("Std Dev – daily return variability, %"),
+                            html.Li("Sharpe – risk-adjusted return (higher is better)"),
+                            html.Li("t-Statistic / p-Value – significance of Avg Daily Capture"),
+                            html.Li("Significant 90/95/99 – p < 0.10 / 0.05 / 0.01 flags"),
+                            html.Li("Avg Daily Capture – mean daily edge, %"),
+                            html.Li("Total Capture – cumulative edge over the period, %"),
+                        ], style={"marginBottom": 0})
+                    ],
+                    target="master-snapshot-info",
+                    placement="right",
+                    autohide=True
+                ),
+                dash_table.DataTable(
+                    id='master-strategy-snapshot',
+                    columns=[{'name': c, 'id': c} for c in master_snapshot_columns],
+                    data=[master_snapshot_row],
+                    style_table={'overflowX': 'auto', 'backgroundColor': 'black'},
+                    style_cell={
+                        'backgroundColor': 'black', 
+                        'color': '#80ff00',
+                        'textAlign': 'center',
+                        'minWidth': '60px', 
+                        'width': '100px', 
+                        'maxWidth': '150px',
+                        'whiteSpace': 'normal', 
+                        'border': '1px solid #80ff00',
+                        'fontSize': '12px'
+                    },
+                    style_header={
+                        'backgroundColor': 'black', 
+                        'color': '#80ff00',
+                        'fontWeight': 'bold', 
+                        'border': '2px solid #80ff00',
+                        'fontSize': '11px'
+                    },
+                    style_data_conditional=[
+                        # Highlight significant metrics with subtle glow
+                        {
+                            'if': {'column_id': 'Significant 95%', 'filter_query': '{Significant 95%} = Yes'},
+                            'boxShadow': '0 0 8px rgba(128, 255, 0, 0.4)',
+                            'fontWeight': 'bold'
+                        },
+                        {
+                            'if': {'column_id': 'Significant 99%', 'filter_query': '{Significant 99%} = Yes'},
+                            'boxShadow': '0 0 12px rgba(128, 255, 0, 0.6)',
+                            'fontWeight': 'bold'
+                        },
+                        # Color code Win Ratio using existing thresholds
+                        {
+                            'if': {
+                                'filter_query': '{{Win Ratio (%)}} > {}'.format(55),  # Good threshold
+                                'column_id': 'Win Ratio (%)'
+                            },
+                            'color': '#00ff00',  # Bright green
+                            'fontWeight': 'bold'
+                        },
+                        {
+                            'if': {
+                                'filter_query': '{{Win Ratio (%)}} >= {} && {{Win Ratio (%)}} <= {}'.format(50, 55),
+                                'column_id': 'Win Ratio (%)'
+                            },
+                            'color': '#ffff00'  # Yellow
+                        },
+                        {
+                            'if': {
+                                'filter_query': '{{Win Ratio (%)}} < {}'.format(50),
+                                'column_id': 'Win Ratio (%)'
+                            },
+                            'color': '#ff6666'  # Red
+                        },
+                        # Highlight good Sharpe ratios
+                        {
+                            'if': {
+                                'filter_query': '{{Sharpe Ratio}} > {}'.format(0.5),
+                                'column_id': 'Sharpe Ratio'
+                            },
+                            'color': '#00ff00',
+                            'fontWeight': 'bold'
+                        }
+                    ]
+                )
+            ],
+            id='dynamic-master-metrics',
+            className='mb-3',
+            style={
+                "padding": "15px", 
+                "backgroundColor": "rgba(0,0,0,0.7)", 
+                "borderRadius": "8px", 
+                "border": "2px solid #333",
+                "boxShadow": "0 4px 8px rgba(0,0,0,0.3)"
+            }
+        )
+    except Exception as e:
+        # If anything goes wrong, degrade gracefully with a lightweight placeholder
+        logger.warning(f"Failed to create master metrics table: {e}")
+        master_metrics_table = html.Div(id='dynamic-master-metrics')
+    
     # Build the new structured layout
     trading_recommendations = [
         html.Div([
@@ -7728,6 +7897,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     position_history_store[ticker] = position_history_data
     
     return (
+        master_metrics_table,  # Now goes to ai-master-snapshot at top of AI section
         grade_badge,
         progress_bars,
         risk_reward_matrix,
@@ -7789,7 +7959,7 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         )
         return empty_fig, '', '', '', '', '', '', '', '', 'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: --'), html.Span('Max Drawdown: --'), html.Span('Calmar Ratio: --'), 'Total Signals: --', html.Span('Overall Win Rate: --')
 
-    df = fetch_data(ticker)
+    df = fetch_data(ticker, is_secondary=True)
     if df is None or df.empty:
         empty_fig = go.Figure()
         empty_fig.update_layout(
@@ -9037,7 +9207,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     # Process each secondary ticker
     for secondary_ticker in secondary_tickers:
         # Fetch data for secondary ticker
-        secondary_data = fetch_data(secondary_ticker)
+        secondary_data = fetch_data(secondary_ticker, is_secondary=True)
         if secondary_data is None or secondary_data.empty:
             continue  # Skip this ticker if data is unavailable
 
@@ -9542,7 +9712,7 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
             return [], empty_columns, f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.'
 
         # Fetch secondary ticker data
-        secondary_data = fetch_data(secondary_ticker)
+        secondary_data = fetch_data(secondary_ticker, is_secondary=True)
         if secondary_data is None or secondary_data.empty:
             return [], empty_columns, f'No data found for secondary ticker {secondary_ticker}.'
 
@@ -10092,7 +10262,7 @@ def process_console_tickers(ticker_input):
         for ticker in tickers:
             try:
                 # Check if it's a valid ticker first
-                df = fetch_data(ticker)
+                df = fetch_data(ticker, is_secondary=True)
                 if df is None or df.empty:
                     logger.error(f"  ❌ {ticker}: Invalid ticker or no data available")
                     continue
@@ -10205,7 +10375,7 @@ if __name__ == "__main__":
     # Only show startup header once (not in the reloader process)
     import os
     if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
-        # This is the parent process, show the header
+        # Parent process: banner + server info (now Unicode-safe)
         print_startup_banner()
         print_server_info(port=8050)
     

@@ -4,6 +4,38 @@ Logging configuration for spymaster application
 
 import logging
 import sys
+import locale
+import os
+import io
+import ctypes
+
+
+def ensure_utf8_stdio():
+    """
+    Make stdout/stderr UTF-8 across common Windows hosts.
+    - Reconfigure text wrappers (py>=3.7) with errors='replace' to avoid hard failures.
+    - Set console code pages to 65001 when available.
+    No-op on non-Windows.
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+
+
+def _console_supports_unicode():
+    """Check if console supports Unicode characters"""
+    enc = (getattr(sys.stdout, "encoding", None) or locale.getpreferredencoding(False) or "").lower()
+    return "utf" in enc
 
 
 class Colors:
@@ -79,7 +111,11 @@ def print_startup_banner():
 
 def print_server_info(port=8050):
     """Print server startup information"""
-    print(f"{Colors.CYAN}[⚙️] Starting Dash server...{Colors.ENDC}")
-    print(f"{Colors.CYAN}[🌐] Server URL: {Colors.YELLOW}http://127.0.0.1:{port}{Colors.ENDC}")
-    print(f"{Colors.CYAN}[🛑] Stop server: {Colors.YELLOW}Press Ctrl+C{Colors.ENDC}")
-    print(f"{Colors.DIM_GREEN}{'─' * 80}{Colors.ENDC}\n")
+    gear   = "⚙️" if _console_supports_unicode() else "*"
+    globe  = "🌐" if _console_supports_unicode() else "*"
+    stop   = "🛑" if _console_supports_unicode() else "*"
+    line   = "─" if _console_supports_unicode() else "-"
+    print(f"{Colors.CYAN}[{gear}] Starting Dash server...{Colors.ENDC}")
+    print(f"{Colors.CYAN}[{globe}] Server URL: {Colors.YELLOW}http://127.0.0.1:{port}{Colors.ENDC}")
+    print(f"{Colors.CYAN}[{stop}] Stop server: {Colors.YELLOW}Press Ctrl+C{Colors.ENDC}")
+    print(f"{Colors.DIM_GREEN}{line * 80}{Colors.ENDC}\n")
