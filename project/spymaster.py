@@ -2683,14 +2683,16 @@ def log_section(section_name, color=Colors.NEON_GREEN):
     logger.info(section_text)
 
 def log_ticker_section(ticker, action="PROCESSING"):
-    """Special section header for ticker changes"""
-    logger.info("")  # Blank line before
-    ticker_text = (
-        Colors.PURPLE + "✦" * 80 + Colors.ENDC + "\n" +
-        Colors.PURPLE + Colors.BOLD + f"📊 TICKER: {ticker} | {action} 📊".center(80, " ") + Colors.ENDC + "\n" +
-        Colors.PURPLE + "✦" * 80 + Colors.ENDC
+    """Minimal, width-safe banner for ticker changes (no purple/diamonds)."""
+    logger.info("")  # blank line
+    line = "─" * 80
+    header = f"TICKER: {ticker} | {action}"
+    block = (
+        Colors.DIM_GREEN + line + Colors.ENDC + "\n" +
+        Colors.NEON_GREEN + Colors.BOLD + header.center(80, " ") + Colors.ENDC + "\n" +
+        Colors.DIM_GREEN + line + Colors.ENDC
     )
-    logger.info(ticker_text)
+    logger.info(block)
 
 def log_success(message):
     logger.info(Colors.BRIGHT_GREEN + "[✓] " + message + Colors.ENDC)
@@ -2743,21 +2745,35 @@ from tqdm import tqdm as original_tqdm
 
 # Create a wrapper class that preserves all tqdm functionality
 class CustomTqdm(original_tqdm):
+    """Width-safe tqdm with compact format that respects the 80-col print budget."""
     def __init__(self, *args, **kwargs):
-        # Set default parameters for width and ASCII
-        kwargs.setdefault('ncols', 75)  # Reduced to ensure it fits
-        kwargs.setdefault('ascii', True)
-        kwargs.setdefault('leave', True)
-        kwargs.setdefault('bar_format', '{l_bar}{bar}| {n_fmt}/{total_fmt}')  # Simplified format
+        # Hard cap the bar width, and prevent dynamic console resizing.
+        kwargs.setdefault('ncols', 68)                 # leaves room for logger prefix
+        kwargs.setdefault('dynamic_ncols', False)
+        kwargs.setdefault('ascii', True)               # ASCII bars for consistency
+        kwargs.setdefault('leave', True)               # leave final line
+        # Minimal, fixed layout (no giant bar); keep % and counts only.
+        kwargs.setdefault('bar_format', '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}')
         super().__init__(*args, **kwargs)
-    
+
     @staticmethod
     def write(*args, **kwargs):
-        # Preserve the write method
         original_tqdm.write(*args, **kwargs)
 
 # Override tqdm with our custom version
 tqdm = CustomTqdm
+
+# Compact helper that also truncates long descriptions to avoid overflow.
+def tqdm_compact(iterable=None, total=None, desc="", unit=None, **kwargs):
+    desc_short = (desc[:36] + '...') if len(desc) > 37 else desc
+    defaults = dict(ncols=68, ascii=True, dynamic_ncols=False,
+                    bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt}',
+                    leave=True)
+    # Only add unit if it's not None
+    if unit is not None:
+        defaults['unit'] = unit
+    defaults.update(kwargs)
+    return CustomTqdm(iterable=iterable, total=total, desc=desc_short, **defaults)
 
 # ============================================================================
 # CONFIGURATION AND GLOBAL VARIABLES
@@ -3362,7 +3378,7 @@ def precompute_results(ticker, event):
                     chunk_size_sma = 50
                     total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
 
-                    with tqdm(total=total_chunks, desc="Processing SMA chunks", unit="chunk") as pbar:
+                    with tqdm_compact(total=total_chunks, desc="SMA chunks", unit="chunk") as pbar:
                         for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
                             chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
                             sma_dict = {}
@@ -3430,7 +3446,7 @@ def precompute_results(ticker, event):
                 sma_matrix[:, k-1] = df[f'SMA_{k}'].values
 
             pair_count = 0
-            with tqdm(total=num_pair_chunks, desc="Processing SMA pair chunks", unit="chunk") as pbar_pairs:
+            with tqdm_compact(total=num_pair_chunks, desc="SMA pair chunks", unit="chunk") as pbar_pairs:
                 for chunk_idx in range(num_pair_chunks):
                     start_idx = chunk_idx * chunk_size_pairs
                     end_idx = min((chunk_idx + 1) * chunk_size_pairs, total_pairs)
@@ -3559,7 +3575,7 @@ def precompute_results(ticker, event):
             results['start_time'] = master_stopwatch_start
 
             logger.info(f"Saving final results to {pkl_file}")
-            with tqdm(total=1, desc="Saving final results", unit="file", leave=True, position=0) as pbar_save:
+            with tqdm_compact(total=1, desc="Saving results", unit="file") as pbar_save:
                 save_precomputed_results(ticker, results)
 
                 pbar_save.update(1)
@@ -5606,7 +5622,7 @@ def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_sho
 
     logger.info("Calculating cumulative combined capture...")
     with logging_redirect_tqdm():
-        with tqdm(total=len(dates), desc="Calculating cumulative combined captures", unit="day", dynamic_ncols=True, mininterval=0.1, leave=True, position=0) as pbar:
+        with tqdm_compact(total=len(dates), desc="Combined captures", unit="day") as pbar:
             for i in range(len(dates)):
                 current_date = dates[i]
 
@@ -10007,7 +10023,7 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
         from tqdm import tqdm
 
         logger.info(f"Total combinations to process: {len(valid_combinations)}")
-        with tqdm(total=len(valid_combinations), desc="Calculating metrics for combinations") as pbar:
+        with tqdm_compact(total=len(valid_combinations), desc="Combos metrics") as pbar:
             for idx, state_dict in enumerate(valid_combinations):
                 
                 # Get unmuted tickers
