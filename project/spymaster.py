@@ -36,6 +36,155 @@ from dash.exceptions import PreventUpdate
 from bs4 import BeautifulSoup
 import uuid
 import ast
+from datetime import datetime, timedelta, date
+
+# ---- Optional calendar for authoritative NYSE sessions (incl. early closes) ----
+try:
+    import pandas_market_calendars as mcal
+    _HAS_PMC = True
+except Exception:
+    _HAS_PMC = False
+
+# ---- ET tz constant used by market-clock helpers ----
+_ET_TZ = pytz.timezone("US/Eastern")
+
+# --------------------------- Holiday-aware helpers ----------------------------
+def _easter_date(year: int) -> date:
+    """Gregorian Easter (Meeus/Jones/Butcher algorithm)"""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+def _observed(d: date) -> date:
+    """Observed holiday date (Sat -> Fri, Sun -> Mon)."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """n-th weekday (Mon=0..Sun=6) in a month."""
+    first = date(year, month, 1)
+    add = (weekday - first.weekday()) % 7
+    return first + timedelta(days=add + (n - 1) * 7)
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """Last weekday (Mon=0..Sun=6) in a month."""
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    sub = (last.weekday() - weekday) % 7
+    return last - timedelta(days=sub)
+
+def _nyse_full_holidays(year: int) -> set:
+    """Standard NYSE full-day holidays."""
+    h = set()
+    # New Year's Day
+    h.add(_observed(date(year, 1, 1)))
+    # Martin Luther King Jr. Day (3rd Monday in Jan)
+    h.add(_nth_weekday_of_month(year, 1, 0, 3))
+    # Presidents Day (3rd Monday in Feb)
+    h.add(_nth_weekday_of_month(year, 2, 0, 3))
+    # Good Friday (2 days before Easter Sunday)
+    h.add(_easter_date(year) - timedelta(days=2))
+    # Memorial Day (last Monday in May)
+    h.add(_last_weekday_of_month(year, 5, 0))
+    # Juneteenth (June 19, observed)
+    h.add(_observed(date(year, 6, 19)))
+    # Independence Day (July 4, observed)
+    h.add(_observed(date(year, 7, 4)))
+    # Labor Day (1st Monday in September)
+    h.add(_nth_weekday_of_month(year, 9, 0, 1))
+    # Thanksgiving Day (4th Thursday in November)
+    h.add(_nth_weekday_of_month(year, 11, 3, 4))
+    # Christmas Day (Dec 25, observed)
+    h.add(_observed(date(year, 12, 25)))
+    return h
+
+def _nyse_early_close_et(d: date):
+    """
+    Return early close datetime in ET if the given date is a known NYSE early-close day,
+    else None. Typical early closes: day after Thanksgiving, Christmas Eve (if not
+    a holiday), and the trading day before Independence Day when applicable.
+    """
+    fourth_thu = _nth_weekday_of_month(d.year, 11, 3, 4)
+    black_friday = fourth_thu + timedelta(days=1)
+    xmas_eve = date(d.year, 12, 24)
+    july4_actual = date(d.year, 7, 4)
+    day_before_july4 = date(d.year, 7, 3)
+    holidays = _nyse_full_holidays(d.year)
+    early = set()
+    # Day after Thanksgiving (Friday)
+    if black_friday.weekday() < 5 and black_friday not in holidays:
+        early.add(black_friday)
+    # Christmas Eve (weekday, not a full holiday)
+    if xmas_eve.weekday() < 5 and xmas_eve not in holidays:
+        early.add(xmas_eve)
+    # Day before July 4th when July 4 is Tue–Fri (Mon case handled by observed holiday rules)
+    if day_before_july4.weekday() < 5 and day_before_july4 not in holidays and july4_actual.weekday() in (1, 2, 3, 4):
+        early.add(day_before_july4)
+    if d in early:
+        return datetime(d.year, d.month, d.day, 13, 0, tzinfo=_ET_TZ)  # 1:00 PM ET
+    return None
+
+def _session_open_close_et_for_date(d: date):
+    """
+    Return (open_dt_et, close_dt_et) for a given date in ET, or None if closed/holiday.
+    Uses pandas-market-calendars if available, else a rules-based fallback.
+    """
+    # Weekend
+    if d.weekday() >= 5:
+        return None
+    # Authoritative path (includes ad-hoc closures & early closes)
+    if _HAS_PMC:
+        try:
+            cal = mcal.get_calendar("NYSE")
+            sched = cal.schedule(start_date=d, end_date=d)
+            if not sched.empty:
+                o = sched["market_open"].iloc[0].tz_convert(_ET_TZ).to_pydatetime()
+                c = sched["market_close"].iloc[0].tz_convert(_ET_TZ).to_pydatetime()
+                return o, c
+        except Exception:
+            # Fall through to rules-based if calendar fails
+            pass
+    # Rules-based fallback
+    if d in _nyse_full_holidays(d.year):
+        return None
+    open_dt = datetime(d.year, d.month, d.day, 9, 30, tzinfo=_ET_TZ)
+    close_early = _nyse_early_close_et(d)
+    close_dt = close_early or datetime(d.year, d.month, d.day, 16, 0, tzinfo=_ET_TZ)
+    return open_dt, close_dt
+
+def _next_session_open_et(after_et: datetime):
+    """
+    Find the next session open (ET) strictly after the provided ET datetime.
+    """
+    d = after_et.date()
+    # If today has a session and hasn't opened yet, return today's open
+    sess = _session_open_close_et_for_date(d)
+    if sess and after_et < sess[0]:
+        return sess[0]
+    # Otherwise search forward
+    for i in range(1, 370):  # safe upper bound
+        nd = d + timedelta(days=i)
+        sess2 = _session_open_close_et_for_date(nd)
+        if sess2:
+            return sess2[0]
+    return None
 
 # Performance Metrics Utility Class
 class PerformanceMetrics:
@@ -2001,43 +2150,28 @@ class PerformanceMetrics:
     
     @classmethod
     def create_market_countdown_timer(cls):
-        """Create a countdown timer to market close"""
-        from datetime import datetime, timedelta
-        eastern = pytz.timezone('US/Eastern')
-        now = datetime.now(eastern)
-        
-        # Market close time (4:00 PM ET)
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-        
-        # Check if market is closed (after 4 PM or weekend)
-        is_weekend = now.weekday() >= 5
-        is_after_close = now >= market_close
-        
-        if is_weekend or is_after_close:
-            # Calculate time until next market open (9:30 AM)
-            if is_after_close and now.weekday() == 4:  # Friday after close
-                next_open = now + timedelta(days=3)
-            elif is_weekend:
-                days_until_monday = 7 - now.weekday()
-                next_open = now + timedelta(days=days_until_monday)
-            else:
-                next_open = now + timedelta(days=1)
-            
-            next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
-            time_until_open = next_open - now
-            hours = int(time_until_open.total_seconds() // 3600)
-            minutes = int((time_until_open.total_seconds() % 3600) // 60)
-            seconds = int(time_until_open.total_seconds() % 60)
-            
+        """Create a countdown timer to NYSE regular session close, holiday & early-close aware."""
+        now = datetime.now(_ET_TZ)
+        sess = _session_open_close_et_for_date(now.date())
+
+        # If no session (weekend/holiday) OR before today's open => show time until next session open
+        if not sess or now < sess[0]:
+            next_open = sess[0] if (sess and now < sess[0]) else _next_session_open_et(now)
+            if next_open is None:
+                return html.Div()  # Defensive: shouldn't happen, but avoid breaking UI
+            delta = next_open - now
+            hours = int(delta.total_seconds() // 3600)
+            minutes = int((delta.total_seconds() % 3600) // 60)
+            seconds = int(delta.total_seconds() % 60)
             return dbc.Card([
                 dbc.CardBody([
                     html.Div([
                         html.I(className="fas fa-moon fa-2x mb-2", style={"color": "#808080"}),
                         html.H5("MARKET CLOSED", style={"color": "#ff0040", "marginBottom": "10px"}),
-                        html.H3(f"{hours:02d}:{minutes:02d}:{seconds:02d}", 
-                               style={"fontSize": "2rem", "fontFamily": "monospace", "color": "#ff0040"}),
-                        html.P("Until Market Opens (9:30 AM ET)", style={"marginBottom": "5px"}),
-                        html.Small(f"Next: {next_open.strftime('%a %b %d, 9:30 AM ET')}", style={"color": "#808080"})
+                        html.H3(f"{hours:02d}:{minutes:02d}:{seconds:02d}",
+                                style={"fontSize": "2rem", "fontFamily": "monospace", "color": "#ff0040"}),
+                        html.P(f"Until Market Opens ({next_open.strftime('%#I:%M %p' if os.name == 'nt' else '%-I:%M %p')} ET)", style={"marginBottom": "5px"}),
+                        html.Small(f"Next: {next_open.strftime('%a %b %d, %#I:%M %p ET' if os.name == 'nt' else '%a %b %d, %-I:%M %p ET')}", style={"color": "#808080"})
                     ], style={"textAlign": "center"})
                 ])
             ], style={
@@ -2045,43 +2179,39 @@ class PerformanceMetrics:
                 "border": "2px solid #ff0040",
                 "marginBottom": "20px"
             })
+
+        # Session exists and has opened—count down to today's (possibly early) close
+        market_open, market_close = sess
+        delta = market_close - now
+        hours = int(delta.total_seconds() // 3600)
+        minutes = int((delta.total_seconds() % 3600) // 60)
+        seconds = int(delta.total_seconds() % 60)
+
+        # Urgency coloring
+        if hours == 0 and minutes < 30:
+            color = "#ff0040"; icon = "fa-exclamation-triangle"; urgency = "CLOSING SOON"
+        elif hours < 2:
+            color = "#ff8800"; icon = "fa-clock"; urgency = "TIME SENSITIVE"
         else:
-            # Calculate time until market close
-            time_until_close = market_close - now
-            hours = int(time_until_close.total_seconds() // 3600)
-            minutes = int((time_until_close.total_seconds() % 3600) // 60)
-            seconds = int(time_until_close.total_seconds() % 60)
-            
-            # Determine urgency color
-            if hours == 0 and minutes < 30:
-                color = "#ff0040"  # Red for last 30 minutes
-                icon = "fa-exclamation-triangle"
-                urgency = "CLOSING SOON"
-            elif hours < 2:
-                color = "#ff8800"  # Orange for last 2 hours
-                icon = "fa-clock"
-                urgency = "TIME SENSITIVE"
-            else:
-                color = "#00ff41"  # Green for normal trading hours
-                icon = "fa-chart-line"
-                urgency = "MARKET OPEN"
-            
-            return dbc.Card([
-                dbc.CardBody([
-                    html.Div([
-                        html.I(className=f"fas {icon} fa-2x mb-2", style={"color": color}),
-                        html.H5(urgency, style={"color": color, "marginBottom": "10px"}),
-                        html.H3(f"{hours:02d}:{minutes:02d}:{seconds:02d}", 
-                               id="countdown-display",
-                               style={"fontSize": "2rem", "fontFamily": "monospace", "color": color}),
-                        html.P("Until Market Close (4:00 PM ET)", style={"marginBottom": "0"})
-                    ], style={"textAlign": "center"})
-                ])
-            ], style={
-                "backgroundColor": f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)",
-                "border": f"2px solid {color}",
-                "marginBottom": "20px"
-            }, id="countdown-timer-card")
+            color = "#00ff41"; icon = "fa-chart-line"; urgency = "MARKET OPEN"
+
+        close_label = "1:00 PM ET (Early Close)" if market_close.hour == 13 else "4:00 PM ET"
+        return dbc.Card([
+            dbc.CardBody([
+                html.Div([
+                    html.I(className=f"fas {icon} fa-2x mb-2", style={"color": color}),
+                    html.H5(urgency, style={"color": color, "marginBottom": "10px"}),
+                    html.H3(f"{hours:02d}:{minutes:02d}:{seconds:02d}",
+                            id="countdown-display",
+                            style={"fontSize": "2rem", "fontFamily": "monospace", "color": color}),
+                    html.P(f"Until Market Close ({close_label})", style={"marginBottom": "0"})
+                ], style={"textAlign": "center"})
+            ])
+        ], style={
+            "backgroundColor": f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)",
+            "border": f"2px solid {color}",
+            "marginBottom": "20px"
+        }, id="countdown-timer-card")
     
     @classmethod
     def create_price_zone_visualization(cls, current_price, thresholds):
@@ -2854,44 +2984,38 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
             logger.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
             _logged_primary_fetch_success.add(ticker)
             
-            # Check if we should add today's date
-            today = pd.Timestamp.now().normalize().tz_localize(None)
+            # Check if we should add today's date (ET trading day only)
+            et_now = pd.Timestamp.now(tz=_ET_TZ)
+            today_et_date = et_now.date()
+            today = pd.Timestamp(today_et_date)  # naive TS aligned to ET date
             
             # Different handling for crypto vs traditional assets
             if is_crypto_ticker(ticker):
                 logger.info(f"Crypto ticker {ticker} detected - allowing 24/7 trading")
                 if len(df) > 0 and df.index[-1] < today:
-                    last_adj_close = df['Close'].iloc[-1]  # Already using adjusted price if available
-                    df.loc[today, 'Close'] = last_adj_close
+                    last_close = df['Close'].iloc[-1]  # Already using adjusted price if available
+                    df.loc[today, 'Close'] = last_close
                     logger.info(f"Added current day {today} to crypto data")
             else:
-                # Only add today if:
-                # 1. It's a weekday
-                # 2. It's not a future date
-                # 3. The last date in df is earlier than today
-                # 4. The time is during market hours (9:30 AM - 4:00 PM ET)
-                if (len(df) > 0 and 
-                    df.index[-1] < today and 
-                    today.weekday() < 5):  # 0-4 represents Monday-Friday
-                    
-                    # Convert to Eastern Time for market hours check
-                    et_tz = pytz.timezone('US/Eastern')
-                    et_now = pd.Timestamp.now(tz=et_tz)
-                    market_open = et_now.replace(hour=9, minute=30)
-                    market_close = et_now.replace(hour=16, minute=0)
-                    
-                    # Only add today's date if we're during market hours
-                    if market_open <= et_now <= market_close:
-                        last_adj_close = df['Close'].iloc[-1]  # Already using adjusted price if available
-                        df.loc[today, 'Close'] = last_adj_close
-                        logger.debug(f"Added current market day {today} to data")
+                # Only add today's date if:
+                # 1) It's a valid NYSE session day (not weekend/holiday)
+                # 2) Data is behind today
+                # 3) We are currently within the session window (regular/early close)
+                if len(df) > 0 and df.index[-1] < today:
+                    sess = _session_open_close_et_for_date(today_et_date)
+                    if sess:
+                        open_et, close_et = sess
+                        if open_et <= et_now.to_pydatetime() <= close_et:
+                            last_close = df['Close'].iloc[-1]
+                            df.loc[today, 'Close'] = last_close
+                            logger.debug(f"Added current market day {today} to data")
+                        else:
+                            logger.debug("Outside today's session window; not adding today's date")
                     else:
-                        logger.debug("Current time is outside market hours, not adding today's date")
+                        logger.debug("Today is not a NYSE trading session (holiday/weekend); not adding date")
                 else:
-                    if today.weekday() >= 5:
-                        logger.debug("Current day is weekend, not adding today's date")
-                    elif df.index[-1] >= today:
-                        logger.debug("Data already includes the latest date")
+                    if df.index[-1] >= today:
+                        logger.debug("Data already at latest date; no action")
                     else:
                         logger.debug("Conditions not met for adding current date")      
         return df
@@ -3646,59 +3770,58 @@ app.layout = dbc.Container(
                                 dbc.CardBody([
                                     html.Div([
                                         html.I(className="fas fa-rocket fa-3x mb-3", style={"color": "#80ff00"}),
-                                        html.H4("Get Started in 3 Easy Steps", className="mb-4")
+                                        html.H4("Get Started (Recommended Workflow)", className="mb-4")
                                     ], className="text-center"),
                                     
-                                    # Step 1
+                                    # Step 1: onepass.py
                                     dbc.Card([
                                         dbc.CardBody([
                                             html.H5([
-                                                html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
-                                                "Step 1: Find Signal Relationships"
+                                                html.I(className="fas fa-database me-2", style={"color": "#00ff41"}),
+                                                "Step 1: Build Signal Libraries (onepass.py)"
                                             ]),
-                                            html.P("Run impactsearch.py to discover which tickers have the strongest impact on your target."),
-                                            dbc.Button([
-                                                html.I(className="fas fa-external-link-alt me-2"),
-                                                "Open Impact Search"
-                                            ], href="http://127.0.0.1:8051/", target="_blank", color="success", size="sm"),
+                                            html.P("Run onepass.py first. It builds the signal libraries used by the rest of the tools."),
                                             dbc.Alert([
                                                 html.I(className="fas fa-lightbulb me-2"),
-                                                "Pro tip: Look for both positive AND negative correlations!"
+                                                "Tip: Keep the libraries current when you add or remove tickers."
                                             ], color="info", className="mt-2 py-2")
                                         ])
                                     ], className="mb-3", style={"border": "2px solid #80ff00"}),
                                     
-                                    # Step 2
+                                    # Step 2: impactsearch.py
                                     dbc.Card([
                                         dbc.CardBody([
                                             html.H5([
-                                                html.I(className="fas fa-tasks me-2", style={"color": "#00ff41"}),
-                                                "Step 2: Batch Process Your Tickers"
+                                                html.I(className="fas fa-search me-2", style={"color": "#00ff41"}),
+                                                "Step 2: Explore Single-Primary Effects (impactsearch.py)"
                                             ]),
-                                            html.P("Load your top correlated tickers into the Batch Process section."),
-                                            html.Div([
-                                                dbc.InputGroup([
-                                                    dbc.InputGroupText(html.I(className="fas fa-copy")),
-                                                    dbc.Input(value="AAPL, MSFT, GOOGL, AMZN, TSLA", id="example-tickers", readonly=True),
-                                                    dbc.Button("Copy", id="copy-tickers-btn", color="secondary", size="sm")
-                                                ], size="sm")
-                                            ], className="mt-2")
+                                            html.P("Use the signal libraries from onepass.py to see how Primary tickers impact a Secondary ticker."),
+                                            dbc.Button([
+                                                html.I(className="fas fa-external-link-alt me-2"),
+                                                "Open Impact Search"
+                                            ], href="http://127.0.0.1:8051/", target="_blank", color="success", size="sm")
                                         ])
                                     ], className="mb-3", style={"border": "2px solid #80ff00"}),
                                     
-                                    # Step 3
+                                    # Step 3: matrix.py (under development)
+                                    dbc.Card([
+                                        dbc.CardBody([
+                                            html.H5([
+                                                html.I(className="fas fa-layer-group me-2", style={"color": "#00ff41"}),
+                                                "Step 3: Test Multi-Primary Effects (matrix.py)"
+                                            ]),
+                                            html.P("(Under development) Combine MULTIPLE Primary tickers to see the effect on one Secondary ticker.")
+                                        ])
+                                    ], className="mb-3", style={"border": "2px solid #80ff00"}),
+
+                                    # Step 4: spymaster.py
                                     dbc.Card([
                                         dbc.CardBody([
                                             html.H5([
                                                 html.I(className="fas fa-magic me-2", style={"color": "#00ff41"}),
-                                                "Step 3: Optimize & Analyze"
+                                                "Step 4: Validate & Optimize (spymaster.py)"
                                             ]),
-                                            html.P("Run the Signal Optimization to find the best ticker combinations."),
-                                            html.Div([
-                                                dbc.Progress(value=33, label="Batch Process", color="success", style={"height": "20px"}),
-                                                dbc.Progress(value=33, label="Optimize", color="warning", style={"height": "20px"}),
-                                                dbc.Progress(value=34, label="Analyze", color="info", style={"height": "20px"})
-                                            ], className="mt-2")
+                                            html.P("Open spymaster.py. Batch-process your focus list, run the Signal Optimization Engine, click a promising row, and use the Multi-Primary Signal Aggregator to test additional Secondary tickers.")
                                         ])
                                     ], className="mb-3", style={"border": "2px solid #80ff00"})
                                 ])
@@ -3717,58 +3840,55 @@ app.layout = dbc.Container(
                                         dbc.AccordionItem([
                                             html.Div([
                                                 html.I(className="fas fa-database me-2", style={"color": "#80ff00"}),
-                                                html.Strong("Data Discovery Phase")
+                                                html.Strong("Phase 1: Build Libraries (onepass.py)")
                                             ]),
                                             html.Ol([
-                                                html.Li("Run impactsearch.py in a separate console"),
-                                                html.Li("Enter your target ticker as the Secondary Ticker"),
-                                                html.Li("Enter potential signal generators as Primary Tickers"),
-                                                html.Li("Review the generated Excel file for top correlations")
+                                                html.Li("Run onepass.py to build/refresh signal libraries"),
+                                                html.Li("Make sure your coverage list reflects what you intend to study")
                                             ]),
-                                            dbc.Alert("Tip: Include both sector leaders and inverse ETFs for comprehensive coverage", color="success", className="py-2")
-                                        ], title="Phase 1: Impact Search"),
+                                            dbc.Alert("Keep libraries fresh whenever you add/remove tickers.", color="success", className="py-2")
+                                        ], title="Phase 1: onepass.py"),
                                         
                                         dbc.AccordionItem([
                                             html.Div([
-                                                html.I(className="fas fa-cogs me-2", style={"color": "#80ff00"}),
-                                                html.Strong("Data Preparation")
+                                                html.I(className="fas fa-search me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Phase 2: Explore Single-Primary Effects (impactsearch.py)")
                                             ]),
                                             html.Ol([
-                                                html.Li("Navigate to Ticker Batch Process section"),
-                                                html.Li("Input your selected tickers (comma-separated)"),
-                                                html.Li("Click 'Process Tickers' and wait for completion"),
-                                                html.Li("Verify all tickers show 'Ready' status")
+                                                html.Li("Open impactsearch.py (uses onepass libraries)"),
+                                                html.Li("Set your Secondary ticker"),
+                                                html.Li("Supply candidate Primary tickers"),
+                                                html.Li("Review top impacts (positive and negative)")
                                             ]),
-                                            dbc.Alert("Important: This step prevents timeouts during optimization", color="warning", className="py-2")
-                                        ], title="Phase 2: Batch Processing"),
+                                            dbc.Alert("Include sector leaders and inverses for coverage.", color="info", className="py-2")
+                                        ], title="Phase 2: impactsearch.py"),
                                         
                                         dbc.AccordionItem([
                                             html.Div([
-                                                html.I(className="fas fa-chart-line me-2", style={"color": "#80ff00"}),
-                                                html.Strong("Signal Optimization")
+                                                html.I(className="fas fa-layer-group me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Phase 3: Multi-Primary (matrix.py, under development)")
                                             ]),
                                             html.Ol([
-                                                html.Li("Go to Automated Signal Optimization"),
-                                                html.Li("Enter your target as Secondary Ticker"),
-                                                html.Li("Enter signal generators as Primary Tickers"),
-                                                html.Li("Click 'Optimize Signals' and analyze results")
+                                                html.Li("Combine MULTIPLE Primary tickers"),
+                                                html.Li("Measure their impact on one Secondary")
                                             ]),
-                                            dbc.Alert("Look for: High Sharpe Ratio + Statistical Significance + 30+ Trigger Days", color="info", className="py-2")
-                                        ], title="Phase 3: Optimization"),
+                                            dbc.Alert("This is a work in progress but already useful for scenario thinking.", color="warning", className="py-2")
+                                        ], title="Phase 3: matrix.py"),
                                         
                                         dbc.AccordionItem([
                                             html.Div([
-                                                html.I(className="fas fa-microscope me-2", style={"color": "#80ff00"}),
-                                                html.Strong("Results Validation")
+                                                html.I(className="fas fa-magic me-2", style={"color": "#80ff00"}),
+                                                html.Strong("Phase 4: Validate & Optimize (spymaster.py)")
                                             ]),
                                             html.Ol([
-                                                html.Li("Click on promising combinations in the results table"),
-                                                html.Li("This auto-populates the Multi-Primary Aggregator"),
-                                                html.Li("Test with additional secondary tickers"),
-                                                html.Li("Verify consistency across different market conditions")
+                                                html.Li("Batch Process your list (precompute to avoid timeouts)"),
+                                                html.Li("Run the Signal Optimization Engine"),
+                                                html.Li("Click a promising row → deep dive view opens"),
+                                                html.Li("Use the Multi-Primary Signal Aggregator to test additional Secondary tickers"),
+                                                html.Li("Confirm statistical strength and robustness across regimes")
                                             ]),
-                                            dbc.Alert("Remember: Past performance ≠ future results. Always validate!", color="danger", className="py-2")
-                                        ], title="Phase 4: Validation")
+                                            dbc.Alert("Look for: 30+ Trigger Days, significant p-value, and solid Sharpe.", color="info", className="py-2")
+                                        ], title="Phase 4: spymaster.py")
                                     ], start_collapsed=True)
                                 ])
                             ),
@@ -4383,96 +4503,82 @@ app.layout = dbc.Container(
                                     style_cell={
                                         'backgroundColor': 'black',
                                         'color': '#80ff00',
-                                        'textAlign': 'left',
-                                        'minWidth': '50px', 
-                                        'width': '100px', 
-                                        'maxWidth': '180px',
+                                        'textAlign': 'center',
+                                        'minWidth': '50px',
+                                        'width': '75px',
+                                        'maxWidth': '100px',
                                         'whiteSpace': 'normal',
-                                        'border': '1px solid #80ff00'
+                                        'border': '1px solid #80ff00',
+                                        'fontSize': '11px',
+                                        'padding': '4px 2px'
                                     },
                                     style_header={
                                         'backgroundColor': 'black',
                                         'color': '#80ff00',
                                         'fontWeight': 'bold',
-                                        'border': '2px solid #80ff00'
+                                        'border': '2px solid #80ff00',
+                                        'fontSize': '10px',
+                                        'padding': '4px 2px'
                                     },
                                     style_data_conditional=[
                                         {
                                             'if': {'row_index': 'odd'},
                                             'backgroundColor': 'rgba(0, 255, 0, 0.05)'
                                         },
-                                        # Color code Win Ratio column using centralized thresholds
+                                        # Color code Win % column
                                         {
                                             'if': {
-                                                'filter_query': '{{Win Ratio (%)}} > {}'.format(PerformanceMetrics.THRESHOLDS['win_rate']['good']),
-                                                'column_id': 'Win Ratio (%)'
+                                                'filter_query': '{{Win %}} > {}'.format(55),
+                                                'column_id': 'Win %'
                                             },
-                                            'color': PerformanceMetrics.COLORS['excellent'],
+                                            'color': '#00ff00',  # Bright green
                                             'fontWeight': 'bold'
                                         },
                                         {
                                             'if': {
-                                                'filter_query': '{{Win Ratio (%)}} > {} && {{Win Ratio (%)}} <= {}'.format(
-                                                    PerformanceMetrics.THRESHOLDS['win_rate']['warning'],
-                                                    PerformanceMetrics.THRESHOLDS['win_rate']['good']
-                                                ),
-                                                'column_id': 'Win Ratio (%)'
+                                                'filter_query': '{{Win %}} >= {} && {{Win %}} <= {}'.format(50, 55),
+                                                'column_id': 'Win %'
                                             },
-                                            'color': PerformanceMetrics.COLORS['moderate']
+                                            'color': '#ffff00'  # Yellow
                                         },
                                         {
                                             'if': {
-                                                'filter_query': '{{Win Ratio (%)}} <= {}'.format(PerformanceMetrics.THRESHOLDS['win_rate']['warning']),
-                                                'column_id': 'Win Ratio (%)'
+                                                'filter_query': '{{Win %}} < {}'.format(50),
+                                                'column_id': 'Win %'
                                             },
-                                            'color': PerformanceMetrics.COLORS['poor']
+                                            'color': '#ff6666'  # Red
                                         },
-                                        # Color code Total Capture column using centralized thresholds
+                                        # Highlight significant metrics
+                                        {
+                                            'if': {'column_id': 'Sig 95%', 'filter_query': '{Sig 95%} = Yes'},
+                                            'boxShadow': '0 0 8px rgba(128, 255, 0, 0.4)',
+                                            'fontWeight': 'bold'
+                                        },
+                                        {
+                                            'if': {'column_id': 'Sig 99%', 'filter_query': '{Sig 99%} = Yes'},
+                                            'boxShadow': '0 0 12px rgba(128, 255, 0, 0.6)',
+                                            'fontWeight': 'bold'
+                                        },
+                                        # Color code Sharpe column
                                         {
                                             'if': {
-                                                'filter_query': '{{Total Capture (%)}} > {}'.format(PerformanceMetrics.THRESHOLDS['total_capture']['good']),
-                                                'column_id': 'Total Capture (%)'
+                                                'filter_query': '{Sharpe} > 1',
+                                                'column_id': 'Sharpe'
                                             },
-                                            'color': PerformanceMetrics.COLORS['excellent'],
+                                            'color': '#00ff00',
                                             'fontWeight': 'bold'
                                         },
                                         {
                                             'if': {
-                                                'filter_query': '{{Total Capture (%)}} > {} && {{Total Capture (%)}} <= {}'.format(
-                                                    PerformanceMetrics.THRESHOLDS['total_capture']['warning'],
-                                                    PerformanceMetrics.THRESHOLDS['total_capture']['good']
-                                                ),
-                                                'column_id': 'Total Capture (%)'
-                                            },
-                                            'color': PerformanceMetrics.COLORS['moderate']
-                                        },
-                                        {
-                                            'if': {
-                                                'filter_query': '{{Total Capture (%)}} <= {}'.format(PerformanceMetrics.THRESHOLDS['total_capture']['warning']),
-                                                'column_id': 'Total Capture (%)'
-                                            },
-                                            'color': PerformanceMetrics.COLORS['poor']
-                                        },
-                                        # Color code Sharpe Ratio column using centralized thresholds
-                                        {
-                                            'if': {
-                                                'filter_query': '{{Sharpe Ratio}} > {}'.format(PerformanceMetrics.THRESHOLDS['sharpe']['moderate']),
-                                                'column_id': 'Sharpe Ratio'
-                                            },
-                                            'color': PerformanceMetrics.COLORS['excellent'],
-                                            'fontWeight': 'bold'
-                                        },
-                                        {
-                                            'if': {
-                                                'filter_query': '{Sharpe Ratio} > 0 && {Sharpe Ratio} <= 1',
-                                                'column_id': 'Sharpe Ratio'
+                                                'filter_query': '{Sharpe} > 0 && {Sharpe} <= 1',
+                                                'column_id': 'Sharpe'
                                             },
                                             'color': '#ffff00'
                                         },
                                         {
                                             'if': {
-                                                'filter_query': '{Sharpe Ratio} <= 0',
-                                                'column_id': 'Sharpe Ratio'
+                                                'filter_query': '{Sharpe} <= 0',
+                                                'column_id': 'Sharpe'
                                             },
                                             'color': '#ff0040'
                                         },
@@ -4751,23 +4857,63 @@ app.layout = dbc.Container(
                                                 style_cell={
                                                     'backgroundColor': 'black',
                                                     'color': '#80ff00',
-                                                    'textAlign': 'left',
-                                                    'minWidth': '50px', 
-                                                    'width': '100px', 
-                                                    'maxWidth': '180px',
+                                                    'textAlign': 'center',
+                                                    'minWidth': '56px',
+                                                    'width': '86px',
+                                                    'maxWidth': '110px',
                                                     'whiteSpace': 'normal',
-                                                    'border': '1px solid #80ff00'
+                                                    'border': '1px solid #80ff00',
+                                                    'fontSize': '11px',
+                                                    'padding': '6px 4px'
                                                 },
                                                 style_header={
                                                     'backgroundColor': 'black',
                                                     'color': '#80ff00',
                                                     'fontWeight': 'bold',
-                                                    'border': '2px solid #80ff00'
+                                                    'border': '2px solid #80ff00',
+                                                    'fontSize': '10px',
+                                                    'padding': '6px 4px'
                                                 },
-                                                style_data_conditional=[{
-                                                    'if': {'row_index': 'odd'},
-                                                    'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                                                }],
+                                                style_data_conditional=[
+                                                    {
+                                                        'if': {'row_index': 'odd'},
+                                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                                    },
+                                                    # Color code Win % column
+                                                    {
+                                                        'if': {
+                                                            'filter_query': '{{Win %}} > {}'.format(55),
+                                                            'column_id': 'Win %'
+                                                        },
+                                                        'color': '#00ff00',  # Bright green
+                                                        'fontWeight': 'bold'
+                                                    },
+                                                    {
+                                                        'if': {
+                                                            'filter_query': '{{Win %}} >= {} && {{Win %}} <= {}'.format(50, 55),
+                                                            'column_id': 'Win %'
+                                                        },
+                                                        'color': '#ffff00'  # Yellow
+                                                    },
+                                                    {
+                                                        'if': {
+                                                            'filter_query': '{{Win %}} < {}'.format(50),
+                                                            'column_id': 'Win %'
+                                                        },
+                                                        'color': '#ff6666'  # Red
+                                                    },
+                                                    # Highlight significant metrics
+                                                    {
+                                                        'if': {'column_id': 'Sig 95%', 'filter_query': '{Sig 95%} = Yes'},
+                                                        'boxShadow': '0 0 8px rgba(128, 255, 0, 0.4)',
+                                                        'fontWeight': 'bold'
+                                                    },
+                                                    {
+                                                        'if': {'column_id': 'Sig 99%', 'filter_query': '{Sig 99%} = Yes'},
+                                                        'boxShadow': '0 0 12px rgba(128, 255, 0, 0.6)',
+                                                        'fontWeight': 'bold'
+                                                    }
+                                                ],
                                             )
                                         ])
                                     ], className='mt-3')
@@ -4957,19 +5103,19 @@ app.layout = dbc.Container(
                                             id='optimization-results-table',
                                             columns=[
                                                 {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
-                                                {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
+                                                {'name': 'Triggers', 'id': 'Triggers', 'type': 'numeric'},
                                                 {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
                                                 {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
-                                                {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
-                                                {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
-                                                {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
-                                                {'name': 't-Statistic', 'id': 't-Statistic'},
-                                                {'name': 'p-Value', 'id': 'p-Value'},
-                                                {'name': 'Significant 90%', 'id': 'Significant 90%'},
-                                                {'name': 'Significant 95%', 'id': 'Significant 95%'},
-                                                {'name': 'Significant 99%', 'id': 'Significant 99%'},
-                                                {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
-                                                {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
+                                                {'name': 'Win %', 'id': 'Win %', 'type': 'numeric'},
+                                                {'name': 'StdDev %', 'id': 'StdDev %', 'type': 'numeric'},
+                                                {'name': 'Sharpe', 'id': 'Sharpe', 'type': 'numeric'},
+                                                {'name': 't', 'id': 't'},
+                                                {'name': 'p', 'id': 'p'},
+                                                {'name': 'Sig 90%', 'id': 'Sig 90%'},
+                                                {'name': 'Sig 95%', 'id': 'Sig 95%'},
+                                                {'name': 'Sig 99%', 'id': 'Sig 99%'},
+                                                {'name': 'Avg Cap %', 'id': 'Avg Cap %', 'type': 'numeric'},
+                                                {'name': 'Total %', 'id': 'Total %', 'type': 'numeric'}
                                             ],
                                             data=[],
                                             sort_action='custom',
@@ -4988,18 +5134,22 @@ app.layout = dbc.Container(
                                             style_cell={
                                                 'backgroundColor': 'black',
                                                 'color': '#80ff00',
-                                                'textAlign': 'left',
-                                                'minWidth': '50px', 
-                                                'width': '100px', 
-                                                'maxWidth': '180px',
+                                                'textAlign': 'center',
+                                                'minWidth': '56px',
+                                                'width': '86px',
+                                                'maxWidth': '110px',
                                                 'whiteSpace': 'normal',
-                                                'border': '1px solid #80ff00'
+                                                'border': '1px solid #80ff00',
+                                                'fontSize': '11px',
+                                                'padding': '6px 4px'
                                             },
                                             style_header={
                                                 'backgroundColor': 'black',
                                                 'color': '#80ff00',
                                                 'fontWeight': 'bold',
-                                                'border': '2px solid #80ff00'
+                                                'border': '2px solid #80ff00',
+                                                'fontSize': '10px',
+                                                'padding': '6px 4px'
                                             },
                                             style_data_conditional=[
                                                 {
@@ -7315,10 +7465,10 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             
         # Build one-row data payload with required ordering/format
         master_snapshot_columns = [
-            'Status','Ticker','Trigger Days','Wins','Losses','Win Ratio (%)',
-            'Std Dev (%)','Sharpe Ratio','t-Statistic','p-Value',
-            'Significant 90%','Significant 95%','Significant 99%',
-            'Avg Daily Capture (%)','Total Capture (%)'
+            'Status','Ticker','Triggers','Wins','Losses','Win %',
+            'StdDev %','Sharpe','t','p',
+            'Sig 90%','Sig 95%','Sig 99%',
+            'Avg Cap %','Total %'
         ]
         
         # Format trigger days with comma separator
@@ -7327,104 +7477,81 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         master_snapshot_row = {
             'Status': status_icon,
             'Ticker': ticker,
-            'Trigger Days': formatted_trigger_days,
+            'Triggers': formatted_trigger_days,
             'Wins': f"{int(wins):,}" if isinstance(wins, (int, float)) else "0",
             'Losses': f"{int(losses):,}" if isinstance(losses, (int, float)) else "0",
-            'Win Ratio (%)': f"{float(win_ratio):.2f}" if win_ratio is not None else "0.00",
-            'Std Dev (%)': f"{float(std_dev):.4f}" if std_dev is not None else "0.0000",
-            'Sharpe Ratio': f"{float(sharpe_ratio):.2f}" if sharpe_ratio is not None else "0.00",
-            't-Statistic': f"{float(t_statistic):.4f}" if t_statistic is not None else "N/A",
-            'p-Value': f"{float(p_value):.4f}" if p_value is not None else "N/A",
-            'Significant 90%': 'Yes' if (p_value is not None and p_value < 0.10) else 'No',
-            'Significant 95%': 'Yes' if (p_value is not None and p_value < 0.05) else 'No',
-            'Significant 99%': 'Yes' if (p_value is not None and p_value < 0.01) else 'No',
-            'Avg Daily Capture (%)': f"{float(avg_daily_capture):.4f}" if avg_daily_capture is not None else "0.0000",
-            'Total Capture (%)': f"{float(total_capture):.2f}" if total_capture is not None else "0.00"
+            'Win %': f"{float(win_ratio):.2f}" if win_ratio is not None else "0.00",
+            'StdDev %': f"{float(std_dev):.4f}" if std_dev is not None else "0.0000",
+            'Sharpe': f"{float(sharpe_ratio):.2f}" if sharpe_ratio is not None else "0.00",
+            't': f"{float(t_statistic):.4f}" if t_statistic is not None else "N/A",
+            'p': f"{float(p_value):.4f}" if p_value is not None else "N/A",
+            'Sig 90%': 'Yes' if (p_value is not None and p_value < 0.10) else 'No',
+            'Sig 95%': 'Yes' if (p_value is not None and p_value < 0.05) else 'No',
+            'Sig 99%': 'Yes' if (p_value is not None and p_value < 0.01) else 'No',
+            'Avg Cap %': f"{float(avg_daily_capture):.4f}" if avg_daily_capture is not None else "0.0000",
+            'Total %': f"{float(total_capture):.2f}" if total_capture is not None else "0.00"
         }
         
         master_metrics_table = html.Div(
             [
-                html.H3([
-                    "Master Strategy Snapshot",
-                    html.Span("ⓘ", 
-                             id="master-snapshot-info",
-                             style={"cursor": "help", "fontSize": "0.9em", "marginLeft": "8px"},
-                             **{"aria-label": "What these metrics mean"})
-                ], className="mb-2", style={"color": "#80ff00"}),
-                dbc.Tooltip(
-                    [
-                        html.Div("What this shows:", style={"fontWeight": "bold", "marginBottom": "4px"}),
-                        html.Ul([
-                            html.Li("Trigger Days – days a trade was active (Buy/Short)"),
-                            html.Li("Wins / Losses – count of completed trades with +/− P&L"),
-                            html.Li("Win Ratio – Wins ÷ (Wins + Losses), %"),
-                            html.Li("Std Dev – daily return variability, %"),
-                            html.Li("Sharpe – risk-adjusted return (higher is better)"),
-                            html.Li("t-Statistic / p-Value – significance of Avg Daily Capture"),
-                            html.Li("Significant 90/95/99 – p < 0.10 / 0.05 / 0.01 flags"),
-                            html.Li("Avg Daily Capture – mean daily edge, %"),
-                            html.Li("Total Capture – cumulative edge over the period, %"),
-                        ], style={"marginBottom": 0})
-                    ],
-                    target="master-snapshot-info",
-                    placement="right",
-                    autohide=True
-                ),
+                html.H3("Master Strategy Snapshot", className="mb-2", style={"color": "#80ff00"}),
                 dash_table.DataTable(
                     id='master-strategy-snapshot',
                     columns=[{'name': c, 'id': c} for c in master_snapshot_columns],
                     data=[master_snapshot_row],
                     style_table={'overflowX': 'auto', 'backgroundColor': 'black'},
                     style_cell={
-                        'backgroundColor': 'black', 
+                        'backgroundColor': 'black',
                         'color': '#80ff00',
                         'textAlign': 'center',
-                        'minWidth': '60px', 
-                        'width': '100px', 
-                        'maxWidth': '150px',
-                        'whiteSpace': 'normal', 
+                        'minWidth': '56px',
+                        'width': '86px',
+                        'maxWidth': '110px',
+                        'whiteSpace': 'normal',
                         'border': '1px solid #80ff00',
-                        'fontSize': '12px'
+                        'fontSize': '11px',
+                        'padding': '6px 4px'
                     },
                     style_header={
-                        'backgroundColor': 'black', 
+                        'backgroundColor': 'black',
                         'color': '#80ff00',
-                        'fontWeight': 'bold', 
+                        'fontWeight': 'bold',
                         'border': '2px solid #80ff00',
-                        'fontSize': '11px'
+                        'fontSize': '10px',
+                        'padding': '6px 4px'
                     },
                     style_data_conditional=[
                         # Highlight significant metrics with subtle glow
                         {
-                            'if': {'column_id': 'Significant 95%', 'filter_query': '{Significant 95%} = Yes'},
+                            'if': {'column_id': 'Sig 95%', 'filter_query': '{Sig 95%} = Yes'},
                             'boxShadow': '0 0 8px rgba(128, 255, 0, 0.4)',
                             'fontWeight': 'bold'
                         },
                         {
-                            'if': {'column_id': 'Significant 99%', 'filter_query': '{Significant 99%} = Yes'},
+                            'if': {'column_id': 'Sig 99%', 'filter_query': '{Sig 99%} = Yes'},
                             'boxShadow': '0 0 12px rgba(128, 255, 0, 0.6)',
                             'fontWeight': 'bold'
                         },
                         # Color code Win Ratio using existing thresholds
                         {
                             'if': {
-                                'filter_query': '{{Win Ratio (%)}} > {}'.format(55),  # Good threshold
-                                'column_id': 'Win Ratio (%)'
+                                'filter_query': '{{Win %}} > {}'.format(55),
+                                'column_id': 'Win %'
                             },
                             'color': '#00ff00',  # Bright green
                             'fontWeight': 'bold'
                         },
                         {
                             'if': {
-                                'filter_query': '{{Win Ratio (%)}} >= {} && {{Win Ratio (%)}} <= {}'.format(50, 55),
-                                'column_id': 'Win Ratio (%)'
+                                'filter_query': '{{Win %}} >= {} && {{Win %}} <= {}'.format(50, 55),
+                                'column_id': 'Win %'
                             },
                             'color': '#ffff00'  # Yellow
                         },
                         {
                             'if': {
-                                'filter_query': '{{Win Ratio (%)}} < {}'.format(50),
-                                'column_id': 'Win Ratio (%)'
+                                'filter_query': '{{Win %}} < {}'.format(50),
+                                'column_id': 'Win %'
                             },
                             'color': '#ff6666'  # Red
                         },
@@ -8752,7 +8879,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
 
             # Calculate metrics
             trigger_days = int((buy_mask | short_mask).sum())
-            metrics = {'Ticker': ticker, 'Trigger Days': trigger_days}
+            metrics = {'Ticker': ticker, 'Triggers': trigger_days}
 
             if trigger_days > 0:
                 signal_captures = daily_captures[buy_mask | short_mask]
@@ -8796,30 +8923,37 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 metrics.update({
                     'Wins': wins,
                     'Losses': losses,
-                    'Win Ratio (%)': win_ratio,
-                    'Std Dev (%)': std_dev,
-                    'Sharpe Ratio': sharpe_ratio,
-                    't-Statistic': t_statistic if t_statistic is not None else 'N/A',
-                    'p-Value': p_value if p_value is not None else 'N/A',
-                    'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                    'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                    'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                    'Avg Daily Capture (%)': avg_daily_capture,
-                    'Total Capture (%)': total_capture
+                    'Win %': win_ratio,
+                    'StdDev %': std_dev,
+                    'Sharpe': sharpe_ratio,
+                    't': t_statistic if t_statistic is not None else 'N/A',
+                    'p': p_value if p_value is not None else 'N/A',
+                    'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+                    'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+                    'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
+                    'Avg Cap %': avg_daily_capture,
+                    'Total %': total_capture
                 })
             else:
                 metrics.update({
                     'Wins': 0,
                     'Losses': 0,
-                    'Win Ratio (%)': 0.0,
-                    'Avg Daily Capture (%)': 0.0,
-                    'Total Capture (%)': 0.0
+                    'Win %': 0.0,
+                    'StdDev %': 0.0,
+                    'Sharpe': 0.0,
+                    't': 'N/A',
+                    'p': 'N/A',
+                    'Sig 90%': 'No',
+                    'Sig 95%': 'No',
+                    'Sig 99%': 'No',
+                    'Avg Cap %': 0.0,
+                    'Total %': 0.0
                 })
 
             metrics_list.append(metrics)
-            logger.info(f"Processed {ticker} - Capture: {metrics['Total Capture (%)']:.2f}%, "
-                        f"Win Ratio: {metrics['Win Ratio (%)']:.2f}%, "
-                        f"Days: {metrics['Trigger Days']}")
+            logger.info(f"Processed {ticker} - Capture: {metrics['Total %']:.2f}%, "
+                        f"Win Ratio: {metrics['Win %']:.2f}%, "
+                        f"Days: {metrics['Triggers']}")
 
             # Add chart trace
             fig.add_trace(go.Scatter(
@@ -8882,13 +9016,13 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         metrics_df = pd.DataFrame(metrics_list)
         
         # Add status column using centralized performance metrics
-        metrics_df['Status'] = metrics_df['Win Ratio (%)'].apply(PerformanceMetrics.get_status_emoji)
+        metrics_df['Status'] = metrics_df['Win %'].apply(PerformanceMetrics.get_status_emoji)
         
         # Reorder columns to put Status first
         cols = ['Status', 'Ticker'] + [col for col in metrics_df.columns if col not in ['Status', 'Ticker']]
         metrics_df = metrics_df[cols]
         
-        metrics_df.sort_values(by='Avg Daily Capture (%)', ascending=False, inplace=True)
+        metrics_df.sort_values(by='Avg Cap %', ascending=False, inplace=True)
         columns = [{'name': col, 'id': col} for col in metrics_df.columns]
         data = metrics_df.to_dict('records')
 
@@ -9269,20 +9403,20 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
             p_value = None
 
         metrics_data.append({
-            'Secondary Ticker': secondary_ticker,
-            'Trigger Days': int(trigger_days),
+            'Ticker': secondary_ticker,
+            'Triggers': int(trigger_days),
             'Wins': int(wins),
             'Losses': int(losses),
-            'Win Ratio (%)': round(win_ratio, 2),
-            'Std Dev (%)': round(std_dev, 4),
-            'Sharpe Ratio': round(sharpe_ratio, 2),
-            't-Statistic': t_statistic if t_statistic is not None else 'N/A',
-            'p-Value': p_value if p_value is not None else 'N/A',
-            'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-            'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-            'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-            'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-            'Total Capture (%)': round(total_capture, 4)
+            'Win %': round(win_ratio, 2),
+            'StdDev %': round(std_dev, 4),
+            'Sharpe': round(sharpe_ratio, 2),
+            't': t_statistic if t_statistic is not None else 'N/A',
+            'p': p_value if p_value is not None else 'N/A',
+            'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+            'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+            'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
+            'Avg Cap %': round(avg_daily_capture, 4),
+            'Total %': round(total_capture, 4)
         })
 
         # Add trace to figure
@@ -9570,9 +9704,9 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                         col_id = sort_spec['column_id']
                         is_ascending = sort_spec['direction'] == 'asc'
                         try:
-                            if col_id in ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
-                                        'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
-                                        'Total Capture (%)']:
+                            if col_id in ['Triggers', 'Wins', 'Losses', 'Win %', 
+                                        'StdDev %', 'Sharpe', 'Avg Cap %', 
+                                        'Total %']:
                                 sortable_data = sorted(
                                     sortable_data,
                                     key=lambda x: (float(str(x[col_id]).replace('N/A', '-inf'))
@@ -9617,9 +9751,9 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                             col_id = sort_spec['column_id']
                             is_ascending = sort_spec['direction'] == 'asc'
                             # Handle different column types
-                            if col_id in ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
-                                        'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
-                                        'Total Capture (%)']:
+                            if col_id in ['Triggers', 'Wins', 'Losses', 'Win %', 
+                                        'StdDev %', 'Sharpe', 'Avg Cap %', 
+                                        'Total %']:
                                 sortable_data = sorted(sortable_data,
                                                      key=lambda x: float(x[col_id]) if x[col_id] != 'N/A' else float('-inf'),
                                                      reverse=not is_ascending)
@@ -9991,19 +10125,19 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 results_list.append({
                     'id': idx,  # Add a unique identifier
                     'Combination': combination_labels[idx],
-                    'Trigger Days': int(trigger_days),
+                    'Triggers': int(trigger_days),
                     'Wins': int(wins),
                     'Losses': int(losses),
-                    'Win Ratio (%)': round(win_ratio, 2),
-                    'Std Dev (%)': round(std_dev, 4),
-                    'Sharpe Ratio': round(sharpe_ratio, 2),
-                    't-Statistic': t_statistic if t_statistic is not None else 'N/A',
-                    'p-Value': p_value if p_value is not None else 'N/A',
-                    'Significant 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                    'Significant 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                    'Significant 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                    'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-                    'Total Capture (%)': round(total_capture, 4)
+                    'Win %': round(win_ratio, 2),
+                    'StdDev %': round(std_dev, 4),
+                    'Sharpe': round(sharpe_ratio, 2),
+                    't': t_statistic if t_statistic is not None else 'N/A',
+                    'p': p_value if p_value is not None else 'N/A',
+                    'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
+                    'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
+                    'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
+                    'Avg Cap %': round(avg_daily_capture, 4),
+                    'Total %': round(total_capture, 4)
                 })
 
                 # Update progress bar
@@ -10016,25 +10150,25 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                     optimization_lock.release()
             return [], empty_columns, 'No valid combinations found.', True  # Add the fourth output
 
-        # Sort by Sharpe Ratio
-        results_list.sort(key=lambda x: x['Sharpe Ratio'], reverse=True)
+        # Sort by Sharpe
+        results_list.sort(key=lambda x: x['Sharpe'], reverse=True)
 
         # Define columns for the DataTable
         columns = [
             {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
-            {'name': 'Trigger Days', 'id': 'Trigger Days', 'type': 'numeric'},
+            {'name': 'Triggers', 'id': 'Triggers', 'type': 'numeric'},
             {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
             {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
-            {'name': 'Win Ratio (%)', 'id': 'Win Ratio (%)', 'type': 'numeric'},
-            {'name': 'Std Dev (%)', 'id': 'Std Dev (%)', 'type': 'numeric'},
-            {'name': 'Sharpe Ratio', 'id': 'Sharpe Ratio', 'type': 'numeric'},
-            {'name': 't-Statistic', 'id': 't-Statistic'},
-            {'name': 'p-Value', 'id': 'p-Value'},
-            {'name': 'Significant 90%', 'id': 'Significant 90%'},
-            {'name': 'Significant 95%', 'id': 'Significant 95%'},
-            {'name': 'Significant 99%', 'id': 'Significant 99%'},
-            {'name': 'Avg Daily Capture (%)', 'id': 'Avg Daily Capture (%)', 'type': 'numeric'},
-            {'name': 'Total Capture (%)', 'id': 'Total Capture (%)', 'type': 'numeric'}
+            {'name': 'Win %', 'id': 'Win %', 'type': 'numeric'},
+            {'name': 'StdDev %', 'id': 'StdDev %', 'type': 'numeric'},
+            {'name': 'Sharpe', 'id': 'Sharpe', 'type': 'numeric'},
+            {'name': 't', 'id': 't'},
+            {'name': 'p', 'id': 'p'},
+            {'name': 'Sig 90%', 'id': 'Sig 90%'},
+            {'name': 'Sig 95%', 'id': 'Sig 95%'},
+            {'name': 'Sig 99%', 'id': 'Sig 99%'},
+            {'name': 'Avg Cap %', 'id': 'Avg Cap %', 'type': 'numeric'},
+            {'name': 'Total %', 'id': 'Total %', 'type': 'numeric'}
         ]
 
         try:
@@ -10042,28 +10176,28 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
             if results_list:
                 averages = {
                     'Combination': 'AVERAGES',
-                    'Trigger Days': round(sum(r['Trigger Days'] for r in results_list) / len(results_list)),
+                    'Triggers': round(sum(r['Triggers'] for r in results_list) / len(results_list)),
                     'Wins': round(sum(r['Wins'] for r in results_list) / len(results_list)),
                     'Losses': round(sum(r['Losses'] for r in results_list) / len(results_list)),
-                    'Win Ratio (%)': round(sum(r['Win Ratio (%)'] for r in results_list) / len(results_list), 2),
-                    'Std Dev (%)': round(sum(r['Std Dev (%)'] for r in results_list) / len(results_list), 4),
-                    'Sharpe Ratio': round(sum(r['Sharpe Ratio'] for r in results_list) / len(results_list), 2),
-                    't-Statistic': round(sum(float(r['t-Statistic']) if r['t-Statistic'] != 'N/A' else 0 for r in results_list) / 
-                                      sum(1 for r in results_list if r['t-Statistic'] != 'N/A'), 4) if any(r['t-Statistic'] != 'N/A' for r in results_list) else 'N/A',
-                    'p-Value': round(sum(float(r['p-Value']) if r['p-Value'] != 'N/A' else 0 for r in results_list) / 
-                                   sum(1 for r in results_list if r['p-Value'] != 'N/A'), 4) if any(r['p-Value'] != 'N/A' for r in results_list) else 'N/A',
-                    'Significant 90%': f"{round(sum(1 for r in results_list if r['Significant 90%'] == 'Yes') / len(results_list) * 100, 1)}% of combinations",
-                    'Significant 95%': f"{round(sum(1 for r in results_list if r['Significant 95%'] == 'Yes') / len(results_list) * 100, 1)}% of combinations",
-                    'Significant 99%': f"{round(sum(1 for r in results_list if r['Significant 99%'] == 'Yes') / len(results_list) * 100, 1)}% of combinations",
-                    'Avg Daily Capture (%)': round(sum(r['Avg Daily Capture (%)'] for r in results_list) / len(results_list), 4),
-                    'Total Capture (%)': round(sum(r['Total Capture (%)'] for r in results_list) / len(results_list), 4)
+                    'Win %': round(sum(r['Win %'] for r in results_list) / len(results_list), 2),
+                    'StdDev %': round(sum(r['StdDev %'] for r in results_list) / len(results_list), 4),
+                    'Sharpe': round(sum(r['Sharpe'] for r in results_list) / len(results_list), 2),
+                    't': round(sum(float(r['t']) if r['t'] != 'N/A' else 0 for r in results_list) / 
+                                      sum(1 for r in results_list if r['t'] != 'N/A'), 4) if any(r['t'] != 'N/A' for r in results_list) else 'N/A',
+                    'p': round(sum(float(r['p']) if r['p'] != 'N/A' else 0 for r in results_list) / 
+                                   sum(1 for r in results_list if r['p'] != 'N/A'), 4) if any(r['p'] != 'N/A' for r in results_list) else 'N/A',
+                    'Sig 90%': f"{round(sum(1 for r in results_list if r['Sig 90%'] == 'Yes') / len(results_list) * 100, 1)}% of combos",
+                    'Sig 95%': f"{round(sum(1 for r in results_list if r['Sig 95%'] == 'Yes') / len(results_list) * 100, 1)}% of combos",
+                    'Sig 99%': f"{round(sum(1 for r in results_list if r['Sig 99%'] == 'Yes') / len(results_list) * 100, 1)}% of combos",
+                    'Avg Cap %': round(sum(r['Avg Cap %'] for r in results_list) / len(results_list), 4),
+                    'Total %': round(sum(r['Total %'] for r in results_list) / len(results_list), 4)
                 }        
             # Handle sorting and fixed averages row
             cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
             if results_list:
                 # Store current sort state with the cache
                 current_sort = getattr(ctx.inputs, 'optimization-results-table.sort_by', None)
-                sortable_data = sorted(results_list, key=lambda x: x['Sharpe Ratio'], reverse=True)
+                sortable_data = sorted(results_list, key=lambda x: x['Sharpe'], reverse=True)
                 
                 # Apply current sort if exists
                 if current_sort:
@@ -10071,9 +10205,9 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                         col_id = sort_spec['column_id']
                         is_ascending = sort_spec['direction'] == 'asc'
                         try:
-                            if col_id in ['Trigger Days', 'Wins', 'Losses', 'Win Ratio (%)', 
-                                        'Std Dev (%)', 'Sharpe Ratio', 'Avg Daily Capture (%)', 
-                                        'Total Capture (%)']:
+                            if col_id in ['Triggers', 'Wins', 'Losses', 'Win %', 
+                                        'StdDev %', 'Sharpe', 'Avg Cap %', 
+                                        'Total %']:
                                 sortable_data = sorted(
                                     sortable_data,
                                     key=lambda x: (float(str(x[col_id]).replace('N/A', '-inf'))
