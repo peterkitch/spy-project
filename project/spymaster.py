@@ -3671,10 +3671,6 @@ app.layout = dbc.Container(
                         "Manual"
                     ], href="#manual-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
                     html.A([
-                        html.I(className="fas fa-layer-group me-1"),
-                        "Multi-Primary"
-                    ], href="#multi-primary-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
-                    html.A([
                         html.I(className="fas fa-tasks me-1"),
                         "Batch"
                     ], href="#batch-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
@@ -3682,6 +3678,10 @@ app.layout = dbc.Container(
                         html.I(className="fas fa-magic me-1"),
                         "Optimization"
                     ], href="#optimization-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
+                    html.A([
+                        html.I(className="fas fa-layer-group me-1"),
+                        "Multi-Primary"
+                    ], href="#multi-primary-section", className="nav-link", style={"color": "#80ff00", "padding": "0 15px", "textDecoration": "none", "fontSize": "0.9em", "fontWeight": "500", "borderRight": "1px solid rgba(128, 255, 0, 0.3)"}),
                     html.A([
                         html.I(className="fas fa-question-circle me-1"),
                         "Help"
@@ -4741,191 +4741,6 @@ app.layout = dbc.Container(
                 ], className='mb-3')  # End of Card
             ], width=12)
         ]),  # End of Manual SMA Analysis Section
-        # New Section: Multi-Primary Signal Aggregator
-        html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
-        html.H2('Multi-Primary Signal Aggregator', className='text-center mt-5'),
-        html.P('Combine signals from multiple primary tickers to create an aggregated trading strategy for a single-ticker (signal follower)', 
-               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader([
-                        html.Div([
-                            html.I(className="fas fa-layer-group me-2"),
-                            'Aggregate Signals from Multiple Primary Tickers'
-                        ], style={"display": "flex", "alignItems": "center"}),
-                        html.Button(children='Hide', id='toggle-multi-primary-button', className='btn btn-sm btn-secondary ml-auto')
-                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
-                    dbc.Collapse(
-                        dbc.CardBody([
-                            # Secondary Ticker Input for Multi-Primary Aggregator
-                            html.Div([
-                                html.Label("Secondary Ticker (Signal Follower):", className='mb-2'),
-                                dbc.Input(
-                                    id='multi-secondary-ticker-input',
-                                    placeholder='Enter a single ticker (e.g., DJT)',
-                                    type='text',
-                                    debounce=True
-                                ),
-                                html.Div(id='multi-secondary-feedback', className='text-danger')
-                            ], className='mb-3'),
-                            # Primary Tickers Input for Multi-Primary Aggregator
-                            html.Div([
-                                html.Label("Primary Signal Generators:", className='mb-2'),
-                                html.Div([
-                                    dbc.Row([
-                                        dbc.Col(
-                                            dbc.Input(
-                                                id={'type': 'primary-ticker-input', 'index': 0},
-                                                placeholder='Enter ticker (e.g., CENN)',
-                                                type='text',
-                                                debounce=True
-                                            ),
-                                            width=4
-                                        ),
-                                        dbc.Col(
-                                            dbc.Switch(
-                                                id={'type': 'invert-primary-switch', 'index': 0},
-                                                label='Invert Signals',
-                                                value=False
-                                            ),
-                                            width=2
-                                        ),
-                                        dbc.Col(
-                                            dbc.Switch(
-                                                id={'type': 'mute-primary-switch', 'index': 0},
-                                                label='Mute',
-                                                value=False
-                                            ),
-                                            width=2
-                                        ),
-                                        dbc.Col(
-                                            dbc.Button(
-                                                'Delete',
-                                                id={'type': 'delete-primary-button', 'index': 0},
-                                                color='danger',
-                                                size='sm'
-                                            ),
-                                            width=2
-                                        )
-                                    ], className='mb-2', id={'type': 'primary-ticker-row', 'index': 0})
-                                ], id='primary-tickers-container'),
-                                dbc.Button(
-                                    [html.I(className="fas fa-plus me-2"), 'Add Primary Ticker'], 
-                                    id='add-primary-button', 
-                                    color='success', 
-                                    size='sm', 
-                                    className='mt-2',
-                                    style={"boxShadow": "0 0 10px rgba(0, 255, 65, 0.5)"}
-                                )
-                            ], className='mb-3'),
-                            # Results Display for Multi-Primary Aggregator
-                            dcc.Loading(
-                                id="loading-multi-primary",
-                                type="circle",
-                                color="#80ff00",
-                                children=[
-                                    dcc.Graph(
-                                        id='multi-primary-chart',
-                                        figure=go.Figure(
-                                            layout=go.Layout(
-                                                title=dict(text="Combined Signals Capture Chart", font=dict(color='#80ff00')),
-                                                plot_bgcolor='black',
-                                                paper_bgcolor='black',
-                                                font=dict(color='#80ff00'),
-                                                xaxis=dict(visible=False),
-                                                yaxis=dict(visible=False),
-                                                template='plotly_dark'
-                                            )
-                                        )
-                                    ),
-                                    dbc.Card([
-                                        dbc.CardHeader([
-                                            html.I(className="fas fa-chart-pie me-2"),
-                                            'Aggregated Signal Performance'
-                                        ], style={"color": "#80ff00"}),
-                                        dbc.CardBody([
-                                            dash_table.DataTable(
-                                                id='multi-primary-metrics-table',
-                                                columns=[],  # Will be updated in callback
-                                                data=[],     # Will be updated in callback
-                                                sort_action='native',
-                                                style_table={
-                                                    'overflowX': 'auto',
-                                                    'backgroundColor': 'black',
-                                                },
-                                                style_cell={
-                                                    'backgroundColor': 'black',
-                                                    'color': '#80ff00',
-                                                    'textAlign': 'center',
-                                                    'minWidth': '56px',
-                                                    'width': '86px',
-                                                    'maxWidth': '110px',
-                                                    'whiteSpace': 'normal',
-                                                    'border': '1px solid #80ff00',
-                                                    'fontSize': '11px',
-                                                    'padding': '6px 4px'
-                                                },
-                                                style_header={
-                                                    'backgroundColor': 'black',
-                                                    'color': '#80ff00',
-                                                    'fontWeight': 'bold',
-                                                    'border': '2px solid #80ff00',
-                                                    'fontSize': '10px',
-                                                    'padding': '6px 4px'
-                                                },
-                                                style_data_conditional=[
-                                                    {
-                                                        'if': {'row_index': 'odd'},
-                                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
-                                                    },
-                                                    # Color code Win % column
-                                                    {
-                                                        'if': {
-                                                            'filter_query': '{{Win %}} > {}'.format(55),
-                                                            'column_id': 'Win %'
-                                                        },
-                                                        'color': '#00ff00',  # Bright green
-                                                        'fontWeight': 'bold'
-                                                    },
-                                                    {
-                                                        'if': {
-                                                            'filter_query': '{{Win %}} >= {} && {{Win %}} <= {}'.format(50, 55),
-                                                            'column_id': 'Win %'
-                                                        },
-                                                        'color': '#ffff00'  # Yellow
-                                                    },
-                                                    {
-                                                        'if': {
-                                                            'filter_query': '{{Win %}} < {}'.format(50),
-                                                            'column_id': 'Win %'
-                                                        },
-                                                        'color': '#ff6666'  # Red
-                                                    },
-                                                    # Highlight significant metrics
-                                                    {
-                                                        'if': {'column_id': 'Sig 95%', 'filter_query': '{Sig 95%} = Yes'},
-                                                        'boxShadow': '0 0 8px rgba(128, 255, 0, 0.4)',
-                                                        'fontWeight': 'bold'
-                                                    },
-                                                    {
-                                                        'if': {'column_id': 'Sig 99%', 'filter_query': '{Sig 99%} = Yes'},
-                                                        'boxShadow': '0 0 12px rgba(128, 255, 0, 0.6)',
-                                                        'fontWeight': 'bold'
-                                                    }
-                                                ],
-                                            )
-                                        ])
-                                    ], className='mt-3')
-                                ]
-                            )
-                        ]),
-                        id='multi-primary-collapse',
-                        is_open=True
-                    )
-                ], className='mb-3')
-            ], width=12)
-        ]),
         # Ticker Batch Process Section
         html.Div(id="batch-section", style={"position": "relative", "top": "-80px"}),
         html.H2('Ticker Batch Process', className='text-center mt-5'),
@@ -5176,6 +4991,191 @@ app.layout = dbc.Container(
                     ]),
                     id='optimization-collapse',
                     is_open=True
+                    )
+                ], className='mb-3')
+            ], width=12)
+        ]),
+        # New Section: Multi-Primary Signal Aggregator
+        html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
+        html.H2('Multi-Primary Signal Aggregator', className='text-center mt-5'),
+        html.P('Combine signals from multiple primary tickers to create an aggregated trading strategy for a single-ticker (signal follower)', 
+               className='text-center text-muted mb-4', style={'fontSize': '14px'}),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.Div([
+                            html.I(className="fas fa-layer-group me-2"),
+                            'Aggregate Signals from Multiple Primary Tickers'
+                        ], style={"display": "flex", "alignItems": "center"}),
+                        html.Button(children='Hide', id='toggle-multi-primary-button', className='btn btn-sm btn-secondary ml-auto')
+                    ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
+                    dbc.Collapse(
+                        dbc.CardBody([
+                            # Secondary Ticker Input for Multi-Primary Aggregator
+                            html.Div([
+                                html.Label("Secondary Ticker (Signal Follower):", className='mb-2'),
+                                dbc.Input(
+                                    id='multi-secondary-ticker-input',
+                                    placeholder='Enter a single ticker (e.g., DJT)',
+                                    type='text',
+                                    debounce=True
+                                ),
+                                html.Div(id='multi-secondary-feedback', className='text-danger')
+                            ], className='mb-3'),
+                            # Primary Tickers Input for Multi-Primary Aggregator
+                            html.Div([
+                                html.Label("Primary Signal Generators:", className='mb-2'),
+                                html.Div([
+                                    dbc.Row([
+                                        dbc.Col(
+                                            dbc.Input(
+                                                id={'type': 'primary-ticker-input', 'index': 0},
+                                                placeholder='Enter ticker (e.g., CENN)',
+                                                type='text',
+                                                debounce=True
+                                            ),
+                                            width=4
+                                        ),
+                                        dbc.Col(
+                                            dbc.Switch(
+                                                id={'type': 'invert-primary-switch', 'index': 0},
+                                                label='Invert Signals',
+                                                value=False
+                                            ),
+                                            width=2
+                                        ),
+                                        dbc.Col(
+                                            dbc.Switch(
+                                                id={'type': 'mute-primary-switch', 'index': 0},
+                                                label='Mute',
+                                                value=False
+                                            ),
+                                            width=2
+                                        ),
+                                        dbc.Col(
+                                            dbc.Button(
+                                                'Delete',
+                                                id={'type': 'delete-primary-button', 'index': 0},
+                                                color='danger',
+                                                size='sm'
+                                            ),
+                                            width=2
+                                        )
+                                    ], className='mb-2', id={'type': 'primary-ticker-row', 'index': 0})
+                                ], id='primary-tickers-container'),
+                                dbc.Button(
+                                    [html.I(className="fas fa-plus me-2"), 'Add Primary Ticker'], 
+                                    id='add-primary-button', 
+                                    color='success', 
+                                    size='sm', 
+                                    className='mt-2',
+                                    style={"boxShadow": "0 0 10px rgba(0, 255, 65, 0.5)"}
+                                )
+                            ], className='mb-3'),
+                            # Results Display for Multi-Primary Aggregator
+                            dcc.Loading(
+                                id="loading-multi-primary",
+                                type="circle",
+                                color="#80ff00",
+                                children=[
+                                    dcc.Graph(
+                                        id='multi-primary-chart',
+                                        figure=go.Figure(
+                                            layout=go.Layout(
+                                                title=dict(text="Combined Signals Capture Chart", font=dict(color='#80ff00')),
+                                                plot_bgcolor='black',
+                                                paper_bgcolor='black',
+                                                font=dict(color='#80ff00'),
+                                                xaxis=dict(visible=False),
+                                                yaxis=dict(visible=False),
+                                                template='plotly_dark'
+                                            )
+                                        )
+                                    ),
+                                    dbc.Card([
+                                        dbc.CardHeader([
+                                            html.I(className="fas fa-chart-pie me-2"),
+                                            'Aggregated Signal Performance'
+                                        ], style={"color": "#80ff00"}),
+                                        dbc.CardBody([
+                                            dash_table.DataTable(
+                                                id='multi-primary-metrics-table',
+                                                columns=[],  # Will be updated in callback
+                                                data=[],     # Will be updated in callback
+                                                sort_action='native',
+                                                style_table={
+                                                    'overflowX': 'auto',
+                                                    'backgroundColor': 'black',
+                                                },
+                                                style_cell={
+                                                    'backgroundColor': 'black',
+                                                    'color': '#80ff00',
+                                                    'textAlign': 'center',
+                                                    'minWidth': '56px',
+                                                    'width': '86px',
+                                                    'maxWidth': '110px',
+                                                    'whiteSpace': 'normal',
+                                                    'border': '1px solid #80ff00',
+                                                    'fontSize': '11px',
+                                                    'padding': '6px 4px'
+                                                },
+                                                style_header={
+                                                    'backgroundColor': 'black',
+                                                    'color': '#80ff00',
+                                                    'fontWeight': 'bold',
+                                                    'border': '2px solid #80ff00',
+                                                    'fontSize': '10px',
+                                                    'padding': '6px 4px'
+                                                },
+                                                style_data_conditional=[
+                                                    {
+                                                        'if': {'row_index': 'odd'},
+                                                        'backgroundColor': 'rgba(0, 255, 0, 0.05)'
+                                                    },
+                                                    # Color code Win % column
+                                                    {
+                                                        'if': {
+                                                            'filter_query': '{{Win %}} > {}'.format(55),
+                                                            'column_id': 'Win %'
+                                                        },
+                                                        'color': '#00ff00',  # Bright green
+                                                        'fontWeight': 'bold'
+                                                    },
+                                                    {
+                                                        'if': {
+                                                            'filter_query': '{{Win %}} >= {} && {{Win %}} <= {}'.format(50, 55),
+                                                            'column_id': 'Win %'
+                                                        },
+                                                        'color': '#ffff00'  # Yellow
+                                                    },
+                                                    {
+                                                        'if': {
+                                                            'filter_query': '{{Win %}} < {}'.format(50),
+                                                            'column_id': 'Win %'
+                                                        },
+                                                        'color': '#ff6666'  # Red
+                                                    },
+                                                    # Highlight significant metrics
+                                                    {
+                                                        'if': {'column_id': 'Sig 95%', 'filter_query': '{Sig 95%} = Yes'},
+                                                        'boxShadow': '0 0 8px rgba(128, 255, 0, 0.4)',
+                                                        'fontWeight': 'bold'
+                                                    },
+                                                    {
+                                                        'if': {'column_id': 'Sig 99%', 'filter_query': '{Sig 99%} = Yes'},
+                                                        'boxShadow': '0 0 12px rgba(128, 255, 0, 0.6)',
+                                                        'fontWeight': 'bold'
+                                                    }
+                                                ],
+                                            )
+                                        ])
+                                    ], className='mt-3')
+                                ]
+                            )
+                        ]),
+                        id='multi-primary-collapse',
+                        is_open=True
                     )
                 ], className='mb-3')
             ], width=12)
