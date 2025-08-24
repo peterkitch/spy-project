@@ -4257,83 +4257,15 @@ app.layout = dbc.Container(
                                     html.Div(id='ai-master-snapshot', className='mb-3'),
                                     
                                     # TWO-COLUMN LAYOUT: Historical Performance (left) and Risk/Reward (right)
-                                    dbc.Row([
-                                        # LEFT COLUMN: Historical Performance
-                                        dbc.Col([
-                                            html.Div([
-                                                # Header matching Risk/Reward style
-                                                html.H4("📊 Historical Performance", 
-                                                       style={"marginBottom": "15px", "color": "#80ff00", "textAlign": "center"}),
-                                                
-                                                # Row for Strategy Grade/Confidence (left) and Alerts (right)
-                                                dbc.Row([
-                                                    # Left side: Strategy Grade and Confidence
-                                                    dbc.Col([
-                                                        # Strategy Grade Badge
-                                                        html.Div(id='strategy-grade-badge', className='mb-2'),
-                                                        
-                                                        # Strategy Confidence Badge - hidden (integrated above)
-                                                        html.Div(id='strategy-confidence-badge', style={'display': 'none'}),
-                                                    ], md=6),
-                                                    
-                                                    # Right side: Alert Badges
-                                                    dbc.Col([
-                                                        html.Div(id='alert-badges', 
-                                                                style={"textAlign": "center"}),
-                                                    ], md=6),
-                                                ], className="mb-3"),
-                                                
-                                                # Quick Stats Cards in 2x2 grid
-                                                html.Div(id='quick-stats-cards', className='mb-3'),
-                                                
-                                                # Historical Performance Progress Bar
-                                                html.Div(id='performance-progress-bars', className='mb-3'),
-                                            ], style={
-                                                "padding": "20px",
-                                                "backgroundColor": "rgba(0, 0, 0, 0.5)",
-                                                "borderRadius": "10px",
-                                                "border": "1px solid #333",
-                                                "height": "100%"
-                                            })
-                                        ], md=6, className="mb-4"),
-                                        
-                                        # RIGHT COLUMN: Risk/Reward Analysis
-                                        dbc.Col([
-                                            html.Div([
-                                                # Risk/Reward Matrix (moved to its own column)
-                                                html.Div(id='ai-risk-reward-matrix', style={"height": "100%"}),
-                                            ], style={
-                                                "padding": "20px",
-                                                "backgroundColor": "rgba(0, 0, 0, 0.5)",
-                                                "borderRadius": "10px",
-                                                "border": "1px solid #333",
-                                                "height": "100%"
-                                            })
-                                        ], md=6, className="mb-4"),
-                                    ], className="d-flex align-items-stretch"),
+                                    # This entire section will be populated dynamically when a ticker is entered
+                                    html.Div(id='historical-performance-container'),
                                     
                                     # Hidden placeholders for signal components (actual display in Dynamic section)
                                     html.Div(id='visual-signal-indicators', style={'display': 'none'}),
                                     html.Div(id='signal-strength-meters', style={'display': 'none'}),
                                     
-                                    # Toggle button for Current Leaders section - moved before collapsible content
-                                    html.Div([
-                                        dbc.Button(
-                                            "Show Current Top Pair Leaders Analysis",
-                                            id="toggle-current-leaders",
-                                            color="success",
-                                            size="md",
-                                            className="mb-3",
-                                            style={
-                                                "fontWeight": "bold",
-                                                "boxShadow": "0 2px 4px rgba(0,0,0,0.2)",
-                                                "border": "2px solid #00ff41",
-                                                "backgroundColor": "#1a1a1a",
-                                                "color": "#00ff41",
-                                                "padding": "10px 20px"
-                                            }
-                                        )
-                                    ], style={"textAlign": "center"}),
+                                    # Toggle button for Current Leaders section - will only show when ticker is entered
+                                    html.Div(id='toggle-leaders-button-container'),
                                     
                                     # GROUP 2: CURRENT LEADERS (Today's Top Performers) - Hidden by default
                                     dbc.Collapse([
@@ -6433,15 +6365,11 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 
 @app.callback(
     [Output('ai-master-snapshot', 'children'),
-     Output('strategy-grade-badge', 'children'),
-     Output('performance-progress-bars', 'children'),
-     Output('ai-risk-reward-matrix', 'children'),
+     Output('historical-performance-container', 'children'),
+     Output('toggle-leaders-button-container', 'children'),
      Output('performance-heatmap', 'children'),
      Output('signal-strength-meters', 'children'),
-     Output('strategy-confidence-badge', 'children'),
-     Output('quick-stats-cards', 'children'),
      Output('visual-signal-indicators', 'children'),
-     Output('alert-badges', 'children'),
      Output('strategy-comparison-table', 'children'),
      Output('position-history-store', 'data'),
      Output('most-productive-buy-pair', 'children'),
@@ -6470,8 +6398,8 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Only log if the ticker changed, not on interval updates
     should_log = trigger_id == 'ticker-input'
     if not ticker:
-        # Return 23 items: 1 for snapshot + 10 empty + empty dict for position store + 11 empty
-        return [""] * 11 + [{}] + [""] * 11
+        # Return 19 items: 1 for snapshot + 2 containers + 4 empty + empty dict for position store + 11 empty
+        return ["", None, None] + [""] * 4 + [{}] + [""] * 11
     
     # Initialize or get ticker-specific position history
     if position_history_store is None or not isinstance(position_history_store, dict):
@@ -6489,16 +6417,16 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     
     if results is None:
         # Return 23 items with error message in trading-recommendations (position 22)
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data not available. Please wait..."] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data not available. Please wait..."] + [""]
     
     if 'status' in results:
         if results['status'] == 'processing':
-            return [""] * 11 + [position_history_store] + [""] * 9 + ["Data is currently being processed."] + [""]
+            return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data is currently being processed."] + [""]
         elif results['status'] == 'complete':
             if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                return [""] * 11 + [position_history_store] + [""] * 9 + ["Processing complete, but top pairs not found. Please check data integrity."] + [""]
+                return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Processing complete, but top pairs not found. Please check data integrity."] + [""]
         elif results['status'] == 'failed':
-            return [""] * 11 + [position_history_store] + [""] * 9 + [f"Processing failed for {ticker}. Please check the error message."] + [""]
+            return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + [f"Processing failed for {ticker}. Please check the error message."] + [""]
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
@@ -6508,23 +6436,23 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     
     if top_buy_pair is None or top_short_pair is None:
         logger.warning(f"Missing top pairs data for {ticker}")
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing top pairs"] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing top pairs"] + [""]
 
     df = results.get('preprocessed_data')
     if df is None or df.empty:
         logger.warning(f"Missing preprocessed data for {ticker}")
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing preprocessed data"] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing preprocessed data"] + [""]
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
         logger.warning(f"Invalid top pairs format for {ticker}")
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data integrity issue - invalid pair format"] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data integrity issue - invalid pair format"] + [""]
 
     try:
         # Validate top pairs data
         if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [top_buy_pair, top_short_pair]):
             logger.error(f"Invalid pair format detected for {ticker}")
-            return [""] * 11 + [position_history_store] + [""] * 9 + ["Invalid pair format detected. Please reprocess data."] + [""]
+            return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Invalid pair format detected. Please reprocess data."] + [""]
 
         # Validate that all required SMA columns exist
         required_smas = [
@@ -6535,7 +6463,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         missing_smas = [sma for sma in required_smas if sma not in df.columns]
         if missing_smas:
             logger.error(f"Missing SMA columns for {ticker}: {missing_smas}")
-            return [""] * 11 + [position_history_store] + [""] * 9 + ["Missing required SMA columns. Please reprocess data."] + [""]
+            return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Missing required SMA columns. Please reprocess data."] + [""]
 
         sma1_buy_leader = df[f'SMA_{top_buy_pair[0]}']
         sma2_buy_leader = df[f'SMA_{top_buy_pair[1]}']
@@ -6550,7 +6478,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         logger.error(f"Required SMA columns not found in the DataFrame for {ticker}: {str(e)}")
         if should_log:
             logger.error(f"Error details: Missing column {str(e)}")
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Data not available or processing not yet complete. Please wait..."] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data not available or processing not yet complete. Please wait..."] + [""]
 
     current_date = df.index[-1]
     previous_date = df.index[-2]
@@ -6598,7 +6526,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Validate dates exist in the index
     if previous_date not in df.index or current_date not in df.index:
         logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Missing required dates in data. Please reprocess data."] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Missing required dates in data. Please reprocess data."] + [""]
 
     try:
         # Calculate signals for today based on yesterday's close
@@ -6614,7 +6542,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
-        return [""] * 11 + [position_history_store] + [""] * 9 + ["Error calculating signals. Please check the data."] + [""]
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Error calculating signals. Please check the data."] + [""]
 
     # Calculate yesterday's signals (which determined the position entered at yesterday's close)
     # This is our CURRENT position
@@ -8023,17 +7951,88 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     # Update the ticker-specific position history in the store
     position_history_store[ticker] = position_history_data
     
+    # Create the Historical Performance container (combines left and right columns)
+    historical_performance_container = dbc.Row([
+        # LEFT COLUMN: Historical Performance
+        dbc.Col([
+            html.Div([
+                # Header matching Risk/Reward style
+                html.H4("📊 Historical Performance", 
+                       style={"marginBottom": "15px", "color": "#80ff00", "textAlign": "center"}),
+                
+                # Row for Strategy Grade/Confidence (left) and Alerts (right)
+                dbc.Row([
+                    # Left side: Strategy Grade and Confidence
+                    dbc.Col([
+                        # Strategy Grade Badge
+                        html.Div(grade_badge, className='mb-2'),
+                        
+                        # Strategy Confidence Badge - hidden (integrated above)
+                        html.Div(strategy_confidence_badge, style={'display': 'none'}),
+                    ], md=6),
+                    
+                    # Right side: Alert Badges
+                    dbc.Col([
+                        html.Div(alert_badges, 
+                                style={"textAlign": "center"}),
+                    ], md=6),
+                ], className="mb-3"),
+                
+                # Quick Stats Cards in 2x2 grid
+                html.Div(quick_stats_cards, className='mb-3'),
+                
+                # Historical Performance Progress Bar
+                html.Div(progress_bars, className='mb-3'),
+            ], style={
+                "padding": "20px",
+                "backgroundColor": "rgba(0, 0, 0, 0.5)",
+                "borderRadius": "10px",
+                "border": "1px solid #333",
+                "height": "100%"
+            })
+        ], md=6, className="mb-4"),
+        
+        # RIGHT COLUMN: Risk/Reward Analysis
+        dbc.Col([
+            html.Div([
+                # Risk/Reward Matrix (moved to its own column)
+                html.Div(risk_reward_matrix, style={"height": "100%"}),
+            ], style={
+                "padding": "20px",
+                "backgroundColor": "rgba(0, 0, 0, 0.5)",
+                "borderRadius": "10px",
+                "border": "1px solid #333",
+                "height": "100%"
+            })
+        ], md=6, className="mb-4"),
+    ], className="d-flex align-items-stretch")
+    
+    # Create the Toggle Leaders button container
+    toggle_leaders_button = html.Div([
+        dbc.Button(
+            "Show Current Top Pair Leaders Analysis",
+            id="toggle-current-leaders",
+            color="success",
+            size="md",
+            className="mb-3",
+            style={
+                "fontWeight": "bold",
+                "boxShadow": "0 2px 4px rgba(0,0,0,0.2)",
+                "border": "2px solid #00ff41",
+                "backgroundColor": "#1a1a1a",
+                "color": "#00ff41",
+                "padding": "10px 20px"
+            }
+        )
+    ], style={"textAlign": "center"})
+    
     return (
         master_metrics_table,  # Now goes to ai-master-snapshot at top of AI section
-        grade_badge,
-        progress_bars,
-        risk_reward_matrix,
+        historical_performance_container,  # New container for Historical Performance section
+        toggle_leaders_button,  # New container for toggle button
         performance_heatmap,
         signal_strength_meters,
-        strategy_confidence_badge,
-        quick_stats_cards,
         visual_signal_indicators,
-        alert_badges,
         strategy_comparison_table,
         position_history_store,
         most_productive_buy_pair_text,
