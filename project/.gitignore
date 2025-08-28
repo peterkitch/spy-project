@@ -70,3 +70,6 @@ global_ticker_library/data/*.db
 global_ticker_library/data/*.db-*
 global_ticker_library/data/*.txt
 global_ticker_library/data/*.json
+
+# Windows NUL device file
+NUL

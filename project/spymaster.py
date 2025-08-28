@@ -10,12 +10,14 @@ from utils.spymaster.logging_config import (
 import pickle
 from tqdm import tqdm
 import os
-os.environ['DASH_CALLBACK_TIMEOUT'] = '3000'  # Changed from 300 seconds (5 minutes) to 3000 seconds (50 minutes)
+# Keep callbacks from hanging forever; override via SPYMASTER_CB_TIMEOUT
+os.environ['DASH_CALLBACK_TIMEOUT'] = str(int(os.getenv('SPYMASTER_CB_TIMEOUT', '600')))
 import json
 import tempfile
 import shutil
 import time
 import numpy as np
+import re
 from scipy import stats
 import gc
 import threading
@@ -38,6 +40,22 @@ import uuid
 import ast
 from datetime import datetime, timedelta, date
 
+# --- Lightweight central job pool for background work (precompute, refresh) ---
+from concurrent.futures import ThreadPoolExecutor
+_job_pool = ThreadPoolExecutor(max_workers=int(os.getenv("SPYMASTER_BG_WORKERS", "2")))
+
+def submit_bg(fn, *args, **kwargs):
+    """Submit background work with tiny pool to avoid thread sprawl."""
+    try:
+        return _job_pool.submit(fn, *args, **kwargs)
+    except RuntimeError:
+        # Pool may be shutting down; run inline as a last resort
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Background job failed inline: {e}")
+        return None
+
 # ---- Optional calendar for authoritative NYSE sessions (incl. early closes) ----
 try:
     import pandas_market_calendars as mcal
@@ -47,6 +65,122 @@ except Exception:
 
 # ---- ET tz constant used by market-clock helpers ----
 _ET_TZ = pytz.timezone("US/Eastern")
+
+# --- DIAGNOSTIC UTILITIES -----------------------------------------------------
+import os, json, time, platform
+from typing import Any
+
+_DIAG = os.getenv("PRJCT9_DIAG", "1").lower() not in ("0", "false", "off")
+
+def _short(x: Any) -> str:
+    try:
+        s = str(x)
+        return (s[:8] + "…") if len(s) > 12 else s
+    except Exception:
+        return repr(x)
+
+def _fig_meta(fig) -> dict:
+    """Extract safe meta/uirevision/datarevision from a Plotly figure or dict, never raises."""
+    try:
+        # Plotly Figure object
+        meta = dict(getattr(fig.layout, "meta", {}) or {})
+        uir  = getattr(fig.layout, "uirevision", None)
+        drv  = getattr(fig.layout, "datarevision", None)
+        return {"placeholder": bool(meta.get("placeholder", False)),
+                "uirevision": uir, "datarevision": drv}
+    except Exception:
+        try:
+            # dict-like
+            lay = (fig or {}).get("layout", {}) or {}
+            meta = lay.get("meta", {}) or {}
+            return {"placeholder": bool(meta.get("placeholder", False)),
+                    "uirevision": lay.get("uirevision"), "datarevision": lay.get("datarevision")}
+        except Exception:
+            return {"placeholder": None, "uirevision": None, "datarevision": None}
+
+def dlog(tag: str, **fields):
+    if not _DIAG:
+        return
+    # keep prints small & structured
+    safe = {}
+    for k, v in fields.items():
+        if k in {"fig", "results", "df"}:
+            continue
+        safe[k] = v
+    print(f"[🧪 {tag}] {json.dumps(safe, default=str)}", flush=True)
+
+# one-time environment banner
+if _DIAG:
+    try:
+        import dash, plotly
+        print("──────────────── DIAG ON ────────────────", flush=True)
+        print(f"[🧪 env] python={platform.python_version()} dash={dash.__version__} plotly={plotly.__version__}", flush=True)
+    except Exception:
+        pass
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Cancellation exception used only inside precompute_results
+# ------------------------------------------------------------
+class ComputationCancelled(Exception):
+    """Raised when the user switches tickers or a refresh cancels this run."""
+    pass
+
+# Log deduplication helper
+class DeduplicatingLogger:
+    """Logger wrapper that deduplicates repeated messages within a time window."""
+    
+    def __init__(self, logger, dedup_window_seconds=5):
+        self.logger = logger
+        self.dedup_window = dedup_window_seconds
+        self.recent_messages = {}  # message -> (count, first_time, last_time, level)
+        self._lock = threading.Lock()
+    
+    def _should_log(self, message, level):
+        """Check if message should be logged or deduplicated."""
+        current_time = time.time()
+        
+        with self._lock:
+            # Clean old entries
+            to_remove = []
+            for msg, (count, first_time, last_time, lvl) in list(self.recent_messages.items()):
+                if current_time - last_time > self.dedup_window:
+                    if count > 1:
+                        # Log summary of deduplicated messages at the original level
+                        self.logger.log(lvl, f"[Previous message repeated {count} times over {last_time - first_time:.1f}s]")
+                    to_remove.append(msg)
+            
+            for msg in to_remove:
+                del self.recent_messages[msg]
+            
+            # Check if this message should be logged
+            if message in self.recent_messages:
+                count, first_time, _, lvl = self.recent_messages[message]
+                self.recent_messages[message] = (count + 1, first_time, current_time, lvl)
+                return False  # Don't log duplicate
+            else:
+                self.recent_messages[message] = (1, current_time, current_time, level)
+                return True  # Log new message
+    
+    def info(self, message):
+        if self._should_log(message, logging.INFO):
+            self.logger.info(message)
+    
+    def warning(self, message):
+        if self._should_log(message, logging.WARNING):
+            self.logger.warning(message)
+    
+    def error(self, message):
+        if self._should_log(message, logging.ERROR):
+            self.logger.error(message)
+    
+    def debug(self, message):
+        if self._should_log(message, logging.DEBUG):
+            self.logger.debug(message)
+    
+    # Pass through methods that shouldn't be deduplicated
+    def __getattr__(self, name):
+        return getattr(self.logger, name)
 
 # --------------------------- Holiday-aware helpers ----------------------------
 def _easter_date(year: int) -> date:
@@ -469,7 +603,7 @@ class PerformanceMetrics:
             return ""
         
         diff = current_value - previous_value
-        if abs(diff) < 0.01:  # No significant change
+        if abs(diff) < FINGERPRINT_TOLERANCE:  # No significant change
             return "→"
         elif diff > 0:
             return "↑" if higher_is_better else "↓"
@@ -478,10 +612,10 @@ class PerformanceMetrics:
     
     @classmethod
     def get_progress_bar_color(cls, win_rate):
-        """Get progress bar color based on win rate (returns Bootstrap color name)"""
-        if win_rate > cls.THRESHOLDS['win_rate']['moderate'] / 100:
+        """Get progress bar color based on win rate (0-100 scale)"""
+        if win_rate >= cls.THRESHOLDS['win_rate']['moderate']:
             return "success"
-        elif win_rate > cls.THRESHOLDS['win_rate']['poor'] / 100:
+        elif win_rate >= cls.THRESHOLDS['win_rate']['poor']:
             return "warning"
         else:
             return "danger"
@@ -994,14 +1128,17 @@ class PerformanceMetrics:
         ], className="mb-3")
     
     @classmethod
-    def create_strategy_confidence_badge(cls, p_value, sample_size):
+    def create_strategy_confidence_badge(cls, p_value, sample_size, badge_id=None):
         """
         Create confidence badge based on statistical significance
         
         Args:
             p_value: Statistical p-value
             sample_size: Number of samples/trades
+            badge_id: Optional unique ID for the badge (to avoid collisions)
         """
+        import uuid
+        
         if p_value is None or sample_size < 30:
             confidence = "LOW"
             color = "#ff0040"
@@ -1028,10 +1165,13 @@ class PerformanceMetrics:
             icon = "fas fa-question-circle"
             tooltip = f"Results not statistically significant (p={p_value:.4f}, n={sample_size})"
         
+        # Generate unique ID to avoid tooltip collisions
+        _id = badge_id or f"confidence-badge-target-{uuid.uuid4().hex[:8]}"
+        
         badge = html.Span([
             html.I(className=f"{icon} me-2"),
             f"Confidence: {confidence}"
-        ], id="confidence-badge-target",
+        ], id=_id,
            style={
             "backgroundColor": color,
             "color": "black" if color in ["#00ff41", "#80ff00", "#ffff00"] else "white",
@@ -1045,7 +1185,7 @@ class PerformanceMetrics:
         
         badge_with_tooltip = html.Div([
             badge,
-            dbc.Tooltip(tooltip, target="confidence-badge-target", placement="bottom")
+            dbc.Tooltip(tooltip, target=_id, placement="bottom")
         ], style={"display": "inline-block"})
         
         return badge_with_tooltip
@@ -2599,6 +2739,9 @@ app = Dash(__name__, external_stylesheets=[
     # Custom styles are now loaded from /assets/spymaster/spymaster_styles.css automatically
 ])
 
+# Enable callback exception visibility for debugging
+app.config.suppress_callback_exceptions = True  # Safety: avoid issues with dynamic components
+
 # Custom index string simplified - CSS moved to external file  
 app.index_string = '''
 <!DOCTYPE html>
@@ -2627,8 +2770,16 @@ status_lock = threading.Lock()
 # Setup logging using the external configuration
 logger = setup_logging(__name__, logging.INFO)
 
+# Create deduplicated logger for repetitive messages
+dedup_logger = DeduplicatingLogger(logger, dedup_window_seconds=10)
+
 # Track which tickers have had their price data logged
 _logged_price_tickers = set()
+
+# --- Lightweight caches for the Batch Processing Results table ---
+# Avoid heavy work on each interval tick; only update rows when status changes.
+_batch_rows_cache = {}        # ticker -> DataTable row dict
+_batch_status_snapshot = {}   # ticker -> (status, progress, message, cache_status)
 
 # Custom formatter with colors
 class ColoredFormatter(logging.Formatter):
@@ -2648,24 +2799,26 @@ class ColoredFormatter(logging.Formatter):
 # Ensure UTF-8 stdio early (safe in IDEs/terminals; graceful on failure)
 ensure_utf8_stdio()
 
-# Create console handler with stdout stream
-console_handler = logging.StreamHandler(stream=sys.stdout)
-console_handler.setLevel(logging.INFO)
+# Create handlers only once (avoid duplicates on reload)
+has_stream = any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
 
-# Ensure logs directory exists
-os.makedirs('logs', exist_ok=True)
-file_handler = logging.FileHandler('logs/spymaster.log', encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
+if not has_stream:
+    # Create console handler with stdout stream
+    console_handler = logging.StreamHandler(stream=sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(ColoredFormatter())
+    logger.addHandler(console_handler)
 
-# Create formatters and add them to handlers
-console_handler.setFormatter(ColoredFormatter())
-
-file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-file_handler.setFormatter(file_formatter)
-
-# Add handlers to the logger
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
+if not has_file:
+    # Ensure logs directory exists
+    os.makedirs('logs', exist_ok=True)
+    # Create file handler with UTF-8 encoding
+    file_handler = logging.FileHandler('logs/spymaster.log', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
 
 # Prevent logger from propagating messages to the root logger
 logger.propagate = False
@@ -2680,7 +2833,7 @@ def log_section(section_name, color=Colors.NEON_GREEN):
         color + Colors.BOLD + f"⚡ {section_name} ⚡".center(80, " ") + Colors.ENDC + "\n" +
         color + "═" * 80 + Colors.ENDC
     )
-    logger.info(section_text)
+    dedup_logger.info(section_text)
 
 def log_ticker_section(ticker, action="PROCESSING"):
     """Minimal, width-safe banner for ticker changes (no purple/diamonds)."""
@@ -2698,14 +2851,14 @@ def log_success(message):
     logger.info(Colors.BRIGHT_GREEN + "[✓] " + message + Colors.ENDC)
 
 def log_processing(message):
-    logger.info(Colors.CYAN + "[⚙️] " + message + Colors.ENDC)
+    dedup_logger.info(Colors.CYAN + "[⚙️] " + message + Colors.ENDC)
 
 def log_result(label, value, color=Colors.YELLOW):
     # Ensure output fits within 80 chars
     formatted_line = f"{label}: {value}"
     if len(formatted_line) > 76:  # Leave room for prefix
         formatted_line = formatted_line[:73] + "..."
-    logger.info(f"  {Colors.OKGREEN}{label}:{Colors.ENDC} {color}{Colors.BOLD}{value}{Colors.ENDC}")
+    logger.info(f"{Colors.OKGREEN}{label}:{Colors.ENDC} {color}{Colors.BOLD}{value}{Colors.ENDC}")
 
 def log_metric(label, value, unit="", indent=2):
     """Log a metric with consistent formatting"""
@@ -2737,6 +2890,7 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 
 # Suppress urllib3 debug logs
 logging.getLogger('urllib3').setLevel(logging.WARNING)
+
 
 tqdm.pandas()
 
@@ -2783,10 +2937,256 @@ _precomputed_results_cache = {}
 _loading_in_progress = {}
 _loading_lock = threading.Lock()
 
+def _enforce_cache_limits():
+    """Clamp in-RAM caches that can grow without bound."""
+    # These are intentionally small; disk remains the source of truth.
+    MAX_PRECOMP_IN_RAM = int(os.getenv("SPYMASTER_MAX_RESULTS_RAM", "12"))
+    MAX_OPT_RESULTS = int(os.getenv("SPYMASTER_MAX_OPT_CACHE", "32"))
+
+    # Trim precomputed results cache
+    if isinstance(_precomputed_results_cache, dict) and len(_precomputed_results_cache) > MAX_PRECOMP_IN_RAM:
+        # Drop oldest by load_time/start_time
+        items = list(_precomputed_results_cache.items())
+        items.sort(key=lambda kv: max(
+            (kv[1] or {}).get("load_time", 0) or 0,
+            (kv[1] or {}).get("start_time", 0) or 0
+        ))
+        survivors = dict(items[-MAX_PRECOMP_IN_RAM:])
+        _precomputed_results_cache.clear()
+        _precomputed_results_cache.update(survivors)
+
+    # Trim optimization results cache if present
+    if 'optimization_results_cache' in globals():
+        cache = globals()['optimization_results_cache']
+        if isinstance(cache, dict) and len(cache) > MAX_OPT_RESULTS:
+            # Drop oldest by insertion order
+            keys = list(cache.keys())[-MAX_OPT_RESULTS:]
+            new_cache = {k: cache[k] for k in keys}
+            cache.clear()
+            cache.update(new_cache)
+# Request key management to prevent stale results
+_active_request_keys = {}
+_cancel_flags = {}
+
+# LRU DataFrame cache with single-flight loading to prevent UI freezes
+from collections import OrderedDict, defaultdict
+_DF_RAM_LIMIT = int(os.getenv("DF_RAM_LIMIT", "3"))  # keep last 3 tickers in RAM
+_df_ram_cache = OrderedDict()
+_df_load_locks = defaultdict(threading.Lock)
+
+def _df_cache_get(ticker):
+    """Get DataFrame from LRU cache"""
+    tk = normalize_ticker(ticker)
+    df = _df_ram_cache.pop(tk, None)
+    if df is not None:
+        _df_ram_cache[tk] = df  # LRU: move to end
+    return df
+
+def _df_cache_put(ticker, df):
+    """Put DataFrame in LRU cache, evicting oldest if needed"""
+    tk = normalize_ticker(ticker)
+    _df_ram_cache[tk] = df
+    while len(_df_ram_cache) > _DF_RAM_LIMIT:
+        _df_ram_cache.popitem(last=False)  # evict LRU
+
 optimization_lock = threading.Lock()
 optimization_in_progress = False
 optimization_results_cache = {}  # Add this line to store results
 optimization_progress = None  # Track optimization progress
+
+# --- Pending Optimization Request (so interval ticks can complete a request) ---
+pending_optimization = None
+
+# --- Multi-Primary aggregator: pending state + placeholder figure ---
+_mp_pending = {}  # key -> True while waiting for any primary to complete
+
+def _mp_key(primary_tickers, invert_flags, mute_flags, secondary):
+    pt = ",".join([normalize_ticker(t) for t in (primary_tickers or []) if t])
+    inv = "".join(["1" if v else "0" for v in (invert_flags or [])])
+    mut = "".join(["1" if v else "0" for v in (mute_flags or [])])
+    sec = normalize_ticker(secondary) if secondary else ""
+    return f"{pt}|{inv}|{mut}|{sec}"
+
+def _multi_primary_placeholder(msg="Preparing data…"):
+    # Mirror your placeholder pattern used for the single-ticker chart (meta.placeholder = True)
+    fig = go.Figure()
+    fig.update_layout(
+        title=dict(text=msg, font=dict(color="#80ff00", size=14)),
+        plot_bgcolor="black", paper_bgcolor="black",
+        font=dict(color="#80ff00"),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        template="plotly_dark",
+        meta={"placeholder": True, "scope": "multi-primary"}
+    )
+    return fig
+
+def _queue_missing_primaries(primary_tickers):
+    """
+    Enqueue any primaries that are not 'complete' so optimization can proceed.
+    - Uses list.append (ticker_queue is a list, not a Queue).
+    - Idempotent: avoids duplicates.
+    - Marks status as 'queued' (unless already 'processing').
+    - Auto-starts the background worker if it's not running.
+    """
+    global ticker_queue, processing_thread, processing_lock
+
+    enqueued = []
+
+    for ticker in (primary_tickers or []):
+        try:
+            st = read_status(ticker) or {}
+        except Exception:
+            st = {}
+
+        # Skip if already complete
+        if (st.get("status") == "complete"):
+            print(f"[OPTIMIZATION] Ticker {ticker} already complete")
+            continue
+
+        # Enqueue once, thread-safe
+        with processing_lock:
+            if ticker not in ticker_queue:
+                ticker_queue.append(ticker)
+                enqueued.append(ticker)
+
+        # Mark as queued if not already processing
+        if st.get("status") not in ("processing", "queued"):
+            write_status(ticker, {'status': 'queued', 'progress': 0})
+
+        print(f"[OPTIMIZATION] Ticker {ticker} not ready (status: {st.get('status')}), added to processing queue")
+
+    # Ensure the worker thread is running if we enqueued anything
+    if enqueued:
+        try:
+            if (processing_thread is None) or (not processing_thread.is_alive()):
+                processing_thread = threading.Thread(target=process_ticker_queue, daemon=True)
+                processing_thread.start()
+        except NameError:
+            # In case processing_thread is defined after this function in the file, it will be available at runtime.
+            # If not, we still avoid crashing here.
+            logger.debug("Processing thread reference not ready at import time; will start when available.")
+
+# --- Input sanitization and rate limiting ---
+_TICKER_RE = re.compile(r'[A-Za-z0-9^=.\-]+')
+
+def sanitize_ticker_input(raw: str, max_tickers: int = 20):
+    """Sanitize ticker input to prevent injection and errors"""
+    if not raw:
+        return []
+    parts = [p.strip().upper() for p in str(raw).split(',')]
+    cleaned = []
+    for p in parts:
+        m = _TICKER_RE.fullmatch(p)
+        if m and 1 <= len(p) <= 12:
+            cleaned.append(p)
+        # else: drop silently
+        if len(cleaned) >= max_tickers:
+            break
+    # Dedup, preserve order
+    seen = set()
+    out = []
+    for t in cleaned:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+# Tiny rate limiter for noisy triggers (per key)
+_last_call_ts = {}
+def rate_limit(key: str, min_gap_sec: float) -> bool:
+    """Rate limit by key to prevent callback spam"""
+    now = time.time()
+    prev = _last_call_ts.get(key, 0.0)
+    if (now - prev) < min_gap_sec:
+        return False
+    _last_call_ts[key] = now
+    return True
+
+# Figure cache to prevent unnecessary redraws - now with LRU eviction
+from collections import OrderedDict
+
+class LRUCache:
+    """Simple LRU cache implementation."""
+    def __init__(self, max_size=10):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+    
+    def get(self, key, default=None):
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return default
+    
+    def __getitem__(self, key):
+        val = self.get(key)
+        if val is None:
+            raise KeyError(key)
+        return val
+    
+    def __setitem__(self, key, value):
+        if key in self.cache:
+            # Move to end
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        # Evict oldest if over capacity
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+    
+    def __contains__(self, key):
+        return key in self.cache
+    
+    def clear(self):
+        self.cache.clear()
+
+_figure_cache = LRUCache(max_size=10)  # Keep last 10 figures in memory
+_fp_live_cache = {}  # {ticker: (timestamp, fingerprint)} - TTL cache for live fingerprints
+_FP_TTL = 60  # 60 second TTL for live fingerprint cache
+
+# Yahoo call rate instrumentation
+_yahoo_call_stats = {'hits': 0, 'misses': 0, 'failures': 0}
+_last_stats_log_time = 0
+
+def _validate_df_shape(df, ticker):
+    """Validate DataFrame shape and integrity to prevent contamination."""
+    if df is None or df.empty:
+        raise ValueError(f"{ticker}: DataFrame is None or empty")
+    
+    # Check for required columns
+    if 'Close' not in df.columns:
+        raise ValueError(f"{ticker}: Missing 'Close' column")
+    
+    # Check index/data length match
+    if len(df.index) != len(df['Close']):
+        raise ValueError(f"{ticker}: Index length ({len(df.index)}) != Close length ({len(df['Close'])})")
+    
+    # Check for datetime index
+    if not pd.api.types.is_datetime64_any_dtype(df.index):
+        raise ValueError(f"{ticker}: Non-datetime index")
+    
+    # Check for duplicates and monotonic increasing
+    if df.index.duplicated().any():
+        logger.warning(f"{ticker}: Duplicate dates found, removing...")
+        df = df[~df.index.duplicated(keep='last')]
+    
+    if not df.index.is_monotonic_increasing:
+        logger.warning(f"{ticker}: Index not monotonic, sorting...")
+        df = df.sort_index()
+    
+    return df
+
+def _chart_fp(results):
+    """Create a fingerprint for chart data to detect changes.
+    Uses existing data_fingerprint + last point of plotted series.
+    """
+    try:
+        fp = results.get('data_fingerprint')  # (last_date, last_close, row_count)
+        cc = results.get('cumulative_combined_captures')
+        if cc is None or len(cc) == 0:
+            return (fp, 0, None)
+        return (fp, int(cc.shape[0]), float(cc.iloc[-1]))
+    except Exception:
+        return None
 
 # Set up persistent cache
 
@@ -2843,21 +3243,57 @@ _SECONDARY_TTL = 900  # 15 minutes
 _logged_primary_fetch_success = set()
 
 def fetch_secondary_window(ticker, start, end):
-    """Download only the needed window for a secondary ticker."""
+    """Download only the needed window for a secondary ticker.
+       - Coerces start/end to scalar timestamps (handles Index/arrays)
+       - Uses inclusive end (+1 day) to include the last day
+       - Has a lightweight last-resort fallback (1y history) if windowed fetch fails
+    """
     import time
-    key = (normalize_ticker(ticker), pd.to_datetime(start).date(), pd.to_datetime(end).date())
+    import numpy as np
+    import pandas as pd
+    import warnings
+    import yfinance as yf
+
+    # --- Coerce start/end to scalar timestamps (Index/Series/ndarray safe) ---
+    def _as_scalar_ts(x, fallback=None):
+        if x is None:
+            return pd.to_datetime(fallback) if fallback is not None else None
+        try:
+            tx = pd.to_datetime(x)
+            if isinstance(tx, (pd.DatetimeIndex, pd.Index, np.ndarray, list, tuple)):
+                if len(tx) == 0:
+                    return pd.to_datetime(fallback) if fallback is not None else None
+                # use min/max window depending on bound
+                # caller will use this for start/end respectively
+                return pd.to_datetime(tx[0]) if hasattr(tx, "__getitem__") else pd.to_datetime(tx)
+            return pd.to_datetime(tx)
+        except Exception:
+            return pd.to_datetime(fallback) if fallback is not None else None
+
+    # normalize early
+    t_norm = normalize_ticker(ticker)
+    start_ts = _as_scalar_ts(start)
+    end_ts   = _as_scalar_ts(end)
+    if start_ts is None or end_ts is None:
+        # minimal last-resort window to try something reasonable
+        end_ts   = pd.Timestamp.today(tz='UTC').normalize()
+        start_ts = end_ts - pd.Timedelta(days=365)
+
+    # If user passed an unordered/degenerate window, fix it
+    if end_ts < start_ts:
+        start_ts, end_ts = end_ts, start_ts
+
+    key = (t_norm, start_ts.date(), end_ts.date())
     cached = _secondary_df_cache.get(key)
     if cached and (time.time() - cached["t"] < _SECONDARY_TTL):
         return cached["df"]
     
     try:
-        import yfinance as yf
-        # Keep it simple and robust
-        # IMPORTANT: yf.download's end parameter is exclusive, so add 1 day to include the end date
-        end_inclusive = pd.to_datetime(end) + pd.Timedelta(days=1)
+        # IMPORTANT: yfinance 'end' is exclusive → add 1 day to include the last date
+        end_inclusive = pd.to_datetime(end_ts) + pd.Timedelta(days=1)
         df = yf.download(
-            ticker,
-            start=pd.to_datetime(start).strftime("%Y-%m-%d"),
+            t_norm,
+            start=pd.to_datetime(start_ts).strftime("%Y-%m-%d"),
             end=end_inclusive.strftime("%Y-%m-%d"),
             auto_adjust=False,
             progress=False,
@@ -2865,179 +3301,583 @@ def fetch_secondary_window(ticker, start, end):
             timeout=15
         )
         if df is not None and not df.empty:
-            df.index = pd.to_datetime(df.index)  # ensure DateTimeIndex
+            # Handle MultiIndex columns if yfinance returns them
+            if isinstance(df.columns, pd.MultiIndex):
+                # yfinance can still return MI in some cases; flatten conservatively
+                try:
+                    df = df['Close'].to_frame('Close')
+                except Exception:
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            
+            # Standardize index and sort
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+            df = df.sort_index()
+            
+            # Enforce numeric dtypes to prevent flat line issue with ^GSPC
+            for col in ('Close', 'Adj Close', 'Open', 'High', 'Low', 'Volume'):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
             _secondary_df_cache[key] = {"df": df, "t": time.time()}
+            # Enforce size limit on secondary cache  
+            if len(_secondary_df_cache) > 12:
+                # Remove oldest entries
+                sorted_keys = sorted(_secondary_df_cache.keys(), 
+                                   key=lambda k: _secondary_df_cache[k]["t"])
+                for old_key in sorted_keys[:-12]:
+                    del _secondary_df_cache[old_key]
             return df
     except Exception as e:
-        logger.error(f"Secondary download failed for {ticker}: {e}")
-    
+        logger.error(f"Secondary download failed for {ticker}: {e} | window=({start_ts.date()}→{end_ts.date()})")
+
+    # --- Last-resort lightweight fallback (1y rolling window) ---
+    try:
+        end_lr = pd.Timestamp.today(tz='UTC').normalize()
+        start_lr = end_lr - pd.Timedelta(days=365)
+        df = yf.download(
+            t_norm,
+            start=start_lr.strftime("%Y-%m-%d"),
+            end=(end_lr + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=12
+        )
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                try:
+                    df = df['Close'].to_frame('Close')
+                except Exception:
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+            df = df.sort_index()
+            for col in ('Close', 'Adj Close', 'Open', 'High', 'Low', 'Volume'):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            # cache under the original key to satisfy the immediate caller
+            _secondary_df_cache[key] = {"df": df, "t": time.time()}
+            logger.info(f"[secondary-fallback] Succeeded with 1y window for {t_norm}")
+            return df
+    except Exception as e:
+        logger.error(f"[secondary-fallback] failed for {t_norm}: {e}")
+
     return None
+
+# ============================================================================
+# DATA FINGERPRINTING FOR CACHE INVALIDATION
+# ============================================================================
+# Control flag for intraday placeholder injection (env toggle; default ON)
+APPEND_INTRADAY_PLACEHOLDER = os.getenv("SPYMASTER_APPEND_TODAY", "1").lower() in ("1", "true", "yes")
+FINGERPRINT_TOLERANCE = float(os.getenv("SPYMASTER_FP_TOL", "0.001"))  # $ tolerance for close drift
+
+def _safe_float(x):
+    """Safely convert value to float, returning None on failure."""
+    try:
+        # Handle pandas Series properly
+        if hasattr(x, 'iloc'):
+            return float(x.iloc[0])
+        return float(x)
+    except Exception:
+        return None
+
+def _df_fingerprint(df):
+    """Create a lightweight fingerprint of a DataFrame for freshness checking.
+    
+    Returns same format as _live_fingerprint_yf for consistency:
+    (first_date, last_date, last_close, row_count, idx_hash)
+    """
+    if df is None or df.empty:
+        return None
+    
+    try:
+        first_date = df.index[0]
+        last_date = df.index[-1]
+        last_close = float(df['Close'].iloc[-1]) if 'Close' in df.columns else 0.0
+        row_count = len(df)
+        
+        # Simple hash of the index for contamination detection
+        try:
+            idx_hash = int(pd.util.hash_pandas_object(df.index, index=True).sum() % 1e9)
+        except:
+            idx_hash = 0
+            
+        return (first_date, last_date, last_close, row_count, idx_hash)
+    except Exception as e:
+        logger.debug(f"Error creating fingerprint: {e}")
+        return None
+
+def _fp_unpack(fp):
+    """Safely unpack fingerprint tuple regardless of format (3 or 5 elements)."""
+    if not fp:
+        return (None, None, None)
+    if len(fp) == 3:
+        last_date, last_close, row_count = fp
+    else:
+        # 5-element format: (first_date, last_date, last_close, row_count, idx_hash)
+        _, last_date, last_close, row_count = fp[:4]
+    return (last_date, _safe_float(last_close), row_count)
+
+def _fingerprint_changed(old_fp, new_fp, tol=FINGERPRINT_TOLERANCE):
+    """Check if two fingerprints differ, indicating data has changed.
+    
+    Compare two fingerprints. Fingerprints can be:
+    - Old format: (last_date, last_close, row_count)
+    - New format: (first_date, last_date, last_close, row_count, idx_hash)
+    
+    Changes detected:
+    - Different last_date -> changed
+    - abs(last_close diff) > tol -> changed  
+    - row_count differs -> changed (only if both are not None)
+    - None anywhere -> treat as changed (conservative)
+    """
+    if not old_fp or not new_fp:
+        return True
+    
+    try:
+        # Handle both old (3-element) and new (5-element) fingerprint formats
+        if len(old_fp) == 3:
+            old_date, old_close, old_count = old_fp
+        else:
+            _, old_date, old_close, old_count = old_fp[:4]
+            
+        if len(new_fp) == 3:
+            new_date, new_close, new_count = new_fp
+        else:
+            _, new_date, new_close, new_count = new_fp[:4]
+        
+        # Use safe float conversion
+        old_close = _safe_float(old_close)
+        new_close = _safe_float(new_close)
+        
+        # Different date means data changed
+        if old_date != new_date:
+            return True
+        
+        # If either close price is None, treat as changed
+        if old_close is None or new_close is None:
+            return True
+            
+        # Check close price with tolerance
+        if abs(old_close - new_close) > tol:
+            return True
+            
+        # Only compare row counts if both are not None
+        if (old_count is not None) and (new_count is not None) and (old_count != new_count):
+            return True
+            
+        return False
+    except Exception as e:
+        logger.debug(f"Error comparing fingerprints: {e}")
+        return True
+
+def _quick_last_fingerprint(ticker):
+    """Quickly get just the fingerprint from cached results without loading all data.
+    
+    Returns fingerprint tuple or None if not found.
+    """
+    pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
+    if not os.path.exists(pkl_file):
+        return None
+    
+    try:
+        with open(pkl_file, 'rb') as f:
+            data = pickle.load(f)
+        return data.get('data_fingerprint')
+    except Exception as e:
+        logger.debug(f"Could not read fingerprint from {pkl_file}: {e}")
+        return None
+
+def _log_yahoo_stats_if_needed(now):
+    """Log Yahoo API call statistics every 60 seconds in debug mode."""
+    global _last_stats_log_time
+    if logger.level <= logging.DEBUG and now - _last_stats_log_time >= 60:
+        total = _yahoo_call_stats['hits'] + _yahoo_call_stats['misses']
+        if total > 0:
+            hit_rate = (_yahoo_call_stats['hits'] / total) * 100
+            logger.debug(f"Yahoo API stats: {_yahoo_call_stats['hits']} hits, {_yahoo_call_stats['misses']} misses "
+                        f"({hit_rate:.1f}% cache hit rate), {_yahoo_call_stats['failures']} failures")
+        _last_stats_log_time = now
+
+def _live_fingerprint_yf(ticker):
+    """Fetch a tiny window to detect same-day 'Close' drift or new day without pulling full history.
+    
+    Uses 60m bars for better intraday drift detection and includes TTL caching to reduce API calls.
+    """
+    # Check if live fingerprints are disabled via environment variable
+    if os.environ.get('SPYMASTER_DISABLE_LIVE_FP', '').lower() in ('1', 'true', 'yes'):
+        logger.debug(f"Live fingerprint disabled via SPYMASTER_DISABLE_LIVE_FP for {ticker}")
+        return None
+    
+    # Check TTL cache first
+    now = time.time()
+    cached = _fp_live_cache.get(ticker)
+    if cached and now - cached[0] < _FP_TTL:
+        _yahoo_call_stats['hits'] += 1
+        logger.debug(f"Using cached live fingerprint for {ticker} (TTL: {_FP_TTL}s)")
+        _log_yahoo_stats_if_needed(now)
+        return cached[1]
+    
+    # Cache miss - will need to call Yahoo
+    _yahoo_call_stats['misses'] += 1
+    
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Use 60m bars for better intraday detection
+            df = yf.download(ticker, period="1d", interval="60m", auto_adjust=False,
+                             threads=False, progress=False, timeout=20)
+        if df is None or df.empty:
+            # Fallback to daily bars if intraday fails
+            df = yf.download(ticker, period="5d", interval="1d", auto_adjust=False,
+                             threads=False, progress=False, timeout=20)
+        if df is None or df.empty:
+            _fp_live_cache[ticker] = (now, None)   # negative cache this miss
+            return None
+        
+        # Ensure timezone-naive index for comparison
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        first_date = df.index[0]  # Add first date for contamination detection
+        last_date = df.index[-1]
+        
+        # Prefer Adj Close if available
+        last_close = None
+        for col in ("Adj Close", "Adj_Close", "Close", "close"):
+            if col in df.columns:
+                last_close = _safe_float(df[col].iloc[-1])
+                if last_close is not None:
+                    break
+        
+        if last_close is None:
+            _fp_live_cache[ticker] = (now, None)
+            return None
+        
+        # Enhanced fingerprint with row count and index hash
+        row_count = len(df)
+        try:
+            # Simple hash of the index for contamination detection
+            idx_hash = int(pd.util.hash_pandas_object(df.index, index=True).sum() % 1e9)
+        except:
+            idx_hash = 0
+        
+        # Cache the fingerprint with timestamp
+        fp = (first_date, last_date, last_close, row_count, idx_hash)
+        _fp_live_cache[ticker] = (now, fp)
+        
+        # Enforce size limit on live fingerprint cache
+        if len(_fp_live_cache) > 20:
+            # Remove oldest entries beyond limit
+            sorted_tickers = sorted(_fp_live_cache.keys(), 
+                                  key=lambda k: _fp_live_cache[k][0])
+            for old_ticker in sorted_tickers[:-20]:
+                del _fp_live_cache[old_ticker]
+        
+        _log_yahoo_stats_if_needed(now)
+        return fp
+    except Exception as e:
+        _yahoo_call_stats['failures'] += 1
+        logger.debug(f"_live_fingerprint_yf failed for {ticker}: {e}")
+        _fp_live_cache[ticker] = (now, None)
+        _log_yahoo_stats_if_needed(now)
+        return None
+
+def _live_daily_fingerprint(ticker):
+    """Return live DAILY fingerprint: (first_date, last_date, last_close, row_count, idx_hash).
+    
+    Uses daily bars for equities to ensure we're comparing apples to apples with cached daily data.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df = yf.download(ticker, period="5d", interval="1d", auto_adjust=False,
+                             threads=False, progress=False, timeout=20)
+        if df is None or df.empty:
+            return None
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        first_date, last_date = df.index[0], df.index[-1]
+        
+        # Try to get adjusted close, fall back to close
+        last_close = None
+        for col in ("Adj Close", "Adj_Close", "Close", "close"):
+            if col in df.columns:
+                last_close = _safe_float(df[col].iloc[-1])
+                if last_close is not None:
+                    break
+        
+        if last_close is None:
+            return None
+            
+        row_count = len(df)
+        try:
+            idx_hash = int(pd.util.hash_pandas_object(df.index, index=True).sum() % 1e9)
+        except Exception:
+            idx_hash = 0
+        return (first_date, last_date, last_close, row_count, idx_hash)
+    except Exception as e:
+        logger.debug(f"_live_daily_fingerprint failed for {ticker}: {e}")
+        return None
+
+def _detect_stale_and_refresh_async(ticker, results):
+    """Non-blocking fingerprint drift check; schedules refresh if stale."""
+    try:
+        old_fp = (results or {}).get('data_fingerprint') or _quick_last_fingerprint(ticker)
+        # Prefer intraday to catch same-day drift even if daily bar hasn't rolled
+        live_fp = _live_fingerprint_yf(ticker) or _live_daily_fingerprint(ticker)
+        if live_fp and old_fp and _fingerprint_changed(old_fp, live_fp, tol=FINGERPRINT_TOLERANCE):
+            dedup_logger.debug(f"{ticker}: live fingerprint changed; scheduling refresh.")
+            results['cache_status'] = "stale"
+            write_status(ticker, {"status": "refreshing", "progress": 5, "cache_status": "stale"})
+            with _loading_lock:
+                _schedule_refresh_locked(ticker)
+    except Exception as e:
+        dedup_logger.debug(f"{ticker}: fingerprint refresh check failed ({e})")
 
 def normalize_ticker(ticker):
     """Normalize ticker to uppercase if it exists"""
     return ticker.strip().upper() if ticker else ticker
 
-def fetch_data(ticker, is_secondary=False, max_retries=4):
-    """Fetch ticker data with improved timeout handling for large tickers."""
-    import random
+def _asof(series_or_dict, target_date, default=None):
+    """
+    Tolerant 'as-of' lookup that finds the value at or just before target_date.
+    
+    Args:
+        series_or_dict: pandas Series/DataFrame or dict with date keys
+        target_date: The date to look up
+        default: Value to return if no suitable date found
+        
+    Returns:
+        The value at target_date or the most recent value before it.
+        Returns default if target_date is before all available dates.
+    """
+    if series_or_dict is None:
+        return default
+        
     try:
-        # Check if we've already determined this is an invalid ticker
-        status_file = f"cache/status/{ticker}_status.json"
-        if os.path.exists(status_file):
-            try:
-                with open(status_file, 'r') as f:
-                    status = json.load(f)
-                    if status.get('message') == "Invalid ticker symbol":
-                        logger.warning(f"Skipping known invalid ticker: {ticker}")
-                        return pd.DataFrame()
-            except Exception as e:
-                logger.error(f"Error reading status file for {ticker}: {str(e)}")
-
-        # Check for empty or whitespace-only ticker
-        if not ticker or not ticker.strip():
-            if not is_secondary:
-                logger.warning("No primary ticker provided")
-            return pd.DataFrame()
+        # Handle pandas Series or DataFrame
+        if hasattr(series_or_dict, 'index'):
+            # Ensure both target and index are timezone-naive for comparison
+            if hasattr(target_date, 'tz_localize'):
+                target_date = target_date.tz_localize(None)
             
-        # Normalize ticker
-        ticker = normalize_ticker(ticker)
-        
-        # Determine timeout based on ticker characteristics
-        base_timeout = 30 if (ticker.startswith('^') or len(ticker) > 4) else 15
-        
-        df = pd.DataFrame()
-        for attempt in range(1, max_retries + 1):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    # auto_adjust=False to ensure we get both Adj Close and Close columns
-                    # threads=False for stability, especially with large tickers
-                    df = yf.download(
-                        ticker, 
-                        period='max', 
-                        interval='1d', 
-                        progress=False,
-                        auto_adjust=False,
-                        threads=False,  # Important for stability
-                        timeout=base_timeout
-                    )
-                if not df.empty:
-                    break
-                else:
-                    raise ValueError("No data returned")
-            except Exception as e:
-                logger.warning(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
-                if attempt == max_retries:
-                    logger.error(f"No data fetched for {ticker} after {max_retries} retries")
-                    if not is_secondary:
-                        write_status(ticker, {"status": "failed", "message": "No data"})
-                    return pd.DataFrame()
-                # Exponential backoff with jitter
-                time.sleep(0.75 * (2 ** (attempt - 1)) + random.uniform(0, 0.5))
-
-        # Ensure the index is datetime and timezone naive
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        
-        # Track if we're using adjusted prices
-        using_adjusted = False
-        
-        # Handle column names properly
-        if isinstance(df.columns, pd.MultiIndex):
-            try:
-                # Try to get Adj Close first
-                if ('Adj Close', ticker) in df.columns:
-                    price_data = df['Adj Close'][ticker]
-                    using_adjusted = True
-                elif ('Adj Close', '') in df.columns:
-                    price_data = df['Adj Close']['']
-                    using_adjusted = True
-                # Fall back to Close if Adj Close is not available
-                elif ('Close', ticker) in df.columns:
-                    price_data = df['Close'][ticker]
-                elif ('Close', '') in df.columns:
-                    price_data = df['Close']['']
-                else:
-                    logger.error(f"Could not find price data for {ticker} in MultiIndex columns")
-                    return pd.DataFrame()
-                df = pd.DataFrame({'Close': price_data}, index=df.index)
-            except Exception as e:
-                logger.error(f"Error processing MultiIndex data for {ticker}: {str(e)}")
-                return pd.DataFrame()
-        else:
-            try:
-                # For single-level columns, standardize names and prefer Adj Close
-                df.columns = [str(col).capitalize() for col in df.columns]
-                if 'Adj Close' in df.columns:
-                    price_data = df['Adj Close']
-                    using_adjusted = True
-                elif 'Adj_Close' in df.columns:
-                    price_data = df['Adj_Close']
-                    using_adjusted = True
-                elif 'Close' in df.columns:
-                    price_data = df['Close']
-                else:
-                    logger.error(f"No price data found in single-level columns for {ticker}")
-                    return pd.DataFrame()
-                df = pd.DataFrame({'Close': price_data}, index=df.index)
-            except Exception as e:
-                logger.error(f"Error processing single-level data for {ticker}: {str(e)}")
-                return pd.DataFrame()
+            # If exact date exists, return it
+            if target_date in series_or_dict.index:
+                return series_or_dict.loc[target_date]
+            
+            # Find the most recent date <= target_date
+            valid_dates = series_or_dict.index[series_or_dict.index <= target_date]
+            if len(valid_dates) == 0:
+                return default
                 
-        # Log price type only once per ticker
-        global _logged_price_tickers
-        if ticker not in _logged_price_tickers and not is_secondary:
-            if using_adjusted:
-                log_result("Price Data", f"Using Adjusted Close for {ticker}", Colors.BRIGHT_GREEN)
-            else:
-                logger.warning(f"Adjusted Close not available for {ticker} - defaulting to Close prices")
-            _logged_price_tickers.add(ticker)
+            closest_date = valid_dates[-1]  # Last date before or at target
+            return series_or_dict.loc[closest_date]
+            
+        # Handle dictionary
+        elif isinstance(series_or_dict, dict):
+            # Ensure target_date is timezone-naive
+            if hasattr(target_date, 'tz_localize'):
+                target_date = target_date.tz_localize(None)
+            
+            # If exact date exists, return it
+            if target_date in series_or_dict:
+                return series_or_dict[target_date]
+            
+            # Find the most recent date <= target_date
+            valid_dates = [d for d in series_or_dict.keys() if d <= target_date]
+            if not valid_dates:
+                return default
+                
+            closest_date = max(valid_dates)
+            return series_or_dict[closest_date]
+            
+        else:
+            return default
+            
+    except Exception as e:
+        logger.debug(f"_asof lookup failed: {e}")
+        return default
+
+# --------------------------- Console→UI synchronization helper ----------------------------
+def _last_active_ticker():
+    """
+    Best-effort fallback for console-initiated processing.
+    Prefers most-recent in-RAM results; then latest status file; then latest results file.
+    Returns uppercase ticker or None.
+    """
+    try:
+        # 1) Most recently 'touched' in the in-memory cache (by start_time/load_time)
+        if _precomputed_results_cache:
+            def score(item):
+                res = item[1] or {}
+                return max(res.get('start_time') or 0, res.get('load_time') or 0)
+            t, _ = max(_precomputed_results_cache.items(), key=score)
+            return normalize_ticker(t)
+
+        # 2) Most recent status JSON on disk
+        status_files = glob.glob("cache/status/*_status.json")
+        if status_files:
+            latest = max(status_files, key=os.path.getmtime)
+            base = os.path.basename(latest)
+            return normalize_ticker(base.replace("_status.json", ""))
+
+        # 3) Most recent precomputed results on disk
+        result_files = glob.glob("cache/results/*_precomputed_results.pkl")
+        if result_files:
+            latest = max(result_files, key=os.path.getmtime)
+            base = os.path.basename(latest)
+            return normalize_ticker(base.replace("_precomputed_results.pkl", ""))
+    except Exception:
+        pass
+    return None
+
+def fetch_data(ticker, is_secondary=False, max_retries=4):
+    """Fetch ticker data with guardrails to avoid long UI stalls.
+       - Primary (is_secondary=False): up to 4 tries with larger timeout.
+       - Secondary (is_secondary=True): SINGLE quick try with small timeout.
+    """
+    import random
+    
+    # Normalize early
+    ticker = normalize_ticker(ticker)
+
+    # Empty / whitespace ticker quick exit
+    if not ticker or not ticker.strip():
+        if not is_secondary:
+            logger.warning("No primary ticker provided")
+        return pd.DataFrame()
+    
+    # If we already marked the ticker invalid, bail fast
+    status_file = f"cache/status/{ticker}_status.json"
+    try:
+        if os.path.exists(status_file):
+            content = (open(status_file, "r").read() or "").strip()
+            if content:
+                st = json.loads(content)
+                if st.get("message") == "Invalid ticker symbol":
+                    logger.warning(f"Skipping known invalid ticker: {ticker}")
+                    return pd.DataFrame()
+    except Exception as e:
+        logger.debug(f"Status file check failed for {ticker}: {e}")
+
+    # Timeout / retry strategy
+    if is_secondary:
+        base_timeout = 12    # keep secondary pulls snappy
+        max_retries   = 1    # one quick attempt only
+    else:
+        # Indexes/very long tickers get a bit more time
+        base_timeout = 30 if (ticker.startswith('^') or len(ticker) > 4) else 15
+        max_retries  = max(1, min(4, max_retries))
         
-        if df.empty:
-            logger.error(f"No valid data found for {ticker}")
+    df = pd.DataFrame()
+    for attempt in range(1, max_retries + 1):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                df = yf.download(
+                    ticker,
+                    period="max",
+                    interval="1d",
+                    progress=False,
+                    auto_adjust=False,   # keep both Close & Adj Close if available
+                    threads=False,       # more stable for large pulls
+                    timeout=base_timeout
+                )
+            if not df.empty:
+                break
+            raise ValueError("No data returned")
+        except Exception as e:
+            logger.warning(f"{'SECONDARY' if is_secondary else 'PRIMARY'} fetch attempt "
+                           f"{attempt}/{max_retries} failed for {ticker}: {e}")
+            if attempt == max_retries:
+                if not is_secondary:
+                    write_status(ticker, {"status": "failed", "message": "No data"})
+                return pd.DataFrame()
+            # Backoff with jitter (primary only)
+            if not is_secondary:
+                sleep_s = min(8.0, (2 ** (attempt - 1))) + random.random()
+                time.sleep(sleep_s)
+
+    # Clean up the index/dupes just once
+    try:
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+        if df.index.duplicated().any():
+            df = df[~df.index.duplicated(keep='last')]
+    except Exception as e:
+        logger.debug(f"Index cleanup issue for {ticker}: {e}")
+
+    # Standardize columns to always have 'Close' (preferring Adj Close)
+    if not df.empty:
+        standardized_df = pd.DataFrame(index=df.index)
+        
+        # Handle different column structures from yfinance
+        if isinstance(df.columns, pd.MultiIndex):
+            # Multi-level columns (happens with some tickers)
+            for col in df.columns.levels[0]:
+                if 'Adj Close' in col or 'Adj_Close' in col:
+                    standardized_df['Close'] = df[col].iloc[:, 0] if len(df[col].shape) > 1 else df[col]
+                    logger.debug(f"Standardized {ticker}: using Adj Close as price data")
+                    break
+            else:
+                # Fallback to regular Close
+                for col in df.columns.levels[0]:
+                    if 'Close' in col:
+                        standardized_df['Close'] = df[col].iloc[:, 0] if len(df[col].shape) > 1 else df[col]
+                        logger.debug(f"Standardized {ticker}: using Close as price data (Adj Close not available)")
+                        break
+        else:
+            # Single-level columns (most common case)
+            if 'Adj Close' in df.columns:
+                standardized_df['Close'] = df['Adj Close']
+                logger.debug(f"Standardized {ticker}: using Adj Close as price data")
+            elif 'Adj_Close' in df.columns:
+                standardized_df['Close'] = df['Adj_Close']
+                logger.debug(f"Standardized {ticker}: using Adj_Close as price data")
+            elif 'Close' in df.columns:
+                standardized_df['Close'] = df['Close']
+                logger.debug(f"Standardized {ticker}: using Close as price data (Adj Close not available)")
+            else:
+                # Try case-insensitive search as last resort
+                for col in df.columns:
+                    if 'close' in col.lower():
+                        standardized_df['Close'] = df[col]
+                        logger.debug(f"Standardized {ticker}: using {col} as price data (case-insensitive match)")
+                        break
+        
+        # Validate we got price data
+        if 'Close' not in standardized_df.columns:
+            logger.error(f"Could not find price data for {ticker}. Available columns: {list(df.columns)[:10]}")
             return pd.DataFrame()
         
-        if not is_secondary and ticker not in _logged_primary_fetch_success:
-            logger.info(f"Successfully fetched primary ticker {ticker} data ({len(df)} periods)")
-            _logged_primary_fetch_success.add(ticker)
-            
-            # Check if we should add today's date (ET trading day only)
-            et_now = pd.Timestamp.now(tz=_ET_TZ)
-            today_et_date = et_now.date()
-            today = pd.Timestamp(today_et_date)  # naive TS aligned to ET date
-            
-            # Different handling for crypto vs traditional assets
-            if is_crypto_ticker(ticker):
-                logger.info(f"Crypto ticker {ticker} detected - allowing 24/7 trading")
-                if len(df) > 0 and df.index[-1] < today:
-                    last_close = df['Close'].iloc[-1]  # Already using adjusted price if available
-                    df.loc[today, 'Close'] = last_close
-                    logger.info(f"Added current day {today} to crypto data")
+        # Enforce numeric dtype to prevent issues with string/object dtypes (especially for ^GSPC)
+        standardized_df['Close'] = pd.to_numeric(standardized_df['Close'], errors='coerce')
+        
+        # --- Only inject a 'today' row when inside regular market hours (avoid weekends/holidays) ---
+        if APPEND_INTRADAY_PLACEHOLDER:
+            try:
+                et_now = pd.Timestamp.now(tz=_ET_TZ)
+            except Exception:
+                et_now = pd.Timestamp.utcnow()
+            today_dt = pd.Timestamp(et_now.date())  # tz-naive to match df
+            last_date = standardized_df.index[-1] if not standardized_df.empty else None
+
+            # Skip synthetic row for Yahoo FX pairs and index symbols where intraday feed is noisy
+            if ticker.upper().endswith('USD=X') or '^' in ticker:
+                logger.debug(f"Skipping synthetic 'today' row for {ticker}: detected FX/index")
             else:
-                # Only add today's date if:
-                # 1) It's a valid NYSE session day (not weekend/holiday)
-                # 2) Data is behind today
-                # 3) We are currently within the session window (regular/early close)
-                if len(df) > 0 and df.index[-1] < today:
-                    sess = _session_open_close_et_for_date(today_et_date)
-                    if sess:
-                        open_et, close_et = sess
-                        if open_et <= et_now.to_pydatetime() <= close_et:
-                            last_close = df['Close'].iloc[-1]
-                            df.loc[today, 'Close'] = last_close
-                            logger.debug(f"Added current market day {today} to data")
-                        else:
-                            logger.debug("Outside today's session window; not adding today's date")
-                    else:
-                        logger.debug("Today is not a NYSE trading session (holiday/weekend); not adding date")
-                else:
-                    if df.index[-1] >= today:
-                        logger.debug("Data already at latest date; no action")
-                    else:
-                        logger.debug("Conditions not met for adding current date")      
-        return df
-    except Exception as e:
-        logger.error(f"Failed to fetch data for '{ticker}': {type(e).__name__} - {str(e)}")
-        return pd.DataFrame()
+                live_fp = _live_fingerprint_yf(ticker)  # 60m intraday fingerprint
+                live_price = float(live_fp[2]) if (live_fp and len(live_fp) >= 3) else None
+                if live_price is not None:
+                    if last_date is not None and last_date == today_dt:
+                        # Update today's partially-rolled daily bar with intraday last
+                        standardized_df.loc[last_date, 'Close'] = live_price
+                        logger.debug(f"Updated today row for {ticker} with intraday price: ${live_price:.2f}")
+                    elif last_date is None or last_date < today_dt:
+                        # Append a synthetic 'today' row seeded with intraday last
+                        standardized_df.loc[today_dt, 'Close'] = live_price
+                        logger.debug(f"Added synthetic today row for {ticker} with intraday price: ${live_price:.2f}")
+        
+        return standardized_df
+
+    return df
 
 # ============================================================================
 # DATA FETCHING AND PROCESSING FUNCTIONS
@@ -3049,13 +3889,25 @@ def get_last_valid_trading_day(df):
             return date
     return None
 
-def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
+def load_precomputed_results_from_file(pkl_file, ticker=None, max_retries=5, delay=1):
     retries = 0
     while retries < max_retries:
         try:
             with open(pkl_file, 'rb') as f:
                 data = pickle.load(f)
-            return data
+                # Validate self-check tokens if present
+                if ticker and '_ticker' in data and data['_ticker'] != ticker:
+                    logger.error(f"CONTAMINATION DETECTED!")
+                    logger.error(f"Pickle for {ticker} contains data for {data['_ticker']}")
+                    logger.error(f"Row count: {data.get('_row_count')}")
+                    logger.error(f"Date range: {data.get('_first_date')} to {data.get('_last_date')}")
+                    logger.error(f"Deleting contaminated file: {pkl_file}")
+                    try:
+                        os.remove(pkl_file)
+                    except Exception:
+                        pass
+                    return None
+                return data
         except PermissionError:
             logger.error(f"Permission denied when loading results from {pkl_file}. Retrying...")
             time.sleep(delay)
@@ -3069,57 +3921,190 @@ def load_precomputed_results_from_file(pkl_file, max_retries=5, delay=1):
     logger.error(f"Failed to load results from {pkl_file} after {max_retries} retries.")
     return None
 
-def load_precomputed_results(ticker, from_callback=False, should_log=True):
-    global _precomputed_results_cache, _loading_in_progress
+def _results_for(ticker, request_key):
+    """Get results only if they match the current request key."""
+    res = _precomputed_results_cache.get(normalize_ticker(ticker))
+    if not res:
+        return None
+    # Only enforce request-key equality if the result actually carries a key.
+    # Older cached results won't have one - treat them as acceptable.
+    if request_key and res.get('request_key') is not None and res.get('request_key') != request_key:
+        # Stale result from a previous selection; ignore
+        return None
+    return res
+
+def _schedule_refresh_locked(ticker):
+    """Schedule a refresh for a ticker (must be called under _loading_lock)."""
+    global _loading_in_progress
+    if ticker in _loading_in_progress:
+        logger.debug(f"Refresh already in progress for {ticker}; not scheduling a duplicate.")
+        return
+    dedup_logger.info("Scheduling refresh...")
+    write_status(ticker, {"status": "refreshing", "progress": 5, "cache_status": "stale"})
+    event = threading.Event()
+    _loading_in_progress[ticker] = event
+    # Use job pool instead of new thread
+    submit_bg(precompute_results, ticker, event)
+
+def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_staleness_check=False, request_key=None, bypass_loading_check=False):
+    """Load precomputed results with optional bypass of loading check.
     
+    Args:
+        ticker: Ticker symbol to load
+        from_callback: Whether called from a callback
+        should_log: Whether to log detailed messages
+        skip_staleness_check: Skip checking if cache is stale
+        request_key: Optional request key for tracking
+        bypass_loading_check: If True, bypass the loading flag check (use for Multi-Primary only)
+    """
+    global _precomputed_results_cache, _loading_in_progress, _cancel_flags, _active_request_keys
+    
+    # Normalize ticker immediately to ensure consistent cache lookups
+    ticker = normalize_ticker(ticker)
+    
+    # --- start under _loading_lock just to read flags/short-circuit ---
     with _loading_lock:
         if ticker in _precomputed_results_cache:
-            # Log when called from callback with should_log=True (ticker change)
+            results = _precomputed_results_cache[ticker]
+            results.setdefault('cache_status', 'unknown')
+            if request_key:
+                results['request_key'] = request_key
+            
+            # Only print the big banner when this was triggered by the ticker change
             if from_callback and should_log:
-                logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
+                dedup_logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
                 log_ticker_section(ticker, "LOADING CACHED DATA")
-                logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker}{Colors.ENDC}")
+                status_msg = results.get('cache_status', 'unknown')
+                dedup_logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker} ({status_msg}){Colors.ENDC}")
             else:
-                # Only log debug info for interval updates
-                logger.debug(f"Using cached results for {ticker}")
-            return _precomputed_results_cache[ticker]
-
-        if ticker in _loading_in_progress:
-            logger.debug(f"Loading in progress for {ticker}")
+                logger.debug(f"Using session-cached data for {ticker}")
+            
+            # If RAM cache has the DF, also cache it in the LRU DF cache
+            df = results.get('preprocessed_data')
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                _df_cache_put(ticker, df)
+            
+            logger.info(f"[cache] RAM hit for {ticker} (req={request_key})")
+            
+        if ticker in _loading_in_progress and not bypass_loading_check:
+            logger.debug(f"Loading in progress for {ticker} (bypass={bypass_loading_check})")
             return None  # Return None immediately if loading is in progress
-
-        # Log ticker input for new requests
-        if should_log:
-            logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
+    # --- release lock before touching disk ---
+    
+    # Handle RAM hit case outside the lock
+    if 'results' in locals():
+        # Write status as complete so interval callbacks don't block
+        write_status(ticker, {
+            "status": "complete",
+            "progress": 100,
+            "cache_status": results.get('cache_status', 'unknown')
+        })
         
-        # Attempt to load from file if not in cache and not currently loading
-        pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
-        if os.path.exists(pkl_file):
+        # Check staleness asynchronously using a proper thread
+        if not skip_staleness_check:
+            submit_bg(_detect_stale_and_refresh_async, ticker, results)
+        
+        return results
+
+        # (removed duplicate ticker log; we log exactly once later to avoid duplicates)
+        
+    # Attempt to load from file if not in cache and not currently loading
+    pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
+    if os.path.exists(pkl_file):
+        if from_callback and should_log:
             log_ticker_section(ticker, "LOADING EXISTING DATA")
             log_processing(f"Loading precomputed results from file for {ticker}")
-            load_start_time = time.time()
-            results = load_precomputed_results_from_file(pkl_file)
-            if results:
-                _precomputed_results_cache[ticker] = results
-                logger.debug(f"Loaded results from file for {ticker}")
-                return results
-            else:
-               logger.warning(f"Failed to load results from file for {ticker}")
+        t0 = time.time()
+        results_full = load_precomputed_results_from_file(pkl_file, ticker)
+        if results_full:
+            results_full.setdefault('cache_status', 'unknown')
+            
+            # Pre-hydrate small tickers to prevent UI freezes
+            rows = results_full.get('_row_count') or \
+                   (len(results_full['preprocessed_data']) if isinstance(results_full.get('preprocessed_data'), pd.DataFrame) else 0)
+            
+            if rows and rows <= int(os.getenv("SMALL_TICKER_ROWS", "6000")):  # ~24 years of daily bars
+                df = results_full.get('preprocessed_data')
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    _df_cache_put(ticker, df)
+                    logger.debug(f"Pre-hydrated DF for small ticker {ticker} ({rows} rows)")
+            
+            # keep RAM light; do NOT keep the DataFrame in session cache
+            results_mem = _lighten_for_runtime(results_full, pkl_file)
+            results_mem['load_time'] = time.time() - t0
+            with _loading_lock:
+                _precomputed_results_cache[ticker] = results_mem
+                _enforce_cache_limits()
+            # Attach request_key so helpers (e.g., _results_for) and multi-callback flows
+            # can verify freshness across triggers.
+            if request_key:
+                results_mem['request_key'] = request_key
+            
+            # Only log when triggered by ticker change
+            if from_callback and should_log:
+                logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
+                logger.info(f"{Colors.OKGREEN}[✅] Loaded existing results from file cache{Colors.ENDC}")
+                # Show cache load time
+                load_time = results_mem.get('load_time', 0)
+                logger.info(f"{Colors.OKGREEN}Cache load time:{Colors.ENDC} {Colors.YELLOW}{load_time:.3f} seconds{Colors.ENDC}")
+            
+            # Write status as complete so interval callbacks don't block
+            write_status(ticker, {
+                "status": "complete",
+                "progress": 100,
+                "cache_status": results_mem.get('cache_status', 'unknown')
+            })
+            
+            logger.info(f"[cache] Disk hit for {ticker} (req={request_key}) file={pkl_file} "
+                        f"load_time={results_mem.get('load_time', 0):.3f}s")
+            
+            # Check staleness asynchronously using a proper thread
+            if not skip_staleness_check:
+                submit_bg(_detect_stale_and_refresh_async, ticker, results_mem)
+            
+            return results_mem
+        else:
+           logger.warning(f"Failed to load results from file for {ticker}")
 
-        # Check if we've already tried and failed due to insufficient data
-        status = read_status(ticker)
-        if status.get('message') == "Insufficient trading history":
+    # Check if we've already tried and failed due to insufficient data
+    status = read_status(ticker)
+    if status.get('message') == "Insufficient trading history":
+        return None
+
+    # NEW: Do not immediately retry a ticker that just failed — avoid tight loops
+    if status.get('status') == 'failed':
+        logger.debug(f"{ticker}: last attempt failed; not retrying automatically.")
+        return None
+
+    # Mark as in-progress & fire background precompute (single-flight guard)
+    with _loading_lock:
+        # Another callback may have scheduled the same ticker while we were checking disk.
+        if ticker in _loading_in_progress:
+            # Someone else owns the compute; interval polling will pick up results.
             return None
 
+        # We are the first to schedule; log exactly once here.
         log_ticker_section(ticker, "COMPUTING NEW DATA")
         log_processing(f"Starting to precompute results for {ticker}...")
+
+        # Cancel any other in-flight jobs (only for different tickers)
+        for t, ev in list(_loading_in_progress.items()):
+            if t != ticker:  # Don't cancel ourselves
+                cf = _cancel_flags.get(t)
+                if cf:
+                    cf.set()
+                    logger.debug(f"Cancelled in-flight computation for {t}")
+        
         event = threading.Event()
+        cancel_event = threading.Event()
         _loading_in_progress[ticker] = event
-        # Set daemon=True so the thread doesn't prevent program exit
-        thread = threading.Thread(target=precompute_results, args=(ticker, event))
-        thread.daemon = True
-        thread.start()
-        return None
+        _cancel_flags[ticker] = cancel_event
+        _active_request_keys[ticker] = request_key
+        
+        # Submit to job pool instead of creating new thread
+        submit_bg(precompute_results, ticker, event, cancel_event)
+    
+    return None
 
 def fetch_precomputed_results(ticker):
     precomputed_results = load_precomputed_results(ticker)
@@ -3140,12 +4125,12 @@ def fetch_precomputed_results(ticker):
 
 def get_data(ticker, MAX_SMA_DAY):
     # Use logger instead of logging for consistency
-    # Internal function call - no logging needed
     # Force flush to ensure output appears
     for handler in logger.handlers:
         handler.flush()
     
-    results = load_precomputed_results(ticker)
+    # Pass should_log=True to ensure Statistical Significance and Forecast are logged
+    results = load_precomputed_results(ticker, skip_staleness_check=True, should_log=True)
     return results
     
 def compute_signals(df, sma1, sma2):
@@ -3174,41 +4159,188 @@ def compute_signals(df, sma1, sma2):
     return {'buy_capture': buy_capture, 'short_capture': short_capture}
 
 def write_status(ticker, status):
-    ticker = normalize_ticker(ticker)
-    status_file = f"cache/status/{ticker}_status.json"
+    """
+    Atomically write status JSON to avoid truncated/empty reads by other threads/processes.
+    """
+    t = normalize_ticker(ticker)
+    status_dir = os.path.join("cache", "status")
+    os.makedirs(status_dir, exist_ok=True)
+    final_path = os.path.join(status_dir, f"{t}_status.json")
+
+    payload = json.dumps(status, ensure_ascii=False, separators=(",", ":"))
+    tmp_path = None
+
     with status_lock:
-        with open(status_file, 'w') as f:
-            json.dump(status, f)
+        try:
+            # Write to a temp file in the same directory, flush + fsync, then atomic replace.
+            with tempfile.NamedTemporaryFile(
+                mode="w", delete=False, dir=status_dir, suffix=".json", encoding="utf-8"
+            ) as tf:
+                tmp_path = tf.name
+                tf.write(payload)
+                tf.flush()
+                os.fsync(tf.fileno())
+            os.replace(tmp_path, final_path)  # atomic on POSIX and Windows 10+
+        except Exception as e:
+            # Fall back to a direct write to avoid dropping status entirely
+            try:
+                with open(final_path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+            except Exception as e2:
+                logger.error(f"write_status fallback failed for {t}: {e2}")
+            finally:
+                # Best effort to clean up the temp file
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+# Define transient keys that should not be persisted to disk
+TRANSIENT_KEYS = {"section_times", "start_time", "load_time", "cache_status", "stale"}
+
+# Keys too heavy for the in-memory session cache
+_HEAVY_RUNTIME_ONLY_KEYS = {"preprocessed_data"}
+
+def _lighten_for_runtime(full_results: dict, pkl_path: str) -> dict:
+    """
+    Return a lightweight copy of results that is safe to keep in RAM
+    and pass through callbacks. Removes large DataFrame(s) but remembers
+    where to reload from.
+    """
+    r = dict(full_results)  # shallow copy
+    # mark where we can hydrate from
+    r["_pkl_path"] = pkl_path
+    # drop the big frame(s) from the in-memory copy
+    for k in list(_HEAVY_RUNTIME_ONLY_KEYS):
+        if k in r:
+            del r[k]
+    # bookkeeping flags
+    r["_has_df"] = "preprocessed_data" in full_results
+    return r
+
+def load_preprocessed_df(ticker: str, pkl_path: str = None):
+    """
+    Load just the DataFrame from disk. Avoids touching the RAM cache.
+    """
+    t = normalize_ticker(ticker)
+    if not pkl_path:
+        pkl_path = f"cache/results/{t}_precomputed_results.pkl"
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+    return data.get("preprocessed_data")
+
+def ensure_df_available(ticker: str, results: dict = None):
+    """
+    Get a DataFrame for code that truly needs it.
+    Uses LRU cache and single-flight loading to prevent UI freezes.
+    """
+    # 0) RAM hit?
+    df = _df_cache_get(ticker)
+    if df is not None:
+        return df
+
+    # 1) Already in results (old behavior)
+    if results is not None:
+        df = results.get('preprocessed_data')
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            _df_cache_put(ticker, df)
+            return df
+
+    # 2) Single-flight guarded disk load
+    tk = normalize_ticker(ticker)
+    lock = _df_load_locks[tk]
+    if not lock.acquire(blocking=False):
+        # Someone else is loading this DF right now; avoid pile-ups.
+        logger.debug(f"DF load already in progress for {ticker}; skipping duplicate.")
+        return None
+    try:
+        # Resolve a path—either saved by _lighten_for_runtime or standard fallback
+        pkl_file = (results or {}).get('_pkl_path') or f'cache/results/{tk}_precomputed_results.pkl'
+        
+        full = load_precomputed_results_from_file(pkl_file, ticker)
+        df = None
+        if full:
+            df = full.get('preprocessed_data')
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            _df_cache_put(ticker, df)
+            logger.debug(f"Rehydrated DF for {ticker} from disk ({len(df)} rows)")
+            return df
+        logger.warning(f"Could not rehydrate DF for {ticker} from {pkl_file}")
+        return None
+    finally:
+        lock.release()
+
+def _same_calendar_day(a, b):
+    """Check if two timestamps are on the same calendar day."""
+    try:
+        return pd.Timestamp(a).date() == pd.Timestamp(b).date()
+    except Exception:
+        return False
+
+def _persistable_results(results: dict) -> dict:
+    """Return a copy of results without transient/session-only fields."""
+    # Shallow copy is fine; we are just dropping top-level keys
+    return {k: v for k, v in results.items() if k not in TRANSIENT_KEYS}
 
 def save_precomputed_results(ticker, results):
+    """Save results with per-ticker file lock to prevent corruption."""
     ticker = normalize_ticker(ticker)
     final_name = f'cache/results/{ticker}_precomputed_results.pkl'
+    temp_name = None
+    
+    # Ensure target dir exists
+    os.makedirs(os.path.dirname(final_name), exist_ok=True)
+    # Validate before saving
+    if '_ticker' in results and results['_ticker'] != ticker:
+        logger.error(f"PREVENTING CONTAMINATION: Trying to save {results['_ticker']} data as {ticker}")
+        return
+    
+    # CRITICAL: Prevent saving corrupted results with (0,0) SMA pairs
+    if 'top_buy_pair' in results and results['top_buy_pair'] == (0, 0):
+        logger.error(f"PREVENTING CORRUPTION: Refusing to save {ticker} with (0,0) buy pair")
+        # Clean up corrupted in-memory cache
+        with _loading_lock:
+            if ticker in _precomputed_results_cache:
+                del _precomputed_results_cache[ticker]
+            if ticker in _loading_in_progress:
+                del _loading_in_progress[ticker]
+        return
+    if 'top_short_pair' in results and results['top_short_pair'] == (0, 0):
+        logger.error(f"PREVENTING CORRUPTION: Refusing to save {ticker} with (0,0) short pair")
+        # Clean up corrupted in-memory cache
+        with _loading_lock:
+            if ticker in _precomputed_results_cache:
+                del _precomputed_results_cache[ticker]
+            if ticker in _loading_in_progress:
+                del _loading_in_progress[ticker]
+        return
+    
+    # Add guard against saving incomplete light copies
+    if 'preprocessed_data' not in results and not results.get('_has_df'):
+        # This is a light copy - don't write incomplete objects back to disk
+        logger.debug(f"Skipping save of light copy for {ticker}")
+        return
+    
+    # Strip transient keys before persisting
+    results_to_disk = _persistable_results(results)
     
     # Create a temporary file and write data
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tf:
-        pickle.dump(results, tf)
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl', dir='cache/results') as tf:
+        pickle.dump(results_to_disk, tf, protocol=pickle.HIGHEST_PROTOCOL)
+        tf.flush()  # Flush Python buffer
+        os.fsync(tf.fileno())  # Force OS to write to disk
         temp_name = tf.name
     
-    # Try to move the file with retry logic for Windows file locking
+    # Try atomic replace (better than remove+move)
     max_retries = 3
     retry_delay = 0.5
     
     for attempt in range(max_retries):
         try:
-            # On Windows, if file exists, remove it first
-            if os.path.exists(final_name):
-                try:
-                    os.remove(final_name)
-                except (OSError, PermissionError):
-                    # File might be in use, wait and retry
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-                        continue
-            
-            # Now move the temp file
-            shutil.move(temp_name, final_name)
+            # Use os.replace for atomic operation
+            os.replace(temp_name, final_name)
             break  # Success!
-            
         except (PermissionError, FileExistsError) as e:
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
@@ -3223,7 +4355,7 @@ def save_precomputed_results(ticker, results):
                     logger.warning(f"Could not save results for {ticker}: {e}")
                     
     # Clean up temp file if it still exists
-    if os.path.exists(temp_name):
+    if temp_name and os.path.exists(temp_name):
         try:
             os.remove(temp_name)
         except:
@@ -3236,377 +4368,598 @@ def save_precomputed_results(ticker, results):
 # ============================================================================
 # PRECOMPUTATION AND CACHING FUNCTIONS
 # ============================================================================
-def precompute_results(ticker, event):
-    global master_stopwatch_start
-    master_stopwatch_start = time.time()
+def precompute_results(ticker, event, cancel_event=None):
+    """
+    Compute (or refresh) all precomputed data for `ticker`.
+    Safe for background threads; supports cooperative cancellation via `event` or `cancel_event`.
+
+    Major stages:
+      1) Fetch + validate history
+      2) Decide whether recomputation is required (fingerprint + SMA limit)
+      3) Build SMA columns
+      4) Find daily top pairs (streaming for tiny problems; chunked-vectorized otherwise)
+      5) Compute cumulative combined capture & top leaders
+      6) Persist (atomic) + publish in-memory copy
+    """
+    # ---------- small helpers ----------
+    def _check_cancel(where: str = ""):
+        # Check both the explicit cancel flag and the completion event
+        if (cancel_event and cancel_event.is_set()) or (event and event.is_set()):
+            # Tag the status before bailing out so the UI flips quickly
+            write_status(ticker, {"status": "cancelled", "progress": 0, "cache_status": "unknown"})
+            logger.info(f"{Colors.WARNING}⚠️ Computation cancelled{Colors.ENDC} {('at ' + where) if where else ''}.")
+            raise ComputationCancelled()
+
+    def _now_secs():
+        return time.time()
+
+    CANCEL_POLL_EVERY_DAY = 50     # daily streaming loop: check every 50 days
+    CANCEL_POLL_EVERY_CHUNK = 1    # vectorized pair-chunk loop: check each chunk
+    CANCEL_POLL_EVERY_SMA = 5      # SMA build loop: check every 5 SMA periods
+
+    master_start = _now_secs()
     section_times = {}
-    global _loading_in_progress, _precomputed_results_cache
-    
-    # Header is shown by log_ticker_section in load_precomputed_results
-    with logging_redirect_tqdm():
-        try:
-            # Internal function call - no logging needed
-            # Force flush to ensure output appears
-            for handler in logger.handlers:
-                handler.flush()
-            section_start = time.time()
-            
-            def log_section_time(section_name):
-                section_time = time.time() - section_start
-                section_times[section_name] = section_time
-                return time.time()
-            
+
+    # Ensure status is visible to the UI immediately; mark cache as "stale" while preparing
+    write_status(ticker, {"status": "processing", "progress": 0, "cache_status": "stale"})
+
+    try:
+        with logging_redirect_tqdm():
+            # -----------------------------------------------------------------
+            # 1) Fetch + validate
+            # -----------------------------------------------------------------
+            section_t0 = _now_secs()
+            _check_cancel("start")
+
             df = fetch_data(ticker)
+            _check_cancel("after fetch_data")
+
             if df is None or df.empty:
                 write_status(ticker, {"status": "failed", "message": "No data"})
                 logger.warning(f"No data fetched for {ticker}")
                 return None
-                
-            # Check for minimum required trading days
-            if len(df) < 2:  # Minimum 2 days needed for calculations
-                write_status(ticker, {"status": "failed", "message": "Insufficient trading history"})
-                logger.warning(f"Unable to process {ticker}: Found only {len(df)} trading day(s). Min. 2 trading days required.")
-                logger.warning("Please enter a different ticker symbol.")
+
+            try:
+                df = _validate_df_shape(df, ticker)
+            except ValueError as ve:
+                write_status(ticker, {"status": "failed", "message": str(ve)})
+                logger.error(f"DataFrame validation failed: {ve}")
                 return None
-            
-            logger.info("")  # Line break before section
+
+            if len(df) < 2:
+                write_status(ticker, {"status": "failed", "message": "Insufficient trading history"})
+                logger.warning(f"Unable to process {ticker}: Found only {len(df)} trading day(s).")
+                logger.warning("Minimum 2 trading days required.")
+                return None
+
+            # -----------------------------------------------------------------
+            # 2) Decide whether recomputation is required
+            # -----------------------------------------------------------------
+            pkl_file = f'cache/results/{normalize_ticker(ticker)}_precomputed_results.pkl'
+            existing_results = load_precomputed_results_from_file(pkl_file, ticker) if os.path.exists(pkl_file) else {}
+            existing_max_sma_day = existing_results.get('existing_max_sma_day', 0)
+            old_fingerprint = existing_results.get('data_fingerprint')
+
+            # Trim extremely long histories if needed (protects memory)
+            MAX_TRADING_DAYS = 30000
+            if len(df) > MAX_TRADING_DAYS:
+                df = df.iloc[-MAX_TRADING_DAYS:]
+                logger.warning(f"Trimmed data to last {MAX_TRADING_DAYS} trading days")
+                logger.warning("Due to memory constraints.")
+
+            max_sma_day = min(MAX_SMA_DAY, len(df))
+            current_fingerprint = _df_fingerprint(df)
+            fingerprint_changed = _fingerprint_changed(old_fingerprint, current_fingerprint)
+            needs_precompute = (max_sma_day > existing_max_sma_day) or fingerprint_changed
+
+            logger.info(f"Total trading days: {len(df)}")
+            logger.debug(f"MAX_SMA_DAY={max_sma_day} existing_max_sma_day={existing_max_sma_day} changed={fingerprint_changed} needs={needs_precompute}")
+
+            # If we can reuse, publish existing result quickly
+            if not needs_precompute and existing_results:
+                dedup_logger.info("Existing results found for {0} and no precomputation needed.\nUsing existing results."
+                                  .format(ticker))
+                # Rehydrate minimal fields if missing (no disk write needed)
+                if 'cumulative_combined_captures' not in existing_results:
+                    # Use ensure_df_available to get the DataFrame
+                    df_existing = ensure_df_available(ticker, existing_results)
+                    if df_existing is None:
+                        df_existing = existing_results.get('preprocessed_data')  # Fallback
+                    daily_top_buy = existing_results.get('daily_top_buy_pairs', {})
+                    daily_top_short = existing_results.get('daily_top_short_pairs', {})
+                    ccc, active = calculate_cumulative_combined_capture(df_existing, daily_top_buy, daily_top_short)
+                    existing_results['cumulative_combined_captures'] = ccc
+                    existing_results['active_pairs'] = active
+
+                # In‑memory enrichment only - use lightweight version
+                results_mem = _lighten_for_runtime(existing_results, pkl_file)
+                results_mem['section_times'] = section_times
+                results_mem['start_time'] = master_start
+                # Preserve the active request key for this computation (if any).
+                rk = _active_request_keys.get(ticker)
+                if rk:
+                    results_mem['request_key'] = rk
+
+                write_status(ticker, {"status": "complete", "progress": 100, "cache_status": results_mem.get('cache_status', 'unknown')})
+                with _loading_lock:
+                    _precomputed_results_cache[ticker] = results_mem
+                _enforce_cache_limits()
+                if ticker in _loading_in_progress:
+                    _loading_in_progress[ticker].set()
+                    del _loading_in_progress[ticker]
+                return results_mem
+
+            # Now we know we're actually going to compute, so log the banner
+            section_times['Data Preprocessing'] = _now_secs() - section_t0
             log_section("Data Preprocessing")
             log_processing(f"Data loading initiated for {ticker}")
-            section_times['Data Preprocessing'] = time.time() - section_start
-            section_start = time.time()
 
-            pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
+            # -----------------------------------------------------------------
+            # 3) Build SMA columns (simple and robust; cancellation-aware)
+            # -----------------------------------------------------------------
+            _check_cancel("before SMA build")
+            log_section("SMA Build")
+            smat0 = _now_secs()
+
+            # Import numpy for this section
+            import numpy as np
             
-            if os.path.exists(pkl_file):
-                existing_results = load_precomputed_results_from_file(pkl_file)
-                existing_max_sma_day = existing_results.get('existing_max_sma_day', 0)
-                last_processed_date = existing_results.get('last_processed_date')
+            # --- Extract a robust 1‑D Close series once (handles MultiIndex/1-col DataFrame cases) ---
+            if 'Close' in df.columns:
+                close_series = df['Close']
+            elif 'Adj Close' in df.columns:
+                close_series = df['Adj Close']
+            elif 'Adj_Close' in df.columns:
+                close_series = df['Adj_Close']
             else:
-                existing_results = {}
-                existing_max_sma_day = 0
-                last_processed_date = None
+                # Fallback: first numeric column (guard against exotic inputs)
+                _num_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
+                if not _num_cols:
+                    raise KeyError("No numeric price column found to build SMAs.")
+                close_series = df[_num_cols[0]]
 
-            MAX_TRADING_DAYS = 30000  # Adjust if needed
-            total_trading_days = len(df)
-            if total_trading_days > MAX_TRADING_DAYS:
-                df = df.iloc[-MAX_TRADING_DAYS:]
-                logger.warning(f"Trimmed data to last {MAX_TRADING_DAYS} trading days due to memory constraints.")
-            
-            max_sma_day = min(MAX_SMA_DAY, len(df))
-            needs_precompute = max_sma_day > existing_max_sma_day or last_processed_date != df.index[-1]
-            
-            logger.info(f"Total trading days: {total_trading_days}")
-            logger.info(f"MAX_SMA_DAY: {max_sma_day}, existing_max_sma_day: {existing_max_sma_day}")
-            logger.info(f"Needs precompute: {needs_precompute}")
-            
-            if not needs_precompute:
-                logger.info(f"Existing results found for {ticker} and no precomputation needed. Using existing results.")
-                results = load_precomputed_results(ticker)
-                if 'active_pairs' not in results or not results['active_pairs']:
-                    logger.info(f"'active_pairs' not found or empty for {ticker}, recalculating...")
-                    daily_top_buy_pairs = results.get('daily_top_buy_pairs')
-                    daily_top_short_pairs = results.get('daily_top_short_pairs')
-                    if daily_top_buy_pairs and daily_top_short_pairs:
-                        df = results['preprocessed_data']
-                        cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs)
-                        results['cumulative_combined_captures'] = cumulative_combined_captures
-                        results['active_pairs'] = active_pairs
-                        # Set section_times BEFORE saving for cached results too
-                        results['section_times'] = section_times
-                        results['start_time'] = master_stopwatch_start
-                        save_precomputed_results(ticker, results)
-                    else:
-                        logger.warning(f"Missing daily top pairs for {ticker}, unable to recalculate 'active_pairs'.")
+            # If it came back as a 1‑column DataFrame (common in MultiIndex), squeeze to Series
+            if isinstance(close_series, pd.DataFrame):
+                close_series = close_series.iloc[:, 0]
 
-                # Ensure required keys exist
-                if 'top_buy_pair' not in results:
-                    results['top_buy_pair'] = (0,0)
-                if 'top_short_pair' not in results:
-                    results['top_short_pair'] = (0,0)
-                if 'cumulative_combined_captures' not in results:
-                    results['cumulative_combined_captures'] = pd.Series([0], index=[df.index[0]])
-                if 'active_pairs' not in results:
-                    results['active_pairs'] = ['None'] * len(df)
+            # ENHANCEMENT 4: Use float64 for SMA calculations for maximum precision
+            close_series = pd.to_numeric(close_series, errors='coerce').astype(np.float64)
+            logger.debug(f"[SMA Build] close_series: shape={getattr(close_series, 'shape', None)}, dtype={getattr(close_series, 'dtype', None)}")
 
-                write_status(ticker, {"status": "complete", "progress": 100})
-                with _loading_lock:
-                    _precomputed_results_cache[ticker] = results
-                    if ticker in _loading_in_progress:
-                        _loading_in_progress[ticker].set()
-                        del _loading_in_progress[ticker]
+            # Build all SMAs at once to avoid DataFrame fragmentation
+            sma_cols = {}
+            with tqdm_compact(total=max_sma_day, desc="SMAs", unit="SMA") as pbar_sma:
+                for j in range(1, max_sma_day + 1):
+                    if (j % CANCEL_POLL_EVERY_SMA) == 0:
+                        _check_cancel(f"SMA {j}")
+                    # ENHANCEMENT 5: Use center=False explicitly for accuracy (trailing window)
+                    sma_cols[f"SMA_{j}"] = close_series.rolling(window=j, min_periods=j, center=False).mean()
+                    pbar_sma.update(1)
 
+            # Concatenate all SMAs at once to avoid fragmentation
+            sma_df = pd.DataFrame(sma_cols, index=df.index)
+            # Ensure Close column is preserved during concatenation
+            if 'Close' not in df.columns:
+                df['Close'] = close_series
+            df = pd.concat([df, sma_df], axis=1)
 
-                # Keep section_times in memory cache too
-                results['section_times'] = section_times
-                results['start_time'] = master_stopwatch_start
+            section_times['SMA Build'] = _now_secs() - smat0
+            write_status(ticker, {"status": "processing", "progress": 10, "cache_status": "stale"})
 
-                logger.info("Computation and loading process completed.")
-                return results
-
-            else:
-                results = existing_results or {}
-
-                start_date = df.index.min().strftime('%Y-%m-%d')
-                last_date = df.index.max().strftime('%Y-%m-%d')
-                logger.info(f"Date range: {start_date} to {last_date}")
-
-            logger.info("")  # Line break before section
-            log_section("SMA Calculation")
-            logger.info("Checking SMA cache...")
-
-            cache_dir = 'cache/sma_cache'
-            os.makedirs(cache_dir, exist_ok=True)
-            sma_cache_path = os.path.join(cache_dir, f'sma_full_{ticker}.npz')
-
-            smas_loaded = False
-            if os.path.exists(sma_cache_path):
-                logger.info("Loading SMAs from cache...")
-                try:
-                    with np.load(sma_cache_path) as data:
-                        for i in range(1, max_sma_day + 1):
-                            df[f'SMA_{i}'] = data[f'SMA_{i}']
-                    logger.info("Successfully loaded SMAs from cache")
-                    smas_loaded = True
-                except Exception as e:
-                    logger.warning(f"Error loading SMAs from cache: {str(e)}")
-
-            if not smas_loaded:
-                logger.info("Computing new SMA columns...")
-                if max_sma_day > existing_max_sma_day:
-                    sma_list = []
-                    logger.info("Beginning SMA calculations in chunks...")
-                    chunk_size_sma = 50
-                    total_chunks = (max_sma_day - existing_max_sma_day + chunk_size_sma - 1) // chunk_size_sma
-
-                    with tqdm_compact(total=total_chunks, desc="SMA chunks", unit="chunk") as pbar:
-                        for i in range(existing_max_sma_day + 1, max_sma_day + 1, chunk_size_sma):
-                            chunk_end = min(i + chunk_size_sma, max_sma_day + 1)
-                            sma_dict = {}
-                            for j in range(i, chunk_end):
-                                sma_values = df['Close'].rolling(window=j, min_periods=j).mean().squeeze()
-                                sma_dict[f'SMA_{j}'] = sma_values
-                            sma_chunk = pd.DataFrame(sma_dict, index=df.index)
-                            sma_list.append(sma_chunk)
-                            gc.collect()
-                            pbar.update(1)
-
-                    logger.info(f"\nCompleted SMA calculations for {max_sma_day - existing_max_sma_day} new periods")
-
-                    sma_df = pd.concat(sma_list, axis=1)
-                    df = pd.concat([df, sma_df], axis=1)
-                    df = df.copy()
-                    logger.info(f"Added {max_sma_day - existing_max_sma_day} new SMA columns to DataFrame.")
-
-                else:
-                    logger.info("No new SMA periods to compute.")
-                    logger.info("Updating existing SMA columns for new data.")
-                    for sma_period in range(1, max_sma_day + 1):
-                        sma_column_name = f'SMA_{sma_period}'
-                        df[sma_column_name] = df['Close'].rolling(window=sma_period, min_periods=sma_period).mean()
-                        df.iloc[:sma_period-1, df.columns.get_loc(sma_column_name)] = np.nan
-                    df = df.copy()
-
-                    logger.info("SMA columns updated.")
-                    logger.info("Ensuring correct NaN values for SMA calculations.")
-                    for j in range(1, max_sma_day + 1):
-                        sma_column_name = f'SMA_{j}'
-                        df.iloc[:j-1, df.columns.get_loc(sma_column_name)] = np.nan
-                    logger.info("Ensured correct NaN values for SMA calculations.")
-
-                    expected_sma_columns = [f'SMA_{i}' for i in range(1, max_sma_day + 1)]
-                    missing_smas = [sma for sma in expected_sma_columns if sma not in df.columns]
-                    if not missing_smas:
-                        try:
-                            sma_dict = {f'SMA_{i}': df[f'SMA_{i}'].values for i in range(1, max_sma_day + 1)}
-                            np.savez_compressed(sma_cache_path, **sma_dict)
-                            logger.info("Saved SMAs to cache after full computation")
-                        except Exception as e:
-                            logger.warning(f"Failed to save SMA cache: {str(e)}")
-                    else:
-                        logger.warning(f"Missing SMA columns even after computation: {missing_smas}. Cannot cache incomplete SMA data.")
-
-            # Process SMA pairs and find top performers in a fully vectorized manner with chunking
-            logger.info("")  # Line break before section
+            # -----------------------------------------------------------------
+            # 4) Daily top pairs (streaming for tiny problems; chunked, vectorized otherwise)
+            # -----------------------------------------------------------------
+            _check_cancel("before pair search")
             log_section("SMA Pairs Processing")
+            pair_t0 = _now_secs()
+
+            dates = df.index
+            
+            # Import numpy for this section
+            import numpy as np
+
+            # Robustly derive a 1‑D returns vector with improved accuracy
+            # ENHANCEMENT 1: Prefer Adjusted Close for dividends/splits accuracy
+            if 'Adj Close' in df.columns:
+                prices = df['Adj Close']
+                logger.debug("Using Adjusted Close for accurate returns (accounts for dividends/splits)")
+            elif 'Adj_Close' in df.columns:
+                prices = df['Adj_Close']
+                logger.debug("Using Adj_Close for accurate returns")
+            elif 'Close' in df.columns:
+                prices = df['Close']
+                logger.debug("Using Close prices (no dividend adjustment)")
+            else:
+                _num_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
+                if not _num_cols:
+                    raise KeyError("No numeric price column found for returns.")
+                prices = df[_num_cols[0]]
+
+            if isinstance(prices, pd.DataFrame):
+                prices = prices.iloc[:, 0]
+
+            # ENHANCEMENT 2: Use float64 throughout for maximum precision
+            prices = pd.to_numeric(prices, errors='coerce').astype(np.float64)
+            
+            # ENHANCEMENT 3 (updated): Make returns fully NaN/Inf-safe; first day = 0
+            returns = prices.pct_change()
+            # corporate actions or data glitches may introduce ±inf; coerce to NaN → fill with 0
+            returns = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            # ensure contiguous 1-D float64
+            returns = returns.to_numpy(dtype=np.float64).reshape(-1)
+
+            logger.debug(f"[SMA Pairs] df cols={list(df.columns)[:8]}... (total {len(df.columns)})")
+            logger.debug(f"[SMA Pairs] returns: shape={returns.shape}, dtype={returns.dtype}")
+
             daily_top_buy_pairs = {}
             daily_top_short_pairs = {}
 
-            dates = df.index
-            returns = df['Close'].pct_change().fillna(0).values
-
-            # Determine total pairs
-            total_pairs = sum(1 for i in range(1, max_sma_day+1) for j in range(1, max_sma_day+1) if i != j)
-            chunk_size_pairs = 100000 if max_sma_day <= 500 else 75000 if max_sma_day <= 1000 else 50000 if max_sma_day <= 1500 else 25000
-            num_pair_chunks = (total_pairs + chunk_size_pairs - 1) // chunk_size_pairs
-
-            logger.info(f"Processing {total_pairs} pairs in {num_pair_chunks} chunks of {chunk_size_pairs}")
-
+            # Prepare an SMA matrix for vectorized ops
             sma_matrix = np.empty((len(dates), max_sma_day), dtype=np.float64)
-            for k in range(1, max_sma_day+1):
-                sma_matrix[:, k-1] = df[f'SMA_{k}'].values
+            for k in range(1, max_sma_day + 1):
+                sma_matrix[:, k - 1] = df[f'SMA_{k}'].values
 
-            pair_count = 0
-            with tqdm_compact(total=num_pair_chunks, desc="SMA pair chunks", unit="chunk") as pbar_pairs:
-                for chunk_idx in range(num_pair_chunks):
-                    start_idx = chunk_idx * chunk_size_pairs
-                    end_idx = min((chunk_idx + 1) * chunk_size_pairs, total_pairs)
+            total_pairs = max_sma_day * (max_sma_day - 1)
+            # Decide approach; threshold keeps streaming only for truly small problems
+            work_estimate = int(len(dates)) * int(total_pairs)
+            use_streaming = False  # force vectorized path for correctness on small tickers
 
-                    # Generate pairs for this chunk
-                    chunk_pairs = []
-                    pc = 0
-                    for i in range(1, max_sma_day+1):
-                        for j in range(1, max_sma_day+1):
-                            if i != j:
-                                if pc >= start_idx and pc < end_idx:
-                                    chunk_pairs.append((i, j))
-                                pc += 1
-                                if pc >= end_idx:
-                                    break
-                        if pc >= end_idx:
-                            break
+            # -- Streaming (tiny problems): O(days * SMA^2), tiny only
+            def _compute_daily_top_pairs_streaming():
+                nonlocal daily_top_buy_pairs, daily_top_short_pairs
+                for day_idx in range(len(dates)):
+                    # Cooperative cancellation
+                    if (day_idx % CANCEL_POLL_EVERY_DAY) == 0:
+                        _check_cancel(f"streaming day {day_idx}")
 
-                    chunk_pairs = np.array(chunk_pairs)
-                    num_pairs_chunk = len(chunk_pairs)
-                    if num_pairs_chunk == 0:
-                        pbar_pairs.update(1)
+                    if day_idx == 0:
+                        daily_top_buy_pairs[dates[day_idx]] = ((1, 2), 0.0)
+                        daily_top_short_pairs[dates[day_idx]] = ((2, 1), 0.0)
                         continue
 
-                    i_indices = chunk_pairs[:, 0] - 1
-                    j_indices = chunk_pairs[:, 1] - 1
+                    best_buy_capture = -np.inf
+                    best_buy_pair = None
+                    best_short_capture = -np.inf
+                    best_short_pair = None
 
-                    sma_i = sma_matrix[:, i_indices]
-                    sma_j = sma_matrix[:, j_indices]
-                    buy_signals = np.vstack([np.zeros((1, num_pairs_chunk), dtype=bool), (sma_i[:-1] > sma_j[:-1])])
-                    short_signals = np.vstack([np.zeros((1, num_pairs_chunk), dtype=bool), (sma_i[:-1] < sma_j[:-1])])
+                    today_return = returns[day_idx]
 
-                    returns_expanded = returns[:, np.newaxis]
-                    buy_captures = np.cumsum(returns_expanded * buy_signals * 100, axis=0)
-                    short_captures = np.cumsum(-returns_expanded * short_signals * 100, axis=0)
+                    # Only check cancel on the outer SMA loop to keep overhead low
+                    for i in range(1, max_sma_day + 1):
+                        if (i % 50) == 0:
+                            _check_cancel(f"streaming day {day_idx}, i={i}")
 
-                    # Update daily_top_buy_pairs and daily_top_short_pairs directly from this chunk
-                    for day_idx in range(len(dates)):
-                        # Buy
-                        max_buy_val = np.max(buy_captures[day_idx])
-                        # Reverse priority in case of ties
-                        max_buy_idx = len(buy_captures[day_idx]) - 1 - np.argmax(buy_captures[day_idx][::-1])
-                        current_buy_pair = tuple(chunk_pairs[max_buy_idx])
-                        if dates[day_idx] not in daily_top_buy_pairs or max_buy_val > daily_top_buy_pairs[dates[day_idx]][1]:
-                            daily_top_buy_pairs[dates[day_idx]] = (current_buy_pair, float(max_buy_val))
+                        for j in range(1, max_sma_day + 1):
+                            if i == j:
+                                continue
 
-                        # Short
-                        max_short_val = np.max(short_captures[day_idx])
-                        # Reverse priority in case of ties
-                        max_short_idx = len(short_captures[day_idx]) - 1 - np.argmax(short_captures[day_idx][::-1])
-                        current_short_pair = tuple(chunk_pairs[max_short_idx])
-                        if dates[day_idx] not in daily_top_short_pairs or max_short_val > daily_top_short_pairs[dates[day_idx]][1]:
-                            daily_top_short_pairs[dates[day_idx]] = (current_short_pair, float(max_short_val))
+                            sma_i_prev = sma_matrix[day_idx - 1, i - 1]
+                            sma_j_prev = sma_matrix[day_idx - 1, j - 1]
+                            if np.isnan(sma_i_prev) or np.isnan(sma_j_prev):
+                                continue
 
-                    del sma_i, sma_j, buy_signals, short_signals, buy_captures, short_captures
-                    gc.collect()
+                            if sma_i_prev > sma_j_prev:
+                                # buy running capture (we only need max for the day)
+                                best_buy_capture = max(best_buy_capture, best_buy_capture + 0 if best_buy_pair is None else best_buy_capture)
+                                # For streaming correctness, compare the *single-day* increment
+                                candidate = today_return * 100
+                                if candidate >= best_buy_capture:
+                                    best_buy_capture = candidate
+                                    best_buy_pair = (i, j)
+                            elif sma_i_prev < sma_j_prev:
+                                candidate = -today_return * 100
+                                if candidate >= best_short_capture:
+                                    best_short_capture = candidate
+                                    best_short_pair = (i, j)
 
-                    pbar_pairs.update(1)
-            
-            # Add line break after progress bar
-            logger.info("")
-            
-            # Update results
+                    daily_top_buy_pairs[dates[day_idx]] = (best_buy_pair or (1, 2), float(best_buy_capture if np.isfinite(best_buy_capture) else 0.0))
+                    daily_top_short_pairs[dates[day_idx]] = (best_short_pair or (2, 1), float(best_short_capture if np.isfinite(best_short_capture) else 0.0))
+
+            # -- Chunked vectorized (default path; fast and memory-aware)
+            def _compute_daily_top_pairs_vectorized():
+                nonlocal daily_top_buy_pairs, daily_top_short_pairs
+                
+                # Memory-safe chunking for large tickers
+                if len(dates) > 20000:  # Very large ticker like ^GSPC
+                    chunk_size_pairs = min(1500, total_pairs)  # Very small chunks for huge datasets
+                elif len(dates) > 15000:
+                    chunk_size_pairs = min(2500, total_pairs)
+                elif len(dates) > 10000:
+                    chunk_size_pairs = min(5000, total_pairs)
+                else:
+                    # Original logic for smaller tickers
+                    chunk_size_pairs = 100000 if max_sma_day <= 500 else 75000 if max_sma_day <= 1000 else 50000 if max_sma_day <= 1500 else 25000
+                
+                num_pair_chunks = (total_pairs + chunk_size_pairs - 1) // chunk_size_pairs
+                logger.info(f"Processing {total_pairs} pairs")
+                logger.info(f"  Chunks: {num_pair_chunks} x {chunk_size_pairs}")
+                logger.info(f"  Days: {len(dates)} | Memory-safe chunking: {len(dates) > 10000}")
+
+                # Track best per-day with global tie-break (prefer right-most overall)
+                n_days = len(dates)
+                EPS = 1e-12
+                buy_best_val = np.full(n_days, -np.inf, dtype=float)
+                buy_best_gidx = np.full(n_days, -1, dtype=int)
+                buy_best_pair = np.zeros((n_days, 2), dtype=int)
+                short_best_val = np.full(n_days, -np.inf, dtype=float)
+                short_best_gidx = np.full(n_days, -1, dtype=int)
+                short_best_pair = np.zeros((n_days, 2), dtype=int)
+
+                with tqdm_compact(total=num_pair_chunks, desc="SMA pair chunks", unit="chunk") as pbar_pairs:
+                    pc_global = 0
+                    for chunk_idx in range(num_pair_chunks):
+                        if (chunk_idx % CANCEL_POLL_EVERY_CHUNK) == 0:
+                            _check_cancel(f"pair-chunk {chunk_idx + 1}/{num_pair_chunks}")
+
+                        start_idx = chunk_idx * chunk_size_pairs
+                        end_idx = min((chunk_idx + 1) * chunk_size_pairs, total_pairs)
+
+                        # Materialize the (i,j) pairs in this chunk
+                        chunk_pairs = []
+                        while pc_global < end_idx:
+                            i = (pc_global // (max_sma_day - 1)) + 1
+                            j = (pc_global % (max_sma_day - 1)) + 1
+                            j = j if j < i else j + 1  # skip equal pairs by "shifting" j≥i
+                            if pc_global >= start_idx:
+                                chunk_pairs.append((i, j))
+                            pc_global += 1
+                        if not chunk_pairs:
+                            pbar_pairs.update(1)
+                            continue
+
+                        chunk_pairs = np.asarray(chunk_pairs, dtype=np.int32)
+                        i_idx = chunk_pairs[:, 0] - 1
+                        j_idx = chunk_pairs[:, 1] - 1
+
+                        # Compare previous day SMA for signal today (shift by 1)
+                        sma_i = sma_matrix[:, i_idx]
+                        sma_j = sma_matrix[:, j_idx]
+                        # prepend a zero row so day 0 has no position
+                        buy_signals = np.vstack([np.zeros((1, sma_i.shape[1]), dtype=bool), (sma_i[:-1] > sma_j[:-1])])
+                        short_signals = np.vstack([np.zeros((1, sma_i.shape[1]), dtype=bool), (sma_i[:-1] < sma_j[:-1])])
+
+                        # ENHANCEMENT 7: Use higher precision for capture calculations
+                        rexp = returns[:, None].astype(np.float64)  # Ensure float64 precision
+                        # ENHANCEMENT 8: Avoid precision loss in multiplication by using proper order
+                        buy_captures = np.cumsum(buy_signals.astype(np.float64) * rexp * 100.0, axis=0)
+                        short_captures = np.cumsum(short_signals.astype(np.float64) * (-rexp) * 100.0, axis=0)
+
+                        # For each day, keep the best pair from this chunk
+                        # (We do a local max per chunk, then across chunks we keep the global max.)
+                        # Doing this in a Python loop across days with NumPy max/argmax per row is fast enough
+                        # and keeps memory usage bounded by chunk size.
+                        for day_idx in range(len(dates)):
+                            if (day_idx % 250) == 0:
+                                _check_cancel(f"vector day {day_idx}")
+
+                            buy_row = buy_captures[day_idx]
+                            short_row = short_captures[day_idx]
+
+                            # BUY - ENHANCEMENT 6: More accurate tie-breaking with smaller epsilon
+                            mbv = float(buy_row.max())
+                            mbi = buy_row.size - 1 - int(np.argmax(buy_row[::-1]))  # right-most max
+                            gbi = start_idx + mbi  # global pair index
+                            # Update if strictly better OR equal with higher index (deterministic tie-break)
+                            if mbv > buy_best_val[day_idx] + EPS or (np.abs(mbv - buy_best_val[day_idx]) <= EPS and gbi > buy_best_gidx[day_idx]):
+                                buy_best_val[day_idx] = mbv
+                                buy_best_gidx[day_idx] = gbi
+                                buy_best_pair[day_idx] = chunk_pairs[mbi]
+
+                            # SHORT - ENHANCEMENT 6: More accurate tie-breaking with smaller epsilon
+                            msv = float(short_row.max())
+                            msi = short_row.size - 1 - int(np.argmax(short_row[::-1]))
+                            gsi = start_idx + msi  # global pair index
+                            if msv > short_best_val[day_idx] + EPS or (np.abs(msv - short_best_val[day_idx]) <= EPS and gsi > short_best_gidx[day_idx]):
+                                short_best_val[day_idx] = msv
+                                short_best_gidx[day_idx] = gsi
+                                short_best_pair[day_idx] = chunk_pairs[msi]
+
+                        del sma_i, sma_j, buy_signals, short_signals, buy_captures, short_captures
+                        gc.collect()
+                        pbar_pairs.update(1)
+                
+                # Materialize dicts after all chunks so tie-break is global
+                # If any days were never updated (still (0,0)), fill with MAX-SMA sentinels
+                zero_buy = (buy_best_pair[:, 0] == 0) & (buy_best_pair[:, 1] == 0)
+                zero_short = (short_best_pair[:, 0] == 0) & (short_best_pair[:, 1] == 0)
+                if zero_buy.any() or zero_short.any():
+                    sentinel_buy = np.array([max_sma_day, max_sma_day - 1], dtype=buy_best_pair.dtype)
+                    sentinel_short = np.array([max_sma_day - 1, max_sma_day], dtype=short_best_pair.dtype)
+                    if zero_buy.any():
+                        buy_best_pair[zero_buy] = sentinel_buy
+                        buy_best_val[zero_buy] = 0.0
+                    if zero_short.any():
+                        short_best_pair[zero_short] = sentinel_short
+                        short_best_val[zero_short] = 0.0
+                    logger.warning(f"[PAIR FILL] Replaced {(int(zero_buy.sum()))} buy and {(int(zero_short.sum()))} short (0,0) days with MAX-SMA sentinels")
+
+                for d in range(n_days):
+                    daily_top_buy_pairs[dates[d]] = ((int(buy_best_pair[d, 0]), int(buy_best_pair[d, 1])), float(buy_best_val[d]))
+                    daily_top_short_pairs[dates[d]] = ((int(short_best_pair[d, 0]), int(short_best_pair[d, 1])), float(short_best_val[d]))
+
+            if use_streaming:
+                logger.debug(f"Using streaming approach: days={len(dates)}, pairs={total_pairs} (≈{work_estimate:,} ops)")
+                _compute_daily_top_pairs_streaming()
+            else:
+                _compute_daily_top_pairs_vectorized()
+
+            section_times['SMA Pairs Processing'] = _now_secs() - pair_t0
+            write_status(ticker, {"status": "processing", "progress": 50, "cache_status": "stale"})
+
+            # -----------------------------------------------------------------
+            # 5) Combined capture + leaders (cancellation checked before start)
+            # -----------------------------------------------------------------
+            _check_cancel("before combined capture")
+            log_section("Cumulative Combined Captures")
+            ccc_t0 = _now_secs()
+
+            # Deep copy to protect against aliasing
+            results = dict(existing_results or {})
+            results['preprocessed_data'] = df.copy(deep=True)
+            results['existing_max_sma_day'] = max_sma_day
+            results['last_processed_date'] = df.index[-1]
+            results['data_fingerprint'] = current_fingerprint
+            results['start_date'] = df.index[0]
+            results['last_date'] = df.index[-1]
+            results['total_trading_days'] = len(df)
+            # self-check tokens to detect cross-ticker contamination
+            results['_ticker'] = ticker
+            results['_row_count'] = len(df)
+            results['_first_date'] = df.index[0]
+            results['_last_date'] = df.index[-1]
             results['daily_top_buy_pairs'] = daily_top_buy_pairs
             results['daily_top_short_pairs'] = daily_top_short_pairs
 
-            write_status(ticker, {"status": "processing", "progress": 50})
-
-            # Update other results
-            results['preprocessed_data'] = df
-            results['existing_max_sma_day'] = max_sma_day
-            results['last_processed_date'] = df.index[-1]
-            results['start_date'] = start_date
-            results['last_date'] = last_date
-            results['total_trading_days'] = total_trading_days
-
-            # Begin Cumulative Combined Captures Calculation
-            logger.info("")  # Line break before section
-            log_section("Cumulative Combined Captures")
-            section_start = log_section_time("Cumulative Combined Captures")
             cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
-                df,
-                results['daily_top_buy_pairs'],
-                results['daily_top_short_pairs']
+                df, daily_top_buy_pairs, daily_top_short_pairs
             )
-
             results['cumulative_combined_captures'] = cumulative_combined_captures
             results['active_pairs'] = active_pairs
 
-            # Find best overall pairs from daily results
+            # Leaders on last available day
             last_day = df.index[-1]
-            if last_day in results['daily_top_buy_pairs']:
-                top_buy_pair = results['daily_top_buy_pairs'][last_day][0]
-                top_buy_capture = results['daily_top_buy_pairs'][last_day][1]
+            if last_day in daily_top_buy_pairs:
+                results['top_buy_pair'] = daily_top_buy_pairs[last_day][0]
+                results['top_buy_capture'] = daily_top_buy_pairs[last_day][1]
             else:
-                top_buy_pair = (0,0)
-                top_buy_capture = 0
+                # fallback to most recent <= last_day; if none, use MAX-SMA sentinel
+                available = sorted([d for d in daily_top_buy_pairs.keys() if d <= last_day])
+                if available:
+                    fb = available[-1]
+                    results['top_buy_pair'] = daily_top_buy_pairs[fb][0]
+                    results['top_buy_capture'] = daily_top_buy_pairs[fb][1]
+                    logger.warning(f"[LEADER Fallback] Using {fb} for buy instead of {last_day}")
+                else:
+                    msd = max_sma_day
+                    results['top_buy_pair'] = (msd, msd - 1)
+                    results['top_buy_capture'] = 0.0
+                    logger.error(f"[LEADER Fallback] No buy pairs available; seeded with MAX-SMA sentinel")
 
-            if last_day in results['daily_top_short_pairs']:
-                top_short_pair = results['daily_top_short_pairs'][last_day][0]
-                top_short_capture = results['daily_top_short_pairs'][last_day][1]
+            if last_day in daily_top_short_pairs:
+                results['top_short_pair'] = daily_top_short_pairs[last_day][0]
+                results['top_short_capture'] = daily_top_short_pairs[last_day][1]
             else:
-                top_short_pair = (0,0)
-                top_short_capture = 0
+                available = sorted([d for d in daily_top_short_pairs.keys() if d <= last_day])
+                if available:
+                    fb = available[-1]
+                    results['top_short_pair'] = daily_top_short_pairs[fb][0]
+                    results['top_short_capture'] = daily_top_short_pairs[fb][1]
+                    logger.warning(f"[LEADER Fallback] Using {fb} for short instead of {last_day}")
+                else:
+                    msd = max_sma_day
+                    results['top_short_pair'] = (msd - 1, msd)
+                    results['top_short_capture'] = 0.0
+                    logger.error(f"[LEADER Fallback] No short pairs available; seeded with MAX-SMA sentinel")
 
-            results['top_buy_pair'] = top_buy_pair
-            results['top_buy_capture'] = top_buy_capture
-            results['top_short_pair'] = top_short_pair
-            results['top_short_capture'] = top_short_capture
+            # --- Persist tiny summary fields for the Batch table (cheap to read later) ---
+            # Last date (string) and last prices
+            try:
+                results['last_date'] = last_day                # keep Timestamp too (already set above)
+                results['last_date_str'] = pd.to_datetime(last_day).strftime('%Y-%m-%d')
+            except Exception:
+                results['last_date_str'] = None
 
-            # Ensure required keys are always present
-            if 'cumulative_combined_captures' not in results:
-                results['cumulative_combined_captures'] = pd.Series([0], index=[df.index[0]])
-            if 'active_pairs' not in results:
-                results['active_pairs'] = ['None'] * len(df)
-            if 'top_buy_pair' not in results:
-                results['top_buy_pair'] = (0,0)
-            if 'top_short_pair' not in results:
-                results['top_short_pair'] = (0,0)
+            try:
+                last_close = float(df['Close'].iloc[-1]) if 'Close' in df.columns else None
+            except Exception:
+                last_close = None
 
-            logger.info(f"Current Top Buy Pair for {ticker}: {top_buy_pair} with total capture {top_buy_capture}")
-            logger.info(f"Current Top Short Pair for {ticker}: {top_short_pair} with total capture {top_short_capture}")
+            try:
+                last_adj = float(df['Adj Close'].iloc[-1]) if 'Adj Close' in df.columns else None
+            except Exception:
+                last_adj = None
 
-            # Set section_times BEFORE saving so it's available for next session
-            results['section_times'] = section_times
-            results['start_time'] = master_stopwatch_start
+            results['last_close'] = last_close
+            results['last_adj_close'] = last_adj
+            results['last_price'] = float(last_adj if last_adj is not None else last_close) if (last_adj is not None or last_close is not None) else None
 
+            # Leader-pair on/off flags on the last day (use tolerant ASOF lookups)
+            buy_pair = results.get('top_buy_pair')
+            short_pair = results.get('top_short_pair')
+            def _pair_ok(p): return isinstance(p, tuple) and len(p) == 2 and p != (0, 0)
+            try:
+                if _pair_ok(buy_pair):
+                    sma1_buy = _asof(df.get(f'SMA_{buy_pair[0]}'), last_day, default=None)
+                    sma2_buy = _asof(df.get(f'SMA_{buy_pair[1]}'), last_day, default=None)
+                    buy_active = (sma1_buy is not None and sma2_buy is not None and sma1_buy > sma2_buy)
+                else:
+                    buy_active = False
+            
+                if _pair_ok(short_pair):
+                    sma1_short = _asof(df.get(f'SMA_{short_pair[0]}'), last_day, default=None)
+                    sma2_short = _asof(df.get(f'SMA_{short_pair[1]}'), last_day, default=None)
+                    short_active = (sma1_short is not None and sma2_short is not None and sma1_short < sma2_short)
+                else:
+                    short_active = False
+            
+                results['last_day_signal'] = {'buy_active': buy_active, 'short_active': short_active}
+            except Exception:
+                results['last_day_signal'] = {'buy_active': None, 'short_active': None}
+
+            logger.info(f"Current Top Buy Pair for {ticker}: {results['top_buy_pair']}")
+            logger.info(f"  Total capture: {results['top_buy_capture']:.2f}")
+            logger.info(f"Current Top Short Pair for {ticker}: {results['top_short_pair']}")
+            logger.info(f"  Total capture: {results['top_short_capture']:.2f}")
+
+            section_times['Cumulative Combined Captures'] = _now_secs() - ccc_t0
+
+            # -----------------------------------------------------------------
+            # 6) Persist atomically + publish enriched in-memory copy
+            # -----------------------------------------------------------------
+            _check_cancel("before save")
             logger.info(f"Saving final results to {pkl_file}")
             with tqdm_compact(total=1, desc="Saving results", unit="file") as pbar_save:
-                save_precomputed_results(ticker, results)
-
+                save_precomputed_results(ticker, results)  # per-ticker lock + os.replace
                 pbar_save.update(1)
-            
-            # Add line break after progress bar
-            logger.info("")
-            
-            write_status(ticker, {"status": "complete", "progress": 100})
-            
+
+            # Enrich in-memory only (not persisted) - use lightweight version
+            results_mem = _lighten_for_runtime(results, pkl_file)
+            results_mem['section_times'] = section_times
+            results_mem['start_time'] = master_start
+            # Preserve the active request key for this computation (if any).
+            rk = _active_request_keys.get(ticker)
+            if rk:
+                results_mem['request_key'] = rk
+
+            # Mark UI status
+            write_status(ticker, {"status": "complete", "progress": 100, "cache_status": "fresh"})
             log_success("Process completed.")
-
+            
+            # Store results in cache BEFORE printing summary
             with _loading_lock:
-                _precomputed_results_cache[ticker] = results
+                _precomputed_results_cache[ticker] = results_mem
+                _enforce_cache_limits()
                 if ticker in _loading_in_progress:
                     _loading_in_progress[ticker].set()
                     del _loading_in_progress[ticker]
+            
+            # Print timing summary (now it can access the cached data)
+            print_timing_summary(ticker)
 
-        except Exception as e:
-            logger.error(f"Error in precompute_results for {ticker}: {str(e)}")
-            logger.error(traceback.format_exc())
-        finally:
-            with _loading_lock:
-                if ticker in _loading_in_progress:
-                    _loading_in_progress[ticker].set()
-                    del _loading_in_progress[ticker]
+            return results_mem
 
-    logger.info("Computation and loading process completed.")
+    except ComputationCancelled:
+        # Already wrote status above
+        return None
 
+    except Exception as e:
+        logger.error(f"Error in precompute_results for {ticker}: {str(e)}")
+        write_status(ticker, {"status": "failed", "message": str(e), "cache_status": "unknown"})
+        return None
+    
+    finally:
+        # Always clean up flags to prevent stuck states
+        with _loading_lock:
+            if ticker in _loading_in_progress:
+                _loading_in_progress[ticker].set()
+                del _loading_in_progress[ticker]
+            # Also clean up related flags
+            _cancel_flags.pop(ticker, None)
+            _active_request_keys.pop(ticker, None)
 def print_timing_summary(ticker):
     results = _precomputed_results_cache.get(ticker)
     if results and 'section_times' in results and 'start_time' in results:
+        # Fresh processing - show detailed timing
         section_times = results['section_times']
         start_time = results['start_time']
         
@@ -3628,26 +4981,42 @@ def print_timing_summary(ticker):
         log_result("Total processing time", f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
         log_separator("═", Colors.DIM_GREEN)
         logger.info("Load complete. Data is now available in the Dash app.")
-    elif results and 'load_time' in results:
-        load_time = results['load_time']
-        hours, rem = divmod(load_time, 3600)
-        minutes, seconds = divmod(rem, 60)
+    else:
+        # Cached ticker - show simple loading message
+        # For cached tickers, we don't have timing data, so show 00:00:00
         log_separator("═", Colors.DIM_GREEN)
-        logger.info(f"Loading time for existing {ticker} data: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (hh:mm:ss)")
+        logger.info(f"Loading time for existing {ticker} data: 00:00:00 (hh:mm:ss)")
         log_separator("═", Colors.DIM_GREEN)
         logger.info("Load complete. Data is now available in the Dash app.")
 
 # Function to read the processing status from a file
 def read_status(ticker):
-    ticker = normalize_ticker(ticker)
-    status_path = f"cache/status/{ticker}_status.json"
+    """
+    Read status JSON safely. If a writer has just rotated the file, tolerate a
+    transient JSONDecodeError by retrying once after a short pause.
+    """
+    t = normalize_ticker(ticker)
+    status_path = os.path.join("cache", "status", f"{t}_status.json")
+
     with status_lock:
-        if os.path.exists(status_path):
-            with open(status_path, 'r') as file:
-                try:
-                    return json.load(file)
-                except json.JSONDecodeError:
-                    print(f"Empty JSON file: {status_path}")
+        if not os.path.exists(status_path):
+            return {"status": "not started", "progress": 0}
+
+        # Try once, and if we see a transient parse problem, retry quickly.
+        for attempt in range(2):
+            try:
+                with open(status_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                if attempt == 0:
+                    # Writer may have just replaced the file; tiny pause then re-read
+                    time.sleep(0.05)
+                    continue
+                logger.debug(f"Corrupt/partial JSON in {status_path}; returning default.")
+            except Exception as e:
+                logger.debug(f"read_status error for {t}: {e}")
+                break
+
         return {"status": "not started", "progress": 0}
 
 # ============================================================================
@@ -4174,30 +5543,24 @@ app.layout = dbc.Container(
                         # Store for timing summary flag
                         dcc.Store(id='timing-summary-printed', data=False),
                         dcc.Store(id='charts-loaded-state', data={}),  # Track which charts have loaded
+                        # New: per-selection request key + active primary ticker
+                        dcc.Store(id='primary-request-key', storage_type='session'),
+                        dcc.Store(id='active-primary', storage_type='session'),
+                        # Diagnostic client-side logging
+                        dcc.Store(id='diag-client-log', storage_type='memory'),
                         # Combined Capture Chart with MAX_SMA_DAY display
                         html.Div([
                             html.Div(id='max-sma-day-display', style={'font-size': '16px', 'margin-bottom': '10px', 'text-align': 'left'}),
                             dcc.Loading(
                                 id="loading-combined-capture",
-                    type="circle",
-                    color="#80ff00",
-                    children=[
-                        dcc.Graph(
-                            id='combined-capture-chart',
-                            figure=go.Figure(
-                                layout=go.Layout(
-                                    title=dict(text="Cumulative Combined Capture Chart", font=dict(color='#80ff00')),
-                                    plot_bgcolor='black',
-                                    paper_bgcolor='black',
-                                    font=dict(color='#80ff00'),
-                                    xaxis=dict(visible=False),
-                                    yaxis=dict(visible=False),
-                                    template='plotly_dark'
-                                )
+                                type="circle", color="#80ff00", delay_show=3500,
+                                fullscreen=False, parent_style={"position": "relative"},
+                                children=[
+                                    dcc.Graph(
+                                        id='combined-capture-chart'
+                                    )
+                                ]
                             )
-                        )
-                    ]
-                )
                         ]),
                         # Advanced Visualizations (Color-Coded Chart) - Now part of Single-Ticker section
                 dbc.Card([
@@ -4228,8 +5591,8 @@ app.layout = dbc.Container(
                             ]),
                             dcc.Loading(
                                 id="loading-historical-top-pairs",
-                                type="circle",
-                                color="#80ff00",
+                                type="circle", color="#80ff00", delay_show=3500,
+                                fullscreen=False, parent_style={"position": "relative"},
                                 children=[
                                     dcc.Graph(
                                         id='historical-top-pairs-chart',
@@ -4404,32 +5767,32 @@ app.layout = dbc.Container(
                             id="loading-secondary-capture",
                             type="circle",
                             color="#80ff00",
-                            children=[
-                                dcc.Graph(
-                                    id='secondary-capture-chart',
-                                    figure=go.Figure(
-                                        layout=go.Layout(
-                                            title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00')),
-                                            plot_bgcolor='black',
-                                            paper_bgcolor='black',
-                                            font=dict(color='#80ff00'),
-                                            xaxis=dict(
-                                                visible=False,
-                                                showgrid=False,
-                                                zeroline=False,
-                                                showticklabels=False
-                                            ),
-                                            yaxis=dict(
-                                                visible=False,
-                                                showgrid=False,
-                                                zeroline=False,
-                                                showticklabels=False
-                                            ),
-                                            template='plotly_dark'
-                                        )
+                            fullscreen=False,                       # keep overlay local to this component
+                            parent_style={"position": "relative"},  # ensure overlay is bounded by parent
+                            children=dcc.Graph(
+                                id='secondary-capture-chart',
+                                figure=go.Figure(
+                                    layout=go.Layout(
+                                        title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00')),
+                                        plot_bgcolor='black',
+                                        paper_bgcolor='black',
+                                        font=dict(color='#80ff00'),
+                                        xaxis=dict(
+                                            visible=False,
+                                            showgrid=False,
+                                            zeroline=False,
+                                            showticklabels=False
+                                        ),
+                                        yaxis=dict(
+                                            visible=False,
+                                            showgrid=False,
+                                            zeroline=False,
+                                            showticklabels=False
+                                        ),
+                                        template='plotly_dark'
                                     )
                                 )
-                            ]
+                            )
                         ),
                         
                         # Signal Following Metrics Table
@@ -4740,8 +6103,8 @@ app.layout = dbc.Container(
                             dbc.CardBody([
                                 dcc.Loading(
                                     id="loading-batch-process",
-                                    type="circle",
-                                    color="#80ff00",
+                                    type="circle", color="#80ff00", delay_show=1200,
+                                    fullscreen=False, parent_style={"position": "relative"},
                                     children=[
                                         dash_table.DataTable(
                                             id='batch-process-table',
@@ -4858,8 +6221,8 @@ app.layout = dbc.Container(
                             dbc.CardBody([
                                 dcc.Loading(
                                     id="loading-optimization",
-                                    type="circle",
-                                    color="#80ff00",
+                                    type="circle", color="#80ff00", delay_show=1200,
+                                    fullscreen=False, parent_style={"position": "relative"},
                                     children=[
                                         # Table to display results
                                         dash_table.DataTable(
@@ -5024,8 +6387,8 @@ app.layout = dbc.Container(
                             # Results Display for Multi-Primary Aggregator
                             dcc.Loading(
                                 id="loading-multi-primary",
-                                type="circle",
-                                color="#80ff00",
+                                type="circle", color="#80ff00", delay_show=3500,
+                                fullscreen=False, parent_style={"position": "relative"},
                                 children=[
                                     dcc.Graph(
                                         id='multi-primary-chart',
@@ -5129,20 +6492,18 @@ app.layout = dbc.Container(
             ], width=12)
         ]),
         # Interval components for periodic updates
-        dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0),
+        dcc.Interval(id='batch-update-interval', interval=5000, n_intervals=0, disabled=True),
         dcc.Interval(id='update-interval', interval=1000, n_intervals=0, disabled=False),  # Adaptive starting at 1000ms
-        dcc.Interval(id='loading-interval', interval=3000, n_intervals=0),  # Update every 3 seconds
         dcc.Interval(id='optimization-update-interval', interval=3000, n_intervals=0, disabled=True),
         dcc.Interval(id='countdown-interval', interval=1000, n_intervals=0),  # Re-enabled with proper target
+
+        # NEW: Poller dedicated to Multi-Primary so we don't depend on the global one
+        dcc.Interval(id='multi-primary-interval', interval=1200, n_intervals=0, disabled=True),
+
         # Store adaptive interval state per session (no cross-session leakage)
         dcc.Store(id='interval-adaptive-state', storage_type='memory'),
-        # Loading spinner output (if needed)
-        dcc.Loading(
-            id="loading-spinner",
-            type="circle",
-            color="#80ff00",
-            children=[html.Div(id="loading-spinner-output")]
-        ),
+        # Loading spinner output div (removed dcc.Loading wrapper to prevent false spinner detection)
+        html.Div(id="loading-spinner-output"),
         # Notification container
         html.Div(id="notification-container", style={
             "position": "fixed",
@@ -5199,10 +6560,9 @@ def update_max_sma_day_display(ticker):
      Output('sma-input-2-label', 'children'),
      Output('sma-input-3-label', 'children'),
      Output('sma-input-4-label', 'children')],
-    [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')]
+    [Input('ticker-input', 'value')]
 )
-def update_sma_labels(ticker, n_intervals):
+def update_sma_labels(ticker):
     if not ticker:
         trading_days = 1
     else:
@@ -5214,7 +6574,8 @@ def update_sma_labels(ticker, n_intervals):
         
         results = load_precomputed_results(ticker)
         if results is not None:
-            preprocessed_df = results.get('preprocessed_data')
+            # Use helper to get DataFrame on-demand
+            preprocessed_df = ensure_df_available(ticker, results)
             if preprocessed_df is not None and not preprocessed_df.empty:
                 trading_days = max(trading_days, len(preprocessed_df))
 
@@ -5228,28 +6589,29 @@ def update_sma_labels(ticker, n_intervals):
 
     return max_values + labels
 
+# -- SINGLE SOURCE OF TRUTH for the "Processing..." label --
 @app.callback(
     Output('processing-status', 'children'),
-    [Input('update-interval', 'n_intervals')],
-    [State('ticker-input', 'value')]
+    [Input('ticker-input', 'value'),
+     Input('update-interval', 'n_intervals')],
+    prevent_initial_call=True
 )
-def update_processing_status(n_intervals, ticker):
+def update_processing_status(ticker, _):
     if not ticker:
-        return ""
+        raise PreventUpdate
     
-    status = read_status(ticker)
-    if status['status'] == 'processing':
-        return f"Processing data for {ticker}... Progress: {status['progress']:.2f}%"
-    elif status['status'] == 'complete':
+    status = read_status(ticker) or {}
+    state = status.get('status', 'unknown')
+    progress = status.get('progress', 0.0)
+    
+    # Never call loaders from a status label callback — just reflect status.
+    if state == 'processing':
+        return f"Processing data for {ticker}... Progress: {progress:.2f}%"
+    if state == 'complete':
         return f"Data processing complete for {ticker}."
-    elif status['status'] == 'failed':
+    if state == 'failed':
         return f"Data processing failed for {ticker}. Please try again."
-    else:
-        results = load_precomputed_results(ticker)
-        if results is None:
-            return f"Loading data for {ticker}..."
-        else:
-            return f"Data loaded for {ticker}."
+    return ""  # unknown/pending
 
 # Callback to toggle the visibility of the Dynamic Master Trading Strategy section
 @app.callback(
@@ -5345,6 +6707,25 @@ def toggle_multi_primary_collapse(n_clicks, is_open):
         return not is_open, 'Hide' if not is_open else 'Show'
     return is_open, 'Hide' if is_open else 'Show'
 
+# Enable the Multi-Primary poller while the card is open AND the figure is a placeholder
+@app.callback(
+    Output('multi-primary-interval', 'disabled'),
+    [Input('multi-primary-chart', 'figure'),
+     Input('multi-primary-collapse', 'is_open')],
+    prevent_initial_call=False
+)
+def _gate_multi_primary_interval(fig, is_open):
+    try:
+        if not is_open:
+            return True
+        meta = ((fig or {}).get('layout') or {}).get('meta') or {}
+        is_placeholder = (meta.get('placeholder') is True)
+        # Enable poller only while showing placeholder
+        return not is_placeholder
+    except Exception:
+        # Fail-safe: do not spam polls if anything goes wrong
+        return True
+
 # Callback to toggle the Current Leaders section in AI-Optimized Trading Signals
 @app.callback(
     [Output('current-leaders-collapse', 'is_open'),
@@ -5357,38 +6738,42 @@ def toggle_current_leaders_collapse(n_clicks, is_open):
         return not is_open, 'Hide Current Top Pair Leaders Analysis' if not is_open else 'Show Current Top Pair Leaders Analysis'
     return is_open, 'Hide Current Top Pair Leaders Analysis' if is_open else 'Show Current Top Pair Leaders Analysis'
 
-# Callback to update Primary Ticker status
+# Callback to update Primary Ticker status with cache freshness indicator
 @app.callback(
     Output('primary-ticker-status', 'children'),
-    [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')],
-    prevent_initial_call=True
+    [Input('combined-capture-chart', 'figure'),
+     Input('update-interval', 'disabled'),
+     Input('ticker-input', 'value')],
+    prevent_initial_call=False
 )
-def update_primary_ticker_status(ticker, n_intervals):
-    if not ticker:
-        return ''
+def update_primary_ticker_status(fig, poller_disabled, ticker):
+    """Prefer what the user sees: if a real chart is shown, say Ready; else show progress."""
+    from dash import html
     
-    ticker = normalize_ticker(ticker)
-    status = read_status(ticker)
+    t = normalize_ticker(ticker) if ticker else None
+    try:
+        meta = ((fig or {}).get('layout') or {}).get('meta') or {}
+        is_real = (meta.get('placeholder') is False)
+    except Exception:
+        is_real = False
     
-    if status['status'] == 'processing':
-        progress = status.get('progress', 0)
-        return html.Span([
-            html.I(className="fas fa-spinner fa-spin me-2"),
-            f"Processing... {progress:.0f}%"
-        ], style={"color": "#ffa500"})
-    elif status['status'] == 'complete':
-        return html.Span([
-            html.I(className="fas fa-check-circle me-2"),
-            "Ready"
-        ], style={"color": "#00ff41"})
-    elif status['status'] == 'failed':
-        return html.Span([
-            html.I(className="fas fa-exclamation-circle me-2"),
-            "Failed"
-        ], style={"color": "#ff0040"})
-    else:
-        return ''
+    # If the chart is real or the poller is off, we are done.
+    if is_real or poller_disabled:
+        if not t:
+            return ""
+        return html.Span(
+            [html.I(className="fas fa-check-circle me-1"), f"Ready — {t} loaded"],
+            style={"color": "#80ff00", "fontWeight": "600", "marginLeft": "8px"}
+        )
+    
+    if not t:
+        return ""
+    
+    # Otherwise fall back to status-based progress
+    st = read_status(t) or {}
+    pct = float(st.get("progress", 0.0) or 0.0)
+    return f"Processing data for {t}… Progress: {pct:.2f}%"
+
 
 # Callback to update Batch Process status
 @app.callback(
@@ -5428,15 +6813,28 @@ def update_batch_process_status(n_clicks, n_intervals, tickers_input):
     prevent_initial_call=True
 )
 def update_optimization_status(n_clicks, n_intervals, feedback):
+    """Show progress and auto-recover if no updates arrive for a while."""
     try:
-        global optimization_progress
-        
-        if optimization_progress and isinstance(optimization_progress, dict):
+        global optimization_progress, optimization_in_progress
+        now = time.time()
+        # Ensure progress dict has a heartbeat
+        if isinstance(optimization_progress, dict):
+            last = float(optimization_progress.get('ts', 0.0) or 0.0)
+            # Consider stuck if no heartbeat in 45s while marked processing
+            if optimization_progress.get('status') == 'processing' and (now - last) > 45:
+                logger.warning("[watchdog] Optimization progress heartbeat missing; auto-resetting.")
+                optimization_in_progress = False
+                optimization_progress = {'status': 'idle'}
+                return html.Span([
+                    html.I(className="fas fa-exclamation-triangle me-2"),
+                    "Recovered from a stalled optimization. Please run again."
+                ], style={"color": "#ffa500"})
+
             if optimization_progress.get('status') == 'processing':
-                current = optimization_progress.get('current', 0)
-                total = optimization_progress.get('total', 0)
+                current = int(optimization_progress.get('current', 0) or 0)
+                total = int(optimization_progress.get('total', 0) or 0)
                 if total > 0:
-                    percent = (current / total) * 100
+                    percent = (current / max(1, total)) * 100
                     return html.Span([
                         html.I(className="fas fa-spinner fa-spin me-2"),
                         f"Optimizing... {percent:.0f}%"
@@ -5446,11 +6844,10 @@ def update_optimization_status(n_clicks, n_intervals, feedback):
                     html.I(className="fas fa-check-circle me-2"),
                     "Optimization Complete"
                 ], style={"color": "#00ff41"})
-        
-        # Default return when no optimization in progress
+
         return ''
     except Exception:
-        # Silently handle any errors without logging
+        # Silently handle any errors without logging (avoid UI churn)
         return ''
 
 @app.callback(
@@ -5489,6 +6886,51 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, tick
 
     return input_classes + error_messages
 
+# Callback to reset UI and create fresh request key on primary ticker change
+import uuid
+from dash.exceptions import PreventUpdate
+import plotly.graph_objects as go
+
+@app.callback(
+    [Output('primary-request-key','data'),
+     Output('active-primary','data')],
+    [Input('ticker-input','value')],
+    [State('active-primary','data')],
+    prevent_initial_call=True
+)
+def _on_primary_change(ticker, prev_active):
+    """Reset UI and create fresh request key when primary ticker changes."""
+    if not ticker:
+        raise PreventUpdate
+    t = normalize_ticker(ticker)
+    prev = normalize_ticker(prev_active) if prev_active else None
+
+    if prev == t:
+        # Nothing actually changed; do NOT mint a new key.
+        print(f"[key] ticker unchanged -> keep key (ticker={t})")
+        raise PreventUpdate
+
+    key = uuid.uuid4().hex
+    # Clear any stale placeholder for this ticker so the next pass must repaint
+    try:
+        _figure_cache.pop(t, None)
+    except Exception:
+        pass
+
+    # Secondary DF cache can hold prior primary's window—clear it
+    try:
+        _secondary_df_cache.clear()
+    except Exception:
+        pass
+
+    print(f"[key] NEW key for {t}: {key}")
+    return key, t
+
+# _throttle_updates callback removed - was causing duplicate output conflicts
+# The interval control is now handled by:
+# - adapt_update_interval (changes frequency)
+# - disable_interval_when_data_loaded (stops polling when ready)
+
 # Callback to auto-populate SMA inputs with top pairs when ticker processing completes
 @app.callback(
     [Output('sma-input-1', 'value'),
@@ -5506,19 +6948,43 @@ def validate_sma_inputs(sma_input_1, sma_input_2, sma_input_3, sma_input_4, tick
 def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, current_sma3, current_sma4):
     """Auto-populate SMA input fields with top-performing pairs when data is ready."""
     if not ticker:
+        # Don't try to guess - clear fields if no ticker provided
         return None, None, None, None  # Clear when no ticker
     
-    # Use context to check if ticker changed
+    # Check context to see what triggered this callback
     ctx = dash.callback_context
+    is_ticker_change = False
     if ctx.triggered:
         trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        if trigger_id == 'ticker-input':
-            # Ticker changed - clear values first
-            return None, None, None, None
+        is_ticker_change = (trigger_id == 'ticker-input')
     
-    # If SMA inputs already have values, don't update them
-    # This prevents the chart from constantly reloading
+    # If ticker changed, immediately try to load and populate
+    # This ensures we always update when user enters a new ticker
+    if is_ticker_change:
+        # Check if data is ready
+        status = read_status(ticker)
+        if status['status'] == 'complete':
+            # Load results and populate
+            results = load_precomputed_results(ticker, from_callback=False, should_log=False)
+            if results:
+                top_buy_pair = results.get('top_buy_pair')
+                top_short_pair = results.get('top_short_pair')
+                if top_buy_pair and top_short_pair:
+                    try:
+                        buy_sma1, buy_sma2 = top_buy_pair
+                        short_sma1, short_sma2 = top_short_pair
+                        # ALWAYS return the values when ticker changes and data is ready
+                        logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
+                        return buy_sma1, buy_sma2, short_sma1, short_sma2
+                    except (ValueError, TypeError):
+                        pass
+        # If data not ready yet, clear the fields and wait for interval update
+        return None, None, None, None
+    
+    # This is an interval update, not a ticker change
+    # Only update if fields are currently empty
     if all([current_sma1, current_sma2, current_sma3, current_sma4]):
+        # Fields already populated, don't change them
         return no_update, no_update, no_update, no_update
     
     # Check if data processing is complete
@@ -5527,7 +6993,7 @@ def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, cu
         return no_update, no_update, no_update, no_update
     
     # Load precomputed results
-    results = load_precomputed_results(ticker)
+    results = load_precomputed_results(ticker, from_callback=False, should_log=False)
     if not results:
         return no_update, no_update, no_update, no_update
     
@@ -5535,23 +7001,19 @@ def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, cu
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
     
-    # Validate pairs exist and are in correct format
-    if not top_buy_pair or not top_short_pair:
-        return no_update, no_update, no_update, no_update
+    # Validate and populate
+    if top_buy_pair and top_short_pair:
+        if isinstance(top_buy_pair, tuple) and isinstance(top_short_pair, tuple):
+            if len(top_buy_pair) == 2 and len(top_short_pair) == 2:
+                try:
+                    buy_sma1, buy_sma2 = top_buy_pair
+                    short_sma1, short_sma2 = top_short_pair
+                    logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
+                    return buy_sma1, buy_sma2, short_sma1, short_sma2
+                except (ValueError, TypeError):
+                    pass
     
-    if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
-        return no_update, no_update, no_update, no_update
-    
-    if len(top_buy_pair) != 2 or len(top_short_pair) != 2:
-        return no_update, no_update, no_update, no_update
-    
-    # Only populate if fields are empty (prevent constant updates)
-    return (
-        top_buy_pair[0] if not current_sma1 else no_update,    # Buy pair first SMA
-        top_buy_pair[1] if not current_sma2 else no_update,    # Buy pair second SMA
-        top_short_pair[0] if not current_sma3 else no_update,  # Short pair first SMA
-        top_short_pair[1] if not current_sma4 else no_update   # Short pair second SMA
-    )
+    return no_update, no_update, no_update, no_update
 
 def get_existing_max_sma_day(df):
     sma_columns = [col for col in df.columns if 'SMA_' in col]
@@ -5597,17 +7059,65 @@ def validate_ticker_input(ticker):
 
     return '', True, False
 
+
+def _align_pairs_to_calendar(df_index, daily_top_buy_pairs, daily_top_short_pairs):
+    """
+    Ensure every trading day has a valid (pair, capture). Treat (0,0) as missing and
+    fill from nearest valid day. If *all* days are invalid, fall back to MAX-SMA sentinels.
+    """
+    cal = pd.DatetimeIndex(df_index).normalize()
+
+    def _to_series(dct):
+        return pd.Series({pd.Timestamp(k).normalize(): v for k, v in dct.items()})
+
+    def _mask_invalid(series):
+        # value is a 2-tuple: ((sma_i, sma_j), capture)
+        def _is_bad(v):
+            try:
+                p, _ = v
+                return isinstance(p, tuple) and p == (0, 0)
+            except Exception:
+                return True  # malformed → treat as invalid
+        return series.where(~series.apply(_is_bad), pd.NA)
+
+    buy_s = _to_series(daily_top_buy_pairs).reindex(cal)
+    shr_s = _to_series(daily_top_short_pairs).reindex(cal)
+
+    # treat (0,0) as missing *before* filling
+    buy_s = _mask_invalid(buy_s).ffill().bfill()
+    shr_s = _mask_invalid(shr_s).ffill().bfill()
+
+    # if *everything* was invalid, seed with MAX-SMA sentinels
+    if buy_s.isna().all() or shr_s.isna().all():
+        msd = globals().get("MAX_SMA_DAY", 114)
+        if buy_s.isna().all():
+            buy_s = pd.Series([((msd, msd-1), 0.0)] * len(cal), index=cal)
+        if shr_s.isna().all():
+            shr_s = pd.Series([((msd-1, msd), 0.0)] * len(cal), index=cal)
+        logger.error("[ALIGN] All daily pairs were invalid; seeded with MAX-SMA sentinels.")
+
+    buy_aligned = {d: buy_s.loc[d] for d in cal}
+    shr_aligned = {d: shr_s.loc[d] for d in cal}
+    return buy_aligned, shr_aligned
+
+
 def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_short_pairs):
-    logger.info("Calculating cumulative combined capture")
+    # Removed duplicate - printed again at line 6236
 
     if not daily_top_buy_pairs or not daily_top_short_pairs:
         logger.warning("No daily top pairs available for processing cumulative combined captures.")
         return pd.Series([0], index=[df.index[0]]), ['None']
 
-    # Ensure daily_top_pairs have matching lengths
-    dates = sorted(set(daily_top_buy_pairs.keys()) & set(daily_top_short_pairs.keys()))
+    # Ensure daily_top_pairs cover every trading day in df; fill any gaps first.
+    daily_top_buy_pairs, daily_top_short_pairs = _align_pairs_to_calendar(
+        df.index, daily_top_buy_pairs, daily_top_short_pairs
+    )
+
+    # Use the full trading calendar from the df (no gaps).
+    df_index_norm = pd.DatetimeIndex(df.index).normalize()
+    dates = list(df_index_norm)
     if not dates:
-        logger.warning("No overlapping dates between buy and short pairs")
+        logger.warning("No trading dates available to compute cumulative capture")
         return pd.Series([0], index=[df.index[0]]), ['None']
     
     # Verify data integrity
@@ -5636,23 +7146,33 @@ def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_sho
                     prev_buy_pair, prev_buy_capture = daily_top_buy_pairs[previous_date]
                     prev_short_pair, prev_short_capture = daily_top_short_pairs[previous_date]
 
-                    if prev_buy_pair == (0, 0) or prev_short_pair == (0, 0):
-                        current_position = 'None'
-                    else:
-                        buy_signal = df[f'SMA_{prev_buy_pair[0]}'].loc[previous_date] > df[f'SMA_{prev_buy_pair[1]}'].loc[previous_date]
-                        short_signal = df[f'SMA_{prev_short_pair[0]}'].loc[previous_date] < df[f'SMA_{prev_short_pair[1]}'].loc[previous_date]
+                    # Treat (0,0) as invalid → swap to MAX-SMA sentinels for simulation
+                    if prev_buy_pair == (0, 0):
+                        msd = globals().get("MAX_SMA_DAY", 114)
+                        prev_buy_pair = (msd, msd - 1)
+                    if prev_short_pair == (0, 0):
+                        msd = globals().get("MAX_SMA_DAY", 114)
+                        prev_short_pair = (msd - 1, msd)
 
-                        if buy_signal and short_signal:
-                            if prev_buy_capture > prev_short_capture:
-                                current_position = f"Buy {prev_buy_pair[0]},{prev_buy_pair[1]}"
-                            else:
-                                current_position = f"Short {prev_short_pair[0]},{prev_short_pair[1]}"
-                        elif buy_signal:
+                    sma_buy_0 = _asof(df[f'SMA_{prev_buy_pair[0]}'], previous_date, default=0.0)
+                    sma_buy_1 = _asof(df[f'SMA_{prev_buy_pair[1]}'], previous_date, default=0.0)
+                    buy_signal = sma_buy_0 > sma_buy_1
+                    
+                    sma_short_0 = _asof(df[f'SMA_{prev_short_pair[0]}'], previous_date, default=0.0)
+                    sma_short_1 = _asof(df[f'SMA_{prev_short_pair[1]}'], previous_date, default=0.0)
+                    short_signal = sma_short_0 < sma_short_1
+
+                    if buy_signal and short_signal:
+                        if prev_buy_capture > prev_short_capture:
                             current_position = f"Buy {prev_buy_pair[0]},{prev_buy_pair[1]}"
-                        elif short_signal:
-                            current_position = f"Short {prev_short_pair[0]},{prev_short_pair[1]}"
                         else:
-                            current_position = "None"
+                            current_position = f"Short {prev_short_pair[0]},{prev_short_pair[1]}"
+                    elif buy_signal:
+                        current_position = f"Buy {prev_buy_pair[0]},{prev_buy_pair[1]}"
+                    elif short_signal:
+                        current_position = f"Short {prev_short_pair[0]},{prev_short_pair[1]}"
+                    else:
+                        current_position = "None"
 
                     daily_return = df['Close'].loc[current_date] / df['Close'].loc[previous_date] - 1
 
@@ -5672,7 +7192,7 @@ def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_sho
                     current_buy_pair = daily_top_buy_pairs[dates[i]][0]
                     current_short_pair = daily_top_short_pairs[dates[i]][0]
                     current_capture = cumulative_combined_captures[-1]
-                    tqdm.write(f"Day {i+1}: Top Buy Pair: {current_buy_pair}, Top Short Pair: {current_short_pair}, Cumulative Capture: {current_capture:.2f}%")
+                    tqdm.write(f"{Colors.OKGREEN}Day {i+1}: Top Buy Pair: {current_buy_pair}, Top Short Pair: {current_short_pair}, Capture: {current_capture:.2f}%{Colors.ENDC}")
 
                 pbar.update(1)
     
@@ -5723,7 +7243,7 @@ def get_or_calculate_combined_captures(results, df, daily_top_buy_pairs, daily_t
         # Update the results dictionary with the new data
         results['cumulative_combined_captures'] = cumulative_combined_captures
         results['active_pairs'] = active_pairs
-        save_precomputed_results(ticker, results)
+        # Don't save from helper functions - let precompute_results handle saving
 
     logger.info(f"Number of cumulative combined captures: {len(cumulative_combined_captures)}")
     logger.info(f"Number of active pairs: {len(active_pairs)}")
@@ -5758,14 +7278,13 @@ def prepare_historical_top_pairs_data(df, daily_top_buy_pairs, daily_top_short_p
 
     return cumulative_combined_captures, top_pairs_performance
 
-def load_and_prepare_data(ticker):
-    results = load_precomputed_results(ticker)
+def load_and_prepare_data_from_results(ticker, results):
+    """Extract and prepare data from already-loaded results (avoids double disk/CPU work)."""
     if results is None:
-        logger.debug(f"Data for ticker {ticker} is still loading.")
         return None, None, None, None, None, None
     
-    # Enhanced validation of required data
-    required_keys = ['preprocessed_data', 'daily_top_buy_pairs', 'daily_top_short_pairs', 
+    # Don't require the heavy DF in the in-memory copy
+    required_keys = ['daily_top_buy_pairs', 'daily_top_short_pairs', 
                     'top_buy_pair', 'top_short_pair']
     missing_keys = [key for key in required_keys if key not in results]
     
@@ -5777,30 +7296,115 @@ def load_and_prepare_data(ticker):
     if not isinstance(results['top_buy_pair'], tuple) or not isinstance(results['top_short_pair'], tuple):
         logger.error(f"Invalid top pairs format for {ticker}")
         return None, None, None, None, None, None
-        
-    # Validate data structure
-    df = results['preprocessed_data']
-    daily_top_buy_pairs = results['daily_top_buy_pairs']
-    daily_top_short_pairs = results['daily_top_short_pairs']
     
-    # Ensure length matches
-    if len(df) != len(daily_top_buy_pairs) or len(df) != len(daily_top_short_pairs):
-        logger.error(f"Length mismatch in data for {ticker}")
-        logger.error(f"DataFrame length: {len(df)}")
-        logger.error(f"Buy pairs length: {len(daily_top_buy_pairs)}")
-        logger.error(f"Short pairs length: {len(daily_top_short_pairs)}")
+    # Get DataFrame - either from results or load on demand
+    df = ensure_df_available(ticker, results)
+    if df is None or df.empty:
+        logger.error(f"No DataFrame available for {ticker}")
         return None, None, None, None, None, None
     
-    df = results['preprocessed_data']
-    daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
-    daily_top_short_pairs = results.get('daily_top_short_pairs', {})
-    cumulative_combined_captures = results.get('cumulative_combined_captures', pd.Series())
-    active_pairs = results.get('active_pairs', [])
+    # Harmonize types and timezones (legacy caches may vary)
+    df = df.copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
     
-    # Silent load - no logging in callback
+    # Coerce daily pair dict keys to tz-naive pandas Timestamps
+    def _to_naive_ts(k):
+        try:
+            kts = pd.Timestamp(k)
+            return kts.tz_localize(None) if kts.tzinfo is not None else kts
+        except Exception:
+            # fall back to string parse
+            return pd.to_datetime(k).tz_localize(None)
     
-    # Only calculate if not already present in results
-    if 'cumulative_combined_captures' not in results or 'active_pairs' not in results:
+    raw_buy = results.get('daily_top_buy_pairs', {}) or {}
+    raw_shr = results.get('daily_top_short_pairs', {}) or {}
+    daily_top_buy_pairs = {_to_naive_ts(k): v for k, v in raw_buy.items()}
+    daily_top_short_pairs = {_to_naive_ts(k): v for k, v in raw_shr.items()}
+    
+    # If counts differ (legacy caches, holidays, recomputes), warn but proceed
+    if len(daily_top_buy_pairs) != len(daily_top_short_pairs):
+        logger.warning(
+            f"[{ticker}] daily_top_* length mismatch: buy={len(daily_top_buy_pairs)}, "
+            f"short={len(daily_top_short_pairs)}; proceeding with intersection."
+        )
+    
+    # Use existing cumulative series if valid; otherwise compute now
+    cumulative_combined_captures = results.get('cumulative_combined_captures', None)
+    active_pairs = results.get('active_pairs', None)
+    
+    if not isinstance(cumulative_combined_captures, pd.Series) or not isinstance(active_pairs, list) \
+       or len(cumulative_combined_captures) == 0 or len(active_pairs) != len(cumulative_combined_captures):
+        cumulative_combined_captures, active_pairs = get_or_calculate_combined_captures(
+            results=results,
+            df=df,
+            daily_top_buy_pairs=daily_top_buy_pairs,
+            daily_top_short_pairs=daily_top_short_pairs,
+            ticker=ticker
+        )
+    
+    return results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs
+
+def load_and_prepare_data(ticker):
+    # Silent load to avoid duplicate header logs
+    results = load_precomputed_results(ticker, from_callback=False, should_log=False)
+    if results is None:
+        logger.debug(f"Data for ticker {ticker} is still loading.")
+        return None, None, None, None, None, None
+    
+    # Enhanced validation of required data (don't require preprocessed_data since it's loaded on-demand)
+    required_keys = ['daily_top_buy_pairs', 'daily_top_short_pairs', 
+                    'top_buy_pair', 'top_short_pair']
+    missing_keys = [key for key in required_keys if key not in results]
+    
+    if missing_keys:
+        logger.error(f"Missing required keys in results for {ticker}: {missing_keys}")
+        return None, None, None, None, None, None
+    
+    # Validate top pairs format
+    if not isinstance(results['top_buy_pair'], tuple) or not isinstance(results['top_short_pair'], tuple):
+        logger.error(f"Invalid top pairs format for {ticker}")
+        return None, None, None, None, None, None
+    
+    # Get DataFrame using helper that loads on-demand
+    df = ensure_df_available(ticker, results)
+    if df is None or df.empty:
+        logger.error(f"Could not load DataFrame for {ticker}")
+        return None, None, None, None, None, None
+    
+    # Harmonize types and timezones (legacy caches may vary)
+    df = df.copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    
+    # Coerce daily pair dict keys to tz-naive pandas Timestamps
+    def _to_naive_ts(k):
+        try:
+            kts = pd.Timestamp(k)
+            return kts.tz_localize(None) if kts.tzinfo is not None else kts
+        except Exception:
+            # fall back to string parse
+            return pd.to_datetime(k).tz_localize(None)
+    
+    raw_buy = results.get('daily_top_buy_pairs', {}) or {}
+    raw_shr = results.get('daily_top_short_pairs', {}) or {}
+    daily_top_buy_pairs = {_to_naive_ts(k): v for k, v in raw_buy.items()}
+    daily_top_short_pairs = {_to_naive_ts(k): v for k, v in raw_shr.items()}
+    
+    # If counts differ (legacy caches, holidays, recomputes), warn but proceed
+    if len(daily_top_buy_pairs) != len(daily_top_short_pairs):
+        logger.warning(
+            f"[{ticker}] daily_top_* length mismatch: buy={len(daily_top_buy_pairs)}, "
+            f"short={len(daily_top_short_pairs)}; proceeding with intersection."
+        )
+    
+    # Note: We removed the strict length check against df because it's unnecessary
+    # The cumulative series is computed over dict keys, not df rows
+    
+    # Use existing cumulative series if valid; otherwise compute now
+    cumulative_combined_captures = results.get('cumulative_combined_captures', None)
+    active_pairs = results.get('active_pairs', None)
+    
+    if not isinstance(cumulative_combined_captures, pd.Series) or not isinstance(active_pairs, list) \
+       or len(cumulative_combined_captures) == 0 or len(active_pairs) != len(cumulative_combined_captures):
         cumulative_combined_captures, active_pairs = get_or_calculate_combined_captures(
             results=results,
             df=df,
@@ -5814,48 +7418,38 @@ def load_and_prepare_data(ticker):
 # -----------------------------------------------------------------------------
 # Chart Update Callbacks
 # -----------------------------------------------------------------------------
-@app.callback(
-    [Output('combined-capture-chart', 'figure'),
-     Output('charts-loaded-state', 'data')],
-    [Input('ticker-input', 'value'),
-     Input('update-interval', 'n_intervals')],
-    [State('charts-loaded-state', 'data')]
-)
-def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
-    if not ticker:
-        return no_update, no_update
-    
-    # Initialize charts_loaded if needed
-    if charts_loaded is None:
-        charts_loaded = {}
-    
-    # Check if this chart has already been loaded for this ticker
-    chart_key = f'combined_capture_{ticker}'
-    if chart_key in charts_loaded and charts_loaded[chart_key]:
-        # Chart already loaded, check if this is just an interval update
-        ctx = dash.callback_context
-        if ctx.triggered:
-            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-            if trigger_id == 'update-interval':
-                # This is just an interval update, don't refresh the chart
-                return no_update, no_update
 
-    status = read_status(ticker)
-    if status['status'] != 'complete':
-        # Data is not ready yet
-        return no_update, no_update
+def _placeholder_fig(ticker, revision_token=None):
+    """Create a lightweight placeholder figure that immediately hides the spinner."""
+    import plotly.graph_objects as go
+    # A tiny, fast-to-serialize canvas that still satisfies dcc.Loading
+    fig = go.Figure(layout=go.Layout(
+        title=dict(text=f'{ticker} — preparing chart...', x=0.0, xanchor='left', font=dict(color='#80ff00')),
+        template='plotly_dark',
+        plot_bgcolor='black',
+        paper_bgcolor='black',
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        # Preserve interactions for future updates and force a repaint token
+        uirevision=normalize_ticker(ticker),
+        datarevision=str(revision_token or time.time()),
+        # Crucial: mark as placeholder so we don't disable the interval yet
+        meta={'placeholder': True}
+    ))
+    return fig
 
-    results = load_precomputed_results(ticker)
-    if results is None:
-        return no_update, no_update
-
-    results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs = load_and_prepare_data(ticker)
+def build_combined_capture_figure(ticker, results, *, revision=None):
+    """Build the combined capture chart figure from results."""
+    if not results:
+        return None
+    # Use the results we already have instead of reloading
+    results, df, daily_top_buy_pairs, daily_top_short_pairs, cumulative_combined_captures, active_pairs = load_and_prepare_data_from_results(ticker, results)
     if results is None or df is None or daily_top_buy_pairs is None or daily_top_short_pairs is None or cumulative_combined_captures is None or active_pairs is None:
-        return no_update, no_update
-
+        return None
+    
     if len(cumulative_combined_captures) == 1 and active_pairs == ['None']:
-        return no_update, no_update
-
+        return None
+    
     data = pd.DataFrame({
         'date': cumulative_combined_captures.index,
         'capture': cumulative_combined_captures,
@@ -5878,62 +7472,79 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
         'active_pair_current': active_pairs,
         'active_pair_next': active_pairs[1:] + ['']  # Placeholder for the last day
     })
-
+    
     # Calculate the next day's active pair for the last day with enhanced validation
     last_date = data['date'].iloc[-1]
     buy_pair_data = daily_top_buy_pairs.get(last_date)
     short_pair_data = daily_top_short_pairs.get(last_date)
     
     if buy_pair_data is None or short_pair_data is None:
-        logger.error(f"Missing pair data for last date {last_date}")
-        return no_update
+        # Fallback: use most recent available date <= last_date
+        try:
+            avail = sorted(set(daily_top_buy_pairs.keys()) & set(daily_top_short_pairs.keys()))
+            fallback = max([d for d in avail if d <= last_date]) if avail else None
+            if fallback:
+                buy_pair_data = daily_top_buy_pairs.get(fallback)
+                short_pair_data = daily_top_short_pairs.get(fallback)
+        except Exception:
+            pass
         
-    top_buy_pair = buy_pair_data[0] if isinstance(buy_pair_data, tuple) else (0, 0)
-    top_short_pair = short_pair_data[0] if isinstance(short_pair_data, tuple) else (0, 0)
+        if buy_pair_data is None or short_pair_data is None:
+            logger.warning(f"Missing pair data near {last_date}; using fallback display")
+            # Set next_active_pair and continue with figure generation
+            data.loc[data.index[-1], 'active_pair_next'] = "None"
     
-    if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
-        logger.error(f"Invalid pair format for {last_date}")
-        return no_update
-
-    if top_buy_pair and top_buy_pair[0] != 0 and top_buy_pair[1] != 0 and top_short_pair and top_short_pair[0] != 0 and top_short_pair[1] != 0:
-        if last_date in df.index:
-            # Use data corresponding to last_date
-            buy_signal = df[f'SMA_{top_buy_pair[0]}'].loc[last_date] > df[f'SMA_{top_buy_pair[1]}'].loc[last_date]
-            short_signal = df[f'SMA_{top_short_pair[0]}'].loc[last_date] < df[f'SMA_{top_short_pair[1]}'].loc[last_date]
-        else:
-            # Handle case where last_date is not in df.index
-            buy_signal = False
-            short_signal = False
+    # Only proceed with pair analysis if we have valid data
+    if buy_pair_data is not None and short_pair_data is not None:
+        top_buy_pair = buy_pair_data[0] if isinstance(buy_pair_data, tuple) else (0, 0)  # Show corruption to user
+        top_short_pair = short_pair_data[0] if isinstance(short_pair_data, tuple) else (0, 0)  # Show corruption to user
         
-        if buy_signal and short_signal:
-            buy_capture = daily_top_buy_pairs.get(last_date, (None, 0))[1]
-            short_capture = daily_top_short_pairs.get(last_date, (None, 0))[1]
-            if buy_capture > short_capture:
-                data.loc[data.index[-1], 'active_pair_next'] = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
+        if isinstance(top_buy_pair, tuple) and isinstance(top_short_pair, tuple) \
+           and top_buy_pair[0] != 0 and top_buy_pair[1] != 0 \
+           and top_short_pair[0] != 0 and top_short_pair[1] != 0:
+            # Use tolerant lookups for SMA values at last_date
+            sma_buy_0 = _asof(df[f'SMA_{top_buy_pair[0]}'], last_date, default=None)
+            sma_buy_1 = _asof(df[f'SMA_{top_buy_pair[1]}'], last_date, default=None)
+            sma_short_0 = _asof(df[f'SMA_{top_short_pair[0]}'], last_date, default=None)
+            sma_short_1 = _asof(df[f'SMA_{top_short_pair[1]}'], last_date, default=None)
+            
+            # Check if we got valid values
+            if sma_buy_0 is not None and sma_buy_1 is not None:
+                buy_signal = sma_buy_0 > sma_buy_1
             else:
+                buy_signal = False
+                
+            if sma_short_0 is not None and sma_short_1 is not None:
+                short_signal = sma_short_0 < sma_short_1
+            else:
+                short_signal = False
+            
+            if buy_signal and short_signal:
+                buy_capture = daily_top_buy_pairs.get(last_date, (None, 0))[1]
+                short_capture = daily_top_short_pairs.get(last_date, (None, 0))[1]
+                if buy_capture > short_capture:
+                    data.loc[data.index[-1], 'active_pair_next'] = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
+                else:
+                    data.loc[data.index[-1], 'active_pair_next'] = f"Short ({top_short_pair[0]},{top_short_pair[1]})"
+            elif buy_signal:
+                data.loc[data.index[-1], 'active_pair_next'] = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
+            elif short_signal:
                 data.loc[data.index[-1], 'active_pair_next'] = f"Short ({top_short_pair[0]},{top_short_pair[1]})"
-        elif buy_signal:
-            data.loc[data.index[-1], 'active_pair_next'] = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
-        elif short_signal:
-            data.loc[data.index[-1], 'active_pair_next'] = f"Short ({top_short_pair[0]},{top_short_pair[1]})"
+            else:
+                data.loc[data.index[-1], 'active_pair_next'] = "None"
         else:
             data.loc[data.index[-1], 'active_pair_next'] = "None"
-    else:
-        data.loc[data.index[-1], 'active_pair_next'] = "None"
-
-    # Commented out sample data display to reduce log clutter
-    # logger.debug(f"Sample data rows:\n{data.head(10)}\n{data.tail(10)}")
-
+    
     # Calculate the active pair for the upcoming trading session
     last_date = df.index[-1]
     if last_date in daily_top_buy_pairs and last_date in daily_top_short_pairs:
         top_buy_pair = daily_top_buy_pairs[last_date][0]
         top_short_pair = daily_top_short_pairs[last_date][0]
-
+        
         if top_buy_pair and top_buy_pair[0] != 0 and top_buy_pair[1] != 0 and top_short_pair and top_short_pair[0] != 0 and top_short_pair[1] != 0:
             buy_signal = df[f'SMA_{top_buy_pair[0]}'].iloc[-1] > df[f'SMA_{top_buy_pair[1]}'].iloc[-1]
             short_signal = df[f'SMA_{top_short_pair[0]}'].iloc[-1] < df[f'SMA_{top_short_pair[1]}'].iloc[-1]
-
+            
             if buy_signal and short_signal:
                 if daily_top_buy_pairs[last_date][1] > daily_top_short_pairs[last_date][1]:
                     next_active_pair = f"Buy ({top_buy_pair[0]},{top_buy_pair[1]})"
@@ -5950,14 +7561,23 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
     else:
         next_active_pair = "None"
     
-    # Active pair info will be shown in statistical analysis section
-
     fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=data['date'],
-        y=data['capture'],
+    
+    # TEMP: Disable WebGL to avoid occasional blank/black canvas in some browsers/GPUs.
+    # If you want to re-enable later, set `use_webgl = (n_points > 20000)` and restore Scattergl.
+    n_points = len(data)
+    # use_webgl = n_points > 5000  # Commented out - forcing CPU renderer
+    # KEEP EVERY DAY THAT EXISTS IN YFINANCE - NO DECIMATION
+    decimated_data = data  # full fidelity, zero downsampling
+    
+    # Use WebGL automatically when the dataset is large for performance
+    TraceClass = go.Scattergl if len(data) > 3000 else go.Scatter
+    
+    fig.add_trace(TraceClass(
+        x=decimated_data['date'],
+        y=decimated_data['capture'],
         mode='lines',
+        connectgaps=True,  # Connect lines across any gaps in dates
         name='Combined Capture',
         hovertemplate=(
             'Date: %{x}<br>'
@@ -5968,10 +7588,10 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
             'Active Pair for Next Day: %{customdata[3]}'
             '<extra></extra>'
         ),
-        customdata=data[['top_buy_pair', 'top_short_pair', 'active_pair_current', 'active_pair_next']],
+        customdata=decimated_data[['top_buy_pair', 'top_short_pair', 'active_pair_current', 'active_pair_next']],
         line=dict(color='#00eaff'),
     ))
-
+    
     fig.update_layout(
         title=dict(
             text=f'{ticker} Cumulative Combined Capture Chart',
@@ -5980,7 +7600,9 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
         xaxis_title='Trading Day',
         yaxis_title='Cumulative Combined Capture (%)',
         hovermode='x',
-        uirevision={'ticker': normalize_ticker(ticker), 'chart': 'combined'},
+        # Preserve UI interactions AND force client repaint when the token changes
+        uirevision=ticker,
+        datarevision=str(revision) if revision is not None else str(_chart_fp(results)),
         template='plotly_dark',
         font=dict(color='#80ff00'),
         plot_bgcolor='black',
@@ -6002,11 +7624,108 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
             tickfont=dict(color='#80ff00')
         )
     )
-
-    # Mark this chart as loaded for this ticker
-    charts_loaded[chart_key] = True
     
-    return fig, charts_loaded
+    # Mark this as a real chart, not a placeholder
+    fig.update_layout(meta={"placeholder": False})
+    
+    return fig
+
+@app.callback(
+    Output('combined-capture-chart', 'figure'),
+    [Input('ticker-input', 'value'),
+     Input('ticker-input', 'n_submit'),
+     Input('update-interval', 'n_intervals')],
+    [State('primary-request-key', 'data'),
+     State('combined-capture-chart', 'figure')],   # NEW: what the browser is currently showing
+    prevent_initial_call=True
+)
+def update_combined_capture_chart(ticker, n_submit, n_intervals, request_key, current_fig):
+    """Paint a placeholder on ticker change, then replace with the real chart.
+       If the cached figure is real but the browser still shows a placeholder,
+       push the real figure once to guarantee delivery.
+    """
+    from dash.exceptions import PreventUpdate
+    if not ticker:
+        ticker = _last_active_ticker()
+        if not ticker:
+            dlog("combined.enter", t=None, trig=None, n=n_intervals, note="no ticker -> PreventUpdate")
+            raise PreventUpdate
+
+    t = normalize_ticker(ticker)
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    dlog("combined.enter", t=t, trig=trigger_id, n=n_intervals, req=_short(request_key))
+
+    # On ticker change: immediately paint placeholder and start/refresh compute
+    if trigger_id and trigger_id.startswith('ticker-input'):
+        results = load_precomputed_results(t, from_callback=False, should_log=True, request_key=request_key)
+        if results:
+            # Fast path - data already available
+            fig = build_combined_capture_figure(t, results, revision=_chart_fp(results))
+            _figure_cache[t] = {"fp": _chart_fp(results), "fig": fig}
+            dlog("combined.fast_path", t=t, meta=_fig_meta(fig))
+            return fig
+        
+        # Paint placeholder while computing
+        placeholder = _placeholder_fig(t, revision_token=(request_key or time.time()))
+        _figure_cache[t] = {"fp": None, "fig": placeholder}
+        dlog("combined.placeholder", t=t, meta=_fig_meta(placeholder), cache_keys=list(_figure_cache.cache.keys() if hasattr(_figure_cache, 'cache') else []))
+        return placeholder
+
+    # ---- Interval ticks ----
+    # If we already have a cached non-placeholder figure, but the browser is still
+    # showing a placeholder, force-deliver the real figure once.
+    cached = _figure_cache.get(t)
+    if cached and cached.get('fig'):
+        fig = cached['fig']
+        meta = _fig_meta(fig)
+        cached_is_real = not meta.get("placeholder", False)
+        dlog("combined.cached", t=t, meta=meta, have_fp=bool(cached.get("fp")))
+
+        if cached_is_real:
+            # Inspect what the browser is actually showing
+            current_is_placeholder = True
+            try:
+                # Dash gives us a dict for current_fig
+                layout = (current_fig or {}).get('layout') or {}
+                current_meta = layout.get('meta') or {}
+                current_is_placeholder = bool(current_meta.get('placeholder', True))
+            except Exception:
+                current_is_placeholder = True
+
+            if current_is_placeholder:
+                # Browser still has placeholder — push the real fig now
+                dlog("combined.force_deliver", t=t, reason="browser still has placeholder")
+                return fig
+            else:
+                # Browser already has the real fig — do nothing
+                dlog("combined.no_update", t=t, reason="browser already has real figure")
+                return no_update
+
+    # Try to load ready results and replace the placeholder
+    results = load_precomputed_results(t, from_callback=False, should_log=False, request_key=request_key)
+    if not results:
+        dlog("combined.prevent", t=t, reason="results not ready")
+        raise PreventUpdate
+
+    fig = build_combined_capture_figure(t, results, revision=_chart_fp(results))
+    if not fig:
+        dlog("combined.prevent", t=t, reason="build_combined_capture_figure returned None")
+        raise PreventUpdate
+
+    meta = dict(getattr(fig.layout, "meta", {}) or {})
+    meta["placeholder"] = False  # explicit
+    fig.update_layout(meta=meta, uirevision=t, datarevision=str(_chart_fp(results)))
+    _figure_cache[t] = {"fp": _chart_fp(results), "fig": fig}
+    dlog("combined.return_real",
+         t=t,
+         traces=len(fig.data) if hasattr(fig, "data") else None,
+         meta=_fig_meta(fig),
+         fp=_short(_chart_fp(results)))
+    return fig
+
+# Removed spinner hiding callback - it was hiding the entire graph wrapper
+# The dcc.Loading component will naturally show/hide spinner when graph updates
 
 @app.callback(
     Output('historical-top-pairs-chart', 'figure'),
@@ -6018,37 +7737,41 @@ def update_combined_capture_chart(ticker, n_intervals, charts_loaded):
 )
 def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pairs, n_intervals, charts_loaded):
     if not ticker:
-        return no_update
+        # Don't try to guess - just prevent update if no ticker
+        raise PreventUpdate
+    
+    t = normalize_ticker(ticker)
+    
+    # Always paint a placeholder immediately on ticker change so Loading hides.
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    if trigger_id == 'ticker-input':
+        return _placeholder_fig(t, revision_token=time.time())
     
     # Initialize charts_loaded if needed
     if charts_loaded is None:
         charts_loaded = {}
     
-    # Check if this chart has already been loaded for this ticker
-    # Only prevent refresh if toggles haven't changed
-    ctx = dash.callback_context
-    if ctx.triggered:
-        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        chart_key = f'historical_{ticker}_{show_annotations}_{display_top_pairs}'
-        
-        # If it's just an interval update and chart is loaded, skip
-        if trigger_id == 'update-interval' and chart_key in charts_loaded:
+    # If it's just an interval tick and we've already rendered this exact variant, skip.
+    if trigger_id == 'update-interval':
+        chart_key = f'historical_{t}_{show_annotations}_{display_top_pairs}'
+        if chart_key in charts_loaded:
             return no_update
 
     # Check if data processing is complete
-    status = read_status(ticker)
+    status = read_status(t)
     if status['status'] != 'complete':
-        return no_update  # Do not update the chart
+        return no_update  # Keep showing the placeholder already painted
 
     # Proceed only if data is ready
     try:
-        results = load_precomputed_results(ticker)
+        results = load_precomputed_results(t, from_callback=False, should_log=False)
         if results is None:
             return no_update  # Do not update the chart
 
-        # Ensure required keys exist before accessing
+        # Ensure required keys exist before accessing (don't require preprocessed_data)
         required_keys = [
-            'preprocessed_data',
             'daily_top_buy_pairs',
             'daily_top_short_pairs',
             'cumulative_combined_captures',
@@ -6060,8 +7783,11 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
             # Return no_update since we cannot proceed without these keys
             return no_update
 
-        # Extract required data from results
-        df = results['preprocessed_data']
+        # Extract required data from results - load DataFrame on-demand
+        df = ensure_df_available(ticker, results)
+        if df is None or df.empty:
+            logger.error(f"Could not load DataFrame for {ticker}")
+            return no_update
         daily_top_buy_pairs = results['daily_top_buy_pairs']
         daily_top_short_pairs = results['daily_top_short_pairs']
         cumulative_combined_captures = results['cumulative_combined_captures']
@@ -6262,8 +7988,8 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
             next_day_pairs[-1] = "None"
         else:
             try:
-                top_buy_pair = buy_pair_data[0] if isinstance(buy_pair_data, tuple) else (0, 0)
-                top_short_pair = short_pair_data[0] if isinstance(short_pair_data, tuple) else (0, 0)
+                top_buy_pair = buy_pair_data[0] if isinstance(buy_pair_data, tuple) else (0, 0)  # Show corruption to user
+                top_short_pair = short_pair_data[0] if isinstance(short_pair_data, tuple) else (0, 0)  # Show corruption to user
                 buy_capture = buy_pair_data[1] if isinstance(buy_pair_data, tuple) else 0
                 short_capture = short_pair_data[1] if isinstance(short_pair_data, tuple) else 0
 
@@ -6272,9 +7998,22 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
                     next_day_pairs[-1] = "None"
                 else:
                     try:
-                        # Calculate signals for the last date
-                        buy_signal = df[f'SMA_{top_buy_pair[0]}'].loc[last_date] > df[f'SMA_{top_buy_pair[1]}'].loc[last_date]
-                        short_signal = df[f'SMA_{top_short_pair[0]}'].loc[last_date] < df[f'SMA_{top_short_pair[1]}'].loc[last_date]
+                        # Calculate signals for the last date using tolerant lookups
+                        sma_buy_0 = _asof(df[f'SMA_{top_buy_pair[0]}'], last_date, default=None)
+                        sma_buy_1 = _asof(df[f'SMA_{top_buy_pair[1]}'], last_date, default=None)
+                        sma_short_0 = _asof(df[f'SMA_{top_short_pair[0]}'], last_date, default=None)
+                        sma_short_1 = _asof(df[f'SMA_{top_short_pair[1]}'], last_date, default=None)
+                        
+                        # Check if we have valid SMA values
+                        if sma_buy_0 is not None and sma_buy_1 is not None:
+                            buy_signal = sma_buy_0 > sma_buy_1
+                        else:
+                            buy_signal = False
+                            
+                        if sma_short_0 is not None and sma_short_1 is not None:
+                            short_signal = sma_short_0 < sma_short_1
+                        else:
+                            short_signal = False
                         
                         if buy_signal and short_signal:
                             # Compare captures to determine which signal to use
@@ -6342,13 +8081,15 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
 
         fig.update_layout(
             title=dict(
-                text=f'{ticker} Color-Coded Cumulative Combined Capture Chart',
+                text=f'{t} Color-Coded Cumulative Combined Capture Chart',
                 font=dict(color='#80ff00')
             ),
             xaxis_title='Trading Day',
             yaxis_title='Cumulative Combined Capture (%)',
             hovermode='x unified',
-            uirevision={'ticker': normalize_ticker(ticker), 'chart': 'historical'},
+            # Preserve interactions and mark as a real (non-placeholder) figure
+            uirevision=t,
+            meta={'placeholder': False},
             template='plotly_dark',
             showlegend=False,
             font=dict(color='#80ff00'),
@@ -6400,10 +8141,11 @@ def update_historical_top_pairs_chart(ticker, show_annotations, display_top_pair
      Output('trading-recommendations', 'children'),
      Output('dynamic-signal-analysis', 'children')],
     [Input('ticker-input', 'value'),
+     Input('combined-capture-chart', 'figure'),
      Input('update-interval', 'n_intervals')],
     [State('position-history-store', 'data')]
 )
-def update_dynamic_strategy_display(ticker, n_intervals, position_history_store):
+def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_history_store):
     # Check if this is an interval update or a ticker change
     ctx = dash.callback_context
     if not ctx.triggered:
@@ -6413,9 +8155,36 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     
     # Only log if the ticker changed, not on interval updates
     should_log = trigger_id == 'ticker-input'
+    
+    # --- DEBUG LOGGING FOR AI SECTION ISSUES ---
+    is_placeholder = (not combined_fig) or combined_fig.get('layout', {}).get('meta', {}).get('placeholder', True)
+    try:
+        file_stat = read_status(ticker) if ticker else {}
+    except Exception as _e:
+        file_stat = {'status': 'error', 'note': f'read_status failed: {type(_e).__name__}: {str(_e)[:200]}'}
+    
+    print(f"[AI DEBUG] Entry: ticker={ticker}, trigger={trigger_id}, fig_placeholder={is_placeholder}, file_status={file_stat.get('status')}, progress={file_stat.get('progress')}")
+    
+    # Early guard - but with soft gate for cached results
+    if is_placeholder:
+        # Check if we have cached results already
+        _t = normalize_ticker(ticker) if ticker else None
+        if _t:
+            soft_results = load_precomputed_results(_t, from_callback=False, should_log=False)
+            if soft_results and 'top_buy_pair' in soft_results and 'top_short_pair' in soft_results:
+                print(f"[AI DEBUG] Soft gate: Proceeding despite placeholder because results exist for {_t}")
+                # Don't raise PreventUpdate - continue processing
+            else:
+                print(f"[AI DEBUG] Hard gate: No results yet, waiting for real chart")
+                raise PreventUpdate
+        else:
+            raise PreventUpdate
     if not ticker:
         # Return 19 items: 1 for snapshot + 2 containers + 4 empty + empty dict for position store + 11 empty
         return ["", None, None] + [""] * 4 + [{}] + [""] * 11
+    
+    # Normalize ticker for consistent processing
+    ticker = normalize_ticker(ticker)
     
     # Initialize or get ticker-specific position history
     if position_history_store is None or not isinstance(position_history_store, dict):
@@ -6429,20 +8198,56 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         position_history_data = []
 
     # Call with callback parameters to ensure proper logging
-    results = load_precomputed_results(ticker, from_callback=True, should_log=should_log)
+    results = load_precomputed_results(ticker, from_callback=False, should_log=should_log)
     
+    # FALLBACK: If RAM cache isn't ready but pickle exists, load from disk
     if results is None:
-        # Return 23 items with error message in trading-recommendations (position 22)
-        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data not available. Please wait..."] + [""]
+        print(f"[AI DEBUG] RAM cache miss for {ticker}, trying disk fallback...")
+        pkl_file = f"cache/results/{ticker}_precomputed_results.pkl"
+        if os.path.exists(pkl_file):
+            try:
+                import pickle
+                with open(pkl_file, "rb") as f:
+                    results = pickle.load(f)
+                if results and 'top_buy_pair' in results and 'top_short_pair' in results:
+                    print(f"[AI DEBUG] SUCCESS: Loaded from disk for {ticker}")
+                else:
+                    print(f"[AI DEBUG] Disk file exists but missing required keys")
+                    results = None
+            except Exception as e:
+                print(f"[AI DEBUG] Disk load failed: {e}")
+                results = None
     
-    if 'status' in results:
-        if results['status'] == 'processing':
-            return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data is currently being processed."] + [""]
-        elif results['status'] == 'complete':
-            if 'top_buy_pair' not in results or 'top_short_pair' not in results:
-                return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Processing complete, but top pairs not found. Please check data integrity."] + [""]
-        elif results['status'] == 'failed':
+    # If still None after fallback, show status message
+    if results is None:
+        fs = read_status(ticker)
+        msg = "Data not available. Please wait..."
+        if fs.get('status') == 'processing':
+            msg += f" Processing... {fs.get('progress', 0):.0f}%"
+        print(f"[AI DEBUG] No data found, returning: {msg}")
+        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + [msg] + [""]
+    else:
+        print(f"[AI DEBUG] Got results for {ticker} with {len(results)} keys")
+    
+    # Check file status but DON'T block if we have valid results from cache/fallback
+    file_status = read_status(ticker)
+    
+    # Only show processing/failed message if we don't have valid results
+    if results is None or 'top_buy_pair' not in results or 'top_short_pair' not in results:
+        if file_status.get('status') == 'processing':
+            progress = file_status.get('progress', 0)
+            return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + [f"Data is currently being processed... {progress}%"] + [""]
+        elif file_status.get('status') == 'failed':
             return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + [f"Processing failed for {ticker}. Please check the error message."] + [""]
+    else:
+        # We have valid results - if status shows processing, update it to complete
+        if file_status.get('status') == 'processing':
+            write_status(ticker, {
+                "status": "complete", 
+                "progress": 100,
+                "cache_status": "fresh"
+            })
+            print(f"[AI FIX] Updated stale status to complete for {ticker}")
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
@@ -6454,10 +8259,11 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         logger.warning(f"Missing top pairs data for {ticker}")
         return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing top pairs"] + [""]
 
-    df = results.get('preprocessed_data')
+    # Get DataFrame using the helper that loads on-demand if needed
+    df = ensure_df_available(ticker, results)
     if df is None or df.empty:
-        logger.warning(f"Missing preprocessed data for {ticker}")
-        return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Data integrity issue - missing preprocessed data"] + [""]
+        logger.warning(f"Could not load DataFrame for {ticker}")
+        raise PreventUpdate
 
     # Validate top pairs format
     if not isinstance(top_buy_pair, tuple) or not isinstance(top_short_pair, tuple):
@@ -6540,22 +8346,34 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             return "Cash", "N/A"
 
     # Validate dates exist in the index
-    if previous_date not in df.index or current_date not in df.index:
-        logger.error(f"Missing required dates in data: prev={previous_date}, current={current_date}")
+    # Use tolerant check - dates don't need to be exact matches
+    # Just ensure we have data up to or before these dates
+    if df.index.max() < previous_date:
+        logger.error(f"Data ends before required date: max={df.index.max()}, needed={previous_date}")
         return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Missing required dates in data. Please reprocess data."] + [""]
 
     try:
-        # Calculate signals for today based on yesterday's close
-        buy_signal = (sma1_buy_leader.loc[previous_date] > sma2_buy_leader.loc[previous_date]) if all(
-            pd.notna([sma1_buy_leader.loc[previous_date], sma2_buy_leader.loc[previous_date]])) else False
-        short_signal = (sma1_short_leader.loc[previous_date] < sma2_short_leader.loc[previous_date]) if all(
-            pd.notna([sma1_short_leader.loc[previous_date], sma2_short_leader.loc[previous_date]])) else False
+        # Calculate signals for today based on yesterday's close using tolerant lookups
+        sma1_buy_prev = _asof(sma1_buy_leader, previous_date, default=None)
+        sma2_buy_prev = _asof(sma2_buy_leader, previous_date, default=None)
+        sma1_short_prev = _asof(sma1_short_leader, previous_date, default=None)
+        sma2_short_prev = _asof(sma2_short_leader, previous_date, default=None)
+        
+        buy_signal = (sma1_buy_prev > sma2_buy_prev) if (sma1_buy_prev is not None and sma2_buy_prev is not None 
+                                                          and pd.notna(sma1_buy_prev) and pd.notna(sma2_buy_prev)) else False
+        short_signal = (sma1_short_prev < sma2_short_prev) if (sma1_short_prev is not None and sma2_short_prev is not None
+                                                               and pd.notna(sma1_short_prev) and pd.notna(sma2_short_prev)) else False
 
-        # Calculate signals for tomorrow based on today's close
-        next_buy_signal = (sma1_buy_leader.loc[current_date] > sma2_buy_leader.loc[current_date]) if all(
-            pd.notna([sma1_buy_leader.loc[current_date], sma2_buy_leader.loc[current_date]])) else False
-        next_short_signal = (sma1_short_leader.loc[current_date] < sma2_short_leader.loc[current_date]) if all(
-            pd.notna([sma1_short_leader.loc[current_date], sma2_short_leader.loc[current_date]])) else False
+        # Calculate signals for tomorrow based on today's close using tolerant lookups
+        sma1_buy_curr = _asof(sma1_buy_leader, current_date, default=None)
+        sma2_buy_curr = _asof(sma2_buy_leader, current_date, default=None)
+        sma1_short_curr = _asof(sma1_short_leader, current_date, default=None)
+        sma2_short_curr = _asof(sma2_short_leader, current_date, default=None)
+        
+        next_buy_signal = (sma1_buy_curr > sma2_buy_curr) if (sma1_buy_curr is not None and sma2_buy_curr is not None
+                                                              and pd.notna(sma1_buy_curr) and pd.notna(sma2_buy_curr)) else False
+        next_short_signal = (sma1_short_curr < sma2_short_curr) if (sma1_short_curr is not None and sma2_short_curr is not None
+                                                                    and pd.notna(sma1_short_curr) and pd.notna(sma2_short_curr)) else False
     except Exception as e:
         logger.error(f"Error calculating signals: {str(e)}")
         return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + ["Error calculating signals. Please check the data."] + [""]
@@ -6738,7 +8556,10 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
     daily_top_buy_pairs = results.get('daily_top_buy_pairs', {})
     daily_top_short_pairs = results.get('daily_top_short_pairs', {})
 
-    dates = sorted(set(daily_top_buy_pairs.keys()) & set(daily_top_short_pairs.keys()))
+    # Align date keys to df index (normalize to midnight; drop any not present)
+    df_index_norm = pd.DatetimeIndex(df.index).normalize()
+    dates = [pd.Timestamp(d).normalize() for d in (set(daily_top_buy_pairs.keys()) & set(daily_top_short_pairs.keys()))]
+    dates = sorted([d for d in dates if d in df_index_norm])
     if not dates:
         total_capture = 0
         avg_daily_capture = 0
@@ -6753,6 +8574,11 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         max_drawdown = 0
     else:
         daily_returns_series = df['Close'].pct_change().fillna(0)
+        # Normalize the index to match our normalized dates (midnight boundary)
+        daily_returns_series.index = pd.DatetimeIndex(daily_returns_series.index).normalize()
+        # Recreate a normalized view of the DF index (safe if already defined above)
+        df_index_norm = pd.DatetimeIndex(df.index).normalize()
+
         cumulative_captures = []
         current_capture = 0
         active_signals = []
@@ -6765,8 +8591,13 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             prev_short_pair, prev_short_cap = daily_top_short_pairs[prev_day]
 
             if (prev_buy_pair != (0,0)) and (prev_short_pair != (0,0)):
-                buy_signal = df[f'SMA_{prev_buy_pair[0]}'].loc[prev_day] > df[f'SMA_{prev_buy_pair[1]}'].loc[prev_day]
-                short_signal = df[f'SMA_{prev_short_pair[0]}'].loc[prev_day] < df[f'SMA_{prev_short_pair[1]}'].loc[prev_day]
+                sma_buy_0 = _asof(df[f'SMA_{prev_buy_pair[0]}'], prev_day, default=0.0)
+                sma_buy_1 = _asof(df[f'SMA_{prev_buy_pair[1]}'], prev_day, default=0.0)
+                buy_signal = sma_buy_0 > sma_buy_1
+                
+                sma_short_0 = _asof(df[f'SMA_{prev_short_pair[0]}'], prev_day, default=0.0)
+                sma_short_1 = _asof(df[f'SMA_{prev_short_pair[1]}'], prev_day, default=0.0)
+                short_signal = sma_short_0 < sma_short_1
 
                 if buy_signal and short_signal:
                     if prev_buy_cap > prev_short_cap:
@@ -6780,15 +8611,23 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                 else:
                     current_position = 'None'
             elif (prev_buy_pair != (0,0)):
-                buy_signal = df[f'SMA_{prev_buy_pair[0]}'].loc[prev_day] > df[f'SMA_{prev_buy_pair[1]}'].loc[prev_day]
+                sma_buy_0 = _asof(df[f'SMA_{prev_buy_pair[0]}'], prev_day, default=0.0)
+                sma_buy_1 = _asof(df[f'SMA_{prev_buy_pair[1]}'], prev_day, default=0.0)
+                buy_signal = sma_buy_0 > sma_buy_1
                 current_position = 'Buy' if buy_signal else 'None'
             elif (prev_short_pair != (0,0)):
-                short_signal = df[f'SMA_{prev_short_pair[0]}'].loc[prev_day] < df[f'SMA_{prev_short_pair[1]}'].loc[prev_day]
+                sma_short_0 = _asof(df[f'SMA_{prev_short_pair[0]}'], prev_day, default=0.0)
+                sma_short_1 = _asof(df[f'SMA_{prev_short_pair[1]}'], prev_day, default=0.0)
+                short_signal = sma_short_0 < sma_short_1
                 current_position = 'Short' if short_signal else 'None'
             else:
                 current_position = 'None'
 
-            daily_return = daily_returns_series.loc[current_day]
+            # Tolerant as-of lookup: if current_day not present, use the last day <= current_day
+            daily_return = _asof(daily_returns_series, current_day, default=0.0)
+            if daily_return is not None:
+                daily_return = float(daily_return)
+            
             if current_position == 'Buy':
                 daily_capture = daily_return * 100
             elif current_position == 'Short':
@@ -6839,22 +8678,9 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
                 degrees_of_freedom = trigger_days - 1
                 p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
 
-                confidence_levels = {
-                    '90%': p_value < 0.10,
-                    '95%': p_value < 0.05,
-                    '99%': p_value < 0.01
-                }
-                if should_log:
-                    log_subsection("Statistical Significance Analysis")
-                    log_metric("t-Statistic", f"{t_statistic:.4f}")
-                    log_metric("p-Value", f"{p_value:.4f}")
-                    log_metric("Degrees of Freedom", degrees_of_freedom)
-                    logger.info("")
-                    logger.info(f"{Colors.CYAN}Confidence Levels:{Colors.ENDC}")
-                    for level, significant in confidence_levels.items():
-                        status = 'Significant' if significant else 'Not Significant'
-                        color = Colors.BRIGHT_GREEN if significant else Colors.ORANGE
-                        logger.info(f"  {Colors.OKBLUE}{level} Confidence:{Colors.ENDC} {color}{status}{Colors.ENDC}")
+                # Don't print stats from callback for cached tickers to avoid issues
+                # Stats are already printed during processing
+                pass
             else:
                 t_statistic = None
                 p_value = None
@@ -6996,13 +8822,9 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         results['cached_predictions'] = predictions
         results['cached_predictions_time'] = time.time()
 
-    # Only log if this is a ticker change, not an interval update
-    if should_log:
-        logger.info("")  # Line break before section
-        log_section("Forecast Recommendations")
-        for pred in predictions:
-            logger.info(f"  💵 {pred['price_range']:<20} → {pred['signal']:<12} [{pred['recommendation']}]")
-        logger.info("")  # Clean line break
+    # Don't print forecast from callback for cached tickers to avoid issues
+    # Forecasts are already printed during processing
+    pass
 
     # Prepare data for new components
     # Boolean flags for today's signals (what to do at today's close)
@@ -7032,10 +8854,10 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             current_sma_pair = top_short_pair  # Use the current top short pair
         elif current_pair_str == "None" or current_pair_str == "Cash":
             current_position = "Cash"
-            current_sma_pair = (0, 0)
+            current_sma_pair = (0, 0)  # No SMA pair for Cash position
         else:
             current_position = "Cash"
-            current_sma_pair = (0, 0)
+            current_sma_pair = (0, 0)  # No SMA pair for Cash position
     else:
         # Fallback: Calculate based on yesterday's signals if active_pairs not available
         if yesterday_both_signals_active:
@@ -7054,7 +8876,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
             current_sma_pair = top_short_pair
         else:  # yesterday_no_signals_active
             current_position = "Cash"
-            current_sma_pair = (0, 0)
+            current_sma_pair = (0, 0)  # No SMA pair for Cash position
     
     # Determine yesterday's position (what was held yesterday, entered at close two days ago)
     # We need to look at the active_pairs list to find this
@@ -7096,7 +8918,7 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         next_sma_pair = top_short_pair
     else:  # next_no_signals_active
         next_position = "Cash"
-        next_sma_pair = (0, 0)
+        next_sma_pair = (0, 0)  # No SMA pair for Cash position
     
     # Enhanced confidence calculation using multiple factors
     confidence = (
@@ -7628,10 +9450,9 @@ def update_dynamic_strategy_display(ticker, n_intervals, position_history_store)
         ], className="p-3")
     ]
 
-    # After Forecast Recommendations are complete, update results
-    # Always save results to ensure charts can load properly
+    # Don't save from callbacks - causes lock contention and is unnecessary
+    # Charts read from cache/file anyway
     results['last_recommendation_time'] = time.time()
-    save_precomputed_results(ticker, results)
 
     # Calculate the time period in years for the data
     if dates is not None and len(dates) > 0:
@@ -8540,61 +10361,62 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
 
 
 # Split callbacks to prevent interval start/stop thrashing
-
-# Callback 1: Adaptive interval (only changes frequency, no disabling)
+# -----------------------------------------------------------------------------
+# Callback 1: Adaptive interval (ONLY changes frequency; never disables)
 @app.callback(
     [Output('update-interval', 'interval'),
-     Output('interval-adaptive-state', 'data'),
-     Output('update-interval', 'n_intervals')],
+     Output('interval-adaptive-state', 'data')],
     [Input('ticker-input', 'value'),
      Input('update-interval', 'n_intervals')],
     [State('interval-adaptive-state', 'data')],
     prevent_initial_call=False
 )
 def adapt_update_interval(ticker, n, state):
-    """Only adapts interval frequency based on ticker and elapsed time"""
+    """Only adapts interval frequency based on ticker and elapsed time.
+       IMPORTANT: This callback never disables the interval and never inspects
+       the figure. Disabling is handled by the callback below.
+    """
     import time
     from dash.exceptions import PreventUpdate
-    
+
     if not ticker:
+        dlog("interval.adapt", note="no ticker -> PreventUpdate")
         raise PreventUpdate
-    
+
     tnorm = normalize_ticker(ticker)
-    
-    # Init / on ticker change: seed store once, reset n_intervals so ramp starts fresh
+
+    # Init / on ticker change: seed store once and start with a fast cadence
     if state is None or state.get('ticker') != tnorm:
         results = _load_last_results_for(tnorm)
         predicted = predicted_seconds_from_results(results) if results else None
         t0 = time.perf_counter()
         base_ms = interval_from_measured_secs(predicted) or MIN_INTERVAL_MS
-        
-        # Start computation on ticker change
-        load_precomputed_results(tnorm)
-        
+        dlog("interval.adapt.init", t=tnorm, predicted=predicted, base_ms=base_ms)
         return int(MIN_INTERVAL_MS), {
             'ticker': tnorm,
             't0': t0,
             'predicted': predicted,
             'last_interval_ms': base_ms
-        }, 0
-    
-    # Normal ticks: time-based ramp with gentle backoff if we've exceeded the prediction
+        }
+
+    # Normal ticks: time-based ramp with gentle backoff if we've exceeded prediction
     t0 = state.get('t0', time.perf_counter())
     predicted = state.get('predicted')
     elapsed = max(0.0, time.perf_counter() - t0)
-    
+
     if predicted is not None:
         base_ms = interval_from_measured_secs(predicted)
         if elapsed > predicted * SAFETY_MULTIPLIER and base_ms < MAX_INTERVAL_MS:
             base_ms = min(MAX_INTERVAL_MS, base_ms * 2)
         state['last_interval_ms'] = base_ms
-        return int(base_ms), state, n
-    
-    # First-ever run without prediction: time-based ramp
+        dlog("interval.adapt.tick", predicted=predicted, elapsed=elapsed, next_ms=base_ms)
+        return int(base_ms), state
+
+    # First-ever run without prediction: gradual ramp
     if elapsed < 1.0:
-        base_ms = 1000  # MIN_INTERVAL_MS
+        base_ms = 1000
     elif elapsed < 4.0:
-        base_ms = 1000  # Keep at 1 second initially
+        base_ms = 1000
     elif elapsed < 18.0:
         base_ms = 1500
     elif elapsed < 48.0:
@@ -8603,86 +10425,90 @@ def adapt_update_interval(ticker, n, state):
         base_ms = 4000
     else:
         base_ms = 6000
-    
-    state['last_interval_ms'] = base_ms
-    return int(base_ms), state, n
 
-# Callback 2: Disable when data is ready (no frequency changes)
+    state['last_interval_ms'] = base_ms
+    dlog("interval.adapt.tick", predicted=None, elapsed=elapsed, next_ms=base_ms)
+    return int(base_ms), state
+
+# -----------------------------------------------------------------------------
+# Callback 2: Disable the interval the moment the REAL figure is visible
 @app.callback(
     Output('update-interval', 'disabled'),
-    [Input('update-interval', 'n_intervals'),
-     Input('update-interval', 'interval')],
-    [State('ticker-input', 'value'),
-     State('interval-adaptive-state', 'data'),
-     State('trading-recommendations', 'children')]
+    [
+        Input('update-interval', 'n_intervals'),
+        Input('combined-capture-chart', 'figure'),
+        Input('ticker-input', 'value'),
+    ],
+    [State('interval-adaptive-state', 'data')]
 )
-def disable_interval_when_data_loaded(n_intervals, interval_ms, ticker, state, recommendations_loaded):
-    """Only decides when to stop polling, no frequency changes"""
+def disable_interval_when_data_loaded(n_intervals, combined_fig, ticker, state):
+    """Stop polling as soon as the real figure is painted. DOM is the source of truth."""
     import time
-    
+
+    # No ticker ⇒ nothing to poll
     if not ticker:
         return True
-    
-    tnorm = normalize_ticker(ticker)
-    status = read_status(tnorm)
-    
-    if status.get('status') == 'failed':
+
+    # If the browser shows a real figure (meta.placeholder == False), stop polling now.
+    is_real = False
+    try:
+        meta = ((combined_fig or {}).get('layout') or {}).get('meta') or {}
+        is_real = (meta.get('placeholder') is False)
+    except Exception:
+        is_real = False
+
+    if is_real:
+        dlog("interval.disable.decide",
+            t=normalize_ticker(ticker),
+            decision=True,
+            reason="have non-placeholder fig")
+        return True
+
+    # Hard safety cap so we never spin forever
+    t0 = (state or {}).get('t0')
+    elapsed = (time.perf_counter() - t0) if t0 else (n_intervals * 1000.0 / 1000.0)
+    if elapsed >= 120.0:
+        dlog("interval.disable.decide",
+            t=normalize_ticker(ticker),
+            decision=True,
+            reason="safety cap reached")
         return True
     
-    # If data is ready and UI shows content, stop polling
-    results = load_precomputed_results(tnorm)  # RAM cache or file
-    has_cached = (results is not None and
-                  (results.get('status') == 'complete' or
-                   ('top_buy_pair' in results and 'top_short_pair' in results)))
-    
-    if has_cached:
-        # Small grace period for secondary chart to render
-        t0 = (state or {}).get('t0', time.perf_counter())
-        if time.perf_counter() - t0 > 3.0:
-            return True
-    
-    # Fallback: when recommendations block is populated enough
-    if recommendations_loaded and len(str(recommendations_loaded)) > 100:
-        # Small grace to allow secondary chart to render
-        t0 = (state or {}).get('t0', time.perf_counter())
-        if time.perf_counter() - t0 > 3.0:
-            return True
-    
-    # Time-aware guardrail
-    t0 = (state or {}).get('t0')
-    predicted = (state or {}).get('predicted')
-    elapsed = (time.perf_counter() - t0) if t0 else (n_intervals * (interval_ms / 1000.0))
-    
-    if predicted is not None:
-        budget = max(4.0, min(60.0, predicted * SAFETY_MULTIPLIER))
-        return elapsed >= budget
-    else:
-        return elapsed >= 120.0
+    # Still waiting for real figure
+    return False
 
 @app.callback(
     [Output("loading-spinner-output", "children"),
      Output('timing-summary-printed', 'data')],
     [Input('combined-capture-chart', 'figure'),
-     Input('historical-top-pairs-chart', 'figure'),
-     Input('chart', 'figure'),
      Input('ticker-input', 'value')],
     [State('timing-summary-printed', 'data')]
 )
-def update_output_and_reset(combined_capture, historical_top_pairs, chart, ticker, timing_summary_printed):
+def update_output_and_reset(combined_capture, ticker, timing_summary_printed):
     ctx = callback_context
     if not ctx.triggered:
-        return no_update, no_update
+        raise PreventUpdate
 
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
+    # On ticker change: clear any stale overlay and reset printed flag.
     if trigger_id == 'ticker-input':
-        # Reset the timing summary printed flag when ticker changes
-        return no_update, False
-    elif all([combined_capture, historical_top_pairs, chart]) and not timing_summary_printed:
-        print_timing_summary(ticker)
-        return "", True  # Return empty string instead of "Charts loaded successfully"
-    else:
-        return no_update, no_update
+        logger.info("[🧪 spinner.reset] ticker change -> clear overlay & reset flag")
+        return "", False
+
+    # Hide overlay as soon as the combined chart is REAL (not a placeholder)
+    try:
+        layout = (combined_capture or {}).get('layout') or {}
+        meta = layout.get('meta') or {}
+        is_placeholder = bool(meta.get('placeholder', False))
+    except Exception:
+        is_placeholder = True
+
+    if not is_placeholder and not timing_summary_printed:
+        logger.info("[🧪 spinner.hide] combined chart is real -> hide overlay")
+        return "", True
+
+    raise PreventUpdate
 
 from dash import dash_table
 
@@ -8695,96 +10521,87 @@ from dash import dash_table
      Input('secondary-ticker-input', 'value'),
      Input('invert-signals-toggle', 'value'),
      Input('show-secondary-annotations-toggle', 'value'),
-     Input('update-interval', 'n_intervals'),  # Re-added with guards
      Input('trading-recommendations', 'children')],
     prevent_initial_call=True
 )
-def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, invert_signals, show_annotations, n_intervals, trading_recommendations):
-    empty_fig = go.Figure()
-    empty_fig.update_layout(
-        plot_bgcolor='black',
-        paper_bgcolor='black',
-        font=dict(color='#80ff00'),
-        xaxis=dict(
-            visible=False,
-            showgrid=False,
-            zeroline=False,
-            showticklabels=False
-        ),
-        yaxis=dict(
-            visible=False,
-            showgrid=False,
-            zeroline=False,
-            showticklabels=False
-        ),
-        title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00')),
-        uirevision="secondary-static"  # Keep interactions stable
-    )
-
-    if not primary_ticker or not secondary_tickers_input:
-        return empty_fig, [], [], ''
-    
-    # Gate secondary processing until primary is ready
-    primary_ticker_norm = normalize_ticker(primary_ticker)
-    status = read_status(primary_ticker_norm)
-    results = load_precomputed_results(primary_ticker_norm)
-    
-    # Don't process secondaries until primary is complete with data
-    if not (status.get('status') == 'complete' and 
-            results and 
-            results.get('cumulative_combined_captures') is not None):
+def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, invert_signals, show_annotations, trading_recommendations):
+    # Only run when user applies changes or the secondary text actually changes
+    ctx = dash.callback_context
+    if not ctx.triggered:
         raise PreventUpdate
     
-    # NEW: Ignore interval ticks until primary is ready
-    ctx = dash.callback_context
-    if ctx.triggered:
-        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        if trigger_id == 'update-interval':
-            # Already checked above, but keep for additional logic if needed
-            pass
-            ui_ready = bool(trading_recommendations and len(str(trading_recommendations)) > 100)
-            if status.get('status') != 'complete' or not ui_ready:
-                return empty_fig, [], [], 'Waiting for primary ticker data...'
+    def _secondary_placeholder(msg="Enter a primary ticker first."):
+        fig = go.Figure()
+        fig.add_annotation(
+            text=msg, showarrow=False, x=0.5, y=0.5, xref='paper', yref='paper',
+            font=dict(color='#80ff00', size=14)
+        )
+        fig.update_layout(
+            plot_bgcolor='black',
+            paper_bgcolor='black',
+            font=dict(color='#80ff00'),
+            margin=dict(l=20, r=20, t=40, b=20),
+            xaxis=dict(visible=False, showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(visible=False, showgrid=False, zeroline=False, showticklabels=False),
+            title=dict(text="Secondary Ticker Signal Following Chart", font=dict(color='#80ff00')),
+            meta={'placeholder': True, 'uirevision': (primary_ticker or '').upper()}
+        )
+        return fig
 
-    # Load and verify primary ticker results
-    results = load_precomputed_results(primary_ticker)
-    if not results:
-        return empty_fig, [], [], 'Waiting for primary ticker data...'
-
-    # Check for required data components
-    required_keys = ['preprocessed_data', 'active_pairs', 'cumulative_combined_captures']
-    if not all(key in results for key in required_keys):
-        return empty_fig, [], [], 'Waiting for complete primary ticker analysis...'
-
+    # Validate inputs
+    primary = (primary_ticker or '').strip().upper()
+    if not primary:
+        return _secondary_placeholder("Enter a primary ticker first."), [], [{'name': 'Metric', 'id': 'Metric'}], "Enter a primary ticker first."
+    
+    if not secondary_tickers_input:
+        return _secondary_placeholder("Enter at least one secondary ticker."), [], [{'name': 'Metric', 'id': 'Metric'}], "Enter at least one secondary ticker."
+    
+    # Get precomputed results + DataFrame safely
+    # IMPORTANT: do not trigger primary staleness checks from secondary UI
+    results = load_precomputed_results(primary, should_log=False, skip_staleness_check=True)
+    primary_df = ensure_df_available(primary, results)
+    if results is None or primary_df is None or primary_df.empty:
+        return _secondary_placeholder(f"Data not ready for {primary}."), [], [{'name': 'Metric', 'id': 'Metric'}], f"Data not ready for {primary}."
+    
     # Parse secondary tickers
+    raw = (secondary_tickers_input or "")
+    for ch in ";| ":
+        raw = raw.replace(ch, ",")
+    parsed_secondary = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    if not parsed_secondary:
+        return _secondary_placeholder("No valid secondary tickers."), [], [{'name': 'Metric', 'id': 'Metric'}], "No valid secondary tickers."
+    
+    # Remove duplicates while preserving order
+    parsed_secondary = list(dict.fromkeys(parsed_secondary))
+    
+    logger.info(f"\n{'-' * 80}")
+    logger.info("INITIATING SECONDARY ANALYSIS")
+    logger.info(f"Primary Ticker: {primary}")
+    logger.info(f"Processing secondary tickers: {', '.join(parsed_secondary)}")
+    logger.info(f"{'-' * 80}\n")
+    
     try:
-        logger.info(f"\n{'-' * 80}")
-        logger.info("INITIATING SECONDARY ANALYSIS")
-        logger.info(f"Primary Ticker: {primary_ticker}")
-
-        secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
-        if not secondary_tickers:
-            return empty_fig, [], [], 'Please enter valid ticker symbols'
-
-        # Remove duplicates while preserving order
-        secondary_tickers = list(dict.fromkeys(secondary_tickers))
-        logger.info(f"Processing secondary tickers: {', '.join(secondary_tickers)}")
-        logger.info(f"{'-' * 80}\n")
-
-        # Get primary date range for windowed fetching
-        primary_df = results.get('preprocessed_data')
-        if primary_df is None or primary_df.empty:
-            return empty_fig, [], [], 'Primary ticker data not preprocessed'
-        
-        date_min, date_max = primary_df.index.min(), primary_df.index.max()
+        # Get scalar date window from primary (robust to Index types)
+        date_min = pd.to_datetime(primary_df.index.min())
+        date_max = pd.to_datetime(primary_df.index.max())
         
         # Fetch secondary ticker data with windowed approach
         secondary_dfs = {}
-        for ticker in secondary_tickers:
-            # Try windowed fetch first (much faster for large tickers)
-            df = fetch_secondary_window(ticker, start=date_min, end=date_max)
-            if df is None:  # Fallback to existing fetch
-                df = fetch_data(ticker, is_secondary=True)
+        for ticker in parsed_secondary:
+            if ticker == primary:
+                # Reuse the already-loaded primary DF to avoid download and glitches
+                df = primary_df.copy()
+            else:
+                # Try bounded window first
+                df = fetch_secondary_window(ticker, start=date_min, end=date_max)
+                if (df is None) or df.empty:
+                    # Fast small-range fallback (1y)
+                    today = pd.Timestamp.today(tz='UTC').normalize()
+                    one_year = today - pd.Timedelta(days=365)
+                    df = fetch_secondary_window(ticker, start=one_year, end=today)
+                if (df is None) or df.empty:
+                    # Last resort (single quick try)
+                    df = fetch_data(ticker, is_secondary=True)
             
             if df is not None and not df.empty:
                 # Align to primary window to reduce downstream work
@@ -8794,7 +10611,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 logger.warning(f"Unable to fetch data for {ticker}")
 
         if not secondary_dfs:
-            return empty_fig, [], [], 'No valid data available for secondary tickers'
+            return _secondary_placeholder(), [], [], 'No valid data available for secondary tickers'
 
         # Process signals
         active_pairs = results['active_pairs']
@@ -9025,7 +10842,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                     ))
 
         if not metrics_list:
-            return empty_fig, [], [], 'No valid data available for processing'
+            return _secondary_placeholder(), [], [], 'No valid data available for processing'
 
         # Prepare metrics table with performance indicators
         metrics_df = pd.DataFrame(metrics_list)
@@ -9041,7 +10858,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
         columns = [{'name': col, 'id': col} for col in metrics_df.columns]
         data = metrics_df.to_dict('records')
 
-        # Configure chart layout
+        # Configure chart layout - mark as real (non-placeholder) figure
         fig.update_layout(
             title=dict(
                 text=f'{", ".join(secondary_dfs.keys())} Following {primary_ticker} {"(Inverted)" if invert_signals else ""} Signals',
@@ -9050,7 +10867,8 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             xaxis_title='Date',
             yaxis_title='Cumulative Capture (%)',
             hovermode='x unified',
-            uirevision={'ticker': normalize_ticker(primary_ticker), 'chart': 'secondary'},
+            uirevision="secondary-static",
+            meta={'placeholder': False},  # Mark as real figure
             template='plotly_dark',
             showlegend=True,
             font=dict(color='#80ff00'),
@@ -9083,7 +10901,7 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
     except Exception as e:
         logger.error(f"Error in secondary chart processing: {str(e)}")
         logger.error(traceback.format_exc())
-        return empty_fig, [], [], f'Processing error: {str(e)}'
+        return _secondary_placeholder(), [], [], f'Processing error: {str(e)}'
 
 # Callback to add/remove primary ticker inputs dynamically and handle Combination clicks
 @app.callback(
@@ -9267,10 +11085,12 @@ def reindex_children(children):
      Input({'type': 'invert-primary-switch', 'index': ALL}, 'value'),
      Input({'type': 'mute-primary-switch', 'index': ALL}, 'value'),
      Input('multi-secondary-ticker-input', 'value'),
-     Input('primary-tickers-container', 'children')],  # Added this input
-    [State('update-interval', 'n_intervals')]
+     Input('primary-tickers-container', 'children'),
+     # NEW: independent poller so we don't depend on the global one
+     Input('multi-primary-interval', 'n_intervals')],
+    prevent_initial_call=False
 )
-def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, secondary_tickers_input, primary_tickers_children, n_intervals):
+def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, secondary_tickers_input, primary_tickers_children, mp_ticks):
     if not secondary_tickers_input:
         return no_update, no_update, no_update, 'Please enter at least one secondary ticker.'
 
@@ -9294,14 +11114,64 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     primary_signals_list = []
     date_indexes = []
     for idx, (ticker, invert) in enumerate(zip(primary_tickers_filtered, invert_signals_filtered)):
-        results = load_precomputed_results(ticker)
+        # First try to get from cache even if refresh is in progress
+        results = None
+        normalized_ticker = normalize_ticker(ticker)
+        
+        # Check if we have valid data in cache (even if refresh is happening)
+        with _loading_lock:
+            if normalized_ticker in _precomputed_results_cache:
+                cached = _precomputed_results_cache[normalized_ticker]
+                if cached and cached.get('top_buy_pair') != (0, 0) and cached.get('top_short_pair') != (0, 0):
+                    results = cached
+                    logger.debug(f"Using cached data for {ticker} even though refresh may be in progress")
+        
+        # If not in cache or corrupted, try loading normally with bypass
         if not results:
-            return no_update, no_update, no_update, f'Processing Data for primary ticker {ticker}. Please wait.'
+            results = load_precomputed_results(ticker, skip_staleness_check=True, bypass_loading_check=True)
+        
+        # If still no results or corrupted, try disk
+        if not results or results.get('top_buy_pair') == (0, 0) or results.get('top_short_pair') == (0, 0):
+            pkl_file = f'cache/results/{normalized_ticker}_precomputed_results.pkl'
+            if os.path.exists(pkl_file):
+                try:
+                    results = load_precomputed_results_from_file(pkl_file, ticker)
+                    if results and results.get('top_buy_pair') != (0, 0) and results.get('top_short_pair') != (0, 0):
+                        # Valid data from disk - cache it and clear any stuck flag
+                        with _loading_lock:
+                            _precomputed_results_cache[normalized_ticker] = _lighten_for_runtime(results, pkl_file)
+                            # Clear any stuck loading flag
+                            if normalized_ticker in _loading_in_progress:
+                                del _loading_in_progress[normalized_ticker]
+                                logger.info(f"Cleared stuck loading flag for {ticker}")
+                        results = _precomputed_results_cache[normalized_ticker]
+                    else:
+                        results = None
+                except Exception as e:
+                    logger.warning(f"Disk fallback failed for {ticker}: {e}")
+                    results = None
+            if not results:
+                msg = f'Processing Data for primary ticker {ticker}. Please wait.'
+                placeholder_fig = _multi_primary_placeholder(msg)
+                return placeholder_fig, [], [], msg
         signals = results.get('active_pairs')
-        dates = results['preprocessed_data'].index
+        # Load DataFrame on-demand to get dates
+        df = ensure_df_available(ticker, results)
+        if df is None or df.empty:
+            msg = f'Could not load data for {ticker}'
+            placeholder_fig = _multi_primary_placeholder(msg)
+            return placeholder_fig, [], [], msg
+        dates = df.index
 
-        # Create signals_series from signals and dates
-        signals_series = pd.Series(signals, index=dates)
+        # Ensure lengths match to avoid index mismatch error (improved alignment)
+        dates = pd.to_datetime(dates)
+        min_len = min(len(signals), len(dates))
+        signals = signals[:min_len]
+        dates = dates[:min_len]
+        
+        # Create signals_series with proper alignment to prevent ValueError
+        signals_series = pd.Series(np.asarray(signals, dtype=object)[:min_len], index=dates[:min_len])
+        signals_series = signals_series.fillna('None')
 
         # Process signals to extract 'Buy', 'Short', or 'None'
         signals_series = signals_series.astype(str)
@@ -9323,7 +11193,9 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     common_dates = sorted(common_dates)
 
     if not common_dates:
-        return no_update, no_update, no_update, 'No overlapping dates among primary tickers.'
+        msg = 'No overlapping dates among primary tickers.'
+        placeholder_fig = _multi_primary_placeholder(msg)
+        return placeholder_fig, [], [], msg
 
     # Combine signals into a DataFrame
     signals_df = pd.DataFrame({f'primary_{i}': sig.loc[common_dates] for i, sig in enumerate(primary_signals_list)})
@@ -9355,10 +11227,13 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
 
     # Process each secondary ticker
     for secondary_ticker in secondary_tickers:
-        # Fetch data for secondary ticker
-        secondary_data = fetch_data(secondary_ticker, is_secondary=True)
+        # Fetch ONLY the window we need (prevents long blocking downloads)
+        date_min, date_max = combined_signals.index.min(), combined_signals.index.max()
+        secondary_data = fetch_secondary_window(secondary_ticker, start=date_min, end=date_max)
         if secondary_data is None or secondary_data.empty:
             continue  # Skip this ticker if data is unavailable
+        # Align to the window to minimize downstream work
+        secondary_data = secondary_data.loc[(secondary_data.index >= date_min) & (secondary_data.index <= date_max)].copy()
 
         # Align dates with combined signals
         common_dates_sec = combined_signals.index.intersection(secondary_data.index)
@@ -9373,33 +11248,35 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         signals = signals.reindex(common_index).fillna('None')
         prices = prices.reindex(common_index).ffill()
 
-        # Compute daily returns
-        daily_returns = prices.pct_change().fillna(0)
+        # Compute daily returns as a 1-D Series, index-aligned
+        daily_returns = prices.astype('float64').pct_change().fillna(0.0)
+        if isinstance(daily_returns, pd.DataFrame):
+            daily_returns = daily_returns.iloc[:, 0]
 
-        # Ensure signals and daily_returns have the same index
+        # Build a 'signals' Series aligned to daily_returns index
         signals = signals.loc[daily_returns.index]
 
-        # Initialize daily_captures as float
-        daily_captures = pd.Series(0.0, index=signals.index, dtype='float64')
+        # Vectorized capture without pandas boolean-assignment pitfalls
+        ret = daily_returns.to_numpy()
+        buy_mask = signals.eq('Buy').to_numpy()
+        short_mask = signals.eq('Short').to_numpy()
 
-        buy_mask = signals == 'Buy'
-        short_mask = signals == 'Short'
+        cap = np.zeros_like(ret, dtype='float64')
+        cap[buy_mask] = ret[buy_mask] * 100.0
+        cap[short_mask] = -ret[short_mask] * 100.0
 
-        daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-        daily_captures[short_mask] = -daily_returns[short_mask] * 100
-
-        cumulative_captures = daily_captures.cumsum()
+        cumulative_captures = pd.Series(cap, index=daily_returns.index).cumsum()
 
         # Prepare metrics
         trigger_days = (buy_mask | short_mask).sum()
-        wins = (daily_captures > 0).sum()
-        losses = (daily_captures <= 0).sum()
+        wins = (cap > 0).sum()
+        losses = (cap <= 0).sum()
         win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
         # Calculate metrics only on trigger days (buy or short)
         trigger_mask = buy_mask | short_mask
-        avg_daily_capture = daily_captures[trigger_mask].mean() if trigger_days > 0 else 0
+        avg_daily_capture = cap[trigger_mask].mean() if trigger_days > 0 else 0
         total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0
-        std_dev = daily_captures[trigger_mask].std() if trigger_days > 0 else 0
+        std_dev = cap[trigger_mask].std() if trigger_days > 0 else 0
         # Ensure losses is calculated correctly
         losses = trigger_days - wins  # This ensures losses + wins = trigger_days
 
@@ -9444,7 +11321,9 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         ))
 
     if not metrics_data:
-        return no_update, no_update, no_update, 'No valid data for secondary tickers.'
+        msg = 'No valid data for secondary tickers.'
+        placeholder_fig = _multi_primary_placeholder(msg)
+        return placeholder_fig, [], [], msg
 
     columns = [{'name': col, 'id': col} for col in metrics_data[0].keys()]
 
@@ -9498,175 +11377,208 @@ processing_lock = threading.Lock()
      State('batch-process-table', 'data')],
     prevent_initial_call=True
 )
-def batch_process_tickers(n_clicks, n_intervals, tickers_input, existing_table_data):
+def batch_process_tickers(n_clicks, n_intervals, input_value, existing_table_data):
+    """
+    Lightweight, event-driven batch table updater:
+      • On button click: queue work and prime table rows as 'Queued'.
+      • On interval ticks: only update rows whose status tokens changed.
+      • Never load the big DataFrame here; read tiny summary fields instead.
+    """
+    global ticker_queue, processing_thread, all_tickers
     ctx = dash.callback_context
-    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    
-    if triggered_id == 'batch-process-button':
-        if not tickers_input:
-            return existing_table_data or [], 'Please enter at least one ticker symbol.'
-    
-        tickers = [ticker.strip().upper() for ticker in tickers_input.split(',') if ticker.strip()]
+    if not ctx.triggered:
+        raise PreventUpdate
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    # --- 1) Button click: queue tickers and prime rows ---
+    if trigger_id == 'batch-process-button' and n_clicks:
+        if not input_value:
+            return existing_table_data or [], ''
+        tickers = [t.strip().upper() for t in input_value.split(',') if t.strip()]
         if not tickers:
-            return existing_table_data or [], 'Please enter valid ticker symbols.'
-    
-        # Add tickers to the processing queue and all_tickers set
-        with processing_lock:
-            for ticker in tickers:
-                all_tickers.add(ticker)
-                if ticker not in ticker_queue:
-                    ticker_queue.append(ticker)
-    
-        # Start the processing thread if not already running
-        global processing_thread
+            return existing_table_data or [], ''
+
+        # Dedup, queue, and track
+        added = []
+        for t in tickers:
+            all_tickers.add(t)
+            if t not in ticker_queue:
+                ticker_queue.append(t)
+                added.append(t)
+            # Prime caches so the table shows immediately
+            _batch_status_snapshot[t] = ('queued', 0, None, 'stale')
+            _batch_rows_cache[t] = {
+                'Ticker': t,
+                'Last Date': '—',
+                'Last Price': '—',
+                'Next Day Active Signal': '—',
+                'Processing Status': 'Queued'
+            }
+
+        # Start worker if needed
         if processing_thread is None or not processing_thread.is_alive():
             processing_thread = threading.Thread(target=process_ticker_queue, daemon=True)
             processing_thread.start()
-    
-        return existing_table_data or [], ''
-    else:
-        # Interval triggered: Update the DataTable
-        table_data = []
-        tickers_to_check = list(all_tickers)
-        for ticker in tickers_to_check:
-            status = read_status(ticker)
-            if status['status'] == 'complete':
-                results = load_precomputed_results(ticker)
-                if results is None:
-                    continue
-                    
-                # Validate required data exists
-                required_keys = ['preprocessed_data', 'daily_top_buy_pairs', 'daily_top_short_pairs', 
-                               'top_buy_pair', 'top_short_pair']
-                if not all(key in results for key in required_keys):
-                    logger.error(f"Missing required keys in results for {ticker}")
-                    last_date = 'Missing Data'
-                    last_price = 'N/A'
-                    next_day_signal = 'Invalid Data'
-                    processing_status = 'Error'
-                else:
-                    df = results['preprocessed_data']
-                    if df is None or df.empty:
-                        last_date = 'No Data'
-                        last_price = 'N/A'
-                        next_day_signal = 'No Data'
-                        processing_status = 'Error'
-                        continue
-                    
-                    # Get the most recent valid trading day
-                    last_valid_date = None
-                    # Make sure we're working with tz-naive dates throughout
-                    df.index = df.index.tz_localize(None)
-                    
-                    for date in sorted(df.index, reverse=True):
-                        if pd.notna(df.loc[date, 'Close']):
-                            last_valid_date = date
-                            break
-                    
-                    if last_valid_date is None:
-                        last_date = 'No Valid Date'
-                        last_price = 'N/A'
-                        next_day_signal = 'No Valid Date'
-                        processing_status = 'Error'
-                    else:
-                        # Display date only
-                        last_date = last_valid_date.strftime('%Y-%m-%d')
-                        
-                        # Get the last price from the valid trading day
-                        # Convert back to tz-naive for lookup
-                        if 'Adj Close' in df.columns:
-                            last_price = df.loc[last_valid_date.tz_localize(None), 'Adj Close']
-                        else:
-                            last_price = df.loc[last_valid_date.tz_localize(None), 'Close']
-                        last_price = f"${last_price:.2f}"
-                        
-                        # Get next day signal with validation
-                        buy_pair = results.get('top_buy_pair')
-                        short_pair = results.get('top_short_pair')
-                        
-                        if not all(isinstance(pair, tuple) and len(pair) == 2 for pair in [buy_pair, short_pair]):
-                            next_day_signal = 'Invalid pairs'
-                        else:
-                            try:
-                                # Validate SMA columns exist
-                                required_smas = [
-                                    f'SMA_{buy_pair[0]}', f'SMA_{buy_pair[1]}',
-                                    f'SMA_{short_pair[0]}', f'SMA_{short_pair[1]}'
-                                ]
-                                
-                                if not all(sma in df.columns for sma in required_smas):
-                                    next_day_signal = 'Missing SMAs'
-                                else:
-                                    # Get SMAs for the last valid date (using tz-naive index)
-                                    lookup_date = last_valid_date.tz_localize(None)
-                                    sma1_buy = df.loc[lookup_date, f'SMA_{buy_pair[0]}']
-                                    sma2_buy = df.loc[lookup_date, f'SMA_{buy_pair[1]}']
-                                    sma1_short = df.loc[lookup_date, f'SMA_{short_pair[0]}']
-                                    sma2_short = df.loc[lookup_date, f'SMA_{short_pair[1]}']
-                                    
-                                    # Check for NaN values
-                                    if any(pd.isna([sma1_buy, sma2_buy, sma1_short, sma2_short])):
-                                        next_day_signal = 'NaN in SMAs'
-                                    else:
-                                        # Calculate signals
-                                        buy_signal = sma1_buy > sma2_buy
-                                        short_signal = sma1_short < sma2_short
-                                        
-                                        if buy_signal and short_signal:
-                                            buy_capture = results.get('top_buy_capture', 0)
-                                            short_capture = results.get('top_short_capture', 0)
-                                            next_day_signal = f"Buy ({buy_pair[0]},{buy_pair[1]})" if buy_capture > short_capture else f"Short ({short_pair[0]},{short_pair[1]})"
-                                        elif buy_signal:
-                                            next_day_signal = f"Buy ({buy_pair[0]},{buy_pair[1]})"
-                                        elif short_signal:
-                                            next_day_signal = f"Short ({short_pair[0]},{short_pair[1]})"
-                                        else:
-                                            next_day_signal = 'None'
-                            except Exception as e:
-                                logger.error(f"Error calculating signal for {ticker}: {str(e)}")
-                                next_day_signal = 'Error'
-                                
-                        processing_status = 'Complete'
-            elif status['status'] == 'failed':
-                last_date = 'N/A'
-                last_price = 'N/A'
-                next_day_signal = 'N/A'
-                processing_status = 'Failed'
-            elif status['status'] == 'processing':
-                last_date = 'N/A'
-                last_price = 'N/A'
-                next_day_signal = 'N/A'
-                processing_status = 'Processing'
-            else:
-                last_date = 'N/A'
-                last_price = 'N/A'
-                next_day_signal = 'N/A'
-                processing_status = 'Pending'
-    
-            table_data.append({
-                'Ticker': ticker,
-                'Last Date': last_date,
-                'Last Price': last_price,
-                'Next Day Active Signal': next_day_signal,
-                'Processing Status': processing_status
-            })
-    
-        # Sort the table_data list alphabetically by 'Ticker'
-        table_data.sort(key=lambda x: x['Ticker'])
+
+        # Compose table rows (preserve prior ordering if any)
+        order = [r['Ticker'] for r in (existing_table_data or [])]
+        for t in added:
+            if t not in order:
+                order.append(t)
+        table_data = [_batch_rows_cache[t] for t in order if t in _batch_rows_cache]
         return table_data, ''
+    # --- 2) Interval tick: update rows only when status changed ---
+    if not all_tickers:
+        # Nothing to poll; avoid touching the table so Loading doesn't flicker
+        return dash.no_update, dash.no_update
+
+    changed = False
+    for t in list(all_tickers):
+        st = read_status(t) or {}
+        token = (st.get('status'), st.get('progress'), st.get('message'), st.get('cache_status'))
+        if _batch_status_snapshot.get(t) == token:
+            continue  # no change -> no work
+        _batch_status_snapshot[t] = token
+        changed = True
+
+        status_str = st.get('status')
+        if status_str == 'complete':
+            # Read tiny summary fields from cached/file results (no DF load)
+            res = load_precomputed_results(t, from_callback=False, should_log=False) or {}
+            last_date_str = res.get('last_date_str')
+            if not last_date_str and res.get('last_date') is not None:
+                try:
+                    last_date_str = pd.to_datetime(res['last_date']).strftime('%Y-%m-%d')
+                except Exception:
+                    last_date_str = '—'
+
+            price_val = res.get('last_adj_close', None)
+            if price_val is None:
+                price_val = res.get('last_close', None)
+            last_price = f"${price_val:.2f}" if isinstance(price_val, (int, float)) else '—'
+
+            def _pair_ok(p):
+                return isinstance(p, tuple) and len(p) == 2 and p != (0, 0)
+            
+            sig = res.get('last_day_signal') or {}
+            buy_active = bool(sig.get('buy_active'))
+            short_active = bool(sig.get('short_active'))
+            tbp = res.get('top_buy_pair')
+            tsp = res.get('top_short_pair')
+            tbc = res.get('top_buy_capture', 0.0)
+            tsc = res.get('top_short_capture', 0.0)
+            
+            # Render the same way we choose elsewhere: if both true, pick the higher capture; ties go to Short.
+            if buy_active and short_active and _pair_ok(tbp) and _pair_ok(tsp):
+                next_signal = f"Buy ({int(tbp[0])},{int(tbp[1])})" if tbc > tsc else f"Short ({int(tsp[0])},{int(tsp[1])})"
+            elif buy_active and _pair_ok(tbp):
+                next_signal = f"Buy ({int(tbp[0])},{int(tbp[1])})"
+            elif short_active and _pair_ok(tsp):
+                next_signal = f"Short ({int(tsp[0])},{int(tsp[1])})"
+            else:
+                next_signal = "None"
+
+            _batch_rows_cache[t] = {
+                'Ticker': t,
+                'Last Date': last_date_str or '—',
+                'Last Price': last_price,
+                'Next Day Active Signal': next_signal,
+                'Processing Status': 'Complete'
+            }
+
+        elif status_str == 'failed':
+            msg = st.get('message', 'Failed')
+            _batch_rows_cache[t] = {
+                'Ticker': t,
+                'Last Date': '—',
+                'Last Price': '—',
+                'Next Day Active Signal': '—',
+                'Processing Status': f"Error: {msg}"
+            }
+        else:
+            prog = int(st.get('progress', 0)) if isinstance(st.get('progress', 0), (int, float)) else 0
+            _batch_rows_cache[t] = {
+                'Ticker': t,
+                'Last Date': 'Processing…',
+                'Last Price': 'Processing…',
+                'Next Day Active Signal': 'Processing…',
+                'Processing Status': f'Processing… {prog}%'
+            }
+
+    if not changed:
+        # Do not touch the table; keeps the spinner from reappearing
+        return dash.no_update, dash.no_update
+
+    # Build table in stable order (keep any previous order, then append newcomers)
+    order = [r['Ticker'] for r in (existing_table_data or [])]
+    for t in all_tickers:
+        if t not in order:
+            order.append(t)
+    table_data = [_batch_rows_cache[t] for t in order if t in _batch_rows_cache]
+
+    return table_data, dash.no_update
+
+# DUPLICATE process_ticker_queue REMOVED - keep the second one
+# DUPLICATE optimize_signals callback REMOVED
+# ORPHANED CODE REMOVED - was causing runtime issues
 
 def process_ticker_queue():
+    """
+    Drain the ticker_queue in FIFO order.
+    Robust to legacy entries that might be tuples/lists (normalize to ticker str).
+    Always updates status and never raises uncaught exceptions that could kill the worker.
+    """
     while True:
+        # Take work item
         with processing_lock:
             if not ticker_queue:
                 break
-            ticker = ticker_queue.pop(0)
-        # Update status to processing
-        write_status(ticker, {'status': 'processing', 'progress': 0})
-        event = threading.Event()
-        precompute_results(ticker, event)
-        # After processing, update status
-        write_status(ticker, {'status': 'complete', 'progress': 100})
+            item = ticker_queue.pop(0)
+
+        # Normalize legacy tuple/list items -> ticker string
+        ticker = item[0] if isinstance(item, (tuple, list)) else item
+        try:
+            if not isinstance(ticker, str):
+                logger.warning(f"process_ticker_queue: unexpected queue item type={type(item)} value={item}; skipping")
+                continue
+
+            # Update status to processing
+            write_status(ticker, {'status': 'processing', 'progress': 0})
+
+            # Compute
+            event = threading.Event()
+            precompute_results(ticker, event)
+
+            # Mark complete
+            write_status(ticker, {'status': 'complete', 'progress': 100})
+
+        except Exception as e:
+            logger.error(f"process_ticker_queue: error processing {ticker}: {e}")
+            # Mark failed but keep the worker alive and continue
+            try:
+                write_status(ticker, {'status': 'failed', 'progress': 0, 'message': str(e)})
+            except Exception:
+                pass
+            # continue loop; do not re-raise
+
+@app.callback(
+    Output('batch-update-interval', 'disabled'),
+    [Input('batch-process-collapse', 'is_open'),
+     Input('batch-process-table', 'data')],
+    prevent_initial_call=False
+)
+def _gate_batch_interval(is_open, data):
+    """
+    Keep the batch refresh disabled unless the Batch card is visible AND
+    we actually have at least one row to monitor. This prevents an idle
+    interval from firing forever and keeps the rest of the app snappy.
+    """
+    try:
+        has_rows = bool(data) and len(data) > 0
+        return not (bool(is_open) and has_rows)
+    except Exception as e:
+        logger.debug(f"Batch interval gate fallback: {e}")
+        return True
 
 @app.callback(
     [Output('optimization-results-table', 'data'),
@@ -9681,25 +11593,63 @@ def process_ticker_queue():
     prevent_initial_call=True
 )
 def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, secondary_ticker_input):
-    global optimization_in_progress
+    global optimization_in_progress, pending_optimization
     empty_columns = [{'name': i, 'id': i} for i in ['Combination']]
     
     try:
         ctx = dash.callback_context
         triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
         
-        # Validate inputs
-        if not primary_tickers_input or not secondary_ticker_input:
+        # Throttle only interval/sort spam; always allow button clicks
+        if triggered_id in ('optimization-update-interval', 'optimization-results-table'):
+            if not rate_limit('opt_interval', 0.5):
+                raise PreventUpdate
+        
+        logger.info(f"OPTIMIZE_SIGNALS called: triggered_id={triggered_id}, n_clicks={n_clicks}, primary={primary_tickers_input}, secondary={secondary_ticker_input}")
+        
+        # Sanitize inputs server-side
+        primary_tickers_sanitized = sanitize_ticker_input(primary_tickers_input or "", max_tickers=20)
+        secondary_ticker_list = sanitize_ticker_input(secondary_ticker_input or "", max_tickers=1)
+        
+        if not primary_tickers_sanitized or not secondary_ticker_list:
             raise PreventUpdate
         
-        primary_tickers_input = primary_tickers_input.strip()
-        secondary_ticker_input = secondary_ticker_input.strip()
-        
-        if not primary_tickers_input or not secondary_ticker_input:
-            raise PreventUpdate
+        # Use sanitized inputs
+        primary_tickers_input = ', '.join(primary_tickers_sanitized)
+        secondary_ticker_input = secondary_ticker_list[0]
 
-        # Check cache first for any request type
-        if primary_tickers_input and secondary_ticker_input:
+        # Force-run flag: lets the interval trigger the same path as the button click
+        force_run = False
+
+        # Check for pending optimization on interval ticks
+        if triggered_id == 'optimization-update-interval' and pending_optimization:
+            # Check if all tickers from pending request are ready
+            primary_tickers = [t.strip().upper() for t in pending_optimization['primary'].split(',') if t.strip()]
+            all_ready = all((read_status(t) or {}).get("status") == "complete" for t in primary_tickers)
+            
+            if all_ready:
+                # Execute the pending optimization (treat like a button click)
+                logger.info("[OPTIMIZATION] All tickers ready, executing pending optimization")
+                primary_tickers_input = pending_optimization['primary']
+                secondary_ticker_input = pending_optimization['secondary']
+                sort_by = pending_optimization.get('sort_by')
+                pending_optimization = None  # Clear pending request
+                force_run = True            # <— critical: drive the heavy path below
+            else:
+                # Show progress while waiting
+                processing_statuses = []
+                for t in primary_tickers:
+                    st = read_status(t) or {}
+                    if st.get('status') == 'processing':
+                        processing_statuses.append(f"{t}: {st.get('progress', 0):.1f}%")
+                    elif st.get('status') != 'complete':
+                        processing_statuses.append(f"{t}: Waiting")
+                
+                msg = f"Preparing tickers for optimization: {', '.join(processing_statuses)}"
+                return [], empty_columns, msg, False
+        
+        # Check cache / statuses ONLY for poll/sort events (avoid swallowing button clicks)
+        if (triggered_id in ('optimization-update-interval', 'optimization-results-table')) and not force_run and primary_tickers_input and secondary_ticker_input:
             cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
             if cache_key in optimization_results_cache:
                 cached_results, cached_columns, cached_message, cached_sort = optimization_results_cache[cache_key]
@@ -9741,154 +11691,162 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                     sorted_results = [averages_row] + sortable_data if averages_row else sortable_data
                     # Update cache with new sort state
                     optimization_results_cache[cache_key] = (sorted_results, cached_columns, cached_message, current_sort)
-                    return sorted_results, cached_columns, cached_message, True  # Add the fourth output
+                    _enforce_cache_limits()
+                    return sorted_results, cached_columns, cached_message, False  # keep interval active when polling
 
-                return cached_results, cached_columns, cached_message, True  # Add the fourth output
-
-        # Handle interval updates
-        if triggered_id == 'optimization-update-interval':
-            # Prevent processing if inputs are None or empty
-            if not primary_tickers_input or not secondary_ticker_input:
-                raise PreventUpdate
-            cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
-            if cache_key in optimization_results_cache:
-                cached_results, cached_columns, cached_message, cached_sort = optimization_results_cache[cache_key]
-                
-                # If this is a sort request, handle it without reprocessing
-                if ctx.triggered_id == 'optimization-results-table.sort_by' and cached_results:
-                    # Separate averages row from sortable data
-                    averages_row = next((row for row in cached_results if row['Combination'] == 'AVERAGES'), None)
-                    sortable_data = [row for row in cached_results if row['Combination'] != 'AVERAGES']
-                    
-                    # Apply sorting if requested
-                    if sort_by:
-                        for sort_spec in sort_by:
-                            col_id = sort_spec['column_id']
-                            is_ascending = sort_spec['direction'] == 'asc'
-                            # Handle different column types
-                            if col_id in ['Triggers', 'Wins', 'Losses', 'Win %', 
-                                        'StdDev %', 'Sharpe', 'Avg Cap %', 
-                                        'Total %']:
-                                sortable_data = sorted(sortable_data,
-                                                     key=lambda x: float(x[col_id]) if x[col_id] != 'N/A' else float('-inf'),
-                                                     reverse=not is_ascending)
-                            else:
-                                sortable_data = sorted(sortable_data,
-                                                     key=lambda x: str(x[col_id]),
-                                                     reverse=not is_ascending)
-                    
-                    # Return sorted data with averages row at top
-                    if averages_row:
-                        sorted_results = [averages_row] + sortable_data
-                    else:
-                        sorted_results = sortable_data
-                        
-                    return sorted_results, cached_columns, cached_message, False  # Keep the interval active
-
-                # For non-sort requests, verify processing status
-                primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
-                all_processed = all(
-                    read_status(ticker).get('status') == 'complete'
-                    for ticker in primary_tickers
-                )
+                # Non-sort poll: if everything is ready, return cached results and stop polling
+                primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+                all_processed = all((read_status(t).get('status') == 'complete') for t in primary_tickers)
                 if all_processed:
                     return optimization_results_cache[cache_key][:3] + (True,)
                 
-            # Check processing status of primary tickers
-            primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
-            processing_statuses = []
-            completed_tickers = []
-            any_processing = False
-            needs_processing = False
-            
-            for ticker in primary_tickers:
-                status = read_status(ticker)
-                if status['status'] == 'processing':
+            # Polling with no cached results or not all processed yet: show status
+            primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+            processing_statuses, completed_tickers = [], []
+            any_processing, needs_processing = False, False
+            for t in primary_tickers:
+                st = read_status(t)
+                if st['status'] == 'processing':
                     any_processing = True
-                    processing_statuses.append(f"{ticker}: {status['progress']:.1f}%")
-                elif status['status'] == 'complete':
-                    completed_tickers.append(ticker)
-                elif status['status'] in ['not started', 'failed']:
+                    processing_statuses.append(f"{t}: {st['progress']:.1f}%")
+                elif st['status'] == 'complete':
+                    completed_tickers.append(t)
+                elif st['status'] in ['not started', 'failed']:
                     needs_processing = True
-                    processing_statuses.append(f"{ticker}: Waiting...")
-                elif status['status'] == 'failed':
-                    processing_statuses.append(f"{ticker}: Failed")
-                    
-            if any_processing or needs_processing:
-                status_message = f"Processing: {', '.join(processing_statuses)}"
-                if completed_tickers:
-                    status_message += f" | Completed: {', '.join(completed_tickers)}"
-                return [], empty_columns, status_message, False  # Keep the interval active
+                    processing_statuses.append(f"{t}: Waiting.")
+                elif st['status'] == 'failed':
+                    processing_statuses.append(f"{t}: Failed")
 
-            # After handling everything, prevent further updates
+            if any_processing or needs_processing:
+                msg = f"Processing: {', '.join(processing_statuses)}"
+                if completed_tickers:
+                    msg += f" | Completed: {', '.join(completed_tickers)}"
+                return [], empty_columns, msg, False  # keep interval active
+
+            # Nothing to do for this poll/sort tick
             raise PreventUpdate
 
-        # Handle button click to start optimization
-        if triggered_id == 'optimize-signals-button':
-            if n_clicks is None or n_clicks == 0:
-                raise PreventUpdate  # Button has not been clicked
-            
+
+        # Handle button click – or interval force-run – check readiness and queue if needed
+        if triggered_id == 'optimize-signals-button' or force_run:
+            logger.info(f"OPTIMIZATION BUTTON CLICKED! n_clicks={n_clicks}")
+            if not n_clicks:
+                raise PreventUpdate
             if optimization_in_progress:
-                return [], empty_columns, "Optimization already in progress. Please wait...", False  # Keep interval disabled
-
-            # Acquire lock for new processing
-            if not optimization_lock.acquire(blocking=False):
-                return [], empty_columns, "Another optimization is in progress. Please wait...", False  # Keep interval disabled
-
-            optimization_in_progress = True
-
-            # Proceed to processing code without returning immediately
-            # Remove the 'return' statement here to allow the processing to proceed
+                return [], empty_columns, "Optimization already in progress. Please wait...", False
+                
+            # Parse tickers early to check their status
+            primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+            
+            # Check if any primaries need processing
+            needs_processing = []
+            for ticker in primary_tickers:
+                status = read_status(ticker)
+                if status.get("status") != "complete":
+                    needs_processing.append(ticker)
+            
+            if needs_processing:
+                # Queue missing tickers for processing
+                _queue_missing_primaries(needs_processing)
+                
+                # Store pending optimization request
+                pending_optimization = {
+                    'primary': primary_tickers_input,
+                    'secondary': secondary_ticker_input,
+                    'sort_by': sort_by
+                }
+                logger.info(f"[OPTIMIZATION] Queued {len(needs_processing)} tickers for processing: {needs_processing}")
+                
+                return [], empty_columns, f"Processing required tickers: {', '.join(needs_processing)}. Optimization will start automatically when ready.", False
+            
+            # All tickers ready, fall through to actual optimization
 
         # Basic input validation
         if not primary_tickers_input or not secondary_ticker_input:
-            if optimization_in_progress:
-                optimization_in_progress = False
-                if optimization_lock.locked():
-                    optimization_lock.release()
-            return [], empty_columns, 'Please enter both primary and secondary tickers.'
+            return [], empty_columns, 'Please enter both primary and secondary tickers.', False
 
         # Parse tickers
         primary_tickers = [ticker.strip().upper() for ticker in primary_tickers_input.split(',') if ticker.strip()]
         secondary_tickers = [ticker.strip().upper() for ticker in secondary_ticker_input.split(',') if ticker.strip()]
         if len(secondary_tickers) != 1:
-            return [], empty_columns, 'Please enter exactly one secondary ticker.'
+            return [], empty_columns, 'Please enter exactly one secondary ticker.', False
         secondary_ticker = secondary_tickers[0]
 
         # Limit the number of primary tickers
         max_primary_tickers = 18 # Limit to 18 tickers for performance
         if len(primary_tickers) > max_primary_tickers:
-            return [], empty_columns, f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.'
+            return [], empty_columns, f'Please enter {max_primary_tickers} or fewer primary tickers to limit computation time.', False
 
-        # Fetch secondary ticker data
-        secondary_data = fetch_data(secondary_ticker, is_secondary=True)
+        # Fetch secondary ticker data with resilient approach
+        secondary_data = None
+        
+        # Try to get a window from the first available primary
+        for ticker in primary_tickers:
+            results = load_precomputed_results(ticker, skip_staleness_check=True, bypass_loading_check=True)
+            if results:
+                df = ensure_df_available(ticker, results)
+                if df is not None and not df.empty:
+                    start_win, end_win = df.index.min(), df.index.max()
+                    secondary_data = fetch_secondary_window(secondary_ticker, start=start_win, end=end_win)
+                    if secondary_data is not None and not secondary_data.empty:
+                        break
+        
+        # Fallback if no primaries had data
         if secondary_data is None or secondary_data.empty:
-            return [], empty_columns, f'No data found for secondary ticker {secondary_ticker}.'
+            today = pd.Timestamp.today(tz='UTC').normalize()
+            start_win, end_win = today - pd.Timedelta(days=365), today
+            secondary_data = fetch_secondary_window(secondary_ticker, start=start_win, end=end_win)
+        
+        if secondary_data is None or secondary_data.empty:
+            # Try fetching without window constraints as last resort
+            try:
+                secondary_data = fetch_data(secondary_ticker, is_secondary=True)
+            except:
+                pass
+        
+        if secondary_data is None or secondary_data.empty:
+            return [], empty_columns, f'No data found for secondary ticker {secondary_ticker}.', False
 
         # Fetch data for each primary ticker
         primary_signals = {}
         date_indexes = {}
+        missing_tickers = []
+        
         for ticker in primary_tickers:
-            results = load_precomputed_results(ticker)
+            logger.info(f"Loading precomputed results for {ticker}...")
+            # Use skip_staleness_check=True to ensure we get results even if not in RAM cache
+            results = load_precomputed_results(ticker, skip_staleness_check=True, bypass_loading_check=True)
             if not results or 'active_pairs' not in results:
-                return [], empty_columns, f'Data not processed for primary ticker {ticker}. Please wait.'
+                logger.info(f"No complete results found for {ticker}")
+                missing_tickers.append(ticker)
+                continue  # Don't return early, collect all missing tickers
+            logger.info(f"Successfully loaded results for {ticker}")
 
             active_pairs = results['active_pairs']
-            dates = results['preprocessed_data'].index
+            # Load DataFrame on-demand to get dates
+            df = ensure_df_available(ticker, results)
+            if df is None or df.empty:
+                logger.warning(f"Could not load DataFrame for {ticker}")
+                continue
+            dates = df.index
 
             # Handle length mismatch
             if len(active_pairs) != len(dates):
                 if len(active_pairs) == len(dates) - 1:
                     dates = dates[1:]
                 else:
-                    return [], empty_columns, f'Length mismatch between active_pairs and dates for ticker {ticker}. Cannot proceed.'
+                    return [], empty_columns, f'Length mismatch between active_pairs and dates for ticker {ticker}. Cannot proceed.', False
 
             # Create signals series
             signals_series = pd.Series(active_pairs, index=dates)
             
             # Process for next day's signals
-            if 'preprocessed_data' in results and 'daily_top_buy_pairs' in results and 'daily_top_short_pairs' in results:
-                df = results['preprocessed_data']
+            if 'daily_top_buy_pairs' in results and 'daily_top_short_pairs' in results:
+                # Load DataFrame on-demand to get last date
+                df = ensure_df_available(ticker, results)
+                if df is None or df.empty:
+                    logger.warning(f"Could not load DataFrame for {ticker}")
+                    continue
                 last_date = df.index[-1]
                 buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
                 short_pair_data = results['daily_top_short_pairs'].get(last_date)
@@ -9913,8 +11871,22 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                         if not all(sma in df.columns for sma in required_smas):
                             raise ValueError("Missing required SMA columns")
                             
-                        buy_signal = df[f'SMA_{buy_pair[0]}'].loc[last_date] > df[f'SMA_{buy_pair[1]}'].loc[last_date]
-                        short_signal = df[f'SMA_{short_pair[0]}'].loc[last_date] < df[f'SMA_{short_pair[1]}'].loc[last_date]
+                        # Use tolerant lookups for last_date
+                        sma_buy_0 = _asof(df[f'SMA_{buy_pair[0]}'], last_date, default=None)
+                        sma_buy_1 = _asof(df[f'SMA_{buy_pair[1]}'], last_date, default=None)
+                        sma_short_0 = _asof(df[f'SMA_{short_pair[0]}'], last_date, default=None)
+                        sma_short_1 = _asof(df[f'SMA_{short_pair[1]}'], last_date, default=None)
+                        
+                        # Check if we have valid values
+                        if sma_buy_0 is not None and sma_buy_1 is not None:
+                            buy_signal = sma_buy_0 > sma_buy_1
+                        else:
+                            buy_signal = False
+                            
+                        if sma_short_0 is not None and sma_short_1 is not None:
+                            short_signal = sma_short_0 < sma_short_1
+                        else:
+                            short_signal = False
                             
                         # Determine next signal
                         if buy_signal and short_signal:
@@ -9953,11 +11925,40 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                             
                     except Exception as e:
                         logger.error(f"Error processing signals for {ticker}: {str(e)}")
-                        return [], empty_columns, f'Error processing signals for {ticker}.'
+                        return [], empty_columns, f'Error processing signals for {ticker}.', False
                 else:
-                    return [], empty_columns, f'Incomplete data for ticker {ticker}.'
+                    missing_tickers.append(ticker)
+                    logger.warning(f"Incomplete data for ticker {ticker}")
             else:
-                return [], empty_columns, f'Missing data in results for ticker {ticker}.'
+                missing_tickers.append(ticker)
+                logger.warning(f"Missing data in results for ticker {ticker}")
+        
+        # Check if we have any missing tickers that need processing
+        if missing_tickers:
+            # Queue missing tickers for processing
+            _queue_missing_primaries(missing_tickers)
+            
+            # Store pending optimization request
+            pending_optimization = {
+                'primary': primary_tickers_input,
+                'secondary': secondary_ticker_input,
+                'sort_by': sort_by
+            }
+            logger.info(f"[OPTIMIZATION] Queued {len(missing_tickers)} missing tickers: {missing_tickers}")
+            
+            return [], empty_columns, f"Processing required tickers: {', '.join(missing_tickers)}. Optimization will start automatically when ready.", False
+
+        # === Begin critical section ===
+        # Take the lock only after inputs & data are validated and loaded.
+        if optimization_in_progress:
+            logger.info(f"OPTIMIZATION BLOCKED - already in progress")
+            return [], empty_columns, "Optimization already in progress. Please wait...", False
+        if not optimization_lock.acquire(blocking=False):
+            logger.info(f"OPTIMIZATION BLOCKED - couldn't acquire lock")
+            return [], empty_columns, "Another optimization is in progress. Please wait...", False
+        optimization_in_progress = True
+        logger.info(f"OPTIMIZATION STARTED - Lock acquired, processing {len(primary_tickers)} primaries with {secondary_ticker}")
+        # (No explicit return in this region; the function-level 'finally' below will always release the lock.)
 
         # Generate possible states for each ticker based on next day's signals
         ticker_states = {}
@@ -10025,6 +12026,13 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
         logger.info(f"Total combinations to process: {len(valid_combinations)}")
         with tqdm_compact(total=len(valid_combinations), desc="Combos metrics") as pbar:
             for idx, state_dict in enumerate(valid_combinations):
+                # Update progress with timestamp
+                optimization_progress = {
+                    'status': 'processing',
+                    'current': idx,
+                    'total': len(valid_combinations),
+                    'ts': time.time()
+                }
                 
                 # Get unmuted tickers
                 unmuted_tickers = [ticker for ticker in primary_tickers 
@@ -10088,18 +12096,24 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
 
                 # Align signals and prices
                 prices = secondary_data['Close'].loc[signals.index]
-                daily_returns = prices.pct_change().fillna(0)
+                
+                # Compute daily returns (1-D Series) and aligned signals
+                daily_returns = prices.astype('float64').pct_change().fillna(0.0)
+                if isinstance(daily_returns, pd.DataFrame):
+                    daily_returns = daily_returns.iloc[:, 0]
 
-                # Ensure signals and daily_returns have the same index
                 signals = signals.loc[daily_returns.index]
 
-                # Calculate daily captures
-                daily_captures = pd.Series(0.0, index=signals.index)
-                buy_mask = signals == 'Buy'
-                short_mask = signals == 'Short'
-                
-                daily_captures[buy_mask] = daily_returns[buy_mask] * 100
-                daily_captures[short_mask] = -daily_returns[short_mask] * 100
+                # Robust vectorized capture
+                ret = daily_returns.to_numpy()
+                buy_mask = signals.eq('Buy').to_numpy()
+                short_mask = signals.eq('Short').to_numpy()
+
+                cap = np.zeros_like(ret, dtype='float64')
+                cap[buy_mask] = ret[buy_mask] * 100.0
+                cap[short_mask] = -ret[short_mask] * 100.0
+
+                daily_captures = pd.Series(cap, index=daily_returns.index)
 
                 # Calculate metrics
                 trigger_days = (buy_mask | short_mask).sum()
@@ -10241,12 +12255,15 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 
                 fixed_results = [averages] + sortable_data
                 optimization_results_cache[cache_key] = (fixed_results, columns, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.', current_sort)
+                _enforce_cache_limits()
             else:
                 optimization_results_cache[cache_key] = ([], columns, 'No valid combinations found.', None)
+                _enforce_cache_limits()
             return optimization_results_cache[cache_key][:3] + (True,)
 
         finally:
             optimization_in_progress = False
+            optimization_progress = {'status': 'complete', 'ts': time.time()}
             if optimization_lock.locked():
                 optimization_lock.release()
                 
@@ -10422,6 +12439,8 @@ def process_console_tickers(ticker_input):
                 
                 if results:
                     logger.info(f"{Colors.OKGREEN}[✅] {ticker} processing complete!{Colors.ENDC}")
+                    # Print timing summary only
+                    print_timing_summary(ticker)
                 else:
                     logger.info(f"{Colors.YELLOW}[⚠️] {ticker} is being processed in background{Colors.ENDC}")
                     
@@ -10492,6 +12511,30 @@ def update_countdown_timer(n):
     return PerformanceMetrics.create_market_countdown_timer()
 
 
+# Client-side callback for diagnostic logging - commented out for now to avoid startup error
+# Can be enabled by uncommenting if needed for debugging
+"""
+app.clientside_callback(
+    \"\"\"
+    function(fig) {
+        try {
+            var meta = (fig && fig.layout && fig.layout.meta) ? fig.layout.meta : {};
+            var uir = fig && fig.layout ? fig.layout.uirevision : null;
+            var drv = fig && fig.layout ? fig.layout.datarevision : null;
+            console.log("[🧪 client] combined figure changed",
+                        { placeholder: !!(meta && meta.placeholder),
+                          uirevision: uir, datarevision: drv });
+        } catch (e) {
+            console.log("[🧪 client] figure change (error extracting meta)", e);
+        }
+        return 0;
+    }
+    \"\"\",
+    Output('diag-client-log', 'data'),
+    Input('combined-capture-chart', 'figure')
+)
+"""
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -10534,8 +12577,28 @@ if __name__ == "__main__":
     
     # Define cleanup function
     def cleanup_server():
-        logger.info(f"\n{Colors.YELLOW}[⚡] Shutting down server...{Colors.ENDC}")
+        # Use print instead of logger during shutdown to avoid logging system issues
         try:
+            print(f"\n[INFO] Shutting down server...")
+            
+            # Cancel any in-flight computations
+            for t, ev in list(_cancel_flags.items()):
+                try:
+                    ev.set()
+                except Exception:
+                    pass
+            
+            # Stop background pool cleanly
+            try:
+                _job_pool.shutdown(wait=False, cancel_futures=True)  # Python 3.9+
+                print("[INFO] Background executor shut down cleanly")
+            except TypeError:
+                # Fallback for older Python versions
+                _job_pool.shutdown(wait=False)
+                print("[INFO] Background executor shut down (legacy mode)")
+            except Exception as e:
+                print(f"[WARN] Error during executor shutdown: {e}")
+            
             # Kill any process using port 8050
             if sys.platform == 'win32':
                 os.system('netstat -ano | findstr :8050 > temp_port.txt 2>nul')
@@ -10552,16 +12615,14 @@ if __name__ == "__main__":
                 except:
                     pass
             
+            print("[INFO] Server shutdown complete")
             # Force terminate all daemon threads
             os._exit(0)
         except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-        finally:
-            logger.info(f"{Colors.GREEN}[✓] Server shutdown complete{Colors.ENDC}")
+            # Use print to avoid logging system issues during shutdown
+            print(f"[ERROR] Error during cleanup: {str(e)}")
     
-    # Register cleanup handlers
-    def signal_handler(signum, frame):
-        cleanup_server()
+    # Register cleanup handlers - using the signal_handler defined above
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -10578,23 +12639,39 @@ if __name__ == "__main__":
         click.echo = lambda *args, **kwargs: None
         werkzeug._internal._log = lambda *args, **kwargs: None
         
-        # Suppress Dash's startup message
-        import dash._utils
-        dash._utils.print = lambda *args, **kwargs: None
+        # Dash startup message will be shown (removing suppression that broke callbacks)
+        
+        # Check for duplicate callback outputs before starting
+        def check_duplicate_outputs():
+            output_to_callbacks = {}
+            for cb_id, info in app.callback_map.items():
+                s = str(cb_id)
+                fn = info['callback'].__name__
+                if s.startswith('..'):
+                    # multi-output: '..id.prop...id.prop'
+                    for part in s.strip('.').split('...'):
+                        if part:
+                            output_to_callbacks.setdefault(part, []).append(fn)
+                else:
+                    # single output: 'id.prop'
+                    if s:
+                        output_to_callbacks.setdefault(s, []).append(fn)
+
+            dups = [f"  {out} -> {', '.join(fns)}"
+                    for out, fns in output_to_callbacks.items()
+                    if len(set(fns)) > 1]
+            if dups:
+                logger.error("Duplicate callback outputs detected:\n" + "\n".join(dups))
+                sys.exit(1)
+        
+        check_duplicate_outputs()
         
         # Start console input handler in a separate thread
         console_thread = threading.Thread(target=console_input_handler, daemon=True)
         console_thread.start()
         
-        # Temporarily redirect stdout to suppress "Dash is running on..." message
-        import io
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        
-        try:
-            app.run_server(debug=debug_mode, host='127.0.0.1', port=8050, use_reloader=False)
-        finally:
-            sys.stdout = old_stdout
+        # Run the server without stdout redirection to allow callbacks to function properly
+        app.run_server(debug=debug_mode, host='127.0.0.1', port=8050, use_reloader=False)
     except KeyboardInterrupt:
         cleanup_server()
     except Exception as e:
