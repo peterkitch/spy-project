@@ -2316,8 +2316,8 @@ class PerformanceMetrics:
         now = datetime.now(_ET_TZ)
         sess = _session_open_close_et_for_date(now.date())
 
-        # If no session (weekend/holiday) OR before today's open => show time until next session open
-        if not sess or now < sess[0]:
+        # If market is closed (no session), before open, OR after today's close => show time until next session open
+        if not sess or (sess and (now < sess[0] or now >= sess[1])):
             next_open = sess[0] if (sess and now < sess[0]) else _next_session_open_et(now)
             if next_open is None:
                 return html.Div()  # Defensive: shouldn't happen, but avoid breaking UI
@@ -2755,7 +2755,7 @@ def is_crypto_ticker(ticker_symbol):
 
 
 # Initialize the Dash app with a dark theme and custom styles
-app = Dash(__name__, external_stylesheets=[
+app = Dash(__name__, update_title=None, external_stylesheets=[
     dbc.themes.DARKLY,
     "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
     # Custom styles are now loaded from /assets/spymaster/spymaster_styles.css automatically
@@ -2770,7 +2770,7 @@ app.index_string = '''
 <html>
     <head>
         {%metas%}
-        <title>PRJCT9 - Advanced Trading Analysis</title>
+        <title>PRJCT9</title>
         {%favicon%}
         {%css%}
     </head>
@@ -4749,8 +4749,8 @@ def precompute_results(ticker, event, cancel_event=None):
                 
                 num_pair_chunks = (total_pairs + chunk_size_pairs - 1) // chunk_size_pairs
                 logger.info(f"Processing {total_pairs} pairs")
-                logger.info(f"  Chunks: {num_pair_chunks} x {chunk_size_pairs}")
-                logger.info(f"  Days: {len(dates)} | Memory-safe chunking: {len(dates) > 10000}")
+                logger.info(f"Chunks: {num_pair_chunks} x {chunk_size_pairs}")
+                logger.info(f"Days: {len(dates)} | Memory-safe chunking: {len(dates) > 10000}")
 
                 # Track best per-day with global tie-break (prefer right-most overall)
                 n_days = len(dates)
@@ -4989,10 +4989,8 @@ def precompute_results(ticker, event, cancel_event=None):
             except Exception:
                 results['last_day_signal'] = {'buy_active': None, 'short_active': None}
 
-            logger.info(f"Current Top Buy Pair for {ticker}: {results['top_buy_pair']}")
-            logger.info(f"  Total capture: {results['top_buy_capture']:.2f}")
-            logger.info(f"Current Top Short Pair for {ticker}: {results['top_short_pair']}")
-            logger.info(f"  Total capture: {results['top_short_capture']:.2f}")
+            logger.info(f"Current Top Buy Pair for {ticker}: {results['top_buy_pair']} // Total Cap: {results['top_buy_capture']:.2f}%")
+            logger.info(f"Current Top Short Pair for {ticker}: {results['top_short_pair']} // Total Cap: {results['top_short_capture']:.2f}%")
 
             section_times['Cumulative Combined Captures'] = _now_secs() - ccc_t0
 
@@ -6606,6 +6604,11 @@ app.layout = dbc.Container(
         # NEW: Poller dedicated to Multi-Primary so we don't depend on the global one
         dcc.Interval(id='multi-primary-interval', interval=1200, n_intervals=0, disabled=True),
 
+        # --- Browser tab title status (aggregated) ---
+        dcc.Interval(id='title-interval', interval=1200, n_intervals=0, disabled=False),
+        dcc.Store(id='browser-title', storage_type='memory'),
+        html.Div(id='title-applied', style={'display': 'none'}),
+
         # Store adaptive interval state per session (no cross-session leakage)
         dcc.Store(id='interval-adaptive-state', storage_type='memory'),
         # Loading spinner output div (removed dcc.Loading wrapper to prevent false spinner detection)
@@ -6638,6 +6641,140 @@ app.layout = dbc.Container(
 # ============================================================================
 # CALLBACKS - UI INTERACTION HANDLERS
 # ============================================================================
+
+# -----------------------------------------------------------------------------
+# Browser TAB TITLE: aggregate in-flight work across the app
+_BASE_TITLE = "PRJCT9"
+_title_last_opt = {'current': 0, 'total': 0, 'ts': 0.0}  # for ETA
+
+def _fmt_eta(sec: float) -> str:
+    try:
+        s = max(0, int(sec))
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        if h:   return f" ~{h}h {m}m"
+        if m:   return f" ~{m}m"
+        return f" ~{s}s"
+    except Exception:
+        return ""
+
+@app.callback(
+    Output('browser-title', 'data'),
+    [Input('title-interval', 'n_intervals')],
+    [
+        State('active-primary', 'data'),
+        State('ticker-input', 'value'),
+        State('optimization-secondary-ticker', 'value'),
+        State('optimization-primary-tickers', 'value'),
+        State('multi-secondary-ticker-input', 'value'),
+        State({'type': 'primary-ticker-input', 'index': ALL}, 'value')
+    ],
+    prevent_initial_call=False
+)
+def _compose_browser_title(_ticks, active_primary, primary_input, opt_sec, opt_primary, mp_sec, mp_primary_list):
+    """
+    Build a compact title summarizing CURRENT work:
+      - Optimization progress (+ETA)
+      - Batch progress
+      - Primary ticker load progress
+      - Multi-Primary readiness (K/N ready)
+    Falls back to base title when idle.
+    """
+    global _title_last_opt, optimization_progress
+    try:
+        segments = []
+
+        # 1) Optimization Engine progress (has best ETA signal)
+        opt = optimization_progress or {}  # {'status','current','total','ts',...}
+        if isinstance(opt, dict) and (opt.get('status') == 'processing'):
+            cur = int(opt.get('current') or 0)
+            tot = int(opt.get('total') or 0)
+            pct = (100.0 * cur / tot) if tot else 0.0
+            # ETA from short-term rate
+            eta_txt = ""
+            try:
+                now = float(opt.get('ts') or time.time())
+                if _title_last_opt['total'] == tot and cur > _title_last_opt['current'] and now > _title_last_opt['ts']:
+                    rate = (cur - _title_last_opt['current']) / (now - _title_last_opt['ts'] + 1e-6)
+                    if rate > 0 and tot > cur:
+                        eta_txt = _fmt_eta((tot - cur) / rate)
+                _title_last_opt = {'current': cur, 'total': tot, 'ts': now}
+            except Exception:
+                pass
+            sec_lbl = (opt_sec or "").strip().upper()
+            segments.append(f"Optimizing {sec_lbl or ''} {cur}/{tot} ({pct:.0f}%){eta_txt}")
+
+        # 2) Batch progress (based on file-backed statuses to avoid off-by-one)
+        try:
+            # Snapshot the current tracking set under lock, then read statuses outside the lock
+            with processing_lock:
+                tickers = list(all_tickers)
+            tsize = len(tickers)
+            if tsize > 0:
+                done = 0
+                active = 0
+                for _t in tickers:
+                    st = read_status(_t) or {}
+                    s = (st.get('status') or '').lower()
+                    if s in ('complete', 'failed'):
+                        done += 1
+                    else:
+                        # Treat any non-final state (incl. "queued", "processing", "not started") as active
+                        active += 1
+                # Show the batch segment only while something is still active.
+                if active > 0:
+                    pct = 100.0 * done / max(tsize, 1)
+                    segments.append(f"Batch {done}/{tsize} ({pct:.0f}%)")
+                # else: hide the segment once fully done to avoid lingering "3/3 (100%)"
+        except Exception:
+            pass
+
+        # 3) Primary ticker load (file status)
+        t = (active_primary or primary_input or "").strip().upper()
+        if t:
+            try:
+                st = read_status(t)  # {"status","progress",...}
+                if (st or {}).get('status') == 'processing':
+                    pct = float((st or {}).get('progress') or 0.0)
+                    segments.append(f"{t} {pct:.0f}%")
+            except Exception:
+                pass
+
+        # 4) Multi-Primary readiness (K/N primaries ready)
+        try:
+            if mp_sec and mp_primary_list:
+                primaries = [ (p or "").strip().upper() for p in mp_primary_list if p ]
+                primaries = [p for p in primaries if p]  # drop empties
+                if primaries:
+                    ready = 0
+                    for p in primaries:
+                        st = read_status(p)
+                        if (st or {}).get('status') == 'complete':
+                            ready += 1
+                    if ready < len(primaries):
+                        segments.append(f"Multi-Primary {ready}/{len(primaries)} ready")
+        except Exception:
+            pass
+
+        if not segments:
+            return _BASE_TITLE
+        return "PRJCT9 - " + " | ".join(segments)
+    except Exception:
+        # Always degrade to base title on any error
+        return _BASE_TITLE
+
+# Client-side apply: set document.title without causing Dash's own flicker
+app.clientside_callback(
+    """
+    function(titleText){
+        if (!titleText) { return ''; }
+        try { document.title = titleText; } catch(e) {}
+        return '';
+    }
+    """,
+    Output('title-applied', 'children'),
+    Input('browser-title', 'data')
+)
 
 # -----------------------------------------------------------------------------
 # Ticker and SMA Display Callbacks
@@ -6892,23 +7029,34 @@ def update_primary_ticker_status(fig, poller_disabled, ticker):
 def update_batch_process_status(n_clicks, n_intervals, tickers_input):
     if not tickers_input:
         return ''
-    
+
+    # Compute status-based progress (robust to the in-flight pop from the queue)
     with processing_lock:
-        queue_size = len(ticker_queue)
-        total_size = len(all_tickers)
-    
-    if queue_size > 0:
+        tickers = list(all_tickers)
+    tsize = len(tickers)
+    if tsize == 0:
+        return ''
+
+    done = 0
+    active = 0
+    for t in tickers:
+        st = read_status(t) or {}
+        s = (st.get('status') or '').lower()
+        if s in ('complete', 'failed'):
+            done += 1
+        else:
+            active += 1
+
+    if active > 0:
         return html.Span([
             html.I(className="fas fa-spinner fa-spin me-2"),
-            f"Processing {total_size - queue_size}/{total_size} tickers"
+            f"Processing {done}/{tsize} tickers"
         ], style={"color": "#ffa500"})
-    elif total_size > 0:
+    else:
         return html.Span([
             html.I(className="fas fa-check-circle me-2"),
-            f"Completed {total_size} tickers"
+            f"Completed {tsize} tickers"
         ], style={"color": "#00ff41"})
-    else:
-        return ''
 
 # Callback to update Optimization status  
 @app.callback(
@@ -12707,6 +12855,9 @@ def update_countdown_timer(n):
     # This runs separately and doesn't trigger loading states for other components
     return PerformanceMetrics.create_market_countdown_timer()
 
+# Client-side callback removed - update_title=None is sufficient to prevent flickering
+# The tab title will remain static as "PRJCT9"
+
 
 # Client-side callback for diagnostic logging - commented out for now to avoid startup error
 # Can be enabled by uncommenting if needed for debugging
@@ -12870,7 +13021,8 @@ if __name__ == "__main__":
             output_to_callbacks = {}
             for cb_id, info in app.callback_map.items():
                 s = str(cb_id)
-                fn = info['callback'].__name__
+                # Clientside callbacks don't have __name__, handle gracefully
+                fn = getattr(info.get('callback'), '__name__', 'clientside_callback')
                 if s.startswith('..'):
                     # multi-output: '..id.prop...id.prop'
                     for part in s.strip('.').split('...'):
@@ -12899,5 +13051,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         cleanup_server()
     except Exception as e:
+        import traceback
         logger.error(f"Server error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         cleanup_server()
