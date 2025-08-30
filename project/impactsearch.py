@@ -1483,24 +1483,25 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
         t_statistic = None
         p_value = None
 
-    significant_90 = 'Yes' if p_value and p_value < 0.10 else 'No'
-    significant_95 = 'Yes' if p_value and p_value < 0.05 else 'No'
-    significant_99 = 'Yes' if p_value and p_value < 0.01 else 'No'
+    significant_90 = 'Yes' if (p_value is not None and p_value < 0.10) else 'No'
+    significant_95 = 'Yes' if (p_value is not None and p_value < 0.05) else 'No'
+    significant_99 = 'Yes' if (p_value is not None and p_value < 0.01) else 'No'
 
+    # Standardize names and types to match UI/OnePass
     return {
         'Total Capture (%)': float(total_capture),
-        'Average Daily Capture (%)': float(avg_daily_capture),
+        'Avg Daily Capture (%)': float(avg_daily_capture),
         'Trigger Days': int(trigger_days),
         'Wins': int(wins),
         'Losses': int(losses),
         'Win Ratio (%)': float(win_ratio),
         'Std Dev (%)': float(std_dev),
         'Sharpe Ratio': float(sharpe_ratio) if np.isfinite(sharpe_ratio) else 0.0,
-        't-Statistic': None if t_statistic is None else float(t_statistic),
-        'p-Value': None if p_value is None else float(p_value),
-        'Significant @90%?': significant_90,
-        'Significant @95%?': significant_95,
-        'Significant @99%?': significant_99
+        't-Statistic': 'N/A' if t_statistic is None else float(t_statistic),
+        'p-Value': 'N/A' if p_value is None else float(p_value),
+        'Significant 90%': significant_90,
+        'Significant 95%': significant_95,
+        'Significant 99%': significant_99
     }
 
 def _align_pairs_to_calendar_spyfaithful(dates, daily_top_buy_pairs_raw, daily_top_short_pairs_raw):
@@ -1595,17 +1596,6 @@ def _calculate_cumulative_combined_capture_spyfaithful(df, daily_top_buy_pairs, 
     return pd.Series(ccc, index=dates), active_pairs
 
 
-def _metrics_from_ccc(ccc_series):
-    """Translate combined capture series into OnePass/Spymaster metrics."""
-    if ccc_series is None or len(ccc_series) == 0:
-        return None
-    total = float(ccc_series.iloc[-1])
-    return {
-        'Total Capture (%)': total,
-        'Buy Capture (%)': None,
-        'Short Capture (%)': None,
-        'Trigger Days': int((ccc_series.diff().abs() > 0).sum())
-    }
 
 def export_results_to_excel(output_filename, metrics_list):
     # Ensure output directory exists
@@ -1634,12 +1624,31 @@ def export_results_to_excel(output_filename, metrics_list):
         'Total Capture (%)'
     ]
 
-    # Normalize rows to ensure all keys exist; prevents KeyErrors on older runs
+    # Map legacy keys -> standardized keys and normalize values
+    def _normalize_keys(d):
+        d = dict(d)  # shallow copy
+        key_map = {
+            'Significant @90%?': 'Significant 90%',
+            'Significant @95%?': 'Significant 95%',
+            'Significant @99%?': 'Significant 99%',
+            'Average Daily Capture (%)': 'Avg Daily Capture (%)',
+        }
+        for old, new in key_map.items():
+            if old in d and new not in d:
+                d[new] = d.pop(old)
+        # Ensure text 'N/A' for missing stats (UI expects this)
+        if d.get('p-Value') in (None, np.nan):
+            d['p-Value'] = 'N/A'
+        if d.get('t-Statistic') in (None, np.nan):
+            d['t-Statistic'] = 'N/A'
+        return d
+
     normalized_rows = []
     for m in metrics_list:
+        m = _normalize_keys(m)
         row = {}
         for col in desired_order:
-            row[col] = m.get(col, '')  # Use empty string for missing values
+            row[col] = m.get(col, '')  # defaults stay empty string; will be coerced as needed
         # Add any extra columns that aren't in desired_order
         for key, value in m.items():
             if key not in desired_order:
@@ -1651,9 +1660,10 @@ def export_results_to_excel(output_filename, metrics_list):
         new_df = pd.DataFrame(normalized_rows)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
 
-        # Optionally sort by Sharpe Ratio
+        # Coerce Sharpe to numeric before sorting to avoid float<->str errors
         if 'Sharpe Ratio' in combined_df.columns:
-            combined_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True)
+            combined_df['Sharpe Ratio'] = pd.to_numeric(combined_df['Sharpe Ratio'], errors='coerce')
+            combined_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
         combined_df = combined_df.reindex(columns=desired_order + 
@@ -1663,9 +1673,10 @@ def export_results_to_excel(output_filename, metrics_list):
     else:
         df = pd.DataFrame(normalized_rows)
 
-        # Optionally sort by Sharpe Ratio
+        # Coerce Sharpe to numeric before sorting
         if 'Sharpe Ratio' in df.columns:
-            df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True)
+            df['Sharpe Ratio'] = pd.to_numeric(df['Sharpe Ratio'], errors='coerce')
+            df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
         df = df.reindex(columns=desired_order + 
@@ -1820,24 +1831,30 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             stored_dates = signal_data['dates']
             primary_dates = df.index
             
-            # T-1 PARITY FIX: Only use dates that have corresponding signals
-            # OnePass saves N-1 signals for N days of data (T-1 persistence)
-            # So we should only use the first N-1 days from df
-            if len(primary_dates) > len(stored_dates):
-                # Trim primary_dates to match signal count
-                primary_dates = primary_dates[:len(stored_dates)]
-                logger.info(f"T-1 alignment: Using {len(primary_dates)} days to match {len(stored_dates)} stored signals")
-            
             # Build dict once for O(1) lookups - fixes O(N²) issue
             signal_map = {date: signal for date, signal in zip(stored_dates, primary_signals)}
             
-            # Map signals in O(N) total time
+            # Find the actual overlapping dates between stored and current data
+            df_date_strings = [str(d.date()) for d in primary_dates]
+            stored_date_set = set(stored_dates)
+            df_date_set = set(df_date_strings)
+            
+            # Get the intersection of dates
+            common_dates = stored_date_set & df_date_set
+            logger.info(f"Signal Library has {len(stored_dates)} dates, DataFrame has {len(primary_dates)} dates")
+            logger.info(f"Found {len(common_dates)} overlapping dates for signal alignment")
+            
+            # Map signals for ALL dates in the DataFrame
             primary_signals_aligned = []
             for date in primary_dates:
                 date_str = str(date.date())
+                # Use the signal if we have it, otherwise 'None'
                 primary_signals_aligned.append(signal_map.get(date_str, 'None'))
             
             primary_signals = primary_signals_aligned
+            
+            # Keep primary_dates as the full DataFrame index (no trimming!)
+            # This ensures we use all available data
             
             # NO SMA COMPUTATION NEEDED AT ALL!
             logger.info(f"Skipping ALL SMA computation - using {len(primary_signals)} pre-computed signals")
@@ -2021,45 +2038,8 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     logger.info(f"Short signals: {signal_counts.get('Short', 0)}")
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
     
-    # SELF-CORRELATION: If secondary is effectively the same series as primary,
-    # compute performance via the Spymaster/OnePass CCC path (pair-gated, T-1 aligned).
-    _self_corr = False
-    try:
-        _self_corr = (
-            sec_df is not None and df is not None and
-            len(sec_df) == len(df) and
-            sec_df.index.equals(df.index) and
-            'Close' in sec_df and 'Close' in df and
-            np.allclose(
-                sec_df['Close'].to_numpy(dtype='float64'),
-                df['Close'].to_numpy(dtype='float64'),
-                equal_nan=True
-            )
-        )
-    except Exception:
-        _self_corr = False
-
-    if _self_corr:
-        # Prefer pairs from the signal library if available; else fall back to locally computed daily_top_*.
-        _lib = locals().get('signal_data', None)
-        _buy_pairs_raw = (_lib.get('daily_top_buy_pairs') if _lib else None) or locals().get('daily_top_buy_pairs')
-        _short_pairs_raw = (_lib.get('daily_top_short_pairs') if _lib else None) or locals().get('daily_top_short_pairs')
-
-        if _buy_pairs_raw is None or _short_pairs_raw is None:
-            logger.warning("Self-corr detected but daily top pairs not found; falling back to signal-based metrics.")
-            result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
-        else:
-            # Align pairs to the calendar (fills any gaps with sentinels) then compute CCC exactly
-            _bp_aligned, _sp_aligned = _align_pairs_to_calendar_spyfaithful(df.index, _buy_pairs_raw, _short_pairs_raw)
-
-            # Enforce T-1 policy before CCC (drop in-flight bar like OnePass persistence)
-            _df_eff = df.iloc[:-PERSIST_SKIP_BARS] if (PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS) else df
-
-            ccc, _ = _calculate_cumulative_combined_capture_spyfaithful(_df_eff, _bp_aligned, _sp_aligned)
-            result = _metrics_from_ccc(ccc)
-    else:
-        # Cross-ticker path (unchanged)
-        result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
+    # Always compute metrics from signals (no self-correlation override)
+    result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
     
     if result is not None:
         # Track all ticker names for transparency
@@ -2687,10 +2667,23 @@ def update_progress(n_intervals, processing_state):
     if progress_tracker['results']:
         results_df = pd.DataFrame(progress_tracker['results'])
         
-        # Calculate summary metrics
-        avg_sharpe = results_df['Sharpe Ratio'].mean()
-        best_performer = results_df.loc[results_df['Sharpe Ratio'].idxmax()]
-        significant_count = len(results_df[results_df['Significant 95%'] == 'Yes'])
+        # Back-compat: normalize legacy column names and types
+        if 'Significant 95%' not in results_df.columns and 'Significant @95%?' in results_df.columns:
+            results_df.rename(columns={'Significant @95%?': 'Significant 95%'}, inplace=True)
+        if 'Avg Daily Capture (%)' not in results_df.columns and 'Average Daily Capture (%)' in results_df.columns:
+            results_df.rename(columns={'Average Daily Capture (%)': 'Avg Daily Capture (%)'}, inplace=True)
+        if 'Sharpe Ratio' not in results_df.columns:
+            results_df['Sharpe Ratio'] = np.nan
+        
+        # Calculate summary metrics with safe numeric conversion
+        sharpe_numeric = pd.to_numeric(results_df['Sharpe Ratio'], errors='coerce')
+        avg_sharpe = sharpe_numeric.mean()
+        if sharpe_numeric.notna().any():
+            best_idx = sharpe_numeric.idxmax()
+            best_performer = results_df.loc[best_idx]
+        else:
+            best_performer = pd.Series({'Primary Ticker': 'N/A', 'Sharpe Ratio': np.nan})
+        significant_count = int((results_df.get('Significant 95%', pd.Series(dtype=object)) == 'Yes').sum())
         
         summary_cards = dbc.Row([
             dbc.Col([
