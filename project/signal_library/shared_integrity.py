@@ -20,6 +20,19 @@ HEAD_TAIL_ATOL_CRYPTO = 100.0
 HEAD_TAIL_RTOL = 0.001
 HEAD_TAIL_MIN_MATCH_FRAC = 0.8
 
+def _ensure_status_dict(status):
+    """
+    Normalize an integrity status value to a dict.
+    - If it's already a dict, return a shallow copy.
+    - If it's a string (e.g., 'NEW_DATA'), wrap as {'status': 'NEW_DATA'}.
+    - If it's None, return {}.
+    """
+    if isinstance(status, dict):
+        return dict(status)
+    if status is None:
+        return {}
+    return {'status': str(status)}
+
 # Market-specific absolute tolerances (in native currency units)
 # These are calibrated for typical price ranges and tick sizes in each market
 MARKET_ATOL = {
@@ -551,6 +564,9 @@ def check_head_tail_match_fuzzy(signal_data, current_df,
     Returns:
         (ok: bool, stats: dict) - Whether match succeeded and statistics
     """
+    # Defensive guard for malformed or empty frames
+    if not isinstance(current_df, pd.DataFrame) or 'Close' not in current_df.columns or current_df.empty:
+        return False, {'reason': 'no_current_close'}
     # Support both schema styles
     snap = signal_data.get('head_tail_snapshot')
     if not snap:
@@ -611,11 +627,12 @@ def evaluate_library_acceptance(signal_data, current_df, config=None):
     Acceptance ladder (in order of preference):
     1. STRICT - Perfect fingerprint match
     2. LOOSE - Match after quantization (minor price differences)
-    3. HEADTAIL_FUZZY - Fuzzy head/tail match (tolerates small changes)
-    4. SCALE_RECONCILE - Constant scale factor detected (vendor rebasing)
-    5. HEADTAIL - Exact head/tail match
-    6. ALL_BUT_LAST - All data except last row matches
-    7. REBUILD - Too different, must rebuild
+    3. RETURNS_MATCH - Returns correlation high enough despite price-level changes
+    4. HEADTAIL_FUZZY - Fuzzy head/tail match (tolerates small changes)
+    5. SCALE_RECONCILE - Constant scale factor detected (vendor rebasing)
+    6. HEADTAIL - Exact head/tail match
+    7. ALL_BUT_LAST - All data except last row matches
+    8. REBUILD - Too different, must rebuild
     
     Args:
         signal_data: Library data to evaluate
@@ -751,10 +768,10 @@ def evaluate_library_acceptance(signal_data, current_df, config=None):
             else:
                 ratio = tail_ratio if ok_tail else head_ratio
 
-            integrity_status = dict(integrity_status or {})
-            integrity_status['scale_factor'] = float(ratio)
+            status_dict = _ensure_status_dict(integrity_status)
+            status_dict['scale_factor'] = float(ratio)
             
-            return 'SCALE_RECONCILE', integrity_status, (
+            return 'SCALE_RECONCILE', status_dict, (
                 f"Scale change detected (factor={ratio:.6f}, "
                 f"cv={'{:.4f}'.format((tail_stats or head_stats).get('cv', 0.0))}, "
                 f"residuals={(tail_stats or head_stats).get('mean_residual_pct', 0.0):.2%})"
@@ -773,7 +790,9 @@ def evaluate_library_acceptance(signal_data, current_df, config=None):
     
     # Level 5: Must rebuild
     revision_threshold = signal_data.get('session_metadata', {}).get('revision_rebuild_threshold', 30)
-    if integrity_status == 'REVISION':
+    # Be robust whether integrity_status is str or dict
+    _status_str = integrity_status.get('status') if isinstance(integrity_status, dict) else integrity_status
+    if _status_str == 'REVISION':
         # Check how many days are affected
         stored_num_days = signal_data.get('num_days', 0)
         current_num_days = len(current_df)
@@ -790,4 +809,7 @@ def verify_data_integrity(signal_data, current_df):
     Returns: 'VALID', 'NEW_DATA', 'PARTIAL_SESSION', or 'REVISION'
     """
     _, integrity_status, _ = evaluate_library_acceptance(signal_data, current_df)
+    # Keep the legacy contract: always return a string status
+    if isinstance(integrity_status, dict):
+        return integrity_status.get('status', 'UNKNOWN')
     return integrity_status

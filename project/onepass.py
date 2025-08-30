@@ -107,6 +107,30 @@ def _fmt(n): return f"{n:,}"
 def _pct(n, d): return ("0.00%" if not d else f"{(n*100.0/d):.2f}%")
 def _now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def _reverse_argmax_among_mask(arr: np.ndarray, valid_mask: np.ndarray) -> int:
+    """
+    Reverse-argmax restricted to a boolean mask.
+    Returns the absolute index into arr.
+    If no element is valid, returns -1.
+    """
+    if not np.any(valid_mask):
+        return -1
+    idxs = np.flatnonzero(valid_mask)
+    rel = len(idxs) - 1 - np.argmax(arr[idxs][::-1])
+    return int(idxs[rel])
+
+def _reverse_argmax_global(arr: np.ndarray) -> int:
+    """
+    Reverse-argmax across ALL entries (no mask).
+    Matches Spymaster's global right-most tie behavior.
+    Returns absolute index into arr (or -1 if empty).
+    """
+    n = arr.size
+    if n == 0:
+        return -1
+    # Right-most maximum across full array
+    return int(n - 1 - np.argmax(arr[::-1]))
+
 @dataclass
 class TickerOutcome:
     ticker: str
@@ -725,7 +749,7 @@ def perform_incremental_update(ticker, signal_data, new_df):
                 prev_buy_pair = last_buy_data['pair']
                 prev_buy_value = last_buy_data['avg_capture']
             else:
-                prev_buy_pair = (1, 2)
+                prev_buy_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # Buy sentinel: (msd, msd-1)
                 prev_buy_value = 0.0
                 
             last_short_data = None
@@ -741,13 +765,13 @@ def perform_incremental_update(ticker, signal_data, new_df):
                 prev_short_pair = last_short_data['pair']
                 prev_short_value = last_short_data['avg_capture']
             else:
-                prev_short_pair = (1, 2)
+                prev_short_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # Initially same as buy sentinel
                 prev_short_value = 0.0
             
             # Compute SMAs for working window
             close_values = working_df['Close'].values
             cumsum = np.cumsum(np.insert(close_values, 0, 0))
-            sma_matrix = np.empty((len(working_df), MAX_SMA_DAY), dtype=np.float32)
+            sma_matrix = np.empty((len(working_df), MAX_SMA_DAY), dtype=np.float64)  # float64 for precision parity
             sma_matrix.fill(np.nan)
             for i in range(1, MAX_SMA_DAY + 1):
                 valid_indices = np.arange(i-1, len(working_df))
@@ -755,7 +779,7 @@ def perform_incremental_update(ticker, signal_data, new_df):
             
             # Process only new days
             new_start_idx = len(working_df) - len(new_rows)
-            returns = working_df['Close'].pct_change().fillna(0).values * 100
+            returns = working_df['Close'].pct_change().fillna(0).to_numpy(dtype=np.float64) * 100
             
             # Use precomputed pairs
             pairs = PAIRS
@@ -815,14 +839,17 @@ def perform_incremental_update(ticker, signal_data, new_df):
                         if short_mask.any():
                             short_cum[short_mask] += -today_return
 
-                    # Reverse-argmax for deterministic tie-breaking (parity)
-                    best_buy_idx   = len(buy_cum)   - 1 - np.argmax(buy_cum[::-1])
-                    best_short_idx = len(short_cum) - 1 - np.argmax(short_cum[::-1])
+                    # Spymaster-faithful: choose among ALL pairs (sentinel wins zero-ties)
+                    best_buy_idx   = _reverse_argmax_global(buy_cum)
+                    best_short_idx = _reverse_argmax_global(short_cum)
                     
-                    prev_buy_pair = tuple(pairs[best_buy_idx])
-                    prev_buy_value = buy_cum[best_buy_idx]
-                    prev_short_pair = tuple(pairs[best_short_idx])
-                    prev_short_value = short_cum[best_short_idx]
+                    # If still no valid pairs (very early days), keep prior pairs instead of overwriting
+                    if best_buy_idx >= 0:
+                        prev_buy_pair = tuple(pairs[best_buy_idx])
+                        prev_buy_value = buy_cum[best_buy_idx]
+                    if best_short_idx >= 0:
+                        prev_short_pair = tuple(pairs[best_short_idx])
+                        prev_short_value = short_cum[best_short_idx]
                     
                     # Keep keys as Timestamp for parity with full run
                     daily_top_buy_pairs[date] = (prev_buy_pair, prev_buy_value)
@@ -926,13 +953,13 @@ def _persist_library_metadata(ticker, signal_data):
     """
     try:
         vendor_symbol, _ = resolve_symbol(ticker)
-        lib_dir = os.path.join(SIGNAL_LIBRARY_DIR, "stable", vendor_symbol[:2].upper())
-        os.makedirs(lib_dir, exist_ok=True)
-        path = os.path.join(lib_dir, f"{vendor_symbol}_signal_library.pkl")
+        # Always persist to the SAME root path + filename as main saves.
+        path = _lib_path_for(vendor_symbol)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:
-            pickle.dump(signal_data, f)
+            pickle.dump(signal_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         persist_skip = signal_data.get('meta', {}).get('persist_skip_bars')
-        logger.info(f"{ticker}: persisted library metadata (persist_skip_bars={persist_skip})")
+        logger.info(f"{ticker}: persisted library metadata to {path} (persist_skip_bars={persist_skip})")
     except Exception:
         logger.exception(f"{ticker}: failed to persist library metadata")
 
@@ -1210,7 +1237,7 @@ def fetch_data_raw(ticker, max_retries=3):
                 return pd.DataFrame(), ticker
     return pd.DataFrame(), ticker
 
-def _coerce_to_close_frame(df, preferred='Adj Close'):
+def _coerce_to_close_frame(df, preferred=None):
     """
     Helper function to handle various column structures from yfinance.
     Ensures we always get a clean DataFrame with a single 'Close' column.
@@ -1218,7 +1245,12 @@ def _coerce_to_close_frame(df, preferred='Adj Close'):
     Args:
         df: DataFrame from yfinance
         preferred: 'Adj Close' or 'Close' - which price basis to prefer
+                  If None, reads from PRICE_BASIS environment variable
     """
+    # Support environment variable for price basis if not explicitly provided
+    if preferred is None:
+        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+        preferred = 'Adj Close' if price_basis == 'adj' else 'Close'
     if df.empty:
         return pd.DataFrame()
     
@@ -1271,11 +1303,35 @@ def _coerce_to_close_frame(df, preferred='Adj Close'):
         else:
             return pd.DataFrame(df[['Close']])
     
+    # --- Last-ditch fallback: flatten MultiIndex and scan for a usable column ---
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            flat = ['__'.join(map(str, tup)) for tup in df.columns.to_list()]
+            temp = df.copy()
+            temp.columns = flat
+            
+            # Build candidate patterns in both orientations, prefer preferred then fallback
+            fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
+            candidates = []
+            # Contains-based search is robust to (field,ticker) vs (ticker,field)
+            for needle in (preferred, fallback):
+                candidates.extend([c for c in flat if needle in c])
+            
+            for c in candidates:
+                ser = temp[c]
+                if isinstance(ser, pd.Series) and ser.notna().any():
+                    out = pd.DataFrame(ser)
+                    out.columns = ['Close']
+                    return out
+    except Exception:
+        # swallow and fall through to the final error
+        pass
+    
     # If we can't find any close column, return empty
     logger.error(f"No Close/Adj Close data found in DataFrame")
     return pd.DataFrame()
 
-def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
+def fetch_data(ticker, reference_now=None, price_source=None):
     """
     Single-download path: grab raw once, coerce, then session-guard.
     
@@ -1283,7 +1339,12 @@ def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
         ticker: The ticker symbol to fetch
         reference_now: Frozen analysis clock for consistent session checks
         price_source: 'Adj Close' or 'Close' - which price basis to use
+                     If None, reads from PRICE_BASIS environment variable
     """
+    # Support environment variable for price basis if not explicitly provided
+    if price_source is None:
+        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+        price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
     if not ticker or not ticker.strip():
         return pd.DataFrame()
     # Use resolve_symbol to get correct vendor format
@@ -1316,6 +1377,120 @@ def fetch_data(ticker, reference_now=None, price_source='Adj Close'):
         logger.info(f"Applied strict parity mode transformations")
     
     return df
+
+# ---------------------------------------------------------------------------
+# NEW: Spymaster-faithful helpers for parity
+# ---------------------------------------------------------------------------
+def _align_pairs_to_calendar_spyfaithful(idx, buy_pairs, short_pairs):
+    """
+    Bring daily_top_* dicts onto the full df calendar, ffill/bfill gaps,
+    and replace (0,0) with MAX-SMA sentinels exactly like Spymaster.
+    """
+    cal = pd.DatetimeIndex(idx).normalize()
+    def _as_series(d):
+        if not d: return pd.Series(index=cal, dtype=object)
+        s = pd.Series(d)
+        s.index = pd.to_datetime(s.index).tz_localize(None)
+        return s.reindex(cal)
+    buy_s = _as_series(buy_pairs)
+    shr_s = _as_series(short_pairs)
+    # Treat (0,0) as invalid before filling
+    def _mask_invalid(s):
+        def bad(x):
+            try:
+                p = x[0] if isinstance(x, (list, tuple)) else None
+                return (p == (0,0))
+            except Exception:
+                return False
+        m = s.apply(bad)
+        s = s.mask(m)
+        return s
+    buy_s = _mask_invalid(buy_s).ffill().bfill()
+    shr_s = _mask_invalid(shr_s).ffill().bfill()
+    # If everything invalid, seed with sentinels
+    msd = MAX_SMA_DAY
+    if buy_s.isna().all():
+        buy_s = pd.Series([((msd, msd-1), 0.0)] * len(cal), index=cal)
+    if shr_s.isna().all():
+        shr_s = pd.Series([((msd-1, msd), 0.0)] * len(cal), index=cal)
+    # Replace any remaining NaNs (fillna doesn't work with tuples, use manual replacement)
+    buy_s = buy_s.apply(lambda x: ((msd, msd-1), 0.0) if pd.isna(x) else x)
+    shr_s = shr_s.apply(lambda x: ((msd-1, msd), 0.0) if pd.isna(x) else x)
+    # Coerce back to dicts keyed by normalized Timestamp
+    return ({d: buy_s.loc[d] for d in cal}, {d: shr_s.loc[d] for d in cal})
+
+def _calculate_cumulative_combined_capture_spyfaithful(df, buy_pairs, short_pairs):
+    """
+    Spymaster-faithful cumulative combined capture:
+      - Gate TODAY by YESTERDAY's best pairs and YESTERDAY's SMAs
+      - If both signals true, follow the leader by comparing YESTERDAY's captures
+      - Daily capture uses Close[t]/Close[t-1]-1 (percent)
+    """
+    if df is None or df.empty or 'Close' not in df.columns:
+        return pd.Series([0], index=pd.DatetimeIndex([])), ['None']
+    # Ensure per-day pairs cover the calendar identically to Spymaster
+    daily_top_buy_pairs, daily_top_short_pairs = _align_pairs_to_calendar_spyfaithful(
+        df.index, buy_pairs or {}, short_pairs or {}
+    )
+    dates = pd.DatetimeIndex(df.index).normalize()
+    # Precompute SMAs once for gating (float64 like Spymaster)
+    close_vals = df['Close'].to_numpy(dtype=np.float64)
+    n = len(close_vals)
+    sma = np.full((n, MAX_SMA_DAY), np.nan, dtype=np.float64)
+    csum = np.cumsum(np.insert(close_vals, 0, 0.0))
+    for k in range(1, MAX_SMA_DAY+1):
+        v = np.arange(k-1, n)
+        sma[v, k-1] = (csum[v+1] - csum[v+1-k]) / k
+    # Helper to as-of lookup into our SMA matrix by index
+    def _sma_at(day_idx, m, col):
+        if day_idx < 0: return np.nan
+        return sma[day_idx, col-1] if (1 <= col <= MAX_SMA_DAY) else np.nan
+    ccc = []
+    active_pairs = []
+    cumulative = 0.0
+    for i, cur_dt in enumerate(dates):
+        if i == 0:
+            active_pairs.append('None')
+            ccc.append(0.0)
+            continue
+        prev_dt = dates[i-1]
+        # Yesterday's leaders and their captures
+        pb_pair, pb_cap = daily_top_buy_pairs[prev_dt]
+        ps_pair, ps_cap = daily_top_short_pairs[prev_dt]
+        # Gate using yesterday's SMAs
+        y_idx = i-1
+        buy_ok   = np.isfinite(_sma_at(y_idx, sma, pb_pair[0])) and np.isfinite(_sma_at(y_idx, sma, pb_pair[1])) \
+                   and (_sma_at(y_idx, sma, pb_pair[0]) > _sma_at(y_idx, sma, pb_pair[1]))
+        short_ok = np.isfinite(_sma_at(y_idx, sma, ps_pair[0])) and np.isfinite(_sma_at(y_idx, sma, ps_pair[1])) \
+                   and (_sma_at(y_idx, sma, ps_pair[0]) < _sma_at(y_idx, sma, ps_pair[1]))
+        if buy_ok and short_ok:
+            # Tie-break: follow the larger previous capture (short on equality)
+            current = f"Buy {pb_pair[0]},{pb_pair[1]}" if (pb_cap > ps_cap) else f"Short {ps_pair[0]},{ps_pair[1]}"
+        elif buy_ok:
+            current = f"Buy {pb_pair[0]},{pb_pair[1]}"
+        elif short_ok:
+            current = f"Short {ps_pair[0]},{ps_pair[1]}"
+        else:
+            current = "None"
+        # Daily return (percent)
+        day_ret = (close_vals[i] / close_vals[i-1] - 1.0) * 100.0
+        daily_capture = day_ret if current.startswith('Buy') else (-day_ret if current.startswith('Short') else 0.0)
+        cumulative += daily_capture
+        ccc.append(cumulative)
+        active_pairs.append(current)
+    return pd.Series(ccc, index=dates), active_pairs
+
+def _metrics_from_ccc(ccc_series):
+    """Translate combined capture series into OnePass' metrics payload."""
+    if ccc_series is None or len(ccc_series) == 0:
+        return None
+    total = float(ccc_series.iloc[-1])
+    return {
+        'Total Capture (%)': total,
+        'Buy Capture (%)': None,    # (optional: can be split if needed later)
+        'Short Capture (%)': None,  # (optional: can be split if needed later)
+        'Trigger Days': int((ccc_series.diff().abs() > 0).sum())
+    }
 
 def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_returns, persist_skip_bars=None):
     """
@@ -1377,7 +1552,7 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
     prices = df_for_returns['Close'].reindex(common_dates)
 
     # Calculate returns and ensure no NaN propagation
-    daily_returns = prices.pct_change()
+    daily_returns = prices.pct_change().fillna(0)
     
     # Ensure signals are properly normalized (no duplicate fillna needed)
     signals = signals.str.strip()
@@ -1395,7 +1570,8 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
     daily_captures.loc[buy_mask] = daily_returns.loc[buy_mask] * 100
     daily_captures.loc[short_mask] = -daily_returns.loc[short_mask] * 100
 
-    signal_captures = daily_captures[trigger_mask]
+    # Drop NaN values to avoid RuntimeWarning in statistics
+    signal_captures = daily_captures[trigger_mask].dropna()
 
     wins = (signal_captures > 0).sum()
     losses = trigger_days - wins
@@ -1531,7 +1707,9 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         
         # Check if we can use existing signals or perform incremental update
         existing_signal_data = None
-        price_source = 'Adj Close'  # Default
+        # Support switching between 'Adj Close' and 'Close' via environment variable
+        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+        price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
         had_library = check_signal_library_exists(vendor_symbol)
         outcome.had_library = had_library
         bars_before = 0
@@ -1570,8 +1748,20 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         if resolved != vendor_symbol:
             logger.info(f"One-pass resolved {vendor_symbol} -> {resolved}")
         
-        # Coerce to requested price basis
-        df = _coerce_to_close_frame(df_raw, preferred=price_source)
+        # Coerce to requested price basis with guard for edge cases
+        try:
+            df = _coerce_to_close_frame(df_raw, preferred=price_source)
+            if df.empty and price_source == 'Adj Close':
+                # Try a simple fallback to raw Close if Adj Close is absent
+                df = _coerce_to_close_frame(df_raw, preferred='Close')
+        except Exception as e:
+            logger.exception(f"Coercion failed for {vendor_symbol}: {e}")
+            RUN_REPORT.end_ticker(outcome, "SKIPPED_NO_DATA",
+                                  bars_before=bars_before, bars_after=bars_before,
+                                  bars_added=0, persist_dropped_bars=0,
+                                  resolved=resolved, error=f"COERCE_FAIL:{e}")
+            continue
+        
         # De-dup & sort to avoid rare vendor duplicate rows
         df = df[~df.index.duplicated(keep='last')].sort_index()
         if df.empty:
@@ -1604,7 +1794,14 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
             current_end_effective = str(effective_end.date()) if effective_end is not None else None  # For comparison
             
             # Use the full acceptance ladder evaluation (matching impactsearch.py)
-            acceptance_level, integrity_status, message = evaluate_library_acceptance(existing_signal_data, df)
+            # Guard against acceptance check crashes to prevent ticker failures
+            try:
+                acceptance_level, integrity_status, message = evaluate_library_acceptance(existing_signal_data, df)
+            except Exception as e:
+                logger.exception(f"Library acceptance check crashed for {vendor_symbol}: {e}")
+                # Treat as REBUILD so the ticker still completes
+                acceptance_level, integrity_status, message = "REBUILD", "ACCEPTANCE_ERROR", str(e)
+                existing_signal_data = None  # force rebuild path below
             
             # Track acceptance for reporting
             suggested = "REBUILD" if acceptance_level == "REBUILD" else "OK"
@@ -1702,9 +1899,12 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
                     daily_top_short_pairs = signal_data['daily_top_short_pairs']
                     primary_signals = signal_data['primary_signals']
                     
-                    # Proceed to metrics calculation
+                    # Proceed to metrics calculation using Spymaster-style combined capture (then T-1)
                     df_eff = df.iloc[:-PERSIST_SKIP_BARS].copy() if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS else df
-                    metrics = calculate_metrics_from_signals(primary_signals, df_eff.index, df_eff)
+                    ccc, active_pairs = _calculate_cumulative_combined_capture_spyfaithful(
+                        df_eff, signal_data['daily_top_buy_pairs'], signal_data['daily_top_short_pairs']
+                    )
+                    metrics = _metrics_from_ccc(ccc)
                     if metrics:
                         metrics['Primary Ticker'] = vendor_symbol
                         metrics_list.append(metrics)
@@ -1769,7 +1969,7 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
                     if not df.empty:
                         close_values = df['Close'].values
                         cumsum = np.cumsum(np.insert(close_values, 0, 0))
-                        sma_matrix = np.empty((len(df), MAX_SMA_DAY), dtype=np.float32)  # float32 for memory efficiency
+                        sma_matrix = np.empty((len(df), MAX_SMA_DAY), dtype=np.float64)  # float64 for precision parity with spymaster
                         sma_matrix.fill(np.nan)
                         for i in range(1, MAX_SMA_DAY + 1):
                             valid_indices = np.arange(i-1, len(df))
@@ -1841,14 +2041,14 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
 
         logger.info("Computing SMAs...")
         cumsum = np.cumsum(np.insert(close_values, 0, 0))
-        sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float32)  # float32 for memory efficiency
+        sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float64)  # float64 for precision parity with spymaster
         sma_matrix.fill(np.nan)
         for i in range(1, MAX_SMA_DAY + 1):
             valid_indices = np.arange(i-1, num_days)
             sma_matrix[valid_indices, i-1] = (cumsum[valid_indices+1] - cumsum[valid_indices+1 - i]) / i
 
         logger.info("Computing returns using pct_change()...")
-        returns = df_eff['Close'].pct_change().fillna(0).values * 100
+        returns = df_eff['Close'].pct_change().fillna(0).to_numpy(dtype=np.float64) * 100
 
         # Use precomputed PAIRS from module level
         pairs = PAIRS
@@ -1867,9 +2067,11 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         primary_signals = []  # Store signals for later saving
         
         # Track previous day's top pairs for signal generation
-        prev_buy_pair = (1, 2)
+        # Use MAX_SMA_DAY sentinels for initialization (matching spymaster)
+        # IMPORTANT: Same pair for both buy and short (different comparison operators)
+        prev_buy_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # (114, 113)
         prev_buy_value = 0.0
-        prev_short_pair = (1, 2)
+        prev_short_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # Initially same as buy sentinel
         prev_short_value = 0.0
         
         for idx, date in enumerate(df_eff.index):
@@ -1882,13 +2084,20 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
                 sma_prev = sma_matrix[idx - 1]  # Yesterday's SMAs
                 
                 # Gate using yesterday's top pairs
-                sma1_buy = sma_prev[prev_buy_pair[0] - 1]
-                sma2_buy = sma_prev[prev_buy_pair[1] - 1]
-                buy_signal = sma1_buy > sma2_buy if np.isfinite(sma1_buy) and np.isfinite(sma2_buy) else False
+                # Check if we're still using sentinel values
+                if prev_buy_pair[0] >= MAX_SMA_DAY or prev_buy_pair[1] >= MAX_SMA_DAY:
+                    buy_signal = False  # Can't trade with sentinel pairs
+                else:
+                    sma1_buy = sma_prev[prev_buy_pair[0] - 1]
+                    sma2_buy = sma_prev[prev_buy_pair[1] - 1]
+                    buy_signal = sma1_buy > sma2_buy if np.isfinite(sma1_buy) and np.isfinite(sma2_buy) else False
                 
-                sma1_short = sma_prev[prev_short_pair[0] - 1]
-                sma2_short = sma_prev[prev_short_pair[1] - 1]
-                short_signal = sma1_short < sma2_short if np.isfinite(sma1_short) and np.isfinite(sma2_short) else False
+                if prev_short_pair[0] >= MAX_SMA_DAY or prev_short_pair[1] >= MAX_SMA_DAY:
+                    short_signal = False  # Can't trade with sentinel pairs
+                else:
+                    sma1_short = sma_prev[prev_short_pair[0] - 1]
+                    sma2_short = sma_prev[prev_short_pair[1] - 1]
+                    short_signal = sma1_short < sma2_short if np.isfinite(sma1_short) and np.isfinite(sma2_short) else False
                 
                 # Determine signal using YESTERDAY's cumulative values
                 if buy_signal and short_signal:
@@ -1904,9 +2113,10 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
             
             # STEP 2: Update accumulators with TODAY's return and find TODAY's top pairs
             if idx == 0:
-                # Day 0: still store initial state (all zeros)
-                daily_top_buy_pairs[date] = ((1, 2), 0.0)
-                daily_top_short_pairs[date] = ((1, 2), 0.0)
+                # Day 0: store sentinel values matching spymaster
+                # Spymaster uses SAME sentinel for both initially
+                daily_top_buy_pairs[date] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)  # (114, 113)
+                daily_top_short_pairs[date] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)  # (114, 113) - same as buy initially
                 # Return is 0 on day 0, so no accumulator updates needed
             else:
                 # Use PREVIOUS day's SMAs to compute signals for accumulator update
@@ -1932,15 +2142,24 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
                         short_cum[short_mask] += -r  # Gain from shorting = negative of market return
                 
                 # Find TODAY's top pairs (after including today's return)
-                # Use reverse argmax to ensure consistent tiebreaking
-                max_buy_idx = len(buy_cum) - 1 - np.argmax(buy_cum[::-1])
-                max_short_idx = len(short_cum) - 1 - np.argmax(short_cum[::-1])
+                # Spymaster-faithful: choose among ALL pairs (sentinel wins zero-ties)
+                max_buy_idx   = _reverse_argmax_global(buy_cum)
+                max_short_idx = _reverse_argmax_global(short_cum)
                 
-                # Extract pair indices and values
-                top_buy_pair = (int(pairs[max_buy_idx, 0]), int(pairs[max_buy_idx, 1]))
-                buy_value = float(buy_cum[max_buy_idx])
-                top_short_pair = (int(pairs[max_short_idx, 0]), int(pairs[max_short_idx, 1]))
-                short_value = float(short_cum[max_short_idx])
+                # Only update prev_* when we actually had valid pairs yesterday
+                if max_buy_idx >= 0:
+                    top_buy_pair = (int(pairs[max_buy_idx, 0]), int(pairs[max_buy_idx, 1]))
+                    buy_value = float(buy_cum[max_buy_idx])
+                else:
+                    top_buy_pair = prev_buy_pair
+                    buy_value = prev_buy_value
+                
+                if max_short_idx >= 0:
+                    top_short_pair = (int(pairs[max_short_idx, 0]), int(pairs[max_short_idx, 1]))
+                    short_value = float(short_cum[max_short_idx])
+                else:
+                    top_short_pair = prev_short_pair
+                    short_value = prev_short_value
                 
                 # Store TODAY's results (state after incorporating today's return)
                 daily_top_buy_pairs[date] = (top_buy_pair, buy_value)
@@ -1977,9 +2196,11 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         logger.info(f"Short signals: {s_counts.get('Short', 0)}")
         logger.info(f"None signals: {s_counts.get('None', 0)}")
 
-        # Now measure performance using the same df for returns
-        primary_dates = df_eff.index
-        result = calculate_metrics_from_signals(primary_signals, primary_dates, df_eff)
+        # Calculate metrics via Spymaster-faithful combined capture (then T-1)
+        ccc, active_pairs = _calculate_cumulative_combined_capture_spyfaithful(
+            df_eff, daily_top_buy_pairs, daily_top_short_pairs
+        )
+        result = _metrics_from_ccc(ccc)
         if result is not None:
             result['Primary Ticker'] = vendor_symbol
             metrics_list.append(result)
@@ -2052,6 +2273,10 @@ def get_random_mix():
 # DASH APP LAYOUT
 ##################
 
+# --- UI: active price-basis banner (Adj Close vs Close) ---
+_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
+_BASIS_TEXT = 'Adj Close' if _BASIS == 'adj' else 'Close'
+
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 
 app.layout = dbc.Container([
@@ -2065,6 +2290,18 @@ app.layout = dbc.Container([
                    style={'color': '#888', 'fontSize': '24px', 'fontFamily': 'monospace', 'marginBottom': '5px'}),
             html.P("Step 1: Build your trading signal database.",
                    style={'color': '#666', 'fontSize': '14px'}),
+            html.Div(
+                [
+                    html.Span("PRICE BASIS: ",
+                              style={'color': '#aaa', 'fontSize': '11px', 'letterSpacing': '1px'}),
+                    html.Strong(_BASIS_TEXT, id='basis-text',
+                                style={'color': '#00ff41', 'fontSize': '11px'})
+                ],
+                id='price-basis-banner',
+                style={'display': 'inline-block', 'marginTop': '6px', 'padding': '2px 8px',
+                       'borderRadius': '6px', 'backgroundColor': 'rgba(128,255,0,0.08)',
+                       'border': '1px solid rgba(128,255,0,0.25)'}
+            ),
             html.Hr(style={'borderColor': '#333', 'opacity': '0.3', 'marginTop': '20px', 'marginBottom': '20px'})
         ])
     ]),
