@@ -66,11 +66,20 @@ except Exception:
 # ---- ET tz constant used by market-clock helpers ----
 _ET_TZ = pytz.timezone("US/Eastern")
 
+# ---- Price basis configuration (Adj Close vs Close) ----
+# Controlled via PRICE_BASIS environment variable: 'adj' (default) or 'raw'
+_PRICE_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
+PRICE_COLUMN = 'Adj Close' if _PRICE_BASIS == 'adj' else 'Close'
+_BASIS_TEXT = PRICE_COLUMN  # for UI banner
+
 # --- DIAGNOSTIC UTILITIES -----------------------------------------------------
 import os, json, time, platform
 from typing import Any
 
 _DIAG = os.getenv("PRJCT9_DIAG", "1").lower() not in ("0", "false", "off")
+
+# Control verbose debug messages via environment variable
+VERBOSE_DEBUG = os.getenv("SPYMASTER_VERBOSE_DEBUG", "0").lower() in ("1", "true", "on")
 
 def _short(x: Any) -> str:
     try:
@@ -3539,9 +3548,16 @@ def _live_fingerprint_yf(ticker):
         first_date = df.index[0]  # Add first date for contamination detection
         last_date = df.index[-1]
         
-        # Prefer Adj Close if available
+        # Use configured price basis
         last_close = None
-        for col in ("Adj Close", "Adj_Close", "Close", "close"):
+        # Try preferred column first, then fallbacks
+        cols_to_try = [PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')]
+        if PRICE_COLUMN == 'Adj Close':
+            cols_to_try.extend(['Close', 'close'])
+        else:  # PRICE_COLUMN == 'Close'
+            cols_to_try.extend(['Adj Close', 'Adj_Close'])
+        
+        for col in cols_to_try:
             if col in df.columns:
                 last_close = _safe_float(df[col].iloc[-1])
                 if last_close is not None:
@@ -3595,9 +3611,16 @@ def _live_daily_fingerprint(ticker):
         df.index = pd.to_datetime(df.index).tz_localize(None)
         first_date, last_date = df.index[0], df.index[-1]
         
-        # Try to get adjusted close, fall back to close
+        # Use configured price basis
         last_close = None
-        for col in ("Adj Close", "Adj_Close", "Close", "close"):
+        # Try preferred column first, then fallbacks
+        cols_to_try = [PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')]
+        if PRICE_COLUMN == 'Adj Close':
+            cols_to_try.extend(['Close', 'close'])
+        else:  # PRICE_COLUMN == 'Close'
+            cols_to_try.extend(['Adj Close', 'Adj_Close'])
+        
+        for col in cols_to_try:
             if col in df.columns:
                 last_close = _safe_float(df[col].iloc[-1])
                 if last_close is not None:
@@ -3804,36 +3827,42 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
     except Exception as e:
         logger.debug(f"Index cleanup issue for {ticker}: {e}")
 
-    # Standardize columns to always have 'Close' (preferring Adj Close)
+    # Standardize columns to always have 'Close' (based on PRICE_COLUMN setting)
     if not df.empty:
         standardized_df = pd.DataFrame(index=df.index)
         
         # Handle different column structures from yfinance
         if isinstance(df.columns, pd.MultiIndex):
             # Multi-level columns (happens with some tickers)
+            # Try preferred price basis first
             for col in df.columns.levels[0]:
-                if 'Adj Close' in col or 'Adj_Close' in col:
+                if PRICE_COLUMN in col or PRICE_COLUMN.replace(' ', '_') in col:
                     standardized_df['Close'] = df[col].iloc[:, 0] if len(df[col].shape) > 1 else df[col]
-                    logger.debug(f"Standardized {ticker}: using Adj Close as price data")
+                    logger.debug(f"Standardized {ticker}: using {PRICE_COLUMN} as price data")
                     break
             else:
-                # Fallback to regular Close
+                # Fallback to any Close column if preferred not found
                 for col in df.columns.levels[0]:
                     if 'Close' in col:
                         standardized_df['Close'] = df[col].iloc[:, 0] if len(df[col].shape) > 1 else df[col]
-                        logger.debug(f"Standardized {ticker}: using Close as price data (Adj Close not available)")
+                        logger.debug(f"Standardized {ticker}: using Close as price data ({PRICE_COLUMN} not available)")
                         break
         else:
             # Single-level columns (most common case)
-            if 'Adj Close' in df.columns:
-                standardized_df['Close'] = df['Adj Close']
-                logger.debug(f"Standardized {ticker}: using Adj Close as price data")
-            elif 'Adj_Close' in df.columns:
-                standardized_df['Close'] = df['Adj_Close']
-                logger.debug(f"Standardized {ticker}: using Adj_Close as price data")
+            # Try preferred price basis first
+            if PRICE_COLUMN in df.columns:
+                standardized_df['Close'] = df[PRICE_COLUMN]
+                logger.debug(f"Standardized {ticker}: using {PRICE_COLUMN} as price data")
+            elif PRICE_COLUMN.replace(' ', '_') in df.columns:
+                standardized_df['Close'] = df[PRICE_COLUMN.replace(' ', '_')]
+                logger.debug(f"Standardized {ticker}: using {PRICE_COLUMN.replace(' ', '_')} as price data")
             elif 'Close' in df.columns:
                 standardized_df['Close'] = df['Close']
-                logger.debug(f"Standardized {ticker}: using Close as price data (Adj Close not available)")
+                logger.debug(f"Standardized {ticker}: using Close as price data ({PRICE_COLUMN} not available)")
+            elif 'Adj Close' in df.columns and PRICE_COLUMN == 'Close':
+                # If we want raw Close but only have Adj Close, use it as fallback
+                standardized_df['Close'] = df['Adj Close']
+                logger.debug(f"Standardized {ticker}: using Adj Close as fallback (Close not available)")
             else:
                 # Try case-insensitive search as last resort
                 for col in df.columns:
@@ -3984,7 +4013,8 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
             if isinstance(df, pd.DataFrame) and not df.empty:
                 _df_cache_put(ticker, df)
             
-            logger.info(f"[cache] RAM hit for {ticker} (req={request_key})")
+            if VERBOSE_DEBUG:
+                logger.info(f"[cache] RAM hit for {ticker} (req={request_key})")
             
         if ticker in _loading_in_progress and not bypass_loading_check:
             logger.debug(f"Loading in progress for {ticker} (bypass={bypass_loading_check})")
@@ -4055,8 +4085,9 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
                 "cache_status": results_mem.get('cache_status', 'unknown')
             })
             
-            logger.info(f"[cache] Disk hit for {ticker} (req={request_key}) file={pkl_file} "
-                        f"load_time={results_mem.get('load_time', 0):.3f}s")
+            if VERBOSE_DEBUG:
+                logger.info(f"[cache] Disk hit for {ticker} (req={request_key}) file={pkl_file} "
+                            f"load_time={results_mem.get('load_time', 0):.3f}s")
             
             # Check staleness asynchronously using a proper thread
             if not skip_staleness_check:
@@ -4505,12 +4536,14 @@ def precompute_results(ticker, event, cancel_event=None):
             import numpy as np
             
             # --- Extract a robust 1‑D Close series once (handles MultiIndex/1-col DataFrame cases) ---
+            # Try standardized 'Close' first (should be present after standardization)
             if 'Close' in df.columns:
                 close_series = df['Close']
-            elif 'Adj Close' in df.columns:
-                close_series = df['Adj Close']
-            elif 'Adj_Close' in df.columns:
-                close_series = df['Adj_Close']
+            # Fallback to raw price columns based on configured preference
+            elif PRICE_COLUMN in df.columns:
+                close_series = df[PRICE_COLUMN]
+            elif PRICE_COLUMN.replace(' ', '_') in df.columns:
+                close_series = df[PRICE_COLUMN.replace(' ', '_')]
             else:
                 # Fallback: first numeric column (guard against exotic inputs)
                 _num_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
@@ -4865,7 +4898,13 @@ def precompute_results(ticker, event, cancel_event=None):
                 last_close = None
 
             try:
-                last_adj = float(df['Adj Close'].iloc[-1]) if 'Adj Close' in df.columns else None
+                # Extract last price based on configured preference
+                if PRICE_COLUMN in df.columns:
+                    last_adj = float(df[PRICE_COLUMN].iloc[-1])
+                elif PRICE_COLUMN.replace(' ', '_') in df.columns:
+                    last_adj = float(df[PRICE_COLUMN.replace(' ', '_')].iloc[-1])
+                else:
+                    last_adj = None
             except Exception:
                 last_adj = None
 
@@ -5138,6 +5177,19 @@ app.layout = dbc.Container(
                     "letterSpacing": "2px",
                     "opacity": "0.8"
                 }
+            ),
+            html.Div(
+                [
+                    html.Span("PRICE BASIS: ",
+                              style={"color": "#aaa", "fontSize": "11px", "letterSpacing": "1px"}),
+                    html.Strong(_BASIS_TEXT, id="basis-text",
+                                style={"color": "#80ff00", "fontSize": "11px"})
+                ],
+                id="price-basis-banner",
+                className="text-center",
+                style={"display": "inline-block", "marginTop": "6px", "padding": "2px 8px",
+                       "borderRadius": "6px", "backgroundColor": "rgba(128,255,0,0.08)",
+                       "border": "1px solid rgba(128,255,0,0.25)"}
             ),
         ]),
         # Help modal (button now in navigation)
@@ -6907,7 +6959,8 @@ def _on_primary_change(ticker, prev_active):
 
     if prev == t:
         # Nothing actually changed; do NOT mint a new key.
-        print(f"[key] ticker unchanged -> keep key (ticker={t})")
+        if VERBOSE_DEBUG:
+            print(f"[key] ticker unchanged -> keep key (ticker={t})")
         raise PreventUpdate
 
     key = uuid.uuid4().hex
@@ -6923,7 +6976,8 @@ def _on_primary_change(ticker, prev_active):
     except Exception:
         pass
 
-    print(f"[key] NEW key for {t}: {key}")
+    if VERBOSE_DEBUG:
+        print(f"[key] NEW key for {t}: {key}")
     return key, t
 
 # _throttle_updates callback removed - was causing duplicate output conflicts
@@ -6974,7 +7028,8 @@ def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, cu
                         buy_sma1, buy_sma2 = top_buy_pair
                         short_sma1, short_sma2 = top_short_pair
                         # ALWAYS return the values when ticker changes and data is ready
-                        logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
+                        if VERBOSE_DEBUG:
+                            logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
                         return buy_sma1, buy_sma2, short_sma1, short_sma2
                     except (ValueError, TypeError):
                         pass
@@ -7008,7 +7063,8 @@ def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, cu
                 try:
                     buy_sma1, buy_sma2 = top_buy_pair
                     short_sma1, short_sma2 = top_short_pair
-                    logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
+                    if VERBOSE_DEBUG:
+                        logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
                     return buy_sma1, buy_sma2, short_sma1, short_sma2
                 except (ValueError, TypeError):
                     pass
@@ -8163,7 +8219,8 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     except Exception as _e:
         file_stat = {'status': 'error', 'note': f'read_status failed: {type(_e).__name__}: {str(_e)[:200]}'}
     
-    print(f"[AI DEBUG] Entry: ticker={ticker}, trigger={trigger_id}, fig_placeholder={is_placeholder}, file_status={file_stat.get('status')}, progress={file_stat.get('progress')}")
+    if VERBOSE_DEBUG:
+        print(f"[AI DEBUG] Entry: ticker={ticker}, trigger={trigger_id}, fig_placeholder={is_placeholder}, file_status={file_stat.get('status')}, progress={file_stat.get('progress')}")
     
     # Early guard - but with soft gate for cached results
     if is_placeholder:
@@ -8172,10 +8229,12 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         if _t:
             soft_results = load_precomputed_results(_t, from_callback=False, should_log=False)
             if soft_results and 'top_buy_pair' in soft_results and 'top_short_pair' in soft_results:
-                print(f"[AI DEBUG] Soft gate: Proceeding despite placeholder because results exist for {_t}")
+                if VERBOSE_DEBUG:
+                    print(f"[AI DEBUG] Soft gate: Proceeding despite placeholder because results exist for {_t}")
                 # Don't raise PreventUpdate - continue processing
             else:
-                print(f"[AI DEBUG] Hard gate: No results yet, waiting for real chart")
+                if VERBOSE_DEBUG:
+                    print(f"[AI DEBUG] Hard gate: No results yet, waiting for real chart")
                 raise PreventUpdate
         else:
             raise PreventUpdate
@@ -8202,7 +8261,8 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     
     # FALLBACK: If RAM cache isn't ready but pickle exists, load from disk
     if results is None:
-        print(f"[AI DEBUG] RAM cache miss for {ticker}, trying disk fallback...")
+        if VERBOSE_DEBUG:
+            print(f"[AI DEBUG] RAM cache miss for {ticker}, trying disk fallback...")
         pkl_file = f"cache/results/{ticker}_precomputed_results.pkl"
         if os.path.exists(pkl_file):
             try:
@@ -8210,12 +8270,15 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
                 with open(pkl_file, "rb") as f:
                     results = pickle.load(f)
                 if results and 'top_buy_pair' in results and 'top_short_pair' in results:
-                    print(f"[AI DEBUG] SUCCESS: Loaded from disk for {ticker}")
+                    if VERBOSE_DEBUG:
+                        print(f"[AI DEBUG] SUCCESS: Loaded from disk for {ticker}")
                 else:
-                    print(f"[AI DEBUG] Disk file exists but missing required keys")
+                    if VERBOSE_DEBUG:
+                        print(f"[AI DEBUG] Disk file exists but missing required keys")
                     results = None
             except Exception as e:
-                print(f"[AI DEBUG] Disk load failed: {e}")
+                if VERBOSE_DEBUG:
+                    print(f"[AI DEBUG] Disk load failed: {e}")
                 results = None
     
     # If still None after fallback, show status message
@@ -8224,10 +8287,12 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         msg = "Data not available. Please wait..."
         if fs.get('status') == 'processing':
             msg += f" Processing... {fs.get('progress', 0):.0f}%"
-        print(f"[AI DEBUG] No data found, returning: {msg}")
+        if VERBOSE_DEBUG:
+            print(f"[AI DEBUG] No data found, returning: {msg}")
         return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + [msg] + [""]
     else:
-        print(f"[AI DEBUG] Got results for {ticker} with {len(results)} keys")
+        if VERBOSE_DEBUG:
+            print(f"[AI DEBUG] Got results for {ticker} with {len(results)} keys")
     
     # Check file status but DON'T block if we have valid results from cache/fallback
     file_status = read_status(ticker)
@@ -8247,7 +8312,8 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
                 "progress": 100,
                 "cache_status": "fresh"
             })
-            print(f"[AI FIX] Updated stale status to complete for {ticker}")
+            if VERBOSE_DEBUG:
+                print(f"[AI FIX] Updated stale status to complete for {ticker}")
 
     top_buy_pair = results.get('top_buy_pair')
     top_short_pair = results.get('top_short_pair')
@@ -10493,7 +10559,8 @@ def update_output_and_reset(combined_capture, ticker, timing_summary_printed):
 
     # On ticker change: clear any stale overlay and reset printed flag.
     if trigger_id == 'ticker-input':
-        logger.info("[🧪 spinner.reset] ticker change -> clear overlay & reset flag")
+        if VERBOSE_DEBUG:
+            logger.info("[🧪 spinner.reset] ticker change -> clear overlay & reset flag")
         return "", False
 
     # Hide overlay as soon as the combined chart is REAL (not a placeholder)
@@ -10505,7 +10572,8 @@ def update_output_and_reset(combined_capture, ticker, timing_summary_printed):
         is_placeholder = True
 
     if not is_placeholder and not timing_summary_printed:
-        logger.info("[🧪 spinner.hide] combined chart is real -> hide overlay")
+        if VERBOSE_DEBUG:
+            logger.info("[🧪 spinner.hide] combined chart is real -> hide overlay")
         return "", True
 
     raise PreventUpdate
@@ -10637,22 +10705,22 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             signals = pd.Series(active_pairs, index=dates).loc[common_dates]
             signals = signals.astype(str)
             
-            # Extract Close prices robustly (prefer Adj Close like primary analysis)
-            # Check for Adj Close first (to match primary analysis behavior)
-            if 'Adj Close' in secondary_df.columns:
-                prices = secondary_df['Adj Close'].loc[common_dates]
-            elif 'Adj_Close' in secondary_df.columns:
-                prices = secondary_df['Adj_Close'].loc[common_dates]
+            # Extract Close prices robustly (use configured price basis)
+            # Check for configured price column first
+            if PRICE_COLUMN in secondary_df.columns:
+                prices = secondary_df[PRICE_COLUMN].loc[common_dates]
+            elif PRICE_COLUMN.replace(' ', '_') in secondary_df.columns:
+                prices = secondary_df[PRICE_COLUMN.replace(' ', '_')].loc[common_dates]
             elif 'Close' in secondary_df.columns:
                 prices = secondary_df['Close'].loc[common_dates]
             elif isinstance(secondary_df.columns, pd.MultiIndex):
                 # Handle multi-level columns from yfinance
-                # Try Adj Close first
-                adj_close_cols = [col for col in secondary_df.columns if col[0] == 'Adj Close' or col == 'Adj Close']
-                if adj_close_cols:
-                    prices = secondary_df[adj_close_cols[0]].loc[common_dates]
+                # Try configured price column first
+                price_cols = [col for col in secondary_df.columns if col[0] == PRICE_COLUMN or col == PRICE_COLUMN]
+                if price_cols:
+                    prices = secondary_df[price_cols[0]].loc[common_dates]
                 else:
-                    # Then try regular Close
+                    # Then try any Close column
                     close_cols = [col for col in secondary_df.columns if col[0] == 'Close' or col == 'Close']
                     if close_cols:
                         prices = secondary_df[close_cols[0]].loc[common_dates]
@@ -12460,7 +12528,8 @@ def console_input_handler():
     # Wait a moment for the server to start
     time.sleep(2)
     
-    logger.info(f"\n{Colors.OKGREEN}[🎯] Console input ready! Type 'help' for commands{Colors.ENDC}")
+    if VERBOSE_DEBUG:
+        logger.info(f"\n{Colors.OKGREEN}[🎯] Console input ready! Type 'help' for commands{Colors.ENDC}")
     
     while True:
         try:

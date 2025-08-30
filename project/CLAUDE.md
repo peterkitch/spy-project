@@ -405,6 +405,19 @@ Note: Machine learning integration, advanced analytics, and institutional featur
   - SMA 3 and SMA 4 cannot be the same value
 - Verify that metric reporting and dashboard visuals accurately reflect these flexible SMA pair configurations
 
+### Understanding SMA Pair Signal Logic
+**CRITICAL**: The same pair (e.g., 114,113) can be used for both buy and short signals with opposite comparison operators:
+- **Buy signal for pair (A,B)**: Triggered when SMA_A > SMA_B
+- **Short signal for pair (A,B)**: Triggered when SMA_A < SMA_B
+- Example: Pair (114,113) on day 0:
+  - Buy (114,113): Buy when SMA_114 > SMA_113
+  - Short (114,113): Short when SMA_114 < SMA_113
+  - These are opposite conditions using the same pair!
+- The "top" buy/short pair is the one with the highest cumulative capture for its respective signal type
+- Sentinel initialization values:
+  - Spymaster uses (MAX_SMA_DAY, MAX_SMA_DAY-1) = (114, 113) for both buy and short on day 0
+  - This represents impossible conditions initially (SMA_114 can't be both > and < SMA_113 simultaneously)
+
 ## Development Guidelines & Best Practices
 
 ### Repository Cleanliness & Organization

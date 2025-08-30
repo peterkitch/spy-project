@@ -205,6 +205,7 @@ else:
 MAX_SMA_DAY = 114
 ENGINE_VERSION = "1.0.0"  # Version for Signal Library compatibility
 SIGNAL_LIBRARY_DIR = "signal_library/data"  # Directory where onepass.py saves signals
+PERSIST_SKIP_BARS = 1  # T-1 persistence policy (skip last N bars when persisting)
 
 # Precompute pairs once at module level for efficiency
 PAIR_DTYPE = np.uint16 if MAX_SMA_DAY > 255 else np.uint8
@@ -233,6 +234,22 @@ def safe_divide(numerator, denominator, default=0):
     if not np.isfinite(result):
         return default
     return result
+
+def _reverse_argmax_global(arr):
+    """
+    PARITY HELPER: Find argmax with reverse tie-breaking (matches spymaster/onepass).
+    When multiple elements have the same max value, returns the LAST index.
+    
+    Args:
+        arr: numpy array or list
+    
+    Returns:
+        Index of maximum value (last occurrence if ties)
+    """
+    if len(arr) == 0:
+        return 0
+    # Reverse the array, find argmax, then convert back to original index
+    return len(arr) - 1 - np.argmax(arr[::-1])
 
 
 class VisualMetrics:
@@ -1150,7 +1167,7 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
                 time.sleep(wait_time)
     return pd.DataFrame(), ticker
 
-def _coerce_to_close_frame(df, preferred='Adj Close'):
+def _coerce_to_close_frame(df, preferred=None):
     """
     Helper function to handle various column structures from yfinance.
     Ensures we always get a clean DataFrame with a single 'Close' column.
@@ -1158,7 +1175,12 @@ def _coerce_to_close_frame(df, preferred='Adj Close'):
     Args:
         df: DataFrame from yfinance
         preferred: 'Adj Close' or 'Close' - which price basis to prefer
+                  If None, reads from PRICE_BASIS environment variable
     """
+    # Support environment variable for price basis if not explicitly provided
+    if preferred is None:
+        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+        preferred = 'Adj Close' if price_basis == 'adj' else 'Close'
     if df.empty:
         return pd.DataFrame()
     
@@ -1211,7 +1233,7 @@ def _coerce_to_close_frame(df, preferred='Adj Close'):
     logger.error(f"No Close/Adj Close data found in DataFrame")
     return pd.DataFrame()
 
-def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, reference_now=None, price_source='Adj Close'):
+def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, reference_now=None, price_source=None):
     """
     Fetch data with optional caching support
     
@@ -1222,10 +1244,15 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
         return_symbol: If True, return tuple (df, resolved_ticker)
         reference_now: Optional fixed timestamp for consistent session checks
         price_source: 'Adj Close' or 'Close' - which price basis to use
+                     If None, reads from PRICE_BASIS environment variable
     
     Returns:
         DataFrame or tuple (DataFrame, resolved_ticker) if return_symbol=True
     """
+    # Support environment variable for price basis if not explicitly provided
+    if price_source is None:
+        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+        price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
     if not ticker or not ticker.strip():
         if return_symbol:
             return pd.DataFrame(), ticker
@@ -1363,155 +1390,221 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
             return pd.DataFrame(), ticker
         return pd.DataFrame()
 
-def calculate_metrics_from_signals(primary_signals, primary_dates, secondary_df):
-    logger.debug("Calculating final metrics from generated signals...")
-    
-    # Extra prints to debug alignment issues
+def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_returns, persist_skip_bars=None):
+    """
+    Matches OnePass' metrics path and enforces T-1 (persist_skip_bars) before computing captures.
+    - Signals and returns are aligned by overlapping dates
+    - Returns are Close-to-Close pct change
+    - Captures: Buy => +ret*100, Short => -ret*100
+    """
+    # Default to module-level T-1 policy if not supplied
+    if persist_skip_bars is None:
+        persist_skip_bars = PERSIST_SKIP_BARS
+
+    # Enforce T-1 in metrics: drop in-flight last bar to avoid noisy P&L
+    if persist_skip_bars > 0 and len(df_for_returns) > persist_skip_bars:
+        df_for_returns = df_for_returns.iloc[:-persist_skip_bars].copy()
+        # Trim signals/dates to match if they are longer than df_for_returns
+        if len(primary_signals) > len(df_for_returns):
+            primary_signals = primary_signals[:len(df_for_returns)]
+        if len(primary_dates) > len(df_for_returns.index):
+            primary_dates = primary_dates[:len(df_for_returns.index)]
+
+    logger.debug("Calculating final metrics from generated signals.")
+
+    # Guard against empty inputs
+    if not primary_signals or len(primary_dates) == 0 or len(df_for_returns) == 0:
+        logger.debug(f"Empty inputs: signals={len(primary_signals)}, dates={len(primary_dates)}, df={len(df_for_returns)}")
+        return None
+
     logger.debug(f"Initial primary_signals length: {len(primary_signals)}")
     logger.debug(f"Initial primary_dates range: {primary_dates[0]} to {primary_dates[-1]} (len={len(primary_dates)})")
-    logger.debug(f"secondary_df index range: {secondary_df.index[0]} to {secondary_df.index[-1]} (len={len(secondary_df)})")
-    
-    # Guard against length mismatches (parity with onepass)
-    if len(primary_signals) != len(primary_dates):
-        n = min(len(primary_signals), len(primary_dates))
-        logger.warning(f"Signal/date length mismatch: signals={len(primary_signals)}, dates={len(primary_dates)}. Truncating to {n}.")
+    logger.debug(f"df_for_returns index range: {df_for_returns.index[0]} to {df_for_returns.index[-1]} (len={len(df_for_returns)})")
+
+    # Normalize primary_dates to a DatetimeIndex
+    primary_dates = pd.DatetimeIndex(primary_dates)
+
+    # Length mismatch guard (library reuse / session guards)
+    n_dates = len(primary_dates)
+    n_signals = len(primary_signals)
+    if n_signals != n_dates:
+        n = min(n_signals, n_dates)
+        logger.warning(f"Signal/date length mismatch: signals={n_signals}, dates={n_dates}. Truncating to {n}.")
         signals = pd.Series(primary_signals[:n], index=primary_dates[:n])
     else:
         signals = pd.Series(primary_signals, index=primary_dates)
 
-    logger.debug(f"Signals head (unshifted):\n{signals.head(5)}")
-    logger.debug(f"Signals tail (unshifted):\n{signals.tail(5)}")
-    
-    # Get common dates between signals and prices
-    common_dates = sorted(set(primary_dates) & set(secondary_df.index))
-    logger.debug(f"Number of common dates between signals & secondary: {len(common_dates)}")
-
-    if len(common_dates) < 2:  # Only need 2 days minimum for valid calculations
+    # Overlapping dates
+    common_dates = sorted(set(primary_dates) & set(df_for_returns.index))
+    logger.debug(f"Number of common dates between signals & data: {len(common_dates)}")
+    if len(common_dates) < 2:
         logger.debug("Insufficient overlapping dates for metrics calculation.")
         return None
-        
-    # Use all valid dates - MAX_SMA_DAY is just for SMA calculations
-    valid_dates = common_dates
-    
-    # Now reindex both series to valid dates
-    signals = signals.reindex(valid_dates).fillna('None')
-    prices = secondary_df['Close'].reindex(valid_dates)
-    
-    logger.debug(f"Signals head after reindex:\n{signals.head(5)}")
-    logger.debug(f"Prices head after reindex:\n{prices.head(5)}")
-    
-    # Returns are calculated after date alignment but before signal processing
-    daily_returns = prices.pct_change()
-    
-    logger.debug(f"Daily returns head (pre-shift alignment):\n{daily_returns.head(5)}")
-    
-    # NEW: Drop days where pct_change is NaN (first aligned day) - PARITY CRITICAL
-    valid = daily_returns.notna()
-    signals = signals.loc[valid]
-    daily_returns = daily_returns.loc[valid]
-    
-    logger.debug(f"After dropping NaN returns: {len(signals)} signals remaining")
-    logger.debug(f"Signals head (NO SHIFT):\n{signals.head(5)}")
 
-    logger.debug(f"Signals index after dropping first date: {signals.index[0]} ... {signals.index[-1]}")
-    logger.debug(f"Daily returns index after dropping first date: {daily_returns.index[0]} ... {daily_returns.index[-1]}")
-    
-    # Clean signals and create masks
-    signals = signals.fillna('None').str.strip()  # Ensure no NaN values
+    # Align signals and prices to common dates
+    signals = signals.reindex(common_dates).fillna('None').str.strip()
+    prices = df_for_returns['Close'].reindex(common_dates)
+
+    # Daily returns (fill first diff as 0 to keep indices aligned)
+    daily_returns = prices.pct_change().fillna(0)
+
+    # Vectorized capture
     buy_mask = signals.eq('Buy')
     short_mask = signals.eq('Short')
     trigger_mask = buy_mask | short_mask
     trigger_days = int(trigger_mask.sum())
-
-    logger.debug(f"Final signals distribution:\n{signals.value_counts()}")
-    logger.debug(f"Number of trigger days: {trigger_days}")
-
     if trigger_days == 0:
         logger.debug("No trigger days found, no metrics to report.")
         return None
 
-    # Calculate captures for trigger days
     daily_captures = pd.Series(0.0, index=signals.index)
-    daily_captures.loc[buy_mask] = daily_returns.loc[buy_mask] * 100
-    daily_captures.loc[short_mask] = -daily_returns.loc[short_mask] * 100
+    daily_captures.loc[buy_mask] = daily_returns.loc[buy_mask] * 100.0
+    daily_captures.loc[short_mask] = -daily_returns.loc[short_mask] * 100.0
 
-    # Get captures only for trigger days
-    signal_captures = daily_captures[trigger_mask]
-
-    logger.debug(f"Sample of signal_captures:\n{signal_captures.head(10)}\n...\n{signal_captures.tail(10)}")
-
-    # Defensive math: explicitly drop NaN values (redundant after Patch #1, but safe)
-    signal_captures = signal_captures.dropna()
-    
-    # Calculate basic metrics
+    # Stats over trigger days only
+    signal_captures = daily_captures[trigger_mask].dropna()
     wins = (signal_captures > 0).sum()
     losses = trigger_days - wins
-    win_ratio = (wins / trigger_days * 100)
-    avg_daily_capture = signal_captures.mean()
-    total_capture = signal_captures.sum()
-    
-    logger.debug(f"wins={wins}, losses={losses}, win_ratio={win_ratio:.2f}%")
-    logger.debug(f"avg_daily_capture={avg_daily_capture:.4f}%, total_capture={total_capture:.4f}%")
-    
-    # Calculate standard deviation using ddof=1 for sample standard deviation
+    win_ratio = (wins / trigger_days * 100.0) if trigger_days else 0.0
+    avg_daily_capture = signal_captures.mean() if trigger_days else 0.0
+    total_capture = signal_captures.sum() if trigger_days else 0.0
+
     if trigger_days > 1:
         std_dev = signal_captures.std(ddof=1)
-        
-        # Calculate Sharpe ratio
-        risk_free_rate = 5.0  # 5% annual rate
-        annualized_return = avg_daily_capture * 252
-        annualized_std = std_dev * np.sqrt(252)
+        risk_free_rate = 5.0
+        annualized_return = avg_daily_capture * 252.0
+        annualized_std = std_dev * np.sqrt(252.0)
         sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std != 0 else 0.0
-        # Ensure Sharpe ratio is real
-        if isinstance(sharpe_ratio, complex):
-            sharpe_ratio = sharpe_ratio.real
-        
-        # Calculate t-statistic and p-value
-        if std_dev == 0:
-            t_statistic, p_value = None, None
-        else:
-            t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
-            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=trigger_days - 1))
+        t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days)) if std_dev != 0 else None
+        p_value = (2 * (1 - stats.t.cdf(abs(t_statistic), df=trigger_days - 1))) if t_statistic else None
     else:
         std_dev = 0.0
         sharpe_ratio = 0.0
         t_statistic = None
         p_value = None
 
-    # Determine significance levels
-    significant_90 = 'Yes' if p_value is not None and p_value < 0.10 else 'No'
-    significant_95 = 'Yes' if p_value is not None and p_value < 0.05 else 'No'
-    significant_99 = 'Yes' if p_value is not None and p_value < 0.01 else 'No'
-
-    logger.debug(
-        f"Metrics:\n"
-        f"  Trigger Days={trigger_days}\n"
-        f"  Wins={wins}\n"
-        f"  Losses={losses}\n"
-        f"  Win Ratio={win_ratio:.2f}%\n"
-        f"  StdDev={std_dev:.4f}%\n"
-        f"  Sharpe Ratio={sharpe_ratio:.2f}\n"
-        f"  Avg Daily Capture={avg_daily_capture:.4f}%\n"
-        f"  Total Capture={total_capture:.4f}%\n"
-        f"  t-Statistic={t_statistic if t_statistic is not None else 'N/A'}\n"
-        f"  p-Value={p_value if p_value is not None else 'N/A'}"
-    )
+    significant_90 = 'Yes' if p_value and p_value < 0.10 else 'No'
+    significant_95 = 'Yes' if p_value and p_value < 0.05 else 'No'
+    significant_99 = 'Yes' if p_value and p_value < 0.01 else 'No'
 
     return {
-        'Primary Ticker': '',  # Will be filled later
-        'Trigger Days': trigger_days,
+        'Total Capture (%)': float(total_capture),
+        'Average Daily Capture (%)': float(avg_daily_capture),
+        'Trigger Days': int(trigger_days),
         'Wins': int(wins),
         'Losses': int(losses),
-        'Win Ratio (%)': round(win_ratio, 2),
-        'Std Dev (%)': round(std_dev, 4),
-        'Sharpe Ratio': round(sharpe_ratio, 2),
-        'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-        'Total Capture (%)': round(total_capture, 4),
-        't-Statistic': round(t_statistic, 4) if t_statistic is not None else 'N/A',
-        'p-Value': round(p_value, 4) if p_value is not None else 'N/A',
-        'Significant 90%': significant_90,
-        'Significant 95%': significant_95,
-        'Significant 99%': significant_99
+        'Win Ratio (%)': float(win_ratio),
+        'Std Dev (%)': float(std_dev),
+        'Sharpe Ratio': float(sharpe_ratio) if np.isfinite(sharpe_ratio) else 0.0,
+        't-Statistic': None if t_statistic is None else float(t_statistic),
+        'p-Value': None if p_value is None else float(p_value),
+        'Significant @90%?': significant_90,
+        'Significant @95%?': significant_95,
+        'Significant @99%?': significant_99
+    }
+
+def _align_pairs_to_calendar_spyfaithful(dates, daily_top_buy_pairs_raw, daily_top_short_pairs_raw):
+    """
+    Align per-day top pairs dicts to the full price calendar, filling gaps with sentinels.
+    Buy sentinel:   (MAX_SMA_DAY,   MAX_SMA_DAY-1)
+    Short sentinel: (MAX_SMA_DAY-1, MAX_SMA_DAY)
+    """
+    msd = MAX_SMA_DAY
+    buy_sentinel = ((msd,   msd-1), 0.0)
+    short_sentinel = ((msd-1, msd), 0.0)
+
+    # Normalize keys to Timestamps
+    def _normalize(d):
+        return {pd.Timestamp(k): v for k, v in (d or {}).items()}
+
+    b_raw = _normalize(daily_top_buy_pairs_raw)
+    s_raw = _normalize(daily_top_short_pairs_raw)
+
+    buy_aligned = {}
+    short_aligned = {}
+    for dt in pd.DatetimeIndex(dates):
+        buy_aligned[dt] = b_raw.get(dt, buy_sentinel)
+        short_aligned[dt] = s_raw.get(dt, short_sentinel)
+
+    return buy_aligned, short_aligned
+
+
+def _calculate_cumulative_combined_capture_spyfaithful(df, daily_top_buy_pairs, daily_top_short_pairs):
+    """
+    Spymaster-faithful CCC:
+      - Use YESTERDAY's top Buy/Short pairs to choose TODAY's action
+      - Gate with yesterday's SMAs (i>j => Buy; i<j => Short)
+      - Tie-break: follow the larger previous capture (short-on-equality)
+      - Captures are percent (Close-to-Close * 100)
+    """
+    if df is None or len(df) == 0:
+        return pd.Series(dtype='float64'), []
+
+    dates = df.index
+    close_vals = df['Close'].to_numpy(dtype='float64')
+    n = len(close_vals)
+
+    # Precompute SMA matrix [n x MAX_SMA_DAY]
+    sma = np.full((n, MAX_SMA_DAY), np.nan, dtype='float64')
+    csum = np.cumsum(np.insert(close_vals, 0, 0.0))
+    for k in range(1, MAX_SMA_DAY+1):
+        v = np.arange(k-1, n)
+        sma[v, k-1] = (csum[v+1] - csum[v+1-k]) / k
+
+    def _sma_at(day_idx, m, col):
+        if day_idx < 0:
+            return np.nan
+        return m[day_idx, col-1] if (1 <= col <= MAX_SMA_DAY) else np.nan
+
+    ccc = []
+    active_pairs = []
+    cumulative = 0.0
+
+    for i, cur_dt in enumerate(dates):
+        if i == 0:
+            active_pairs.append('None')
+            ccc.append(0.0)
+            continue
+
+        prev_dt = dates[i-1]
+        (pb_pair, pb_cap) = daily_top_buy_pairs[prev_dt]
+        (ps_pair, ps_cap) = daily_top_short_pairs[prev_dt]
+
+        y_idx = i - 1
+        buy_ok = np.isfinite(_sma_at(y_idx, sma, pb_pair[0])) and np.isfinite(_sma_at(y_idx, sma, pb_pair[1])) \
+                 and (_sma_at(y_idx, sma, pb_pair[0]) > _sma_at(y_idx, sma, pb_pair[1]))
+        short_ok = np.isfinite(_sma_at(y_idx, sma, ps_pair[0])) and np.isfinite(_sma_at(y_idx, sma, ps_pair[1])) \
+                   and (_sma_at(y_idx, sma, ps_pair[0]) < _sma_at(y_idx, sma, ps_pair[1]))
+
+        if buy_ok and short_ok:
+            current = f"Buy {pb_pair[0]},{pb_pair[1]}" if (pb_cap > ps_cap) else f"Short {ps_pair[0]},{ps_pair[1]}"
+        elif buy_ok:
+            current = f"Buy {pb_pair[0]},{pb_pair[1]}"
+        elif short_ok:
+            current = f"Short {ps_pair[0]},{ps_pair[1]}"
+        else:
+            current = "None"
+
+        # Daily return as percent
+        day_ret = (close_vals[i] / close_vals[i-1] - 1.0) * 100.0
+        daily_capture = day_ret if current.startswith('Buy') else (-day_ret if current.startswith('Short') else 0.0)
+        cumulative += daily_capture
+        ccc.append(cumulative)
+        active_pairs.append(current)
+
+    return pd.Series(ccc, index=dates), active_pairs
+
+
+def _metrics_from_ccc(ccc_series):
+    """Translate combined capture series into OnePass/Spymaster metrics."""
+    if ccc_series is None or len(ccc_series) == 0:
+        return None
+    total = float(ccc_series.iloc[-1])
+    return {
+        'Total Capture (%)': total,
+        'Buy Capture (%)': None,
+        'Short Capture (%)': None,
+        'Trigger Days': int((ccc_series.diff().abs() > 0).sum())
     }
 
 def export_results_to_excel(output_filename, metrics_list):
@@ -1627,7 +1720,9 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     primary_dates = None
     
     # Check if we have a library to get price_source from
-    price_source = 'Adj Close'  # Default
+    # Support switching between 'Adj Close' and 'Close' via environment variable
+    price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+    price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
     temp_lib = load_signal_library(prim_ticker)
     if temp_lib and 'price_source' in temp_lib:
         price_source = temp_lib['price_source']
@@ -1724,6 +1819,14 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         if 'dates' in signal_data:
             stored_dates = signal_data['dates']
             primary_dates = df.index
+            
+            # T-1 PARITY FIX: Only use dates that have corresponding signals
+            # OnePass saves N-1 signals for N days of data (T-1 persistence)
+            # So we should only use the first N-1 days from df
+            if len(primary_dates) > len(stored_dates):
+                # Trim primary_dates to match signal count
+                primary_dates = primary_dates[:len(stored_dates)]
+                logger.info(f"T-1 alignment: Using {len(primary_dates)} days to match {len(stored_dates)} stored signals")
             
             # Build dict once for O(1) lookups - fixes O(N²) issue
             signal_map = {date: signal for date, signal in zip(stored_dates, primary_signals)}
@@ -1822,8 +1925,9 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         for idx, date in enumerate(df.index):
             # Skip first day - can't trade without previous day's signals
             if idx == 0:
-                daily_top_buy_pairs[date] = ((1, 2), 0.0)
-                daily_top_short_pairs[date] = ((1, 2), 0.0)
+                # PARITY FIX: Use sentinel pair (114, 113) to match spymaster and onepass
+                daily_top_buy_pairs[date] = ((114, 113), 0.0)
+                daily_top_short_pairs[date] = ((114, 113), 0.0)
                 continue
             
             # Use PREVIOUS day's SMAs to generate signals
@@ -1847,7 +1951,8 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                 if short_mask.any():
                     short_cum[short_mask] += -r  # Gain from shorting = negative of market return
             
-            # Find top pairs with reverse tie-breaking
+            # Find top pairs with reverse tie-breaking (global, not filtered by valid mask)
+            # PARITY FIX: Use global reverse argmax exactly like spymaster
             max_buy_idx = len(buy_cum) - 1 - np.argmax(buy_cum[::-1])
             max_short_idx = len(short_cum) - 1 - np.argmax(short_cum[::-1])
             
@@ -1906,7 +2011,8 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     else:
         # We already have pre-computed signals (V2 path)
         logger.info(f"Using {len(primary_signals)} pre-computed signals from Signal Library V2")
-        primary_dates = df.index
+        # primary_dates was already set correctly in the alignment section above
+        # DO NOT reset it to df.index here!
 
     logger.info(f"Calculating final metrics for {prim_ticker}...")
     logger.info(f"Signal distribution before metrics calculation:")
@@ -1915,7 +2021,46 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     logger.info(f"Short signals: {signal_counts.get('Short', 0)}")
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
     
-    result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
+    # SELF-CORRELATION: If secondary is effectively the same series as primary,
+    # compute performance via the Spymaster/OnePass CCC path (pair-gated, T-1 aligned).
+    _self_corr = False
+    try:
+        _self_corr = (
+            sec_df is not None and df is not None and
+            len(sec_df) == len(df) and
+            sec_df.index.equals(df.index) and
+            'Close' in sec_df and 'Close' in df and
+            np.allclose(
+                sec_df['Close'].to_numpy(dtype='float64'),
+                df['Close'].to_numpy(dtype='float64'),
+                equal_nan=True
+            )
+        )
+    except Exception:
+        _self_corr = False
+
+    if _self_corr:
+        # Prefer pairs from the signal library if available; else fall back to locally computed daily_top_*.
+        _lib = locals().get('signal_data', None)
+        _buy_pairs_raw = (_lib.get('daily_top_buy_pairs') if _lib else None) or locals().get('daily_top_buy_pairs')
+        _short_pairs_raw = (_lib.get('daily_top_short_pairs') if _lib else None) or locals().get('daily_top_short_pairs')
+
+        if _buy_pairs_raw is None or _short_pairs_raw is None:
+            logger.warning("Self-corr detected but daily top pairs not found; falling back to signal-based metrics.")
+            result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
+        else:
+            # Align pairs to the calendar (fills any gaps with sentinels) then compute CCC exactly
+            _bp_aligned, _sp_aligned = _align_pairs_to_calendar_spyfaithful(df.index, _buy_pairs_raw, _short_pairs_raw)
+
+            # Enforce T-1 policy before CCC (drop in-flight bar like OnePass persistence)
+            _df_eff = df.iloc[:-PERSIST_SKIP_BARS] if (PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS) else df
+
+            ccc, _ = _calculate_cumulative_combined_capture_spyfaithful(_df_eff, _bp_aligned, _sp_aligned)
+            result = _metrics_from_ccc(ccc)
+    else:
+        # Cross-ticker path (unchanged)
+        result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
+    
     if result is not None:
         # Track all ticker names for transparency
         result['Primary Ticker'] = requested_ticker  # What user asked for
@@ -1963,11 +2108,14 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
         logger.info(f"Secondary ticker resolved {secondary_ticker} -> {sec_resolved}")
     
     # Coerce secondary once (we use it read-only everywhere)
-    sec_df = _coerce_to_close_frame(sec_raw, preferred='Adj Close')
+    # Use same price basis as primary tickers
+    price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+    price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
+    sec_df = _coerce_to_close_frame(sec_raw, preferred=price_source)
     # De-dup & sort to avoid rare vendor duplicate rows
     sec_df = sec_df[~sec_df.index.duplicated(keep='last')].sort_index()
     if sec_df.empty:
-        logger.error(f"No Adj Close series for secondary {sec_resolved}, cannot proceed.")
+        logger.error(f"No {price_source} series for secondary {sec_resolved}, cannot proceed.")
         return []
     
     # Session guard for secondary too
@@ -2041,6 +2189,10 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     return metrics_list
 
 # Create Dash app
+# --- UI: active price-basis banner (Adj Close vs Close) ---
+_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
+_BASIS_TEXT = 'Adj Close' if _BASIS == 'adj' else 'Close'
+
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 
 # Define the layout
@@ -2051,7 +2203,19 @@ app.layout = dbc.Container([
             html.H1("Impact Analysis Tool", 
                    style={'color': '#00ff41', 'textShadow': '0 0 10px rgba(0, 255, 65, 0.5)'}),
             html.P("Analyze the impact of primary tickers on secondary ticker performance using SMA-based signals",
-                  style={'color': '#aaa'})
+                  style={'color': '#aaa'}),
+            html.Div(
+                [
+                    html.Span("PRICE BASIS: ",
+                              style={'color': '#aaa', 'fontSize': '11px', 'letterSpacing': '1px'}),
+                    html.Strong(_BASIS_TEXT, id='basis-text',
+                                style={'color': '#00ff41', 'fontSize': '11px'})
+                ],
+                id='price-basis-banner',
+                style={'display': 'inline-block', 'marginTop': '6px', 'padding': '2px 8px',
+                       'borderRadius': '6px', 'backgroundColor': 'rgba(128,255,0,0.08)',
+                       'border': '1px solid rgba(128,255,0,0.25)'}
+            )
         ])
     ], className='mb-4'),
     
