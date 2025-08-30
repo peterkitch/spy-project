@@ -3097,7 +3097,8 @@ def _queue_missing_primaries(primary_tickers):
         if st.get("status") not in ("processing", "queued"):
             write_status(ticker, {'status': 'queued', 'progress': 0})
 
-        print(f"[OPTIMIZATION] Ticker {ticker} not ready (status: {st.get('status')}), added to processing queue")
+        if VERBOSE_DEBUG:
+            print(f"[OPTIMIZATION] Ticker {ticker} not ready (status: {st.get('status')}), added to processing queue")
 
     # Ensure the worker thread is running if we enqueued anything
     if enqueued:
@@ -6261,6 +6262,17 @@ app.layout = dbc.Container(
         html.H2('Automated Signal Optimization', className='text-center mt-5'),
         html.P('Find the best combination of primary tickers to maximize secondary ticker performance', 
                className='text-center text-muted mb-4', style={'fontSize': '14px'}),
+        
+        # WARNING: Under Construction
+        dbc.Alert([
+            html.I(className="fas fa-exclamation-triangle me-2"),
+            html.Strong("UNDER CONSTRUCTION: "),
+            "This section contains a known logic bug and is being actively revised. Results may be unreliable. Please use with caution."
+        ], color="warning", className="mb-4", style={
+            'border': '2px solid #ff8800',
+            'backgroundColor': 'rgba(255, 136, 0, 0.1)'
+        }),
+        
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -11875,7 +11887,8 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
             if not rate_limit('opt_interval', 0.5):
                 raise PreventUpdate
         
-        logger.info(f"OPTIMIZE_SIGNALS called: triggered_id={triggered_id}, n_clicks={n_clicks}, primary={primary_tickers_input}, secondary={secondary_ticker_input}")
+        if VERBOSE_DEBUG:
+            logger.info(f"OPTIMIZE_SIGNALS called: triggered_id={triggered_id}, n_clicks={n_clicks}, primary={primary_tickers_input}, secondary={secondary_ticker_input}")
         
         # Sanitize inputs server-side
         primary_tickers_sanitized = sanitize_ticker_input(primary_tickers_input or "", max_tickers=20)
@@ -11999,7 +12012,8 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
 
         # Handle button click – or interval force-run – check readiness and queue if needed
         if triggered_id == 'optimize-signals-button' or force_run:
-            logger.info(f"OPTIMIZATION BUTTON CLICKED! n_clicks={n_clicks}")
+            if VERBOSE_DEBUG:
+                logger.info(f"OPTIMIZATION BUTTON CLICKED! n_clicks={n_clicks}")
             if not n_clicks:
                 raise PreventUpdate
             if optimization_in_progress:
@@ -12221,13 +12235,16 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
         # === Begin critical section ===
         # Take the lock only after inputs & data are validated and loaded.
         if optimization_in_progress:
-            logger.info(f"OPTIMIZATION BLOCKED - already in progress")
+            if VERBOSE_DEBUG:
+                logger.info(f"OPTIMIZATION BLOCKED - already in progress")
             return [], empty_columns, "Optimization already in progress. Please wait...", False
         if not optimization_lock.acquire(blocking=False):
-            logger.info(f"OPTIMIZATION BLOCKED - couldn't acquire lock")
+            if VERBOSE_DEBUG:
+                logger.info(f"OPTIMIZATION BLOCKED - couldn't acquire lock")
             return [], empty_columns, "Another optimization is in progress. Please wait...", False
         optimization_in_progress = True
-        logger.info(f"OPTIMIZATION STARTED - Lock acquired, processing {len(primary_tickers)} primaries with {secondary_ticker}")
+        if VERBOSE_DEBUG:
+            logger.info(f"OPTIMIZATION STARTED - Lock acquired, processing {len(primary_tickers)} primaries with {secondary_ticker}")
         # (No explicit return in this region; the function-level 'finally' below will always release the lock.)
 
         # Generate possible states for each ticker based on next day's signals
@@ -12524,7 +12541,9 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                             continue
                 
                 fixed_results = [averages] + sortable_data
-                optimization_results_cache[cache_key] = (fixed_results, columns, 'Optimization complete. Please verify the results by manually entering the target combination into the Multi-Primary Signal Aggregator.', current_sort)
+                success_message = html.Div('Optimization complete. Click any ticker combination cell to auto-populate in Multi-Primary Signal Aggregator.', 
+                                          style={'color': '#80ff00'})
+                optimization_results_cache[cache_key] = (fixed_results, columns, success_message, current_sort)
                 _enforce_cache_limits()
             else:
                 optimization_results_cache[cache_key] = ([], columns, 'No valid combinations found.', None)
