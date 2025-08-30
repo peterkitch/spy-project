@@ -76,7 +76,7 @@ _BASIS_TEXT = PRICE_COLUMN  # for UI banner
 import os, json, time, platform
 from typing import Any
 
-_DIAG = os.getenv("PRJCT9_DIAG", "1").lower() not in ("0", "false", "off")
+_DIAG = os.getenv("PRJCT9_DIAG", "0").lower() not in ("0", "false", "off")
 
 # Control verbose debug messages via environment variable
 VERBOSE_DEBUG = os.getenv("SPYMASTER_VERBOSE_DEBUG", "0").lower() in ("1", "true", "on")
