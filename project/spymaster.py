@@ -53,8 +53,16 @@ def submit_bg(fn, *args, **kwargs):
         try:
             fn(*args, **kwargs)
         except Exception as e:
-            logger.error(f"Background job failed inline: {e}")
+            # logger may not be initialized yet during early import errors
+            try:
+                logger.error(f"Background job failed inline: {e}")
+            except Exception:
+                print(f"[spymaster] Background job failed inline: {e}")
         return None
+
+# Ensure worker threads don't linger across reloads or exit
+import atexit as _spymaster_atexit  # already imported earlier; safe alias
+_spymaster_atexit.register(lambda: _job_pool.shutdown(wait=False, cancel_futures=True))
 
 # ---- Optional calendar for authoritative NYSE sessions (incl. early closes) ----
 try:
@@ -80,6 +88,11 @@ _DIAG = os.getenv("PRJCT9_DIAG", "0").lower() not in ("0", "false", "off")
 
 # Control verbose debug messages via environment variable
 VERBOSE_DEBUG = os.getenv("SPYMASTER_VERBOSE_DEBUG", "0").lower() in ("1", "true", "on")
+
+# --- Central debug switch used everywhere -------------------------------------
+def debug_enabled() -> bool:
+    """True when any debug mode is active (DIAG or VERBOSE)."""
+    return bool(_DIAG or VERBOSE_DEBUG)
 
 def _short(x: Any) -> str:
     try:
@@ -108,7 +121,7 @@ def _fig_meta(fig) -> dict:
             return {"placeholder": None, "uirevision": None, "datarevision": None}
 
 def dlog(tag: str, **fields):
-    if not _DIAG:
+    if not debug_enabled():
         return
     # keep prints small & structured
     safe = {}
@@ -119,7 +132,7 @@ def dlog(tag: str, **fields):
     print(f"[🧪 {tag}] {json.dumps(safe, default=str)}", flush=True)
 
 # one-time environment banner
-if _DIAG:
+if debug_enabled():
     try:
         import dash, plotly
         print("──────────────── DIAG ON ────────────────", flush=True)
@@ -2832,6 +2845,28 @@ if not has_file:
 # Prevent logger from propagating messages to the root logger
 logger.propagate = False
 
+# Keep references to handlers for dynamic level control
+# (Note: FileHandler subclasses StreamHandler, so exclude it when choosing console)
+CONSOLE_HANDLER = next(
+    (h for h in logger.handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)),
+    None
+)
+FILE_HANDLER = next((h for h in logger.handlers if isinstance(h, logging.FileHandler)), None)
+
+def _apply_debug_levels():
+    """Apply effective debug level to console handler without restart."""
+    lvl = logging.DEBUG if debug_enabled() else logging.INFO
+    try:
+        if CONSOLE_HANDLER:
+            CONSOLE_HANDLER.setLevel(lvl)
+        # keep file handler at DEBUG to capture everything on disk
+        logger.setLevel(logging.DEBUG if debug_enabled() else logging.INFO)  # ensures .debug() is emitted to console when enabled
+    except Exception:
+        pass
+
+# Apply once on import (honors startup env)
+_apply_debug_levels()
+
 # Enhanced logging functions with colors
 def log_separator(char="═", color=Colors.DIM_GREEN, width=80):
     logger.info(color + char * width + Colors.ENDC)
@@ -3999,12 +4034,13 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
             if request_key:
                 results['request_key'] = request_key
             
-            # Only print the big banner when this was triggered by the ticker change
-            if from_callback and should_log:
+            # Always show ticker entry for user feedback
+            if from_callback:
                 dedup_logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
-                log_ticker_section(ticker, "LOADING CACHED DATA")
-                status_msg = results.get('cache_status', 'unknown')
-                dedup_logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker} ({status_msg}){Colors.ENDC}")
+                if should_log:
+                    log_ticker_section(ticker, "LOADING CACHED DATA")
+                    status_msg = results.get('cache_status', 'unknown')
+                    dedup_logger.info(f"{Colors.OKGREEN}[✅] Using session-cached data for {ticker} ({status_msg}){Colors.ENDC}")
             else:
                 logger.debug(f"Using session-cached data for {ticker}")
             
@@ -4013,7 +4049,7 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
             if isinstance(df, pd.DataFrame) and not df.empty:
                 _df_cache_put(ticker, df)
             
-            if VERBOSE_DEBUG:
+            if debug_enabled():
                 logger.info(f"[cache] RAM hit for {ticker} (req={request_key})")
             
         if ticker in _loading_in_progress and not bypass_loading_check:
@@ -4070,13 +4106,14 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
             if request_key:
                 results_mem['request_key'] = request_key
             
-            # Only log when triggered by ticker change
-            if from_callback and should_log:
+            # Always show ticker entry for user feedback
+            if from_callback:
                 logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
-                logger.info(f"{Colors.OKGREEN}[✅] Loaded existing results from file cache{Colors.ENDC}")
-                # Show cache load time
-                load_time = results_mem.get('load_time', 0)
-                logger.info(f"{Colors.OKGREEN}Cache load time:{Colors.ENDC} {Colors.YELLOW}{load_time:.3f} seconds{Colors.ENDC}")
+                if should_log:
+                    logger.info(f"{Colors.OKGREEN}[✅] Loaded existing results from file cache{Colors.ENDC}")
+                    # Show cache load time
+                    load_time = results_mem.get('load_time', 0)
+                    logger.info(f"{Colors.OKGREEN}Cache load time:{Colors.ENDC} {Colors.YELLOW}{load_time:.3f} seconds{Colors.ENDC}")
             
             # Write status as complete so interval callbacks don't block
             write_status(ticker, {
@@ -4085,7 +4122,7 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
                 "cache_status": results_mem.get('cache_status', 'unknown')
             })
             
-            if VERBOSE_DEBUG:
+            if debug_enabled():
                 logger.info(f"[cache] Disk hit for {ticker} (req={request_key}) file={pkl_file} "
                             f"load_time={results_mem.get('load_time', 0):.3f}s")
             
@@ -4115,6 +4152,9 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
             return None
 
         # We are the first to schedule; log exactly once here.
+        # Always show ticker entry for user feedback
+        if from_callback:
+            logger.info(f"{Colors.CYAN}[🔍] User entered ticker: {Colors.YELLOW}{ticker}{Colors.ENDC}")
         log_ticker_section(ticker, "COMPUTING NEW DATA")
         log_processing(f"Starting to precompute results for {ticker}...")
 
@@ -4281,9 +4321,11 @@ def ensure_df_available(ticker: str, results: dict = None):
     # 2) Single-flight guarded disk load
     tk = normalize_ticker(ticker)
     lock = _df_load_locks[tk]
-    if not lock.acquire(blocking=False):
-        # Someone else is loading this DF right now; avoid pile-ups.
-        logger.debug(f"DF load already in progress for {ticker}; skipping duplicate.")
+    # Small, bounded wait (env-tunable) to avoid transient None in hot paths
+    wait_secs = float(os.getenv("SPYMASTER_DF_LOAD_WAIT", "0.50"))
+    acquired = lock.acquire(timeout=wait_secs)
+    if not acquired:
+        logger.debug(f"DF load already in progress for {ticker}; timed out after {wait_secs:.2f}s.")
         return None
     try:
         # Resolve a path—either saved by _lighten_for_runtime or standard fallback
@@ -4300,7 +4342,10 @@ def ensure_df_available(ticker: str, results: dict = None):
         logger.warning(f"Could not rehydrate DF for {ticker} from {pkl_file}")
         return None
     finally:
-        lock.release()
+        try:
+            lock.release()
+        except Exception:
+            pass
 
 def _same_calendar_day(a, b):
     """Check if two timestamps are on the same calendar day."""
@@ -4654,8 +4699,8 @@ def precompute_results(ticker, event, cancel_event=None):
                     best_buy_pair = None
                     best_short_capture = -np.inf
                     best_short_pair = None
-
-                    today_return = returns[day_idx]
+                    # Single-day increment in percent (consistent with vectorized path)
+                    today_return = float(returns[day_idx]) * 100.0
 
                     # Only check cancel on the outer SMA loop to keep overhead low
                     for i in range(1, max_sma_day + 1):
@@ -4672,15 +4717,14 @@ def precompute_results(ticker, event, cancel_event=None):
                                 continue
 
                             if sma_i_prev > sma_j_prev:
-                                # buy running capture (we only need max for the day)
-                                best_buy_capture = max(best_buy_capture, best_buy_capture + 0 if best_buy_pair is None else best_buy_capture)
-                                # For streaming correctness, compare the *single-day* increment
-                                candidate = today_return * 100
+                                # Compare the *single-day* increment for BUY
+                                candidate = today_return
                                 if candidate >= best_buy_capture:
                                     best_buy_capture = candidate
                                     best_buy_pair = (i, j)
                             elif sma_i_prev < sma_j_prev:
-                                candidate = -today_return * 100
+                                # Compare the *single-day* increment for SHORT
+                                candidate = -today_return
                                 if candidate >= best_short_capture:
                                     best_short_capture = candidate
                                     best_short_pair = (i, j)
@@ -4850,6 +4894,16 @@ def precompute_results(ticker, event, cancel_event=None):
             results['active_pairs'] = active_pairs
 
             # Leaders on last available day
+            def _debug_assert_no_zero_pairs(buy_dict, short_dict):
+                # Developer diagnostic only; controlled by PRJCT9_DIAG
+                if not _DIAG:
+                    return
+                bad_buy = sum(1 for _, (p, _) in buy_dict.items() if p == (0, 0))
+                bad_short = sum(1 for _, (p, _) in short_dict.items() if p == (0, 0))
+                if bad_buy or bad_short:
+                    logger.warning(f"[PAIR SANITY] Found {bad_buy} buy and {bad_short} short '(0,0)' days before leader selection")
+            _debug_assert_no_zero_pairs(daily_top_buy_pairs, daily_top_short_pairs)
+            
             last_day = df.index[-1]
             if last_day in daily_top_buy_pairs:
                 results['top_buy_pair'] = daily_top_buy_pairs[last_day][0]
@@ -6959,7 +7013,7 @@ def _on_primary_change(ticker, prev_active):
 
     if prev == t:
         # Nothing actually changed; do NOT mint a new key.
-        if VERBOSE_DEBUG:
+        if debug_enabled():
             print(f"[key] ticker unchanged -> keep key (ticker={t})")
         raise PreventUpdate
 
@@ -6976,7 +7030,7 @@ def _on_primary_change(ticker, prev_active):
     except Exception:
         pass
 
-    if VERBOSE_DEBUG:
+    if debug_enabled():
         print(f"[key] NEW key for {t}: {key}")
     return key, t
 
@@ -7028,7 +7082,7 @@ def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, cu
                         buy_sma1, buy_sma2 = top_buy_pair
                         short_sma1, short_sma2 = top_short_pair
                         # ALWAYS return the values when ticker changes and data is ready
-                        if VERBOSE_DEBUG:
+                        if debug_enabled():
                             logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
                         return buy_sma1, buy_sma2, short_sma1, short_sma2
                     except (ValueError, TypeError):
@@ -7063,7 +7117,7 @@ def auto_populate_sma_inputs(ticker, n_intervals, current_sma1, current_sma2, cu
                 try:
                     buy_sma1, buy_sma2 = top_buy_pair
                     short_sma1, short_sma2 = top_short_pair
-                    if VERBOSE_DEBUG:
+                    if debug_enabled():
                         logger.info(f"{Colors.OKGREEN}[🎯] Auto-populating Manual SMA Analysis: Buy({buy_sma1},{buy_sma2}), Short({short_sma1},{short_sma2}){Colors.ENDC}")
                     return buy_sma1, buy_sma2, short_sma1, short_sma2
                 except (ValueError, TypeError):
@@ -7714,7 +7768,7 @@ def update_combined_capture_chart(ticker, n_submit, n_intervals, request_key, cu
 
     # On ticker change: immediately paint placeholder and start/refresh compute
     if trigger_id and trigger_id.startswith('ticker-input'):
-        results = load_precomputed_results(t, from_callback=False, should_log=True, request_key=request_key)
+        results = load_precomputed_results(t, from_callback=True, should_log=True, request_key=request_key)
         if results:
             # Fast path - data already available
             fig = build_combined_capture_figure(t, results, revision=_chart_fp(results))
@@ -8209,8 +8263,8 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     else:
         trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
-    # Only log if the ticker changed, not on interval updates
-    should_log = trigger_id == 'ticker-input'
+    # Only log if debug mode is enabled (either flag) AND the ticker changed (not on interval updates)
+    should_log = debug_enabled() and trigger_id == 'ticker-input'
     
     # --- DEBUG LOGGING FOR AI SECTION ISSUES ---
     is_placeholder = (not combined_fig) or combined_fig.get('layout', {}).get('meta', {}).get('placeholder', True)
@@ -8219,7 +8273,7 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     except Exception as _e:
         file_stat = {'status': 'error', 'note': f'read_status failed: {type(_e).__name__}: {str(_e)[:200]}'}
     
-    if VERBOSE_DEBUG:
+    if debug_enabled():
         print(f"[AI DEBUG] Entry: ticker={ticker}, trigger={trigger_id}, fig_placeholder={is_placeholder}, file_status={file_stat.get('status')}, progress={file_stat.get('progress')}")
     
     # Early guard - but with soft gate for cached results
@@ -8229,11 +8283,11 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         if _t:
             soft_results = load_precomputed_results(_t, from_callback=False, should_log=False)
             if soft_results and 'top_buy_pair' in soft_results and 'top_short_pair' in soft_results:
-                if VERBOSE_DEBUG:
+                if debug_enabled():
                     print(f"[AI DEBUG] Soft gate: Proceeding despite placeholder because results exist for {_t}")
                 # Don't raise PreventUpdate - continue processing
             else:
-                if VERBOSE_DEBUG:
+                if debug_enabled():
                     print(f"[AI DEBUG] Hard gate: No results yet, waiting for real chart")
                 raise PreventUpdate
         else:
@@ -8257,11 +8311,11 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         position_history_data = []
 
     # Call with callback parameters to ensure proper logging
-    results = load_precomputed_results(ticker, from_callback=False, should_log=should_log)
+    results = load_precomputed_results(ticker, from_callback=True, should_log=should_log)
     
     # FALLBACK: If RAM cache isn't ready but pickle exists, load from disk
     if results is None:
-        if VERBOSE_DEBUG:
+        if debug_enabled():
             print(f"[AI DEBUG] RAM cache miss for {ticker}, trying disk fallback...")
         pkl_file = f"cache/results/{ticker}_precomputed_results.pkl"
         if os.path.exists(pkl_file):
@@ -8270,14 +8324,14 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
                 with open(pkl_file, "rb") as f:
                     results = pickle.load(f)
                 if results and 'top_buy_pair' in results and 'top_short_pair' in results:
-                    if VERBOSE_DEBUG:
+                    if debug_enabled():
                         print(f"[AI DEBUG] SUCCESS: Loaded from disk for {ticker}")
                 else:
-                    if VERBOSE_DEBUG:
+                    if debug_enabled():
                         print(f"[AI DEBUG] Disk file exists but missing required keys")
                     results = None
             except Exception as e:
-                if VERBOSE_DEBUG:
+                if debug_enabled():
                     print(f"[AI DEBUG] Disk load failed: {e}")
                 results = None
     
@@ -8287,11 +8341,11 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         msg = "Data not available. Please wait..."
         if fs.get('status') == 'processing':
             msg += f" Processing... {fs.get('progress', 0):.0f}%"
-        if VERBOSE_DEBUG:
+        if debug_enabled():
             print(f"[AI DEBUG] No data found, returning: {msg}")
         return ["", None, None] + [""] * 4 + [position_history_store] + [""] * 9 + [msg] + [""]
     else:
-        if VERBOSE_DEBUG:
+        if debug_enabled():
             print(f"[AI DEBUG] Got results for {ticker} with {len(results)} keys")
     
     # Check file status but DON'T block if we have valid results from cache/fallback
@@ -8312,7 +8366,7 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
                 "progress": 100,
                 "cache_status": "fresh"
             })
-            if VERBOSE_DEBUG:
+            if debug_enabled():
                 print(f"[AI FIX] Updated stale status to complete for {ticker}")
 
     top_buy_pair = results.get('top_buy_pair')
@@ -10559,7 +10613,7 @@ def update_output_and_reset(combined_capture, ticker, timing_summary_printed):
 
     # On ticker change: clear any stale overlay and reset printed flag.
     if trigger_id == 'ticker-input':
-        if VERBOSE_DEBUG:
+        if debug_enabled():
             logger.info("[🧪 spinner.reset] ticker change -> clear overlay & reset flag")
         return "", False
 
@@ -10572,7 +10626,7 @@ def update_output_and_reset(combined_capture, ticker, timing_summary_printed):
         is_placeholder = True
 
     if not is_placeholder and not timing_summary_printed:
-        if VERBOSE_DEBUG:
+        if debug_enabled():
             logger.info("[🧪 spinner.hide] combined chart is real -> hide overlay")
         return "", True
 
@@ -12471,12 +12525,25 @@ def copy_tickers(n_clicks, tickers):
 # ============================================================================
 def print_console_help():
     """Print help information for console commands"""
+    global _DIAG, VERBOSE_DEBUG
+    if _DIAG and VERBOSE_DEBUG:
+        debug_status = "ON (DIAG + VERBOSE)"
+    elif _DIAG:
+        debug_status = "ON (DIAG only)"
+    elif debug_enabled():
+        debug_status = "ON (VERBOSE only)"
+    else:
+        debug_status = "OFF"
     logger.info(f"\n{Colors.CYAN}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.YELLOW}PRJCT9 Console Commands:{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}  Enter tickers:{Colors.ENDC} Type comma-separated tickers (e.g., AAPL, MSFT, GOOGL)")
     logger.info(f"{Colors.OKGREEN}  help:{Colors.ENDC} Show this help message")
     logger.info(f"{Colors.OKGREEN}  status:{Colors.ENDC} Show processing status")
     logger.info(f"{Colors.OKGREEN}  clear:{Colors.ENDC} Clear console")
+    logger.info(f"{Colors.OKGREEN}  debug on/off:{Colors.ENDC} Toggle ALL verbose/diagnostic output (currently: {Colors.YELLOW}{debug_status}{Colors.ENDC})")
+    logger.info(f"{Colors.OKGREEN}  set PRJCT9_DIAG=1|0|{Colors.ENDC}  Enable/disable/clear DIAG (updates env + runtime)")
+    logger.info(f"{Colors.OKGREEN}  set SPYMASTER_VERBOSE_DEBUG=1|0|{Colors.ENDC}  Enable/disable/clear VERBOSE (env + runtime)")
+    logger.info(f"{Colors.OKGREEN}  env:{Colors.ENDC} Show current debug-related environment/flags")
     logger.info(f"{Colors.OKGREEN}  exit:{Colors.ENDC} Stop console input (Dash app continues running)")
     logger.info(f"{Colors.CYAN}{'='*80}{Colors.ENDC}\n")
 
@@ -12528,8 +12595,18 @@ def console_input_handler():
     # Wait a moment for the server to start
     time.sleep(2)
     
-    if VERBOSE_DEBUG:
-        logger.info(f"\n{Colors.OKGREEN}[🎯] Console input ready! Type 'help' for commands{Colors.ENDC}")
+    # Always show console ready message and debug status
+    global _DIAG, VERBOSE_DEBUG
+    if _DIAG and VERBOSE_DEBUG:
+        debug_status = "ON (DIAG + VERBOSE)"
+    elif _DIAG:
+        debug_status = "ON (DIAG only)"
+    elif debug_enabled():
+        debug_status = "ON (VERBOSE only)"
+    else:
+        debug_status = "OFF"
+    logger.info(f"{Colors.OKGREEN}[🎯] Console input ready! Type 'help' for commands{Colors.ENDC}")
+    logger.info(f"{Colors.CYAN}[🔧] Debug mode: {Colors.YELLOW}{debug_status}{Colors.ENDC}")
     
     while True:
         try:
@@ -12554,6 +12631,57 @@ def console_input_handler():
                     logger.info(f"{Colors.YELLOW}Currently processing: {', '.join(_loading_in_progress.keys())}{Colors.ENDC}")
                 else:
                     logger.info(f"{Colors.OKGREEN}No active processing{Colors.ENDC}")
+            elif user_input.lower() == 'debug on':
+                # Enable both flags and raise console logging level immediately
+                _DIAG = True
+                VERBOSE_DEBUG = True
+                os.environ['PRJCT9_DIAG'] = '1'
+                os.environ['SPYMASTER_VERBOSE_DEBUG'] = '1'
+                _apply_debug_levels()
+                logger.info(f"{Colors.OKGREEN}[✓] Debug mode enabled{Colors.ENDC}")
+                logger.info(f"{Colors.CYAN}All diagnostic + verbose logging are now ON (equivalent to PRJCT9_DIAG=1){Colors.ENDC}")
+            elif user_input.lower() == 'debug off':
+                # Disable both flags and drop console logging level
+                _DIAG = False
+                VERBOSE_DEBUG = False
+                os.environ['PRJCT9_DIAG'] = '0'
+                os.environ['SPYMASTER_VERBOSE_DEBUG'] = '0'
+                _apply_debug_levels()
+                logger.info(f"{Colors.YELLOW}[✓] Debug mode disabled{Colors.ENDC}")
+                logger.info(f"{Colors.CYAN}All diagnostic + verbose logging are now OFF (equivalent to PRJCT9_DIAG=0){Colors.ENDC}")
+            elif user_input.lower() == 'env':
+                # Show current relevant env + effective state
+                logger.info(f"{Colors.CYAN}PRJCT9_DIAG={os.environ.get('PRJCT9_DIAG', '')}, "
+                            f"SPYMASTER_VERBOSE_DEBUG={os.environ.get('SPYMASTER_VERBOSE_DEBUG', '')}, "
+                            f"EFFECTIVE={debug_enabled()}{Colors.ENDC}")
+            elif user_input.lower().startswith('set '):
+                # Allow setting env vars at runtime (with sync for known flags)
+                try:
+                    _, pair = user_input.split(' ', 1)
+                    name, value = pair.split('=', 1)
+                    name = name.strip()
+                    # Value may be empty string => unset
+                    if value == "":
+                        os.environ.pop(name, None)
+                        logger.info(f"{Colors.YELLOW}[env]{Colors.ENDC} unset {name}")
+                        if name.upper() == 'PRJCT9_DIAG':
+                            _DIAG = False
+                        elif name.upper() == 'SPYMASTER_VERBOSE_DEBUG':
+                            VERBOSE_DEBUG = False
+                    else:
+                        os.environ[name] = value
+                        v = value.strip().lower()
+                        if name.upper() == 'PRJCT9_DIAG':
+                            _DIAG = (v not in ("0", "false", "off"))
+                        elif name.upper() == 'SPYMASTER_VERBOSE_DEBUG':
+                            VERBOSE_DEBUG = (v in ("1", "true", "on"))
+                        logger.info(f"{Colors.YELLOW}[env]{Colors.ENDC} set {name}={value}")
+                    # Apply new effective level if any debug flag changed
+                    if name.upper() in ('PRJCT9_DIAG', 'SPYMASTER_VERBOSE_DEBUG'):
+                        _apply_debug_levels()
+                        logger.info(f"{Colors.CYAN}Effective debug: {debug_enabled()}{Colors.ENDC}")
+                except ValueError:
+                    logger.warning("Use: set NAME=VALUE  (empty VALUE clears the var)")
             else:
                 # Process as ticker input
                 process_console_tickers(user_input)
@@ -12701,14 +12829,41 @@ if __name__ == "__main__":
     atexit.register(cleanup_server)
     
     try:
-        # Suppress Flask's startup message
+        # Suppress Flask's startup messages
         import click
         import werkzeug
-        # Override both click.echo and werkzeug logging
-        click.echo = lambda *args, **kwargs: None
+        import sys
+        
+        # Override click.echo to suppress Dash/Flask messages
+        original_click_echo = click.echo
+        def filtered_echo(*args, **kwargs):
+            if args and args[0]:
+                msg = str(args[0])
+                # Suppress these specific messages
+                if any(x in msg for x in ["Dash is running on", "Serving Flask app", "Debug mode:"]):
+                    return None
+            return original_click_echo(*args, **kwargs)
+        click.echo = filtered_echo
+        
+        # Suppress werkzeug logging
         werkzeug._internal._log = lambda *args, **kwargs: None
         
-        # Dash startup message will be shown (removing suppression that broke callbacks)
+        # Also suppress print statements from Flask
+        class FilteredOutput:
+            def __init__(self, stream):
+                self.stream = stream
+            def write(self, text):
+                # Filter out Flask startup messages
+                if text and not any(x in text for x in ["Serving Flask", "Debug mode:", "WARNING:"]):
+                    self.stream.write(text)
+            def flush(self):
+                self.stream.flush()
+            def __getattr__(self, attr):
+                return getattr(self.stream, attr)
+        
+        # Apply the filter to stdout
+        if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+            sys.stdout = FilteredOutput(sys.stdout)
         
         # Check for duplicate callback outputs before starting
         def check_duplicate_outputs():
