@@ -50,12 +50,10 @@ dependencies:
       - multitasking==0.0.11
       - multiprocess==0.70.17
       - nest-asyncio==1.6.0
-      - threading  # Note: this is standard library, included for documentation
       
       # Data formats and serialization
       - openpyxl==3.1.5
       - xlsxwriter==3.1.0
-      - pickle  # Note: this is standard library, included for documentation
       - joblib==1.4.2
       
       # Utilities
