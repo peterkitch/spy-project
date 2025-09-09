@@ -4,9 +4,6 @@
 # Web framework and dashboard
 dash==2.18.1
 dash-bootstrap-components==1.6.0
-dash-core-components==2.0.0
-dash-html-components==2.0.0
-dash-table==5.0.0
 flask==3.0.2
 flask-caching==2.1.0
 werkzeug==3.0.1
@@ -14,7 +11,7 @@ werkzeug==3.0.1
 # Data analysis and scientific computing
 numpy>=1.26.4
 pandas>=2.2.1
-scipy>=1.14.1
+scipy==1.13.1
 
 # Data visualization
 plotly>=5.20.0
