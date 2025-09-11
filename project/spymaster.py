@@ -80,6 +80,33 @@ _PRICE_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
 PRICE_COLUMN = 'Adj Close' if _PRICE_BASIS == 'adj' else 'Close'
 _BASIS_TEXT = PRICE_COLUMN  # for UI banner
 
+# --- Centralized price-series selector to enforce one-basis-only semantics ---
+def _price_series(df: pd.DataFrame, index=None) -> pd.Series:
+    """
+    Select the configured price series deterministically.
+    Reject cross-basis fallbacks to prevent mixing.
+    """
+    # If both appear, keep the configured, drop the other (warn)
+    if 'Close' in df.columns and 'Adj Close' in df.columns:
+        if PRICE_COLUMN not in df.columns:
+            logger.error("Both Close & Adj Close present but configured column missing; refusing to guess")
+            return pd.Series(dtype=float, index=(index or df.index))
+        # proceed; selection below forces the configured one
+    
+    for col in (PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')):
+        if col in df.columns:
+            s = df[col]
+            s = s.iloc[:,0] if isinstance(s, pd.DataFrame) else s
+            return (s.loc[index] if index is not None else s).astype(float)
+    
+    # As a last resort, accept normalized 'Close' only (already standardized upstream)
+    if 'Close' in df.columns:
+        s = df['Close']
+        return (s.loc[index] if index is not None else s).astype(float)
+    
+    logger.error(f"_price_series: {PRICE_COLUMN} not available")
+    return pd.Series(dtype=float, index=(index or df.index))
+
 # --- DIAGNOSTIC UTILITIES -----------------------------------------------------
 import os, json, time, platform
 from typing import Any
@@ -3328,7 +3355,8 @@ def fetch_secondary_window(ticker, start, end):
     if end_ts < start_ts:
         start_ts, end_ts = end_ts, start_ts
 
-    key = (t_norm, start_ts.date(), end_ts.date())
+    # Include PRICE_COLUMN to prevent cross-basis cache contamination
+    key = (t_norm, start_ts.date(), end_ts.date(), PRICE_COLUMN)
     cached = _secondary_df_cache.get(key)
     if cached and (time.time() - cached["t"] < _SECONDARY_TTL):
         return cached["df"]
@@ -3346,22 +3374,28 @@ def fetch_secondary_window(ticker, start, end):
             timeout=15
         )
         if df is not None and not df.empty:
-            # Handle MultiIndex columns if yfinance returns them
-            if isinstance(df.columns, pd.MultiIndex):
-                # yfinance can still return MI in some cases; flatten conservatively
-                try:
-                    df = df['Close'].to_frame('Close')
-                except Exception:
-                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            
-            # Standardize index and sort
+            # Standardize index & order
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
             df = df.sort_index()
             
-            # Enforce numeric dtypes to prevent flat line issue with ^GSPC
-            for col in ('Close', 'Adj Close', 'Open', 'High', 'Low', 'Volume'):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            # ---- STANDARDIZE TO ONE-BASIS-ONLY → single 'Close' column ----
+            std = pd.DataFrame(index=df.index)
+            # Flatten MI if needed
+            if isinstance(df.columns, pd.MultiIndex):
+                try:
+                    src = df[PRICE_COLUMN]
+                    std['Close'] = pd.to_numeric(src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src, errors='coerce')
+                except Exception:
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            if 'Close' not in std.columns:
+                if PRICE_COLUMN in df.columns:
+                    std['Close'] = pd.to_numeric(df[PRICE_COLUMN], errors='coerce')
+                elif PRICE_COLUMN.replace(' ', '_') in df.columns:
+                    std['Close'] = pd.to_numeric(df[PRICE_COLUMN.replace(' ', '_')], errors='coerce')
+                else:
+                    logger.error(f"fetch_secondary_window: {PRICE_COLUMN} not available for {ticker}; aborting to avoid basis mix")
+                    return None
+            df = std
             
             _secondary_df_cache[key] = {"df": df, "t": time.time()}
             # Enforce size limit on secondary cache  
@@ -3389,16 +3423,27 @@ def fetch_secondary_window(ticker, start, end):
             timeout=12
         )
         if df is not None and not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                try:
-                    df = df['Close'].to_frame('Close')
-                except Exception:
-                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            # Standardize index & order
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
             df = df.sort_index()
-            for col in ('Close', 'Adj Close', 'Open', 'High', 'Low', 'Volume'):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # ---- STANDARDIZE TO ONE-BASIS-ONLY (fallback path) ----
+            std = pd.DataFrame(index=df.index)
+            if isinstance(df.columns, pd.MultiIndex):
+                try:
+                    src = df[PRICE_COLUMN]
+                    std['Close'] = pd.to_numeric(src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src, errors='coerce')
+                except Exception:
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            if 'Close' not in std.columns:
+                if PRICE_COLUMN in df.columns:
+                    std['Close'] = pd.to_numeric(df[PRICE_COLUMN], errors='coerce')
+                elif PRICE_COLUMN.replace(' ', '_') in df.columns:
+                    std['Close'] = pd.to_numeric(df[PRICE_COLUMN.replace(' ', '_')], errors='coerce')
+                else:
+                    logger.error(f"fetch_secondary_window fallback: {PRICE_COLUMN} not available for {t_norm}")
+                    return None
+            df = std
             # cache under the original key to satisfy the immediate caller
             _secondary_df_cache[key] = {"df": df, "t": time.time()}
             logger.info(f"[secondary-fallback] Succeeded with 1y window for {t_norm}")
@@ -3584,14 +3629,9 @@ def _live_fingerprint_yf(ticker):
         first_date = df.index[0]  # Add first date for contamination detection
         last_date = df.index[-1]
         
-        # Use configured price basis
+        # Use configured price basis (no cross-basis fallbacks)
         last_close = None
-        # Try preferred column first, then fallbacks
         cols_to_try = [PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')]
-        if PRICE_COLUMN == 'Adj Close':
-            cols_to_try.extend(['Close', 'close'])
-        else:  # PRICE_COLUMN == 'Close'
-            cols_to_try.extend(['Adj Close', 'Adj_Close'])
         
         for col in cols_to_try:
             if col in df.columns:
@@ -3647,14 +3687,9 @@ def _live_daily_fingerprint(ticker):
         df.index = pd.to_datetime(df.index).tz_localize(None)
         first_date, last_date = df.index[0], df.index[-1]
         
-        # Use configured price basis
+        # Use configured price basis (no cross-basis fallbacks)
         last_close = None
-        # Try preferred column first, then fallbacks
         cols_to_try = [PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')]
-        if PRICE_COLUMN == 'Adj Close':
-            cols_to_try.extend(['Close', 'close'])
-        else:  # PRICE_COLUMN == 'Close'
-            cols_to_try.extend(['Adj Close', 'Adj_Close'])
         
         for col in cols_to_try:
             if col in df.columns:
@@ -3870,41 +3905,46 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
         # Handle different column structures from yfinance
         if isinstance(df.columns, pd.MultiIndex):
             # Multi-level columns (happens with some tickers)
-            # Try preferred price basis first
+            # Select EXACTLY the configured basis (no substring matching)
+            target_names = {PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')}
             for col in df.columns.levels[0]:
-                if PRICE_COLUMN in col or PRICE_COLUMN.replace(' ', '_') in col:
-                    standardized_df['Close'] = df[col].iloc[:, 0] if len(df[col].shape) > 1 else df[col]
-                    logger.debug(f"Standardized {ticker}: using {PRICE_COLUMN} as price data")
+                if col in target_names:
+                    src = df[col]
+                    src = src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src
+                    standardized_df['Close'] = pd.to_numeric(src, errors='coerce')
+                    logger.debug(f"Standardized {ticker}: using '{col}' as price data")
                     break
             else:
-                # Fallback to any Close column if preferred not found
+                # Fallback ONLY to exact 'Close' (never Adj Close) if preferred not found
                 for col in df.columns.levels[0]:
-                    if 'Close' in col:
-                        standardized_df['Close'] = df[col].iloc[:, 0] if len(df[col].shape) > 1 else df[col]
-                        logger.debug(f"Standardized {ticker}: using Close as price data ({PRICE_COLUMN} not available)")
+                    if col == 'Close':
+                        src = df[col]
+                        src = src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src
+                        standardized_df['Close'] = pd.to_numeric(src, errors='coerce')
+                        logger.debug(f"Standardized {ticker}: using 'Close' as price data (configured '{PRICE_COLUMN}' not available)")
                         break
         else:
             # Single-level columns (most common case)
-            # Try preferred price basis first
+            # Try preferred price basis first (exact matches only)
             if PRICE_COLUMN in df.columns:
-                standardized_df['Close'] = df[PRICE_COLUMN]
-                logger.debug(f"Standardized {ticker}: using {PRICE_COLUMN} as price data")
+                standardized_df['Close'] = pd.to_numeric(df[PRICE_COLUMN], errors='coerce')
+                logger.debug(f"Standardized {ticker}: using '{PRICE_COLUMN}' as price data")
             elif PRICE_COLUMN.replace(' ', '_') in df.columns:
-                standardized_df['Close'] = df[PRICE_COLUMN.replace(' ', '_')]
-                logger.debug(f"Standardized {ticker}: using {PRICE_COLUMN.replace(' ', '_')} as price data")
+                standardized_df['Close'] = pd.to_numeric(df[PRICE_COLUMN.replace(' ', '_')], errors='coerce')
+                logger.debug(f"Standardized {ticker}: using '{PRICE_COLUMN.replace(' ', '_')}' as price data")
             elif 'Close' in df.columns:
-                standardized_df['Close'] = df['Close']
-                logger.debug(f"Standardized {ticker}: using Close as price data ({PRICE_COLUMN} not available)")
+                standardized_df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+                logger.debug(f"Standardized {ticker}: using 'Close' as price data (configured '{PRICE_COLUMN}' not available)")
             elif 'Adj Close' in df.columns and PRICE_COLUMN == 'Close':
-                # If we want raw Close but only have Adj Close, use it as fallback
-                standardized_df['Close'] = df['Adj Close']
-                logger.debug(f"Standardized {ticker}: using Adj Close as fallback (Close not available)")
+                # Do NOT cross-basis fallback; abort to prevent mixing
+                logger.error(f"Standardize {ticker}: requested RAW Close but Close missing (Adj present). Rejecting fallback.")
+                return pd.DataFrame()
             else:
-                # Try case-insensitive search as last resort
+                # Try case-insensitive search for exact 'close' only (not 'adj close')
                 for col in df.columns:
-                    if 'close' in col.lower():
-                        standardized_df['Close'] = df[col]
-                        logger.debug(f"Standardized {ticker}: using {col} as price data (case-insensitive match)")
+                    if col.lower() == 'close':
+                        standardized_df['Close'] = pd.to_numeric(df[col], errors='coerce')
+                        logger.debug(f"Standardized {ticker}: using '{col}' as price data (case-insensitive match)")
                         break
         
         # Validate we got price data
@@ -3912,8 +3952,7 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
             logger.error(f"Could not find price data for {ticker}. Available columns: {list(df.columns)[:10]}")
             return pd.DataFrame()
         
-        # Enforce numeric dtype to prevent issues with string/object dtypes (especially for ^GSPC)
-        standardized_df['Close'] = pd.to_numeric(standardized_df['Close'], errors='coerce')
+        # Note: pd.to_numeric already applied in all selection paths above
         
         # --- Only inject a 'today' row when inside regular market hours (avoid weekends/holidays) ---
         if APPEND_INTRADAY_PLACEHOLDER:
@@ -4637,17 +4676,10 @@ def precompute_results(ticker, event, cancel_event=None):
             # Import numpy for this section
             import numpy as np
 
-            # Robustly derive a 1‑D returns vector with improved accuracy
-            # ENHANCEMENT 1: Prefer Adjusted Close for dividends/splits accuracy
-            if 'Adj Close' in df.columns:
-                prices = df['Adj Close']
-                logger.debug("Using Adjusted Close for accurate returns (accounts for dividends/splits)")
-            elif 'Adj_Close' in df.columns:
-                prices = df['Adj_Close']
-                logger.debug("Using Adj_Close for accurate returns")
-            elif 'Close' in df.columns:
+            # Returns MUST use the standardized 'Close', which already reflects PRICE_COLUMN.
+            if 'Close' in df.columns:
                 prices = df['Close']
-                logger.debug("Using Close prices (no dividend adjustment)")
+                logger.debug(f"Using standardized Close (basis={PRICE_COLUMN}) for returns vector")
             else:
                 _num_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
                 if not _num_cols:
@@ -4880,6 +4912,7 @@ def precompute_results(ticker, event, cancel_event=None):
             results['start_date'] = df.index[0]
             results['last_date'] = df.index[-1]
             results['total_trading_days'] = len(df)
+            results['price_basis'] = PRICE_COLUMN  # aid future audits
             # self-check tokens to detect cross-ticker contamination
             results['_ticker'] = ticker
             results['_row_count'] = len(df)
@@ -10919,35 +10952,8 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             signals = pd.Series(active_pairs, index=dates).loc[common_dates]
             signals = signals.astype(str)
             
-            # Extract Close prices robustly (use configured price basis)
-            # Check for configured price column first
-            if PRICE_COLUMN in secondary_df.columns:
-                prices = secondary_df[PRICE_COLUMN].loc[common_dates]
-            elif PRICE_COLUMN.replace(' ', '_') in secondary_df.columns:
-                prices = secondary_df[PRICE_COLUMN.replace(' ', '_')].loc[common_dates]
-            elif 'Close' in secondary_df.columns:
-                prices = secondary_df['Close'].loc[common_dates]
-            elif isinstance(secondary_df.columns, pd.MultiIndex):
-                # Handle multi-level columns from yfinance
-                # Try configured price column first
-                price_cols = [col for col in secondary_df.columns if col[0] == PRICE_COLUMN or col == PRICE_COLUMN]
-                if price_cols:
-                    prices = secondary_df[price_cols[0]].loc[common_dates]
-                else:
-                    # Then try any Close column
-                    close_cols = [col for col in secondary_df.columns if col[0] == 'Close' or col == 'Close']
-                    if close_cols:
-                        prices = secondary_df[close_cols[0]].loc[common_dates]
-                    else:
-                        # Fallback to first column
-                        prices = secondary_df.iloc[:, 0].loc[common_dates]
-            else:
-                # Fallback to first column if nothing found
-                prices = secondary_df.iloc[:, 0].loc[common_dates]
-            
-            # Ensure prices is a Series
-            if isinstance(prices, pd.DataFrame):
-                prices = prices.iloc[:, 0]
+            # Extract prices using the one-basis selector
+            prices = _price_series(secondary_df, index=common_dates)
 
             # Apply inversion if necessary
             if invert_signals:
@@ -11523,7 +11529,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
             continue  # Skip if insufficient data overlap
 
         signals = combined_signals.loc[common_dates_sec].astype(str)
-        prices = secondary_data['Close'].loc[common_dates_sec]
+        prices = _price_series(secondary_data, index=common_dates_sec)
 
         # Reindex signals and prices to a common index
         common_index = signals.index.union(prices.index)
@@ -12382,7 +12388,7 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 signals = combined_signals.fillna('None')
 
                 # Align signals and prices
-                prices = secondary_data['Close'].loc[signals.index]
+                prices = _price_series(secondary_data, index=signals.index)
                 
                 # Compute daily returns (1-D Series) and aligned signals
                 daily_returns = prices.astype('float64').pct_change().fillna(0.0)
