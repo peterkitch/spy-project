@@ -45,6 +45,12 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Python virtual environments
+venv/
+env/
+.venv/
+.env/
+
 # Ignore MCP server container directory
 mcp-server/
 
@@ -73,3 +79,14 @@ global_ticker_library/data/*.json
 
 # Windows NUL device file
 NUL
+
+# Local machine-specific optimization files
+local_optimization/
+
+# Machine-specific Python scripts (if any remain in root)
+*mkl*.py
+*benchmark*.py
+fix_*.py
+verify_*.py
+install_*.py
+cleanup_*.py
