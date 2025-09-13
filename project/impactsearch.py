@@ -4,6 +4,11 @@ import numpy as np
 from scipy import stats
 import logging
 import random
+import warnings
+
+# Optional: Show each deprecation warning only once to reduce spam
+if os.environ.get("IMPACTSEARCH_WARN_ONCE", "0").lower() in ("1", "true", "on"):
+    warnings.filterwarnings("once", category=DeprecationWarning)
 import dash
 from dash import dcc, html, Input, Output, State, dash_table, callback_context, ALL, MATCH
 import dash_bootstrap_components as dbc
@@ -1033,7 +1038,18 @@ def load_signal_library(ticker):
             if os.path.exists(filepath):
                 try:
                     with open(filepath, 'rb') as f:
-                        signal_data = pickle.load(f)
+                        # Suppress NumPy deprecation warning from old pickle files
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                                  message=".*numpy.core.numeric.*")
+                            warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                                  message=".*numpy._core.numeric.*")
+                            signal_data = pickle.load(f)
+
+                        # Defensive type check to prevent 'str' object has no attribute 'get' errors
+                        if not isinstance(signal_data, dict):
+                            logger.error(f"Invalid signal library format for {ticker}: expected dict, got {type(signal_data).__name__}")
+                            continue
                 except (pickle.UnpicklingError, EOFError) as e:
                     logger.error(f"Corrupt Signal Library for {ticker}: {e}")
                     # Quarantine corrupt file for debugging
@@ -1171,7 +1187,7 @@ def _coerce_to_close_frame(df, preferred=None):
     """
     Helper function to handle various column structures from yfinance.
     Ensures we always get a clean DataFrame with a single 'Close' column.
-    
+
     Args:
         df: DataFrame from yfinance
         preferred: 'Adj Close' or 'Close' - which price basis to prefer
@@ -1181,56 +1197,42 @@ def _coerce_to_close_frame(df, preferred=None):
     if preferred is None:
         price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
         preferred = 'Adj Close' if price_basis == 'adj' else 'Close'
-    if df.empty:
+    if df is None or df.empty:
         return pd.DataFrame()
-    
-    # Handle MultiIndex columns (both orientations from yfinance)
+
+    # Handle MultiIndex columns (yfinance sometimes returns MI)
     if isinstance(df.columns, pd.MultiIndex):
         lvl0 = list(df.columns.get_level_values(0))
         lvl1 = list(df.columns.get_level_values(1))
-        
         # Orientation A: (field, ticker) - group_by='column'
-        if preferred in lvl0 and len(set(lvl1)) >= 1:
-            tk = df.columns.get_level_values(1)[0]
-            result = df[(preferred, tk)].to_frame(name='Close')
-            return result
-        
-        # Fallback to other field if preferred not available
-        fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
-        if fallback in lvl0 and len(set(lvl1)) >= 1:
-            tk = df.columns.get_level_values(1)[0]
-            result = df[(fallback, tk)].to_frame(name='Close')
-            return result
-            
+        u1 = list(set(lvl1))
+        if preferred in lvl0 and len(u1) == 1:
+            tk = u1[0]
+            src = df[(preferred, tk)]
+            out = pd.DataFrame(pd.to_numeric(src, errors='coerce'))
+            out.columns = ['Close']
+            return out
         # Orientation B: (ticker, field) - group_by='ticker'
-        if preferred in lvl1 and len(set(lvl0)) >= 1:
-            tk = df.columns.get_level_values(0)[0]
-            result = df[(tk, preferred)].to_frame(name='Close')
-            return result
-            
-        # Fallback for orientation B
-        if fallback in lvl1 and len(set(lvl0)) >= 1:
-            tk = df.columns.get_level_values(0)[0]
-            result = df[(tk, fallback)].to_frame(name='Close')
-            return result
-    
-    # Handle regular columns - prefer the requested field
-    if preferred in df.columns:
-        if preferred == 'Adj Close':
-            return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
-        else:
-            return pd.DataFrame(df[['Close']])
-    
-    # Fallback to other field if preferred not available
-    fallback = 'Close' if preferred == 'Adj Close' else 'Adj Close'
-    if fallback in df.columns:
-        if fallback == 'Adj Close':
-            return pd.DataFrame(df[['Adj Close']].rename(columns={'Adj Close': 'Close'}))
-        else:
-            return pd.DataFrame(df[['Close']])
-    
-    # If we can't find any close column, return empty
-    logger.error(f"No Close/Adj Close data found in DataFrame")
+        u0 = list(set(lvl0))
+        if preferred in lvl1 and len(u0) == 1:
+            tk = u0[0]
+            src = df[(tk, preferred)]
+            out = pd.DataFrame(pd.to_numeric(src, errors='coerce'))
+            out.columns = ['Close']
+            return out
+        # If multiple tickers present, fail loud to avoid accidental cross-ticker selection
+        if (preferred in lvl0 and len(u1) > 1) or (preferred in lvl1 and len(u0) > 1):
+            logger.error("MultiIndex contains multiple tickers; refusing ambiguous selection")
+            return pd.DataFrame()
+
+    # Handle flat columns - exact match only (no substring scans)
+    colmap = {str(c): c for c in df.columns}
+    if preferred in colmap:
+        src = df[colmap[preferred]]
+        return pd.DataFrame(pd.to_numeric(src, errors='coerce')).rename(columns={colmap[preferred]: 'Close'})
+
+    # STRICT: Do not cross-basis fallback
+    logger.error("No exact price column found matching preferred basis; returning empty")
     return pd.DataFrame()
 
 def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, reference_now=None, price_source=None):
@@ -1361,7 +1363,7 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
         # De-dup & sort to avoid rare vendor duplicate rows
         df = df[~df.index.duplicated(keep='last')].sort_index()
         if df.empty:
-            logger.error(f"No Close/Adj Close data found for {ticker}, aborting this ticker.")
+            logger.error(f"No exact price column found for basis={price_source} on {ticker}, aborting.")
             if return_symbol:
                 return pd.DataFrame(), ticker
             return pd.DataFrame()
@@ -1586,8 +1588,11 @@ def _calculate_cumulative_combined_capture_spyfaithful(df, daily_top_buy_pairs, 
         else:
             current = "None"
 
-        # Daily return as percent
-        day_ret = (close_vals[i] / close_vals[i-1] - 1.0) * 100.0
+        # Daily return as percent with safe division
+        if close_vals[i-1] > 0 and np.isfinite(close_vals[i-1]) and np.isfinite(close_vals[i]):
+            day_ret = (close_vals[i] / close_vals[i-1] - 1.0) * 100.0
+        else:
+            day_ret = 0.0  # No return when previous price invalid
         daily_capture = day_ret if current.startswith('Buy') else (-day_ret if current.startswith('Short') else 0.0)
         cumulative += daily_capture
         ccc.append(cumulative)
@@ -1595,6 +1600,110 @@ def _calculate_cumulative_combined_capture_spyfaithful(df, daily_top_buy_pairs, 
 
     return pd.Series(ccc, index=dates), active_pairs
 
+def _safe_div_impactsearch(a, b, default=0.0):
+    """Scalar-safe divide with minimal overhead."""
+    return float(a) / float(b) if (b not in (0, 0.0) and np.isfinite(a) and np.isfinite(b)) else default
+
+def _metrics_from_ccc(ccc_series, active_pairs=None):
+    """
+    Warning-free metrics calculation matching onepass.py.
+    Uses signal-based trigger counting to match SpyMaster's convention.
+    """
+    if ccc_series is None or len(ccc_series) == 0:
+        return None
+
+    # Daily captures in percent
+    steps = ccc_series.diff().fillna(0.0)
+    caps = steps.to_numpy()
+
+    # Trigger mask: prefer explicit signals; fallback to legacy non-zero caps
+    if active_pairs is not None and len(active_pairs) == len(caps):
+        # Count actual signal days (including zero-capture days)
+        trig_mask = np.array([p.startswith('Buy') or p.startswith('Short')
+                              for p in active_pairs], dtype=bool)
+    else:
+        # Legacy fallback (for backward compatibility)
+        trig_mask = np.abs(caps) > 0
+
+    trigger_days = int(trig_mask.sum())
+    signal_caps = caps[trig_mask]
+
+    # Remove non-finite values from captures for statistics
+    signal_caps = signal_caps[np.isfinite(signal_caps)]
+
+    # SpyMaster rule: wins are positive captures, losses = trigger_days - wins
+    # This ensures zero-capture days count as losses
+    wins = int((signal_caps > 0).sum())
+    losses = int(trigger_days - wins)  # This includes zero-capture days as losses
+    total = float(ccc_series.iloc[-1]) if np.isfinite(ccc_series.iloc[-1]) else 0.0
+
+    # Calculate metrics with guards
+    if trigger_days == 0:
+        avg_daily = 0.0
+        std = 0.0
+        sharpe = 0.0
+        t_stat = None
+        p_val = None
+    else:
+        avg_daily = float(signal_caps.mean()) if len(signal_caps) > 0 else 0.0
+
+        if trigger_days >= 2:
+            # Use NumPy directly to avoid pandas nanops warnings
+            with np.errstate(invalid='ignore', divide='ignore'):
+                std = float(np.std(signal_caps.values if hasattr(signal_caps, 'values') else signal_caps, ddof=1)) if len(signal_caps) > 1 else 0.0
+
+            if std > 0.0 and np.isfinite(std):
+                annualized_return = avg_daily * 252.0
+                annualized_std = std * np.sqrt(252.0)
+                risk_free_rate = 5.0
+                sharpe = _safe_div_impactsearch(annualized_return - risk_free_rate, annualized_std, 0.0)
+
+                # t-stat with safe division
+                t_stat = _safe_div_impactsearch(avg_daily, std / np.sqrt(trigger_days), 0.0)
+
+                # p-value calculation
+                try:
+                    if t_stat != 0.0:
+                        p_val = float(2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=trigger_days - 1)))
+                    else:
+                        p_val = 1.0
+                except Exception:
+                    p_val = 1.0
+            else:
+                std = 0.0
+                sharpe = 0.0
+                t_stat = None
+                p_val = None
+        else:
+            # Only 1 trigger day - no variance-based stats
+            std = 0.0
+            sharpe = 0.0
+            t_stat = None
+            p_val = None
+
+    # Significance flags
+    sig90 = 'Yes' if (p_val is not None and p_val < 0.10) else 'No'
+    sig95 = 'Yes' if (p_val is not None and p_val < 0.05) else 'No'
+    sig99 = 'Yes' if (p_val is not None and p_val < 0.01) else 'No'
+
+    # Win ratio with safe division
+    win_ratio = _safe_div_impactsearch(wins * 100.0, trigger_days, 0.0)
+
+    return {
+        'Trigger Days': trigger_days,
+        'Wins': wins,
+        'Losses': losses,
+        'Win Ratio (%)': round(win_ratio, 2),
+        'Std Dev (%)': round(std, 4),
+        'Sharpe Ratio': round(sharpe, 2) if np.isfinite(sharpe) else 0.0,
+        't-Statistic': 'N/A' if t_stat is None else round(t_stat, 4),
+        'p-Value': 'N/A' if p_val is None else round(p_val, 4),
+        'Significant 90%': sig90,
+        'Significant 95%': sig95,
+        'Significant 99%': sig99,
+        'Avg Daily Capture (%)': round(avg_daily, 4),
+        'Total Capture (%)': round(total, 4)
+    }
 
 
 def export_results_to_excel(output_filename, metrics_list):
@@ -1732,12 +1841,19 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     
     # Check if we have a library to get price_source from
     # Support switching between 'Adj Close' and 'Close' via environment variable
-    price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-    price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
+    price_basis_env = os.environ.get('PRICE_BASIS', 'adj').lower()
+    price_source = 'Adj Close' if price_basis_env == 'adj' else 'Close'
     temp_lib = load_signal_library(prim_ticker)
-    if temp_lib and 'price_source' in temp_lib:
+    # ENV overrides library unless explicitly allowed
+    if (os.environ.get('IMPACTSEARCH_ALLOW_LIB_BASIS', '0').lower() in ('1','true','on')
+        and temp_lib and 'price_source' in temp_lib):
         price_source = temp_lib['price_source']
-        logger.debug(f"Using price_source from library: {price_source}")
+        logger.debug(f"Using price_source from library: {price_source} (IMPACTSEARCH_ALLOW_LIB_BASIS=1)")
+    elif temp_lib and 'price_source' in temp_lib and temp_lib['price_source'] != price_source:
+        logger.info(
+            f"Ignoring library basis {temp_lib['price_source']} (env PRICE_BASIS={price_basis_env}); "
+            f"using {price_source}"
+        )
     
     # Single download: get raw frame & resolved symbol once
     df_raw, fetched_symbol = fetch_data_raw(prim_ticker, reference_now=analysis_clock)
@@ -2038,8 +2154,18 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     logger.info(f"Short signals: {signal_counts.get('Short', 0)}")
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
     
-    # Always compute metrics from signals (no self-correlation override)
-    result = calculate_metrics_from_signals(primary_signals, primary_dates, sec_df)
+    # Use SpyFaithful method for correct calculation (matches spymaster/onepass)
+    # Apply T-1 policy: drop last day to match OnePass behavior
+    df_eff = df.iloc[:-PERSIST_SKIP_BARS].copy() if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS else df
+
+    # Calculate cumulative combined capture using the SpyFaithful method
+    # IMPORTANT: Use df_eff (primary ticker data with T-1), not sec_df (secondary)
+    ccc, active_pairs = _calculate_cumulative_combined_capture_spyfaithful(
+        df_eff, daily_top_buy_pairs, daily_top_short_pairs
+    )
+
+    # Get full metrics from the cumulative capture series
+    result = _metrics_from_ccc(ccc, active_pairs)
     
     if result is not None:
         # Track all ticker names for transparency
