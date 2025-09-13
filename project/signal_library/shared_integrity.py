@@ -9,8 +9,25 @@ import numpy as np
 import pandas as pd
 import logging
 import os
+import math
 
 logger = logging.getLogger(__name__)
+
+# Safe formatting helper
+def _fmt_pct_safe(x, default="N/A"):
+    """
+    Return a percentage string that won't crash if x is None/NaN/inf or non-numeric.
+    Examples: 0.123 -> '12.30%', None -> 'N/A'
+    """
+    try:
+        if x is None:
+            return default
+        v = float(x)
+        if not math.isfinite(v):
+            return default
+        return f"{v:.2%}"
+    except Exception:
+        return default
 
 # Configuration constants (should match both scripts)
 HEAD_TAIL_SNAPSHOT_SIZE = 20
@@ -771,10 +788,15 @@ def evaluate_library_acceptance(signal_data, current_df, config=None):
             status_dict = _ensure_status_dict(integrity_status)
             status_dict['scale_factor'] = float(ratio)
             
+            # Defensive: handle None values in stats
+            _stats = (tail_stats or head_stats) or {}
+            _cv = _stats.get('cv', 0.0) or 0.0  # Handle None
+            _resid = _stats.get('mean_residual_pct')  # May be None
+            
             return 'SCALE_RECONCILE', status_dict, (
                 f"Scale change detected (factor={ratio:.6f}, "
-                f"cv={'{:.4f}'.format((tail_stats or head_stats).get('cv', 0.0))}, "
-                f"residuals={(tail_stats or head_stats).get('mean_residual_pct', 0.0):.2%})"
+                f"cv={_cv:.4f}, "
+                f"residuals={_fmt_pct_safe(_resid)})"
             )
     
     # Level 3c: Exact head/tail check (fallback)
