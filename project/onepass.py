@@ -381,6 +381,11 @@ class OnepassRunReport:
             json.dump(self.to_dict(), f, indent=2)
 # ==============================================================================
 
+# Helper function for safe integrity_status access
+def _status_dict(x):
+    """Convert integrity_status to dict safely. Returns empty dict if x is not a dict."""
+    return x if isinstance(x, dict) else {}
+
 # Constants
 MAX_SMA_DAY = 114  # Same logic as impactsearch.py
 ENGINE_VERSION = "1.0.0"  # Version for Signal Library
@@ -1982,7 +1987,9 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
                 if existing_signal_data:
                     # Special handling for SCALE_RECONCILE mode (use structured integrity_status)
                     if acceptance_level == 'SCALE_RECONCILE':
-                        sf = (integrity_status or {}).get('scale_factor')
+                        # Use helper to safely access integrity_status dict
+                        status_dict = _status_dict(integrity_status)
+                        sf = status_dict.get('scale_factor')
                         if sf and sf > 0:
                             existing_signal_data['pending_scale_factor'] = 1.0 / float(sf)
                             logger.info(f"SCALE_RECONCILE: Will rescale current data by x{existing_signal_data['pending_scale_factor']:.6f} before append")

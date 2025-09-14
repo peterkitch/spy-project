@@ -206,6 +206,11 @@ if 'log_parity_status' in globals():
 else:
     logger.info("Parity configuration not available - using defaults")
 
+# Helper function for safe integrity_status access
+def _status_dict(x):
+    """Convert integrity_status to dict safely. Returns empty dict if x is not a dict."""
+    return x if isinstance(x, dict) else {}
+
 # Constants
 MAX_SMA_DAY = 114
 ENGINE_VERSION = "1.0.0"  # Version for Signal Library compatibility
@@ -951,9 +956,10 @@ class CacheManager:
     
     @staticmethod
     def get_cache_path(ticker, data_type='data'):
-        """Generate cache file path"""
+        """Generate cache file path with basis awareness"""
         os.makedirs(CACHE_DIR, exist_ok=True)
-        return os.path.join(CACHE_DIR, f"{ticker}_{data_type}.pkl")
+        basis = os.environ.get('PRICE_BASIS', 'adj').lower()
+        return os.path.join(CACHE_DIR, f"{ticker}_{data_type}_{basis}.pkl")
     
     @staticmethod
     def is_cache_valid(cache_path):
@@ -988,7 +994,12 @@ class CacheManager:
         
         try:
             with open(cache_path, 'rb') as f:
-                data = pickle.load(f)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                          message=".*numpy.core.numeric.*")
+                    warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                          message=".*numpy._core.numeric.*")
+                    data = pickle.load(f)
             logger.debug(f"Loaded {data_type} from cache for {ticker}")
             return data
         except Exception as e:
