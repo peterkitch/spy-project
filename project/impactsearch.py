@@ -27,9 +27,23 @@ import multiprocessing
 from threading import Lock
 import re
 import contextlib
+import socket
+
+# ---------- Instance & paths ----------
+# Each run can be isolated via env vars to support multi-instance execution.
+INSTANCE_NAME = os.environ.get("IMPACT_INSTANCE_NAME", f"pid{os.getpid()}")
+CACHE_ROOT = os.environ.get("IMPACT_CACHE_ROOT", "cache")
+LOGS_ROOT = os.environ.get("IMPACT_LOGS_ROOT", "logs")
+
+# Backpressure control for UI responsiveness
+RESULTS_SNAPSHOT_EVERY = int(os.environ.get("IMPACT_RESULTS_SNAPSHOT_EVERY", "250"))
+RESULTS_FLUSH_SEC = int(os.environ.get("IMPACT_RESULTS_FLUSH_SEC", "3"))
+RESULTS_FLUSH_COUNT = int(os.environ.get("IMPACT_RESULTS_FLUSH_COUNT", "2500"))
+LIGHT_SUMMARY = os.environ.get("IMPACT_LIGHT_SUMMARY", "1").lower() in ("1", "true", "on", "yes")
+os.makedirs(LOGS_ROOT, exist_ok=True)
 
 # ---------- Max-period capability registry ----------
-PERIOD_CAPABILITY_CACHE_PATH = os.path.join('cache', 'period_capabilities.json')
+PERIOD_CAPABILITY_CACHE_PATH = os.path.join(CACHE_ROOT, 'period_capabilities.json')
 PERIOD_RECHECK_DAYS = 30  # 30-day hold period as requested
 
 class PeriodCapabilityCache:
@@ -48,16 +62,32 @@ class PeriodCapabilityCache:
                     self.data = json.load(f)
         except Exception as e:
             logging.error(f"Failed to load period capabilities cache: {e}")
+            # Auto-heal: rename corrupt file and start fresh
+            try:
+                if os.path.exists(self.path):
+                    corrupt_path = self.path + ".corrupt"
+                    os.replace(self.path, corrupt_path)
+                    logging.warning(f"Renamed corrupt cache to {corrupt_path}")
+            except Exception:
+                pass
             self.data = {}
 
     def _save(self):
-        """Save cache to JSON file"""
+        """Save cache atomically to avoid corruption under concurrency."""
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, 'w') as f:
+            tmp = self.path + ".tmp"
+            with open(tmp, 'w') as f:
                 json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)  # atomic on Windows/NTFS
         except Exception as e:
             logging.error(f"Failed to save period capabilities cache: {e}")
+            # Best effort quarantine if file became corrupt
+            try:
+                if os.path.exists(self.path):
+                    os.replace(self.path, self.path + ".corrupt")
+            except Exception:
+                pass
 
     def _expired(self, iso_ts):
         """Check if a cached entry has expired"""
@@ -148,6 +178,55 @@ import warnings
 import hashlib
 warnings.filterwarnings('ignore')
 
+# --- Fast-path imports for skipping Yahoo Finance calls on primary tickers
+try:
+    from signal_library.impact_fastpath import (
+        get_primary_signals_fast,
+        IMPACT_TRUST_LIBRARY,
+        IMPACT_TRUST_MAX_AGE_HOURS,
+        PERSIST_SKIP_BARS_IMPACT,
+        log_fastpath_stats
+    )
+    FASTPATH_AVAILABLE = True
+except ImportError:
+    # Fallback: support local module placement too
+    try:
+        from impact_fastpath import (
+            get_primary_signals_fast,
+            IMPACT_TRUST_LIBRARY,
+            IMPACT_TRUST_MAX_AGE_HOURS,
+            PERSIST_SKIP_BARS_IMPACT,
+            log_fastpath_stats
+        )
+        FASTPATH_AVAILABLE = True
+        print("[INFO] Using local impact_fastpath module")
+    except ImportError:
+        FASTPATH_AVAILABLE = False
+        IMPACT_TRUST_LIBRARY = False
+        print("[WARNING] Fast-path module not available - using slow path only")
+
+# Lightweight in-memory fast-path usage stats (for run summary)
+FASTPATH_STATS = {'total_primaries': 0, 'fastpath_used': 0, 'fallback_used': 0, 'fallback_reasons': {}}
+
+# --- Optional instrumentation to count yfinance calls (verify speedup)
+YF_CALLS = 0
+if os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower() in ("1", "true", "on", "yes"):
+    import yfinance as _yf
+    _ORIG_YF_DOWNLOAD = _yf.download
+    def _wrapped_download(*args, **kwargs):
+        global YF_CALLS
+        YF_CALLS += 1
+        return _ORIG_YF_DOWNLOAD(*args, **kwargs)
+    _yf.download = _wrapped_download
+    yf.download = _wrapped_download  # Also wrap the imported reference
+    print("[INSTRUMENTATION] Yahoo Finance call counting enabled")
+
+# Boot-time visibility for user
+print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
+      f"IMPACT_TRUST_LIBRARY={IMPACT_TRUST_LIBRARY}  "
+      f"PRICE_BASIS={os.environ.get('PRICE_BASIS','adj')}  "
+      f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}")
+
 # Import parity configuration
 try:
     from signal_library.parity_config import (
@@ -223,7 +302,7 @@ PAIRS = np.array([(i, j) for i in range(1, MAX_SMA_DAY+1)
                   for j in range(1, MAX_SMA_DAY+1) if i != j], dtype=PAIR_DTYPE)
 I_IDX = PAIRS[:, 0] - 1
 J_IDX = PAIRS[:, 1] - 1  # Set fixed window for SMA calculations
-CACHE_DIR = 'cache/impact_analysis'
+CACHE_DIR = os.path.join(CACHE_ROOT, 'impact_analysis')
 CACHE_EXPIRY_DAYS = 7
 
 # Global progress tracking
@@ -1844,8 +1923,55 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     requested_ticker = prim_ticker  # Keep original for transparency
     vendor_symbol, _ = resolve_symbol(prim_ticker)
     prim_ticker = vendor_symbol
+
+    # FAST-PATH: Skip Yahoo Finance call if library is fresh and compatible
+    global FASTPATH_STATS
+    FASTPATH_STATS['total_primaries'] += 1
+
+    if FASTPATH_AVAILABLE and IMPACT_TRUST_LIBRARY:
+        sig_series, fp_reason = get_primary_signals_fast(prim_ticker, sec_df.index)
+        if sig_series is not None:
+            logger.info(f"Processing {prim_ticker}... [FASTPATH: {fp_reason}]")
+
+            # Align signals to secondary's index with carry-forward inside grace window
+            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
+            if grace_days > 0:
+                aligned_signals = sig_series.reindex(
+                    sec_df.index, method='pad', tolerance=pd.Timedelta(days=grace_days)
+                ).fillna('None')
+            else:
+                aligned_signals = sig_series.reindex(sec_df.index).fillna('None')
+
+            # Convert to lists for compatibility with existing metrics function
+            primary_signals = aligned_signals.values.tolist()
+            primary_dates = aligned_signals.index.tolist()
+
+            # Calculate metrics using existing function
+            metrics = calculate_metrics_from_signals(
+                primary_signals,
+                primary_dates,
+                sec_df,
+                persist_skip_bars=PERSIST_SKIP_BARS
+            )
+
+            # Add ticker info
+            if metrics:
+                metrics['Primary Ticker'] = prim_ticker
+                metrics['Requested Ticker'] = requested_ticker
+                metrics['Data Source'] = 'FASTPATH'
+
+            # Account for fast-path usage
+            FASTPATH_STATS['fastpath_used'] += 1
+            return metrics
+        else:
+            # Log at INFO level for better visibility
+            logger.info(f"[FASTPATH:FALLBACK] {prim_ticker}: {fp_reason}")
+            FASTPATH_STATS['fallback_used'] += 1
+            FASTPATH_STATS['fallback_reasons'][fp_reason] = FASTPATH_STATS['fallback_reasons'].get(fp_reason, 0) + 1
+
+    # SLOW PATH: Original processing with Yahoo Finance fetch
     logger.info(f"Processing {prim_ticker}...")
-    
+
     # If Signal Library is available, use precomputed signals
     primary_signals = None
     primary_dates = None
@@ -2158,31 +2284,37 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         # primary_dates was already set correctly in the alignment section above
         # DO NOT reset it to df.index here!
 
-    logger.info(f"Calculating final metrics for {prim_ticker}...")
-    logger.info(f"Signal distribution before metrics calculation:")
+    logger.info(f"Calculating final metrics for {prim_ticker} (applying primary signals to SECONDARY returns)...")
+    logger.info("Signal distribution before metrics calculation:")
     signal_counts = pd.Series(primary_signals).value_counts()
     logger.info(f"Buy signals: {signal_counts.get('Buy', 0)}")
     logger.info(f"Short signals: {signal_counts.get('Short', 0)}")
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
-    
-    # Use SpyFaithful method for correct calculation (matches spymaster/onepass)
-    # Apply T-1 policy: drop last day to match OnePass behavior
-    df_eff = df.iloc[:-PERSIST_SKIP_BARS].copy() if PERSIST_SKIP_BARS > 0 and len(df) > PERSIST_SKIP_BARS else df
 
-    # Calculate cumulative combined capture using the SpyFaithful method
-    # IMPORTANT: Use df_eff (primary ticker data with T-1), not sec_df (secondary)
-    ccc, active_pairs = _calculate_cumulative_combined_capture_spyfaithful(
-        df_eff, daily_top_buy_pairs, daily_top_short_pairs
+    # Align primary signals to the SECONDARY calendar with optional grace window
+    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
+    sig_series = pd.Series(primary_signals, index=pd.DatetimeIndex(primary_dates))
+    if grace_days > 0:
+        aligned = sig_series.reindex(sec_df.index, method='pad',
+                                     tolerance=pd.Timedelta(days=grace_days))
+    else:
+        aligned = sig_series.reindex(sec_df.index)
+    aligned = aligned.fillna('None').astype(str).str.strip()
+
+    # Compute metrics against the SECONDARY ticker's returns (ImpactSearch semantics)
+    result = calculate_metrics_from_signals(
+        aligned.values.tolist(),
+        aligned.index.tolist(),
+        sec_df,
+        persist_skip_bars=PERSIST_SKIP_BARS
     )
-
-    # Get full metrics from the cumulative capture series
-    result = _metrics_from_ccc(ccc, active_pairs)
     
     if result is not None:
         # Track all ticker names for transparency
         result['Primary Ticker'] = requested_ticker  # What user asked for
         result['Resolved/Fetched'] = fetched_symbol   # What Yahoo returned
         result['Library Source'] = library_ticker      # Which library was used
+        result['Data Source'] = 'SLOW_PATH'           # Mark as slow-path result
     
     return result
 
@@ -2264,29 +2396,73 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
         process_args = [(ticker, sec_df, None, analysis_clock) for ticker in primary_tickers]
         
         # Use ThreadPoolExecutor (ProcessPoolExecutor has pickle issues with DataFrames)
-        max_workers = max(1, min(multiprocessing.cpu_count() - 1, 8))
+        # Allow override via IMPACT_MAX_WORKERS; otherwise default to min(CPU-1, 8)
+        _mw_env = os.environ.get("IMPACT_MAX_WORKERS")
+        if _mw_env:
+            try:
+                max_workers = max(1, int(_mw_env))
+                logger.info(f"Using IMPACT_MAX_WORKERS={max_workers} for parallel processing")
+            except ValueError:
+                max_workers = max(1, min(multiprocessing.cpu_count() - 1, 8))
+                logger.warning(f"Invalid IMPACT_MAX_WORKERS value, using default: {max_workers}")
+        else:
+            max_workers = max(1, min(multiprocessing.cpu_count() - 1, 8))
         
+        # Helper function for bounded submission
+        from itertools import islice
+
+        def bounded_submit(executor, args_iter, inflight_limit):
+            """Submit tasks in bounded batches to prevent memory pressure from 70K futures."""
+            inflight = {}
+
+            # Prime the pool with initial batch
+            for args in islice(args_iter, inflight_limit):
+                fut = executor.submit(process_single_ticker, *args)
+                inflight[fut] = args[0]  # Store ticker
+
+            # Process completions and maintain queue
+            while inflight:
+                for fut in as_completed(inflight):
+                    ticker = inflight.pop(fut)
+                    yield fut, ticker
+
+                    # Submit next task if available
+                    try:
+                        args = next(args_iter)
+                        new_fut = executor.submit(process_single_ticker, *args)
+                        inflight[new_fut] = args[0]
+                    except StopIteration:
+                        pass  # No more tasks to submit
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks with isolated data copies
-            futures = {executor.submit(process_single_ticker, *args): args[0] 
-                      for args in process_args}
-            
+            # Use bounded submission to prevent memory pressure
+            args_iter = iter(process_args)
+            inflight_limit = max_workers * 4  # Keep 4x workers in flight
+            logger.info(f"Using bounded submission with {inflight_limit} tasks in flight (prevents memory pressure)")
+
             completed_count = 0
-            for future in as_completed(futures):
-                ticker = futures[future]
+            log_interval = 25  # Log every 25 completions to reduce console I/O
+
+            for future, ticker in bounded_submit(executor, args_iter, inflight_limit):
                 try:
                     result = future.result()  # No timeout
                     if result:
                         result['Secondary Ticker'] = secondary_ticker
                         metrics_list.append(result)
-                        progress_tracker['results'] = metrics_list.copy()
+                        # Snapshot periodically to avoid O(n²) copying
+                        if len(metrics_list) % RESULTS_SNAPSHOT_EVERY == 0:
+                            progress_tracker['results'] = metrics_list.copy()
+                            progress_tracker['results_timestamp'] = time.time()
                 except Exception as e:
                     logger.error(f"Error processing {ticker}: {e}")
                 finally:
                     completed_count += 1
                     progress_tracker['current_index'] = completed_count  # Not -1
                     progress_tracker['current_ticker'] = ticker
-                    logger.info(f"Completed {completed_count}/{len(primary_tickers)}: {ticker}")
+
+                    # Log progress at intervals to reduce console I/O
+                    if completed_count % log_interval == 0 or completed_count == len(primary_tickers):
+                        logger.info(f"Completed {completed_count}/{len(primary_tickers)}: {ticker}")
     else:
         # Sequential processing for small batches (with TQDM console bar)
         for idx, prim_ticker in enumerate(tqdm(primary_tickers, desc="Processing Primary Tickers", unit="ticker")):
@@ -2297,12 +2473,50 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
             if result:
                 result['Secondary Ticker'] = secondary_ticker
                 metrics_list.append(result)
-                progress_tracker['results'] = metrics_list.copy()
-            
-            progress_tracker['current_index'] = idx + 1  # Mark as completed
-            logger.info(f"Completed {idx+1}/{len(primary_tickers)}: {prim_ticker}")
+                # Snapshot periodically to avoid O(n²) copying
+                if len(metrics_list) % RESULTS_SNAPSHOT_EVERY == 0:
+                    progress_tracker['results'] = metrics_list.copy()
+                    progress_tracker['results_timestamp'] = time.time()
 
+            progress_tracker['current_index'] = idx + 1  # Mark as completed
+
+            # Log progress at intervals to reduce console I/O
+            if (idx + 1) % 25 == 0 or (idx + 1) == len(primary_tickers):
+                logger.info(f"Completed {idx+1}/{len(primary_tickers)}: {prim_ticker}")
+
+    # Final flush to ensure all results are available
+    progress_tracker['results'] = metrics_list.copy()
+    progress_tracker['results_timestamp'] = time.time()
     progress_tracker['status'] = 'complete'
+
+    # Log Yahoo Finance call count if instrumentation is enabled
+    if os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower() in ("1", "true", "on", "yes"):
+        try:
+            global YF_CALLS
+            logger.info(f"[INSTRUMENTATION] Total Yahoo Finance calls this run: {YF_CALLS}")
+            if len(primary_tickers) > 0:
+                expected_slow = len(primary_tickers) + 1  # +1 for secondary
+                saved = expected_slow - YF_CALLS
+                if saved > 0:
+                    pct_saved = (saved / expected_slow) * 100
+                    logger.info(f"[INSTRUMENTATION] Calls saved by fast-path: {saved}/{expected_slow} ({pct_saved:.1f}%)")
+        except Exception:
+            pass  # Silently ignore any instrumentation errors
+
+    # Additional instrumentation: report total Yahoo downloads if enabled
+    try:
+        if 'YF_CALLS' in globals():
+            logger.info(f"[INSTRUMENTATION] Yahoo Finance downloads in this run: {YF_CALLS}")
+    except Exception:
+        pass
+
+    # Emit fast-path usage breakdown (if module imported)
+    try:
+        if FASTPATH_AVAILABLE and IMPACT_TRUST_LIBRARY:
+            log_fastpath_stats(FASTPATH_STATS)
+    except Exception:
+        pass
+
     return metrics_list
 
 # Create Dash app
@@ -2311,6 +2525,16 @@ _BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
 _BASIS_TEXT = 'Adj Close' if _BASIS == 'adj' else 'Close'
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+
+# --- Quiet HTTP route logs unless explicitly enabled ---
+_IMPACT_HTTP_LOGS = os.environ.get("IMPACT_HTTP_LOGS", "0").lower() in ("1", "true", "on", "yes")
+if not _IMPACT_HTTP_LOGS:
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    try:
+        # also quiet Flask app logger Dash mounts under
+        app.server.logger.setLevel(logging.ERROR)
+    except Exception:
+        pass
 
 # Define the layout
 app.layout = dbc.Container([
@@ -2727,11 +2951,18 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
     def process_async():
         results = process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing)
         if results:
-            # Export Excel if requested
+            # Export Excel if requested (in separate thread to avoid blocking)
             if export_excel:
-                output_filename = f"output/impactsearch/{secondary_ticker}_analysis.xlsx"
-                export_results_to_excel(output_filename, results)
-                logger.info(f"Excel file exported to {output_filename}")
+                def export_excel_async():
+                    try:
+                        output_filename = f"output/impactsearch/{secondary_ticker}_analysis.xlsx"
+                        export_results_to_excel(output_filename, results)
+                        logger.info(f"Excel file exported to {output_filename}")
+                    except Exception as e:
+                        logger.error(f"Excel export failed: {e}")
+
+                excel_thread = threading.Thread(target=export_excel_async, daemon=True)
+                excel_thread.start()
             
             # Generate PDF if requested
             if generate_pdf:
@@ -2770,10 +3001,15 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
 )
 def update_progress(n_intervals, processing_state):
     global progress_tracker
-    
+
     if not processing_state or processing_state.get('status') != 'processing':
         raise dash.exceptions.PreventUpdate
-    
+
+    # Check if we should throttle the update
+    last_update = progress_tracker.get('results_timestamp', 0)
+    current_time = time.time()
+    should_update_results = (current_time - last_update >= RESULTS_FLUSH_SEC)
+
     # Calculate progress
     if progress_tracker['total_tickers'] > 0:
         done = min(progress_tracker['current_index'], progress_tracker['total_tickers'])
@@ -2799,9 +3035,11 @@ def update_progress(n_intervals, processing_state):
                     style={'height': '30px'}, color='success')
     ])
     
-    # Create summary cards if we have results
+    # Create summary cards if we have results (use lightweight mode if not updating)
     summary_cards = []
-    if progress_tracker['results']:
+    results_to_return = dash.no_update  # By default, don't send results
+
+    if progress_tracker['results'] and (should_update_results or LIGHT_SUMMARY):
         results_df = pd.DataFrame(progress_tracker['results'])
         
         # Back-compat: normalize legacy column names and types
@@ -2857,6 +3095,10 @@ def update_progress(n_intervals, processing_state):
             ], width=3)
         ])
     
+    # Determine what results to return based on throttling
+    if should_update_results or len(progress_tracker['results']) <= RESULTS_FLUSH_COUNT:
+        results_to_return = progress_tracker['results']
+
     # Check if processing is complete
     if progress_tracker['status'] == 'complete':
         progress_display = html.Div([
@@ -2865,11 +3107,11 @@ def update_progress(n_intervals, processing_state):
                   style={'color': '#aaa'}),
             dbc.Progress(value=100, striped=False, style={'height': '30px'}, color='success')
         ])
-        # Stop the interval and update state when complete
+        # Stop the interval and update state when complete (always send full results on completion)
         return progress_display, summary_cards, progress_tracker['results'], True, {'status': 'complete'}
-    
-    # Continue updating while processing
-    return progress_display, summary_cards, progress_tracker['results'], False, processing_state
+
+    # Continue updating while processing (with throttled results)
+    return progress_display, summary_cards, results_to_return, False, processing_state
 
 # Tab content callback
 @app.callback(
@@ -3360,9 +3602,17 @@ if __name__ == "__main__":
     
     # Skip initialization in reloader subprocess (prevent double execution)
     if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
-        # Ensure all required directories exist
-        required_dirs = ['cache', 'cache/impact_analysis', 'cache/results', 'cache/status', 
-                        'cache/sma_cache', 'cache/templates', 'output', 'logs']
+        # Ensure all required directories exist (instance-scoped)
+        required_dirs = [
+            CACHE_ROOT,
+            os.path.join(CACHE_ROOT, 'impact_analysis'),
+            os.path.join(CACHE_ROOT, 'results'),
+            os.path.join(CACHE_ROOT, 'status'),
+            os.path.join(CACHE_ROOT, 'sma_cache'),
+            os.path.join(CACHE_ROOT, 'templates'),
+            'output',
+            LOGS_ROOT,
+        ]
         for directory in required_dirs:
             os.makedirs(directory, exist_ok=True)
         
@@ -3375,5 +3625,26 @@ if __name__ == "__main__":
                 except:
                     pass
                 
-    # Use debug=False or use_reloader=False to prevent hanging processes
-    app.run_server(debug=True, port=8051, use_reloader=False)
+    # Per-instance port & debug
+    def _find_free_port(start):
+        for p in range(start, start + 100):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("127.0.0.1", p))
+                except OSError:
+                    continue
+                return p
+        raise RuntimeError("No free port in range")
+
+    debug = os.environ.get("IMPACT_DEBUG", "0").lower() in ("1", "true", "on", "yes")
+    default_port = int(os.environ.get("IMPACT_PORT", "8051"))
+    port = _find_free_port(default_port) if os.environ.get("IMPACT_AUTOPORT", "0").lower() in ("1","true","on","yes") else default_port
+
+    print(f"[BOOT] Instance={INSTANCE_NAME}  CACHE_ROOT={CACHE_ROOT}  PORT={port}  DEBUG={debug}")
+    # Run without the reloader for clean multiprocessing & multi-instance behavior
+    app.run_server(
+        debug=debug,
+        port=port,
+        use_reloader=False,
+        dev_tools_silence_routes_logging=not _IMPACT_HTTP_LOGS
+    )
