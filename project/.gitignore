@@ -90,3 +90,6 @@ fix_*.py
 verify_*.py
 install_*.py
 cleanup_*.py
+
+# Test scripts directory
+test_scripts/

@@ -1,10 +1,78 @@
 import os
+import sys
+import importlib
 import pandas as pd
 import numpy as np
 from scipy import stats
 import logging
 import random
 import warnings
+
+# NumPy 1.x <-> 2.x pickle-compat shims (robust import + alias, both directions)
+def _install_numpy_pickle_compat_shims():
+    """
+    Deterministically import & alias NumPy's internal module paths so pickles
+    serialized under NumPy 2.x (numpy._core.*) or 1.x (numpy.core.*) can load.
+    """
+    import numpy as _np
+    major = int((_np.__version__.split('.')[0] or '1'))
+
+    # (module_to_alias, module_target) pairs to try
+    # When running on NumPy 1.x, we alias numpy._core.* -> numpy.core.*
+    # When running on NumPy 2.x, we alias numpy.core.* -> numpy._core.*
+    pairs_1x = [
+        ("numpy._core", "numpy.core"),
+        ("numpy._core.numeric", "numpy.core.numeric"),
+        ("numpy._core.multiarray", "numpy.core.multiarray"),
+        ("numpy._core._multiarray_umath", "numpy.core._multiarray_umath"),
+        ("numpy._core.umath", "numpy.core.umath"),
+        ("numpy._core.arrayprint", "numpy.core.arrayprint"),
+        ("numpy._core.fromnumeric", "numpy.core.fromnumeric"),
+        ("numpy._core.shape_base", "numpy.core.shape_base"),
+    ]
+    pairs_2x = [
+        ("numpy.core", "numpy._core"),
+        ("numpy.core.numeric", "numpy._core.numeric"),
+        ("numpy.core.multiarray", "numpy._core.multiarray"),
+        ("numpy.core._multiarray_umath", "numpy._core._multiarray_umath"),
+        ("numpy.core.umath", "numpy._core.umath"),
+        ("numpy.core.arrayprint", "numpy._core.arrayprint"),
+        ("numpy.core.fromnumeric", "numpy._core.fromnumeric"),
+        ("numpy.core.shape_base", "numpy._core.shape_base"),
+    ]
+
+    pairs = pairs_1x if major < 2 else pairs_2x
+    for alias_mod, target_mod in pairs:
+        try:
+            # Import the target if needed, then alias
+            if target_mod not in sys.modules:
+                importlib.import_module(target_mod)
+            sys.modules.setdefault(alias_mod, sys.modules[target_mod])
+        except Exception:
+            # Best-effort: ignore missing leaf modules in some NumPy builds
+            pass
+    logging.debug("Installed robust NumPy pickle compatibility shims (major=%d)", major)
+
+# Eagerly install shims at import-time (harmless if already on matching major)
+_install_numpy_pickle_compat_shims()
+
+# Centralized, shim-aware pickle loader
+def _pickle_load_compat(file_obj):
+    """
+    Load a pickle with NumPy 1.x/2.x compatibility.
+    Retries after installing shims if a ModuleNotFoundError occurs.
+    """
+    try:
+        return pickle.load(file_obj)
+    except ModuleNotFoundError as e:
+        if "numpy._core" in str(e) or "numpy.core" in str(e):
+            _install_numpy_pickle_compat_shims()
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+            return pickle.load(file_obj)
+        raise
 
 # Optional: Show each deprecation warning only once to reduce spam
 if os.environ.get("IMPACTSEARCH_WARN_ONCE", "0").lower() in ("1", "true", "on"):
@@ -179,31 +247,41 @@ import hashlib
 warnings.filterwarnings('ignore')
 
 # --- Fast-path imports for skipping Yahoo Finance calls on primary tickers
+FASTPATH_AVAILABLE = False
+IMPACT_TRUST_LIBRARY = os.environ.get("IMPACT_TRUST_LIBRARY", "1").lower() in ("1", "true", "on", "yes")
+_fp_mod = None
+
 try:
-    from signal_library.impact_fastpath import (
-        get_primary_signals_fast,
-        IMPACT_TRUST_LIBRARY,
-        IMPACT_TRUST_MAX_AGE_HOURS,
-        PERSIST_SKIP_BARS_IMPACT,
-        log_fastpath_stats
-    )
+    # Prefer local module so behavior is under our control
+    _fp_mod = importlib.import_module("impact_fastpath")
+    print("[INFO] Using local impact_fastpath module (preferred)")
     FASTPATH_AVAILABLE = True
-except ImportError:
-    # Fallback: support local module placement too
+except Exception:
     try:
-        from impact_fastpath import (
-            get_primary_signals_fast,
-            IMPACT_TRUST_LIBRARY,
-            IMPACT_TRUST_MAX_AGE_HOURS,
-            PERSIST_SKIP_BARS_IMPACT,
-            log_fastpath_stats
-        )
+        _fp_mod = importlib.import_module("signal_library.impact_fastpath")
         FASTPATH_AVAILABLE = True
-        print("[INFO] Using local impact_fastpath module")
-    except ImportError:
-        FASTPATH_AVAILABLE = False
+    except Exception as e:
+        print(f"[WARNING] Fast-path module not available - using slow path only ({e})")
         IMPACT_TRUST_LIBRARY = False
-        print("[WARNING] Fast-path module not available - using slow path only")
+
+if FASTPATH_AVAILABLE and _fp_mod is not None:
+    # Export functions
+    get_primary_signals_fast = _fp_mod.get_primary_signals_fast
+    IMPACT_TRUST_MAX_AGE_HOURS = _fp_mod.IMPACT_TRUST_MAX_AGE_HOURS
+    PERSIST_SKIP_BARS_IMPACT = _fp_mod.PERSIST_SKIP_BARS_IMPACT
+    log_fastpath_stats = _fp_mod.log_fastpath_stats
+
+    # CRITICAL: make the module see the same trust flag the app prints at boot
+    # (get_primary_signals_fast reads _its_ module-level flag).
+    _fp_mod.IMPACT_TRUST_LIBRARY = bool(IMPACT_TRUST_LIBRARY)
+
+    # Optional: propagate basis override so fast-path isn't blocked by basis drift
+    _allow_basis = os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS",
+                                  os.environ.get("IMPACT_FASTPATH_ALLOW_LIB_BASIS", "0"))
+    try:
+        _fp_mod.ALLOW_LIB_BASIS = str(_allow_basis).lower() in ("1", "true", "on", "yes")
+    except Exception:
+        pass
 
 # Lightweight in-memory fast-path usage stats (for run summary)
 FASTPATH_STATS = {'total_primaries': 0, 'fastpath_used': 0, 'fallback_used': 0, 'fallback_reasons': {}}
@@ -221,11 +299,13 @@ if os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower() in ("1", "true", "o
     yf.download = _wrapped_download  # Also wrap the imported reference
     print("[INSTRUMENTATION] Yahoo Finance call counting enabled")
 
-# Boot-time visibility for user
+# Boot-time visibility for user - comprehensive fastpath configuration
 print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
       f"IMPACT_TRUST_LIBRARY={IMPACT_TRUST_LIBRARY}  "
       f"PRICE_BASIS={os.environ.get('PRICE_BASIS','adj')}  "
-      f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}")
+      f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}  "
+      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','7')}  "
+      f"ALLOW_LIB_BASIS={os.environ.get('IMPACTSEARCH_ALLOW_LIB_BASIS','0')}")
 
 # Import parity configuration
 try:
@@ -1065,20 +1145,17 @@ class CacheManager:
     
     @staticmethod
     def load_from_cache(ticker, data_type='data'):
-        """Load data from cache"""
+        """Load data from cache with NumPy 2.x compatibility"""
         cache_path = CacheManager.get_cache_path(ticker, data_type)
-        
+
         if not CacheManager.is_cache_valid(cache_path):
             return None
-        
+
         try:
             with open(cache_path, 'rb') as f:
                 with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                          message=".*numpy.core.numeric.*")
-                    warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                          message=".*numpy._core.numeric.*")
-                    data = pickle.load(f)
+                    warnings.filterwarnings("ignore", category=DeprecationWarning)
+                    data = _pickle_load_compat(f)
             logger.debug(f"Loaded {data_type} from cache for {ticker}")
             return data
         except Exception as e:
@@ -1128,13 +1205,10 @@ def load_signal_library(ticker):
             if os.path.exists(filepath):
                 try:
                     with open(filepath, 'rb') as f:
-                        # Suppress NumPy deprecation warning from old pickle files
+                        # Suppress noisy warnings; use shim-aware loader
                         with warnings.catch_warnings():
-                            warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                                  message=".*numpy.core.numeric.*")
-                            warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                                  message=".*numpy._core.numeric.*")
-                            signal_data = pickle.load(f)
+                            warnings.filterwarnings("ignore", category=DeprecationWarning)
+                            signal_data = _pickle_load_compat(f)
 
                         # Defensive type check to prevent 'str' object has no attribute 'get' errors
                         if not isinstance(signal_data, dict):
@@ -1934,7 +2008,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             logger.info(f"Processing {prim_ticker}... [FASTPATH: {fp_reason}]")
 
             # Align signals to secondary's index with carry-forward inside grace window
-            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
+            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
             if grace_days > 0:
                 aligned_signals = sig_series.reindex(
                     sec_df.index, method='pad', tolerance=pd.Timedelta(days=grace_days)
@@ -2292,7 +2366,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
 
     # Align primary signals to the SECONDARY calendar with optional grace window
-    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
+    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
     sig_series = pd.Series(primary_signals, index=pd.DatetimeIndex(primary_dates))
     if grace_days > 0:
         aligned = sig_series.reindex(sec_df.index, method='pad',

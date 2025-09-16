@@ -21,6 +21,9 @@ import re
 from scipy import stats
 import gc
 import threading
+
+# Flag to suppress background "refresh scheduling" while heavy compute runs
+REFRESH_SUSPENDED = False
 from threading import Lock
 import signal
 import atexit
@@ -3262,6 +3265,74 @@ def _chart_fp(results):
 
 # Set up persistent cache
 
+# ===== Helper Functions =====
+
+def _asof(series, date, default=None):
+    """Safe date-based lookup in a pandas Series.
+    Returns the value at date if it exists, otherwise default.
+    """
+    try:
+        if date in series.index:
+            return series.loc[date]
+        return default
+    except Exception:
+        return default
+
+# ===== Pair/Value Canonicalization Helpers =====
+def _canonicalize_pair_value(value):
+    """Normalize any daily_top_*_pairs entry to ((i, j), capture) format.
+
+    Accepts:
+      - dict formats: {'pair': ..., 'capture': ...}
+      - ((i, j), cap) - already normalized
+      - ((i, j), cap, ...) - with extra values
+      - (i, j, cap) - legacy 3-tuple format
+      - (i, j) - pair only, cap defaults to 0.0
+
+    Returns ((i, j), capture) or sentinel if invalid.
+    """
+    import numpy as np
+    pair = None
+    capture = 0.0
+
+    try:
+        # Handle dictionary formats
+        if isinstance(value, dict):
+            pair = value.get('pair') or value.get('top_pair') or value.get('p')
+            capture = float(value.get('capture', value.get('cap', 0.0)))
+        # Handle tuple/list formats
+        elif isinstance(value, (list, tuple)):
+            # Already normalized: ((i,j), cap[, ...])
+            if len(value) >= 2 and isinstance(value[0], (list, tuple)) and len(value[0]) >= 2:
+                pair = (int(value[0][0]), int(value[0][1]))
+                try:
+                    capture = float(value[1])
+                except (TypeError, ValueError, IndexError):
+                    capture = 0.0
+            # Legacy format: (i, j, cap[, ...])
+            elif len(value) >= 3 and all(isinstance(x, (int, float, np.integer, np.floating)) for x in value[:3]):
+                pair = (int(value[0]), int(value[1]))
+                capture = float(value[2])
+            # Pair only: (i, j)
+            elif len(value) >= 2 and all(isinstance(x, (int, float, np.integer, np.floating)) for x in value[:2]):
+                pair = (int(value[0]), int(value[1]))
+                capture = 0.0
+
+        # Validate pair and capture
+        if not (isinstance(pair, (tuple, list)) and len(pair) == 2):
+            pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)
+        else:
+            pair = tuple(pair)  # Ensure it's a tuple
+
+        if not (isinstance(capture, (int, float)) and np.isfinite(float(capture))):
+            capture = 0.0
+
+    except Exception:
+        pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)
+        capture = 0.0
+
+    return (pair, float(capture))
+
 # ===== Adaptive interval helpers =====
 MIN_INTERVAL_MS = 1000  # 1 second minimum to prevent flashing
 MAX_INTERVAL_MS = 6000
@@ -4040,6 +4111,11 @@ def _results_for(ticker, request_key):
 def _schedule_refresh_locked(ticker):
     """Schedule a refresh for a ticker (must be called under _loading_lock)."""
     global _loading_in_progress
+    # Do not schedule refreshes while we're actively computing; this explodes
+    # background work when many PKLs exist and slows down batch compute.
+    if REFRESH_SUSPENDED:
+        logger.debug(f"Refresh scheduling suppressed (compute running) for {ticker}")
+        return
     if ticker in _loading_in_progress:
         logger.debug(f"Refresh already in progress for {ticker}; not scheduling a duplicate.")
         return
@@ -4107,7 +4183,8 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
         })
         
         # Check staleness asynchronously using a proper thread
-        if not skip_staleness_check:
+        # Also suppressed during heavy compute to prevent ballooning work.
+        if not skip_staleness_check and not REFRESH_SUSPENDED:
             submit_bg(_detect_stale_and_refresh_async, ticker, results)
         
         return results
@@ -4167,7 +4244,8 @@ def load_precomputed_results(ticker, from_callback=False, should_log=True, skip_
                             f"load_time={results_mem.get('load_time', 0):.3f}s")
             
             # Check staleness asynchronously using a proper thread
-            if not skip_staleness_check:
+            # Also suppressed during heavy compute to prevent ballooning work.
+            if not skip_staleness_check and not REFRESH_SUSPENDED:
                 submit_bg(_detect_stale_and_refresh_async, ticker, results_mem)
             
             return results_mem
@@ -4497,6 +4575,17 @@ def precompute_results(ticker, event, cancel_event=None):
       5) Compute cumulative combined capture & top leaders
       6) Persist (atomic) + publish in-memory copy
     """
+    global REFRESH_SUSPENDED
+    _old_suppress = REFRESH_SUSPENDED
+    REFRESH_SUSPENDED = True   # hard gate background refresh while computing this ticker
+
+    try:
+        return _precompute_results_impl(ticker, event, cancel_event)
+    finally:
+        REFRESH_SUSPENDED = _old_suppress
+
+def _precompute_results_impl(ticker, event, cancel_event=None):
+    """Internal implementation of precompute_results."""
     # ---------- small helpers ----------
     def _check_cancel(where: str = ""):
         # Check both the explicit cancel flag and the completion event
@@ -4583,6 +4672,11 @@ def precompute_results(ticker, event, cancel_event=None):
                         df_existing = existing_results.get('preprocessed_data')  # Fallback
                     daily_top_buy = existing_results.get('daily_top_buy_pairs', {})
                     daily_top_short = existing_results.get('daily_top_short_pairs', {})
+                    # Canonicalize legacy formats before CCC computation
+                    if daily_top_buy:
+                        daily_top_buy = {d: _canonicalize_pair_value(v) for d, v in daily_top_buy.items()}
+                    if daily_top_short:
+                        daily_top_short = {d: _canonicalize_pair_value(v) for d, v in daily_top_short.items()}
                     ccc, active = calculate_cumulative_combined_capture(df_existing, daily_top_buy, daily_top_short)
                     existing_results['cumulative_combined_captures'] = ccc
                     existing_results['active_pairs'] = active
@@ -4693,7 +4787,8 @@ def precompute_results(ticker, event, cancel_event=None):
             prices = pd.to_numeric(prices, errors='coerce').astype(np.float64)
             
             # ENHANCEMENT 3 (updated): Make returns fully NaN/Inf-safe; first day = 0
-            returns = prices.pct_change()
+            # NOTE: fill_method=None to avoid FutureWarning and unintended ffill
+            returns = prices.pct_change(fill_method=None)
             # corporate actions or data glitches may introduce ±inf; coerce to NaN → fill with 0
             returns = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
             # ensure contiguous 1-D float64
@@ -7477,7 +7572,16 @@ def calculate_cumulative_combined_capture(df, daily_top_buy_pairs, daily_top_sho
                     else:
                         current_position = "None"
 
-                    daily_return = df['Close'].loc[current_date] / df['Close'].loc[previous_date] - 1
+                    # Guard against NaN/Inf and divide-by-zero to prevent poisoning the series
+                    prev_close = _asof(df['Close'], previous_date, default=np.nan)
+                    curr_close = _asof(df['Close'], current_date, default=np.nan)
+
+                    # NOTE: numpy already imported at module level; no local import needed
+                    if not (isinstance(prev_close, (int, float)) and isinstance(curr_close, (int, float))
+                            and np.isfinite(prev_close) and np.isfinite(curr_close) and prev_close != 0):
+                        daily_return = 0.0
+                    else:
+                        daily_return = (curr_close / prev_close) - 1.0
 
                     if current_position.startswith('Buy'):
                         daily_capture = daily_return * 100
@@ -7518,25 +7622,17 @@ def get_or_calculate_combined_captures(results, df, daily_top_buy_pairs, daily_t
         active_pairs = results['active_pairs']
         logger.info("Using stored cumulative_combined_captures and active_pairs")
     else:
-        # Ensure daily_top_buy_pairs and daily_top_short_pairs are in the correct format
+        # Canonicalize legacy/variant shapes to ((i, j), capture)
         formatted_daily_top_buy_pairs = {}
         formatted_daily_top_short_pairs = {}
 
-        for date, (pair, capture) in daily_top_buy_pairs.items():
-            if isinstance(pair, tuple) and len(pair) == 2:
-                formatted_daily_top_buy_pairs[date] = (pair, capture)
-            elif isinstance(pair, int):
-                formatted_daily_top_buy_pairs[date] = ((pair, capture), 0)
-            else:
-                print(f"Unexpected buy pair format for date {date}: {pair}")
+        for date, value in daily_top_buy_pairs.items():
+            canonical = _canonicalize_pair_value(value)
+            formatted_daily_top_buy_pairs[date] = canonical  # Always returns valid tuple
 
-        for date, (pair, capture) in daily_top_short_pairs.items():
-            if isinstance(pair, tuple) and len(pair) == 2:
-                formatted_daily_top_short_pairs[date] = (pair, capture)
-            elif isinstance(pair, int):
-                formatted_daily_top_short_pairs[date] = ((pair, capture), 0)
-            else:
-                print(f"Unexpected short pair format for date {date}: {pair}")
+        for date, value in daily_top_short_pairs.items():
+            canonical = _canonicalize_pair_value(value)
+            formatted_daily_top_short_pairs[date] = canonical  # Always returns valid tuple
 
         cumulative_combined_captures, active_pairs = calculate_cumulative_combined_capture(
             df, formatted_daily_top_buy_pairs, formatted_daily_top_short_pairs
@@ -11732,7 +11828,15 @@ def batch_process_tickers(n_clicks, n_intervals, input_value, existing_table_dat
         status_str = st.get('status')
         if status_str == 'complete':
             # Read tiny summary fields from cached/file results (no DF load)
-            res = load_precomputed_results(t, from_callback=False, should_log=False) or {}
+            # IMPORTANT: The batch poller should NOT trigger staleness refreshes
+            # as they scale with cache size and compete with active computations
+            res = load_precomputed_results(
+                t,
+                from_callback=False,
+                should_log=False,
+                skip_staleness_check=True,  # Don't trigger refresh jobs
+                bypass_loading_check=True   # Allow read even if loading
+            ) or {}
             last_date_str = res.get('last_date_str')
             if not last_date_str and res.get('last_date') is not None:
                 try:
@@ -11743,7 +11847,16 @@ def batch_process_tickers(n_clicks, n_intervals, input_value, existing_table_dat
             price_val = res.get('last_adj_close', None)
             if price_val is None:
                 price_val = res.get('last_close', None)
-            last_price = f"${price_val:.2f}" if isinstance(price_val, (int, float)) else '—'
+            # Show '—' for NaN/Inf instead of '$nan'
+            try:
+                import numpy as np
+                last_price = (
+                    f"${float(price_val):.2f}"
+                    if (price_val is not None and np.isfinite(float(price_val)))
+                    else '—'
+                )
+            except Exception:
+                last_price = '—'
 
             def _pair_ok(p):
                 return isinstance(p, tuple) and len(p) == 2 and p != (0, 0)
