@@ -19,7 +19,10 @@ This is a quantitative trading analysis web application built with Python and Da
 
 **Operating System**: Windows (platform: win32)
 **Shell**: Windows Command Prompt (CMD)
-**Python Environment**: Conda (spyproject2)
+**Python Environments**:
+  - **spyproject2** (Primary) - Has Intel MKL, NumPy 1.26.4, optimized BLAS
+  - **spyproject2_basic** (Alternative) - Generic BLAS, NumPy 2.2.6, no MKL
+    - Note: This was formerly named `spyproject2_mkl` (misleading name has been corrected)
 **Current Date**: August 27, 2025 (Wednesday)
 
 ### Important Windows CMD Notes:
@@ -425,8 +428,17 @@ Note: Machine learning integration, advanced analytics, and institutional featur
 - **ALL files must follow naming structure rules, regardless of git tracking status**
 - **No temporary files, test scripts, or helper utilities should be left in the root directory**
 - **Clean up after yourself**: Remove any temporary files, test outputs, or debugging artifacts
-- **If a utility script is needed long-term**, place it in an appropriate subdirectory:
-  - `utilities/` - General utility scripts
+- **Application utilities are in the `utils/` directory**:
+  - `utils/spymaster/` - Spymaster utility modules (logging_config.py, etc.)
+  - `utils/impactsearch/` - ImpactSearch utility modules
+  - `utils/onepass/` - OnePass utility modules
+- **Test scripts must be organized in the `test_scripts/` directory**:
+  - `test_scripts/spymaster/` - Tests specific to spymaster.py (e.g., test_axp_baseline.py)
+  - `test_scripts/impactsearch/` - Tests specific to impactsearch.py (e.g., test_impactsearch_performance.py, test_fastpath.py)
+  - `test_scripts/onepass/` - Tests specific to onepass.py (e.g., test_integrity_fix.py, test_simple_fix.py)
+  - `test_scripts/gtl/` - Tests specific to Global Ticker Library
+  - `test_scripts/shared/` - Tests that apply to multiple scripts or the environment (e.g., test_mkl_comparison.py, test_thread_config.py, environment analysis scripts)
+- **Other scripts** should be placed in appropriate subdirectories:
   - `scripts/` - Automation and helper scripts
   - `tools/` - Development tools
 
@@ -442,14 +454,12 @@ Note: Machine learning integration, advanced analytics, and institutional featur
     - `2025-01-15_CODE_CLEANUP_667_LINES_REMOVED.md` (refactoring work)
   - Avoid vague terms like: FINDINGS, NOTES, CHANGES, UPDATE
 - All documentation should be organized in the `md_library/` directory structure:
-  - `md_library/spymaster/` - Spymaster-specific documentation
-    - `/bugs/` - Bug reports and fixes
-    - `/refactoring/` - Refactoring summaries and changes
-    - `/performance/` - Performance improvements
-    - `/adaptive_interval/` - Adaptive interval related docs
-  - `md_library/impactsearch/` - Impactsearch documentation
-  - `md_library/onepass/` - Onepass documentation
-  - `md_library/shared/` - Shared documentation across scripts (testing, tools, environment)
+  - **IMPORTANT: Store MD files directly in their associated directories - NO SUBDIRECTORIES**
+  - `md_library/spymaster/` - Spymaster-specific documentation (all MD files go directly here)
+  - `md_library/impactsearch/` - Impactsearch documentation (all MD files go directly here)
+  - `md_library/onepass/` - Onepass documentation (all MD files go directly here)
+  - `md_library/shared/` - Shared documentation across scripts (all MD files go directly here)
+  - `md_library/global_ticker_library/` - GTL documentation (all MD files go directly here)
 - Text files (.txt) for quick changes/notes can remain in root temporarily but should be cleaned up promptly
 
 ### Git Branch Naming Conventions

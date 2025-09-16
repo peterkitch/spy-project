@@ -7,12 +7,73 @@ signal libraries from onepass.py instead of re-fetching every primary ticker.
 """
 
 import os
+import sys
+import importlib
 import pickle
 import logging
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
+
+# NumPy 1.x <-> 2.x pickle-compat shims (robust import + alias, both directions)
+def _install_numpy_pickle_compat_shims():
+    """
+    Deterministically import & alias NumPy's internal module paths so pickles
+    serialized under NumPy 2.x (numpy._core.*) or 1.x (numpy.core.*) can load.
+    """
+    import numpy as _np
+    major = int((_np.__version__.split('.')[0] or '1'))
+
+    pairs_1x = [
+        ("numpy._core", "numpy.core"),
+        ("numpy._core.numeric", "numpy.core.numeric"),
+        ("numpy._core.multiarray", "numpy.core.multiarray"),
+        ("numpy._core._multiarray_umath", "numpy.core._multiarray_umath"),
+        ("numpy._core.umath", "numpy.core.umath"),
+        ("numpy._core.arrayprint", "numpy.core.arrayprint"),
+        ("numpy._core.fromnumeric", "numpy.core.fromnumeric"),
+        ("numpy._core.shape_base", "numpy.core.shape_base"),
+    ]
+    pairs_2x = [
+        ("numpy.core", "numpy._core"),
+        ("numpy.core.numeric", "numpy._core.numeric"),
+        ("numpy.core.multiarray", "numpy._core.multiarray"),
+        ("numpy.core._multiarray_umath", "numpy._core._multiarray_umath"),
+        ("numpy.core.umath", "numpy._core.umath"),
+        ("numpy.core.arrayprint", "numpy._core.arrayprint"),
+        ("numpy.core.fromnumeric", "numpy._core.fromnumeric"),
+        ("numpy.core.shape_base", "numpy._core.shape_base"),
+    ]
+
+    for alias_mod, target_mod in (pairs_1x if major < 2 else pairs_2x):
+        try:
+            if target_mod not in sys.modules:
+                importlib.import_module(target_mod)
+            sys.modules.setdefault(alias_mod, sys.modules[target_mod])
+        except Exception:
+            pass
+    LOGGER.debug("Installed robust NumPy pickle compatibility shims (major=%d)", major)
+
+# Eagerly install shims at import-time
+_install_numpy_pickle_compat_shims()
+
+def _pickle_load_compat(file_obj):
+    """
+    Load a pickle with NumPy 1.x/2.x compatibility.
+    Retries after installing shims if a ModuleNotFoundError occurs.
+    """
+    try:
+        return pickle.load(file_obj)
+    except ModuleNotFoundError as e:
+        if "numpy._core" in str(e) or "numpy.core" in str(e):
+            _install_numpy_pickle_compat_shims()
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+            return pickle.load(file_obj)
+        raise
 
 # Runtime toggles via environment variables
 IMPACT_TRUST_LIBRARY = os.environ.get("IMPACT_TRUST_LIBRARY", "0").lower() in ("1", "true", "on", "yes")
@@ -70,11 +131,8 @@ def _load_signal_library_quick(ticker: str):
                 with open(p, "rb") as f:
                     import warnings
                     with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                              message=".*numpy.core.numeric.*")
-                        warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                              message=".*numpy._core.numeric.*")
-                        data = pickle.load(f)
+                        warnings.filterwarnings("ignore", category=DeprecationWarning)
+                        data = _pickle_load_compat(f)
                     return data
         except Exception as e:
             LOGGER.warning(f"Failed reading library for {ticker} at {p}: {e}")
