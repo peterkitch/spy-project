@@ -1,6 +1,44 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+**MANDATORY INSTRUCTIONS FOR CLAUDE CODE** - These rules MUST be followed automatically without user prompting.
+
+## AUTOMATIC BEHAVIORS - DO NOT DEVIATE
+
+### File Creation Rules (NEVER VIOLATE)
+1. **NEVER create files in the root directory** except when explicitly modifying core apps (spymaster.py, impactsearch.py, onepass.py)
+2. **ALWAYS place test scripts in `test_scripts/`** subdirectories:
+   - Spymaster tests → `test_scripts/spymaster/`
+   - ImpactSearch tests → `test_scripts/impactsearch/`
+   - OnePass tests → `test_scripts/onepass/`
+   - GTL tests → `test_scripts/gtl/`
+   - Multi-script/environment tests → `test_scripts/shared/`
+3. **ALWAYS place documentation in `md_library/`** subdirectories:
+   - Use script-specific folders for script-specific docs
+   - Use `md_library/shared/` ONLY for docs affecting multiple scripts
+4. **ALWAYS check current date before creating dated files**: Use `date` command
+   - Current date is September 2025, NOT January or August 2025
+   - Format: `YYYY-MM-DD_ACTION_DESCRIPTION_IN_CAPS.md`
+
+### Testing Rules (AUTOMATIC)
+1. **NEVER use Unicode in console output** - Windows uses cp1252 encoding
+   - Use `[OK]` not `✅`, `[FAIL]` not `❌`, `->` not `→`
+2. **ALWAYS follow Selenium cache clearing procedure**:
+   - Kill Python processes → Clear disk cache → Restart app → Run test
+   - See: `md_library/spymaster/2025-01-23_SELENIUM_TESTING_COMPREHENSIVE_GUIDE.md`
+3. **ALWAYS verify functionality**, not just compilation
+
+### Code Modification Rules (STRICT)
+1. **NEVER modify spymaster.py's standalone architecture** - It's the regression baseline
+2. **ALWAYS use the optimized launcher** for performance testing:
+   - Location: `local_optimization/batch_files/LAUNCH_OPTIMIZED_V4.bat`
+3. **ALWAYS enable ImpactSearch FastPath** unless testing slow path:
+   - Set `IMPACT_TRUST_LIBRARY=1`
+   - See: `md_library/impactsearch/2025-09-16_IMPACTSEARCH_FASTPATH_OPTIMIZATION_IMPLEMENTATION.md`
+
+### Clean Repository Rules (MAINTAIN AT ALL TIMES)
+1. **DELETE temporary files immediately** after use
+2. **MOVE misplaced files immediately** when discovered
+3. **FOLLOW naming conventions strictly** - no exceptions
 
 ## Project Overview
 
@@ -23,7 +61,16 @@ This is a quantitative trading analysis web application built with Python and Da
   - **spyproject2** (Primary) - Has Intel MKL, NumPy 1.26.4, optimized BLAS
   - **spyproject2_basic** (Alternative) - Generic BLAS, NumPy 2.2.6, no MKL
     - Note: This was formerly named `spyproject2_mkl` (misleading name has been corrected)
-**Current Date**: August 27, 2025 (Wednesday)
+**System Specs**: Intel Core i7-13700KF (16 cores), 32GB RAM
+**Conda Path**: `C:\Users\sport\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat`
+
+### CRITICAL DATE AWARENESS ISSUE
+**IMPORTANT**: The system often shows incorrect dates. When creating MD files with date prefixes:
+- **ALWAYS verify the actual current date** using `date` command or checking system clock
+- **As of this writing**: The actual date is September 16, 2025 (NOT January or August 2025)
+- **Common date confusion**: System may think it's January or August 2025 when it's actually September
+- **Before creating any dated file**: Double-check the current date to avoid mislabeled files
+- **Existing mislabeled files**: Many MD files are incorrectly dated as "2025-01-*" or "2025-08-*" when they were actually created in September 2025
 
 ### Important Windows CMD Notes:
 - Environment variables: Use `set VAR=value && command` syntax
@@ -41,6 +88,23 @@ conda activate spyproject2
 ```
 
 ### Running Applications
+
+#### Using the Optimized Launcher (Recommended)
+```bash
+# Navigate to launcher directory
+cd local_optimization\batch_files
+
+# Run the optimized launcher with system detection
+LAUNCH_OPTIMIZED_V4.bat
+```
+
+The launcher provides:
+- Automatic CPU core detection (P-cores vs E-cores for Intel 13th gen)
+- Performance profiles: Conservative (25%), Balanced (50%), Performance (75%), Maximum (100%)
+- MKL threading optimization (MKL_NUM_THREADS, OMP_NUM_THREADS, etc.)
+- ImpactSearch FastPath configurations
+
+#### Direct Application Launch
 ```bash
 # Main trading analysis dashboard (default port 8050)
 python spymaster.py
@@ -55,6 +119,16 @@ python onepass.py
 cd global_ticker_library
 python run.py --validate-manual
 ```
+
+#### ImpactSearch FastPath Configuration
+Critical environment variables for ImpactSearch optimization:
+- `IMPACT_TRUST_LIBRARY=1` - Enable fastpath (reduces API calls from 73,000+ to 1)
+- `IMPACT_TRUST_MAX_AGE_HOURS=720` - Production: 30 days cache validity
+- `IMPACT_TRUST_MAX_AGE_HOURS=168` - Conservative: 7 days cache validity
+- `IMPACT_CALENDAR_GRACE_DAYS=10` - Grace period for calendar adjustments
+- `IMPACTSEARCH_ALLOW_LIB_BASIS=1` - Allow library-based calculations
+
+**Note**: See `md_library/impactsearch/2025-09-16_IMPACTSEARCH_FASTPATH_OPTIMIZATION_IMPLEMENTATION.md` for fastpath gate mismatch fix details
 
 ### Building Executable
 ```bash
@@ -423,44 +497,64 @@ Note: Machine learning integration, advanced analytics, and institutional featur
 
 ## Development Guidelines & Best Practices
 
-### Repository Cleanliness & Organization
-- **We aim to keep the entire repository clean and organized at all times**
-- **ALL files must follow naming structure rules, regardless of git tracking status**
-- **No temporary files, test scripts, or helper utilities should be left in the root directory**
-- **Clean up after yourself**: Remove any temporary files, test outputs, or debugging artifacts
-- **Application utilities are in the `utils/` directory**:
-  - `utils/spymaster/` - Spymaster utility modules (logging_config.py, etc.)
-  - `utils/impactsearch/` - ImpactSearch utility modules
-  - `utils/onepass/` - OnePass utility modules
-- **Test scripts must be organized in the `test_scripts/` directory**:
-  - `test_scripts/spymaster/` - Tests specific to spymaster.py (e.g., test_axp_baseline.py)
-  - `test_scripts/impactsearch/` - Tests specific to impactsearch.py (e.g., test_impactsearch_performance.py, test_fastpath.py)
-  - `test_scripts/onepass/` - Tests specific to onepass.py (e.g., test_integrity_fix.py, test_simple_fix.py)
-  - `test_scripts/gtl/` - Tests specific to Global Ticker Library
-  - `test_scripts/shared/` - Tests that apply to multiple scripts or the environment (e.g., test_mkl_comparison.py, test_thread_config.py, environment analysis scripts)
-- **Other scripts** should be placed in appropriate subdirectories:
-  - `scripts/` - Automation and helper scripts
-  - `tools/` - Development tools
+### MANDATORY Repository Organization
 
-### Documentation Organization
+**YOU MUST automatically enforce these rules WITHOUT being asked:**
+
+#### File Placement (ENFORCE IMMEDIATELY)
+- **Root directory = FORBIDDEN for new files** (only modify existing core apps)
+- **Test scripts = MUST go in `test_scripts/[appropriate_subfolder]/`**
+- **Documentation = MUST go in `md_library/[appropriate_subfolder]/`**
+- **Temporary files = DELETE IMMEDIATELY after use**
+- **Utilities = MUST go in `utils/[appropriate_subfolder]/`**
+
+#### When Creating ANY File, You MUST:
+1. **CHECK**: Is this a test? → `test_scripts/[app_name]/`
+2. **CHECK**: Is this documentation? → `md_library/[app_name]/`
+3. **CHECK**: Is this temporary? → Create, use, DELETE immediately
+4. **CHECK**: Current date with `date` command before naming
+5. **NEVER**: Place in root unless modifying existing core files
+
+#### Automatic Cleanup Actions:
+- **If you see a test file in root** → Move it immediately
+- **If you see an MD file in root** → Move it immediately
+- **If you create a temporary file** → Delete it before session ends
+- **If you see wrongly dated files** → Note in response and fix if possible
+
+### Documentation Organization & Reference Guide
+
+#### Where to Store Documentation
 - **NEVER place new markdown files in the root project folder** (except CLAUDE.md)
 - **ALWAYS use date prefix and descriptive uppercase title for markdown filenames**: `YYYY-MM-DD_DESCRIPTION_IN_CAPS.md`
-  - Date format: YYYY-MM-DD (ISO 8601)
+  - Date format: YYYY-MM-DD (ISO 8601) - **VERIFY CURRENT DATE FIRST**
   - Description: Use UPPERCASE with underscores, be specific about the content
   - Include action words like: INVESTIGATION, FIX, ENHANCEMENT, REFACTOR, IMPLEMENTATION, ANALYSIS
   - Good examples:
-    - `2025-01-16_UNICODE_AND_SELENIUM_TEST_ISSUE_INVESTIGATIONS.md` (investigation into problems)
-    - `2025-01-14_ADAPTIVE_INTERVAL_PERFORMANCE_6X_FASTER.md` (performance improvement)
-    - `2025-01-15_CODE_CLEANUP_667_LINES_REMOVED.md` (refactoring work)
+    - `2025-09-16_UNICODE_AND_SELENIUM_TEST_ISSUE_INVESTIGATIONS.md` (investigation into problems)
+    - `2025-09-14_ADAPTIVE_INTERVAL_PERFORMANCE_6X_FASTER.md` (performance improvement)
+    - `2025-09-15_CODE_CLEANUP_667_LINES_REMOVED.md` (refactoring work)
   - Avoid vague terms like: FINDINGS, NOTES, CHANGES, UPDATE
 - All documentation should be organized in the `md_library/` directory structure:
   - **IMPORTANT: Store MD files directly in their associated directories - NO SUBDIRECTORIES**
-  - `md_library/spymaster/` - Spymaster-specific documentation (all MD files go directly here)
-  - `md_library/impactsearch/` - Impactsearch documentation (all MD files go directly here)
-  - `md_library/onepass/` - Onepass documentation (all MD files go directly here)
-  - `md_library/shared/` - Shared documentation across scripts (all MD files go directly here)
-  - `md_library/global_ticker_library/` - GTL documentation (all MD files go directly here)
+  - `md_library/spymaster/` - Spymaster-specific documentation
+  - `md_library/impactsearch/` - ImpactSearch documentation
+  - `md_library/onepass/` - OnePass documentation
+  - `md_library/shared/` - Documentation that affects multiple scripts:
+    - Signal library fixes (used by both ImpactSearch and OnePass)
+    - Environment/MKL optimization (affects all scripts)
+    - NumPy compatibility issues (cross-cutting)
+    - Testing procedures (general testing guidelines)
+  - `md_library/global_ticker_library/` - GTL documentation
 - Text files (.txt) for quick changes/notes can remain in root temporarily but should be cleaned up promptly
+
+#### Documentation Quick Access Map
+**USE THE "MANDATORY DOCUMENTATION LOOKUPS" SECTION ABOVE** for detailed guidance on:
+- Which documents to read BEFORE starting any task
+- Exact file paths for critical documentation
+- Search commands to find relevant docs
+- Automatic documentation check protocol
+
+**Key principle**: NEVER start a task without checking for existing documentation first
 
 ### Git Branch Naming Conventions
 - **Be specific about scope and purpose** - branches should clearly indicate what they affect
@@ -509,8 +603,16 @@ When handling git diff requests, pay attention to whether the user wants a file 
 - Provide summary or highlights as requested
 - No files should be created
 
-### Testing Guidelines
-- **NEVER use Unicode characters in test scripts or console output**
+### Testing Guidelines (MANDATORY PROCEDURES)
+
+#### YOU MUST AUTOMATICALLY:
+1. **Place ALL test scripts in `test_scripts/` subdirectories** - NO EXCEPTIONS
+2. **Use ASCII characters in console output** - NO UNICODE
+3. **Clear both cache layers for Selenium** - disk AND session
+4. **Verify actual functionality** - compilation is not enough
+
+#### Unicode Handling (AUTOMATIC REPLACEMENT)
+**When writing ANY console output, you MUST automatically use**:
   - Windows console uses cp1252 encoding which cannot display Unicode characters
   - This causes `UnicodeEncodeError` when Python tries to print Unicode to the Windows terminal
   - Use ASCII alternatives: [OK], [FAIL], [WARNING] instead of ✅, ❌, ⚠️
@@ -522,8 +624,21 @@ When handling git diff requests, pay attention to whether the user wants a file 
   - Internal Python string processing
   - Web-based outputs (JSON, HTML, etc.)
 - **The issue is ONLY with Windows console output (cmd.exe, PowerShell)**
+
+#### Selenium Testing Procedures
+- **CRITICAL: Two-Layer Cache System** - See `md_library/spymaster/2025-01-23_SELENIUM_TESTING_COMPREHENSIVE_GUIDE.md`
+- **Before running Selenium tests, you MUST**:
+  1. Kill all running Python processes: `taskkill /F /IM python.exe`
+  2. Clear disk cache completely: `rmdir /S /Q cache` and `del *.pkl *.json`
+  3. Restart spymaster fresh: `python spymaster.py`
+  4. Only then run Selenium test: `python utils\spymaster\selenium_tests\test_spymaster_comprehensive.py`
+- **Cache contamination warning**: Spymaster maintains both disk cache and session cache - clearing disk alone is insufficient
+- **Test coverage includes all 7 ticker input locations** in spymaster
+
+#### Test Verification Requirements
 - All tests should include verification of newly implemented metrics, visuals, functions, or other components
 - It is not enough that the app compiles - verify actual functionality
+- Use regression testing with spymaster.py as the baseline (it's intentionally standalone)
 
 ### Callback & Interval Handling
 - **Interval updates are critical for chart loading** (currently 3 seconds)
@@ -567,3 +682,119 @@ When handling git diff requests, pay attention to whether the user wants a file 
 - Conditional logging based on whether ticker changed vs interval update
 - Maintained all data processing while controlling console output
 - Preserved the critical 3-second refresh cycle for chart updates
+
+## QUICK REFERENCE - AUTOMATIC ACTIONS
+
+### When Starting ANY Task:
+1. **CHECK root directory** - Move any misplaced files immediately
+2. **CHECK date** - Run `date` command before creating dated files
+3. **CHECK file placement** - Never save to root
+
+### When Creating Files:
+- **Test script?** → `test_scripts/[app]/test_*.py`
+- **Documentation?** → `md_library/[app]/YYYY-MM-DD_*.md`
+- **Temporary?** → Create, use, delete immediately
+- **In root?** → STOP, move to correct location
+
+### When Testing:
+- **Console output** → Use [OK], [FAIL], [WARNING] - NO Unicode
+- **Selenium test** → Kill processes, clear cache, restart app
+- **Performance test** → Use LAUNCH_OPTIMIZED_V4.bat
+
+### When Documenting:
+- **Script-specific** → `md_library/[script_name]/`
+- **Affects multiple** → `md_library/shared/`
+- **Date format** → YYYY-MM-DD (verify current date first!)
+
+### Common Locations:
+- **Launcher**: `local_optimization/batch_files/LAUNCH_OPTIMIZED_V4.bat`
+- **Selenium guide**: `md_library/spymaster/2025-01-23_SELENIUM_TESTING_COMPREHENSIVE_GUIDE.md`
+- **FastPath docs**: `md_library/impactsearch/2025-09-16_IMPACTSEARCH_FASTPATH_OPTIMIZATION_IMPLEMENTATION.md`
+
+### FORBIDDEN ACTIONS - NEVER DO THESE:
+- **NEVER save test files to root** - Always use `test_scripts/`
+- **NEVER save MD files to root** - Always use `md_library/`
+- **NEVER use Unicode in console** - Always use ASCII
+- **NEVER skip cache clearing for Selenium** - Always do full clear
+- **NEVER modify spymaster.py's standalone nature** - It's the baseline
+- **NEVER trust the system date** - Always verify with `date` command
+- **NEVER leave temporary files** - Always clean up immediately
+- **NEVER place files randomly** - Always follow structure
+
+## MANDATORY DOCUMENTATION LOOKUPS
+
+### Before ANY Task, You MUST Check These Resources:
+
+#### For Selenium Testing:
+**MUST READ FIRST**: `md_library/spymaster/2025-01-23_SELENIUM_TESTING_COMPREHENSIVE_GUIDE.md`
+- Contains: Two-layer cache system details, nuclear clear procedure, all 7 ticker input locations
+- Critical: Session cache vs disk cache distinction
+- Element IDs: All 9 test coverage areas documented
+- **DO NOT attempt Selenium testing without reading this first**
+
+#### For ImpactSearch FastPath:
+**MUST READ FIRST**: `md_library/impactsearch/2025-09-16_IMPACTSEARCH_FASTPATH_OPTIMIZATION_IMPLEMENTATION.md`
+- Contains: Gate mismatch fix, module flag propagation solution
+- Critical: Environment variable requirements
+- Performance: Reduces API calls from 73,000+ to 1
+- **DO NOT modify ImpactSearch without understanding fastpath**
+
+#### For Performance/Threading:
+**MUST READ FIRST**:
+- `md_library/shared/2025-01-15_MKL_THREAD_OPTIMIZATION_BASELINE_TESTS.md`
+- `md_library/shared/2025-01-15_COMPLETE_P8_OPTIMIZATION_ALL_SCRIPTS.md`
+- Contains: P-core vs E-core detection, MKL threading configurations
+- Critical: Intel 13th gen optimization settings
+
+#### For NumPy Compatibility Issues:
+**MUST READ FIRST**:
+- `md_library/shared/2025-09-16_NUMPY_PICKLE_COMPATIBILITY_SHIMS_IMPLEMENTATION.md`
+- `md_library/shared/2025-09-16_ROBUST_NUMPY_SHIMS_VERIFIED_WORKING.md`
+- Contains: Cross-version pickle loading fixes
+- Critical: numpy.core vs numpy._core aliasing
+
+#### For Unicode/Console Issues:
+**MUST READ FIRST**: `md_library/shared/2025-08-16_UNICODE_AND_SELENIUM_TEST_ISSUE_INVESTIGATIONS.md`
+- Contains: cp1252 encoding details, ASCII replacement patterns
+- Critical: Why Unicode fails in Windows console
+- Solutions: Complete ASCII alternative mapping
+
+#### For Signal Library Problems:
+**MUST READ FIRST**: Any file matching these patterns:
+- `md_library/shared/2025-08-20_REBUILD_FIX_*.md` - Rebuild reduction
+- `md_library/shared/2025-08-20_SCALE_RECONCILE_*.md` - Scale fixes
+- `md_library/shared/2025-08-21_T1_*.md` - T1 policy implementations
+- Contains: Tolerance adjustments, date alignment fixes
+
+#### For GTL (Global Ticker Library):
+**MUST READ FIRST**:
+- `md_library/global_ticker_library/2025-08-19_TICKER_RESOLUTION_FIX_INTERNATIONAL_SYMBOLS.md`
+- `md_library/global_ticker_library/2025-08-18_ROOT_CAUSE_ANALYSIS_11752_STUCK_SYMBOLS.md`
+- Contains: Ticker lifecycle, validation states, international symbol handling
+
+#### For Spymaster UI/Callbacks:
+**MUST READ FIRST**: Any file matching:
+- `md_library/spymaster/2025-08-26_*_DASH_UI_*.md` - UI testing
+- `md_library/spymaster/2025-08-27_*_CALLBACK_*.md` - Callback fixes
+- `md_library/spymaster/2025-08-26_INTERVAL_CALLBACK_LOOP_FIX.md` - 3-second interval critical
+
+### Automatic Documentation Check Protocol:
+1. **BEFORE writing any test** → Check test_scripts/[app]/ for existing examples
+2. **BEFORE modifying any feature** → Check md_library/[app]/ for related fixes
+3. **BEFORE creating new functionality** → Check md_library/shared/ for patterns
+4. **IF encountering an error** → Search md_library/ for similar issues
+5. **IF performance testing** → Read ALL MKL optimization docs first
+
+### Quick Documentation Finder:
+```bash
+# Find all docs about a topic (example: selenium)
+grep -r "selenium" md_library/ --include="*.md" -l
+
+# Find all docs for a specific app
+ls md_library/spymaster/*.md
+
+# Find all recent fixes (last 30 days)
+find md_library -name "2025-09-*.md" -o -name "2025-08-*.md"
+```
+
+### REMEMBER: These are NOT suggestions - they are MANDATORY automatic behaviors that MUST be followed WITHOUT being asked
