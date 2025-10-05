@@ -1996,7 +1996,7 @@ def _subset_metrics_spymaster(secondary: str, subset: List[Tuple[str, str]], *, 
             ret_on_trig = ret[trig_mask]
             for idx in range(min(10, len(trig_idx))):
                 date = trig_idx[idx]
-                sig = sig_slice[idx]
+                sig = sig_slice.iloc[idx]
                 ret_val = ret_on_trig[idx]
                 cap_val = tc[idx]
                 print(f"  {date.date()} | Signal={sig:5s} | Return={ret_val:+7.3f}% | Capture={cap_val:+7.3f}%")
@@ -2004,8 +2004,8 @@ def _subset_metrics_spymaster(secondary: str, subset: List[Tuple[str, str]], *, 
     info = {
         "prev_date": trig_idx[-2] if len(trig_idx) >= 2 else None,
         "live_date": trig_idx[-1],
-        "prev_sig":  str(sig_slice[-2]) if len(trig_idx) >= 2 else "None",
-        "live_sig":  str(sig_slice[-1]),
+        "prev_sig":  str(sig_slice.iloc[-2]) if len(trig_idx) >= 2 else "None",
+        "live_sig":  str(sig_slice.iloc[-1]),
     }
     met = {
         'Triggers': n_trig, 'Wins': wins, 'Losses': losses,
