@@ -4,17 +4,17 @@
 #
 # What this does
 #  - Loads latest StackBuilder combo_leaderboard for each Secondary.
-#  - Parses K-build Members (e.g., "XLF[D], XLK[I], ...").
+#  - Parses K-build Members (e.g., "XLF, XLK, ...") ignoring any mode suffixes.
 #  - Rebuilds signals from each primary's Spymaster PKL using signals_with_next semantics.
 #  - Combines signals per Spymaster rules: None-neutral, conflicts cancel to None.
 #  - Computes AVERAGES by evaluating all non-empty subsets with combined signals.
 #  - Ranks rows by Sharpe desc. Whole-row color = green (>=2), yellow (-2..2 or no triggers), red (<=-2).
 #
 # Assumptions
-#  - Price basis: RAW Close (default). Set PRICE_BASIS=adj to use Adj Close.
+#  - Price basis: Always uses raw Close prices (no adjusted close)
 #  - PKL location: cache/results (Spymaster PKLs with primary_signals or active_pairs).
 #  - StackBuilder outputs under output/stackbuilder/<SEC>/<run>/combo_leaderboard.(xlsx|parquet|csv)
-#  - Calendar alignment: Grace period (GRACE_DAYS) for signal forward-fill across non-overlapping sessions.
+#  - Calendar alignment: Strict intersection only (no grace periods) for SpyMaster parity
 #
 # Controls
 #  - "Refresh" button recomputes from disk and latest yfinance price (if cache missing).
@@ -59,80 +59,28 @@ except Exception:
         return 16, 0, "America/New_York"
 
 # ---------- Config ----------
-# --- Strict A.S.O. intersection (no grace padding → fixes off-by-one) ---
-os.environ.setdefault('IMPACT_CALENDAR_GRACE_DAYS', '0')  # force zero-padding
+# Strict A.S.O. intersection - no grace padding (SpyMaster parity)
 
 PORT = int(os.environ.get("TRAFFICFLOW_PORT", "8055"))
 RUNS_ROOT = os.environ.get("STACKBUILDER_RUNS_ROOT", "output/stackbuilder")
 SPYMASTER_PKL_DIR = r"C:\Users\sport\Documents\PythonProjects\spy-project\project\cache\results"
 PRICE_CACHE_DIR = os.environ.get("PRICE_CACHE_DIR", "price_cache/daily")
-PRICE_BASIS = os.environ.get("PRICE_BASIS", "close").lower()  # "close" or "adj"
+# PRICE_BASIS removed - always use raw Close prices
 RISK_FREE_ANNUAL = float(os.environ.get("RISK_FREE_ANNUAL", "5.0"))
-GRACE_DAYS = int(os.environ.get("IMPACT_CALENDAR_GRACE_DAYS", "7") or 7)  # legacy; not used in A.S.O. strict path
+# GRACE_DAYS removed - SpyMaster doesn't use grace periods
 TF_SHOW_SESSION_SANITY = os.environ.get("TF_SHOW_SESSION_SANITY", "1").lower() in {"1","true","on","yes"}
 
 # Spymaster parity: ET timezone and price column
 _ET_TZ = pytz.timezone("US/Eastern")
 PRICE_COLUMN = "Close"  # Match Spymaster's raw close usage
 # A.S.O. parity: When using active_pairs directly, signals represent "today's position"
-# which captures "today's return" (t-1 → t), so NO T+1 shift needed
-APPLY_TPLUS1_FOR_ASO = False
+# which captures "today's return" (t-1 → t), so NO T+1 shift is ever needed
 
-# ---------------- Debug toggles (deterministic env flag gating) ----------------
-def _dbg_flag(name: str, default: int = 0) -> int:
-    """Parse debug flag from environment, handling bool and int values."""
-    v = os.environ.get(name)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in {"1","true","on","yes"}:
-        return 1
-    try:
-        return int(s)
-    except Exception:
-        return default
+# Mode handling removed for SpyMaster parity - we don't use [I]/[D] modes anymore
+# Debug configuration removed - using simple, informative logging only
 
-# 0=off, 1=key, 2=verbose, 3=trace
-TF_DEBUG_LEVEL = _dbg_flag("TF_DEBUG", 0)
-_DBG = {
-    "PRICE":   _dbg_flag("TF_DEBUG_PRICE",   0),
-    "SIGNALS": _dbg_flag("TF_DEBUG_SIGNALS", 0),
-    "METRICS": _dbg_flag("TF_DEBUG_METRICS", 0),
-    "DATES":   _dbg_flag("TF_DEBUG_DATES",   0),
-    "HASH":    _dbg_flag("TF_DEBUG_HASHES",  0),
-    "CACHE":   _dbg_flag("TF_DEBUG_CACHE",   0),
-}
-TF_DEBUG_FOCUS = {s.strip().upper() for s in os.environ.get("TF_DEBUG_FOCUS","").split(",") if s.strip()}
-TF_DEBUG_DUMP = os.environ.get("TF_DEBUG_DUMP","0").lower() in {"1","true","on","yes"}
-TF_DEBUG_DUMP_DIR = os.environ.get("TF_DEBUG_DUMP_DIR", "debug_dumps")
-TF_DEBUG_SAMPLE = int(os.environ.get("TF_DEBUG_SAMPLE", "5"))
 
-# --- Members mode override (parse-time enforcement for ticker-agnostic [I] handling) ---
-# Set to "D" or "I" to force all members to that mode (ignoring StackBuilder flags)
-# Set to "" (empty) to respect StackBuilder's per-member mode flags
-# DEFAULT: "" (empty) - respects StackBuilder's mode flags (correct behavior)
-TF_FORCE_MEMBERS_MODE = os.environ.get("TF_FORCE_MEMBERS_MODE", "").strip().upper()
-if TF_FORCE_MEMBERS_MODE not in {"", "D", "I"}:
-    TF_FORCE_MEMBERS_MODE = ""  # Invalid values → respect StackBuilder flags
-
-# Backward compatibility aliases
-TF_DEBUG = TF_DEBUG_LEVEL
-TF_DEBUG_DATES = bool(_DBG["DATES"])
-TF_DEBUG_HASHES = bool(_DBG["HASH"])
-TF_DEBUG_PRICE = bool(_DBG["PRICE"])
-TF_DEBUG_SIGNALS = bool(_DBG["SIGNALS"])
-TF_DEBUG_METRICS = bool(_DBG["METRICS"])
-TF_DEBUG_CACHE = bool(_DBG["CACHE"])
-
-_RUN_ID = f"{int(time.time())%86400}-{os.getpid()}"
-
-def _focus_ok(sec: str) -> bool:
-    """Check if secondary matches TF_DEBUG_FOCUS filter (empty = all pass)."""
-    return (not TF_DEBUG_FOCUS) or (str(sec or "").upper() in TF_DEBUG_FOCUS)
-
-def _dlog(level: int, tag: str, msg: str) -> None:
-    if TF_DEBUG >= level:
-        print(f"[{tag}]#{_RUN_ID} {msg}")
+# Simple logging - no debug levels, just informative messages
 
 def _h64(arr_like) -> str:
     """Stable blake2b/16 hash of numeric array/Series (NaN->0)."""
@@ -175,14 +123,11 @@ def _range_str(idx: pd.Index) -> str:
     return f"{i[0].date()} -> {i[-1].date()} ({len(i)})"
 
 def _dump_csv(name: str, df: pd.DataFrame) -> Optional[str]:
-    """Dump DataFrame to timestamped CSV in debug_dumps/ if TF_DEBUG_DUMP=1."""
-    if not TF_DEBUG_DUMP or df is None or df.empty:
-        return None
     try:
         from pathlib import Path
-        Path(TF_DEBUG_DUMP_DIR).mkdir(parents=True, exist_ok=True)
+        Path(False).mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        p = os.path.join(TF_DEBUG_DUMP_DIR, f"{name}_{ts}.csv")
+        p = os.path.join(False, f"{name}_{ts}.csv")
         df.to_csv(p, index=True)
         return p
     except Exception:
@@ -249,7 +194,7 @@ TF_PERSIST_CUTOFF = int(os.environ.get('TF_PERSIST_CUTOFF', '1'))  # 1=keep same
 TF_CLOSE_BUFFER_MIN = int(os.environ.get('TF_CLOSE_BUFFER_MIN', '10'))  # minutes after 16:00 ET
 
 # ---- Enforce raw Close only (never Adj Close) for deterministic metrics ----
-TF_ENFORCE_CLOSE_ONLY = os.environ.get("TF_ENFORCE_CLOSE_ONLY", "1").lower() in {"1", "true", "on", "yes"}
+# TF_ENFORCE_CLOSE_ONLY removed - always use Close column
 
 # Dead code removed: _RUN_CAP_GLOBAL, _RUN_CAP_BY_SEC, _RUN_LOCK
 # Now using explicit run_fence parameter passing (no global var races)
@@ -257,13 +202,13 @@ TF_ENFORCE_CLOSE_ONLY = os.environ.get("TF_ENFORCE_CLOSE_ONLY", "1").lower() in 
 # ---------- Performance caches ----------
 _PKL_CACHE: Dict[str, dict] = {}            # primary -> PKL dict
 _PRICE_CACHE: Dict[str, pd.DataFrame] = {}  # secondary -> Close df (Spymaster parity cache)
-_SIGNAL_SERIES_CACHE: Dict[Tuple[str, str], pd.Series] = {}  # (primary, mode) -> processed signals (Spymaster parity)
+_SIGNAL_SERIES_CACHE: Dict[str, pd.Series] = {}  # primary -> processed signals (Spymaster parity)
 _LAST_REFRESH_N: int = -1                   # track Refresh button clicks
 _FORCE_PRICE_REFRESH: bool = False          # one-shot flag for forcing price refresh
 
 # PKL freshness memoization
 PKL_TTL_HOURS = int(os.environ.get("PKL_TTL_HOURS", "0"))
-PKL_GATE_VERBOSE = os.environ.get("PKL_GATE_VERBOSE", "0").lower() in {"1","true","on","yes"}
+# PKL_GATE_VERBOSE removed - no longer needed without debug
 _PKL_FRESH_MEMO: Dict[str, Tuple[float, Tuple[bool, str, dict]]] = {}
 PKL_FRESH_MEMO_TTL_SEC = int(os.environ.get("PKL_FRESH_MEMO_TTL_SEC", "300"))
 
@@ -284,7 +229,7 @@ def _clear_runtime(preserve_prices: bool = False):
     _PKL_CACHE.clear()
     _FROZEN_CAP_END.clear()  # Clear frozen cap end dates
     gc.collect()
-    _dlog(1, "CACHE", f"Cleared runtime caches (preserve_prices={preserve_prices}) and forced GC")
+    # Cache cleared - no need to log this routine operation
 
 def _last_full_session_date(df: pd.DataFrame, asset: str) -> Optional[pd.Timestamp]:
     """
@@ -336,9 +281,6 @@ def compute_run_cutoff(universe_prices: Dict[str, Dict[str, Any]]) -> Tuple[Opti
             pool.append(d)
 
     cap_glob = min(pool) if pool else None
-
-    if TF_DEBUG_LEVEL >= 1 and cap_glob:
-        print(f"[GLOBAL-CAP] Computed run cutoff: global={cap_glob.date() if cap_glob else None}, per_sec_count={len(per)}")
 
     return cap_glob, per
 
@@ -438,16 +380,12 @@ def _classify_pkl_freshness(ticker: str, *, verbose: bool = True) -> Tuple[bool,
 
     path = Path(SPYMASTER_PKL_DIR) / f"{ticker}_precomputed_results.pkl"
     if not path.exists():
-        if verbose or PKL_GATE_VERBOSE:
-            _dlog(1, "PKL-GATE", f"{ticker}: MISSING at {path}")
         result = (False, "missing", {"path": str(path)})
         _PKL_FRESH_MEMO[ticker] = (now, result)
         return result
 
     lib = load_spymaster_pkl(ticker)
     if not lib:
-        if verbose or PKL_GATE_VERBOSE:
-            _dlog(1, "PKL-GATE", f"{ticker}: unreadable PKL (treat as missing)")
         result = (False, "missing", {"path": str(path)})
         _PKL_FRESH_MEMO[ticker] = (now, result)
         return result
@@ -461,8 +399,6 @@ def _classify_pkl_freshness(ticker: str, *, verbose: bool = True) -> Tuple[bool,
         pass
 
     if end is None:
-        if verbose or PKL_GATE_VERBOSE:
-            _dlog(1, "PKL-GATE", f"{ticker}: no last date in PKL -> unknown (path={path})")
         result = (False, "unknown", {"path": str(path), "expected": str(exp)})
         _PKL_FRESH_MEMO[ticker] = (now, result)
         return result
@@ -472,26 +408,18 @@ def _classify_pkl_freshness(ticker: str, *, verbose: bool = True) -> Tuple[bool,
         qt = _infer_quote_type(ticker)
         delta_days = (exp.normalize() - end.normalize()).days
         if qt in {"EQUITY", "INDEX"} and 0 < delta_days <= 1:
-            if verbose or PKL_GATE_VERBOSE:
-                _dlog(1, "PKL-GATE", f"{ticker}: OK (T-1 persistence) end={end.date()} exp={exp.date()} (path={path})")
             result = (True, "ok_tminus1", {"end": str(end.date()), "expected": str(exp.date()), "path": str(path)})
             _PKL_FRESH_MEMO[ticker] = (now, result)
             return result
-        if verbose or PKL_GATE_VERBOSE:
-            _dlog(1, "PKL-GATE", f"{ticker}: STALE_BY_DATE end={end.date()} expected>={exp.date()} (path={path})")
         result = (False, "stale_by_date", {"end": str(end.date()), "expected": str(exp.date()), "path": str(path)})
         _PKL_FRESH_MEMO[ticker] = (now, result)
         return result
 
     if PKL_TTL_HOURS > 0 and age_hrs is not None and age_hrs > PKL_TTL_HOURS:
-        if verbose or PKL_GATE_VERBOSE:
-            _dlog(1, "PKL-GATE", f"{ticker}: STALE_BY_TTL age={age_hrs}h ttl={PKL_TTL_HOURS}h (end={end.date()}, path={path})")
         result = (False, "stale_by_ttl", {"end": str(end.date()), "age_hrs": age_hrs, "path": str(path)})
         _PKL_FRESH_MEMO[ticker] = (now, result)
         return result
 
-    if verbose or PKL_GATE_VERBOSE:
-        _dlog(2, "PKL-GATE", f"{ticker}: OK end={end.date()} expected>={exp.date()} age={age_hrs}h (path={path})")
     result = (True, "ok", {"end": str(end.date()), "expected": str(exp.date()), "age_hrs": age_hrs, "path": str(path)})
     _PKL_FRESH_MEMO[ticker] = (now, result)
     return result
@@ -518,7 +446,7 @@ def scan_missing_stale_pkls(secs: List[str], k_limit: Optional[int] = None,
                     k_val = row.get("K")
                     if k_val is None or int(k_val) > k_limit:
                         continue
-                for ticker, mode in parse_members(row.get("Members")):
+                for ticker in parse_members(row.get("Members")):
                     if ticker in result_map:
                         continue  # already recorded
                     fresh, reason, _meta = _classify_pkl_freshness(ticker, verbose=verbose)
@@ -623,55 +551,36 @@ def _read_table(p: Path) -> pd.DataFrame:
         raise RuntimeError(f"read_table({p}) failed: {e}")
 
 # ---------- Members normalization ----------
-def sanitize_members(members_in) -> List[Tuple[str,str]]:
-    """Return a robust [(TICKER, MODE)] list.
-    Accepts: list[tuple], list[list], tuple pairs, strings like "AAPL[D], MSFT[I]".
-    Ensures uppercase tickers and mode in {'D','I'}.
-    Applies TF_FORCE_MEMBERS_MODE override if configured.
-    """
+def sanitize_members(members_in) -> List[str]:
+    """Simply extract ticker names, ignore any mode suffixes.
+    SpyMaster parity: No [I]/[D] mode handling."""
     try:
-        # Already a parsed list of pairs?
-        out: List[Tuple[str,str]] = []
+        out: List[str] = []
         if isinstance(members_in, (list, tuple)):
             for item in list(members_in):
                 if isinstance(item, (list, tuple)) and len(item) >= 1:
+                    # Extract ticker from tuple
                     t = str(item[0]).strip().upper()
-                    m = str(item[1]).strip().upper() if len(item) > 1 else "D"
-                    m = "I" if m.startswith("I") else "D"
-                    # Global mode override (parse-time enforcement)
-                    if TF_FORCE_MEMBERS_MODE in {"D", "I"}:
-                        m = TF_FORCE_MEMBERS_MODE
                     if t:
-                        out.append((t, m))
+                        out.append(t)
                 else:
-                    # Fallback: try "AAPL[D]" format
+                    # String ticker, possibly with [X] suffix
                     s = str(item).strip()
-                    match = re.match(r"^(.*)\[([DI])\]$", s)
-                    if match:
-                        ticker = match.group(1).strip().upper()
-                        mode = match.group(2).strip().upper()
-                        # Global mode override (parse-time enforcement)
-                        if TF_FORCE_MEMBERS_MODE in {"D", "I"}:
-                            mode = TF_FORCE_MEMBERS_MODE
-                        out.append((ticker, mode))
-                    elif s:
-                        mode = TF_FORCE_MEMBERS_MODE if TF_FORCE_MEMBERS_MODE in {"D", "I"} else "D"
-                        out.append((s.strip().upper(), mode))
+                    # Remove any [X] suffix
+                    ticker = s.split('[')[0].strip().upper()
+                    if ticker:
+                        out.append(ticker)
             if out:
                 return out
         # String path
         return parse_members(members_in)
     except Exception:
-        # Last resort: treat as empty
         return []
 
 # ---------- Members parsing ----------
-def parse_members(mval) -> List[Tuple[str,str]]:
-    """
-    Parse Members field into [(TICKER, MODE)] where MODE in {'D','I'}.
-    Accepts "AAPL[D], MSFT[I]" or list-like strings.
-    Applies TF_FORCE_MEMBERS_MODE override if configured.
-    """
+def parse_members(mval) -> List[str]:
+    """Parse Members field into ticker list.
+    SpyMaster parity: No mode handling, just extract tickers."""
     if mval is None:
         return []
     s = str(mval).strip()
@@ -681,23 +590,34 @@ def parse_members(mval) -> List[Tuple[str,str]]:
         toks = [t.strip() for t in s2.split(",")]
     else:
         toks = [t.strip() for t in s.split(",")]
-    out: List[Tuple[str,str]] = []
+    out: List[str] = []
     for tok in toks:
-        t = str(tok).strip().strip("'").strip('"').upper()
+        t = str(tok).strip().strip("'").strip('"')
         if not t:
             continue
-        match = re.match(r"^(.*)\[([DI])\]$", t)
-        if match:
-            ticker = match.group(1)
-            mode = match.group(2)
-            # Global mode override (parse-time enforcement)
-            if TF_FORCE_MEMBERS_MODE in {"D", "I"}:
-                mode = TF_FORCE_MEMBERS_MODE
-            out.append((ticker, mode))
-        else:
-            mode = TF_FORCE_MEMBERS_MODE if TF_FORCE_MEMBERS_MODE in {"D", "I"} else "D"
-            out.append((t, mode))
+        # Remove any [X] suffix and clean up
+        ticker = t.split('[')[0].strip().upper()
+        if ticker:
+            out.append(ticker)
     return out
+
+# --- New: gate rows when no PKLs exist for any member ---
+def _members_have_pkls(members) -> bool:
+    """
+    True if at least one member has a Spymaster PKL on disk.
+    Accepts ['AAPL', ...] or [('AAPL','D'), ...].
+    """
+    try:
+        for m in (members or []):
+            t = m[0] if isinstance(m, (list, tuple)) else m
+            if not t:
+                continue
+            p = Path(SPYMASTER_PKL_DIR) / f"{str(t).upper()}_precomputed_results.pkl"
+            if p.exists():
+                return True
+    except Exception:
+        pass
+    return False
 
 # ---------- Secondary price loader (parity with stackbuilder) ----------
 def _infer_quote_type(sym: str) -> str:
@@ -719,7 +639,6 @@ def _expected_last_session_date_prices(sym: str) -> pd.Timestamp:
     now = pd.Timestamp.now(tz)
     cut = now.normalize() + pd.Timedelta(hours=h, minutes=m) + pd.Timedelta(minutes=TF_EXCHANGE_BUFFER_MIN)
     out = (now.normalize() if now >= cut else (now.normalize() - pd.Timedelta(days=1))).tz_convert(None)
-    _dlog(3, "SESS", f"{sym}: expected_last_session={out.date()} tz={tz} close={h}:{m}+{TF_EXCHANGE_BUFFER_MIN}m")
     return out
 
 def _needs_refresh(sym: str, df: pd.DataFrame, cache_path: Path) -> bool:
@@ -749,7 +668,6 @@ def _needs_refresh(sym: str, df: pd.DataFrame, cache_path: Path) -> bool:
         "FUTURE": 1,
     }.get(_infer_quote_type(sym), TF_CACHE_TTL_EQUITY_DAYS)
     if age_days > max(ttl, 0):
-        _dlog(2, "PRICE-TTL", f"{sym}: age_days={age_days:.2f} > ttl={ttl} path={cache_path.name}")
         return True
 
     # calendar gate: cache missing today's expected bar
@@ -757,7 +675,6 @@ def _needs_refresh(sym: str, df: pd.DataFrame, cache_path: Path) -> bool:
         last_bar = pd.to_datetime(df.index[-1]).normalize()
         exp = _expected_last_session_date_prices(sym).normalize()
         if last_bar < exp:
-            _dlog(2, "PRICE-DATE", f"{sym}: last_bar={last_bar.date()} < expected={exp.date()} path={cache_path.name}")
             return True
 
         # CRITICAL: Intraday staleness detection
@@ -781,7 +698,6 @@ def _needs_refresh(sym: str, df: pd.DataFrame, cache_path: Path) -> bool:
                 if (cache_time_et.hour < market_close_hour and
                     current_time_et.hour >= market_close_hour and
                     cache_time_et.date() == current_time_et.date()):
-                    _dlog(2, "PRICE-INTRA", f"{sym}: intraday cache mtimeET={cache_time_et} nowET={current_time_et}")
                     return True  # Cache has intraday data, needs refresh
             except Exception:
                 # If timezone handling fails, err on side of caution and refresh
@@ -832,8 +748,8 @@ def _yf_fetch_incremental(sym: str, last_date: pd.Timestamp) -> pd.DataFrame:
 
 # ---------- Robust Yahoo loader + full-history guarantees ----------
 
-def _normalize_price_df(df_raw: pd.DataFrame, price_basis: str) -> pd.DataFrame:
-    """Coerce yfinance output to a 1-col Close, tz-naive, sorted, deduped, float (Close ONLY)."""
+def _normalize_price_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Coerce yfinance output to a 1-col Close, tz-naive, sorted, deduped, float (raw Close ONLY)."""
     if df_raw is None or len(df_raw) == 0:
         return pd.DataFrame(columns=["Close"])
 
@@ -842,24 +758,11 @@ def _normalize_price_df(df_raw: pd.DataFrame, price_basis: str) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # Optionally drop all adjusted columns up-front
-    if TF_ENFORCE_CLOSE_ONLY:
-        for c in list(df.columns):
-            cl = str(c).lower()
-            if cl in ("adj close", "adjclose", "adjusted close"):
-                df.drop(columns=[c], inplace=True, errors="ignore")
-
-    # Strictly pick the vendor "Close" column
+    # Always use raw Close column only
     close_col = next((c for c in df.columns if str(c).lower() == "close"), None)
 
-    # If Close is truly absent (legacy cache), allow "Adj Close" ONLY when basis explicitly asks for it
-    if close_col is None and (not TF_ENFORCE_CLOSE_ONLY) and price_basis.lower().startswith("adj"):
-        close_col = next((c for c in df.columns if str(c).lower() in ("adj close", "adjclose", "adjusted close")), None)
-
     if close_col is None:
-        # No usable column → empty; upstream will refetch cleanly
-        if TF_DEBUG_PRICE:
-            _dlog(2, "PRICE-NORM", "no Close column available after enforcement; returning empty")
+        # No Close column → empty; upstream will refetch cleanly
         return pd.DataFrame(columns=["Close"])
 
     out = pd.DataFrame(df[close_col]).rename(columns={close_col: "Close"})
@@ -867,9 +770,6 @@ def _normalize_price_df(df_raw: pd.DataFrame, price_basis: str) -> pd.DataFrame:
     # tz-naive, daily, unique/sorted
     out.index = pd.to_datetime(out.index, utc=True).tz_convert(None).normalize()
     out = out[~out.index.duplicated(keep="last")].sort_index().astype("float64")
-
-    if TF_DEBUG_PRICE and _focus_ok("ALL"):
-        _dlog(2, "PRICE-NORM", f"chosen_col=Close (enforce={TF_ENFORCE_CLOSE_ONLY}) rows={len(out)} range={_range_str(out.index)}")
 
     return out
 
@@ -896,11 +796,9 @@ def _apply_crypto_utc_rollover_guard(symbol: str, px: pd.DataFrame) -> pd.DataFr
         if guarded and last >= today and (in_window or missing_expected):
             if TF_ROLLOVER_VERBOSE:
                 reason = "00:00UTC window" if in_window else f"missing expected {expected_yday.date()}"
-                _dlog(2, "ROLLGUARD", f"{s}: drop last bar {last.date()} ({reason}; now_utc={now_utc}, qt={qt})")
             return px.iloc[:-1]
         return px
     except Exception as e:
-        _dlog(1, "ROLLGUARD", f"{symbol}: guard error: {e}")
         return px
 
 def _is_truncated_history(sym: str, px: pd.DataFrame) -> bool:
@@ -936,7 +834,7 @@ def _ensure_unique_sorted_1d(s: pd.Series) -> pd.Series:
     return s.sort_index()
 
 
-def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
+def _fetch_secondary_from_yf(secondary: str) -> pd.DataFrame:
     """
     Robust Yahoo fetch with fallbacks and truncation detection.
     Always returns FULL history (or best-effort) for daily bars.
@@ -949,10 +847,8 @@ def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
     # Attempt 1: Ticker.history(period='max') (tends to be most reliable)
     try:
         df1 = yf.Ticker(sym).history(period="max", interval="1d", auto_adjust=False)
-        px = _normalize_price_df(df1, price_basis)
-        _dlog(2, "YF-FETCH", f"{sym}: attempt1 -> {len(px)} rows")
+        px = _normalize_price_df(df1)
     except Exception as e:
-        _dlog(2, "YF-FETCH", f"{sym}: attempt1 failed: {e}")
         px = pd.DataFrame(columns=["Close"])
 
     # Attempt 2: explicit start far back (no threads); avoids Yahoo oddities
@@ -960,10 +856,8 @@ def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
         try:
             df2 = yf.download(sym, start="1960-01-01", interval="1d",
                               auto_adjust=False, progress=False, threads=False)
-            px = _normalize_price_df(df2, price_basis)
-            _dlog(2, "YF-FETCH", f"{sym}: attempt2 -> {len(px)} rows")
+            px = _normalize_price_df(df2)
         except Exception as e:
-            _dlog(2, "YF-FETCH", f"{sym}: attempt2 failed: {e}")
             pass
 
     # Attempt 3: last resort — period='max' via download (no threads)
@@ -971,14 +865,10 @@ def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
         try:
             df3 = yf.download(sym, period="max", interval="1d",
                               auto_adjust=False, progress=False, threads=False)
-            px = _normalize_price_df(df3, price_basis)
-            _dlog(2, "YF-FETCH", f"{sym}: attempt3 -> {len(px)} rows")
+            px = _normalize_price_df(df3)
         except Exception as e:
-            _dlog(2, "YF-FETCH", f"{sym}: attempt3 failed: {e}")
             pass
 
-    if TF_DEBUG_PRICE:
-        _dlog(2, "YF-FETCH", f"{sym}: final -> {len(px)} rows, range={_range_str(px.index)}")
     return px
 
 
@@ -1002,7 +892,6 @@ def _choose_price_cache_path(symbol: str) -> Path:
 
 def _read_cache_file(p: Path) -> pd.DataFrame:
     if not p.exists():
-        _dlog(3, "CACHE-READ", f"{p.name}: does not exist")
         return pd.DataFrame(columns=["Close"])
     # Read raw
     df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
@@ -1023,13 +912,7 @@ def _read_cache_file(p: Path) -> pd.DataFrame:
     df = df[~df.index.isna()]
 
     # Normalize/rename/select
-    out = _normalize_price_df(df, PRICE_BASIS)
-    if _DBG["CACHE"]:
-        try:
-            mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            mtime = "NA"
-        print(f"[CACHE] read {p.name} rows={len(out)} last={out.index.max().date() if len(out)>0 else 'NA'} mtime={mtime}")
+    out = _normalize_price_df(df)
     return out
 
 
@@ -1042,7 +925,6 @@ def _write_cache_file(p: Path, df: pd.DataFrame) -> None:
     tmp.replace(p)
 
 def _load_secondary_prices(secondary: str,
-                           price_basis: str,
                            force: bool = False,
                            require_full: bool = True) -> pd.DataFrame:
     """
@@ -1056,12 +938,9 @@ def _load_secondary_prices(secondary: str,
         px = _PRICE_CACHE[sec]
         if not (require_full and _is_truncated_history(sec, px)):
             px = _apply_crypto_utc_rollover_guard(sec, px)
-            if TF_DEBUG_PRICE:
-                _dlog(3, "PRICE-LOAD", f"{sec}: in-memory hit -> {len(px)} rows")
             return px.copy()
         # Drop bad cache
         _PRICE_CACHE.pop(sec, None)
-        _dlog(2, "PRICE-LOAD", f"{sec}: in-memory cache truncated, dropped")
 
     # On-disk cache (validate before trusting)
     cache_path = _choose_price_cache_path(sec)
@@ -1069,29 +948,19 @@ def _load_secondary_prices(secondary: str,
     if not px.empty and not _is_truncated_history(sec, px) and not _needs_refresh(sec, px, cache_path):
         px = _apply_crypto_utc_rollover_guard(sec, px)
         _PRICE_CACHE[sec] = px.copy()
-        if _DBG["PRICE"] and _focus_ok(secondary):
-            tail = px.tail(TF_DEBUG_SAMPLE)[PRICE_COLUMN] if PRICE_COLUMN in px.columns else px.tail(TF_DEBUG_SAMPLE).iloc[:,0]
-            print(f"[PRICE] {sec}: cache-hit rows={len(px)} head={px.index.min().date()} tail={px.index.max().date()} hash={_h64(px[PRICE_COLUMN] if PRICE_COLUMN in px.columns else px.iloc[:,0])} sample_tail={list(tail.round(6).values)}")
         return px.copy()
 
     # No cache or needs refresh -> fetch from yfinance
-    _dlog(2, "PRICE-LOAD", f"{sec}: fetching from Yahoo (force={force})")
-    fresh = _fetch_secondary_from_yf(sec, price_basis)
+    fresh = _fetch_secondary_from_yf(sec)
     if fresh.empty:
-        _dlog(1, "PRICE-LOAD", f"{sec}: Yahoo returned empty")
         return fresh
     try:
         _write_cache_file(cache_path, fresh)
-        _dlog(2, "PRICE-LOAD", f"{sec}: wrote cache -> {len(fresh)} rows")
     except Exception as e:
-        _dlog(1, "PRICE-LOAD", f"{sec}: cache write failed: {e}")
         pass
 
     fresh = _apply_crypto_utc_rollover_guard(sec, fresh)
     _PRICE_CACHE[sec] = fresh.copy()
-    if _DBG["PRICE"] and _focus_ok(secondary):
-        tail = fresh.tail(TF_DEBUG_SAMPLE)[PRICE_COLUMN] if PRICE_COLUMN in fresh.columns else fresh.tail(TF_DEBUG_SAMPLE).iloc[:,0]
-        print(f"[PRICE] {sec}: fetched rows={len(fresh)} head={fresh.index.min().date() if len(fresh)>0 else 'NA'} tail={fresh.index.max().date() if len(fresh)>0 else 'NA'} hash={_h64(fresh[PRICE_COLUMN] if PRICE_COLUMN in fresh.columns else fresh.iloc[:,0])} sample_tail={list(tail.round(6).values)}")
     return fresh
 
 
@@ -1110,8 +979,7 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
 
             # If forced, bypass existing file entirely
             if force:
-                _dlog(2, "REFRESH", f"{sym}: force=True, full fetch")
-                fresh = _fetch_secondary_from_yf(sym, PRICE_BASIS)
+                fresh = _fetch_secondary_from_yf(sym)
                 if fresh.empty:
                     return f"{sym}: no data"
                 _write_cache_file(p, fresh)
@@ -1127,14 +995,12 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
                 existing = existing[~existing.index.isna()]
 
             if _is_truncated_history(sym, existing):
-                _dlog(2, "REFRESH", f"{sym}: existing truncated ({len(existing)} rows), full replace")
-                fresh = _fetch_secondary_from_yf(sym, PRICE_BASIS)
+                fresh = _fetch_secondary_from_yf(sym)
                 if fresh.empty:
                     return f"{sym}: no data"
                 # Never shrink guard: if the new fetch is materially shorter, keep existing.
                 if len(fresh) + max(25, int(0.05 * len(existing))) < len(existing):
                     _PRICE_CACHE[sym] = existing.copy()
-                    _dlog(1, "REFRESH", f"{sym}: NEVER-SHRINK guard triggered (fresh={len(fresh)}, existing={len(existing)})")
                     return f"{sym}: kept existing (fresh shorter: {len(fresh)} < {len(existing)})"
                 _write_cache_file(p, fresh)
                 _PRICE_CACHE[sym] = fresh.copy()
@@ -1144,7 +1010,7 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
             start = (existing.index.max() - pd.Timedelta(days=PRICE_BACKFILL_DAYS)).strftime("%Y-%m-%d")
             inc = yf.download(sym, start=start, interval="1d", auto_adjust=False,
                               progress=False, threads=False)
-            inc = _normalize_price_df(inc, PRICE_BASIS)
+            inc = _normalize_price_df(inc)
 
             # Short-circuit if nothing new (avoid unnecessary cache writes)
             if inc.empty or inc.index.max() <= existing.index.max():
@@ -1155,16 +1021,13 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
             merged = merged[~merged.index.duplicated(keep="last")]
             _write_cache_file(p, merged)
             _PRICE_CACHE[sym] = merged.copy()
-            _dlog(3, "REFRESH", f"{sym}: tail merge -> {merged.index.max().date()}")
             return f"{sym}: merged -> {merged.index.max().date()}"
         except Exception as e:
-            _dlog(1, "REFRESH", f"{sym}: update failed ({e})")
             return f"{sym}: update failed ({e})"
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=max(1, PRICE_REFRESH_THREADS)) as ex:
         msgs = list(ex.map(_one, uniq))
-    _dlog(1, "REFRESH", " | ".join(msgs))
 
 # ---------- Spymaster-parity asof helper ----------
 def _asof(series: pd.Series, ts, default=np.nan):
@@ -1184,8 +1047,8 @@ def _asof(series: pd.Series, ts, default=np.nan):
 def _pct_returns(close: pd.Series) -> pd.Series:
     """
     Safe daily returns in PERCENT points (e.g., +0.57 means +0.57%).
-    T+1 shift is applied when APPLY_TPLUS1_FOR_ASO=True so that a signal
-    decided at day t captures the t->t+1 move (Spymaster A.S.O. parity).
+    For SpyMaster A.S.O. parity: signals represent "today's position" which
+    captures "today's return" (t-1 → t), so NO T+1 shift is applied.
     Defensive: accept a DataFrame with duplicate 'Close' columns and coerce to the first column.
     """
     # Defensive: handle DataFrame inputs from duplicate column scenarios
@@ -1200,8 +1063,7 @@ def _pct_returns(close: pd.Series) -> pd.Series:
             0.0
         )
     rets = pd.Series(arr, index=close.index, dtype='float64')
-    if APPLY_TPLUS1_FOR_ASO:
-        rets = rets.shift(-1).fillna(0.0)
+    # No T+1 shift - maintain SpyMaster parity
     return rets
 
 # ---------- Signal-series caching on secondary calendar ----------
@@ -1213,28 +1075,8 @@ def _sec_index_fp(idx: pd.DatetimeIndex) -> Tuple[str, str, int]:
     i1 = pd.Timestamp(idx[-1]).normalize().strftime("%Y-%m-%d")
     return (i0, i1, len(idx))
 
-def _signals_series_cached(primary: str, mode: str, secondary: str,
-                           sec_index: pd.DatetimeIndex, grace_days: int) -> pd.Series:
-    """
-    Cached version of _signals_series_for_primary keyed by (secondary, primary, mode, index_fp).
-
-    This eliminates K>1 bottleneck by reusing signal series across all subsets for same
-    secondary calendar. Cache cleared on Refresh button.
-    """
-    key = (
-        (secondary or "").upper(),
-        (primary   or "").upper(),
-        (mode      or "D").upper(),
-        _sec_index_fp(sec_index)
-    )
-    hit = _SIGNAL_SERIES_CACHE.get(key)
-    if hit is not None:
-        return hit
-
-    # Cache miss - compute and store
-    ser = _signals_series_for_primary(primary, mode, sec_index, grace_days)
-    _SIGNAL_SERIES_CACHE[key] = ser
-    return ser
+# _signals_series_cached removed - used grace_days which SpyMaster doesn't support
+# This function was not being called anywhere in the code
 
 # ---------- Spymaster PKL loading ----------
 def load_spymaster_pkl(ticker: str) -> Optional[dict]:
@@ -1262,24 +1104,24 @@ def _load_signal_library_quick(primary: str) -> Optional[dict]:
     return load_spymaster_pkl(v)
 
 # ---------- Next-signal parity (Spymaster A.S.O. exact) ----------
-def _next_signal_from_pkl(primary: str, mode: str) -> str:
+def _next_signal_from_pkl(primary: str, as_of: Optional[pd.Timestamp] = None) -> str:
     """
     Derive *today's action at close* using yesterday's top pairs gated by yesterday's SMAs.
     Matches Spymaster: choose Buy/Short by gating both pairs; tie breaks by captures.
     """
     lib = load_spymaster_pkl(primary)
     if not lib:
-        _dlog(2, "NEXT", f"{primary}: PKL missing -> None")
         return "None"
 
     df = lib.get("preprocessed_data")
     bdict = lib.get("daily_top_buy_pairs")
     sdict = lib.get("daily_top_short_pairs")
     if df is None or bdict is None or sdict is None or len(df.index) == 0:
-        _dlog(2, "NEXT", f"{primary}: incomplete PKL -> None")
         return "None"
 
-    last_date = pd.to_datetime(df.index[-1]).tz_localize(None).normalize()
+    # Anchor to caller's cap date if provided; never look past it
+    _last = pd.to_datetime(df.index[-1]).tz_localize(None).normalize()
+    last_date = min(_last, pd.Timestamp(as_of).normalize()) if as_of is not None else _last
 
     # As-of accessor for pair dicts (pick the last key <= last_date)
     def _pair_asof(d: dict, ts: pd.Timestamp):
@@ -1295,7 +1137,6 @@ def _next_signal_from_pkl(primary: str, mode: str) -> str:
     bpair = _pair_asof(bdict, last_date)
     spair = _pair_asof(sdict, last_date)
     if not bpair or not spair:
-        _dlog(2, "NEXT", f"{primary}: no pair-asof for {last_date.date()} -> None")
         return "None"
 
     (bi, bj), b_cap = bpair
@@ -1322,80 +1163,11 @@ def _next_signal_from_pkl(primary: str, mode: str) -> str:
     else:
         nxt = "None"
 
-    if mode.upper() == "I":
-        nxt = "Short" if nxt == "Buy" else ("Buy" if nxt == "Short" else "None")
-    if TF_DEBUG_SIGNALS:
-        _dlog(3, "NEXT", f"{primary}[{mode}] @ {last_date.date()}: next={nxt}")
+    # No signal inversion - SpyMaster parity
     return nxt
 
-# ---------- Signals -> captures on the secondary (spymaster parity) ----------
-def _signals_series_for_primary(primary: str, mode: str, sec_index: pd.DatetimeIndex, grace_days: int) -> pd.Series:
-    """
-    Spymaster parity: Use the precomputed 'active_pairs' from PKL as the signal source.
-    This matches exactly what Spymaster's Automated Signal Optimization uses as 'signals_with_next'.
-
-    Inverse mode 'I' flips Buy/Short after alignment.
-    Includes in-memory caching via wrapper function _signals_series_cached.
-    """
-    # Normalize sec_index defensively; required for pad+tolerance reindex
-    sec_index = pd.DatetimeIndex(pd.to_datetime(sec_index, utc=True)).tz_convert(None).normalize()
-
-    lib = _load_signal_library_quick(primary)
-    if not lib or sec_index is None or len(sec_index) == 0:
-        _dlog(2, "SIGNAL", f"{primary}: lib={lib is not None}, sec_index={len(sec_index) if sec_index is not None else 0}")
-        return pd.Series('None', index=sec_index)
-
-    df = lib.get("preprocessed_data")
-    if df is None or len(df) == 0:
-        _dlog(2, "SIGNAL", f"{primary}: preprocessed_data is None or empty")
-        return pd.Series('None', index=sec_index)
-
-    # CRITICAL: Use active_pairs (precomputed signals) instead of recomputing
-    # This matches Spymaster's signals_with_next (line 12244 in spymaster.py)
-    active_pairs = lib.get("active_pairs")
-    if not active_pairs:
-        _dlog(2, "SIGNAL", f"{primary}: No active_pairs in PKL")
-        return pd.Series('None', index=sec_index)
-
-    # Normalize index to match Spymaster's calendar
-    idx = pd.DatetimeIndex(pd.to_datetime(df.index, utc=True)).tz_convert(None).normalize()
-
-    # Handle length mismatch (Spymaster does this at line 12237-12241)
-    if len(active_pairs) != len(idx):
-        if len(active_pairs) == len(idx) - 1:
-            # Skip first date if active_pairs is one shorter
-            idx = idx[1:]
-        else:
-            _dlog(1, "SIGNAL", f"{primary}: Length mismatch - active_pairs={len(active_pairs)}, dates={len(idx)}")
-            return pd.Series('None', index=sec_index)
-
-    # Create signals series from active_pairs
-    # active_pairs contains strings like "Buy 4,1", "Short 5,1", "None"
-    signals_raw = pd.Series(active_pairs, index=idx, dtype="object")
-
-    # Process signals to extract just Buy/Short/None (matching Spymaster line 12305-12308)
-    def _parse_signal(x):
-        s = str(x).strip()
-        if s.startswith('Buy'):
-            return 'Buy'
-        elif s.startswith('Short'):
-            return 'Short'
-        else:
-            return 'None'
-
-    signals_processed = signals_raw.apply(_parse_signal)
-
-    # Strict A.S.O. parity: exact-date intersection only (no pad/tolerance)
-    common = sec_index.intersection(signals_processed.index)
-    aligned = pd.Series('None', index=sec_index, dtype="object")
-    if len(common) > 0:
-        aligned.loc[common] = signals_processed.loc[common].values
-
-    # Apply inversion after alignment (for Inverse mode)
-    if mode == "I":
-        aligned = aligned.map(lambda v: "Short" if v == "Buy" else ("Buy" if v == "Short" else "None"))
-
-    return aligned.astype("object")
+# _signals_series_for_primary removed - used grace_days which SpyMaster doesn't support
+# This function was only called from the removed _signals_series_cached
 
 def _combine_signals(series_list: List[pd.Series]) -> pd.Series:
     """
@@ -1438,16 +1210,16 @@ def _combine_signals(series_list: List[pd.Series]) -> pd.Series:
     return pd.Series(out, index=idx, dtype="object")
 
 # ---------- Spymaster parity: Signal-first approach (EXACT A.S.O. pipeline) ----------
-def _processed_signals_from_pkl(primary: str, mode: str) -> pd.Series:
+def _processed_signals_from_pkl(primary: str) -> pd.Series:
     """
     Build the per-primary processed signal Series exactly how Spymaster feeds
     Automated Signal Optimization:
       - source: PKL['active_pairs']
       - index: PKL['preprocessed_data'].index (normalized, naive)
       - values mapped to {'Buy','Short','None'} via startswith
-    Cached per (primary, mode) since [I]/[D] inversions are applied here.
+    No mode handling - signals used as-is from PKL.
     """
-    ck = (primary, mode)
+    ck = primary
     if ck in _SIGNAL_SERIES_CACHE:
         return _SIGNAL_SERIES_CACHE[ck]
 
@@ -1463,13 +1235,9 @@ def _processed_signals_from_pkl(primary: str, mode: str) -> pd.Series:
     idx = pd.to_datetime(df.index).tz_localize(None).normalize()
     ap = pd.Series(active_pairs, index=idx, dtype=object)
 
-    if TF_DEBUG_SIGNALS:
-        _dlog(3, "PKL-SIG", f"{primary} mode={mode}: raw idx={len(idx)} fp={_idx_fp(idx)}")
-
     # Length alignment (handle PKL quirks)
     if len(ap) != len(idx):
         m = min(len(ap), len(idx))
-        _dlog(2, "PKL-SIG", f"{primary}: length mismatch {len(ap)}!={len(idx)}, truncating to {m}")
         ap, idx = ap.iloc[:m], idx[:m]
 
     # Spymaster mapping (startswith)
@@ -1478,18 +1246,13 @@ def _processed_signals_from_pkl(primary: str, mode: str) -> pd.Series:
         else ('Short' if x.startswith('Short') else 'None')
     )
 
-    if mode.upper() == "I":
-        proc = proc.map({'Buy': 'Short', 'Short': 'Buy', 'None': 'None'})
-        if TF_DEBUG_SIGNALS:
-            _dlog(3, "PKL-SIG", f"{primary}: mode=I inversion applied")
+    # No signal inversion - SpyMaster parity (signals used as-is)
 
     _SIGNAL_SERIES_CACHE[ck] = proc
-    if TF_DEBUG_SIGNALS:
-        _dlog(3, "PKL-SIG", f"{primary} mode={mode}: final {len(proc)} signals, range={_range_str(proc.index)}")
     return proc
 
 # ---------- Session sanity (what date is each source on?) ----------
-def _session_sanity(secondary: str, members: List[Tuple[str,str]]) -> Dict[str, Any]:
+def _session_sanity(secondary: str, members: List[str]) -> Dict[str, Any]:
     """Report clocks and last available dates from prices vs PKLs for a secondary."""
     try:
         now_utc = pd.Timestamp.utcnow()
@@ -1524,9 +1287,9 @@ def _session_sanity(secondary: str, members: List[Tuple[str,str]]) -> Dict[str, 
 
     # Latest signal date across all members (PKL side)
     sig_last_dates: List[pd.Timestamp] = []
-    for t, m in sanitize_members(members):
+    for t in sanitize_members(members):
         try:
-            s = _processed_signals_from_pkl(t, m)
+            s = _processed_signals_from_pkl(t)
             if len(s.index) > 0:
                 sig_last_dates.append(pd.to_datetime(s.index[-1]).normalize())
         except Exception:
@@ -1573,7 +1336,7 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
     # Load secondary prices
     px = _PRICE_CACHE.get(secondary)
     if px is None:
-        px = _load_secondary_prices(secondary, PRICE_BASIS)
+        px = _load_secondary_prices(secondary)
         _PRICE_CACHE[secondary] = px
 
     # Align to common index
@@ -1613,7 +1376,7 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
     if trigger_days == 0:
         return {
             "Triggers": 0, "Wins": 0, "Losses": 0, "Win %": 0.0,
-            "Std Dev (%)": 0.0, "Sharpe": 0.0, "Avg Cap %": 0.0, "Total %": 0.0, "p": 1.0
+            "Std Dev (%)": 0.0, "Sharpe": 0.0, "Avg %": 0.0, "Total %": 0.0, "p": 1.0
         }
 
     trigger_caps = daily_captures[trig_mask]
@@ -1647,7 +1410,7 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
         "Win %": round(win_pct, 2),
         "Std Dev (%)": round(std, 4),
         "Sharpe": round(sharpe, 2),
-        "Avg Cap %": round(avg_cap, 4),
+        "Avg %": round(avg_cap, 4),
         "Total %": round(total_pct, 4),
         "p": round(p_value, 4),
     }
@@ -1674,29 +1437,29 @@ def _valid_dates_from_results(results: dict, df: pd.DataFrame) -> pd.DatetimeInd
     cand = pd.Index(sorted(kb.intersection(ks)))
     return cand.intersection(ds)
 
-def _extract_signals_from_active_pairs(results: dict, mode: str) -> Tuple[pd.DatetimeIndex, pd.Series]:
+def _extract_signals_from_active_pairs(results: dict, secondary_index: Optional[pd.DatetimeIndex] = None) -> Tuple[pd.DatetimeIndex, pd.Series, Optional[str]]:
     """
     Extract signals directly from active_pairs (Spymaster approach).
-    Matches Spymaster lines 12244, 12305-12308, 12471-12474.
+    Matches Spymaster lines 12244, 12305-12308, 12310-12314 (with next_signal appended).
+
+    Args:
+        results: PKL dict with 'preprocessed_data', 'active_pairs', 'daily_top_buy_pairs', 'daily_top_short_pairs'
+        secondary_index: Optional DatetimeIndex from secondary prices to find next date for appending next_signal
 
     Returns:
-        - dates: DatetimeIndex of all signals
-        - signals: Series of 'Buy'/'Short'/'None' signals
+        - dates: DatetimeIndex of all signals (including next_signal if available)
+        - signals: Series of 'Buy'/'Short'/'None' signals (including next_signal if available)
+        - next_signal: The next trading signal ('Buy', 'Short', 'None', or None if not available)
     """
     df = results.get('preprocessed_data')
     active_pairs = results.get('active_pairs')
 
     if df is None or active_pairs is None:
-        if TF_DEBUG_SIGNALS:
-            _dlog(2, "EXTRACT-SIG", f"mode={mode}: missing data, returning empty")
-        return pd.DatetimeIndex([]), pd.Series([], dtype=object)
+        return pd.DatetimeIndex([]), pd.Series([], dtype=object), None
 
     # Create signals series (matching Spymaster line 12244)
     dates = pd.to_datetime(df.index).tz_localize(None).normalize()
     signals = pd.Series(active_pairs, index=dates, dtype=object)
-
-    if TF_DEBUG_SIGNALS:
-        _dlog(3, "EXTRACT-SIG", f"mode={mode}: raw {len(dates)} dates, fp={_idx_fp(dates)}")
 
     # Process to clean format (matching Spymaster lines 12305-12308)
     signals = signals.astype(str).apply(
@@ -1704,25 +1467,84 @@ def _extract_signals_from_active_pairs(results: dict, mode: str) -> Tuple[pd.Dat
                  'Short' if x.strip().startswith('Short') else 'None'
     )
 
-    # Apply inversion if needed (matching Spymaster lines 12471-12474) without replace() downcast
-    if mode.upper() == 'I':
-        signals = signals.map({'Buy': 'Short', 'Short': 'Buy'}).fillna('None')
-        if TF_DEBUG_SIGNALS:
-            _dlog(3, "EXTRACT-SIG", f"mode=I: inversion applied")
-
-    if _DBG["SIGNALS"]:
+    # Calculate next_signal for optimization parity (Spymaster lines 12310-12314)
+    next_sig = None
+    # Append next_signal for Spymaster parity (lines 12310-12314)
+    # This adds the forecasted next-day signal to match optimization section behavior
+    if secondary_index is not None:
         try:
-            b = int((signals == "Buy").sum()); s = int((signals == "Short").sum()); n = int((signals == "None").sum())
-            print(f"[SIG] idx={signals.index.min().date()}→{signals.index.max().date()} days={len(signals)} Buy={b} Short={s} None={n} mode={mode}")
-        except Exception:
-            pass
+            last_date = dates[-1]
+            # Calculate next_signal using same logic as Spymaster
+            next_sig = _next_signal_from_pkl_raw(results, last_date)
 
-    return dates, signals
+            # Find next available date in secondary
+            next_dates = secondary_index[secondary_index > last_date]
+            if len(next_dates) > 0 and next_sig is not None:
+                next_date = next_dates[0]
+                # Append next_signal (Spymaster line 12314)
+                signals = pd.concat([signals, pd.Series([next_sig], index=[next_date])])
+                dates = signals.index
+        except Exception:
+            pass  # If next_signal calculation fails, just use signals as-is
+
+    return dates, signals, next_sig
+
+
+def _next_signal_from_pkl_raw(results: dict, as_of_date: pd.Timestamp) -> Optional[str]:
+    """
+    Calculate next signal from PKL data (matching Spymaster lines 12286-12302).
+
+    Args:
+        results: PKL dict
+        as_of_date: Date to calculate next signal from
+
+    Returns:
+        'Buy', 'Short', or 'None'
+    """
+    try:
+        df = results.get('preprocessed_data')
+        buy_pairs = results.get('daily_top_buy_pairs', {})
+        short_pairs = results.get('daily_top_short_pairs', {})
+
+        if df is None or not buy_pairs or not short_pairs:
+            return 'None'
+
+        last_date = pd.Timestamp(as_of_date).normalize()
+
+        # Get top pairs for last_date
+        buy_pair_data = buy_pairs.get(last_date)
+        short_pair_data = short_pairs.get(last_date)
+
+        if not buy_pair_data or not short_pair_data:
+            return 'None'
+
+        (bi, bj), buy_capture = buy_pair_data
+        (si, sj), short_capture = short_pair_data
+
+        # Gate signals with SMAs at last_date
+        sma_b0 = _asof(df[f'SMA_{int(bi)}'], last_date, default=np.nan)
+        sma_b1 = _asof(df[f'SMA_{int(bj)}'], last_date, default=np.nan)
+        sma_s0 = _asof(df[f'SMA_{int(si)}'], last_date, default=np.nan)
+        sma_s1 = _asof(df[f'SMA_{int(sj)}'], last_date, default=np.nan)
+
+        buy_signal = (np.isfinite(sma_b0) and np.isfinite(sma_b1) and sma_b0 > sma_b1)
+        short_signal = (np.isfinite(sma_s0) and np.isfinite(sma_s1) and sma_s0 < sma_s1)
+
+        # Combine (matching Spymaster lines 12296-12302)
+        if buy_signal and short_signal:
+            return 'Buy' if buy_capture > short_capture else 'Short'
+        elif buy_signal:
+            return 'Buy'
+        elif short_signal:
+            return 'Short'
+        else:
+            return 'None'
+    except Exception:
+        return 'None'
 
 def _stream_primary_positions_and_captures(results: dict,
                                            prim_df: pd.DataFrame,
-                                           sec_close: pd.Series,
-                                           mode: str) -> Tuple[pd.DatetimeIndex, pd.Series, pd.Series]:
+                                           sec_close: pd.Series) -> Tuple[pd.DatetimeIndex, pd.Series, pd.Series]:
     """
     DEPRECATED: Use _extract_signals_from_active_pairs instead.
     This function re-gates signals which causes None days to be included.
@@ -1789,9 +1611,7 @@ def _stream_primary_positions_and_captures(results: dict,
         else:
             cur_pos = 'Cash'
 
-        # invert if [I] mode
-        if mode.upper().startswith('I'):
-            cur_pos = 'Buy' if cur_pos == 'Short' else ('Short' if cur_pos == 'Buy' else 'Cash')
+        # No signal inversion - SpyMaster parity
 
         # today's secondary return (already aligned to valid_dates)
         r = float(sec_rets.iloc[i])
@@ -1850,183 +1670,160 @@ _COMBINE_INTERSECTION = False  # Spymaster AVERAGES uses the combined series its
 # (Legacy capture-first helpers removed:
 #  _apply_signals_to_secondary, _captures_for, _metrics_from_captures, _metrics_spymaster)
 
-def _subset_metrics_spymaster(secondary: str, subset: List[Tuple[str, str]], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def _subset_metrics_spymaster(secondary: str, subset: List[str], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
-    STRICT parity with Spymaster A.S.O. (direct active_pairs approach):
-      - Extract signals directly from active_pairs (excludes None signals)
-      - Common dates: intersection across members (and secondary)
-      - Combine signals by unanimity
-      - Apply signals to secondary returns (matching Spymaster lines 12514-12520)
-      - Trigger days = count(Buy | Short), excludes None
+    UNIFIED parity with Spymaster A.S.O. for ALL K values:
+      - Extract signals from active_pairs for each member
+      - Align to secondary calendar
+      - Combine via unanimity (K=1 trivially returns single signal)
+      - Apply to same-day returns (no shift)
       - Metrics on trigger-day captures only
     """
-    # Defensive: ensure proper [(ticker, mode)] structure
     subset = sanitize_members(subset)
-    if TF_DEBUG_METRICS:
-        _dlog(2, "METRICS", f"Computing for {secondary}, subset={[f'{t}[{m}]' for t,m in subset]}")
+    if not subset:
+        return _empty_metrics(), _empty_dates()
 
     # Load secondary prices
     sec_df = _PRICE_CACHE.get(secondary)
     if sec_df is None:
-        if TF_DEBUG_PRICE:
-            _dlog(3, "METRICS", f"Loading prices for {secondary}")
-        sec_df = _load_secondary_prices(secondary, PRICE_BASIS)
+        sec_df = _load_secondary_prices(secondary)
         _PRICE_CACHE[secondary] = sec_df
-
-    if sec_df.empty or PRICE_COLUMN not in sec_df.columns:
-        _dlog(1, "METRICS", f"Empty or invalid secondary prices for {secondary}")
+    if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
         return _empty_metrics(), _empty_dates()
 
-    # Defensive: 1-D Close and strictly unique daily index
-    sec_close = sec_df[PRICE_COLUMN]
-    sec_close = _ensure_unique_sorted_1d(sec_close)
-    sec_index = sec_close.index  # Already unique and sorted from _ensure_unique_sorted_1d
-
-    # DIAGNOSTIC: Show first few prices for SBIT/BITU
-    if secondary in ("SBIT", "BITU") and (_DBG["METRICS"] or _DBG["SIGNALS"]):
-        print(f"[PRICE-CHECK] {secondary}: First 5 prices = {sec_close.head(5).to_dict()}")
+    sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
+    sec_index = sec_close.index
 
     # Extract signals directly from active_pairs for each member
+    # Pass secondary_index to enable next_signal appending (Spymaster parity)
+    # CRITICAL: Also capture next_signal to determine if inversion is needed
     signal_blocks = []
-    for prim, mode in subset:
+    for prim in subset:
         results = load_spymaster_pkl(prim)
         if not results:
-            _dlog(2, "METRICS", f"No PKL for {prim}")
             continue
-
-        dates, signals = _extract_signals_from_active_pairs(results, mode)
+        dates, signals, next_sig = _extract_signals_from_active_pairs(results, secondary_index=sec_index)
         if len(dates) == 0:
-            _dlog(2, "METRICS", f"No valid dates for {prim}[{mode}]")
             continue
-
-        signal_blocks.append((dates, signals))
+        signal_blocks.append((dates, signals, next_sig))
 
     if not signal_blocks:
-        _dlog(1, "METRICS", f"{secondary}: No valid members")
         return _empty_metrics(), _empty_dates()
 
-    # Align **every member** to the secondary calendar; fill missing with 'None'
-    # This removes any chance of price NaNs on trigger days.
+    # Find common dates (strict Spymaster approach: intersection only)
+    # Spymaster line 12452-12455: starts with secondary, then intersects with each primary's signal dates
+    common_dates = set(sec_index)
+    for dates, sig, _ in signal_blocks:
+        common_dates = common_dates.intersection(sig.index)
+    common_dates = sorted(common_dates)
+
+    # Build signal dataframe on common dates only (no fillna needed - all dates exist in both)
+    # CRITICAL OPTIMIZATION PARITY FIX: Apply signal inversion based on next_signal
+    # Spymaster optimization section logic (lines 12471-12474):
+    #   - If next_signal = 'Short' → invert signals (Short→Buy, Buy→Short)
+    #   - If next_signal = 'Buy' → keep signals as-is
+    # This implements "What if we bought secondary when primary shows its CURRENT signal type"
     sig_series_list = []
-    for dates, sig in signal_blocks:
+    for dates, sig, next_sig in signal_blocks:
         if not isinstance(sig, pd.Series):
             try:
                 sig = pd.Series(list(sig), index=pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize())
             except Exception:
                 continue
-        sig_aligned = sig.reindex(sec_index).fillna('None').astype(object)
+        # Only use common dates (strict intersection)
+        sig_aligned = sig.loc[common_dates].astype(object)
+
+        # Apply inversion if next_signal is 'Short' (matching Spymaster line 12472)
+        if next_sig == 'Short':
+            sig_aligned = sig_aligned.replace({'Buy': 'Short', 'Short': 'Buy'})
+
         sig_series_list.append(sig_aligned)
+
     if not sig_series_list:
         return _empty_metrics(), _empty_dates()
+
     sig_df = pd.concat(sig_series_list, axis=1)
 
-    # ---- Use full contiguous daily grid, then mask by triggers (Spymaster parity) ----
-    # 1) Cap prices first (if eval_to_date provided)
-    sec_close_cap = sec_close if eval_to_date is None else sec_close.loc[:pd.Timestamp(eval_to_date).normalize()]
-    sec_index_cap = sec_close_cap.index
+    # Apply eval_to_date cap if requested (filter common_dates)
+    if eval_to_date is not None:
+        cap_day = pd.Timestamp(eval_to_date).normalize()
+        common_dates = [d for d in common_dates if d <= cap_day]
+        sig_df = sig_df.loc[common_dates]
 
-    # 2) Align signals to the same daily grid (no downsampling before returns)
-    sig_df_cap = sig_df.reindex(sec_index_cap).fillna('None')
-    combined_signals = _combine_positions_unanimity(sig_df_cap).reindex(sec_index_cap).fillna('None')
+    # Combine signals via unanimity (for K=1, this just returns the single column)
+    # Work directly on common_dates - no reindex/fillna needed
+    combined_signals = _combine_positions_unanimity(sig_df)
 
-    # 3) Compute DAILY returns on the full capped grid
-    sec_rets = _pct_returns(sec_close_cap).astype('float64')  # daily t-1 -> t
+    # Calculate returns on common dates only (no shift - Spymaster parity)
+    sec_close_common = sec_close.loc[common_dates]
+    sec_rets = _pct_returns(sec_close_common).astype('float64')
 
-    # 4) Apply signals as a mask over DAILY returns (no multi-day jumps)
-    buy_mask   = combined_signals.eq('Buy').to_numpy(dtype=bool)
-    short_mask = combined_signals.eq('Short').to_numpy(dtype=bool)
+    # Apply signals to same-day returns
     ret = sec_rets.to_numpy(dtype='float64')
+    valid = np.isfinite(ret)
+    sig = combined_signals.values
+    buy_mask = (sig == 'Buy') & valid
+    short_mask = (sig == 'Short') & valid
+
     cap = np.zeros_like(ret, dtype='float64')
-    cap[buy_mask]   = ret[buy_mask]
+    cap[buy_mask] = ret[buy_mask]
     cap[short_mask] = -ret[short_mask]
 
-    # 5) Trigger-only metrics (days with Buy or Short)
+    # Trigger-only metrics
     trig_mask = buy_mask | short_mask
     if not trig_mask.any():
-        _dlog(1, "METRICS", f"{secondary}: No trigger days after alignment")
         return _empty_metrics(), _empty_dates()
 
-    tc = np.round(cap[trig_mask], 4)
-    trig_idx = sec_index_cap[trig_mask]
+    tc = cap[trig_mask]
+    common_dates_array = pd.DatetimeIndex(common_dates)
+    trig_idx = common_dates_array[trig_mask]
     sig_slice = combined_signals[trig_mask]
 
-    # Debug: Log run cap application
-    if eval_to_date is not None and TF_DEBUG_LEVEL >= 1:
-        print(f"[RUN-CAP-APPLIED] {secondary}: {len(trig_idx)} trigger days <= {pd.Timestamp(eval_to_date).normalize().date()}")
-
-    # 6) Compute direction mix for inverse-twin clarity (hidden field + tooltip)
-    # L% = share of Buy trigger days, S% = share of Short trigger days
-    long_days = int(buy_mask[trig_mask].sum())
-    short_days = int(short_mask[trig_mask].sum())
-    trig_days = int(trig_mask.sum())
-
-    if trig_days > 0:
-        L_pct = int(round(100 * long_days / trig_days))
-        S_pct = int(round(100 * short_days / trig_days))
-        mix_str = f"L{L_pct}|S{S_pct}"
-    else:
-        mix_str = "L0|S0"
-
-    # 7) Metrics on trigger-only captures (tc already computed)
-    n_trig  = int(len(tc))
-    wins    = int(np.sum(tc > 0))
-    losses  = int(n_trig - wins)
+    n_trig = int(len(tc))
+    wins = int(np.sum(tc > 0))
+    losses = int(n_trig - wins)
     avg_cap = float(tc.mean())
-    total   = float(tc.sum())
-    std     = float(np.std(tc, ddof=1)) if n_trig > 1 else 0.0
+    total = float(tc.sum())
+    std = float(np.std(tc, ddof=1)) if n_trig > 1 else 0.0
     ann_ret = avg_cap * 252.0
     ann_std = std * np.sqrt(252.0) if std != 0.0 else 0.0
-    sharpe  = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
-    t_stat  = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
+    sharpe = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
+
+    t_stat = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
     try:
         from scipy import stats as _st
         p_val = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(n_trig - 1, 1))))
     except Exception:
         p_val = 1.0
 
-    if (_DBG["METRICS"] or _DBG["HASH"]) and _focus_ok(secondary):
-        print(f"[DATES] {secondary}: sec_grid={len(trig_idx)} {trig_idx[0].date()}→{trig_idx[-1].date()}  "
-              f"buy={int((sig_slice=='Buy').sum())} short={int((sig_slice=='Short').sum())}")
-        print(f"[METRICS] {secondary}: Trigs={n_trig} Wins={wins} Losses={losses} Win%={round(100*wins/max(n_trig,1),2)} "
-              f"Std={round(std,4)} Sharpe={round(sharpe,2)} Avg={round(avg_cap,4)} Total={round(total,4)} p={round(p_val,4)}")
-
-        # DIAGNOSTIC: Show first 10 signal/return/capture rows for focused tickers
-        if secondary in ("SBIT", "BITU"):
-            print(f"[DIAGNOSTIC] {secondary}: First 10 triggers")
-            ret_on_trig = ret[trig_mask]
-            for idx in range(min(10, len(trig_idx))):
-                date = trig_idx[idx]
-                sig = sig_slice.iloc[idx]
-                ret_val = ret_on_trig[idx]
-                cap_val = tc[idx]
-                print(f"  {date.date()} | Signal={sig:5s} | Return={ret_val:+7.3f}% | Capture={cap_val:+7.3f}%")
-
     info = {
         "prev_date": trig_idx[-2] if len(trig_idx) >= 2 else None,
         "live_date": trig_idx[-1],
-        "prev_sig":  str(sig_slice.iloc[-2]) if len(trig_idx) >= 2 else "None",
-        "live_sig":  str(sig_slice.iloc[-1]),
+        "prev_sig": str(sig_slice.iloc[-2]) if len(trig_idx) >= 2 else "None",
+        "live_sig": str(sig_slice.iloc[-1]),
     }
+
     met = {
         'Triggers': n_trig, 'Wins': wins, 'Losses': losses,
         'Win %': round(100*wins/max(n_trig,1), 2),
         'Std Dev (%)': round(std, 4), 'Sharpe': round(sharpe, 2),
-        'Mix': mix_str,  # Direction mix for tooltips (e.g., "L38|S62")
-        'T': round(t_stat, 4), 'Avg Cap %': round(avg_cap, 4),
+        'T': round(t_stat, 4), 'Avg %': round(avg_cap, 4),
         'Total %': round(total, 4), 'p': round(p_val, 4),
     }
+
     return met, info
+
 
 def _empty_metrics() -> Dict[str, float]:
     """Return empty metrics dict for muted cases."""
-    return {"Sharpe": None, "Win %": None, "Triggers": None, "Avg Cap %": None, "Total %": None, "p": None}
+    return {"Sharpe": None, "Win %": None, "Triggers": None, "Avg %": None, "Total %": None, "p": None}
 
 def _empty_dates() -> Dict[str, Any]:
     """Return empty snapshot info dict."""
     return {
         "today": None,            # last common session
-        "position_now": "Cash",   # Buy/Short/Cash
-        "action_close": "Cash",   # next action at today's close
+        "sharpe_now": None,       # Sharpe through today
+        "sharpe_next": None,      # Projected Sharpe with next signal
         "tomorrow": None          # next session on secondary
     }
 
@@ -2042,8 +1839,8 @@ def _round_metrics_map(m: dict) -> dict:
         m["Win %"] = _r(m["Win %"], 2)
     if m.get("Std Dev (%)") is not None:
         m["Std Dev (%)"] = _r(m["Std Dev (%)"], 4)
-    if m.get("Avg Cap %") is not None:
-        m["Avg Cap %"] = _r(m["Avg Cap %"], 4)
+    if m.get("Avg %") is not None:
+        m["Avg %"] = _r(m["Avg %"], 4)
     if m.get("Total %") is not None:
         m["Total %"] = _r(m["Total %"], 4)
     if m.get("Sharpe") is not None:
@@ -2083,25 +1880,26 @@ def _next_session_naive(asset_type: str, from_date: pd.Timestamp) -> pd.Timestam
         add = 1
     return d + pd.Timedelta(days=add)
 
-def _filter_active_members_by_next_signal(secondary: str, members: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+def _filter_active_members_by_next_signal(secondary: str,
+                                          members: List[str],
+                                          *,
+                                          as_of: Optional[pd.Timestamp] = None) -> List[str]:
     """
     Filter out members whose next signal is 'None' (matching Spymaster's auto-mute behavior).
-    Uses strict PKL-based next signal (no calendar padding or grace tolerance).
-    Returns filtered list of (primary, mode) tuples that have active signals.
+    Uses strict PKL-based next signal (no calendar padding).
+    Returns filtered list of tickers that have active signals.
     """
     if not members:
         return []
 
     active = []
-    for (primary, mode) in members:
-        # Get next signal directly from PKL (strict A.S.O. parity)
-        next_sig = _next_signal_from_pkl(primary, mode)
+    for primary in members:
+        # Get next signal directly from PKL (strict A.S.O. parity) ANCHORED to 'as_of'
+        next_sig = _next_signal_from_pkl(primary, as_of=as_of)
 
         if next_sig != "None":
-            active.append((primary, mode))
-            _dlog(2, "FILTER", f"{primary}[{mode}] -> ACTIVE (next signal: {next_sig})")
-        else:
-            _dlog(2, "FILTER", f"{primary}[{mode}] -> MUTED (next signal: None)")
+            active.append(primary)
+        # else: member is muted (None signal) - skip it
 
     return active
 
@@ -2116,21 +1914,56 @@ def _combine_next_list(next_list: List[str]) -> str:
         return "Short"
     return "Cash"
 
-def _signal_snapshot_for_members(secondary: str, members: List[Tuple[str, str]], cap_dt: Optional[pd.Timestamp] = None) -> Dict[str, Any]:
+def _calculate_signal_mix(members: List[str], as_of: Optional[pd.Timestamp] = None) -> str:
     """
-    Build a simple now/next snapshot:
-      - position_now: last combined signal across members (intersection calendar)
-      - action_close: unanimous combine of members' PKL next signals
+    Calculate signal agreement ratio for MIX column.
+
+    Returns format like "7/8", "3/5", "0/3" showing:
+    - Numerator: Count of most common active signal (Buy or Short, whichever is higher)
+    - Denominator: Total members
+
+    Examples:
+    - 7 Buy, 1 None → "7/8"
+    - 3 Buy, 1 None, 1 Short → "3/5"
+    - 3 Buy, 3 Short → "3/6"
+    - 3 None → "0/3"
+    - 5 Short, 4 Buy, 1 None → "5/10"
+    """
+    if not members:
+        return "0/0"
+
+    total = len(members)
+
+    # Get next signal for each member
+    signals = []
+    for m in members:
+        sig = _next_signal_from_pkl(m, as_of=as_of)
+        signals.append(sig)
+
+    # Count each signal type
+    buy_count = sum(1 for s in signals if s == "Buy")
+    short_count = sum(1 for s in signals if s == "Short")
+    # none_count = sum(1 for s in signals if s == "None")
+
+    # Max agreement is the higher of Buy or Short count
+    max_agreement = max(buy_count, short_count)
+
+    return f"{max_agreement}/{total}"
+
+def _signal_snapshot_for_members(secondary: str, members: List[str], cap_dt: Optional[pd.Timestamp] = None) -> Dict[str, Any]:
+    """
+    Build a simple now/next snapshot with Sharpe ratios:
+      - sharpe_now: Sharpe ratio calculated through today's close (locked-in performance)
+      - sharpe_next: Projected Sharpe ratio including next signal
       - cap_dt: Optional cap date for Today/Now/NEXT parity with metrics
     """
     # Load secondary prices and index
     sec_df = _PRICE_CACHE.get(secondary)
     if sec_df is None:
-        sec_df = _load_secondary_prices(secondary, PRICE_BASIS)
+        sec_df = _load_secondary_prices(secondary)
         _PRICE_CACHE[secondary] = sec_df
 
     if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
-        _dlog(2, "SNAPSHOT", f"{secondary}: no prices")
         return _empty_dates()
 
     # Extract price series
@@ -2139,23 +1972,19 @@ def _signal_snapshot_for_members(secondary: str, members: List[Tuple[str, str]],
         sec_close = sec_close.iloc[:, 0]
     sec_index = pd.DatetimeIndex(pd.to_datetime(sec_close.index, utc=True)).tz_convert(None).normalize()
 
-    if TF_DEBUG_SIGNALS:
-        _dlog(3, "SNAPSHOT", f"{secondary}: price idx={len(sec_index)} fp={_idx_fp(sec_index)}")
-
     # Per-member signals on secondary calendar (no pad tolerance)
     sig_series_list = []
-    for (p, m) in members:
+    for p in members:
         lib = load_spymaster_pkl(p)
         if not lib:
             continue
-        dates, signals = _extract_signals_from_active_pairs(lib, m)
+        dates, signals, _ = _extract_signals_from_active_pairs(lib)  # Ignore next_signal here (auto-mute context)
         if len(dates) == 0:
             continue
         sig = pd.Series(signals, index=pd.DatetimeIndex(dates))
         sig_series_list.append(sig)
 
     if not sig_series_list:
-        _dlog(2, "SNAPSHOT", f"{secondary}: no valid member signals")
         return _empty_dates()
 
     sig_df = pd.concat(sig_series_list, axis=1)
@@ -2172,15 +2001,6 @@ def _signal_snapshot_for_members(secondary: str, members: List[Tuple[str, str]],
     combined = _combine_positions_unanimity(sig_df).reindex(sec_index).fillna('None')
 
     # Diagnostics: distribution on the capped grid
-    if TF_DEBUG_SIGNALS:
-        try:
-            _buy = int((combined == 'Buy').sum())
-            _short = int((combined == 'Short').sum())
-            _none = int((combined == 'None').sum())
-            _dlog(3, "COMBINE", f"{secondary}: Buy={_buy} Short={_short} None={_none} on {len(combined)} days")
-        except Exception:
-            pass
-
     # Today is the last day on the capped grid
     if len(sec_index) == 0:
         return _empty_dates()
@@ -2201,23 +2021,24 @@ def _signal_snapshot_for_members(secondary: str, members: List[Tuple[str, str]],
         else:
             tomorrow_dt = (today_dt + BusinessDay()).normalize()
 
-    # Next action = unanimous combine of members' PKL next signals
-    nexts = [_next_signal_from_pkl(p, m) for (p, m) in members]
-    action = _combine_next_list(nexts)
+    # Calculate NOW Sharpe (through today, excluding next_signal)
+    metrics_now, _ = _subset_metrics_spymaster(secondary, members, eval_to_date=today_dt)
+    sharpe_now = metrics_now.get('Sharpe')
 
-    if TF_DEBUG >= 2:
-        _dlog(2, "SNAPSHOT", f"{secondary} today={today_dt.date() if isinstance(today_dt, pd.Timestamp) else today_dt} "
-              f"pos_now={pos_now} next={action} tomorrow={tomorrow_dt.date() if isinstance(tomorrow_dt, pd.Timestamp) else tomorrow_dt} "
-              f"members={[(p, m) for p, m in members]}")
+    # Calculate NEXT Sharpe (including next_signal projection)
+    # Use tomorrow as eval date if available, otherwise use today
+    eval_next = tomorrow_dt if tomorrow_dt else today_dt
+    metrics_next, _ = _subset_metrics_spymaster(secondary, members, eval_to_date=eval_next)
+    sharpe_next = metrics_next.get('Sharpe')
 
     return {
         "today": today_dt,
-        "position_now": pos_now,
-        "action_close": action,
+        "sharpe_now": round(sharpe_now, 2) if sharpe_now is not None else None,
+        "sharpe_next": round(sharpe_next, 2) if sharpe_next is not None else None,
         "tomorrow": tomorrow_dt
     }
 
-def compute_build_metrics_spymaster_parity(secondary: str, members: List[Tuple[str, str]], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
     Compute averaged metrics across all non-empty subsets (spymaster parity).
 
@@ -2226,7 +2047,7 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[Tuple[s
 
     Args:
         secondary: Secondary ticker symbol
-        members: List of (primary, mode) tuples
+        members: List of primary ticker symbols
         eval_to_date: Cap date for deterministic metrics (passed from run_fence)
 
     Returns (metrics_dict, info_dict) where info contains prev/live dates and signals.
@@ -2236,43 +2057,41 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[Tuple[s
     if not members:
         return _empty_metrics(), _empty_dates()
 
-    # NEXT actions should honor auto-mute; AVERAGES parity should not silently zero-out metrics.
-    active_members = _filter_active_members_by_next_signal(secondary, members)
-    drop_none = TF_AVERAGES_DROP_NONE
-    metrics_members = (active_members if drop_none else members)
-    # If everything would be dropped, fall back to all members so K1 rows still show metrics (BTC-USD case).
-    if not metrics_members:
-        metrics_members = members
-        print(f"[BUILD] {secondary}: All members muted by NEXT; keeping for AVERAGES parity (metrics only).")
-    else:
-        print(f"[BUILD] {secondary}: metrics_members={len(metrics_members)} active_for_next={len(active_members)} total={len(members)}")
-
-    # Snapshot for UI: combine using members that are active for NEXT; if none, show snapshot from all.
+    # Auto-mute uses next-signal parity anchored to the same cap
+    active_members = _filter_active_members_by_next_signal(secondary, members, as_of=eval_to_date)
+    # Metrics are computed on the FULL member set; NOW/NEXT is a separate snapshot only.
+    metrics_members = list(members)
+    # Snapshot for UI only
     snap_basis = active_members if active_members else members
     info_snapshot = _signal_snapshot_for_members(secondary, snap_basis, cap_dt=eval_to_date)
 
     from itertools import combinations
     # Stable subset order for repeatability
-    metrics_members = sorted(metrics_members, key=lambda x: (x[0], x[1]))
+    metrics_members = sorted(metrics_members)
     subsets = [list(c) for r in range(1, len(metrics_members) + 1) for c in combinations(metrics_members, r)]
+
+    # Fast path: K=1 parity
+    if len(metrics_members) == 1:
+        m, _ = _subset_metrics_spymaster(secondary, metrics_members, eval_to_date=eval_to_date)
+        return _round_metrics_map(m), info_snapshot
 
     # Preload PKL signals for all unique members used in METRICS (speeds up K>1 by caching processed signals)
     try:
-        for (t, m) in set(metrics_members):
-            _ = _processed_signals_from_pkl(t, m)
+        for t in set(metrics_members):
+            _ = _processed_signals_from_pkl(t)
     except Exception as e:
-        _dlog(1, "BUILD", f"{secondary}: Signal preload warning: {e}")
+        pass  # Signal preload warning handled silently
 
     # Preload secondary prices
     sec_df = _PRICE_CACHE.get(secondary)
     if sec_df is None:
-        sec_df = _load_secondary_prices(secondary, PRICE_BASIS)
+        sec_df = _load_secondary_prices(secondary)
         _PRICE_CACHE[secondary] = sec_df
 
     mets, info0 = [], None
 
     # Use the cap date passed from caller (explicit parameter, no globals)
-    if eval_to_date is not None and TF_DEBUG_LEVEL >= 1:
+    if eval_to_date is not None and 0 >= 1:
         print(f"[RUN-CAP] {secondary}: using eval_to_date <= {eval_to_date.date()}")
 
     if PARALLEL_SUBSETS and len(subsets) > 1:
@@ -2295,7 +2114,7 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[Tuple[s
     # Combine across subset metrics by mean; be robust to missing/None values
     if not mets:
         return _empty_metrics(), {"note": "no subsets"}
-    out, NUM_KEYS = {}, {"Triggers","Wins","Losses","Win %","Std Dev (%)","Sharpe","Avg Cap %","Total %","T","p"}
+    out, NUM_KEYS = {}, {"Triggers","Wins","Losses","Win %","Std Dev (%)","Sharpe","Avg %","Total %","T","p"}
     keys = list(mets[0].keys())
     for k in keys:
         raw = [mm.get(k) for mm in mets]
@@ -2312,7 +2131,7 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[Tuple[s
 
     return out, info_snapshot
 
-def compute_build_metrics_parity(secondary: str, members: List[Tuple[str,str]], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def compute_build_metrics_parity(secondary: str, members: List[str], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     DEPRECATED: Use compute_build_metrics_spymaster_parity instead.
     Kept for backward compatibility only.
@@ -2365,7 +2184,7 @@ def get_all_missing_pkls(secs: List[str], max_k: int = 10) -> List[str]:
                 k_rows = df[df["K"] == k_val]
                 for _, row in k_rows.iterrows():
                     members = parse_members(row.get("Members"))
-                    for ticker, mode in members:
+                    for ticker in members:
                         fresh, reason, _meta = _classify_pkl_freshness(ticker)
                         if not fresh:
                             missing.add(ticker)
@@ -2388,7 +2207,7 @@ def get_all_missing_pkls_all(secs: List[str]) -> List[str]:
             if "Members" not in df.columns:
                 continue
             for _, row in df.iterrows():
-                for ticker, mode in parse_members(row.get("Members")):
+                for ticker in parse_members(row.get("Members")):
                     fresh, reason, _meta = _classify_pkl_freshness(ticker)
                     if not fresh:
                         missing.add(ticker)
@@ -2429,38 +2248,34 @@ def build_board_rows(sec: str, k: int, run_fence: dict) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for _, row in dfk.iterrows():
         members = sanitize_members(row['Members'])
+        # Skip when none of the members have a PKL. Prevents 'Cash/Cash' placeholder rows.
+        if not _members_have_pkls(members):
+            continue
 
-        # DIAGNOSTIC: Log member parsing for inverse secondaries
-        if sec in ("SBIT", "BITU") or TF_DEBUG_METRICS:
-            force_status = f"FORCED→{TF_FORCE_MEMBERS_MODE}" if TF_FORCE_MEMBERS_MODE in {"D", "I"} else "RESPECTING-FLAGS"
-            print(f"[MEMBERS-DEBUG] {sec}: raw='{row['Members']}' parsed={[(t,m) for t,m in members]} ({force_status})")
-
-        averages, dates = compute_build_metrics_parity(sec, members, eval_to_date=cap_dt)
+        # Option A: strict A.S.O. parity (active_pairs, zero grace, trigger-only)
+        averages, dates = compute_build_metrics_spymaster_parity(sec, members, eval_to_date=cap_dt)
+        # Skip rows with empty metrics and no snapshot (no signals available).
+        if (averages.get("Triggers") is None) and (dates.get("today") is None):
+            continue
 
         # Metrics are already correctly signed (negative for shorts), no flip needed
-        if TF_DEBUG_METRICS:
-            _dlog(2, "BUILD_ROW", f"{sec} K={k}: members={[f'{t}[{m}]' for t,m in members]}, Sharpe={averages.get('Sharpe', 0.0)}, Action={dates.get('action_close', 'Cash')}")
         if TF_SHOW_SESSION_SANITY:
             try:
                 san = _session_sanity(sec, members)
-                _dlog(2, "SANITY", f"{sec} asset={san['asset']} expected={san['expected']} price_last={san['price_last']} "
-                      f"signals_last={san['signals_last']} today={san['today']} tomorrow={san['tomorrow']} nowET={san['nowET']}")
+                # Session sanity check completed
             except Exception as _e:
-                _dlog(1, "SANITY", f"{sec}: error {str(_e)}")
+                pass  # Session sanity check failed silently
 
-        # Format members: plain text for copy-paste, store mode info separately
-        members_list = [t for t, m in members]
-        members_display = ", ".join(members_list)
+        # Format members: plain text for copy-paste
+        members_display = ", ".join(members)
 
-        # Store original members string for mode detection (as plain string, not list)
-        members_raw_str = str(row['Members']) if row.get('Members') else ""
+        # Calculate signal agreement ratio
+        mix_ratio = _calculate_signal_mix(members, as_of=dates.get("today"))
 
         rec = {
             "Ticker": sec,
             "K": int(k),
             "Members": members_display,
-            "Members_Raw": str(members_raw_str or ""),
-            "Mix": averages.get("Mix", "L0|S0"),  # Direction mix (hidden, for tooltips)
             "Trigs": averages.get("Triggers"),
             "Wins": averages.get("Wins"),
             "Losses": averages.get("Losses"),
@@ -2468,12 +2283,13 @@ def build_board_rows(sec: str, k: int, run_fence: dict) -> List[Dict[str, Any]]:
             "StdDev %": averages.get("Std Dev (%)"),
             "Sharpe": averages.get("Sharpe"),  # Follow-signal Sharpe (Spymaster parity)
             "p": averages.get("p"),
-            "Avg Cap %": averages.get("Avg Cap %"),
+            "Avg %": averages.get("Avg %"),
             "Total %": averages.get("Total %"),
             "Today": dates.get("today").strftime("%Y-%m-%d") if dates.get("today") else None,
-            "Now": dates.get("position_now"),
-            "NEXT": dates.get("action_close"),
+            "Now": dates.get("sharpe_now"),
+            "NEXT": dates.get("sharpe_next"),
             "TMRW": dates.get("tomorrow").strftime("%Y-%m-%d") if dates.get("tomorrow") else None,
+            "MIX": mix_ratio,
         }
 
         # >>> PATCH 4: jitter guard (dev only)
@@ -2482,7 +2298,7 @@ def build_board_rows(sec: str, k: int, run_fence: dict) -> List[Dict[str, Any]]:
             trigs = averages.get("Triggers", 0)
             wins = averages.get("Wins", 0)
             losses = averages.get("Losses", 0)
-            avg_cap = averages.get("Avg Cap %", 0.0)
+            avg_cap = averages.get("Avg %", 0.0)
             std_cap = averages.get("Std Dev (%)", 0.0)
             sharpe = averages.get("Sharpe", 0.0)
             total = averages.get("Total %", 0.0)
@@ -2528,11 +2344,11 @@ def make_app():
                 columns=[
                     {"name":c, "id":c} for c in [
                         "Ticker","Trigs","Wins","Losses","Win %","StdDev %","Sharpe","p",
-                        "Avg Cap %","Total %","Today","Now","NEXT","TMRW","Members","Members_Raw","Mix"
+                        "Avg %","Total %","Today","Now","NEXT","TMRW","MIX","Members"
                     ]
                 ],
                 data=[],
-                tooltip_data=[],  # Populated by callback for direction mix display
+                tooltip_data=[],  # Populated by callback for NOW/NEXT semantics
                 sort_action="native",
                 sort_by=[{"column_id":"Sharpe","direction":"desc"},{"column_id":"Total %","direction":"desc"},{"column_id":"Trigs","direction":"desc"}],
                 style_cell={
@@ -2541,21 +2357,15 @@ def make_app():
                     "whiteSpace":"nowrap","textOverflow":"ellipsis","overflow":"hidden",
                     "height":"auto","border":"1px solid #333", "maxWidth":"140px"
                 },
-                style_cell_conditional=[
-                    {"if": {"column_id": "Members_Raw"}, "display": "none"},  # Hide Members_Raw column
-                    {"if": {"column_id": "Mix"}, "display": "none"}  # Hide Mix column (used for tooltips)
-                ],
                 style_header={"backgroundColor":"#1a1a1a","fontWeight":"bold","color":"#00ffff","border":"1px solid #00ffff"},
                 style_table={"overflowX":"auto"},
                 # Keep styling simple and robust
                 style_data_conditional=[
+                    # Simple Sharpe coloring - green for positive, red for negative
                     {"if": {"filter_query": "{Sharpe} >= 2"}, "backgroundColor": "#0a2a0a","color":"#00ff00"},
                     {"if": {"filter_query": "{Sharpe} <= -2"}, "backgroundColor": "#2a0a0a","color":"#ff6666"},
                     {"if": {"filter_query": "{Sharpe} > -2 && {Sharpe} < 2"}, "backgroundColor": "#2a2a0a","color":"#ffff00"},
                     {"if": {"filter_query": "{Trigs} = 0"}, "backgroundColor": "#2a2a0a","color":"#ffff00"},
-                    # Subtle tint for short-dominant Sharpe (helps distinguish inverse pairs)
-                    {"if": {"filter_query": "{Mix} contains 'S6' || {Mix} contains 'S7' || {Mix} contains 'S8' || {Mix} contains 'S9'", "column_id": "Sharpe"}, "color": "#ff9999"},
-                    {"if": {"filter_query": "{Mix} contains 'L6' || {Mix} contains 'L7' || {Mix} contains 'L8' || {Mix} contains 'L9'", "column_id": "Sharpe"}, "color": "#99ff99"},
                     # Highlight planned flips (Now != NEXT)
                     {"if": {"filter_query": "{Now} != {NEXT}"}, "boxShadow": "0 0 8px rgba(255,255,0,0.25)"}
                 ],
@@ -2602,9 +2412,6 @@ def make_app():
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             # Show resolved debug flags once per refresh
-            if TF_DEBUG_LEVEL or any(_DBG.values()):
-                print(f"[DEBUG] TF_DEBUG={TF_DEBUG_LEVEL} PRICE={_DBG['PRICE']} SIGNALS={_DBG['SIGNALS']} METRICS={_DBG['METRICS']} DATES={_DBG['DATES']} HASH={_DBG['HASH']} CACHE={_DBG['CACHE']} FOCUS={','.join(sorted(TF_DEBUG_FOCUS)) or 'ALL'} DUMP={'ON' if TF_DEBUG_DUMP else 'OFF'}")
-
             secs = list_secondaries()  # Fresh list each refresh
 
             # Price refresh policy:
@@ -2614,19 +2421,17 @@ def make_app():
                 first_load = int(_n or 0) == 0
                 if (not first_load) or TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD:
                     refresh_secondary_caches(secs, force=TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK)
-                else:
-                    print("[PRICE-REFRESH] first-load: skipped (TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD=0)")
+                # else: skip price refresh on first load
             except Exception as _e:
-                print("[PRICE-REFRESH] skipped:", _e)
+                pass  # Price refresh error handled silently
 
             k = int(kval or 1)
-            _dlog(1, "REFRESH", f"K={k}, Secondaries={len(secs)}, Click={_n}")
 
             # Compute global cap for deterministic metrics (after price refresh, before row building)
             universe_prices = {}
             for sec in secs:
                 try:
-                    price_df = _load_secondary_prices(sec, PRICE_BASIS)
+                    price_df = _load_secondary_prices(sec)
                     atype = _infer_quote_type(sec)  # EQUITY | INDEX | CRYPTOCURRENCY | CURRENCY | FUTURE
                     universe_prices[sec] = {"prices": price_df, "asset": atype}
                 except Exception:
@@ -2635,9 +2440,6 @@ def make_app():
 
             # Create run_fence dict for explicit cap propagation (no global var races)
             run_fence = {"global": cap_global, "by_sec": cap_by_sec}
-            if TF_DEBUG_LEVEL >= 1:
-                print(f"[RUN-CAP] global={cap_global.date() if cap_global else None} by_sec_count={len(cap_by_sec)}")
-
             # Scan all secondaries and ALL rows (no K filter) for missing/stale PKLs (quiet mode)
             missing_map = scan_missing_stale_pkls(secs, k_limit=None, include_stale=True, verbose=False)
 
@@ -2653,13 +2455,9 @@ def make_app():
                     try:
                         rows = fut.result()
                         rows_all.extend([_jsonify_row(r) for r in rows])
-                        if TF_DEBUG >= 2:
-                            _dlog(2, "REFRESH", f"{sec}: built {len(rows)} rows")
                     except Exception as e:
-                        # Surface short trace in console for debugging (keeps UI message compact)
-                        _dlog(1, "ERROR", f"{sec}: {e}\n{traceback.format_exc().splitlines()[-1]}")
-                        if _focus_ok(sec):
-                            print(f"[ERROR] {sec}: debug context -> DBG={_DBG} TF_DEBUG={TF_DEBUG_LEVEL}")
+                        # Log error to console
+                        print(f"[ERROR] {sec}: {e}")
                         problems.append(f"{sec}: {e}")
 
             # Universal metric-based sort (deterministic Sharpe → Total → Trigs → Ticker)
@@ -2693,16 +2491,10 @@ def make_app():
                 return (-sharpe_val, -total_val, -trigs_val, ticker)
 
             # Debug: show pre-sort order
-            if TF_DEBUG_LEVEL >= 1:
-                print(f"[SORT-BEFORE] {[(r.get('Ticker'), r.get('Sharpe')) for r in rows_all[:5]]}")
-
             rows_all.sort(key=_metric_key)
 
             # Debug: show post-sort order
-            if TF_DEBUG_LEVEL >= 1:
-                print(f"[SORT-AFTER] {[(r.get('Ticker'), r.get('Sharpe')) for r in rows_all[:5]]}")
-
-            msg = f"K={k}  Rows={len(rows_all)}  PriceRefresh={'FULL' if TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK else ('AUTO' if TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD else 'SKIP@startup')}"
+            msg = f"K={k}  Rows={len(rows_all)}  PriceRefresh={'FULL' if TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK else ('AUTO' if TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD else 'SKIP@startup')}  |  NOW=Sharpe through Today  NEXT=Projected Sharpe→TMRW  METRICS=history≤Today"
             if problems:
                 # ASCII-only to avoid cp1252/UTF-8 mojibake ("â€¢")
                 msg += f"  | Issues: {len(problems)} - " + "; ".join(problems[:3])
@@ -2735,26 +2527,21 @@ def make_app():
             Input("board", "data")
         )
         def update_tooltips(rows):
-            """Generate tooltips showing direction mix for each row."""
+            """Tooltips: explicit NOW/NEXT semantics per row."""
             if not rows:
                 return []
 
             tooltip_data = []
             for row in rows:
-                mix = row.get("Mix", "L0|S0")
-                # Parse mix string (e.g., "L38|S62")
-                try:
-                    parts = mix.split("|")
-                    l_part = parts[0].replace("L", "")
-                    s_part = parts[1].replace("S", "")
-                    tooltip_text = f"Direction mix (triggers): L{l_part}% | S{s_part}%"
-                except:
-                    tooltip_text = "Direction mix unknown"
-
-                # Add tooltip to Ticker and Sharpe columns
+                # Tooltips for NOW/NEXT Sharpe semantics
+                today = row.get("Today") or "?"
+                tmrw  = row.get("TMRW") or "?"
+                now_sharpe = row.get("Now")
+                next_sharpe = row.get("NEXT")
                 tooltip_data.append({
-                    "Ticker": {"value": tooltip_text, "type": "text"},
-                    "Sharpe": {"value": tooltip_text, "type": "text"}
+                    "Now":    {"value": f"Sharpe ratio through {today} close (locked-in performance): {now_sharpe}", "type": "text"},
+                    "NEXT":   {"value": f"Projected Sharpe ratio including signal through {tmrw}: {next_sharpe}", "type": "text"},
+                    "TMRW":   {"value": "Next trading session for the secondary", "type": "text"}
                 })
 
             return tooltip_data
@@ -2773,12 +2560,11 @@ def main():
         secs = list_secondaries()
         print(f"\n{'='*70}")
         print(f"  TrafficFlow v1.9 - Signal Aggregation Dashboard")
-        print(f"  Port: {PORT} | Secondaries: {len(secs)} | Price Basis: {PRICE_COLUMN}")
+        print(f"  Port: {PORT} | Secondaries: {len(secs)} | Using raw Close prices")
         print(f"  Alignment: A.S.O. strict intersection | Parallel Subsets: {'Enabled' if PARALLEL_SUBSETS else 'Disabled'}")
         print(f"{'='*70}")
-        print(f"\n[PARITY_MODE] A.S.O. strict intersection: PKL-based next signals, no grace tolerance")
-        if TF_DEBUG_LEVEL or any(_DBG.values()):
-            print(f"[DEBUG] TF_DEBUG={TF_DEBUG_LEVEL} PRICE={_DBG['PRICE']} SIGNALS={_DBG['SIGNALS']} METRICS={_DBG['METRICS']} DATES={_DBG['DATES']} HASH={_DBG['HASH']} CACHE={_DBG['CACHE']} FOCUS={','.join(sorted(TF_DEBUG_FOCUS)) or 'ALL'} DUMP={'ON' if TF_DEBUG_DUMP else 'OFF'}")
+        print(f"\n[PARITY_MODE] A.S.O. strict intersection with PKL-based signals")
+        print(f"[METRICS] Signal-agnostic metrics: ON (SpyMaster parity)")
         print(f"\n  Running on http://127.0.0.1:{PORT}/")
         print(f"  Press CTRL+C to quit\n")
 
