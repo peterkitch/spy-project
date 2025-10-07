@@ -2058,12 +2058,15 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
         return _empty_metrics(), _empty_dates()
 
     # Auto-mute uses next-signal parity anchored to the same cap
+    # CRITICAL K≥2 PARITY FIX: Use active_members (filters out None signals) for metrics
+    # This matches Spymaster's optimization section behavior where tickers with None signals
+    # are automatically muted and don't generate combinations (line 12381)
     active_members = _filter_active_members_by_next_signal(secondary, members, as_of=eval_to_date)
-    # Metrics are computed on the FULL member set; NOW/NEXT is a separate snapshot only.
-    metrics_members = list(members)
-    # Snapshot for UI only
-    snap_basis = active_members if active_members else members
-    info_snapshot = _signal_snapshot_for_members(secondary, snap_basis, cap_dt=eval_to_date)
+
+    # Use active members for both metrics AND snapshot (Spymaster parity)
+    metrics_members = active_members if active_members else []
+    if not metrics_members:
+        return _empty_metrics(), _empty_dates()
 
     from itertools import combinations
     # Stable subset order for repeatability
@@ -2128,6 +2131,29 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
 
     # Apply consistent decimal rounding for K≥2 (matches K1 precision)
     out = _round_metrics_map(out)
+
+    # Create snapshot with AVERAGES Sharpe (not unanimous combination Sharpe)
+    # For K≥2, NOW/NEXT should show the AVERAGES Sharpe, matching the row metrics
+    today_dt = info0.get("live_date") if info0 else None
+
+    # Calculate tomorrow from secondary index
+    tomorrow_dt = None
+    if today_dt and sec_df is not None:
+        sec_index = pd.DatetimeIndex(pd.to_datetime(sec_df.index, utc=True)).tz_convert(None).normalize()
+        nxt_days = sec_index[sec_index > today_dt]
+        if len(nxt_days) > 0:
+            tomorrow_dt = nxt_days[0]
+        else:
+            # Fallback: project next business day
+            from pandas.tseries.offsets import BusinessDay
+            tomorrow_dt = (today_dt + BusinessDay()).normalize()
+
+    info_snapshot = {
+        "today": today_dt,
+        "sharpe_now": out.get("Sharpe"),  # Use AVERAGES Sharpe
+        "sharpe_next": out.get("Sharpe"),  # Use AVERAGES Sharpe (same for now, could be different with projection)
+        "tomorrow": tomorrow_dt
+    }
 
     return out, info_snapshot
 
