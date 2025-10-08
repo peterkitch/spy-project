@@ -48,6 +48,15 @@ try:
 except Exception:
     yf = None
 
+# --- TF EARLY-MAIN GUARD -----------------------------------------------
+# Some legacy blocks call main() mid-file, which boots Dash before the
+# latest functions are defined, leaving the UI on stale logic.
+# Make any early `main()` calls a no-op; the final call at EOF will run.
+if __name__ == "__main__":
+    def main():  # type: ignore[func-override]
+        return None
+# -----------------------------------------------------------------------
+
 # Import exchange hours helper for price refresh logic
 try:
     import sys
@@ -168,9 +177,23 @@ TF_CRYPTO_STRICT_MISSING_DAY = os.environ.get("TF_CRYPTO_STRICT_MISSING_DAY", "1
 PRICE_CACHE_TTL_DAYS   = int(os.environ.get("PRICE_CACHE_TTL_DAYS", "1"))   # refresh if last date < today-1
 PRICE_BACKFILL_DAYS    = int(os.environ.get("PRICE_BACKFILL_DAYS", "10"))   # overlap window to close gaps
 PRICE_REFRESH_THREADS  = int(os.environ.get("PRICE_REFRESH_THREADS", str(max(2, min(8, (os.cpu_count() or 4)//2)))))
-# Determinism: default off unless explicitly enabled
+# Parallel subset evaluation: DISABLED - no proven benefit, may introduce non-determinism
 PARALLEL_SUBSETS       = os.environ.get("PARALLEL_SUBSETS", "0") not in {"0","false","False"}
+# Matrix path toggle and limits (vectorized AVERAGES computation)
+TF_MATRIX_PATH         = os.environ.get("TF_MATRIX_PATH", "0").lower() in {"1","true","on","yes"}  # DISABLED by default until parity verified
+TF_MATRIX_MAX_K        = int(os.environ.get("TF_MATRIX_MAX_K", "12"))  # safe up to ~1023 subsets/row
+TF_MATRIX_DTYPE        = "int8"
 TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK = os.environ.get("TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK", "0").lower() in {"1","true","on","yes"}
+
+# ---- Post-intersection fast path (strict parity, no pre-align) ----
+# Vectorizes *after* computing the strict common-date set per subset.
+# Default off. Enable for speed tests once parity passes.
+TF_POST_INTERSECT_FASTPATH = os.environ.get("TF_POST_INTERSECT_FASTPATH", "0").lower() in {"1","true","on","yes"}
+
+# ---- Bitmask fast path (strict parity, boolean reductions; no .reindex()) ----
+# Builds per-member boolean masks on the secondary calendar and uses bitwise AND/OR.
+# Uses full capped daily returns grid (Spymaster parity).
+TF_BITMASK_FASTPATH = os.environ.get("TF_BITMASK_FASTPATH", "0").lower() in {"1","true","on","yes"}
 
 # ---- First-load & parity gates ----
 # If 0 (default), never hit the network on the first render; use cache as-is.
@@ -206,6 +229,13 @@ _SIGNAL_SERIES_CACHE: Dict[str, pd.Series] = {}  # primary -> processed signals 
 _LAST_REFRESH_N: int = -1                   # track Refresh button clicks
 _FORCE_PRICE_REFRESH: bool = False          # one-shot flag for forcing price refresh
 
+# Fast-path caches (scoped to secondary calendar; cleared on refresh)
+_SEC_POSMAP_CACHE: Dict[Tuple[str, Tuple[str,str,int]], Dict[pd.Timestamp, int]] = {}
+# key: (SEC, PRI, MODE, sec_index_fp) -> (all_pos[int32], buy_pos[int32], short_pos[int32])
+_POSSET_CACHE: Dict[Tuple[str,str,str,Tuple[str,str,int]], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+# key: (SEC, PRI, MODE, sec_index_fp) -> (all_mask[bool], buy_mask[bool], short_mask[bool])
+_MASK_CACHE: Dict[Tuple[str, str, str, Tuple[str,str,int]], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
 # PKL freshness memoization
 PKL_TTL_HOURS = int(os.environ.get("PKL_TTL_HOURS", "0"))
 # PKL_GATE_VERBOSE removed - no longer needed without debug
@@ -228,6 +258,8 @@ def _clear_runtime(preserve_prices: bool = False):
     # Keep _SIGNAL_SERIES_CACHE to avoid reprocessing PKLs repeatedly
     _PKL_CACHE.clear()
     _FROZEN_CAP_END.clear()  # Clear frozen cap end dates
+    _SEC_POSMAP_CACHE.clear()  # Clear fast-path position map cache
+    _POSSET_CACHE.clear()  # Clear fast-path position set cache
     gc.collect()
     # Cache cleared - no need to log this routine operation
 
@@ -1075,6 +1107,104 @@ def _sec_index_fp(idx: pd.DatetimeIndex) -> Tuple[str, str, int]:
     i1 = pd.Timestamp(idx[-1]).normalize().strftime("%Y-%m-%d")
     return (i0, i1, len(idx))
 
+def _sec_posmap(secondary: str, sec_index: pd.DatetimeIndex) -> Dict[pd.Timestamp, int]:
+    """Map each date on the secondary calendar to its integer position."""
+    key = ((secondary or "").upper(), _sec_index_fp(sec_index))
+    hit = _SEC_POSMAP_CACHE.get(key)
+    if hit is not None:
+        return hit
+    pm = {pd.Timestamp(d): i for i, d in enumerate(sec_index)}
+    _SEC_POSMAP_CACHE[key] = pm
+    return pm
+
+def _member_masks_on_secondary(secondary: str,
+                               primary: str,
+                               mode: str,
+                               sec_index: pd.DatetimeIndex) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Boolean masks on the secondary calendar for one member:
+      all_mask:   True where the member has any signal record (Buy/Short/None)
+      buy_mask:   True where signal == Buy
+      short_mask: True where signal == Short
+    Masks are length len(sec_index). Built from integer possets for strict intersection parity.
+    """
+    key = ((secondary or "").upper(), (primary or "").upper(), (mode or "D").upper(), _sec_index_fp(sec_index))
+    hit = _MASK_CACHE.get(key)
+    if hit is not None:
+        return hit
+    # Reuse existing possets (already parity-correct and cached)
+    all_pos, buy_pos, short_pos = _member_possets_on_secondary(secondary, primary, mode, sec_index)
+    n = len(sec_index)
+    all_mask   = np.zeros(n, dtype=bool)
+    buy_mask   = np.zeros(n, dtype=bool)
+    short_mask = np.zeros(n, dtype=bool)
+    if all_pos.size:   all_mask[all_pos] = True
+    if buy_pos.size:   buy_mask[buy_pos] = True
+    if short_pos.size: short_mask[short_pos] = True
+    _MASK_CACHE[key] = (all_mask, buy_mask, short_mask)
+    return _MASK_CACHE[key]
+
+def _signals_from_pkl_for_mode(results: dict, mode: str) -> Tuple[pd.DatetimeIndex, pd.Series]:
+    """
+    Extract Buy/Short/None signals from PKL active_pairs with optional inversion.
+    Mirrors existing extractor + inversion logic. (No reindex, no fills.)
+    """
+    # Use existing helper that returns (dates, signals, next_signal)
+    dates, sigs, next_sig = _extract_signals_from_active_pairs(results, secondary_index=None)
+    s = pd.Series(list(sigs), index=pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize()).astype(str)
+    # Apply inversion if mode indicates inverted
+    if str(mode).upper() == "I":
+        s = s.map({"Buy":"Short","Short":"Buy"}).fillna("None")
+    return pd.DatetimeIndex(s.index), s
+
+def _member_possets_on_secondary(secondary: str,
+                                 primary: str,
+                                 mode: str,
+                                 sec_index: pd.DatetimeIndex) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return integer position sets for a member on the given secondary calendar:
+      - all_pos:  days where member has a non-None signal and secondary has prices
+      - buy_pos:  subset where signal == Buy
+      - short_pos: subset where signal == Short
+    All arrays are sorted int32 and contain *positions* on sec_index.
+    """
+    key = ((secondary or "").upper(), (primary or "").upper(), (mode or "D").upper(), _sec_index_fp(sec_index))
+    hit = _POSSET_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    lib = load_spymaster_pkl(primary)
+    if not lib:
+        _POSSET_CACHE[key] = (np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.int32))
+        return _POSSET_CACHE[key]
+
+    dates, sig = _signals_from_pkl_for_mode(lib, mode)
+    if len(dates) == 0:
+        _POSSET_CACHE[key] = (np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.int32))
+        return _POSSET_CACHE[key]
+
+    posmap = _sec_posmap(secondary, sec_index)
+    buy, short, allp = [], [], []
+    # Iterate once; strict intersection by construction (only dates present in secondary are mapped)
+    for d, v in zip(dates, sig.astype(str)):
+        pos = posmap.get(pd.Timestamp(d))
+        if pos is None:
+            continue
+        # Include ALL signal dates (Buy/Short/None) in all_pos for intersection
+        # This matches baseline behavior which intersects all signal dates first
+        allp.append(pos)
+        if v == "Buy":
+            buy.append(pos)
+        elif v == "Short":
+            short.append(pos)
+        # 'None' signals included in all_pos but not in buy_pos or short_pos
+    # Sorted unique integer arrays
+    all_pos   = np.fromiter(sorted(set(allp)), dtype=np.int32) if allp else np.empty(0, np.int32)
+    buy_pos   = np.fromiter(sorted(set(buy)), dtype=np.int32) if buy else np.empty(0, np.int32)
+    short_pos = np.fromiter(sorted(set(short)), dtype=np.int32) if short else np.empty(0, np.int32)
+    _POSSET_CACHE[key] = (all_pos, buy_pos, short_pos)
+    return _POSSET_CACHE[key]
+
 # _signals_series_cached removed - used grace_days which SpyMaster doesn't support
 # This function was not being called anywhere in the code
 
@@ -1670,7 +1800,15 @@ _COMBINE_INTERSECTION = False  # Spymaster AVERAGES uses the combined series its
 # (Legacy capture-first helpers removed:
 #  _apply_signals_to_secondary, _captures_for, _metrics_from_captures, _metrics_spymaster)
 
-def _subset_metrics_spymaster(secondary: str, subset: List[str], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def _subset_metrics_spymaster(
+    secondary: str,
+    subset: List[str],
+    *,
+    eval_to_date: Optional[pd.Timestamp] = None,
+    _pre_idx: Optional[pd.DatetimeIndex] = None,
+    _pre_rets: Optional[np.ndarray] = None,
+    _sig_cache: Optional[Dict[str, pd.Series]] = None
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
     UNIFIED parity with Spymaster A.S.O. for ALL K values:
       - Extract signals from active_pairs for each member
@@ -1678,51 +1816,97 @@ def _subset_metrics_spymaster(secondary: str, subset: List[str], *, eval_to_date
       - Combine via unanimity (K=1 trivially returns single signal)
       - Apply to same-day returns (no shift)
       - Metrics on trigger-day captures only
+
+    OPTIMIZATION (expert recommendation):
+      - _pre_idx: Precomputed secondary index (reused across subsets)
+      - _pre_rets: Precomputed secondary returns (reused across subsets)
+      - _sig_cache: Aligned signal series cache (reused across subsets)
     """
     subset = sanitize_members(subset)
     if not subset:
         return _empty_metrics(), _empty_dates()
 
-    # Load secondary prices
-    sec_df = _PRICE_CACHE.get(secondary)
-    if sec_df is None:
-        sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = sec_df
-    if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
-        return _empty_metrics(), _empty_dates()
+    # Load secondary prices (or use precomputed)
+    if _pre_idx is None or _pre_rets is None:
+        # Legacy path: compute per-subset (slow)
+        sec_df = _PRICE_CACHE.get(secondary)
+        if sec_df is None:
+            sec_df = _load_secondary_prices(secondary)
+            _PRICE_CACHE[secondary] = sec_df
+        if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
+            return _empty_metrics(), _empty_dates()
 
-    sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
-    sec_index = sec_close.index
+        sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
+        sec_index = sec_close.index
+    else:
+        # Optimized path: use precomputed (fast)
+        sec_index = _pre_idx
 
-    # Extract signals directly from active_pairs for each member
-    # Pass secondary_index to enable next_signal appending (Spymaster parity)
-    # CRITICAL: Also capture next_signal to determine if inversion is needed
+    # Extract signals directly from active_pairs for each member (or use cache)
+    # OPTIMIZATION: Cached signals have inversion applied but NOT reindexed (maintain original dates)
     signal_blocks = []
-    for prim in subset:
-        results = load_spymaster_pkl(prim)
-        if not results:
-            continue
-        dates, signals, next_sig = _extract_signals_from_active_pairs(results, secondary_index=sec_index)
-        if len(dates) == 0:
-            continue
-        signal_blocks.append((dates, signals, next_sig))
+
+    if _sig_cache is not None:
+        # Optimized path: use cached signals (already have inversion applied)
+        for prim in subset:
+            if prim in _sig_cache:
+                sig = _sig_cache[prim]
+                signal_blocks.append((sig.index, sig, None))  # next_sig=None (already applied)
+    else:
+        # Legacy path: load and process signals per-subset
+        for prim in subset:
+            results = load_spymaster_pkl(prim)
+            if not results:
+                continue
+            dates, signals, next_sig = _extract_signals_from_active_pairs(results, secondary_index=sec_index)
+            if len(dates) == 0:
+                continue
+            signal_blocks.append((dates, signals, next_sig))
 
     if not signal_blocks:
         return _empty_metrics(), _empty_dates()
 
-    # Find common dates (strict Spymaster approach: intersection only)
-    # Spymaster line 12452-12455: starts with secondary, then intersects with each primary's signal dates
+    # Find common dates (Spymaster parity: intersection + forward signal allowance)
+    # Include dates where both secondary prices and primary signals exist
     common_dates = set(sec_index)
     for dates, sig, _ in signal_blocks:
-        common_dates = common_dates.intersection(sig.index)
+        if isinstance(sig, pd.Series):
+            sig_dates = set(sig.index)
+        else:
+            # Convert to DatetimeIndex if needed
+            idx = pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize()
+            sig_dates = set(idx)
+
+        # Strict intersection for dates within secondary range
+        common_dates = common_dates.intersection(sig_dates)
+
+    # SPYMASTER PARITY: Allow signals 1 day beyond secondary (for "today's close" forward signal)
+    # Check if ALL primaries have signals on next_day
+    sec_last_date = sec_index[-1] if len(sec_index) > 0 else None
+    if sec_last_date is not None:
+        next_day = sec_last_date + pd.Timedelta(days=1)
+        all_have_next_day = True
+        for dates, sig, _ in signal_blocks:
+            if isinstance(sig, pd.Series):
+                sig_dates = sig.index
+            else:
+                sig_dates = pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize()
+
+            if next_day not in sig_dates:
+                all_have_next_day = False
+                break
+
+        # If all primaries have signals on next_day, include it
+        if all_have_next_day:
+            common_dates.add(next_day)
+
     common_dates = sorted(common_dates)
 
-    # Build signal dataframe on common dates only (no fillna needed - all dates exist in both)
-    # CRITICAL OPTIMIZATION PARITY FIX: Apply signal inversion based on next_signal
-    # Spymaster optimization section logic (lines 12471-12474):
-    #   - If next_signal = 'Short' → invert signals (Short→Buy, Buy→Short)
-    #   - If next_signal = 'Buy' → keep signals as-is
-    # This implements "What if we bought secondary when primary shows its CURRENT signal type"
+    if not common_dates:
+        return _empty_metrics(), _empty_dates()
+
+    # Build signal dataframe on common dates only
+    # CRITICAL: Inversion already applied for cached signals (next_sig=None)
     sig_series_list = []
     for dates, sig, next_sig in signal_blocks:
         if not isinstance(sig, pd.Series):
@@ -1730,10 +1914,9 @@ def _subset_metrics_spymaster(secondary: str, subset: List[str], *, eval_to_date
                 sig = pd.Series(list(sig), index=pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize())
             except Exception:
                 continue
-        # Only use common dates (strict intersection)
         sig_aligned = sig.loc[common_dates].astype(object)
 
-        # Apply inversion if next_signal is 'Short' (matching Spymaster line 12472)
+        # Apply inversion if next_signal is 'Short' (only for non-cached path)
         if next_sig == 'Short':
             sig_aligned = sig_aligned.replace({'Buy': 'Short', 'Short': 'Buy'})
 
@@ -1744,19 +1927,26 @@ def _subset_metrics_spymaster(secondary: str, subset: List[str], *, eval_to_date
 
     sig_df = pd.concat(sig_series_list, axis=1)
 
-    # Apply eval_to_date cap if requested (filter common_dates)
+    # Apply eval_to_date cap if requested
     if eval_to_date is not None:
         cap_day = pd.Timestamp(eval_to_date).normalize()
         common_dates = [d for d in common_dates if d <= cap_day]
         sig_df = sig_df.loc[common_dates]
 
     # Combine signals via unanimity (for K=1, this just returns the single column)
-    # Work directly on common_dates - no reindex/fillna needed
     combined_signals = _combine_positions_unanimity(sig_df)
 
-    # Calculate returns on common dates only (no shift - Spymaster parity)
-    sec_close_common = sec_close.loc[common_dates]
-    sec_rets = _pct_returns(sec_close_common).astype('float64')
+    # Calculate returns on common dates (use precomputed if available)
+    if _pre_rets is not None:
+        # Optimized path: use precomputed returns
+        sec_rets_series = pd.Series(_pre_rets, index=sec_index)
+        # Reindex with forward-fill for dates beyond secondary (forward signal dates)
+        sec_rets = sec_rets_series.reindex(common_dates, method='ffill').fillna(0.0).astype('float64')
+    else:
+        # Legacy path: compute returns per-subset
+        # Reindex with forward-fill for dates beyond secondary (forward signal dates)
+        sec_close_common = sec_close.reindex(common_dates, method='ffill')
+        sec_rets = _pct_returns(sec_close_common).astype('float64')
 
     # Apply signals to same-day returns
     ret = sec_rets.to_numpy(dtype='float64')
@@ -2038,6 +2228,358 @@ def _signal_snapshot_for_members(secondary: str, members: List[str], cap_dt: Opt
         "tomorrow": tomorrow_dt
     }
 
+# ---------- Matrix engine (all subsets in one shot; A.S.O. semantics preserved) ----------
+def _members_signals_df_and_returns(secondary: str, members: List[str],
+                                    *, eval_to_date: Optional[pd.Timestamp]) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Return (signals_df_cap, sec_rets) aligned to the capped secondary grid.
+    Each column of signals_df_cap is 'Buy'/'Short'/'None' for a member.
+
+    WARNING: Uses .reindex().fillna('None') which previously broke parity.
+    This is being tested - if parity breaks, this entire matrix path will be rejected.
+    """
+    # Load prices once
+    sec_df = _PRICE_CACHE.get(secondary)
+    if sec_df is None:
+        sec_df = _load_secondary_prices(secondary)
+        _PRICE_CACHE[secondary] = sec_df
+    if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
+        return pd.DataFrame(), pd.Series(dtype="float64")
+
+    sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
+    # Cap evaluation window to deterministic date if provided
+    if eval_to_date is not None:
+        cap_day = pd.Timestamp(eval_to_date).normalize()
+        sec_close = sec_close.loc[:cap_day]
+    sec_index_cap = sec_close.index
+
+    # Build per-member signal series aligned to capped grid
+    sig_series_list = []
+    for prim in members:
+        res = load_spymaster_pkl(prim)
+        if not res:
+            continue
+        dates, sigs, next_sig = _extract_signals_from_active_pairs(res, secondary_index=None)
+        if len(dates) == 0:
+            continue
+        sig = pd.Series(list(sigs), index=pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize())
+        # PARITY RISK: reindex with fillna - previously broke parity!
+        col = sig.reindex(sec_index_cap).fillna('None').astype(object)
+        # Note: Inversion handling removed from this implementation - may need to add back
+        sig_series_list.append(col)
+
+    if not sig_series_list:
+        return pd.DataFrame(), pd.Series(dtype="float64")
+
+    sig_df_cap = pd.concat(sig_series_list, axis=1)
+    # Same-day returns (signals_with_next semantics; no shift)
+    sec_rets = _pct_returns(sec_close).astype("float64")
+    return sig_df_cap, sec_rets
+
+def _averages_via_matrix(sig_df_cap: pd.DataFrame, sec_rets: pd.Series) -> Dict[str, Any]:
+    """
+    Vectorized computation of AVERAGES across all non-empty subsets.
+    Combiner rule = unanimity with None-neutral (Buy only if no Short present; vice versa).
+    """
+    if sig_df_cap is None or sig_df_cap.empty or sec_rets is None or sec_rets.empty:
+        return _empty_metrics()
+
+    # Encode signals to {-1,0,+1}
+    S = sig_df_cap.replace({'Buy': 1, 'Short': -1}).where(sig_df_cap.isin(['Buy','Short']), 0)
+    S = S.to_numpy(dtype=TF_MATRIX_DTYPE, copy=False)  # [N x K]
+    N, K = S.shape
+
+    # Build subset selection matrix M: [K x (2^K - 1)]
+    S_count = (1 << K) - 1
+    # guard K explosion
+    if S_count <= 0:
+        return _empty_metrics()
+    M = np.zeros((K, S_count), dtype="uint8")
+    for j, mask in enumerate(range(1, S_count + 1)):
+        # column j uses bitmask "mask"
+        # bit i selects member i
+        for i in range(K):
+            if (mask >> i) & 1:
+                M[i, j] = 1
+
+    # Counts of +1 and -1 per day for every subset
+    Ppos = (S == 1).astype("uint8")     # [N x K]
+    Pneg = (S == -1).astype("uint8")    # [N x K]
+    pos_cnt = Ppos @ M                  # [N x S]
+    neg_cnt = Pneg @ M                  # [N x S]
+
+    # Combined signal per subset column: +1 if any Buy and no Short; -1 if any Short and no Buy; else 0
+    pos_any = pos_cnt > 0
+    neg_any = neg_cnt > 0
+    combined = np.zeros_like(pos_cnt, dtype=TF_MATRIX_DTYPE)     # [N x S]
+    combined[np.where(pos_any & ~neg_any)] = 1
+    combined[np.where(neg_any & ~pos_any)] = -1
+
+    # Captures matrix on same-day returns
+    r = sec_rets.to_numpy(dtype="float64").reshape(-1, 1)        # [N x 1]
+    caps = combined.astype("float64") * r                        # [N x S]
+
+    # Trigger mask and stats per subset (vectorized)
+    m = combined != 0                                           # [N x S]
+    n = m.sum(axis=0).astype("float64")                         # [S]
+    # avoid divide-by-zero
+    nz = n > 0
+    # wins/losses
+    wins = ((caps > 0) & m).sum(axis=0).astype("float64")
+    losses = n - wins
+    win_pct = np.where(nz, wins / n * 100.0, 0.0)
+    # sums
+    sum_x  = (caps * m).sum(axis=0)                             # equals Total % over triggers
+    sum_x2 = ((caps * caps) * m).sum(axis=0)
+    avg    = np.where(nz, sum_x / n, 0.0)
+    total  = sum_x
+    # std with ddof=1 where n>1
+    var = np.where(n > 1, (sum_x2 - (sum_x * sum_x) / n) / (n - 1.0), 0.0)
+    var = np.where(var > 0, var, 0.0)
+    std = np.sqrt(var)
+    # Sharpe and t
+    ann_ret = avg * 252.0
+    ann_std = np.where(std > 0, std * np.sqrt(252.0), 0.0)
+    sharpe  = np.where(ann_std > 0, (ann_ret - RISK_FREE_ANNUAL) / ann_std, 0.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t_stat = np.where((std > 0) & (n > 1), avg / (std / np.sqrt(n)), 0.0)
+    try:
+        from scipy import stats as _st  # vectorized CDF
+        p_vals = 2.0 * (1.0 - _st.t.cdf(np.abs(t_stat), df=np.maximum(n - 1.0, 1.0)))
+    except Exception:
+        p_vals = np.ones_like(t_stat)
+
+    # AVERAGES across subsets (unweighted)
+    def _mean_safe(x):  # ignore NaNs/infs
+        x = np.asarray(x, dtype="float64")
+        x[~np.isfinite(x)] = np.nan
+        return float(np.nanmean(x)) if x.size else 0.0
+
+    out = {
+        "Triggers": int(round(_mean_safe(n))),
+        "Wins":     int(round(_mean_safe(wins))),
+        "Losses":   int(round(_mean_safe(losses))),
+        "Win %":    round(_mean_safe(win_pct), 2),
+        "Std Dev (%)": round(_mean_safe(std), 4),
+        "Sharpe":      round(_mean_safe(sharpe), 2),
+        "Avg Cap %":   round(_mean_safe(avg), 4),
+        "Total %":     round(_mean_safe(total), 4),
+        "p":           round(_mean_safe(p_vals), 4),
+    }
+    return out
+
+def _subset_metrics_spymaster_fast(secondary: str,
+                                   subset: List[str],
+                                   *,
+                                   eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Post-intersection vectorized metrics:
+      1) Load secondary Close and *cap window first*.
+      2) For each member, build integer position sets on this secondary calendar.
+      3) Subset common positions by intersecting member 'all_pos'.
+      4) Compute returns *on the common-date series* (baseline rule).
+      5) Wins/Losses from unanimous Buy/Short intersections only.
+    No reindexing. No fills. Same unanimity combiner semantics.
+    """
+    subset = sanitize_members(subset)
+    if not subset:
+        return _empty_metrics(), _empty_dates()
+
+    # 1) Secondary Close + cap (tz-naive, unique, sorted)
+    sec_df = _PRICE_CACHE.get(secondary)
+    if sec_df is None:
+        sec_df = _load_secondary_prices(secondary)
+        _PRICE_CACHE[secondary] = sec_df
+    if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
+        return _empty_metrics(), _empty_dates()
+    sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
+    if eval_to_date is not None:
+        cap_day = pd.Timestamp(eval_to_date).normalize()
+        sec_close = sec_close.loc[:cap_day]
+    sec_index = sec_close.index
+    if len(sec_index) == 0:
+        return _empty_metrics(), _empty_dates()
+
+    # 2) Member position sets on this calendar
+    possets = []
+    for prim in subset:
+        mode = "D"  # Default mode (will need to handle tuple format if present)
+        all_pos, buy_pos, short_pos = _member_possets_on_secondary(secondary, prim, mode, sec_index)
+        if all_pos.size == 0:
+            return _empty_metrics(), _empty_dates()
+        possets.append((all_pos, buy_pos, short_pos))
+
+    # 3) Strict common-date intersection across members (arrays are unique/sorted)
+    common = possets[0][0]
+    for i in range(1, len(possets)):
+        common = np.intersect1d(common, possets[i][0], assume_unique=True)
+        if common.size == 0:
+            return _empty_metrics(), _empty_dates()
+
+    # 4) Returns on the common-date series (baseline parity: compute after intersection)
+    prices = sec_close.to_numpy(dtype=np.float64)
+    # common is sorted; compute pct change on this subsequence
+    ret_common = np.empty(common.shape[0], dtype=np.float64)
+    ret_common[0] = 0.0
+    prev_vals = prices[common[:-1]]
+    cur_vals  = prices[common[1:]]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ret_common[1:] = np.where(
+            (prev_vals > 0) & np.isfinite(prev_vals) & np.isfinite(cur_vals),
+            (cur_vals/prev_vals - 1.0)*100.0,
+            0.0
+        )
+
+    # 5) Unanimity without Python loops (parity: None is neutral; any Buy with no Short => Buy; any Short with no Buy => Short)
+    if len(possets) == 1:
+        buy_any   = np.isin(common, possets[0][1], assume_unique=True)
+        short_any = np.isin(common, possets[0][2], assume_unique=True)
+    else:
+        buy_any   = np.zeros(common.shape[0], dtype=bool)
+        short_any = np.zeros(common.shape[0], dtype=bool)
+        for _all_pos, bpos, spos in possets:
+            if bpos.size:
+                buy_any |= np.isin(common, bpos, assume_unique=True)
+            if spos.size:
+                short_any |= np.isin(common, spos, assume_unique=True)
+    final_buy   = buy_any & ~short_any
+    final_short = short_any & ~buy_any
+    if not (final_buy.any() or final_short.any()):
+        return _empty_metrics(), _empty_dates()
+
+    # Captures with existing sign convention (keeps current parity)
+    tc = np.concatenate([-ret_common[final_buy],  # Buy
+                          ret_common[final_short]], dtype=np.float64)  # Short
+    trig_n = int(tc.size)
+
+    wins = int((tc > 0).sum()); losses = int(trig_n - wins)
+    avg  = float(tc.mean()); total = float(tc.sum())
+    std  = float(tc.std(ddof=1)) if trig_n > 1 else 0.0
+    ann_ret = avg * 252.0
+    ann_std = std * math.sqrt(252.0) if std != 0.0 else 0.0
+    sharpe  = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
+    try:
+        from scipy import stats as _st
+        t_stat = (avg / (std / math.sqrt(trig_n))) if (std > 0 and trig_n > 1) else 0.0
+        p_val  = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(trig_n - 1, 1))))
+    except Exception:
+        t_stat, p_val = 0.0, 1.0
+
+    # Simple info snapshot using last two common dates
+    prev_dt = sec_index[common[-2]] if common.size >= 2 else None
+    live_dt = sec_index[common[-1]]
+    live_sig = "Buy" if final_buy[-1] else ("Short" if final_short[-1] else "None")
+    prev_sig = ("Buy" if (common.size >= 2 and final_buy[-2]) else
+               ("Short" if (common.size >= 2 and final_short[-2]) else "None"))
+
+    met = {
+        "Triggers": trig_n,
+        "Wins": wins,
+        "Losses": losses,
+        "Win %": round(100*wins/max(trig_n,1), 2),
+        "Std Dev (%)": round(std, 4),
+        "Sharpe": round(sharpe, 2),
+        "T": round(t_stat, 4),
+        "Avg Cap %": round(avg, 4),
+        "Total %": round(total, 4),
+        "p": round(p_val, 4),
+    }
+    info = {"prev_date": prev_dt, "live_date": live_dt, "prev_sig": prev_sig, "live_sig": live_sig}
+    return met, info
+
+def _subset_metrics_spymaster_bitmask(secondary: str,
+                                      subset: List[Tuple[str, str]],
+                                      *,
+                                      eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Bitmask fast path:
+      - No .reindex() anywhere.
+      - Strict intersection via AND(all_mask) across members.
+      - Unanimity via OR(buy) / OR(short) then mutual exclusion.
+      - Daily returns computed on full capped grid (Spymaster parity).
+    """
+    subset = sanitize_members(subset)
+    if not subset:
+        return _empty_metrics(), _empty_dates()
+
+    # Secondary Close + cap (unique, sorted, tz-naive)
+    sec_df = _PRICE_CACHE.get(secondary)
+    if sec_df is None:
+        sec_df = _load_secondary_prices(secondary)
+        _PRICE_CACHE[secondary] = sec_df
+    if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
+        return _empty_metrics(), _empty_dates()
+    sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
+    if eval_to_date is not None:
+        cap_day = pd.Timestamp(eval_to_date).normalize()
+        sec_close = sec_close.loc[:cap_day]
+    sec_index = sec_close.index
+    if len(sec_index) == 0:
+        return _empty_metrics(), _empty_dates()
+
+    # Per-member masks on this calendar
+    all_masks:  List[np.ndarray] = []
+    buy_masks:  List[np.ndarray] = []
+    short_masks:List[np.ndarray] = []
+    for prim in subset:
+        mode = "D"  # Default mode
+        a, b, s = _member_masks_on_secondary(secondary, prim, mode, sec_index)
+        if a.size == 0:
+            return _empty_metrics(), _empty_dates()
+        all_masks.append(a); buy_masks.append(b); short_masks.append(s)
+
+    # Strict intersection of dates present in every member record
+    common_mask = np.logical_and.reduce(all_masks) if len(all_masks) > 1 else all_masks[0].copy()
+    if not common_mask.any():
+        return _empty_metrics(), _empty_dates()
+
+    # Unanimity on those dates: Buy if any Buy and no Short; Short if any Short and no Buy.
+    buy_any   = np.logical_or.reduce(buy_masks)   if len(buy_masks)   > 1 else buy_masks[0].copy()
+    short_any = np.logical_or.reduce(short_masks) if len(short_masks) > 1 else short_masks[0].copy()
+    final_buy   = buy_any   & ~short_any & common_mask
+    final_short = short_any & ~buy_any   & common_mask
+    trig_mask   = final_buy | final_short
+    if not trig_mask.any():
+        return _empty_metrics(), _empty_dates()
+
+    # Daily returns on full capped grid (parity), then extract by signal type.
+    sec_rets = _pct_returns(sec_close).astype('float64')
+    ret = sec_rets.to_numpy(dtype='float64')
+
+    # Captures: concatenate Buy and Short separately (matches post-intersection path).
+    tc = np.concatenate([-ret[final_buy],   # Buy
+                          ret[final_short]], dtype=np.float64)  # Short
+
+    n_trig  = int(tc.size)
+    wins    = int(np.sum(tc > 0))
+    losses  = int(n_trig - wins)
+    avg_cap = float(tc.mean())
+    total   = float(tc.sum())
+    std     = float(np.std(tc, ddof=1)) if n_trig > 1 else 0.0
+    ann_ret = avg_cap * 252.0
+    ann_std = std * np.sqrt(252.0) if std != 0.0 else 0.0
+    sharpe  = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
+    t_stat  = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
+    try:
+        from scipy import stats as _st
+        p_val = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(n_trig - 1, 1))))
+    except Exception:
+        p_val = 1.0
+
+    info = {"live_date": sec_index[-1] if len(sec_index) else None}
+    out = {
+        "Triggers": n_trig,
+        "Wins": wins,
+        "Losses": losses,
+        "Win %": round(100.0 * wins / max(n_trig, 1), 2),
+        "Std Dev (%)": round(std, 4),
+        "Sharpe": round(sharpe, 2),
+        "Avg Cap %": round(avg_cap, 4),
+        "Total %": round(total, 4),
+        "p": round(p_val, 4),
+    }
+    return out, info
+
 def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *, eval_to_date: Optional[pd.Timestamp] = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
     Compute averaged metrics across all non-empty subsets (spymaster parity).
@@ -2057,11 +2599,12 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
     if not members:
         return _empty_metrics(), _empty_dates()
 
-    # Auto-mute uses next-signal parity anchored to the same cap
+    # Auto-mute uses next-signal parity anchored to LATEST date (not historical cap)
     # CRITICAL K≥2 PARITY FIX: Use active_members (filters out None signals) for metrics
     # This matches Spymaster's optimization section behavior where tickers with None signals
     # are automatically muted and don't generate combinations (line 12381)
-    active_members = _filter_active_members_by_next_signal(secondary, members, as_of=eval_to_date)
+    # NOTE: Always use as_of=None to evaluate current signals, not historical signals at cap_dt
+    active_members = _filter_active_members_by_next_signal(secondary, members, as_of=None)
 
     # Use active members for both metrics AND snapshot (Spymaster parity)
     metrics_members = active_members if active_members else []
@@ -2075,9 +2618,51 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
 
     # Fast path: K=1 parity
     if len(metrics_members) == 1:
-        m, _ = _subset_metrics_spymaster(secondary, metrics_members, eval_to_date=eval_to_date)
+        m, info = _subset_metrics_spymaster(secondary, metrics_members, eval_to_date=eval_to_date)
+
+        # Load secondary to calculate tomorrow
+        sec_df = _PRICE_CACHE.get(secondary)
+        if sec_df is None:
+            sec_df = _load_secondary_prices(secondary)
+            _PRICE_CACHE[secondary] = sec_df
+
+        # Calculate tomorrow from secondary index
+        today_dt = info.get("live_date")
+        tomorrow_dt = None
+        if today_dt and sec_df is not None:
+            sec_index = pd.DatetimeIndex(pd.to_datetime(sec_df.index, utc=True)).tz_convert(None).normalize()
+            nxt_days = sec_index[sec_index > today_dt]
+            if len(nxt_days) > 0:
+                tomorrow_dt = nxt_days[0]
+            else:
+                # Fallback: project next business day
+                from pandas.tseries.offsets import BusinessDay
+                tomorrow_dt = (today_dt + BusinessDay()).normalize()
+
+        # Create snapshot matching K≥2 format (with today/sharpe_now/sharpe_next/tomorrow)
+        info_snapshot = {
+            "today": today_dt,
+            "sharpe_now": m.get("Sharpe"),  # K=1 Sharpe
+            "sharpe_next": m.get("Sharpe"),  # K=1 Sharpe (same for now)
+            "tomorrow": tomorrow_dt
+        }
+
         return _round_metrics_map(m), info_snapshot
 
+    # --- NEW: Matrix fast path for AVERAGES (K>=2) ---
+    # WARNING: This uses .reindex().fillna() which previously broke parity
+    # Only enabled if TF_MATRIX_PATH=1 and will be rejected if parity tests fail
+    if TF_MATRIX_PATH and 2 <= len(metrics_members) <= TF_MATRIX_MAX_K:
+        sig_df_cap, sec_rets = _members_signals_df_and_returns(secondary, metrics_members, eval_to_date=eval_to_date)
+        if not sig_df_cap.empty and not sec_rets.empty:
+            out = _averages_via_matrix(sig_df_cap, sec_rets)
+            out = _round_metrics_map(out)
+            # Create info_snapshot for matrix path
+            info_snapshot = _signal_snapshot_for_members(secondary, members, cap_dt=eval_to_date)
+            return out, info_snapshot
+        # fall back if any issue
+
+    # --- Fallback: original per-subset loop (PROVEN PARITY) ---
     # Preload PKL signals for all unique members used in METRICS (speeds up K>1 by caching processed signals)
     try:
         for t in set(metrics_members):
@@ -2091,28 +2676,53 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
         sec_df = _load_secondary_prices(secondary)
         _PRICE_CACHE[secondary] = sec_df
 
-    mets, info0 = [], None
+    # --- OPTIMIZATION DISABLED: Breaks financial precision requirements ---
+    # Precomputed returns optimization causes 1-count differences in K>=2 subsets.
+    # In financial applications, even 1-count errors compound and are unacceptable.
+    # Signal caching and return caching both tested and rejected for parity violations.
+    # All cache parameters passed as None to use legacy (accurate) calculation path.
+    _pre_idx = None
+    _pre_rets = None
+    _sig_cache = None
+
+    mets, all_infos = [], []
 
     # Use the cap date passed from caller (explicit parameter, no globals)
     if eval_to_date is not None and 0 >= 1:
         print(f"[RUN-CAP] {secondary}: using eval_to_date <= {eval_to_date.date()}")
 
+    # Choose implementation per flag; default = proven baseline
+    if TF_BITMASK_FASTPATH:
+        _subset_fn = _subset_metrics_spymaster_bitmask
+    elif TF_POST_INTERSECT_FASTPATH:
+        _subset_fn = _subset_metrics_spymaster_fast
+    else:
+        _subset_fn = _subset_metrics_spymaster
+
     if PARALLEL_SUBSETS and len(subsets) > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         _mw = min(len(subsets), max(1, (os.cpu_count() or 4)//2))
         with ThreadPoolExecutor(max_workers=_mw, thread_name_prefix="tfsub") as _ex:
-            _futs = [_ex.submit(_subset_metrics_spymaster, secondary, sub, eval_to_date=eval_to_date) for sub in subsets]
+            if TF_BITMASK_FASTPATH or TF_POST_INTERSECT_FASTPATH:
+                _futs = [_ex.submit(_subset_fn, secondary, sub, eval_to_date=eval_to_date) for sub in subsets]
+            else:
+                _futs = [_ex.submit(_subset_fn, secondary, sub,
+                                   eval_to_date=eval_to_date, _pre_idx=_pre_idx,
+                                   _pre_rets=_pre_rets, _sig_cache=_sig_cache) for sub in subsets]
             for _f in as_completed(_futs):
                 _m, _info = _f.result()
                 mets.append(_m)
-                if info0 is None:
-                    info0 = _info
+                all_infos.append(_info)
     else:
         for sub in subsets:
-            m, info = _subset_metrics_spymaster(secondary, sub, eval_to_date=eval_to_date)
+            if TF_BITMASK_FASTPATH or TF_POST_INTERSECT_FASTPATH:
+                m, info = _subset_fn(secondary, sub, eval_to_date=eval_to_date)
+            else:
+                m, info = _subset_fn(secondary, sub, eval_to_date=eval_to_date,
+                                                  _pre_idx=_pre_idx, _pre_rets=_pre_rets,
+                                                  _sig_cache=_sig_cache)
             mets.append(m)
-            if info0 is None:
-                info0 = info
+            all_infos.append(info)
 
     # Combine across subset metrics by mean; be robust to missing/None values
     if not mets:
@@ -2123,7 +2733,9 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
         raw = [mm.get(k) for mm in mets]
         vals = [float(v) for v in raw if isinstance(v, (int,float,np.floating))]
         if k in {"Triggers","Wins","Losses"}:
-            out[k] = int(round(np.mean(vals))) if vals else None
+            # Spymaster parity: round 0.5 UP (5827.666... → 5828)
+            # Python's round() uses banker's rounding, so use int(mean + 0.5) for ceiling behavior
+            out[k] = int(np.mean(vals) + 0.5) if vals else None
         elif k in NUM_KEYS:
             out[k] = float(np.mean(vals)) if vals else None
         else:
@@ -2134,7 +2746,12 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
 
     # Create snapshot with AVERAGES Sharpe (not unanimous combination Sharpe)
     # For K≥2, NOW/NEXT should show the AVERAGES Sharpe, matching the row metrics
-    today_dt = info0.get("live_date") if info0 else None
+    # TODAY should use the LATEST live_date from all subsets (not first subset)
+    today_dt = None
+    if all_infos:
+        live_dates = [info.get("live_date") for info in all_infos if info.get("live_date") is not None]
+        if live_dates:
+            today_dt = max(live_dates)  # Use the latest date from all subsets
 
     # Calculate tomorrow from secondary index
     tomorrow_dt = None
@@ -2295,8 +2912,8 @@ def build_board_rows(sec: str, k: int, run_fence: dict) -> List[Dict[str, Any]]:
         # Format members: plain text for copy-paste
         members_display = ", ".join(members)
 
-        # Calculate signal agreement ratio
-        mix_ratio = _calculate_signal_mix(members, as_of=dates.get("today"))
+        # Calculate signal agreement ratio (use latest signals, not historical)
+        mix_ratio = _calculate_signal_mix(members, as_of=None)
 
         rec = {
             "Ticker": sec,
@@ -2603,5 +3220,14 @@ def main():
             rows = build_board_rows(sec, k=1)
             print(pd.DataFrame(rows).head())
 
-if __name__ == "__main__":
+# --- Canonical entrypoint (EOF) ----------------------------------------
+# Start the app exactly once, using the latest function definitions.
+try:
+    __TF_ALREADY_STARTED
+except NameError:
+    __TF_ALREADY_STARTED = False
+
+if __name__ == "__main__" and not __TF_ALREADY_STARTED:
+    __TF_ALREADY_STARTED = True
     main()
+# -----------------------------------------------------------------------
