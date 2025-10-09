@@ -177,10 +177,10 @@ TF_CRYPTO_STRICT_MISSING_DAY = os.environ.get("TF_CRYPTO_STRICT_MISSING_DAY", "1
 PRICE_CACHE_TTL_DAYS   = int(os.environ.get("PRICE_CACHE_TTL_DAYS", "1"))   # refresh if last date < today-1
 PRICE_BACKFILL_DAYS    = int(os.environ.get("PRICE_BACKFILL_DAYS", "10"))   # overlap window to close gaps
 PRICE_REFRESH_THREADS  = int(os.environ.get("PRICE_REFRESH_THREADS", str(max(2, min(8, (os.cpu_count() or 4)//2)))))
-# Parallel subset evaluation: DISABLED - no proven benefit, may introduce non-determinism
-PARALLEL_SUBSETS       = os.environ.get("PARALLEL_SUBSETS", "0") not in {"0","false","False"}
-# Matrix path toggle and limits (vectorized AVERAGES computation)
-TF_MATRIX_PATH         = os.environ.get("TF_MATRIX_PATH", "0").lower() in {"1","true","on","yes"}  # DISABLED by default until parity verified
+# Parallel subset evaluation: REMOVED (slower, adds nondeterminism)
+PARALLEL_SUBSETS       = False
+# Matrix path: REMOVED (parity hazard)
+TF_MATRIX_PATH         = False
 TF_MATRIX_MAX_K        = int(os.environ.get("TF_MATRIX_MAX_K", "12"))  # safe up to ~1023 subsets/row
 TF_MATRIX_DTYPE        = "int8"
 TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK = os.environ.get("TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK", "0").lower() in {"1","true","on","yes"}
@@ -2653,7 +2653,8 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
     # --- NEW: Matrix fast path for AVERAGES (K>=2) ---
     # WARNING: This uses .reindex().fillna() which previously broke parity
     # Only enabled if TF_MATRIX_PATH=1 and will be rejected if parity tests fail
-    if TF_MATRIX_PATH and 2 <= len(metrics_members) <= TF_MATRIX_MAX_K:
+    # Matrix path hard-off (kept only as commented reference)
+    if False and TF_MATRIX_PATH and 2 <= len(metrics_members) <= TF_MATRIX_MAX_K:
         sig_df_cap, sec_rets = _members_signals_df_and_returns(secondary, metrics_members, eval_to_date=eval_to_date)
         if not sig_df_cap.empty and not sec_rets.empty:
             out = _averages_via_matrix(sig_df_cap, sec_rets)
@@ -2700,7 +2701,7 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
     else:
         _subset_fn = _subset_metrics_spymaster
 
-    if PARALLEL_SUBSETS and len(subsets) > 1:
+    if False and PARALLEL_SUBSETS and len(subsets) > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         _mw = min(len(subsets), max(1, (os.cpu_count() or 4)//2))
         with ThreadPoolExecutor(max_workers=_mw, thread_name_prefix="tfsub") as _ex:
@@ -3205,7 +3206,7 @@ def main():
         print(f"\n{'='*70}")
         print(f"  TrafficFlow v1.9 - Signal Aggregation Dashboard")
         print(f"  Port: {PORT} | Secondaries: {len(secs)} | Using raw Close prices")
-        print(f"  Alignment: A.S.O. strict intersection | Parallel Subsets: {'Enabled' if PARALLEL_SUBSETS else 'Disabled'}")
+        print(f"  Fast Paths: Bitmask={'ON' if TF_BITMASK_FASTPATH else 'OFF'} | Post-Intersect={'ON' if TF_POST_INTERSECT_FASTPATH else 'OFF'} | Matrix=REMOVED")
         print(f"{'='*70}")
         print(f"\n[PARITY_MODE] A.S.O. strict intersection with PKL-based signals")
         print(f"[METRICS] Signal-agnostic metrics: ON (SpyMaster parity)")
