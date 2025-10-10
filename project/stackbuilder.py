@@ -13,15 +13,16 @@ import numpy as np
 import pandas as pd
 # Opt in to future behaviour to avoid 'replace' downcast warnings
 pd.set_option('future.no_silent_downcasting', True)
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from scipy import stats
 try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
+
 try:
     import yfinance as yf
-except Exception:
+except ImportError:
     yf = None
 
 # ---------- Optional project imports (fallbacks if absent) ----------
@@ -71,11 +72,29 @@ COMBINE_INTERSECTION = False
 VERBOSE = False  # Global verbose flag, set from CLI
 
 def _write_progress(progress_path: str, **payload):
+    """
+    Atomic file-backed progress with field preservation.
+    Keeps 'started_ts' and prior keys unless explicitly overridden.
+    Uses temp file + os.replace for safe concurrent writes.
+    """
     try:
         ensure_dir(os.path.dirname(progress_path))
-        payload['ts'] = time.time()
-        with open(progress_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+        prior = {}
+        try:
+            if os.path.exists(progress_path):
+                with open(progress_path, "r", encoding="utf-8") as _f:
+                    prior = json.load(_f) or {}
+        except Exception:
+            prior = {}
+        prior.update(payload)
+        if 'started_ts' not in prior and str(prior.get('status','')) == 'running':
+            prior['started_ts'] = time.time()
+        prior['ts'] = time.time()
+        # Atomic write: temp file + replace
+        tmp_path = progress_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(prior, f, indent=2)
+        os.replace(tmp_path, progress_path)
     except Exception:
         pass
 
@@ -513,7 +532,7 @@ def _score_primary(primary: str, sec_rets: pd.Series) -> Optional[Dict]:
     m['Primary Ticker'] = vendor
     return m
 
-def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None):
+def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None):
     """Phase 2: Rank all primaries against secondary with progress tracking."""
     # Fast-path: use ImpactSearch .xlsx if requested and available
     if getattr(args, "prefer_impact_xlsx", False):
@@ -542,6 +561,19 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
             write_table(rank_all, os.path.join(outdir, 'rank_all'))
             write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
             write_table(rank_inverse, os.path.join(outdir, 'rank_inverse'))
+            # Emit progress counters even on XLSX fast-path so UI shows advancement
+            if progress_path:
+                total = int(len(rank_all))
+                _write_progress(
+                    progress_path,
+                    status='running',
+                    phase='ranking',
+                    percent=59.0,
+                    message=f'Loaded ImpactSearch ranking: {total} rows.',
+                    counters={'primaries_done': total, 'primaries_total': total},
+                    outdir=outdir,
+                    secondary=secondary
+                )
             return rank_all, rank_direct, rank_inverse
         else:
             # Do NOT compute 70k+ primaries if user asked for fast-path
@@ -567,6 +599,9 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
         else:
             iterator = as_completed(futures)
 
+        # Smoother UI: update at least every 50 items or 0.5% or every 2s
+        last_update_ts = time.time()
+        step = max(50, max(1, total // 200))
         for i, fut in enumerate(iterator, 1):
             ticker = futures[fut]
             res = fut.result()
@@ -575,8 +610,23 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
             else:
                 missing.append(ticker)
 
+            # Progress reporting with counters
+            now = time.time()
+            if progress_path and (i % step == 0 or (now - last_update_ts) >= 2.0 or i == total):
+                pct = 25.0 + (35.0 * i / total)  # Phase 2 runs from 25% to 60%
+                _write_progress(
+                    progress_path,
+                    status='running',
+                    phase='ranking',
+                    percent=pct,
+                    message=f'Ranking primaries {i}/{total}.',
+                    counters={'primaries_done': int(i), 'primaries_total': int(total)},
+                    outdir=outdir,
+                    secondary=secondary
+                )
+                last_update_ts = now
             # Simple progress without tqdm
-            if not tqdm and i % max(1, total // 10) == 0:
+            elif not tqdm and i % step == 0:
                 print(f"[PROGRESS] Phase 2: {i}/{total} primaries processed ({100*i//total}%)")
 
     if missing:
@@ -713,11 +763,13 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     min_td = int(getattr(args, 'min_trigger_days', 30))
     eps = float(getattr(args, 'sharpe_eps', 1e-6))
     seed_by = getattr(args, 'seed_by', 'sharpe')
+    optimize_by = getattr(args, 'optimize_by', seed_by)  # Default to seed_by if not specified
     search = getattr(args, 'search', 'beam')
     beam_w = int(getattr(args, 'beam_width', 12))
     ex_k = int(getattr(args, 'exhaustive_k', 3))
     both_modes = bool(getattr(args, 'both_modes', False))  # Changed default to False
     k_patience = int(getattr(args, 'k_patience', 0))
+    allow_decreasing = bool(getattr(args, 'allow_decreasing', False))
 
     # 1) Build cohort. Always include topN (as Direct) and bottomN (as Inverse).
     top = rank_direct.head(topN).copy()
@@ -727,8 +779,13 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     cohort0 = pd.concat([top, bottom], ignore_index=True)
     cohort0 = cohort0[['Primary Ticker','Mode','Total Capture (%)','Sharpe Ratio','p-Value']]
 
+    # Auto-enable both modes when duplicates exist to prevent mode collapse
+    both_modes_eff = bool(both_modes or cohort0.duplicated(subset=['Primary Ticker']).any())
+    if both_modes_eff and not both_modes:
+        print(f"[PHASE3] Auto-enabled both_modes: {cohort0.duplicated(subset=['Primary Ticker']).sum()} ticker(s) appear in both Top and Bottom")
+
     # Optionally duplicate both modes for every unique ticker
-    if both_modes:
+    if both_modes_eff:
         uniq = sorted(set(cohort0['Primary Ticker']))
         extra = []
         for t in uniq:
@@ -798,16 +855,38 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     # Beam = list of tuples: (path, comb, met)
     beam = [(best1, comb, met)]
 
+    # Pre-compute total combos for ETA calculation
+    import math
+    def comb_count(n, k):
+        if n < k or k < 0:
+            return 0
+        return math.factorial(n) // (math.factorial(k) * math.factorial(n - k))
+
+    uniq_tickers = sorted({t for (t, _) in cohort.itertuples(index=False)})
+    n_candidates = len(uniq_tickers)
+    max_k = int(args.max_k)
+    ex_k_limit = min(ex_k, max_k)
+    combos_total_all = sum(comb_count(n_candidates, k) for k in range(2, ex_k_limit + 1)) if n_candidates >= 2 else 0
+    combos_tested_acc = 0
+
+    if progress_cb and combos_total_all:
+        progress_cb(f"Stacking prep: {n_candidates} candidates, {combos_total_all:,} total combos",
+                    counters={'combos_tested': 0, 'combos_total': combos_total_all, 'current_k': 1})
+
     # Exhaustive for small K
     def exhaustive_k(K):
+        nonlocal combos_tested_acc
         uniq_tickers = sorted({t for (t, _) in cohort.itertuples(index=False)})
         # enforce ticker uniqueness in stacks
         cand_tickers = [t for t in uniq_tickers]
         best = None
+        # Track progress emissions
+        last_emit_time = time.time()
+        k_combos_tested = 0
         for tickers in combinations(cand_tickers, K):
-            # for both_modes, consider all 2^K mode assignments; else derive mode from cohort0
+            # for both_modes_eff, consider all 2^K mode assignments; else derive mode from cohort0
             # Generate mode combinations
-            if both_modes:
+            if both_modes_eff:
                 # When both_modes is enabled, test all 2^K combinations
                 mode_sets = product(['D','I'], repeat=K)
             else:
@@ -827,6 +906,14 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                     search_stats['rejection_reasons']['invalid'] += 1
                     continue
                 search_stats['combinations_tested'] += 1
+                k_combos_tested += 1
+                # Emit progress every ~1.5s
+                now = time.time()
+                if progress_cb and (now - last_emit_time) >= 1.5:
+                    last_emit_time = now
+                    tested_all = int(combos_tested_acc + k_combos_tested)
+                    progress_cb(f"Building stack K={K} — {tested_all:,}/{combos_total_all:,} combos",
+                                counters={'combos_tested': tested_all, 'combos_total': combos_total_all, 'current_k': K})
                 comb, mm = score_path(path)
                 if not mm:
                     search_stats['combinations_rejected'] += 1
@@ -838,17 +925,40 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                     if VERBOSE:
                         print(f"  [REJECT] {[t for t in tickers]}: Trigger Days {mm['Trigger Days']} < {min_td}")
                     continue
-                # enforce monotone Sharpe vs K-1 best on the same tickers subset is hard; approximate by requiring > last leaderboard Sharpe
-                prev = leaderboard[-1]['Sharpe Ratio']
-                if float(mm['Sharpe Ratio']) <= float(prev) + eps:
-                    search_stats['combinations_rejected'] += 1
-                    search_stats['rejection_reasons']['sharpe_improvement'] += 1
-                    if VERBOSE:
-                        print(f"  [REJECT] {[t for t in tickers]}: Sharpe {mm['Sharpe Ratio']:.4f} <= {prev:.4f} + {eps}")
-                    continue
-                key = (mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0), mm['Total_raw'])
+                # Enforce monotone improvement based on optimize_by metric (unless allow_decreasing is enabled)
+                if not allow_decreasing:
+                    if optimize_by == 'total_capture':
+                        prev_metric = leaderboard[-1]['Total Capture (%)']
+                        cur_metric = mm['Total_raw']
+                        metric_name = 'Total Capture'
+                        if float(cur_metric) <= float(prev_metric) + eps:
+                            search_stats['combinations_rejected'] += 1
+                            search_stats['rejection_reasons']['sharpe_improvement'] += 1  # reuse counter
+                            if VERBOSE:
+                                print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f}% <= {prev_metric:.4f}% + {eps}")
+                            continue
+                    else:  # optimize_by == 'sharpe'
+                        prev_metric = leaderboard[-1]['Sharpe Ratio']
+                        cur_metric = mm['Sharpe_raw']
+                        metric_name = 'Sharpe'
+                        if float(cur_metric) <= float(prev_metric) + eps:
+                            search_stats['combinations_rejected'] += 1
+                            search_stats['rejection_reasons']['sharpe_improvement'] += 1
+                            if VERBOSE:
+                                print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f} <= {prev_metric:.4f} + {eps}")
+                            continue
+                # Set key for comparison (always needed, regardless of allow_decreasing)
+                if optimize_by == 'total_capture':
+                    key = (mm['Total_raw'], mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0))
+                else:  # optimize_by == 'sharpe'
+                    key = (mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0), mm['Total_raw'])
                 if (best is None) or (key > best[0]):
                     best = (key, path, comb, mm)
+        # Final update for this K level
+        combos_tested_acc += k_combos_tested
+        if progress_cb:
+            progress_cb(f"K={K} complete.",
+                        counters={'combos_tested': combos_tested_acc, 'combos_total': combos_total_all, 'current_k': K})
         return best
 
     # Track patience for non-improving K levels
@@ -875,7 +985,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
             cand_states = []
             seen = set()
             for path, _, prevm in beam:
-                prev_sharpe = float(prevm['Sharpe_raw'])
+                prev_metric = float(prevm['Sharpe_raw'] if optimize_by=='sharpe' else prevm['Total_raw'])
                 used = {t for (t, _, _) in path}
                 for _, r in cohort.iterrows():
                     t, m = r['Primary Ticker'], r['Mode']
@@ -893,11 +1003,14 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                         search_stats['combinations_rejected'] += 1
                         search_stats['rejection_reasons']['trigger_days'] += 1
                         continue
-                    if float(m2['Sharpe_raw']) <= prev_sharpe + eps:
-                        search_stats['combinations_rejected'] += 1
-                        search_stats['rejection_reasons']['sharpe_improvement'] += 1
-                        continue
-                    key = (m2['Sharpe_raw'] if seed_by=='sharpe' else m2['Total_raw'],
+                    # Enforce monotone improvement (unless allow_decreasing is enabled)
+                    if not allow_decreasing:
+                        cur_metric = float(m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'])
+                        if cur_metric <= prev_metric + eps:
+                            search_stats['combinations_rejected'] += 1
+                            search_stats['rejection_reasons']['sharpe_improvement'] += 1
+                            continue
+                    key = (m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'],
                            - (m2['p_raw'] if m2['p_raw'] is not None else 1.0))
                     sig = (tuple(sorted([x[0] for x in new_path])), tuple([x[1] for x in new_path]))
                     if sig in seen: continue
@@ -913,10 +1026,15 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
         if not found:
             if k_patience > 0 and patience_used < k_patience:
                 patience_used += 1
-                print(f"[PHASE3] K={K}: No Sharpe improvement (>={eps:.6f}), using patience {patience_used}/{k_patience}")
+                metric_name = 'Total Capture' if optimize_by == 'total_capture' else 'Sharpe'
+                print(f"[PHASE3] K={K}: No {metric_name} improvement (>={eps:.6f}), using patience {patience_used}/{k_patience}")
                 continue  # Continue to next K instead of breaking
             else:
-                print(f"[PHASE3] Stopping at K={K-1}: No candidate improves Sharpe by >{eps:.6f} with >={min_td} trigger days")
+                metric_name = 'Total Capture' if optimize_by == 'total_capture' else 'Sharpe'
+                if allow_decreasing:
+                    print(f"[PHASE3] Stopping at K={K-1}: No valid candidates with >={min_td} trigger days")
+                else:
+                    print(f"[PHASE3] Stopping at K={K-1}: No candidate improves {metric_name} by >{eps:.6f} with >={min_td} trigger days")
                 break
 
         # Found improvement, reset patience
@@ -974,8 +1092,8 @@ def run_dash(outdir: str, port: int = 8054):
         html.H3("StackBuilder"),
         html.Div(warn, style={'marginBottom':'8px'}),
         html.Div([
-            html.Label("Secondary ticker"),
-            dcc.Input(id='secondary-input', type='text', value='', placeholder='e.g. SPY', debounce=True),
+            html.Label("Secondary ticker(s)"),
+            dcc.Input(id='secondary-input', type='text', value='', placeholder='e.g. SPY or SPY, QQQ, IWM', debounce=True),
             html.Label("Primary tickers (comma or whitespace separated)", style={'marginLeft':'12px'}),
             dcc.Textarea(id='primaries-input', placeholder='AAPL, MSFT, META ...', style={'width':'60%', 'height':'80px'}),
         ], style={'marginBottom':'8px'}),
@@ -983,6 +1101,7 @@ def run_dash(outdir: str, port: int = 8054):
             html.Label("Top N"), dcc.Input(id='topn', type='number', value=20, min=1, step=1, style={'width':'80px', 'marginRight':'12px'}),
             html.Label("Bottom N"), dcc.Input(id='bottomn', type='number', value=20, min=1, step=1, style={'width':'80px', 'marginRight':'12px'}),
             html.Label("Max K"), dcc.Input(id='maxk', type='number', value=6, min=1, step=1, style={'width':'80px', 'marginRight':'12px'}),
+            html.Label("Exhaustive K"), dcc.Input(id='exk', type='number', value=4, min=1, step=1, style={'width':'100px', 'marginRight':'12px'}),
             html.Label("alpha"), dcc.Input(id='alpha', type='number', value=0.05, min=0.0, step=0.01, style={'width':'100px', 'marginRight':'12px'}),
             html.Label("Min Trigger Days"),
             dcc.Input(id='min-trigger-days', type='number', value=30, min=1, step=1,
@@ -995,10 +1114,21 @@ def run_dash(outdir: str, port: int = 8054):
                 id='seed-by',
                 options=[{'label':'Sharpe','value':'sharpe'},
                          {'label':'Total Capture','value':'total_capture'}],
-                value='sharpe',
+                value='total_capture',
                 labelStyle={'display':'inline-block','marginRight':'12px'},
                 style={'display':'inline-block','marginRight':'12px'}
             ),
+            html.Label("Optimize by"),
+            dcc.RadioItems(
+                id='optimize-by',
+                options=[{'label':'Sharpe','value':'sharpe'},
+                         {'label':'Total Capture','value':'total_capture'},
+                         {'label':'(Same as Seed)','value':'auto'}],
+                value='auto',
+                labelStyle={'display':'inline-block','marginRight':'12px'},
+                style={'display':'inline-block','marginRight':'12px'}
+            ),
+            dcc.Checklist(id='allow-decreasing', options=[{'label':'Allow metric to decrease across K', 'value':'y'}], value=['y'], style={'display':'inline-block', 'marginRight':'12px'}),
             dcc.Checklist(id='prefer-xlsx', options=[{'label':'Use ImpactSearch .xlsx', 'value':'y'}], value=['y'], style={'display':'inline-block', 'marginRight':'12px'}),
             html.Label("ImpactSearch folder"),
             dcc.Input(id='xlsx-dir', type='text', value=DEFAULT_IMPACT_XLSX_DIR, style={'width':'40%'}),
@@ -1011,7 +1141,30 @@ def run_dash(outdir: str, port: int = 8054):
                      children=html.Div(id='progress-inner',
                                        style={'height':'100%','width':'0%','background':'#80ff00'}))
         ]),
+        # --- Batch progress table ---
+        html.Div(id='batch-progress-wrap', style={'marginTop':'10px', 'display':'block'}, children=[
+            html.H5("Batch Progress"),
+            html.Div(id='jobs-summary', style={'marginBottom':'6px', 'fontWeight':'bold', 'color':'#80ff00'}),
+            dash_table.DataTable(
+                id='jobs',
+                columns=[
+                    {'name':'Secondary','id':'Secondary'},
+                    {'name':'Status','id':'Status'},
+                    {'name':'Phase','id':'Phase'},
+                    {'name':'%','id':'Percent'},
+                    {'name':'Combos','id':'Combos'},
+                    {'name':'ETA','id':'ETA'},
+                    {'name':'Updated','id':'Updated'},
+                    {'name':'Message','id':'Message'},
+                    {'name':'Outdir','id':'Outdir'},
+                ],
+                data=[],
+                page_size=20,
+                style_table={'overflowX':'auto'}
+            )
+        ]),
         dcc.Interval(id='progress-interval', interval=1000, n_intervals=0, disabled=True),
+        dcc.Interval(id='jobs-interval', interval=1000, n_intervals=0, disabled=True),
         dcc.Loading(
             id='loading',
             type='circle',
@@ -1021,7 +1174,8 @@ def run_dash(outdir: str, port: int = 8054):
             ]
         ),
         dcc.Store(id='last-outdir'),
-        dcc.Store(id='progress-path')
+        dcc.Store(id='progress-path'),
+        dcc.Store(id='jobs-list')
     ])
 
     def _read_leaderboard(dirpath: str) -> pd.DataFrame:
@@ -1038,75 +1192,105 @@ def run_dash(outdir: str, port: int = 8054):
          Output('last-outdir','data'),
          Output('progress-path','data'),
          Output('progress-interval','disabled'),
-         Output('progress-wrap','style')],
+         Output('progress-wrap','style'),
+         Output('jobs-list','data'),
+         Output('jobs-interval','disabled'),
+         Output('batch-progress-wrap','style')],
         [Input('run-btn','n_clicks')],
         [State('secondary-input','value'), State('primaries-input','value'),
-         State('topn','value'), State('bottomn','value'), State('maxk','value'), State('alpha','value'),
+         State('topn','value'), State('bottomn','value'), State('maxk','value'), State('exk','value'), State('alpha','value'),
          State('prefer-xlsx','value'), State('xlsx-dir','value'),
-         State('min-trigger-days','value'), State('sharpe-eps','value'), State('seed-by','value')],
+         State('min-trigger-days','value'), State('sharpe-eps','value'), State('seed-by','value'), State('optimize-by','value'), State('allow-decreasing','value')],
         prevent_initial_call=True
     )
-    def _run(n, secondary, primaries_str, topn, bottomn, maxk, alpha, prefer, xdir, min_trigger_days, sharpe_eps, seed_by):
+    def _run(n, secondary, primaries_str, topn, bottomn, maxk, exk, alpha, prefer, xdir, min_trigger_days, sharpe_eps, seed_by, optimize_by, allow_decreasing):
         if not n:
             raise PreventUpdate
         if not secondary:
-            return [], [], "Enter a Secondary.", None, None, True, {'display':'none'}
+            return [], [], "Enter a Secondary.", None, None, True, {'display':'none'}, None, True, {'display':'none'}
+
+        # Parse comma-separated secondaries
+        secondaries = [s.strip().upper() for s in secondary.split(',') if s.strip()]
+        if not secondaries:
+            return [], [], "Enter at least one secondary ticker.", None, None, True, {'display':'none'}, None, True, {'display':'none'}
+
         # Validate ImpactSearch folder if fast-path is requested
         prefer_fast = ('y' in (prefer or []))
         if prefer_fast and (not xdir or not os.path.isdir(xdir)):
-            return [], [], f"ImpactSearch folder not found: {xdir}", None
+            return [], [], f"ImpactSearch folder not found: {xdir}", None, None, True, {'display':'none'}, None, True, {'display':'none'}
+
         primaries = []
         if primaries_str:
             primaries = [t.strip().upper() for t in re.split(r'[,\s]+', primaries_str) if t.strip()]
 
         # CRITICAL: Require primaries to be specified - no 72k fallback
         if not primaries and not prefer_fast:
-            return [], [], "[ERROR] Primary tickers field is empty. Please enter one or more primary tickers.", None, None, True, {'display':'none'}
+            return [], [], "[ERROR] Primary tickers field is empty. Please enter one or more primary tickers.", None, None, True, {'display':'none'}, None, True, {'display':'none'}
 
         # Validate and sanitize the new parameters
         min_trigger_days_val = int(min_trigger_days) if min_trigger_days else 30
         sharpe_eps_val = float(sharpe_eps) if sharpe_eps else 0.01
-        seed_by_val = seed_by if seed_by else 'sharpe'  # Default to sharpe, not total_capture
+        seed_by_val = seed_by if seed_by else 'total_capture'
+        optimize_by_val = optimize_by if optimize_by and optimize_by != 'auto' else seed_by_val
+        allow_decreasing_val = ('y' in (allow_decreasing or []))
+        exk_val = int(exk or 4)
 
-        print(f"[STACKBUILDER] Run clicked -> secondary={secondary}  primaries={len(primaries)}  "
-              f"topN={topn} bottomN={bottomn} maxK={maxk} alpha={alpha} prefer_xlsx={prefer_fast} xlsx_dir={xdir} "
-              f"min_trigger_days={min_trigger_days_val} sharpe_eps={sharpe_eps_val} seed_by={seed_by_val}")
+        print(f"[STACKBUILDER] Run clicked -> secondaries={secondaries}  primaries={len(primaries)}  "
+              f"topN={topn} bottomN={bottomn} maxK={maxk} exhaustiveK={exk_val} alpha={alpha} prefer_xlsx={prefer_fast} xlsx_dir={xdir} "
+              f"min_trigger_days={min_trigger_days_val} sharpe_eps={sharpe_eps_val} seed_by={seed_by_val} optimize_by={optimize_by_val} allow_decreasing={allow_decreasing_val}")
 
-        # Pre-create a progress path and start the job in a background thread
-        sec_clean = (secondary or '').upper().replace('^','').replace('.','_')
-        ppath = os.path.join(PROGRESS_ROOT, f"{sec_clean}_{int(time.time())}.json")
-        try:
-            _write_progress(ppath, status='running', phase='preflight', percent=1.0,
-                            message=f"Starting {secondary.upper()}...", secondary=secondary.upper())
-        except Exception:
-            pass
-
-        args = SimpleNamespace(
-            secondary=secondary, secondaries=None, primaries=None,
-            top_n=int(topn or 20), bottom_n=int(bottomn or 20), max_k=int(maxk or 6),
-            alpha=float(alpha or 0.05), min_marginal_capture=0.0,
-            threads='auto', outdir=RUNS_ROOT, price_basis='adj',
-            fail_on_missing_cache=False, serve=False, port=8054,
-            prefer_impact_xlsx=prefer_fast, impact_xlsx_dir=xdir,
-            impact_xlsx_max_age_days=45,
-            min_trigger_days=min_trigger_days_val,
-            sharpe_eps=sharpe_eps_val,
-            seed_by=seed_by_val,
-            search='beam', beam_width=12, exhaustive_k=4,
-            both_modes=False, k_patience=1,
-            progress_path=ppath
-        )
-
-        def _job():
+        # Multi-secondary mode: create jobs list and spawn threads
+        jobs = []
+        for sec in secondaries:
+            sec_clean = sec.replace('^','').replace('.','_')
+            ppath = os.path.join(PROGRESS_ROOT, f"{sec_clean}_{int(time.time())}.json")
             try:
-                run_for_secondary(args, secondary, specified_primaries=primaries if primaries else None)
-            except BaseException as e:
-                _write_progress(ppath, status='failed', phase='error', percent=100.0,
-                                message=f"Error: {e.__class__.__name__}: {e}")
+                _write_progress(ppath, status='running', phase='preflight', percent=1.0,
+                                message=f"Starting {sec}...", secondary=sec, started_ts=time.time())
+            except Exception:
+                pass
 
-        threading.Thread(target=_job, daemon=True).start()
-        # Return immediately; polling callback will stream progress and results
-        return [], [], f"Started {secondary.upper()}...", None, ppath, False, {'marginTop':'10px'}
+            jobs.append({'secondary': sec, 'ppath': ppath})
+
+            args = SimpleNamespace(
+                secondary=sec, secondaries=None, primaries=None,
+                top_n=int(topn or 20), bottom_n=int(bottomn or 20), max_k=int(maxk or 6),
+                alpha=float(alpha or 0.05), min_marginal_capture=0.0,
+                threads='auto', outdir=RUNS_ROOT, price_basis='adj',
+                fail_on_missing_cache=False, serve=False, port=8054,
+                prefer_impact_xlsx=prefer_fast, impact_xlsx_dir=xdir,
+                impact_xlsx_max_age_days=45,
+                min_trigger_days=min_trigger_days_val,
+                sharpe_eps=sharpe_eps_val,
+                seed_by=seed_by_val,
+                optimize_by=optimize_by_val,
+                search='beam', beam_width=12, exhaustive_k=exk_val,
+                both_modes=False, k_patience=1,
+                allow_decreasing=allow_decreasing_val,
+                progress_path=ppath
+            )
+
+            def _job():
+                try:
+                    run_for_secondary(args, sec, specified_primaries=primaries if primaries else None)
+                except BaseException as e:
+                    _write_progress(ppath, status='failed', phase='error', percent=100.0,
+                                    message=f"Error: {e.__class__.__name__}: {e}")
+
+            threading.Thread(target=_job, daemon=True).start()
+
+        # Return immediately; batch polling callback will stream progress for all jobs
+        summary = f"Started {len(secondaries)} job(s): {', '.join(secondaries)}"
+        if len(secondaries) == 1:
+            # Force the batch table even for a single job to surface ETA/outstanding counters
+            return ([], [], summary, None, None,
+                    True,  {'marginTop':'10px', 'display': 'none'},   # hide single progress bar
+                    jobs, False, {'marginTop':'10px', 'display': 'block'})
+        else:
+            batch_mode = True
+            return ([], [], summary, None, None,
+                    False, {'marginTop':'10px', 'display': 'none'},
+                    jobs, False, {'marginTop':'10px', 'display': 'block'})
 
     # Poll progress file and update status + table when ready
     @app.callback(
@@ -1159,11 +1343,146 @@ def run_dash(outdir: str, port: int = 8054):
                 progress_msg,
                 data, cols, outdir, done)
 
+    # Poll batch jobs and update batch progress table
+    @app.callback(
+        [Output('jobs','data'),
+         Output('jobs-interval','disabled', allow_duplicate=True),
+         Output('jobs-summary','children')],
+        [Input('jobs-interval','n_intervals')],
+        [State('jobs-list','data')],
+        prevent_initial_call=True
+    )
+    def _poll_jobs(_ticks, jobs):
+        if not jobs:
+            raise PreventUpdate
+
+        rows = []
+        all_done = True
+        agg_total = 0
+        agg_done = 0
+        now = time.time()
+
+        for job in jobs:
+            ppath = job['ppath']
+            sec = job['secondary']
+            if not os.path.exists(ppath):
+                continue
+            try:
+                with open(ppath, 'r', encoding='utf-8') as f:
+                    prog = json.load(f)
+            except Exception:
+                continue
+
+            pct = float(prog.get('percent') or 0.0)
+            msg = str(prog.get('message') or '')
+            stat = str(prog.get('status') or 'running')
+            phase = str(prog.get('phase') or '')
+            outdir = prog.get('final_outdir') or prog.get('outdir') or ''
+            counters = prog.get('counters') or {}
+            started_ts = prog.get('started_ts') or 0
+
+            # Stall detection: mark as stalled if no update for 10+ minutes
+            try:
+                mtime = os.path.getmtime(ppath)
+                age = now - mtime
+            except Exception:
+                age = 0.0
+
+            updated_str = f"{int(age)}s ago" if age < 3600 else f"{int(age//60)}m ago"
+            if stat == 'running' and age >= 600:  # 10 minutes
+                stat = 'stalled'
+
+            # Calculate outstanding work and combos cell
+            outstanding = ''
+            combos_cell = ''
+            if phase == 'ranking':
+                done = counters.get('primaries_done', 0)
+                total = counters.get('primaries_total', 0)
+                if total > 0:
+                    outstanding = f"{total - done} primaries"
+            elif phase == 'stacking':
+                done = counters.get('combos_tested', 0)
+                total = counters.get('combos_total', 0)
+                if total > 0:
+                    rem = max(0, total - done)
+                    outstanding = f"{rem:,} combos"
+                    combos_cell = f"{done:,}/{total:,}"
+                    agg_total += total
+                    agg_done += min(done, total)
+
+            # Calculate ETA
+            eta = ''
+            if stat == 'running' and phase == 'stacking' and counters.get('combos_total', 0) > 0:
+                done = counters.get('combos_tested', 0)
+                total = counters.get('combos_total', 0)
+                if started_ts > 0 and done > 0:
+                    elapsed = now - started_ts
+                    rate = done / elapsed
+                    if rate > 0:
+                        rem = max(0, total - done)
+                        remaining_sec = int(rem / rate)
+                        if remaining_sec < 60:
+                            eta = f"{remaining_sec}s"
+                        elif remaining_sec < 3600:
+                            eta = f"{remaining_sec // 60}m"
+                        else:
+                            eta = f"{remaining_sec // 3600}h {(remaining_sec % 3600) // 60}m"
+            elif stat == 'running' and pct > 0 and started_ts > 0:
+                elapsed = now - started_ts
+                if pct >= 100:
+                    eta = 'Done'
+                else:
+                    remaining_sec = elapsed * (100 - pct) / pct
+                    if remaining_sec < 60:
+                        eta = f"{int(remaining_sec)}s"
+                    elif remaining_sec < 3600:
+                        eta = f"{int(remaining_sec / 60)}m"
+                    else:
+                        eta = f"{int(remaining_sec / 3600)}h {int((remaining_sec % 3600) / 60)}m"
+
+            rows.append({
+                'Secondary': sec,
+                'Status': stat,
+                'Phase': phase.upper(),
+                'Percent': f"{pct:.1f}%",
+                'Combos': combos_cell,
+                'ETA': eta,
+                'Updated': updated_str,
+                'Message': msg,
+                'Outdir': outdir
+            })
+
+            if stat not in ('complete', 'failed'):
+                all_done = False
+
+        # Build summary line with global progress percentage
+        active_count = sum(1 for r in rows if r['Status'] in ('running', 'stalled'))
+        done_count = sum(1 for r in rows if r['Status'] == 'complete')
+        total_jobs = len(rows)
+
+        if agg_total > 0:
+            global_pct = (agg_done / agg_total) * 100
+            summary = f"Active: {active_count} | Done: {done_count}/{total_jobs} | Global progress: {agg_done:,}/{agg_total:,} ({global_pct:.1f}%)"
+        else:
+            summary = f"Active: {active_count} | Done: {done_count}/{total_jobs}"
+
+        return rows, all_done, summary
+
     # Avoid double-execution noise and keep console logs visible
     app.run_server(debug=False, port=port, use_reloader=False)
 
 # ---------- Orchestration ----------
 def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[str]] = None) -> str:
+    # Ensure worker processes inherit the same runtime configuration as the parent.
+    global OUTPUT_FORMAT, SIGNAL_LIB_DIR_RUNTIME, VERBOSE, COMBINE_INTERSECTION
+    try:
+        OUTPUT_FORMAT = getattr(args, 'output_format', OUTPUT_FORMAT)
+        SIGNAL_LIB_DIR_RUNTIME = getattr(args, 'signal_lib_dir', SIGNAL_LIB_DIR_RUNTIME)
+        VERBOSE = bool(getattr(args, 'verbose', VERBOSE))
+        COMBINE_INTERSECTION = (getattr(args, 'combine_mode', 'intersection') == 'intersection')
+    except Exception:
+        pass
+
     start_time = time.time()
     # Enforce strict calendar by default for parity with spymaster
     os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(getattr(args, 'grace_days', 0) or 0)
@@ -1175,15 +1494,18 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
     secondary_parent = os.path.join(RUNS_ROOT, vendor_secondary_clean)
     ensure_dir(secondary_parent)
     # Use temporary directory initially within the parent
-    temp_outdir = os.path.join(secondary_parent, f"temp_{ts}")
+    # Make temp folder unique per process to avoid collisions under parallel runs
+    temp_outdir = os.path.join(secondary_parent, f"temp_{ts}_{os.getpid()}")
     ensure_dir(temp_outdir)
 
     # Establish progress path from args or create new one
     ppath = getattr(args, 'progress_path', None)
     if not ppath:
-        ppath = os.path.join(PROGRESS_ROOT, f"{vendor_secondary_clean}_{int(time.time())}.json")
+        # Uniquify progress file as well
+        ppath = os.path.join(PROGRESS_ROOT, f"{vendor_secondary_clean}_{os.getpid()}_{int(time.time())}.json")
     _write_progress(ppath, status='running', phase='preflight', percent=5.0,
-                    message='Loading data and validating primaries...', outdir=temp_outdir, secondary=vendor_secondary)
+                    message='Loading data and validating primaries...', outdir=temp_outdir,
+                    secondary=vendor_secondary, started_ts=time.time())
 
     try:
         manifest = {
@@ -1205,7 +1527,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         _write_progress(ppath, status='running', phase='ranking', percent=25.0,
                         message=f'Ranking {len(primaries_df)} primaries against {vendor_secondary}...',
                         outdir=temp_outdir, secondary=vendor_secondary)
-        rank_all, rank_direct, rank_inverse = phase2_rank_all(args, primaries_df, sec_rets, temp_outdir, secondary=vendor_secondary)
+        rank_all, rank_direct, rank_inverse = phase2_rank_all(args, primaries_df, sec_rets, temp_outdir, secondary=vendor_secondary, progress_path=ppath)
 
         cohort_sz = args.top_n + args.bottom_n
         _write_progress(ppath, status='running', phase='stacking', percent=60.0,
@@ -1213,7 +1535,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                         outdir=temp_outdir, secondary=vendor_secondary)
 
         # Progress wrapper: parse "K=" from msg and compute % without closing over final_members
-        def _k_progress(msg: str):
+        def _k_progress(msg: str = "", **kw):
             try:
                 import re
                 m = re.search(r'K=(\d+)', str(msg))
@@ -1224,7 +1546,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
             base, span = 60.0, 30.0
             pct = base + min(span, (k - 1) * (span / max(1, (maxk - 1))))
             _write_progress(ppath, status='running', phase='stacking', percent=pct,
-                            message=msg, outdir=temp_outdir, secondary=vendor_secondary)
+                            message=msg, outdir=temp_outdir, secondary=vendor_secondary, **kw)
 
         # Pass progress callback to phase3
         leaderboard, final_members = phase3_build_stacks(
@@ -1347,8 +1669,12 @@ def parse_args(argv=None):
                    help='Minimum Trigger Days required for any accepted stack')
     p.add_argument('--sharpe-eps', type=float, default=1e-6,
                    help='Strict Sharpe improvement per K must exceed this epsilon')
-    p.add_argument('--seed-by', choices=['sharpe','total_capture'], default='sharpe',
+    p.add_argument('--seed-by', choices=['sharpe','total_capture'], default='total_capture',
                    help='Metric to choose the initial K=1 seed')
+    p.add_argument('--optimize-by', choices=['sharpe','total_capture'], default=None,
+                   help='Metric to optimize for K>=2 (defaults to seed-by if not specified)')
+    p.add_argument('--allow-decreasing', action='store_true',
+                   help='Allow metric to decrease across K levels (find best at each K independently)')
     p.add_argument('--grace-days', type=int, default=0,
                    help='Max calendar pad when aligning primary signals to secondary (0 = strict, spymaster-parity)')
     p.add_argument('--search', choices=['greedy','beam','exhaustive'], default='beam',
@@ -1377,6 +1703,9 @@ def parse_args(argv=None):
     p.add_argument('--impact-xlsx-dir', default=DEFAULT_IMPACT_XLSX_DIR, help='Folder with ImpactSearch .xlsx exports')
     p.add_argument('--impact-xlsx-max-age-days', type=int, default=45)
     p.add_argument('--output-format', choices=['xlsx','parquet','csv'], default=OUTPUT_FORMAT)
+    # Parallelism across secondaries
+    p.add_argument('--jobs', default='1',
+                   help="How many secondaries to build in parallel. Use an integer (e.g. 4) or 'auto'.")
     return p.parse_args(argv)
 
 def main(argv=None):
@@ -1403,7 +1732,21 @@ def main(argv=None):
         specified_primaries = [p.strip().upper() for p in args.primaries.split(',') if p.strip()]
         print(f"[INFO] Using specified primaries: {', '.join(specified_primaries)}")
 
-    run_dirs = [run_for_secondary(args, sec, specified_primaries) for sec in secondaries]
+    # Concurrency across independent secondaries. Parity: each secondary builds in isolation.
+    jobs_arg = str(getattr(args, 'jobs', '1')).strip().lower()
+    if jobs_arg == 'auto':
+        max_workers = max(1, min(len(secondaries), (os.cpu_count() or 2)))
+    else:
+        try:
+            max_workers = max(1, int(jobs_arg))
+        except Exception:
+            max_workers = 1
+    if max_workers > 1 and len(secondaries) > 1:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(run_for_secondary, args, sec, specified_primaries) for sec in secondaries]
+            run_dirs = [f.result() for f in futs]
+    else:
+        run_dirs = [run_for_secondary(args, sec, specified_primaries) for sec in secondaries]
     if args.serve:
         run_dash(run_dirs[-1], port=args.port)
 
