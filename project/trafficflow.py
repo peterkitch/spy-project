@@ -634,6 +634,45 @@ def parse_members(mval) -> List[str]:
             out.append(ticker)
     return out
 
+def parse_members_with_protocol(mval) -> List[tuple]:
+    """Parse Members field into list of (ticker, protocol) tuples.
+
+    Returns:
+        List of tuples: [(ticker, protocol), ...] where protocol is 'D' (Direct), 'I' (Inverse), or None
+
+    Examples:
+        "PSA[I]" -> [('PSA', 'I')]
+        "JNYAX[I], SAMI.BA[I]" -> [('JNYAX', 'I'), ('SAMI.BA', 'I')]
+        "AAPL[D], MSFT[I]" -> [('AAPL', 'D'), ('MSFT', 'I')]
+        "AAPL" -> [('AAPL', None)]  # No protocol marker
+    """
+    if mval is None:
+        return []
+    s = str(mval).strip()
+    toks: List[str] = []
+    if s.startswith("[") and s.endswith("]"):
+        s2 = s[1:-1]
+        toks = [t.strip() for t in s2.split(",")]
+    else:
+        toks = [t.strip() for t in s.split(",")]
+    out: List[tuple] = []
+    for tok in toks:
+        t = str(tok).strip().strip("'").strip('"')
+        if not t:
+            continue
+        # Extract ticker and protocol [D] or [I]
+        if '[' in t and ']' in t:
+            parts = t.split('[')
+            ticker = parts[0].strip().upper()
+            protocol_part = parts[1].split(']')[0].strip().upper()
+            protocol = protocol_part if protocol_part in ('D', 'I') else None
+        else:
+            ticker = t.strip().upper()
+            protocol = None
+        if ticker:
+            out.append((ticker, protocol))
+    return out
+
 # --- New: gate rows when no PKLs exist for any member ---
 def _members_have_pkls(members) -> bool:
     """
@@ -2105,41 +2144,54 @@ def _combine_next_list(next_list: List[str]) -> str:
         return "Short"
     return "Cash"
 
-def _calculate_signal_mix(members: List[str], as_of: Optional[pd.Timestamp] = None) -> str:
+def _calculate_signal_mix(members_with_protocol: List[tuple], as_of: Optional[pd.Timestamp] = None) -> str:
     """
-    Calculate signal agreement ratio for MIX column.
+    Calculate signal conformity ratio for MIX column based on protocol adherence.
 
-    Returns format like "7/8", "3/5", "0/3" showing:
-    - Numerator: Count of most common active signal (Buy or Short, whichever is higher)
-    - Denominator: Total members
+    Args:
+        members_with_protocol: List of (ticker, protocol) tuples where protocol is 'D' (Direct), 'I' (Inverse), or None
+        as_of: Optional timestamp to anchor signal retrieval
+
+    Returns:
+        Format "X/Y" where:
+        - X: Count of members whose current signal matches their build protocol
+        - Y: Total members
+
+    Matching rules:
+        - DIRECT ('D') + Buy signal → MATCH
+        - INVERSE ('I') + Short signal → MATCH
+        - All other combinations → NO MATCH
 
     Examples:
-    - 7 Buy, 1 None → "7/8"
-    - 3 Buy, 1 None, 1 Short → "3/5"
-    - 3 Buy, 3 Short → "3/6"
-    - 3 None → "0/3"
-    - 5 Short, 4 Buy, 1 None → "5/10"
+        - [('AAPL','D')] with Buy → "1/1" (Direct + Buy = match)
+        - [('AAPL','D')] with Short → "0/1" (Direct + Short = no match)
+        - [('MSFT','I')] with Short → "1/1" (Inverse + Short = match)
+        - [('MSFT','I')] with Buy → "0/1" (Inverse + Buy = no match)
+        - [('AAPL','D'), ('MSFT','I')] with Buy, Short → "2/2" (both match)
+        - [('AAPL','D'), ('MSFT','I')] with Short, Buy → "0/2" (neither matches)
     """
-    if not members:
+    if not members_with_protocol:
         return "0/0"
 
-    total = len(members)
+    total = len(members_with_protocol)
+    matching_count = 0
 
-    # Get next signal for each member
-    signals = []
-    for m in members:
-        sig = _next_signal_from_pkl(m, as_of=as_of)
-        signals.append(sig)
+    for ticker, protocol in members_with_protocol:
+        # Get current signal for this primary ticker
+        current_signal = _next_signal_from_pkl(ticker, as_of=as_of)
 
-    # Count each signal type
-    buy_count = sum(1 for s in signals if s == "Buy")
-    short_count = sum(1 for s in signals if s == "Short")
-    # none_count = sum(1 for s in signals if s == "None")
+        # Treat missing protocol as DIRECT
+        if protocol is None:
+            protocol = 'D'
 
-    # Max agreement is the higher of Buy or Short count
-    max_agreement = max(buy_count, short_count)
+        # Check for match based on protocol
+        # DIRECT + Buy = match
+        # INVERSE + Short = match
+        if (protocol == 'D' and current_signal == "Buy") or \
+           (protocol == 'I' and current_signal == "Short"):
+            matching_count += 1
 
-    return f"{max_agreement}/{total}"
+    return f"{matching_count}/{total}"
 
 def _signal_snapshot_for_members(secondary: str, members: List[str], cap_dt: Optional[pd.Timestamp] = None) -> Dict[str, Any]:
     """
@@ -2981,8 +3033,11 @@ def build_board_rows(sec: str, k: int, run_fence: dict, missing_map: Optional[Di
         # Format members: plain text for copy-paste
         members_display = ", ".join(members)
 
-        # Calculate signal agreement ratio (use latest signals, not historical)
-        mix_ratio = _calculate_signal_mix(members, as_of=None)
+        # Parse members with protocol for MIX calculation
+        members_with_protocol = parse_members_with_protocol(row['Members'])
+
+        # Calculate signal conformity ratio (protocol-based agreement)
+        mix_ratio = _calculate_signal_mix(members_with_protocol, as_of=None)
 
         # Check if any member in THIS build has missing/stale PKL
         has_pkl_issues = False
