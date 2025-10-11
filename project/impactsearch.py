@@ -392,7 +392,9 @@ progress_tracker = {
     'total_tickers': 0,
     'start_time': None,
     'results': [],
-    'status': 'idle'
+    'status': 'idle',
+    'show_metrics': False,
+    'excel_path': None
 }
 
 def safe_divide(numerator, denominator, default=0):
@@ -2714,9 +2716,10 @@ app.layout = dbc.Container([
                                 options=[
                                     {'label': ' Use Multiprocessing (Faster for >3 tickers)', 'value': 'multiprocessing'},
                                     {'label': ' Export Excel File', 'value': 'export_excel'},
-                                    {'label': ' Generate PDF Report' + (' (Requires ReportLab)' if not REPORTLAB_AVAILABLE else ''), 
+                                    {'label': ' Generate PDF Report' + (' (Requires ReportLab)' if not REPORTLAB_AVAILABLE else ''),
                                      'value': 'pdf', 'disabled': not REPORTLAB_AVAILABLE},
-                                    {'label': ' Save as Template', 'value': 'save_template'}
+                                    {'label': ' Save as Template', 'value': 'save_template'},
+                                    {'label': ' Display Dashboard Metrics (reduces speed)', 'value': 'show_metrics'}
                                 ],
                                 value=['multiprocessing', 'export_excel'],
                                 inline=False,
@@ -3000,7 +3003,17 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
     
     # Parse tickers
     primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
-    
+
+    # Determine options
+    if analysis_options is None:
+        analysis_options = []
+
+    use_multiprocessing = 'multiprocessing' in analysis_options
+    export_excel = 'export_excel' in analysis_options
+    generate_pdf = 'pdf' in analysis_options
+    save_template = 'save_template' in analysis_options
+    show_metrics = 'show_metrics' in analysis_options
+
     # Reset progress tracker
     global progress_tracker
     progress_tracker = {
@@ -3009,17 +3022,10 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
         'total_tickers': len(primary_tickers),
         'start_time': time.time(),
         'results': [],
-        'status': 'starting'
+        'status': 'starting',
+        'show_metrics': show_metrics,
+        'excel_path': None
     }
-    
-    # Determine options
-    if analysis_options is None:
-        analysis_options = []
-    
-    use_multiprocessing = 'multiprocessing' in analysis_options
-    export_excel = 'export_excel' in analysis_options
-    generate_pdf = 'pdf' in analysis_options
-    save_template = 'save_template' in analysis_options
     
     # Start processing in a separate thread
     def process_async():
@@ -3031,6 +3037,7 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
                     try:
                         output_filename = f"output/impactsearch/{secondary_ticker}_analysis.xlsx"
                         export_results_to_excel(output_filename, results)
+                        progress_tracker['excel_path'] = output_filename
                         logger.info(f"Excel file exported to {output_filename}")
                     except Exception as e:
                         logger.error(f"Excel export failed: {e}")
@@ -3109,13 +3116,13 @@ def update_progress(n_intervals, processing_state):
                     style={'height': '30px'}, color='success')
     ])
     
-    # Create summary cards if we have results (use lightweight mode if not updating)
+    # Create summary cards if we have results and metrics are enabled
     summary_cards = []
     results_to_return = dash.no_update  # By default, don't send results
 
-    if progress_tracker['results'] and (should_update_results or LIGHT_SUMMARY):
+    if progress_tracker['results'] and progress_tracker.get('show_metrics', False) and (should_update_results or LIGHT_SUMMARY):
         results_df = pd.DataFrame(progress_tracker['results'])
-        
+
         # Back-compat: normalize legacy column names and types
         if 'Significant 95%' not in results_df.columns and 'Significant @95%?' in results_df.columns:
             results_df.rename(columns={'Significant @95%?': 'Significant 95%'}, inplace=True)
@@ -3123,7 +3130,7 @@ def update_progress(n_intervals, processing_state):
             results_df.rename(columns={'Average Daily Capture (%)': 'Avg Daily Capture (%)'}, inplace=True)
         if 'Sharpe Ratio' not in results_df.columns:
             results_df['Sharpe Ratio'] = np.nan
-        
+
         # Calculate summary metrics with safe numeric conversion
         sharpe_numeric = pd.to_numeric(results_df['Sharpe Ratio'], errors='coerce')
         avg_sharpe = sharpe_numeric.mean()
@@ -3133,11 +3140,11 @@ def update_progress(n_intervals, processing_state):
         else:
             best_performer = pd.Series({'Primary Ticker': 'N/A', 'Sharpe Ratio': np.nan})
         significant_count = int((results_df.get('Significant 95%', pd.Series(dtype=object)) == 'Yes').sum())
-        
+
         summary_cards = dbc.Row([
             dbc.Col([
                 VisualMetrics.create_performance_card(
-                    "Analyzed", 
+                    "Analyzed",
                     len(results_df),
                     f"of {progress_tracker['total_tickers']} tickers",
                     "📊", "#00ff41", glow=True
@@ -3145,7 +3152,7 @@ def update_progress(n_intervals, processing_state):
             ], width=3),
             dbc.Col([
                 VisualMetrics.create_performance_card(
-                    "Avg Sharpe", 
+                    "Avg Sharpe",
                     f"{avg_sharpe:.2f}",
                     "Risk-adjusted return",
                     "📈", "#80ff00" if avg_sharpe > 0 else "#ff0040", glow=True
@@ -3153,7 +3160,7 @@ def update_progress(n_intervals, processing_state):
             ], width=3),
             dbc.Col([
                 VisualMetrics.create_performance_card(
-                    "Best Performer", 
+                    "Best Performer",
                     best_performer['Primary Ticker'],
                     f"Sharpe: {best_performer['Sharpe Ratio']:.2f}",
                     "🏆", "#00ff41", glow=True
@@ -3161,7 +3168,7 @@ def update_progress(n_intervals, processing_state):
             ], width=3),
             dbc.Col([
                 VisualMetrics.create_performance_card(
-                    "Significant", 
+                    "Significant",
                     significant_count,
                     "95% confidence level",
                     "✅", "#00ff41" if significant_count > 0 else "#ff0040", glow=True
@@ -3175,12 +3182,24 @@ def update_progress(n_intervals, processing_state):
 
     # Check if processing is complete
     if progress_tracker['status'] == 'complete':
-        progress_display = html.Div([
+        excel_path = progress_tracker.get('excel_path', None)
+        completion_message = [
             html.H5("Analysis Complete! ✅", style={'color': '#00ff41'}),
             html.P(f"Processed {progress_tracker['total_tickers']} tickers successfully",
-                  style={'color': '#aaa'}),
+                  style={'color': '#aaa'})
+        ]
+
+        if excel_path:
+            completion_message.append(
+                html.P(f"Excel file: {excel_path}",
+                      style={'color': '#00ff41', 'fontWeight': 'bold', 'marginTop': '10px'})
+            )
+
+        completion_message.append(
             dbc.Progress(value=100, striped=False, style={'height': '30px'}, color='success')
-        ])
+        )
+
+        progress_display = html.Div(completion_message)
         # Stop the interval and update state when complete (always send full results on completion)
         return progress_display, summary_cards, progress_tracker['results'], True, {'status': 'complete'}
 
@@ -3194,9 +3213,21 @@ def update_progress(n_intervals, processing_state):
      Input('analysis-results-store', 'data')],
 )
 def render_tab_content(active_tab, results_data):
+    global progress_tracker
+
     if not results_data:
         return html.Div("No results to display yet.", style={'color': '#aaa'})
-    
+
+    # Check if metrics are enabled
+    show_metrics = progress_tracker.get('show_metrics', False)
+
+    if not show_metrics:
+        return html.Div([
+            html.H5("Visual Metrics Disabled", style={'color': '#00ff41', 'textAlign': 'center'}),
+            html.P("Dashboard metrics are disabled for faster processing. Check the Excel file for results.",
+                  style={'color': '#aaa', 'textAlign': 'center'})
+        ], style={'padding': '40px'})
+
     df = pd.DataFrame(results_data)
     
     if active_tab == 'tab-summary':
