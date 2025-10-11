@@ -2920,8 +2920,15 @@ def get_all_missing_pkls_all(secs: List[str]) -> List[str]:
             continue
     return sorted(missing)
 
-def build_board_rows(sec: str, k: int, run_fence: dict) -> List[Dict[str, Any]]:
-    """Build board rows with enhanced error context for debugging."""
+def build_board_rows(sec: str, k: int, run_fence: dict, missing_map: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """Build board rows with enhanced error context for debugging.
+
+    Args:
+        sec: Secondary ticker symbol
+        k: K size value
+        run_fence: Dictionary containing global and per-secondary cap dates
+        missing_map: Optional dict of {ticker: reason} for missing/stale PKLs (checked per-row members)
+    """
     p = _find_latest_combo_table(sec)
     if not p or not p.exists() or not p.is_file():
         raise RuntimeError(f"{sec}: no combo_leaderboard file found under {RUNS_ROOT}/{sec}")
@@ -2977,8 +2984,19 @@ def build_board_rows(sec: str, k: int, run_fence: dict) -> List[Dict[str, Any]]:
         # Calculate signal agreement ratio (use latest signals, not historical)
         mix_ratio = _calculate_signal_mix(members, as_of=None)
 
+        # Check if any member in THIS build has missing/stale PKL
+        has_pkl_issues = False
+        if missing_map:
+            for member in members:
+                if member in missing_map:
+                    has_pkl_issues = True
+                    break
+
+        # Add warning icon to the left if any member in this build has PKL issues
+        ticker_display = f"\u26A0\uFE0F {sec}" if has_pkl_issues else sec
+
         rec = {
-            "Ticker": sec,
+            "Ticker": ticker_display,
             "K": int(k),
             "Members": members_display,
             "Trigs": averages.get("Triggers"),
@@ -3154,7 +3172,7 @@ def make_app():
             from concurrent.futures import ThreadPoolExecutor, as_completed
             max_workers = min(8, (os.cpu_count() or 4))
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tf") as ex:
-                futs = {ex.submit(build_board_rows, sec, k, run_fence): sec for sec in secs}
+                futs = {ex.submit(build_board_rows, sec, k, run_fence, missing_map): sec for sec in secs}
                 for fut in as_completed(futs):
                     sec = futs[fut]
                     try:
