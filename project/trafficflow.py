@@ -3274,8 +3274,27 @@ def make_app():
             # Debug: show post-sort order
             msg = f"K={k}  Rows={len(rows_all)}  PriceRefresh={'FULL' if TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK else ('AUTO' if TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD else 'SKIP@startup')}  |  NOW=Sharpe through Today  NEXT=Projected Sharpe→TMRW  METRICS=history≤Today"
             if problems:
-                # ASCII-only to avoid cp1252/UTF-8 mojibake ("â€¢")
-                msg += f"  | Issues: {len(problems)} - " + "; ".join(problems[:3])
+                # Group tickers by error type for cleaner display
+                error_groups = {}
+                for problem in problems:
+                    # Parse "TICKER: error message" format
+                    if ": " in problem:
+                        parts = problem.split(": ", 1)
+                        ticker = parts[0]
+                        error_msg = parts[1]
+                        # Normalize error message (remove ticker-specific parts)
+                        normalized_error = error_msg.replace(ticker + ": ", "").replace(f"under {RUNS_ROOT}/{ticker}", "under output/stackbuilder/[TICKER]")
+                        if normalized_error not in error_groups:
+                            error_groups[normalized_error] = []
+                        error_groups[normalized_error].append(ticker)
+
+                # Format: "error message for ticker1, ticker2, ticker3"
+                issue_parts = []
+                for error_msg, tickers in error_groups.items():
+                    ticker_list = ", ".join(sorted(tickers))
+                    issue_parts.append(f"{error_msg.replace('under output/stackbuilder/[TICKER]', 'for ' + ticker_list)}")
+
+                msg += f"  | Issues: {len(problems)} - " + "; ".join(issue_parts)
 
             # Format missing/stale PKLs message with reason counts
             if missing_map:
@@ -3285,7 +3304,8 @@ def make_app():
                     if counts.get(key):
                         parts.append(f"{key}={counts[key]}")
                 summary = ", ".join(parts) if parts else f"total={len(missing_map)}"
-                sample = ", ".join(list(missing_map.keys())[:80])
+                # Display ALL tickers (no truncation) for easy copy/paste
+                sample = ", ".join(sorted(missing_map.keys()))
                 missing_msg = f"Missing/Stale PKLs (ALL K, {len(missing_map)}): {summary} | {sample}"
                 missing_style = {"margin":"8px 0","padding":"12px","backgroundColor":"#1a1a0a",
                                  "border":"1px solid #ffaa00","borderRadius":"4px",
