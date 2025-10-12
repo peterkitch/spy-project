@@ -2394,7 +2394,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     
     return result
 
-def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing=False):
+def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing=False, mark_complete=True):
     """Process primary tickers with progress tracking and optional multiprocessing"""
     global progress_tracker
     
@@ -2534,7 +2534,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
                 finally:
                     completed_count += 1
                     progress_tracker['current_index'] = completed_count  # Not -1
-                    progress_tracker['current_ticker'] = ticker
+                    # Show SECONDARY · PRIMARY for clarity during batches
+                    progress_tracker['current_ticker'] = f"{secondary_ticker} · {ticker}"
 
                     # Log progress at intervals to reduce console I/O
                     if completed_count % log_interval == 0 or completed_count == len(primary_tickers):
@@ -2543,7 +2544,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
         # Sequential processing for small batches (with TQDM console bar)
         for idx, prim_ticker in enumerate(tqdm(primary_tickers, desc="Processing Primary Tickers", unit="ticker")):
             with progress_lock:
-                progress_tracker['current_ticker'] = prim_ticker
+                # Show SECONDARY · PRIMARY
+                progress_tracker['current_ticker'] = f"{secondary_ticker} · {prim_ticker}"
             
             result = process_single_ticker(prim_ticker, sec_df, sma_cache, analysis_clock)
             if result:
@@ -2563,7 +2565,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     # Final flush to ensure all results are available
     progress_tracker['results'] = metrics_list.copy()
     progress_tracker['results_timestamp'] = time.time()
-    progress_tracker['status'] = 'complete'
+    if mark_complete:
+        progress_tracker['status'] = 'complete'
 
     # Log Yahoo Finance call count if instrumentation is enabled
     if os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower() in ("1", "true", "on", "yes"):
@@ -2698,12 +2701,12 @@ app.layout = dbc.Container([
                             )
                         ], width=6),
                         dbc.Col([
-                            html.Label("Secondary Ticker", style={'color': '#00ff41'}),
-                            html.P("Enter the ticker to analyze impact against (e.g., SPY)", 
+                            html.Label("Secondary Ticker(s)", style={'color': '#00ff41'}),
+                            html.P("Enter one or more tickers, comma-separated. Processed sequentially. Example: SPY, QQQ, DIA",
                                   style={'fontSize': '0.8rem', 'color': '#888'}),
                             dbc.Input(
                                 id='secondary-ticker-input',
-                                placeholder='Enter secondary ticker...',
+                                placeholder='Enter secondary ticker(s), comma-separated...',
                                 type='text',
                                 style={'backgroundColor': 'rgba(0, 0, 0, 0.3)',
                                       'border': '1px solid #00ff41', 'color': '#fff'},
@@ -3000,9 +3003,13 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
     
     if not secondary_ticker or not primary_tickers_input:
         raise dash.exceptions.PreventUpdate
-    
-    # Parse tickers
-    primary_tickers = [t.strip().upper() for t in primary_tickers_input.split(',') if t.strip()]
+
+    # Parse tickers (support multiple delimiters)
+    primary_tickers = [t.strip().upper() for t in (primary_tickers_input or '').replace('\n',',').replace(';',',').split(',') if t.strip()]
+    secondary_tickers = [s.strip().upper() for s in (secondary_ticker or '').replace('\n',',').replace(';',',').split(',') if s.strip()]
+
+    if not secondary_tickers:
+        raise dash.exceptions.PreventUpdate
 
     # Determine options
     if analysis_options is None:
@@ -3014,7 +3021,7 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
     save_template = 'save_template' in analysis_options
     show_metrics = 'show_metrics' in analysis_options
 
-    # Reset progress tracker
+    # Reset progress tracker (multi-secondary batch state)
     global progress_tracker
     progress_tracker = {
         'current_ticker': '',
@@ -3024,42 +3031,75 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
         'results': [],
         'status': 'starting',
         'show_metrics': show_metrics,
-        'excel_path': None
+        'excel_path': None,
+        'excel_paths': [],
+        'excel_paths_updated': [],  # Track files that were updated (already existed)
+        'tickers_not_found': [],    # Track tickers that failed to download
+        'secondary_total': len(secondary_tickers),
+        'secondary_index': 0,
+        'current_secondary': None
     }
     
-    # Start processing in a separate thread
+    # Start processing in a separate thread (sequential over secondary tickers)
     def process_async():
-        results = process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing)
-        if results:
-            # Export Excel if requested (in separate thread to avoid blocking)
-            if export_excel:
-                def export_excel_async():
-                    try:
-                        output_filename = f"output/impactsearch/{secondary_ticker}_analysis.xlsx"
-                        export_results_to_excel(output_filename, results)
-                        progress_tracker['excel_path'] = output_filename
-                        logger.info(f"Excel file exported to {output_filename}")
-                    except Exception as e:
-                        logger.error(f"Excel export failed: {e}")
+        os.makedirs("output/impactsearch", exist_ok=True)
+        for i, sec in enumerate(secondary_tickers, start=1):
+            try:
+                progress_tracker['secondary_index'] = i
+                progress_tracker['current_secondary'] = sec
+                progress_tracker['results'] = []  # keep memory small between secondaries
 
-                excel_thread = threading.Thread(target=export_excel_async, daemon=True)
-                excel_thread.start()
-            
-            # Generate PDF if requested
-            if generate_pdf:
-                results_df = pd.DataFrame(results)
-                ReportGenerator.generate_pdf_report(results_df, secondary_ticker)
-            
-            # Save template if requested
-            if save_template:
-                template_config = {
-                    'primary_tickers': primary_tickers,
-                    'secondary_ticker': secondary_ticker,
-                    'options': analysis_options,
-                    'timestamp': datetime.now().isoformat()
-                }
-                template_name = f"{secondary_ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                AnalysisTemplates.save_template(template_name, template_config)
+                # Check if output file exists BEFORE processing (to determine new vs updated)
+                out_path = f"output/impactsearch/{sec}_analysis.xlsx"
+                file_existed_before_processing = os.path.exists(out_path)
+
+                # Run WITHOUT closing the progress loop between secondaries
+                results = process_primary_tickers(sec, primary_tickers, use_multiprocessing, mark_complete=False)
+
+                # Check if ticker was found (results is empty list if no data)
+                if not results:
+                    with progress_lock:
+                        progress_tracker['tickers_not_found'].append(sec)
+                    logger.warning(f"[batch] Secondary {sec} returned no results (ticker not found)")
+                    continue
+
+                if results and export_excel:
+                    def export_excel_async(_sec=sec, _res=results, _existed=file_existed_before_processing):
+                        try:
+                            out = f"output/impactsearch/{_sec}_analysis.xlsx"
+                            export_results_to_excel(out, _res)
+                            with progress_lock:
+                                progress_tracker['excel_path'] = out
+                                if _existed:
+                                    progress_tracker['excel_paths_updated'].append(out)
+                                else:
+                                    paths = progress_tracker.get('excel_paths', [])
+                                    paths.append(out)
+                                    progress_tracker['excel_paths'] = paths
+                            logger.info(f"Excel exported to {out}" + (" (updated)" if _existed else ""))
+                        except Exception as e:
+                            logger.error(f"Excel export failed: {e}")
+                    threading.Thread(target=export_excel_async, daemon=True).start()
+                if results and generate_pdf:
+                    df = pd.DataFrame(results)
+                    ReportGenerator.generate_pdf_report(df, sec)
+                if results and save_template:
+                    template_config = {
+                        'primary_tickers': primary_tickers,
+                        'secondary_ticker': sec,
+                        'options': analysis_options,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    tname = f"{sec}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    AnalysisTemplates.save_template(tname, template_config)
+            except Exception as e:
+                logger.error(f"[batch] Secondary {sec} failed: {e}")
+                with progress_lock:
+                    progress_tracker['tickers_not_found'].append(sec)
+                # continue to next secondary
+                continue
+        # mark batch complete once all secondaries are done
+        progress_tracker['status'] = 'complete'
     
     thread = threading.Thread(target=process_async)
     thread.start()
@@ -3067,7 +3107,7 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
     # Enable interval updates and show progress
     return False, {'status': 'processing'}, {'display': 'block'}, \
            {'backgroundColor': 'rgba(0, 0, 0, 0.6)', 'border': '1px solid #00ff41', 'display': 'block'}, \
-           secondary_ticker
+           ', '.join(secondary_tickers)
 
 # Progress update callback
 @app.callback(
@@ -3106,13 +3146,19 @@ def update_progress(n_intervals, processing_state):
         time_str = f"~{int(remaining)}s remaining"
     else:
         time_str = "Calculating..."
-    
-    # Create progress display
+
+    # Create progress display with secondary ticker info
+    secondary_index = progress_tracker.get('secondary_index', 0)
+    secondary_total = progress_tracker.get('secondary_total', 1)
+    secondary_info = ""
+    if secondary_total > 1:
+        secondary_info = f"Secondary {secondary_index} of {secondary_total} | "
+
     progress_display = html.Div([
         html.H5(f"Processing: {progress_tracker['current_ticker']}", style={'color': '#00ff41'}),
-        html.P(f"Ticker {progress_tracker['current_index'] + 1} of {progress_tracker['total_tickers']} | {time_str}",
+        html.P(f"{secondary_info}Primary {progress_tracker['current_index'] + 1} of {progress_tracker['total_tickers']} | {time_str}",
               style={'color': '#aaa'}),
-        dbc.Progress(value=progress_pct, striped=True, animated=True, 
+        dbc.Progress(value=progress_pct, striped=True, animated=True,
                     style={'height': '30px'}, color='success')
     ])
     
@@ -3182,21 +3228,43 @@ def update_progress(n_intervals, processing_state):
 
     # Check if processing is complete
     if progress_tracker['status'] == 'complete':
-        excel_path = progress_tracker.get('excel_path', None)
+        excel_paths = progress_tracker.get('excel_paths', [])
+        excel_paths_updated = progress_tracker.get('excel_paths_updated', [])
+        tickers_not_found = progress_tracker.get('tickers_not_found', [])
+        secondary_total = progress_tracker.get('secondary_total', 1)
+
         completion_message = [
-            html.H5("Analysis Complete! ✅", style={'color': '#00ff41'}),
-            html.P(f"Processed {progress_tracker['total_tickers']} tickers successfully",
-                  style={'color': '#aaa'})
+            html.H5("Analysis Complete!", style={'color': '#00ff41', 'marginBottom': '10px'}),
+            html.P(f"Processed {secondary_total} secondary ticker(s) × {progress_tracker['total_tickers']} primaries",
+                  style={'color': '#aaa', 'marginBottom': '15px'})
         ]
 
-        if excel_path:
-            completion_message.append(
-                html.P(f"Excel file: {excel_path}",
-                      style={'color': '#00ff41', 'fontWeight': 'bold', 'marginTop': '10px'})
-            )
+        if excel_paths:
+            completion_message.append(html.H6("Excel Files Generated:", style={'color': '#00ff41', 'marginTop': '10px', 'marginBottom': '5px'}))
+            for path in excel_paths:
+                completion_message.append(
+                    html.P(f"[OK] {os.path.basename(path)}",
+                          style={'color': '#00ff41', 'marginLeft': '20px', 'marginTop': '0px', 'marginBottom': '0px'})
+                )
+
+        if excel_paths_updated:
+            completion_message.append(html.H6("Excel Files Updated:", style={'color': '#00ff41', 'marginTop': '15px', 'marginBottom': '5px'}))
+            for path in excel_paths_updated:
+                completion_message.append(
+                    html.P(f"[OK] {os.path.basename(path)}",
+                          style={'color': '#00ff41', 'marginLeft': '20px', 'marginTop': '0px', 'marginBottom': '0px'})
+                )
+
+        if tickers_not_found:
+            completion_message.append(html.H6("Tickers Not Found:", style={'color': '#ff6b6b', 'marginTop': '15px', 'marginBottom': '5px'}))
+            for ticker in tickers_not_found:
+                completion_message.append(
+                    html.P(ticker,
+                          style={'color': '#ff6b6b', 'marginLeft': '20px', 'marginTop': '0px', 'marginBottom': '0px'})
+                )
 
         completion_message.append(
-            dbc.Progress(value=100, striped=False, style={'height': '30px'}, color='success')
+            dbc.Progress(value=100, striped=False, style={'height': '30px', 'marginTop': '20px'}, color='success')
         )
 
         progress_display = html.Div(completion_message)
