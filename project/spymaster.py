@@ -44,7 +44,7 @@ import ast
 from datetime import datetime, timedelta, date
 
 # --- Lightweight central job pool for background work (precompute, refresh) ---
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 _job_pool = ThreadPoolExecutor(max_workers=int(os.getenv("SPYMASTER_BG_WORKERS", "2")))
 
 def submit_bg(fn, *args, **kwargs):
@@ -3745,9 +3745,14 @@ def _live_fingerprint_yf(ticker):
 
 def _live_daily_fingerprint(ticker):
     """Return live DAILY fingerprint: (first_date, last_date, last_close, row_count, idx_hash).
-    
+
     Uses daily bars for equities to ensure we're comparing apples to apples with cached daily data.
     """
+    # Check if live fingerprints are disabled via environment variable
+    if os.environ.get('SPYMASTER_DISABLE_LIVE_FP', '').lower() in ('1', 'true', 'yes'):
+        logger.debug(f"Live daily fingerprint disabled via SPYMASTER_DISABLE_LIVE_FP for {ticker}")
+        return None
+
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -11749,6 +11754,12 @@ all_tickers = set()
 processing_thread = None
 processing_lock = threading.Lock()
 
+# Batch worker configuration
+_DEFAULT_BATCH_WORKERS = max(1, (os.cpu_count() or 8) - 1)
+SPYMASTER_BATCH_WORKERS = int(os.getenv("SPYMASTER_BATCH_WORKERS", str(_DEFAULT_BATCH_WORKERS)))
+# Conservative process cap unless overridden (memory safety)
+_SAFE_PROC_CAP = int(os.getenv("SPYMASTER_MAX_PROCESSES", "12"))
+
 # -----------------------------------------------------------------------------
 # Batch Processing and Optimization Callbacks
 # -----------------------------------------------------------------------------
@@ -11923,44 +11934,95 @@ def batch_process_tickers(n_clicks, n_intervals, input_value, existing_table_dat
 # DUPLICATE optimize_signals callback REMOVED
 # ORPHANED CODE REMOVED - was causing runtime issues
 
+def _process_one_ticker_worker(ticker: str):
+    """
+    Process a single ticker in an isolated process.
+    Ensures BLAS/OpenMP threads = 1 to avoid oversubscription.
+    Returns (ticker, ok, errstr).
+    """
+    # Keep per-process math libs single-threaded
+    for _v in ("OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","OMP_NUM_THREADS","NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+    try:
+        write_status(ticker, {'status': 'processing', 'progress': 0})
+        ev = threading.Event()
+        precompute_results(ticker, ev)
+        write_status(ticker, {'status': 'complete', 'progress': 100})
+        return (ticker, True, "")
+    except Exception as e:
+        try:
+            write_status(ticker, {'status': 'failed', 'progress': 0, 'message': str(e)})
+        except Exception:
+            pass
+        return (ticker, False, str(e))
+
 def process_ticker_queue():
     """
-    Drain the ticker_queue in FIFO order.
-    Robust to legacy entries that might be tuples/lists (normalize to ticker str).
-    Always updates status and never raises uncaught exceptions that could kill the worker.
+    Drain ticker_queue with safe parallelism.
+    - If SPYMASTER_BATCH_WORKERS<=1 -> single-threaded.
+    - Else -> ProcessPoolExecutor with per-process isolation.
     """
-    while True:
-        # Take work item
-        with processing_lock:
-            if not ticker_queue:
-                break
-            item = ticker_queue.pop(0)
-
-        # Normalize legacy tuple/list items -> ticker string
-        ticker = item[0] if isinstance(item, (tuple, list)) else item
-        try:
-            if not isinstance(ticker, str):
-                logger.warning(f"process_ticker_queue: unexpected queue item type={type(item)} value={item}; skipping")
-                continue
-
-            # Update status to processing
-            write_status(ticker, {'status': 'processing', 'progress': 0})
-
-            # Compute
-            event = threading.Event()
-            precompute_results(ticker, event)
-
-            # Mark complete
-            write_status(ticker, {'status': 'complete', 'progress': 100})
-
-        except Exception as e:
-            logger.error(f"process_ticker_queue: error processing {ticker}: {e}")
-            # Mark failed but keep the worker alive and continue
+    workers = max(1, min(SPYMASTER_BATCH_WORKERS, _SAFE_PROC_CAP))
+    if workers <= 1:
+        # Single-threaded fallback (original semantics)
+        while True:
+            with processing_lock:
+                if not ticker_queue:
+                    break
+                item = ticker_queue.pop(0)
+            ticker = item[0] if isinstance(item, (tuple, list)) else item
             try:
-                write_status(ticker, {'status': 'failed', 'progress': 0, 'message': str(e)})
-            except Exception:
-                pass
-            # continue loop; do not re-raise
+                if not isinstance(ticker, str):
+                    logger.warning(f"process_ticker_queue: unexpected queue item type={type(item)} value={item}; skipping")
+                    continue
+                write_status(ticker, {'status': 'processing', 'progress': 0})
+                ev = threading.Event()
+                precompute_results(ticker, ev)
+                write_status(ticker, {'status': 'complete', 'progress': 100})
+            except Exception as e:
+                logger.error(f"process_ticker_queue: error processing {ticker}: {e}")
+                try:
+                    write_status(ticker, {'status': 'failed', 'progress': 0, 'message': str(e)})
+                except Exception:
+                    pass
+        return
+
+    # Parallel path: processes
+    # Default BLAS/OpenMP threads to 1 if the launcher did not set them.
+    for _v in ("OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","OMP_NUM_THREADS","NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+
+    logger.info(f"[BATCH] Starting ProcessPool with {workers} workers")
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        inflight = {}
+        while True:
+            # Fill the pool up to 'workers'
+            while len(inflight) < workers:
+                with processing_lock:
+                    if not ticker_queue:
+                        break
+                    item = ticker_queue.pop(0)
+                ticker = item[0] if isinstance(item, (tuple, list)) else item
+                if not isinstance(ticker, str):
+                    logger.warning(f"process_ticker_queue: unexpected queue item type={type(item)} value={item}; skipping")
+                    continue
+                fut = ex.submit(_process_one_ticker_worker, ticker)
+                inflight[fut] = ticker
+
+            if not inflight:
+                break
+
+            done, _ = wait(list(inflight.keys()), return_when=FIRST_COMPLETED)
+            for f in done:
+                t = inflight.pop(f)
+                try:
+                    _ = f.result()
+                except Exception as e:
+                    logger.error(f"[BATCH] {t}: {e}")
+                    try:
+                        write_status(t, {'status': 'failed', 'progress': 0, 'message': str(e)})
+                    except Exception:
+                        pass
 
 @app.callback(
     Output('batch-update-interval', 'disabled'),
