@@ -134,11 +134,12 @@ def _range_str(idx: pd.Index) -> str:
 def _dump_csv(name: str, df: pd.DataFrame) -> Optional[str]:
     try:
         from pathlib import Path
-        Path(False).mkdir(parents=True, exist_ok=True)
+        dump_dir = Path("debug_dumps")
+        dump_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        p = os.path.join(False, f"{name}_{ts}.csv")
+        p = dump_dir / f"{name}_{ts}.csv"
         df.to_csv(p, index=True)
-        return p
+        return str(p)
     except Exception:
         return None
 
@@ -178,7 +179,12 @@ PRICE_CACHE_TTL_DAYS   = int(os.environ.get("PRICE_CACHE_TTL_DAYS", "1"))   # re
 PRICE_BACKFILL_DAYS    = int(os.environ.get("PRICE_BACKFILL_DAYS", "10"))   # overlap window to close gaps
 PRICE_REFRESH_THREADS  = int(os.environ.get("PRICE_REFRESH_THREADS", str(max(2, min(8, (os.cpu_count() or 4)//2)))))
 # Parallel subset evaluation: REMOVED (slower, adds nondeterminism)
-PARALLEL_SUBSETS       = False
+PARALLEL_SUBSETS       = os.environ.get("PARALLEL_SUBSETS", "0") not in {"0","false","False"}
+# Subset parallelization controls
+PARALLEL_SUBSETS_MIN_K = int(os.environ.get("PARALLEL_SUBSETS_MIN_K", "4"))
+TRAFFICFLOW_SUBSET_WORKERS = int(os.environ.get("TRAFFICFLOW_SUBSET_WORKERS", "4"))
+# Preload control
+TRAFFICFLOW_PRELOAD_CACHE = os.environ.get("TRAFFICFLOW_PRELOAD_CACHE", "0").lower() in {"1","true","on","yes"}
 # Matrix path: REMOVED (parity hazard)
 TF_MATRIX_PATH         = False
 TF_MATRIX_MAX_K        = int(os.environ.get("TF_MATRIX_MAX_K", "12"))  # safe up to ~1023 subsets/row
@@ -633,6 +639,39 @@ def parse_members(mval) -> List[str]:
         if ticker:
             out.append(ticker)
     return out
+
+# ---------- Optional PKL preloading ----------
+def preload_pkl_cache(secs: List[str]) -> int:
+    """
+    Preload all PKL files referenced by combo_leaderboard Members across provided secondaries.
+    Returns number of unique PKLs loaded into _PKL_CACHE.
+    """
+    uniq: set = set()
+    for sec in secs or []:
+        table_path = _find_latest_combo_table(sec)
+        if not table_path:
+            continue
+        try:
+            df = _read_table(table_path)
+            if "Members" not in df.columns:
+                continue
+            for _, row in df.iterrows():
+                members = parse_members(row.get("Members"))
+                for t in members:
+                    if t:
+                        uniq.add(str(t).upper())
+        except Exception:
+            continue
+    loaded = 0
+    for t in sorted(uniq):
+        try:
+            if t not in _PKL_CACHE:
+                if load_spymaster_pkl(t) is not None:
+                    loaded += 1
+        except Exception:
+            continue
+    print(f"[PRELOAD] Loaded {loaded}/{len(uniq)} PKLs into cache")
+    return loaded
 
 def parse_members_with_protocol(mval) -> List[tuple]:
     """Parse Members field into list of (ticker, protocol) tuples.
@@ -2813,10 +2852,11 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
     else:
         _subset_fn = _subset_metrics_spymaster
 
-    if False and PARALLEL_SUBSETS and len(subsets) > 1:
+    enable_subset_parallel = PARALLEL_SUBSETS and len(metrics_members) >= PARALLEL_SUBSETS_MIN_K and len(subsets) > 1
+    if enable_subset_parallel:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        _mw = min(len(subsets), max(1, (os.cpu_count() or 4)//2))
-        with ThreadPoolExecutor(max_workers=_mw, thread_name_prefix="tfsub") as _ex:
+        subset_workers = min(len(subsets), max(1, TRAFFICFLOW_SUBSET_WORKERS))
+        with ThreadPoolExecutor(max_workers=subset_workers, thread_name_prefix="tfsub") as _ex:
             if TF_BITMASK_FASTPATH or TF_POST_INTERSECT_FASTPATH:
                 _futs = [_ex.submit(_subset_fn, secondary, sub, eval_to_date=eval_to_date) for sub in subsets]
             else:
@@ -3192,6 +3232,13 @@ def make_app():
             # Show resolved debug flags once per refresh
             secs = list_secondaries()  # Fresh list each refresh
 
+            # Optional: Preload PKL cache (eliminates disk I/O during parallel phase)
+            if TRAFFICFLOW_PRELOAD_CACHE:
+                try:
+                    preload_pkl_cache(secs)
+                except Exception as _e:
+                    print(f"[PRELOAD] preload_pkl_cache failed: {_e}")
+
             # Price refresh policy:
             # - First load: honor TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD (default OFF to stabilize K1 parity)
             # - Button click: always refresh per TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK
@@ -3225,7 +3272,8 @@ def make_app():
             rows_all: List[Dict[str, Any]] = []
             problems: List[str] = []
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            max_workers = min(8, (os.cpu_count() or 4))
+            # Optimized for i7-13700KF (16 physical cores): Use 16 workers for I/O-bound work
+            max_workers = int(os.getenv("TRAFFICFLOW_MAX_WORKERS", str(min(16, os.cpu_count() or 8))))
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tf") as ex:
                 futs = {ex.submit(build_board_rows, sec, k, run_fence, missing_map): sec for sec in secs}
                 for fut in as_completed(futs):
