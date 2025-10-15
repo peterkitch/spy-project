@@ -1692,7 +1692,7 @@ def parse_args(argv=None):
     p.add_argument('--verbose', action='store_true', help='Enable verbose diagnostic output')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
     p.add_argument('--save-stats', action='store_true', help='Save search statistics to JSON')
-    p.add_argument('--threads', default='auto')
+    p.add_argument('--threads', default=os.environ.get('STACKBUILDER_THREADS', 'auto'))
     p.add_argument('--outdir', default=RUNS_ROOT)
     p.add_argument('--price-basis', default='adj', choices=['adj','close'])
     p.add_argument('--fail-on-missing-cache', action='store_true')
@@ -1704,8 +1704,8 @@ def parse_args(argv=None):
     p.add_argument('--impact-xlsx-max-age-days', type=int, default=45)
     p.add_argument('--output-format', choices=['xlsx','parquet','csv'], default=OUTPUT_FORMAT)
     # Parallelism across secondaries
-    p.add_argument('--jobs', default='1',
-                   help="How many secondaries to build in parallel. Use an integer (e.g. 4) or 'auto'.")
+    p.add_argument('--jobs', default=os.environ.get('STACKBUILDER_JOBS', '1'),
+                   help="How many secondaries to build in parallel. Use an integer (e.g. 4) or 'auto'. Default: STACKBUILDER_JOBS env var or '1'.")
     return p.parse_args(argv)
 
 def main(argv=None):
