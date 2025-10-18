@@ -3152,7 +3152,7 @@ def sanitize_ticker_input(raw: str, max_tickers: int = 20):
     cleaned = []
     for p in parts:
         m = _TICKER_RE.fullmatch(p)
-        if m and 1 <= len(p) <= 12:
+        if m and len(p) >= 1:
             cleaned.append(p)
         # else: drop silently
         if len(cleaned) >= max_tickers:
