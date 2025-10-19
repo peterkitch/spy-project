@@ -686,16 +686,26 @@ def _combined_metrics(member_caps: List[pd.Series]) -> Tuple[pd.Series, Optional
 def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex) -> Tuple[pd.Series, pd.Series]:
     """Return (signals_aligned_to_sec_index, present_mask_before_fill)."""
     vendor, _ = resolve_symbol(primary)
-    lib = load_lib_or_none(vendor)
-    if not lib:
-        return pd.Series('None', index=sec_index), pd.Series(False, index=sec_index)
-    sigs = lib.get('primary_signals') or lib.get('primary_signals_int8')
-    dates = lib.get('dates') or lib.get('date_index')
-    if sigs is None or dates is None:
-        return pd.Series('None', index=sec_index), pd.Series(False, index=sec_index)
-    if len(sigs) > 0 and isinstance(sigs[0], (int, np.integer)):
-        sigs = [{1:'Buy', -1:'Short', 0:'None'}.get(int(x), 'None') for x in sigs]
-    raw = pd.Series(list(sigs), index=pd.to_datetime(dates))
+    try:
+        lib = load_lib_or_none(vendor)
+        if not lib:
+            return pd.Series('None', index=sec_index), pd.Series(False, index=sec_index)
+        sigs = lib.get('primary_signals') or lib.get('primary_signals_int8')
+        dates = lib.get('dates') or lib.get('date_index')
+        if sigs is None or dates is None:
+            return pd.Series('None', index=sec_index), pd.Series(False, index=sec_index)
+
+        # Validate length match
+        if len(sigs) != len(dates):
+            print(f"[WARN] {vendor}: Signal library corrupted - {len(sigs)} signals vs {len(dates)} dates (skipping)")
+            return pd.Series('None', index=sec_index), pd.Series(False, index=sec_index)
+
+        if len(sigs) > 0 and isinstance(sigs[0], (int, np.integer)):
+            sigs = [{1:'Buy', -1:'Short', 0:'None'}.get(int(x), 'None') for x in sigs]
+        raw = pd.Series(list(sigs), index=pd.to_datetime(dates))
+    except Exception as e:
+        print(f"[ERROR] Failed to load signals for {vendor}: {e}")
+        raise RuntimeError(f"Ticker {vendor} signal library error: {e}") from e
     grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
     if grace_days > 0:
         aligned = raw.reindex(sec_index, method='pad', tolerance=pd.Timedelta(days=grace_days))
@@ -1274,8 +1284,13 @@ def run_dash(outdir: str, port: int = 8054):
                 try:
                     run_for_secondary(args, sec, specified_primaries=primaries if primaries else None)
                 except BaseException as e:
+                    import traceback
+                    # Extract ticker name from error message if available
+                    error_msg = str(e)
+                    full_trace = traceback.format_exc()
+                    print(f"[ERROR] Job failed for {sec}:\n{full_trace}")
                     _write_progress(ppath, status='failed', phase='error', percent=100.0,
-                                    message=f"Error: {e.__class__.__name__}: {e}")
+                                    message=f"Error for {sec}: {e.__class__.__name__}: {error_msg}")
 
             threading.Thread(target=_job, daemon=True).start()
 
