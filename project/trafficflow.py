@@ -550,7 +550,7 @@ def list_secondaries() -> List[str]:
     return sorted(secs)
 
 def _find_latest_combo_table(sec: str) -> Optional[Path]:
-    """Find latest combo_leaderboard file, skipping Windows-illegal run directories."""
+    """Find latest combo_leaderboard file (by creation time), skipping Windows-illegal run directories."""
     base = Path(RUNS_ROOT) / sec
     if not base.exists():
         return None
@@ -570,7 +570,19 @@ def _find_latest_combo_table(sec: str) -> Optional[Path]:
         return None
     if not runs:
         return None
-    latest = max(runs, key=lambda p: p.stat().st_mtime)
+
+    # Use creation time on Windows, birth time on macOS/Unix (fallback to ctime if birthtime unavailable)
+    import sys
+    def _get_creation_time(p: Path) -> float:
+        stat = p.stat()
+        if sys.platform == 'win32':
+            return stat.st_ctime  # Windows: creation time
+        elif hasattr(stat, 'st_birthtime'):
+            return stat.st_birthtime  # macOS: true creation time
+        else:
+            return stat.st_ctime  # Linux/Unix: metadata change time (best available)
+
+    latest = max(runs, key=_get_creation_time)
     for fn in ("combo_leaderboard.parquet", "combo_leaderboard.xlsx", "combo_leaderboard.csv"):
         p = latest / fn
         if p.exists() and p.is_file():
