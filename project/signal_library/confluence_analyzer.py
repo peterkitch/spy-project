@@ -32,6 +32,8 @@ def load_signal_library_interval(ticker: str, interval: str) -> Optional[dict]:
     """
     Load a single interval's signal library from disk.
 
+    For 1d interval, falls back to spymaster cache if signal library doesn't exist.
+
     Args:
         ticker: Ticker symbol (e.g., 'SPY')
         interval: Interval string ('1d', '1wk', '1mo', '3mo', '1y')
@@ -47,20 +49,59 @@ def load_signal_library_interval(ticker: str, interval: str) -> Optional[dict]:
 
     filepath = os.path.join(SIGNAL_LIBRARY_DIR, filename)
 
-    if not os.path.exists(filepath):
-        logger.warning(f"Library not found: {filepath}")
-        return None
+    # Try loading from signal library first
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'rb') as f:
+                library = pickle.load(f)
+            logger.debug(f"Loaded {ticker} {interval}: {len(library.get('signals', []))} bars")
+            return library
+        except Exception as e:
+            logger.error(f"Failed to load {filepath}: {e}")
+            return None
 
-    try:
-        with open(filepath, 'rb') as f:
-            library = pickle.load(f)
+    # For 1d interval, fallback to spymaster cache
+    if interval == '1d':
+        spymaster_path = os.path.join('cache', 'results', f'{ticker}_precomputed_results.pkl')
+        if os.path.exists(spymaster_path):
+            try:
+                with open(spymaster_path, 'rb') as f:
+                    spymaster_data = pickle.load(f)
 
-        logger.debug(f"Loaded {ticker} {interval}: {len(library.get('signals', []))} bars")
-        return library
+                # Extract dates from daily_top_buy_pairs keys
+                dates = list(spymaster_data['daily_top_buy_pairs'].keys())
 
-    except Exception as e:
-        logger.error(f"Failed to load {filepath}: {e}")
-        return None
+                # Generate signals from daily pair maps (SpyMaster's dynamic pairs)
+                signals = []
+                for date in dates:
+                    buy_pair, buy_cap = spymaster_data['daily_top_buy_pairs'].get(date, ((114, 113), 0.0))
+                    short_pair, short_cap = spymaster_data['daily_top_short_pairs'].get(date, ((114, 113), 0.0))
+
+                    # Determine signal based on yesterday's top pair (matches SpyMaster logic)
+                    if buy_cap > short_cap:
+                        signals.append('Buy')
+                    elif short_cap > buy_cap:
+                        signals.append('Short')
+                    else:
+                        signals.append('None')
+
+                # Build compatible library structure
+                library = {
+                    'dates': dates,
+                    'signals': signals,
+                    'primary_signals': signals,  # Alias
+                    'source': 'spymaster_cache'
+                }
+
+                logger.info(f"Loaded {ticker} 1d from spymaster cache: {len(signals)} bars")
+                return library
+
+            except Exception as e:
+                logger.error(f"Failed to load spymaster cache {spymaster_path}: {e}")
+                return None
+
+    logger.warning(f"Library not found: {filepath}")
+    return None
 
 
 def load_confluence_data(ticker: str,

@@ -25,6 +25,7 @@ from signal_library.confluence_analyzer import (
     align_signals_to_daily,
     calculate_confluence,
     calculate_time_in_signal,
+    load_signal_library_interval,
 )
 
 from signal_library.multi_timeframe_builder import fetch_interval_data
@@ -32,6 +33,216 @@ from signal_library.multi_timeframe_builder import fetch_interval_data
 # Logging (must be defined before port check)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- PHASE 2A: Multi-Primary core helpers (drop-in) -------------------------
+import math
+try:
+    from scipy import stats
+except Exception:
+    stats = None
+
+RISK_FREE_ANNUAL = float(os.environ.get('CONFLUENCE_RISK_FREE_ANNUAL',
+                                        os.environ.get('RISK_FREE_ANNUAL', '5.0')))
+# Annualization factors per interval for Sharpe
+BARS_PER_YEAR = {
+    '1d': 252,
+    '1wk': 52,
+    '1mo': 12,
+    '3mo': 4,
+    '1y': 1,
+}
+
+def _mp_to_naive_days(idx_like) -> pd.DatetimeIndex:
+    ts = pd.to_datetime(idx_like, utc=True, errors='coerce')
+    return pd.DatetimeIndex(ts.tz_convert(None).normalize())
+
+def _mp_decode_sig(x) -> str:
+    if isinstance(x, (int, np.integer)):
+        return {1: 'Buy', -1: 'Short', 0: 'None'}.get(int(x), 'None')
+    s = str(x or 'None')
+    if s.startswith('Buy'): return 'Buy'
+    if s.startswith('Short'): return 'Short'
+    return 'None'
+
+def _mp_combine_unanimity_vectorized(sig_df: pd.DataFrame) -> pd.Series:
+    # Buy=+1, Short=-1, None=0; unanimity on active members only
+    if sig_df.empty:
+        return pd.Series([], dtype=object)
+    m = {'Buy': 1, 'Short': -1, 'None': 0}
+    arr = sig_df.replace(m).to_numpy(dtype=int)
+    count = (arr != 0).sum(axis=1)
+    ssum = arr.sum(axis=1)
+    out = np.where((count > 0) & (ssum == count), 'Buy',
+          np.where((count > 0) & (ssum == -count), 'Short', 'None'))
+    return pd.Series(out, index=sig_df.index, dtype=object)
+
+def _mp_safe_daily_pct_change(close: pd.Series) -> pd.Series:
+    prev = close.shift(1)
+    ok = prev.notna() & np.isfinite(prev.values) & (prev.values > 0)
+    ret = pd.Series(0.0, index=close.index)
+    ret[ok] = ((close[ok] - prev[ok]) / prev[ok]) * 100.0
+    return ret.astype(float)
+
+def _mp_safe_pct_change(close: pd.Series) -> pd.Series:
+    """
+    Interval-agnostic bar-to-bar percent change (percent points).
+    No T+1 shift. Safe when previous bar is invalid.
+    """
+    prev = close.shift(1)
+    ok = prev.notna() & np.isfinite(prev.values) & (prev.values > 0)
+    out = pd.Series(0.0, index=close.index, dtype=float)
+    out[ok] = ((close[ok] / prev[ok]) - 1.0) * 100.0
+    return out
+
+def _mp_metrics(captures: pd.Series, trig_mask: pd.Series, bars_per_year: int) -> dict:
+    trig_idx = captures.index[trig_mask]
+    n = int(len(trig_idx))
+    if n == 0:
+        return {}
+
+    vals = captures.loc[trig_idx].astype(float)
+    wins = int((vals > 0).sum())
+    losses = n - wins  # includes exactly 0 as losses
+    win_pct = (wins / n * 100.0)
+
+    avg = float(vals.mean())
+    total = float(vals.sum())
+    std = float(vals.std(ddof=1)) if n > 1 else 0.0
+
+    sharpe, t_stat, p_val = 0.0, None, None
+    if n > 1 and std != 0.0:
+        annual_ret = avg * float(bars_per_year)
+        annual_std = std * math.sqrt(float(bars_per_year))
+        if annual_std != 0:
+            sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std
+        if stats is not None:
+            t_stat = avg / (std / math.sqrt(n))
+            p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
+
+    # Sig flags like SpyMaster table
+    sig90 = '✔' if (p_val is not None and p_val <= 0.10) else ''
+    sig95 = '✔' if (p_val is not None and p_val <= 0.05) else ''
+    sig99 = '✔' if (p_val is not None and p_val <= 0.01) else ''
+
+    return {
+        'Triggers': n,
+        'Wins': wins,
+        'Losses': losses,
+        'Win %': round(win_pct, 2),
+        'StdDev %': round(std, 4),
+        'Sharpe': round(sharpe, 2),
+        't': round(t_stat, 4) if t_stat is not None else 'N/A',
+        'p': round(p_val, 4) if p_val is not None else 'N/A',
+        'Sig 90%': sig90,
+        'Sig 95%': sig95,
+        'Sig 99%': sig99,
+        'Avg Cap %': round(avg, 4),
+        'Total %': round(total, 4),
+    }
+
+def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_flags=None):
+    """
+    Interval-aware multi-primary evaluator with SpyMaster parity:
+      • 1d: signals aligned to the DAILY calendar (ffill), daily returns
+      • >1d: signals and returns on the interval's native calendar, strict intersection
+    """
+    invert_flags = invert_flags or [False] * len(primaries)
+    mute_flags   = mute_flags   or [False] * len(primaries)
+
+    # Active primaries
+    act = [(t.strip().upper(), inv) for t, inv, m in zip(primaries, invert_flags, mute_flags) if t and not m]
+    if not act:
+        return {'Interval': interval, 'Members': '', 'Status': 'NO_ACTIVE_PRIMARIES'}
+
+    # ---------- 1) Load secondary prices (interval-aware) ----------
+    # Daily path stays as-is to preserve the validated parity
+    if interval == '1d':
+        sec_df = fetch_interval_data(secondary, '1d')
+    else:
+        sec_df = fetch_interval_data(secondary, interval)
+
+    if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
+        return {'Interval': interval, 'Members': '', 'Status': f'NO_SECONDARY_DATA:{secondary}'}
+
+    sec_df   = sec_df.sort_index()
+    sec_idx  = _mp_to_naive_days(sec_df.index)
+    sec_close = pd.Series(pd.to_numeric(sec_df['Close'].values, errors='coerce'), index=sec_idx, dtype='float64')
+
+    # ---------- 2) Load primary signals ----------
+    series_map = {}
+    for t, inv in act:
+        lib = load_signal_library_interval(t, interval)
+        if not lib:
+            continue
+        dates = _mp_to_naive_days(lib.get('dates', []))
+        raw   = lib.get('primary_signals', lib.get('signals', []))
+        sigs  = pd.Series([_mp_decode_sig(x) for x in raw], index=dates, dtype=object)
+        sigs  = sigs[~sigs.index.duplicated(keep='last')].sort_index()
+        if inv:
+            sigs = sigs.replace({'Buy': 'Short', 'Short': 'Buy'})
+
+        if interval == '1d':
+            # DAILY: align to secondary DAILY calendar with ffill (SpyMaster daily behavior)
+            sigs = sigs.reindex(sec_close.index, method='ffill').fillna('None')
+
+        series_map[t] = sigs
+
+    if not series_map:
+        return {'Interval': interval, 'Members': ', '.join([t for t, _ in act]), 'Status': 'NO_PRIMARY_DATA'}
+
+    members = ', '.join(series_map.keys())
+
+    # ---------- 3) Combine signals and compute captures ----------
+    if interval == '1d':
+        # DAILY path (unchanged from your working version)
+        sig_df   = pd.DataFrame(series_map, index=sec_close.index)
+        combined = _mp_combine_unanimity_vectorized(sig_df)
+        rets     = _mp_safe_daily_pct_change(sec_close)
+
+        cap = pd.Series(0.0, index=sec_close.index, dtype=float)
+        buy_days   = combined.index[combined.eq('Buy')]
+        short_days = combined.index[combined.eq('Short')]
+        if len(buy_days):
+            cap.loc[buy_days] = rets.loc[buy_days]
+        if len(short_days):
+            cap.loc[short_days] = -rets.loc[short_days]
+
+        trig_mask = combined.isin(['Buy', 'Short'])
+        metrics   = _mp_metrics(cap, trig_mask, BARS_PER_YEAR['1d'])
+        return {'Interval': interval, 'Members': members, **(metrics or {'Status': 'NO_TRIGGERS'})}
+
+    else:
+        # NON‑DAILY path: native interval calendar, strict intersection, NO daily ffill
+        # Intersect across all primaries and secondary to avoid mismatched bar calendars
+        common = set(sec_close.index)
+        for s in series_map.values():
+            common &= set(s.index)
+        if not common:
+            return {'Interval': interval, 'Members': members, 'Status': 'NO_COMMON_DATES'}
+
+        dates = pd.DatetimeIndex(sorted(common))
+
+        # Build grid on the interval bar dates and combine
+        sig_df   = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
+        combined = _mp_combine_unanimity_vectorized(sig_df)
+
+        # Bar-to-bar returns on the SAME interval
+        rets_full = _mp_safe_pct_change(sec_close)            # interval-agnostic
+        rets      = rets_full.reindex(dates).fillna(0.0)
+
+        # Apply signals on interval bars only
+        cap = pd.Series(0.0, index=dates, dtype=float)
+        buy_days   = combined.index[combined.eq('Buy')]
+        short_days = combined.index[combined.eq('Short')]
+        if len(buy_days):
+            cap.loc[buy_days] = rets.loc[buy_days]
+        if len(short_days):
+            cap.loc[short_days] = -rets.loc[short_days]
+
+        trig_mask = combined.isin(['Buy', 'Short'])
+        metrics   = _mp_metrics(cap, trig_mask, BARS_PER_YEAR.get(interval, 252))
+        return {'Interval': interval, 'Members': members, **(metrics or {'Status': 'NO_TRIGGERS'})}
+# ---------------------------------------------------------------------------
 
 # Port fallback logic (Patch 4)
 _WANTED = int(os.environ.get('CONFLUENCE_PORT', '8056'))
@@ -291,12 +502,69 @@ def _build_dynamic_active_pair_smas(library: dict, close: pd.Series) -> tuple:
 # UI LAYOUT
 # =============================================================================
 
+# =============================================================================
+# Multi-Primary Signal Aggregator Section
+# =============================================================================
+
+# --- Multi-Primary section (unified, at top of page) ------------------------
+multi_primary_section = dbc.Container([
+    html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
+    html.H2('Multi-Primary Signal Aggregator', className='text-center', style={'color': '#80ff00'}),
+    html.P('Combine multiple primary tickers and apply unanimous signals to a single secondary ticker.',
+           className='text-center text-muted mb-3', style={'fontSize': '14px'}),
+
+    dbc.Row([
+        dbc.Col([
+            html.Label("Secondary Ticker (Signal Follower):", style={'fontWeight': 'bold', 'color': '#ccc'}),
+            dcc.Input(id='multi-secondary-ticker', type='text', value='TQQQ',
+                      placeholder='e.g., TQQQ', style={'width': '100%', 'padding': '8px'}),
+        ], width=4),
+        dbc.Col([
+            html.Label("Primary Tickers (comma-separated):", style={'fontWeight': 'bold', 'color': '#ccc'}),
+            dcc.Input(id='multi-primary-tickers', type='text', value='SPY, QQQ, AAPL',
+                      placeholder='e.g., SPY, QQQ, AAPL', style={'width': '100%', 'padding': '8px'}),
+        ], width=4),
+        dbc.Col([
+            html.Label("Intervals:", style={'fontWeight': 'bold', 'color': '#ccc'}),
+            dcc.Dropdown(
+                id='multi-primary-intervals',
+                options=[
+                    {'label': '1 Day', 'value': '1d'},
+                    {'label': '1 Week', 'value': '1wk'},
+                    {'label': '1 Month', 'value': '1mo'},
+                    {'label': '3 Months', 'value': '3mo'},
+                    {'label': '1 Year', 'value': '1y'},
+                ],
+                value=['1d', '1wk', '1mo', '3mo', '1y'],
+                multi=True,
+                placeholder="Select intervals",
+                style={'width': '100%', 'color': '#000'}
+            ),
+        ], width=4),
+    ], style={'marginBottom': '12px'}),
+
+    dbc.Row([
+        dbc.Col([
+            dbc.Button("Run Multi-Primary Analysis", id='run-multi-primary',
+                       color='primary', n_clicks=0,
+                       style={'width': '100%', 'fontSize': '16px', 'fontWeight': 'bold'}),
+        ], width=12),
+    ]),
+
+    html.Div(id='multi-primary-results', style={'marginTop': '16px'}),
+], fluid=True, style={'backgroundColor': '#222', 'padding': '20px', 'border': '2px solid #80ff00',
+                      'borderRadius': '10px', 'marginBottom': '30px'})
+# ---------------------------------------------------------------------------
+
 app.layout = html.Div([
     # Header
     html.Div([
         html.H2(APP_TITLE, style={'color': '#80ff00', 'marginBottom': '5px'}),
         html.H5(f"Port {APP_PORT}", style={'color': '#888', 'marginTop': '0'}),
     ], style={'textAlign': 'center', 'padding': '20px'}),
+
+    # Multi-Primary Signal Aggregator Section
+    multi_primary_section,
 
     # Input Section
     dbc.Container([
@@ -415,8 +683,8 @@ def create_status_card(confluence: dict, current_date: str) -> html.Div:
     })
 
 
-def create_breakdown_table(breakdown: dict, time_in_signal: dict) -> html.Div:
-    """Create timeframe breakdown table with Days Held and Signal Start Date."""
+def create_breakdown_table(breakdown: dict, time_in_signal: dict, libraries: dict = None) -> html.Div:
+    """Create timeframe breakdown table with Pair, Days Held, and Signal Start Date."""
     rows = []
 
     for interval in ['1d', '1wk', '1mo', '3mo', '1y']:
@@ -429,9 +697,21 @@ def create_breakdown_table(breakdown: dict, time_in_signal: dict) -> html.Div:
             days_held = time_info.get('days', 0)
             start_date = time_info.get('entry_date_iso', 'N/A')
 
+            # Extract pair information from library
+            pair_text = 'N/A'
+            if libraries and interval in libraries:
+                lib = libraries[interval]
+                if signal == 'Buy' and 'top_buy_pair' in lib:
+                    pair = lib['top_buy_pair']
+                    pair_text = f"({pair[0]}, {pair[1]})"
+                elif signal == 'Short' and 'top_short_pair' in lib:
+                    pair = lib['top_short_pair']
+                    pair_text = f"({pair[0]}, {pair[1]})"
+
             rows.append(html.Tr([
                 html.Td(interval.upper(), style={'color': '#ccc', 'padding': '12px', 'fontWeight': 'bold'}),
                 html.Td(signal, style={'color': signal_color, 'padding': '12px', 'fontWeight': 'bold', 'fontSize': '16px'}),
+                html.Td(pair_text, style={'color': '#aaa', 'padding': '12px', 'fontFamily': 'monospace'}),
                 html.Td(f"{days_held} days" if days_held > 0 else 'N/A', style={'color': '#aaa', 'padding': '12px'}),
                 html.Td(start_date, style={'color': '#aaa', 'padding': '12px'}),
             ]))
@@ -442,6 +722,7 @@ def create_breakdown_table(breakdown: dict, time_in_signal: dict) -> html.Div:
             html.Thead(html.Tr([
                 html.Th("Timeframe", style={'color': '#888', 'padding': '12px', 'textAlign': 'left', 'borderBottom': '2px solid #444'}),
                 html.Th("Signal", style={'color': '#888', 'padding': '12px', 'textAlign': 'left', 'borderBottom': '2px solid #444'}),
+                html.Th("Pair", style={'color': '#888', 'padding': '12px', 'textAlign': 'left', 'borderBottom': '2px solid #444'}),
                 html.Th("Days Held", style={'color': '#888', 'padding': '12px', 'textAlign': 'left', 'borderBottom': '2px solid #444'}),
                 html.Th("Signal Start Date", style={'color': '#888', 'padding': '12px', 'textAlign': 'left', 'borderBottom': '2px solid #444'}),
             ])),
@@ -749,6 +1030,147 @@ def create_confluence_timeline(aligned: pd.DataFrame) -> html.Div:
 # =============================================================================
 
 @app.callback(
+    Output('multi-primary-results', 'children'),
+    Input('run-multi-primary', 'n_clicks'),
+    State('multi-secondary-ticker', 'value'),
+    State('multi-primary-tickers', 'value'),
+    State('multi-primary-intervals', 'value')
+)
+def run_multi_primary_analysis(n_clicks, secondary, tickers_str, intervals):
+    """
+    Multi-Primary Signal Aggregator callback - PHASE 2A unified approach.
+
+    Uses _mp_eval_interval() for SpyMaster-matching metrics.
+    """
+    if not n_clicks:
+        return html.Div([
+            html.P("Configure inputs and click 'Run Multi-Primary Analysis'.",
+                   style={'color': '#888', 'textAlign': 'center', 'marginTop': '10px'})
+        ])
+
+    # Validation
+    if not secondary or not secondary.strip():
+        return html.Div([
+            html.P("Please enter a secondary ticker",
+                   style={'color': '#ff4444', 'textAlign': 'center'})
+        ])
+
+    if not tickers_str or not tickers_str.strip():
+        return html.Div([
+            html.P("Please enter primary tickers (comma-separated)",
+                   style={'color': '#ff4444', 'textAlign': 'center'})
+        ])
+
+    if not intervals or len(intervals) == 0:
+        return html.Div([
+            html.P("Please select at least one interval",
+                   style={'color': '#ff4444', 'textAlign': 'center'})
+        ])
+
+    # Parse inputs
+    secondary = secondary.upper().strip()
+    tickers = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
+
+    logger.info(f"[Multi-Primary] Starting analysis: tickers={tickers}, secondary={secondary}, intervals={intervals}")
+
+    # =========================================================================
+    # Call _mp_eval_interval() for each interval (SpyMaster-matching logic)
+    # =========================================================================
+    table_data = []
+    for interval in intervals:
+        try:
+            row = _mp_eval_interval(tickers, secondary, interval)
+            table_data.append(row)
+        except Exception as e:
+            logger.error(f"[Multi-Primary] Error in {interval}: {e}", exc_info=True)
+            table_data.append({
+                'Interval': interval,
+                'Members': '',
+                'Status': f'ERROR: {str(e)[:50]}',
+                'Triggers': 0,
+                'Wins': 0,
+                'Losses': 0,
+                'Win %': 0.0,
+                'StdDev %': 0.0,
+                'Sharpe': 0.0,
+                't': 'N/A',
+                'p': 'N/A',
+                'Sig 90%': '',
+                'Sig 95%': '',
+                'Sig 99%': '',
+                'Avg Cap %': 0.0,
+                'Total %': 0.0,
+            })
+
+    # =========================================================================
+    # Build Results Table
+    # =========================================================================
+    columns = [
+        {'name': 'Interval', 'id': 'Interval'},
+        {'name': 'Members', 'id': 'Members'},
+        {'name': 'Triggers', 'id': 'Triggers'},
+        {'name': 'Wins', 'id': 'Wins'},
+        {'name': 'Losses', 'id': 'Losses'},
+        {'name': 'Win %', 'id': 'Win %'},
+        {'name': 'StdDev %', 'id': 'StdDev %'},
+        {'name': 'Sharpe', 'id': 'Sharpe'},
+        {'name': 'Avg Cap %', 'id': 'Avg Cap %'},
+        {'name': 'Total %', 'id': 'Total %'},
+        {'name': 't', 'id': 't'},
+        {'name': 'p', 'id': 'p'},
+        {'name': 'Sig 90%', 'id': 'Sig 90%'},
+        {'name': 'Sig 95%', 'id': 'Sig 95%'},
+        {'name': 'Sig 99%', 'id': 'Sig 99%'},
+    ]
+
+    table = dash_table.DataTable(
+        data=table_data,
+        columns=columns,
+        style_table={'overflowX': 'auto'},
+        style_cell={
+            'textAlign': 'center',
+            'padding': '10px',
+            'backgroundColor': '#1a1a1a',
+            'color': '#ccc',
+            'border': '1px solid #444'
+        },
+        style_header={
+            'backgroundColor': '#222',
+            'fontWeight': 'bold',
+            'color': '#80ff00',
+            'border': '1px solid #80ff00'
+        },
+        style_data_conditional=[
+            {
+                'if': {'column_id': 'Sharpe', 'filter_query': '{Sharpe} > 2'},
+                'backgroundColor': '#003300',
+                'color': '#00ff00',
+                'fontWeight': 'bold'
+            },
+            {
+                'if': {'column_id': 'Sharpe', 'filter_query': '{Sharpe} > 4'},
+                'backgroundColor': '#004400',
+                'color': '#00ff00',
+                'fontWeight': 'bold'
+            },
+            {
+                'if': {'column_id': 'Win %', 'filter_query': '{Win %} >= 60'},
+                'color': '#ffaa00',
+                'fontStyle': 'italic'
+            }
+        ]
+    )
+
+    return html.Div([
+        html.H4(f"Multi-Primary Results: {', '.join(tickers)} → {secondary}",
+                style={'color': '#80ff00', 'textAlign': 'center', 'marginBottom': '20px'}),
+        html.P(f"Combined signals applied to {secondary} daily prices",
+               style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px', 'marginBottom': '15px'}),
+        table
+    ])
+
+
+@app.callback(
     Output('results-container', 'children'),
     Input('analyze-btn', 'n_clicks'),
     State('ticker-input', 'value'),
@@ -812,7 +1234,7 @@ def update_results(n_clicks, ticker, selected_timeframes):
         components.append(create_status_card(confluence, current_date.date().isoformat()))
 
         # Breakdown table
-        components.append(create_breakdown_table(confluence['breakdown'], time_in_signal))
+        components.append(create_breakdown_table(confluence['breakdown'], time_in_signal, libraries))
 
         # Individual charts section
         components.append(html.H4("Individual Timeframe Charts",
