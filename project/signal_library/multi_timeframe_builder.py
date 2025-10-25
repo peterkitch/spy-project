@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import warnings
+import gc
+import math
 
 # Suppress DataFrame fragmentation warnings (known issue with iterative SMA calculations)
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
@@ -39,6 +41,7 @@ ENGINE_VERSION = "1.0.0"
 MAX_SMA_DAY = 114
 SIGNAL_LIBRARY_DIR = os.environ.get('SIGNAL_LIBRARY_DIR', 'signal_library/data/stable')
 PRICE_BASIS = os.environ.get('PRICE_BASIS', 'close').lower()
+EPS = 1e-12  # tie/equality tolerance for float parity
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -239,8 +242,8 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
     for window in range(1, MAX_SMA_DAY + 1):
         df[f'SMA_{window}'] = df['Close'].rolling(window=window, min_periods=window).mean()
 
-    # Find optimal buy/short pairs with daily tracking
-    top_buy_pair, top_short_pair, cumulative_capture, daily_top_buy_pairs, daily_top_short_pairs = find_optimal_pairs(df, interval)
+    # Find optimal buy/short pairs with daily tracking (vectorized)
+    top_buy_pair, top_short_pair, cumulative_capture, daily_top_buy_pairs, daily_top_short_pairs = find_optimal_pairs_vectorized(df, interval)
 
     # Generate signal series using DYNAMIC daily pairs (not static)
     signals = generate_signal_series_dynamic(df, daily_top_buy_pairs, daily_top_short_pairs)
@@ -438,6 +441,159 @@ def find_optimal_pairs(df: pd.DataFrame, interval: str) -> Tuple[Tuple[int, int]
     logger.info(f"  Top Short pair: {top_short_pair} (capture: {short_cum[final_short_idx]:.2f}%)")
     logger.info(f"  Combined cumulative capture: {cumulative:.2f}%")
 
+    return top_buy_pair, top_short_pair, cumulative, daily_top_buy_pairs, daily_top_short_pairs
+
+
+def _pairs_from_global_index(idx: np.ndarray, max_sma: int) -> np.ndarray:
+    """
+    Convert global pair indices into (i,j) with i!=j, i,j in [1..max_sma],
+    enumerated in i-major order while skipping j==i.
+    """
+    i = (idx // (max_sma - 1)) + 1
+    j = (idx % (max_sma - 1)) + 1
+    j = np.where(j >= i, j + 1, j)
+    return np.stack([i, j], axis=1).astype(np.int16)
+
+
+def find_optimal_pairs_vectorized(df: pd.DataFrame, interval: str) -> Tuple[Tuple[int, int], Tuple[int, int], float, dict, dict]:
+    """
+    Vectorized replacement for the nested-loop solver.
+    - Signals: use SMA(t-1) comparisons to act on return(t)
+    - Cumulative captures: np.cumsum over the time axis
+    - Tie-break: right-most max (reverse argmax), identical to legacy
+    Returns:
+        (top_buy_pair, top_short_pair, cumulative, daily_top_buy_pairs, daily_top_short_pairs)
+    """
+    num_days = len(df)
+    if num_days < 2:
+        logger.warning("Insufficient data to compute pairs.")
+        # Sentinel objects mirror legacy behavior
+        return (114, 113), (114, 113), 0.0, {}, {}
+
+    # Build SMA matrix [num_days x MAX_SMA_DAY] as float64 for parity
+    sma_matrix = np.empty((num_days, MAX_SMA_DAY), dtype=np.float64)
+    for k in range(1, MAX_SMA_DAY + 1):
+        sma_matrix[:, k - 1] = df[f'SMA_{k}'].to_numpy(dtype=np.float64)
+
+    # Daily returns in percent points
+    returns_pct = (df['Close'].pct_change().fillna(0.0).to_numpy(dtype=np.float64)) * 100.0
+
+    total_pairs = MAX_SMA_DAY * (MAX_SMA_DAY - 1)  # ordered pairs, i!=j
+
+    # Adaptive chunking to cap memory: ~O(num_days * chunk_pairs)
+    if num_days > 20000:
+        chunk_size = 1500
+    elif num_days > 10000:
+        chunk_size = 5000
+    else:
+        chunk_size = 100000
+    chunk_size = min(chunk_size, total_pairs)
+    num_chunks = (total_pairs + chunk_size - 1) // chunk_size
+
+    # Track best per-day values and global pair indices (right-most on ties)
+    neginf = -np.inf
+    buy_best_val = np.full(num_days, neginf, dtype=np.float64)
+    shr_best_val = np.full(num_days, neginf, dtype=np.float64)
+    buy_best_idx = np.full(num_days, -1, dtype=np.int64)
+    shr_best_idx = np.full(num_days, -1, dtype=np.int64)
+
+    for c in range(num_chunks):
+        start = c * chunk_size
+        end = min(start + chunk_size, total_pairs)
+        chunk_len = end - start
+
+        # Map chunk to (i,j) and build column indexers
+        idx = np.arange(start, end, dtype=np.int64)
+        pairs_ij = _pairs_from_global_index(idx, MAX_SMA_DAY)  # int16
+        i_idx = (pairs_ij[:, 0] - 1).astype(np.int64)
+        j_idx = (pairs_ij[:, 1] - 1).astype(np.int64)
+
+        # Gather SMA columns for this chunk: shape (num_days, chunk_len)
+        sma_i = sma_matrix[:, i_idx]
+        sma_j = sma_matrix[:, j_idx]
+
+        # Signals use YESTERDAY's SMA comparisons
+        # First row must be zeros because there is no prior day
+        zeros = np.zeros((1, chunk_len), dtype=bool)
+        buy_sig = np.vstack([zeros, (sma_i[:-1] > sma_j[:-1])])
+        shr_sig = np.vstack([zeros, (sma_i[:-1] < sma_j[:-1])])
+
+        # Vectorized cumulative captures for all pairs at once
+        r = returns_pct[:, None]                  # (num_days, 1)
+        buy_cum = np.cumsum(buy_sig * r, axis=0)  # (num_days, chunk_len)
+        shr_cum = np.cumsum(shr_sig * (-r), axis=0)
+
+        # Row-wise maxima and right-most indices on ties (reverse argmax)
+        bmax = np.max(buy_cum, axis=1)
+        smax = np.max(shr_cum, axis=1)
+        bidx_local = (chunk_len - 1) - np.argmax(buy_cum[:, ::-1], axis=1)
+        sidx_local = (chunk_len - 1) - np.argmax(shr_cum[:, ::-1], axis=1)
+        bidx_global = start + bidx_local
+        sidx_global = start + sidx_local
+
+        # Update where strictly better or equal within EPS but later index
+        b_better = bmax > (buy_best_val + EPS)
+        b_equal_later = (np.abs(bmax - buy_best_val) <= EPS) & (bidx_global > buy_best_idx)
+        b_upd = b_better | b_equal_later
+        buy_best_val[b_upd] = bmax[b_upd]
+        buy_best_idx[b_upd] = bidx_global[b_upd]
+
+        s_better = smax > (shr_best_val + EPS)
+        s_equal_later = (np.abs(smax - shr_best_val) <= EPS) & (sidx_global > shr_best_idx)
+        s_upd = s_better | s_equal_later
+        shr_best_val[s_upd] = smax[s_upd]
+        shr_best_idx[s_upd] = sidx_global[s_upd]
+
+        # Release intermediate arrays
+        del sma_i, sma_j, buy_sig, shr_sig, buy_cum, shr_cum
+        if (c & 3) == 3:
+            gc.collect()
+
+    # Materialize daily pair maps
+    dates = df.index
+    daily_top_buy_pairs: dict = {}
+    daily_top_short_pairs: dict = {}
+
+    # Convert global idx -> (i,j)
+    def _idx_to_pair(gidx: int) -> Tuple[int, int]:
+        if gidx < 0:
+            return (114, 113)
+        ij = _pairs_from_global_index(np.array([gidx], dtype=np.int64), MAX_SMA_DAY)[0]
+        return (int(ij[0]), int(ij[1]))
+
+    for d in range(num_days):
+        bp = _idx_to_pair(int(buy_best_idx[d]))
+        sp = _idx_to_pair(int(shr_best_idx[d]))
+        daily_top_buy_pairs[dates[d]] = (bp, float(buy_best_val[d]))
+        daily_top_short_pairs[dates[d]] = (sp, float(shr_best_val[d]))
+
+    # Final top pairs are the winners on the last day
+    top_buy_pair = _idx_to_pair(int(buy_best_idx[-1]))
+    top_short_pair = _idx_to_pair(int(shr_best_idx[-1]))
+
+    # Combined cumulative capture using dynamic daily pairs (yesterday's winners)
+    cumulative = 0.0
+    for t in range(1, num_days):
+        prev_date = dates[t - 1]
+        (pb_pair, pb_cap) = daily_top_buy_pairs.get(prev_date, ((114, 113), 0.0))
+        (ps_pair, ps_cap) = daily_top_short_pairs.get(prev_date, ((114, 113), 0.0))
+        prev = sma_matrix[t - 1]
+
+        buy_ok = (np.isfinite(prev[pb_pair[0] - 1]) and
+                  np.isfinite(prev[pb_pair[1] - 1]) and
+                  prev[pb_pair[0] - 1] > prev[pb_pair[1] - 1])
+        short_ok = (np.isfinite(prev[ps_pair[0] - 1]) and
+                    np.isfinite(prev[ps_pair[1] - 1]) and
+                    prev[ps_pair[0] - 1] < prev[ps_pair[1] - 1])
+
+        if buy_ok and short_ok:
+            cumulative += returns_pct[t] if (pb_cap > ps_cap) else -returns_pct[t]
+        elif buy_ok:
+            cumulative += returns_pct[t]
+        elif short_ok:
+            cumulative += -returns_pct[t]
+
+    logger.info(f"[Vectorized] {interval}: Top Buy {top_buy_pair}, Top Short {top_short_pair}, Combined {cumulative:.2f}%")
     return top_buy_pair, top_short_pair, cumulative, daily_top_buy_pairs, daily_top_short_pairs
 
 
