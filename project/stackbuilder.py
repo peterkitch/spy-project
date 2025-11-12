@@ -326,8 +326,8 @@ def try_load_rank_from_impact_xlsx(sec: str, dirpath: str, max_age_days: int) ->
                 except Exception:
                     continue
                 base = fn.upper()
-                # Must contain the secondary ticker name to be considered
-                if (sec_up and sec_up in base) or (sec_clean and sec_clean in base):
+                # Must match the secondary ticker name exactly at start of filename
+                if base.startswith(sec_up + '_') or base.startswith(sec_clean + '_'):
                     cands.append((mtime, p, base))
 
         if not cands:
