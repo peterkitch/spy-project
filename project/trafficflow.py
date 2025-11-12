@@ -3199,7 +3199,7 @@ def make_app():
                     # Highlight planned flips (Now != NEXT)
                     {"if": {"filter_query": "{Now} != {NEXT}"}, "boxShadow": "0 0 8px rgba(255,255,0,0.25)"}
                 ],
-                page_size=200
+                page_size=500
             ),
         ], style={"backgroundColor":"#000000","minHeight":"100vh","padding":"16px","margin":"0"})
     ]
