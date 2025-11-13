@@ -27,6 +27,9 @@ import math
 
 # Suppress DataFrame fragmentation warnings (known issue with iterative SMA calculations)
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
+# Suppress timezone conversion warnings
+warnings.filterwarnings('ignore', category=UserWarning, message='.*timezone information.*')
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Import existing signal library components
 try:
@@ -69,7 +72,7 @@ def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') 
     # Fetch based on interval
     if interval == '1y':
         # Yahoo doesn't provide 1y interval - resample from daily
-        logger.info(f"{vendor}: Resampling daily -> yearly (A-DEC: last trading day of calendar year)")
+        logger.info(f"{vendor}: Resampling daily -> yearly (YE-DEC: last trading day of calendar year)")
         df_daily = yf.download(vendor, period='max', interval='1d',
                               auto_adjust=False, progress=False, threads=False)
 
@@ -80,9 +83,25 @@ def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') 
         if isinstance(df_daily.columns, pd.MultiIndex):
             df_daily.columns = df_daily.columns.get_level_values(0)
 
-        # Patch 1: Explicit A-DEC resample (year ending December 31)
+        # Patch 1: Explicit YE-DEC resample (year ending December 31)
         # Resample to year-end (last trading day of each calendar year)
-        df = df_daily[['Close']].resample('A-DEC').last()
+        df = df_daily[['Close']].resample('YE-DEC').last()
+
+    elif interval == '3mo':
+        # Yahoo 3mo has misaligned quarter boundaries - resample from daily to align all tickers
+        logger.info(f"{vendor}: Resampling daily -> quarterly (QS: standard calendar quarters Jan/Apr/Jul/Oct)")
+        df_daily = yf.download(vendor, period='max', interval='1d',
+                              auto_adjust=False, progress=False, threads=False)
+
+        if df_daily is None or df_daily.empty:
+            raise ValueError(f"No daily data available for {vendor}")
+
+        # Flatten MultiIndex if present
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+
+        # Resample to quarter-start (first trading day of Jan/Apr/Jul/Oct)
+        df = df_daily[['Close']].resample('QS').first()
 
     else:
         # Use Yahoo native interval
@@ -155,10 +174,10 @@ def apply_t1_skip(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     now = pd.Timestamp.utcnow()
 
     freq_map = {
-        '1wk': 'W-FRI',    # Yahoo weekly ends on Friday
-        '1mo': 'M',        # Monthly ends on last day of month
-        '3mo': 'Q-DEC',    # Quarterly ends on Dec/Mar/Jun/Sep
-        '1y': 'A-DEC'      # Yearly ends on December 31
+        '1wk': 'W-MON',    # Yahoo weekly ends on Monday
+        '1mo': 'MS',       # Yahoo monthly starts on 1st day of month
+        '3mo': 'QS',       # Custom quarterly - resampled to standard calendar quarters (Jan/Apr/Jul/Oct)
+        '1y': 'YE-DEC'     # Custom yearly - resampled to last trading day of year (Dec 31)
     }
 
     freq = freq_map.get(interval)
@@ -731,13 +750,14 @@ def calculate_signal_entry_dates(signals: pd.Series) -> pd.Series:
     return entry_dates
 
 
-def save_signal_library(library: dict, interval: str) -> str:
+def save_signal_library(library: dict, interval: str, force_overwrite: bool = False) -> str:
     """
     Save signal library to disk with correct naming convention.
 
     Args:
         library: Library dictionary
         interval: Interval string
+        force_overwrite: Bypass environment variable check for daily overwrite
 
     Returns:
         Path to saved file
@@ -749,10 +769,10 @@ def save_signal_library(library: dict, interval: str) -> str:
 
     # CRITICAL: Prevent daily overwrite unless explicitly allowed
     if interval == '1d':
-        if os.getenv('CONFLUENCE_ALLOW_DAILY_OVERWRITE', '0') != '1':
+        if not force_overwrite and os.getenv('CONFLUENCE_ALLOW_DAILY_OVERWRITE', '0') != '1':
             raise ValueError(
                 f"Attempted to overwrite daily library for {ticker}. "
-                f"Set CONFLUENCE_ALLOW_DAILY_OVERWRITE=1 to allow (NOT recommended)."
+                f"Use --force-overwrite flag to allow (NOT recommended)."
             )
         # Daily has no suffix
         filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
@@ -781,6 +801,8 @@ def main():
                        help='Comma-separated intervals (default: 1wk,1mo,3mo,1y)')
     parser.add_argument('--allow-daily', action='store_true',
                        help='Allow rebuilding daily library (NOT recommended)')
+    parser.add_argument('--force-overwrite', action='store_true',
+                       help='Force overwrite of daily library (bypasses environment variable check)')
 
     args = parser.parse_args()
 
@@ -802,7 +824,7 @@ def main():
         try:
             library = generate_signals_for_interval(ticker, interval)
             if library:
-                save_signal_library(library, interval)
+                save_signal_library(library, interval, force_overwrite=args.force_overwrite)
         except Exception as e:
             logger.error(f"Failed to build {ticker} {interval}: {e}")
             import traceback
