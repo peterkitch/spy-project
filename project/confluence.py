@@ -119,11 +119,11 @@ def _probe_lib_info(ticker: str, interval: str) -> dict:
     """
     # Temporarily suppress INFO logging AND warnings to prevent diagnostics spam
     import warnings
-    logger = logging.getLogger()
-    original_level = logger.level
-    logger.setLevel(logging.WARNING)
+    root_logger = logging.getLogger()
+    orig = root_logger.level
 
     try:
+        root_logger.setLevel(logging.WARNING)
         # Suppress FutureWarning and UserWarning from pandas operations
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=FutureWarning)
@@ -174,7 +174,7 @@ def _probe_lib_info(ticker: str, interval: str) -> dict:
             return info
     finally:
         # Restore original logging level
-        logger.setLevel(original_level)
+        root_logger.setLevel(orig)
 # ---------------------------------------------------------------------------
 
 def _mp_to_naive_days(idx_like) -> pd.DatetimeIndex:
@@ -407,29 +407,147 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         sig_df   = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
         combined = _mp_combine_unanimity_vectorized(sig_df)
 
-        # Bar-to-bar returns computed DIRECTLY on the 'dates' grid (avoids reindex+shift edge cases)
-        prices_on_grid = sec_close.reindex(dates)
-        rets_next = _mp_forward_return_on_grid(prices_on_grid)  # forward return on same grid
+        # Use same-bar returns on the interval grid (parity with daily path)
+        # Signal at bar N uses previous bar's info to trade bar N's return
+        rets_grid = _mp_safe_pct_change(sec_close).reindex(dates).fillna(0.0)
 
         # Apply signals on interval bars only
-        # Signal at bar N captures return from bar N to bar N+1 (forward-looking)
         cap = pd.Series(0.0, index=dates, dtype=float)
         buy_days   = combined.index[combined.eq('Buy')]
         short_days = combined.index[combined.eq('Short')]
 
         if len(buy_days):
-            cap.loc[buy_days] = rets_next.loc[buy_days]
+            cap.loc[buy_days] = rets_grid.loc[buy_days]
         if len(short_days):
-            cap.loc[short_days] = -rets_next.loc[short_days]
+            cap.loc[short_days] = -rets_grid.loc[short_days]
 
-        # Optional visibility for the intermittent 1mo issue
+        # Optional visibility for the 1mo path
         if interval == '1mo':
-            nz = int(np.count_nonzero(rets_next.values))
-            logger.info(f"[1mo] forward-return sanity: nonzero={nz} / {len(rets_next)}")
+            nz = int(np.count_nonzero(rets_grid.values))
+            logger.info(f"[1mo] return sanity: nonzero={nz} / {len(rets_grid)}")
 
         trig_mask = combined.isin(['Buy', 'Short'])
         metrics   = _mp_metrics(cap, trig_mask, BARS_PER_YEAR.get(interval, 252))
         return {'Interval': interval, 'Members': members, **(metrics or {'Status': 'NO_TRIGGERS'})}
+
+def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flags=None, mute_flags=None) -> pd.Series:
+    """
+    Build the *signal series* (Buy/Short/None) for the secondary by combining the primaries
+    with unanimity rules, matching _mp_eval_interval's calendars.
+    Returns a Series indexed by dates where the signal is evaluated.
+    """
+    invert_flags = invert_flags or [False] * len(primaries)
+    mute_flags   = mute_flags   or [False] * len(primaries)
+
+    # Load secondary prices
+    sec_df = fetch_interval_data(secondary, '1d' if interval == '1d' else interval)
+    if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
+        return pd.Series(dtype=object)
+    if isinstance(sec_df.columns, pd.MultiIndex):
+        sec_df.columns = sec_df.columns.get_level_values(0)
+    sec_idx  = _mp_to_naive_days(sec_df.index)
+    close_data = sec_df['Close']
+    if isinstance(close_data, pd.DataFrame):
+        close_data = close_data.iloc[:, 0]
+    sec_close = pd.Series(pd.to_numeric(close_data.values, errors='coerce'), index=sec_idx, dtype='float64')
+
+    # Load primaries (native calendars; no alignment yet)
+    series_map = {}
+    inv_map = {}
+    for t, inv, m in zip(primaries, invert_flags, mute_flags):
+        if not t or m:
+            continue
+        lib = load_signal_library_interval(t.strip().upper(), interval)
+        if not lib:
+            continue
+        dates = _mp_to_naive_days(lib.get('dates', []))
+        raw   = lib.get('primary_signals', lib.get('signals', []))
+        sigs  = pd.Series([_mp_decode_sig(x) for x in raw], index=dates, dtype=object)
+        sigs  = sigs[~sigs.index.duplicated(keep='last')].sort_index()
+        if inv:
+            arr = sigs.to_numpy(object)
+            arr = np.where(arr == 'Buy', 'Short', np.where(arr == 'Short', 'Buy', arr))
+            sigs = pd.Series(arr, index=sigs.index, dtype=object)
+        series_map[t.strip().upper()] = sigs
+        inv_map[t.strip().upper()]    = inv
+
+    if not series_map:
+        return pd.Series(dtype=object)
+
+    if interval == '1d':
+        # 1) intersect primaries
+        prim_series = list(series_map.values())
+        common_dates = sorted(set.intersection(*[set(s.index) for s in prim_series]))
+        if not common_dates:
+            return pd.Series(dtype=object)
+
+        # 2) combine on primary-intersection only
+        sig_df = pd.DataFrame({t: series_map[t].reindex(common_dates) for t in series_map}, index=common_dates)
+        combined = _mp_combine_unanimity_vectorized(sig_df).astype(str)
+
+        # 3) intersect with secondary calendar (no ffill of signals)
+        grid = pd.Index(common_dates).intersection(sec_close.index)
+        if len(grid) == 0:
+            return pd.Series(dtype=object)
+
+        return combined.reindex(grid)
+
+    else:
+        # native interval: strict intersection across primaries and secondary
+        common = set(sec_close.index)
+        for s in series_map.values():
+            common &= set(s.index)
+        if not common:
+            return pd.Series(dtype=object)
+        dates = pd.DatetimeIndex(sorted(common))
+        sig_df = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
+        combined = _mp_combine_unanimity_vectorized(sig_df).astype(str)
+        return combined
+
+def _compute_entry_dates_from_signals(dates: pd.DatetimeIndex, sigs: pd.Series) -> pd.Series:
+    """
+    Return a series of the latest entry date for each bar based on changes in Buy/Short/None.
+    Used to populate signal_entry_dates in virtual libraries for time-in-signal calculations.
+    """
+    s = sigs.fillna('None').astype(str)
+    changed = s.ne(s.shift(1)).fillna(True)
+    entry_dates = pd.Series(pd.NaT, index=dates)
+    last_entry = pd.NaT
+    for i, chg in enumerate(changed):
+        if chg:
+            last_entry = dates[i]
+        entry_dates.iloc[i] = last_entry
+    return entry_dates
+
+def _is_virtual_mode(library: dict) -> bool:
+    """Check if library is virtual (from multi-primary) vs real (from disk)."""
+    return library.get('origin') == 'virtual-multi-primary'
+
+def _mp_build_virtual_libraries(primaries, secondary, intervals, invert_flags=None, mute_flags=None) -> dict:
+    """
+    Build a {interval: library_dict} for the SECONDARY using the combined multi-primary signals.
+    Tagged as 'virtual-multi-primary' to allow downstream code to suppress pair overlays.
+    """
+    libs = {}
+    for iv in intervals:
+        ser = _mp_build_combined_signal_series(primaries, secondary, iv, invert_flags, mute_flags)
+        if ser is None or ser.empty:
+            continue
+        ser = ser.dropna()
+
+        # Compute entry dates for time-in-signal display
+        entry_dates = _compute_entry_dates_from_signals(ser.index, ser)
+
+        libs[iv] = {
+            'ticker': secondary,
+            'interval': iv,
+            'origin': 'virtual-multi-primary',              # Tag virtual mode
+            'dates': ser.index.tolist(),
+            'signals': ser.astype(str).tolist(),
+            'primary_signals': ser.astype(str).tolist(),    # Alias
+            'signal_entry_dates': entry_dates.tolist(),     # Enable time-in-signal
+        }
+    return libs
 # ---------------------------------------------------------------------------
 
 # Port fallback logic (Patch 4)
@@ -465,6 +583,10 @@ app = dash.Dash(
 )
 
 app.title = APP_TITLE
+
+# Store the most recent Multi-Primary run (secondary, frames, context)
+# Used to bridge into the Analyze Confluence section
+mp_bridge_store = dcc.Store(id='mp-last-run')
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -816,6 +938,11 @@ multi_primary_section = dbc.Container([
                        style={'width': '100%', 'fontSize': '16px', 'fontWeight': 'bold'}),
 
             html.Br(), html.Br(),
+            dbc.Button("Apply to Analyze", id='mp-apply-to-analyze',
+                       color='info', n_clicks=0,
+                       style={'width': '100%', 'fontSize': '14px', 'fontWeight': 'bold'}),
+
+            html.Br(), html.Br(),
             dbc.Button("Rescan Libraries", id='mp-rescan',
                        color='secondary', outline=True, size='sm',
                        style={'width': '100%'}),
@@ -880,6 +1007,9 @@ app.layout = html.Div([
 
     # Multi-Primary Signal Aggregator Section
     multi_primary_section,
+
+    # Hidden bridge store (must be part of layout)
+    mp_bridge_store,
 
     # Input Section
     dbc.Container([
@@ -1084,11 +1214,17 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
             close
         )
 
-        # Get current top pairs for subtitle
-        last_date = pd.to_datetime(dates_in[-1])
-        if hasattr(last_date, 'tz') and last_date.tz is not None:
-            last_date = last_date.tz_localize(None)
-        pairs_info = get_current_top_pairs_for_date(library, last_date)
+        # Check if virtual mode (multi-primary applied)
+        is_virtual = _is_virtual_mode(library)
+
+        # Get current top pairs for subtitle (skip if virtual)
+        if not is_virtual:
+            last_date = pd.to_datetime(dates_in[-1])
+            if hasattr(last_date, 'tz') and last_date.tz is not None:
+                last_date = last_date.tz_localize(None)
+            pairs_info = get_current_top_pairs_for_date(library, last_date)
+        else:
+            pairs_info = None
 
         # Build hover data efficiently using vectorized alignment
         lib_dates = pd.to_datetime(dates_in)
@@ -1101,32 +1237,87 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
         # Align signals to price index
         sig_series = pd.Series(sigs_in, index=lib_dates).reindex(close.index, method='ffill').fillna('None')
 
-        # Build pair series - convert daily_top_*_pairs to aligned series
-        bmap = library.get('daily_top_buy_pairs', {})
-        smap = library.get('daily_top_short_pairs', {})
+        # Build pair series - convert daily_top_*_pairs to aligned series (skip if virtual)
+        if not is_virtual:
+            bmap = library.get('daily_top_buy_pairs', {})
+            smap = library.get('daily_top_short_pairs', {})
+        else:
+            bmap = {}
+            smap = {}
 
         # Normalize pair maps to Series indexed by date
         def _map_to_series(pair_map, idx):
+            """
+            Normalize {date: ((a,b), cap)} into a Series aligned to idx with ffill.
+            - Coerces keys to tz-naive timestamps
+            - Falls back safely if keys are not parseable
+            """
+            if not pair_map:
+                return pd.Series(index=idx, dtype=object)
+
             normalized = {}
             for k, v in pair_map.items():
-                dt = pd.to_datetime(k)
-                if hasattr(dt, 'tz') and dt.tz is not None:
+                # 1) best-effort to parse key as timestamp
+                dt = pd.to_datetime(k, errors='coerce')
+                if pd.isna(dt):
+                    # handle common epoch integer encodings
+                    if isinstance(k, (int, np.integer)):
+                        # decide unit by magnitude (s vs ms vs ns)
+                        try:
+                            if k > 10**12:
+                                dt = pd.to_datetime(k, unit='ns', errors='coerce')
+                            elif k > 10**10:
+                                dt = pd.to_datetime(k, unit='ms', errors='coerce')
+                            else:
+                                dt = pd.to_datetime(k, unit='s', errors='coerce')
+                        except Exception:
+                            dt = pd.NaT
+                if pd.isna(dt):
+                    # drop unparseable keys
+                    continue
+
+                # 2) make tz-naive
+                if getattr(dt, "tz", None) is not None:
                     dt = dt.tz_localize(None)
-                # v is ((pair), capture)
-                if isinstance(v, (tuple, list)) and len(v) == 2:
-                    normalized[dt] = v  # Keep full tuple
+
+                # 3) value normalization: ((pair), cap) or (pair) → (pair, cap)
+                if isinstance(v, (tuple, list)) and len(v) == 2 and isinstance(v[0], (tuple, list)):
+                    pair = tuple(v[0]); cap = float(v[1])
+                elif isinstance(v, (tuple, list)) and len(v) == 2 and isinstance(v[0], (int, np.integer)):
+                    pair = (int(v[0]), int(v[1])); cap = 0.0
                 else:
-                    normalized[dt] = (v, 0.0)
-            ser = pd.Series(normalized).sort_index()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"_map_to_series: input length={len(pair_map)}, series length={len(ser)}, target index length={len(idx)}")
-                logger.debug(f"  Series date range: {ser.index[0].date()} to {ser.index[-1].date()}")
-                logger.debug(f"  Target index range: {idx[0].date()} to {idx[-1].date()}")
-            aligned = ser.reindex(idx, method='ffill')
-            # Clear past library end (prevent static pair leakage)
+                    # last-resort: no capture available
+                    try:
+                        pair = tuple(v); cap = 0.0
+                    except Exception:
+                        continue
+
+                normalized[dt] = (pair, cap)
+
+            if not normalized:
+                # nothing usable → return an empty aligned series
+                return pd.Series(index=idx, dtype=object)
+
+            ser = pd.Series(normalized)
+            # ensure a proper DatetimeIndex
+            ser.index = pd.to_datetime(ser.index, errors='coerce')
+            ser = ser[ser.index.notna()].sort_index()
+
+            try:
+                aligned = ser.reindex(idx, method='ffill')
+            except Exception as e:
+                logger.warning(f"Pair-map reindex fallback: {e}")
+                # asof-like manual fallback
+                aligned = pd.Series(index=idx, dtype=object)
+                if len(ser):
+                    # align by merging and ffill on a combined frame
+                    tmp = pd.DataFrame({'v': ser})
+                    tmp = tmp.reindex(tmp.index.union(idx)).sort_index()
+                    tmp['v'] = tmp['v'].ffill()
+                    aligned = tmp.loc[idx, 'v']
+
+            # Clear beyond library end (prevent static pair leakage)
             aligned.loc[aligned.index > lib_end] = None
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"  After reindex: length={len(aligned)}, non-null={aligned.notna().sum()}")
             return aligned
 
         buy_pair_series = _map_to_series(bmap, close.index)
@@ -1177,15 +1368,17 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
         ))
 
         # Trace 2: Cumulative Combined Capture (right Y-axis) - THE KEY METRIC
-        fig.add_trace(go.Scatter(
-            x=capture_series.index,
-            y=capture_series,
-            mode='lines',
-            name='Cumulative Combined Capture',
-            line=dict(color='#00eaff', width=2),
-            yaxis='y2',
-            customdata=np.column_stack([active_signals, top_buy_pairs, top_buy_captures, top_short_pairs, top_short_captures]),
-            hovertemplate=(
+        # Hover template varies by mode
+        if is_virtual:
+            hovertemplate = (
+                '<b>%{x|%Y-%m-%d}</b><br>'
+                'Active Signal: %{customdata[0]}<br>'
+                'Cumulative Combined Capture: %{y:.2f}%<br>'
+                '<extra></extra>'
+            )
+            customdata = np.column_stack([active_signals])
+        else:
+            hovertemplate = (
                 '<b>%{x|%Y-%m-%d}</b><br>'
                 'Active Signal: %{customdata[0]}<br>'
                 'Cumulative Combined Capture: %{y:.2f}%<br>'
@@ -1193,15 +1386,29 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
                 'Top Short Pair: %{customdata[3]} (%{customdata[4]})'
                 '<extra></extra>'
             )
+            customdata = np.column_stack([active_signals, top_buy_pairs, top_buy_captures, top_short_pairs, top_short_captures])
+
+        fig.add_trace(go.Scatter(
+            x=capture_series.index,
+            y=capture_series,
+            mode='lines',
+            name='Cumulative Combined Capture',
+            line=dict(color='#00eaff', width=2),
+            yaxis='y2',
+            customdata=customdata,
+            hovertemplate=hovertemplate
         ))
 
         # Build subtitle with performance metrics
         final_capture = capture_series.iloc[-1] if len(capture_series) > 0 else 0.0
-        subtitle = (
-            f"Combined Capture: {final_capture:.2f}% | "
-            f"Current Top Buy: {pair_str(pairs_info['top_buy_pair'])} {pairs_info['top_buy_capture']:.2f}% · "
-            f"Top Short: {pair_str(pairs_info['top_short_pair'])} {pairs_info['top_short_capture']:.2f}%"
-        )
+        if is_virtual:
+            subtitle = f"Combined Capture (multi-primary unanimity): {final_capture:.2f}% — pair overlays not applicable"
+        else:
+            subtitle = (
+                f"Combined Capture: {final_capture:.2f}% | "
+                f"Current Top Buy: {pair_str(pairs_info['top_buy_pair'])} {pairs_info['top_buy_capture']:.2f}% · "
+                f"Top Short: {pair_str(pairs_info['top_short_pair'])} {pairs_info['top_short_capture']:.2f}%"
+            )
 
         # Layout with dual Y-axes
         fig.update_layout(
@@ -1256,7 +1463,8 @@ def create_confluence_timeline(aligned: pd.DataFrame) -> html.Div:
             mid = idx[-730:-365:5]
             # Older: monthly (every 21 business days)
             early = idx[:-730:21]
-            dates = early.append(mid).append(last)
+            # Modern pandas: use concatenate instead of deprecated append
+            dates = pd.Index(np.concatenate([early.values, mid.values, last.values]))
 
         tiers = []
         alignment_pcts = []
@@ -1580,7 +1788,8 @@ def update_mp_diagnostics(primary_vals, intervals, secondary, rescan_clicks, run
 
 
 @app.callback(
-    Output('multi-primary-results', 'children'),
+    [Output('multi-primary-results', 'children'),
+     Output('mp-last-run', 'data')],
     Input('run-multi-primary', 'n_clicks'),
     State('multi-secondary-ticker', 'value'),
     State({'type': 'primary-input', 'index': ALL}, 'value'),
@@ -1595,15 +1804,15 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
     Uses _mp_eval_interval() for SpyMaster-matching metrics.
     """
     if not n_clicks:
-        return html.Div([
+        return (html.Div([
             html.P("Configure inputs and click 'Run Multi-Primary Analysis'.",
                    style={'color': '#888', 'textAlign': 'center', 'marginTop': '10px'})
-        ])
+        ]), no_update)
 
     # Validate secondary
     if not secondary or not secondary.strip():
-        return html.Div([html.P("Please enter a secondary ticker",
-                                style={'color': '#ff4444', 'textAlign': 'center'})])
+        return (html.Div([html.P("Please enter a secondary ticker",
+                                 style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
     # Build primaries + flags from rows
     primaries = []
@@ -1616,18 +1825,18 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
             mute_flags.append('mute' in (mval or []))
 
     if not primaries:
-        return html.Div([html.P("Please enter at least one primary ticker",
-                                style={'color': '#ff4444', 'textAlign': 'center'})])
+        return (html.Div([html.P("Please enter at least one primary ticker",
+                                 style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
     # Active rows?
     if all(mute_flags):
-        return html.Div([html.P("All primaries are muted. Unmute at least one.",
-                                style={'color': '#ff4444', 'textAlign': 'center'})])
+        return (html.Div([html.P("All primaries are muted. Unmute at least one.",
+                                 style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
     # Validate intervals
     if not intervals:
-        return html.Div([html.P("Please select at least one interval",
-                                style={'color': '#ff4444', 'textAlign': 'center'})])
+        return (html.Div([html.P("Please select at least one interval",
+                                 style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
     secondary = secondary.strip().upper()
     logger.info(f"[Multi-Primary] Starting analysis: primaries={primaries}, secondary={secondary}, intervals={intervals}")
@@ -1692,29 +1901,36 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
         },
     )
 
-    return html.Div([
+    # Bridge payload for Apply-to-Analyze
+    mp_ctx = {
+        'secondary': secondary,
+        'primaries': primaries,
+        'invert_flags': invert_flags,
+        'mute_flags': mute_flags,
+        'intervals': intervals
+    }
+
+    return (html.Div([
         html.H4(f"Multi-Primary Results: {', '.join(primaries)} → {secondary}",
                 style={'color': '#80ff00', 'textAlign': 'center', 'marginBottom': '12px'}),
         html.P("Signals and returns are computed on each interval's native calendar; 1d uses daily ffill parity.",
                style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px', 'marginBottom': '12px'}),
         table
-    ])
+    ]), mp_ctx)
 
 
-@app.callback(
-    Output('results-container', 'children'),
-    Input('analyze-btn', 'n_clicks'),
-    State('ticker-input', 'value'),
-    State('timeframe-toggles', 'value')
-)
-def update_results(n_clicks, ticker, selected_timeframes):
-    """Main callback to update all results."""
-    if n_clicks == 0:
-        return html.Div([
-            html.P("Enter a ticker symbol and click 'Analyze Confluence' to begin.",
-                   style={'color': '#888', 'textAlign': 'center', 'fontSize': '18px', 'marginTop': '50px'})
-        ])
+def _render_analyze_view(ticker: str, selected_timeframes: list,
+                         prebuilt_libraries: dict = None,
+                         mode_banner: str = None) -> html.Div:
+    """
+    Shared renderer used by both the manual Analyze button and Apply-to-Analyze.
 
+    Args:
+        ticker: Ticker symbol to analyze
+        selected_timeframes: List of intervals to display
+        prebuilt_libraries: Optional dict of virtual libraries (from multi-primary bridge)
+        mode_banner: Optional banner text to display at top (e.g. "Multi-Primary Applied Mode")
+    """
     if not ticker:
         return html.Div([
             html.P("Please enter a ticker symbol.",
@@ -1730,9 +1946,13 @@ def update_results(n_clicks, ticker, selected_timeframes):
     ticker = ticker.upper().strip()
 
     try:
-        # Load libraries
-        logger.info(f"Loading confluence data for {ticker}: {selected_timeframes}")
-        libraries = load_confluence_data(ticker, selected_timeframes)
+        # Load libraries: use prebuilt (multi-primary applied) or load from disk (single ticker)
+        if prebuilt_libraries is not None and len(prebuilt_libraries) > 0:
+            logger.info(f"Using prebuilt multi-primary libraries for {ticker}: {list(prebuilt_libraries.keys())}")
+            libraries = {iv: prebuilt_libraries[iv] for iv in selected_timeframes if iv in prebuilt_libraries}
+        else:
+            logger.info(f"Loading confluence data for {ticker}: {selected_timeframes}")
+            libraries = load_confluence_data(ticker, selected_timeframes)
 
         if not libraries:
             return html.Div([
@@ -1761,6 +1981,13 @@ def update_results(n_clicks, ticker, selected_timeframes):
         # Build UI components
         components = []
 
+        # Add mode banner if provided (multi-primary applied mode)
+        if mode_banner:
+            components.append(
+                dbc.Alert(mode_banner, color='info',
+                         style={'marginBottom': '20px', 'fontSize': '16px', 'fontWeight': 'bold'})
+            )
+
         # Status card
         components.append(create_status_card(confluence, current_date.date().isoformat()))
 
@@ -1784,6 +2011,87 @@ def update_results(n_clicks, ticker, selected_timeframes):
         logger.error(f"Error analyzing {ticker}: {e}", exc_info=True)
         return html.Div([
             html.P(f"Error analyzing {ticker}: {str(e)}",
+                   style={'color': '#ff4444', 'textAlign': 'center', 'fontSize': '18px'}),
+            html.P("Check console for details.",
+                   style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px'})
+        ])
+
+
+@app.callback(
+    Output('results-container', 'children'),
+    Input('analyze-btn', 'n_clicks'),
+    State('ticker-input', 'value'),
+    State('timeframe-toggles', 'value')
+)
+def update_results(n_clicks, ticker, selected_timeframes):
+    """Main callback to update all results."""
+    if n_clicks == 0:
+        return html.Div([
+            html.P("Enter a ticker symbol and click 'Analyze Confluence' to begin.",
+                   style={'color': '#888', 'textAlign': 'center', 'fontSize': '18px', 'marginTop': '50px'})
+        ])
+
+    return _render_analyze_view(ticker, selected_timeframes)
+
+
+@app.callback(
+    Output('results-container', 'children', allow_duplicate=True),
+    Input('mp-apply-to-analyze', 'n_clicks'),
+    State('mp-last-run', 'data'),
+    prevent_initial_call=True
+)
+def apply_mp_to_analyze(n_clicks, mp_ctx):
+    """
+    One-click bridge: apply the latest Multi-Primary run to the Analyze view.
+
+    Builds virtual libraries containing combined multi-primary signals applied to the secondary ticker,
+    then renders the full confluence analysis view showing the secondary's price movements
+    using the primaries' combined signals.
+    """
+    if not n_clicks or not mp_ctx or not mp_ctx.get('secondary'):
+        return no_update
+
+    # Extract full context from stored Multi-Primary run
+    secondary = mp_ctx['secondary']
+    primaries = mp_ctx.get('primaries', [])
+    intervals = mp_ctx.get('intervals') or ['1d', '1wk', '1mo', '3mo', '1y']
+    invert_flags = mp_ctx.get('invert_flags', [False] * len(primaries))
+    mute_flags = mp_ctx.get('mute_flags', [False] * len(primaries))
+
+    logger.info(f"[Bridge] Building virtual libraries: {primaries} -> {secondary} on {intervals}")
+
+    try:
+        # Build virtual libraries containing combined multi-primary signals
+        virtual_libs = _mp_build_virtual_libraries(
+            primaries=primaries,
+            secondary=secondary,
+            intervals=intervals,
+            invert_flags=invert_flags,
+            mute_flags=mute_flags
+        )
+
+        if not virtual_libs:
+            return html.Div([
+                html.P("Failed to build virtual libraries from multi-primary signals.",
+                       style={'color': '#ff4444', 'textAlign': 'center', 'fontSize': '18px'})
+            ])
+
+        # Create informative banner
+        primary_list = ', '.join(primaries)
+        banner = f"Multi-Primary Applied Mode: Combined unanimity signals from [{primary_list}] applied to {secondary}"
+
+        # Render confluence view with virtual libraries
+        return _render_analyze_view(
+            ticker=secondary,
+            selected_timeframes=intervals,
+            prebuilt_libraries=virtual_libs,
+            mode_banner=banner
+        )
+
+    except Exception as e:
+        logger.error(f"[Bridge] Error applying multi-primary to analyze: {e}", exc_info=True)
+        return html.Div([
+            html.P(f"Error building confluence view: {str(e)}",
                    style={'color': '#ff4444', 'textAlign': 'center', 'fontSize': '18px'}),
             html.P("Check console for details.",
                    style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px'})
