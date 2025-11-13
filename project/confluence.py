@@ -7,17 +7,25 @@ Port: 8056 (with fallback if occupied)
 """
 
 import os
-import sys
 import logging
+import glob
+from typing import Optional, Tuple, Dict
+from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
 
 import dash
-from dash import dcc, html, dash_table, Input, Output, State
+from dash import dcc, html, dash_table, Input, Output, State, no_update
+from dash.dependencies import ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
+import json
+import warnings
+
+# Suppress warnings globally for the entire application
+warnings.filterwarnings('ignore', category=UserWarning, message='.*timezone information.*')
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Import confluence engine
 from signal_library.confluence_analyzer import (
@@ -31,7 +39,8 @@ from signal_library.confluence_analyzer import (
 from signal_library.multi_timeframe_builder import fetch_interval_data
 
 # Logging (must be defined before port check)
-logging.basicConfig(level=logging.INFO)
+LEVEL = os.environ.get('CONFLUENCE_LOG_LEVEL', 'INFO').upper()
+logging.basicConfig(level=getattr(logging, LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 # --- PHASE 2A: Multi-Primary core helpers (drop-in) -------------------------
@@ -52,6 +61,122 @@ BARS_PER_YEAR = {
     '1y': 1,
 }
 
+# --- Library probing and freshness helpers -----------------------------------
+def _freq_for_interval(interval: str) -> str:
+    return {
+        '1d':  'D',
+        '1wk': 'W-MON',   # week starts Monday
+        '1mo': 'MS',      # month start
+        '3mo': 'QS-DEC',  # quarter start, Dec year end
+        '1y':  'YE-DEC',  # year end, Dec
+    }.get(interval, 'D')
+
+def _expected_last_complete_bar(idx_like, interval: str) -> Optional[pd.Timestamp]:
+    if idx_like is None:
+        return None
+    idx = pd.DatetimeIndex(pd.to_datetime(idx_like))
+    if len(idx) == 0:
+        return None
+    last = idx[-1]
+    now = pd.Timestamp.now(tz=last.tz)
+    try:
+        if last.to_period(_freq_for_interval(interval)) == now.to_period(_freq_for_interval(interval)):
+            # current, incomplete period -> use prior bar if available
+            return idx[-2] if len(idx) > 1 else last
+    except Exception:
+        pass
+    return last
+
+def _locate_lib_file(ticker: str, interval: str) -> Optional[str]:
+    # search stable and other subfolders; pick newest by mtime
+    # Special case: 1d files have no interval suffix (e.g., SPY_stable_v1_0_0.pkl)
+    if interval == '1d':
+        pat = os.path.join('signal_library', 'data', '**', f'{ticker}_stable_v*.pkl')
+        files = glob.glob(pat, recursive=True)
+        # Exclude files with interval suffixes (1wk, 1mo, etc.)
+        files = [f for f in files if not any(f.endswith(f'_{iv}.pkl') for iv in ['1wk', '1mo', '3mo', '1y'])]
+    else:
+        pat = os.path.join('signal_library', 'data', '**', f'{ticker}*{interval}.pkl')
+        files = glob.glob(pat, recursive=True)
+
+    if not files:
+        return None
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+def _probe_lib_info(ticker: str, interval: str) -> dict:
+    """
+    Returns:
+      {
+        exists: bool,
+        pkl_path: str|None,
+        pkl_mtime: 'YYYY-MM-DD HH:MM:SS'|None,
+        lib_end: 'YYYY-MM-DD'|None,
+        expected_end: 'YYYY-MM-DD'|None,
+        stale: bool,   # lib_end < expected_end
+        fresh: bool,   # lib_end >= expected_end
+      }
+    """
+    # Temporarily suppress INFO logging AND warnings to prevent diagnostics spam
+    import warnings
+    logger = logging.getLogger()
+    original_level = logger.level
+    logger.setLevel(logging.WARNING)
+
+    try:
+        # Suppress FutureWarning and UserWarning from pandas operations
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=FutureWarning)
+            warnings.filterwarnings('ignore', category=UserWarning)
+
+            path = _locate_lib_file(ticker, interval)
+            info = {
+                'exists': False, 'pkl_path': path, 'pkl_mtime': None,
+                'lib_end': None, 'expected_end': None, 'stale': False, 'fresh': False
+            }
+
+            # get expected end from current price calendar for this interval
+            try:
+                df = fetch_interval_data(ticker, '1d' if interval == '1d' else interval)
+                if df is not None and not df.empty:
+                    exp = _expected_last_complete_bar(df.index, interval)
+                    if exp is not None:
+                        info['expected_end'] = pd.Timestamp(exp).tz_localize(None).date().isoformat()
+            except Exception:
+                pass
+
+            if not path:
+                return info
+
+            try:
+                lib = load_signal_library_interval(ticker, interval)
+                if not lib:
+                    return info
+                info['exists'] = True
+                if lib.get('dates'):
+                    dts = pd.to_datetime(lib['dates'])
+                    if hasattr(dts[0], 'tz') and dts[0].tz is not None:
+                        dts = pd.DatetimeIndex([d.tz_localize(None) for d in dts])
+                    lib_end = dts.max().date().isoformat()
+                    info['lib_end'] = lib_end
+                try:
+                    info['pkl_mtime'] = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    pass
+                # mark stale if both dates known and lib_end < expected_end
+                if info['lib_end'] and info['expected_end']:
+                    info['stale'] = pd.to_datetime(info['lib_end']) < pd.to_datetime(info['expected_end'])
+                    info['fresh'] = not info['stale']
+            except Exception:
+                # keep defaults
+                pass
+
+            return info
+    finally:
+        # Restore original logging level
+        logger.setLevel(original_level)
+# ---------------------------------------------------------------------------
+
 def _mp_to_naive_days(idx_like) -> pd.DatetimeIndex:
     ts = pd.to_datetime(idx_like, utc=True, errors='coerce')
     return pd.DatetimeIndex(ts.tz_convert(None).normalize())
@@ -65,13 +190,21 @@ def _mp_decode_sig(x) -> str:
     return 'None'
 
 def _mp_combine_unanimity_vectorized(sig_df: pd.DataFrame) -> pd.Series:
-    # Buy=+1, Short=-1, None=0; unanimity on active members only
+    """
+    Buy=+1, Short=-1, None=0; unanimity on active members only (ignores None).
+    Vectorized, no pandas downcast warnings.
+    """
     if sig_df.empty:
         return pd.Series([], dtype=object)
+
     m = {'Buy': 1, 'Short': -1, 'None': 0}
-    arr = sig_df.replace(m).to_numpy(dtype=int)
+    # Use map instead to replace to avoid FutureWarning
+    tmp = sig_df.apply(lambda s: s.map(m).fillna(0).astype('int8'))
+    arr = tmp.to_numpy(dtype=np.int16)
+
     count = (arr != 0).sum(axis=1)
-    ssum = arr.sum(axis=1)
+    ssum  = arr.sum(axis=1)
+
     out = np.where((count > 0) & (ssum == count), 'Buy',
           np.where((count > 0) & (ssum == -count), 'Short', 'None'))
     return pd.Series(out, index=sig_df.index, dtype=object)
@@ -92,6 +225,18 @@ def _mp_safe_pct_change(close: pd.Series) -> pd.Series:
     ok = prev.notna() & np.isfinite(prev.values) & (prev.values > 0)
     out = pd.Series(0.0, index=close.index, dtype=float)
     out[ok] = ((close[ok] / prev[ok]) - 1.0) * 100.0
+    return out
+
+def _mp_forward_return_on_grid(close_on_grid: pd.Series) -> pd.Series:
+    """
+    Forward-looking return on the *given* grid:
+      ret(t) = (Close[t+1] / Close[t] - 1) * 100
+    Safe to use after any intersection/subsetting. Zeros where next bar is missing/invalid.
+    """
+    nxt = close_on_grid.shift(-1)
+    ok  = close_on_grid.notna() & nxt.notna() & np.isfinite(close_on_grid.values) & np.isfinite(nxt.values) & (close_on_grid.values > 0)
+    out = pd.Series(0.0, index=close_on_grid.index, dtype=float)
+    out[ok] = (nxt[ok] / close_on_grid[ok] - 1.0) * 100.0
     return out
 
 def _mp_metrics(captures: pd.Series, trig_mask: pd.Series, bars_per_year: int) -> dict:
@@ -164,12 +309,23 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
     if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
         return {'Interval': interval, 'Members': '', 'Status': f'NO_SECONDARY_DATA:{secondary}'}
 
+    # Flatten MultiIndex columns if present (yfinance sometimes returns these)
+    if isinstance(sec_df.columns, pd.MultiIndex):
+        sec_df.columns = sec_df.columns.get_level_values(0)
+
     sec_df   = sec_df.sort_index()
     sec_idx  = _mp_to_naive_days(sec_df.index)
-    sec_close = pd.Series(pd.to_numeric(sec_df['Close'].values, errors='coerce'), index=sec_idx, dtype='float64')
+
+    # Extract Close column - handle both Series and DataFrame cases
+    close_data = sec_df['Close']
+    if isinstance(close_data, pd.DataFrame):
+        close_data = close_data.iloc[:, 0]  # Take first column if DataFrame
+
+    sec_close = pd.Series(pd.to_numeric(close_data.values, errors='coerce'), index=sec_idx, dtype='float64')
 
     # ---------- 2) Load primary signals ----------
     series_map = {}
+    invert_map = {}  # Track which tickers are inverted
     for t, inv in act:
         lib = load_signal_library_interval(t, interval)
         if not lib:
@@ -179,36 +335,61 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         sigs  = pd.Series([_mp_decode_sig(x) for x in raw], index=dates, dtype=object)
         sigs  = sigs[~sigs.index.duplicated(keep='last')].sort_index()
         if inv:
-            sigs = sigs.replace({'Buy': 'Short', 'Short': 'Buy'})
+            arr = sigs.to_numpy(object)
+            arr = np.where(arr == 'Buy', 'Short', np.where(arr == 'Short', 'Buy', arr))
+            sigs = pd.Series(arr, index=sigs.index, dtype=object)
 
-        if interval == '1d':
-            # DAILY: align to secondary DAILY calendar with ffill (SpyMaster daily behavior)
-            sigs = sigs.reindex(sec_close.index, method='ffill').fillna('None')
-
+        # Keep primaries on native calendars - intersection happens later
         series_map[t] = sigs
+        invert_map[t] = inv
 
     if not series_map:
         return {'Interval': interval, 'Members': ', '.join([t for t, _ in act]), 'Status': 'NO_PRIMARY_DATA'}
 
-    members = ', '.join(series_map.keys())
+    # Build Members column with asterisks for inverted tickers
+    members = ', '.join([f"{t}*" if invert_map.get(t, False) else t for t in series_map.keys()])
 
     # ---------- 3) Combine signals and compute captures ----------
     if interval == '1d':
-        # DAILY path (unchanged from your working version)
-        sig_df   = pd.DataFrame(series_map, index=sec_close.index)
-        combined = _mp_combine_unanimity_vectorized(sig_df)
-        rets     = _mp_safe_daily_pct_change(sec_close)
+        # DAILY path: Spymaster parity (intersect primaries FIRST)
+        prim_series = list(series_map.values())
+        if not prim_series:
+            return {'Interval': interval, 'Members': members, 'Status': 'NO_PRIMARY_DATA'}
 
-        cap = pd.Series(0.0, index=sec_close.index, dtype=float)
-        buy_days   = combined.index[combined.eq('Buy')]
-        short_days = combined.index[combined.eq('Short')]
-        if len(buy_days):
-            cap.loc[buy_days] = rets.loc[buy_days]
-        if len(short_days):
-            cap.loc[short_days] = -rets.loc[short_days]
+        # Step 1: Intersect primaries (only dates where ALL primaries have signals)
+        common_dates = sorted(set.intersection(*[set(s.index) for s in prim_series]))
+        if not common_dates:
+            return {'Interval': interval, 'Members': members, 'Status': 'NO_COMMON_DATES'}
 
-        trig_mask = combined.isin(['Buy', 'Short'])
-        metrics   = _mp_metrics(cap, trig_mask, BARS_PER_YEAR['1d'])
+        # Step 2: Combine signals on primary-intersection dates only
+        sig_df = pd.DataFrame({t: series_map[t].reindex(common_dates) for t in series_map}, index=common_dates)
+        combined = _mp_combine_unanimity_vectorized(sig_df).astype(str)
+
+        # Step 3: Intersect with secondary
+        common_dates_sec = pd.Index(common_dates).intersection(sec_close.index)
+        if len(common_dates_sec) < 2:
+            return {'Interval': interval, 'Members': members, 'Status': 'NO_OVERLAP_WITH_SECONDARY'}
+
+        signals_f = combined.loc[common_dates_sec]
+        prices_f = sec_close.loc[common_dates_sec]
+
+        # Step 4: Union and ffill PRICES only (not signals)
+        common_ix = signals_f.index.union(prices_f.index)
+        signals_u = signals_f.reindex(common_ix).fillna('None')
+        prices_u = prices_f.reindex(common_ix).ffill()
+
+        # Step 5: Daily returns on the union calendar (percent points)
+        rets = prices_u.astype('float64').pct_change().fillna(0.0) * 100.0
+
+        # Step 6: Vectorized capture
+        buy_mask = signals_u.eq('Buy').to_numpy(bool)
+        short_mask = signals_u.eq('Short').to_numpy(bool)
+        cap = pd.Series(0.0, index=rets.index, dtype=float)
+        cap.iloc[buy_mask] = rets.iloc[buy_mask]
+        cap.iloc[short_mask] = -rets.iloc[short_mask]
+
+        trig_mask = signals_u.isin(['Buy', 'Short'])
+        metrics = _mp_metrics(cap, trig_mask, BARS_PER_YEAR['1d'])
         return {'Interval': interval, 'Members': members, **(metrics or {'Status': 'NO_TRIGGERS'})}
 
     else:
@@ -226,18 +407,25 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         sig_df   = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
         combined = _mp_combine_unanimity_vectorized(sig_df)
 
-        # Bar-to-bar returns on the SAME interval
-        rets_full = _mp_safe_pct_change(sec_close)            # interval-agnostic
-        rets      = rets_full.reindex(dates).fillna(0.0)
+        # Bar-to-bar returns computed DIRECTLY on the 'dates' grid (avoids reindex+shift edge cases)
+        prices_on_grid = sec_close.reindex(dates)
+        rets_next = _mp_forward_return_on_grid(prices_on_grid)  # forward return on same grid
 
         # Apply signals on interval bars only
+        # Signal at bar N captures return from bar N to bar N+1 (forward-looking)
         cap = pd.Series(0.0, index=dates, dtype=float)
         buy_days   = combined.index[combined.eq('Buy')]
         short_days = combined.index[combined.eq('Short')]
+
         if len(buy_days):
-            cap.loc[buy_days] = rets.loc[buy_days]
+            cap.loc[buy_days] = rets_next.loc[buy_days]
         if len(short_days):
-            cap.loc[short_days] = -rets.loc[short_days]
+            cap.loc[short_days] = -rets_next.loc[short_days]
+
+        # Optional visibility for the intermittent 1mo issue
+        if interval == '1mo':
+            nz = int(np.count_nonzero(rets_next.values))
+            logger.info(f"[1mo] forward-return sanity: nonzero={nz} / {len(rets_next)}")
 
         trig_mask = combined.isin(['Buy', 'Short'])
         metrics   = _mp_metrics(cap, trig_mask, BARS_PER_YEAR.get(interval, 252))
@@ -269,7 +457,10 @@ else:
 # Initialize Dash app
 app = dash.Dash(
     __name__,
-    external_stylesheets=[dbc.themes.DARKLY],
+    external_stylesheets=[
+        dbc.themes.DARKLY,
+        "https://use.fontawesome.com/releases/v5.15.4/css/all.css"
+    ],
     suppress_callback_exceptions=True
 )
 
@@ -322,11 +513,15 @@ def calculate_combined_capture_from_signals(lib_dates, lib_signals, price_close:
         Series of cumulative capture % indexed by price dates
     """
     # Create signal series from library
-    sig_dates = pd.to_datetime(lib_dates).tz_localize(None) if hasattr(pd.to_datetime(lib_dates[0]), 'tz') else pd.to_datetime(lib_dates)
-    sig_series = pd.Series(lib_signals, index=sig_dates)
+    sig_dates = pd.to_datetime(lib_dates, errors='coerce')
+    # Only drop tz if index is tz-aware
+    if isinstance(sig_dates, pd.DatetimeIndex) and sig_dates.tz is not None:
+        sig_dates = sig_dates.tz_convert(None)
+
+    sig_series = pd.Series(lib_signals, index=sig_dates).sort_index()
 
     # Clamp range to library coverage
-    lib_end = sig_dates.max()
+    lib_end = sig_series.index.max()
 
     # Align to price index with forward-fill
     aligned_signals = sig_series.reindex(price_close.index, method='ffill').fillna('None')
@@ -499,6 +694,64 @@ def _build_dynamic_active_pair_smas(library: dict, close: pd.Series) -> tuple:
     return sma_a, sma_b, pair_label
 
 # =============================================================================
+# UI HELPER FUNCTIONS
+# =============================================================================
+
+def _create_primary_row(index: int):
+    """One primary ticker row with invert/mute/delete controls."""
+    return dbc.Row(
+        id={'type': 'primary-row', 'index': index},
+        className='mb-2 g-2',  # mb-2 for tighter spacing, g-2 for gutters between columns
+        children=[
+            dbc.Col(
+                dbc.Input(
+                    id={'type': 'primary-input', 'index': index},
+                    placeholder='Enter ticker',
+                    type='text',
+                    debounce=True,
+                    value='',
+                ),
+                xs=12, md=6  # Wider on desktop for better input field visibility
+            ),
+            dbc.Col(
+                dbc.Checklist(
+                    id={'type': 'invert-switch', 'index': index},
+                    options=[{'label': 'Invert Signals', 'value': 'invert'}],
+                    value=[],
+                    switch=True,
+                    style={'marginTop': '6px'}
+                ),
+                xs=6, md=2  # Half-width on mobile, compact on desktop
+            ),
+            dbc.Col(
+                dbc.Checklist(
+                    id={'type': 'mute-switch', 'index': index},
+                    options=[{'label': 'Mute', 'value': 'mute'}],
+                    value=[],
+                    switch=True,
+                    style={'marginTop': '6px'}
+                ),
+                xs=6, md=2  # Half-width on mobile, compact on desktop
+            ),
+            dbc.Col(
+                dbc.Button(
+                    'Delete',
+                    id={'type': 'delete-primary', 'index': index},
+                    color='danger',
+                    size='sm',
+                    style={'width': '100%', 'marginTop': '0px'}  # Aligned with toggles
+                ),
+                xs=12, md=2
+            ),
+            # Hidden status div for callback compatibility
+            html.Div(
+                id={'type': 'primary-status', 'index': index},
+                style={'display': 'none'}
+            ),
+        ]
+    )
+
+# =============================================================================
 # UI LAYOUT
 # =============================================================================
 
@@ -510,21 +763,22 @@ def _build_dynamic_active_pair_smas(library: dict, close: pd.Series) -> tuple:
 multi_primary_section = dbc.Container([
     html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
     html.H2('Multi-Primary Signal Aggregator', className='text-center', style={'color': '#80ff00'}),
-    html.P('Combine multiple primary tickers and apply unanimous signals to a single secondary ticker.',
-           className='text-center text-muted mb-3', style={'fontSize': '14px'}),
 
+    # Full-width form layout
     dbc.Row([
         dbc.Col([
             html.Label("Secondary Ticker (Signal Follower):", style={'fontWeight': 'bold', 'color': '#ccc'}),
-            dcc.Input(id='multi-secondary-ticker', type='text', value='TQQQ',
-                      placeholder='e.g., TQQQ', style={'width': '100%', 'padding': '8px'}),
-        ], width=4),
-        dbc.Col([
-            html.Label("Primary Tickers (comma-separated):", style={'fontWeight': 'bold', 'color': '#ccc'}),
-            dcc.Input(id='multi-primary-tickers', type='text', value='SPY, QQQ, AAPL',
-                      placeholder='e.g., SPY, QQQ, AAPL', style={'width': '100%', 'padding': '8px'}),
-        ], width=4),
-        dbc.Col([
+            dcc.Input(
+                id='multi-secondary-ticker',
+                type='text',
+                value='',  # blank by default
+                placeholder='Enter ticker',
+                debounce=True,  # Wait for user to finish typing before triggering callbacks
+                style={'width': '100%', 'padding': '8px'}
+            ),
+
+            html.Br(), html.Br(),
+
             html.Label("Intervals:", style={'fontWeight': 'bold', 'color': '#ccc'}),
             dcc.Dropdown(
                 id='multi-primary-intervals',
@@ -540,20 +794,81 @@ multi_primary_section = dbc.Container([
                 placeholder="Select intervals",
                 style={'width': '100%', 'color': '#000'}
             ),
-        ], width=4),
-    ], style={'marginBottom': '12px'}),
 
-    dbc.Row([
-        dbc.Col([
+            html.Br(),
+
+            html.Label("Primary Signal Generators:", style={'fontWeight': 'bold', 'color': '#ccc'}),
+            html.Div(id='primary-rows-container', children=[_create_primary_row(0)]),
+
+            dbc.Button(
+                [html.I(className="fas fa-plus me-2"), "Add Primary Ticker"],
+                id='add-primary-button',
+                color='success',
+                size='sm',
+                className='mt-2',
+                style={'width': '200px'}  # Fixed pixel width for compact button
+            ),
+
+            html.Br(), html.Br(),
+
             dbc.Button("Run Multi-Primary Analysis", id='run-multi-primary',
                        color='primary', n_clicks=0,
                        style={'width': '100%', 'fontSize': '16px', 'fontWeight': 'bold'}),
-        ], width=12),
-    ]),
 
-    html.Div(id='multi-primary-results', style={'marginTop': '16px'}),
+            html.Br(), html.Br(),
+            dbc.Button("Rescan Libraries", id='mp-rescan',
+                       color='secondary', outline=True, size='sm',
+                       style={'width': '100%'}),
+        ], xs=12),
+    ], style={'marginBottom': '12px'}),
+
+    # Diagnostics banner + matrix + build commands (with loading spinner)
+    dcc.Loading(
+        id='mp-diagnostics-loading',
+        type='default',
+        children=[
+            dbc.Alert(id='mp-warning-banner', is_open=False, color='warning',
+                      style={'marginTop': '10px', 'marginBottom': '10px'}),
+
+            dash_table.DataTable(
+                id='mp-library-matrix-table',
+                columns=[], data=[],
+                style_table={'overflowX': 'auto'},
+                style_cell={
+                    'textAlign': 'center',
+                    'padding': '6px',
+                    'backgroundColor': '#1a1a1a',
+                    'color': '#ccc',
+                    'border': '1px solid #333',
+                    'minWidth': '90px',
+                    'whiteSpace': 'pre-line',     # allow multi-line status
+                },
+                style_header={
+                    'backgroundColor': '#222',
+                    'fontWeight': 'bold',
+                    'color': '#80ff00',
+                    'border': '1px solid #80ff00'
+                },
+            ),
+
+            html.Details([
+                html.Summary('Build commands for missing/stale libraries', style={'cursor': 'pointer', 'color': '#80ff00'}),
+                html.Pre(id='mp-build-commands', style={
+                    'backgroundColor': '#0f0f0f', 'color': '#ccc', 'padding': '10px',
+                    'border': '1px solid #333', 'borderRadius': '6px', 'whiteSpace': 'pre-wrap'
+                })
+            ], open=False, style={'marginTop': '8px'}),
+        ]
+    ),
+
+    # Results (with loading spinner)
+    dcc.Loading(
+        id='mp-results-loading',
+        type='default',
+        children=html.Div(id='multi-primary-results', style={'marginTop': '16px'})
+    ),
 ], fluid=True, style={'backgroundColor': '#222', 'padding': '20px', 'border': '2px solid #80ff00',
-                      'borderRadius': '10px', 'marginBottom': '30px'})
+                      'borderRadius': '10px', 'marginBottom': '30px', 'maxWidth': '1400px'})
 # ---------------------------------------------------------------------------
 
 app.layout = html.Div([
@@ -750,21 +1065,33 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
 
         close = df_prices['Close']
 
+        # Check for empty library
+        dates_in = library.get('dates', [])
+        if not dates_in:
+            return html.Div([
+                html.H5(f"{interval.upper()} Chart", style={'color': '#80ff00'}),
+                html.P("Library has no dates", style={'color': '#888'})
+            ], style={'marginBottom': '20px'})
+
+        # Use signal key fallback (signals or primary_signals)
+        sig_key = 'signals' if 'signals' in library else 'primary_signals'
+        sigs_in = library.get(sig_key, [])
+
         # Calculate combined capture from stored dynamic signals
         capture_series = calculate_combined_capture_from_signals(
-            library['dates'],
-            library['signals'],
+            dates_in,
+            sigs_in,
             close
         )
 
         # Get current top pairs for subtitle
-        last_date = pd.to_datetime(library['dates'][-1])
+        last_date = pd.to_datetime(dates_in[-1])
         if hasattr(last_date, 'tz') and last_date.tz is not None:
             last_date = last_date.tz_localize(None)
         pairs_info = get_current_top_pairs_for_date(library, last_date)
 
         # Build hover data efficiently using vectorized alignment
-        lib_dates = pd.to_datetime(library['dates'])
+        lib_dates = pd.to_datetime(dates_in)
         if hasattr(lib_dates[0], 'tz') and lib_dates[0].tz is not None:
             lib_dates = pd.DatetimeIndex([d.tz_localize(None) for d in lib_dates])
 
@@ -772,7 +1099,7 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
         lib_end = lib_dates.max()
 
         # Align signals to price index
-        sig_series = pd.Series(library['signals'], index=lib_dates).reindex(close.index, method='ffill').fillna('None')
+        sig_series = pd.Series(sigs_in, index=lib_dates).reindex(close.index, method='ffill').fillna('None')
 
         # Build pair series - convert daily_top_*_pairs to aligned series
         bmap = library.get('daily_top_buy_pairs', {})
@@ -791,13 +1118,15 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
                 else:
                     normalized[dt] = (v, 0.0)
             ser = pd.Series(normalized).sort_index()
-            logger.info(f"_map_to_series: input length={len(pair_map)}, series length={len(ser)}, target index length={len(idx)}")
-            logger.info(f"  Series date range: {ser.index[0].date()} to {ser.index[-1].date()}")
-            logger.info(f"  Target index range: {idx[0].date()} to {idx[-1].date()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"_map_to_series: input length={len(pair_map)}, series length={len(ser)}, target index length={len(idx)}")
+                logger.debug(f"  Series date range: {ser.index[0].date()} to {ser.index[-1].date()}")
+                logger.debug(f"  Target index range: {idx[0].date()} to {idx[-1].date()}")
             aligned = ser.reindex(idx, method='ffill')
             # Clear past library end (prevent static pair leakage)
             aligned.loc[aligned.index > lib_end] = None
-            logger.info(f"  After reindex: length={len(aligned)}, non-null={aligned.notna().sum()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  After reindex: length={len(aligned)}, non-null={aligned.notna().sum()}")
             return aligned
 
         buy_pair_series = _map_to_series(bmap, close.index)
@@ -1026,17 +1355,240 @@ def create_confluence_timeline(aligned: pd.DataFrame) -> html.Div:
 
 
 # =============================================================================
+# DIAGNOSTIC HELPERS
+# =============================================================================
+
+# =============================================================================
 # CALLBACKS
 # =============================================================================
+
+@app.callback(
+    Output('primary-rows-container', 'children'),
+    Input('add-primary-button', 'n_clicks'),
+    State('primary-rows-container', 'children'),
+    prevent_initial_call=True
+)
+def add_primary_row(n_clicks, children):
+    if not n_clicks:
+        return no_update
+    # robust index: 1 + max existing index
+    try:
+        existing = []
+        for ch in children:
+            cid = ch.get('props', {}).get('id', {})
+            if isinstance(cid, dict) and cid.get('type') == 'primary-row':
+                existing.append(cid.get('index'))
+        new_index = (max(existing) + 1) if existing else 0
+    except Exception:
+        new_index = len(children or [])
+    children = list(children or [])
+    children.append(_create_primary_row(new_index))
+    return children
+
+
+@app.callback(
+    Output('primary-rows-container', 'children', allow_duplicate=True),
+    Input({'type': 'delete-primary', 'index': ALL}, 'n_clicks'),
+    State('primary-rows-container', 'children'),
+    prevent_initial_call=True
+)
+def delete_primary_row(n_clicks_list, children):
+    if not children or not n_clicks_list or not any(n_clicks_list):
+        return no_update
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return no_update
+    triggered = ctx.triggered[0]['prop_id'].split('.')[0]
+    try:
+        bid = json.loads(triggered)
+        idx_to_delete = bid.get('index')
+    except Exception:
+        return no_update
+
+    updated = []
+    for ch in children:
+        cid = ch.get('props', {}).get('id', {})
+        if isinstance(cid, dict) and cid.get('type') == 'primary-row' and cid.get('index') == idx_to_delete:
+            continue
+        updated.append(ch)
+
+    # always keep at least one row
+    if not updated:
+        updated = [_create_primary_row(0)]
+    return updated
+
+
+@app.callback(
+    [
+        Output('mp-warning-banner', 'children'),
+        Output('mp-warning-banner', 'color'),
+        Output('mp-warning-banner', 'is_open'),
+        Output('mp-library-matrix-table', 'data'),
+        Output('mp-library-matrix-table', 'columns'),
+        Output('mp-build-commands', 'children'),
+        Output({'type': 'primary-status', 'index': ALL}, 'children'),
+        Output({'type': 'primary-status', 'index': ALL}, 'style'),
+    ],
+    [
+        Input({'type': 'primary-input', 'index': ALL}, 'value'),
+        Input('multi-primary-intervals', 'value'),
+        Input('multi-secondary-ticker', 'value'),
+        Input('mp-rescan', 'n_clicks'),
+        Input('run-multi-primary', 'n_clicks'),
+    ],
+    prevent_initial_call=False
+)
+def update_mp_diagnostics(primary_vals, intervals, secondary, rescan_clicks, run_clicks):
+    """
+    Live diagnostics for multi-primary section with staleness detection.
+    Shows PKL file dates, calendar-aware expected dates, and staleness badges.
+    Dual-trigger: updates on both 'Rescan Libraries' and 'Run' button clicks.
+    """
+    ivs = intervals or ['1d']
+
+    # Build availability matrix for primaries (only non-empty)
+    prims = [p.strip().upper() for p in (primary_vals or []) if p and p.strip()]
+    matrix_rows = []
+    cols = [{'name': 'Ticker', 'id': 'Ticker'}] + [{'name': iv, 'id': iv} for iv in ivs]
+    missing_msgs = []
+    stale_msgs = []
+
+    # Cache to avoid reloading same PKL twice (per callback invocation)
+    info_cache: Dict[Tuple[str, str], dict] = {}
+
+    # Per-row status must align to ALL primary_vals (including empty)
+    # NOTE: Status divs are now hidden, so we return empty strings for content
+    per_row_text = []
+    per_row_style = []
+
+    for pval in (primary_vals or []):
+        if not pval or not pval.strip():
+            # Empty row - return empty content since status is hidden
+            per_row_text.append('')
+            per_row_style.append({'display': 'none'})
+            continue
+
+        p = pval.strip().upper()
+        row = {'Ticker': p}
+        missing_for_p = []
+        stale_for_p = []
+
+        for iv in ivs:
+            key = (p, iv)
+            if key not in info_cache:
+                info_cache[key] = _probe_lib_info(p, iv)
+            info = info_cache[key]
+
+            # Build multi-line cell content
+            if not info['exists']:
+                badge = '—'
+                row[iv] = badge
+                missing_for_p.append(iv)
+            elif info['stale']:
+                lib_end = info.get('lib_end', '?')
+                exp_end = info.get('expected_end', '?')
+                mtime = info.get('pkl_mtime', '?')
+                badge = '[STALE]'
+                cell_text = f"{badge}\nlib:{lib_end}\nexp:{exp_end}\nmt:{mtime}"
+                row[iv] = cell_text
+                stale_for_p.append(iv)
+            else:
+                lib_end = info.get('lib_end', '?')
+                exp_end = info.get('expected_end', '?')
+                mtime = info.get('pkl_mtime', '?')
+                badge = '[OK]'
+                cell_text = f"{badge}\nlib:{lib_end}\nexp:{exp_end}\nmt:{mtime}"
+                row[iv] = cell_text
+
+        matrix_rows.append(row)
+
+        # Track missing/stale for banner messages
+        if missing_for_p:
+            missing_msgs.append(f"{p} -> {', '.join(missing_for_p)}")
+        if stale_for_p:
+            stale_msgs.append(f"{p} -> {', '.join(stale_for_p)}")
+
+        # Return empty content since status divs are hidden
+        per_row_text.append('')
+        per_row_style.append({'display': 'none'})
+
+    # Probe secondary price availability
+    sec_issues = []
+    if secondary and secondary.strip():
+        sec = secondary.strip().upper()
+        for iv in ivs:
+            try:
+                df = fetch_interval_data(sec, '1d' if iv == '1d' else iv)
+                if df is None or df.empty or 'Close' not in df.columns:
+                    sec_issues.append(f"{sec} {iv} prices unavailable")
+            except Exception as e:
+                sec_issues.append(f"{sec} {iv} fetch error: {str(e)[:80]}")
+
+    # Banner content
+    if missing_msgs or stale_msgs or sec_issues:
+        message = []
+        if missing_msgs:
+            message.append("Missing -> " + "; ".join(missing_msgs))
+        if stale_msgs:
+            message.append("Stale -> " + "; ".join(stale_msgs))
+        if sec_issues:
+            message.append("Secondary issues -> " + "; ".join(sec_issues))
+        banner_text = " | ".join(message)
+        banner_color = 'warning'
+        banner_open = True
+    else:
+        banner_text = "All selected primaries have fresh libraries for the chosen intervals. Secondary fetch OK."
+        banner_color = 'success'
+        banner_open = True
+
+    # Suggested build commands (cross-platform) - include BOTH missing AND stale
+    cmds = []
+    is_windows = (os.name == 'nt')
+    path_sep = "\\" if is_windows else "/"
+
+    for p in prims:
+        needs_rebuild = []
+        for iv in ivs:
+            info = info_cache.get((p, iv), {})
+            if not info.get('exists') or info.get('stale'):
+                needs_rebuild.append(iv)
+
+        if not needs_rebuild:
+            continue
+
+        if '1d' in needs_rebuild:
+            cmds.append(f"python signal_library{path_sep}multi_timeframe_builder.py --ticker {p} --intervals 1d --allow-daily --force-overwrite")
+            needs_rebuild = [iv for iv in needs_rebuild if iv != '1d']
+        if needs_rebuild:
+            cmds.append(f"python signal_library{path_sep}multi_timeframe_builder.py --ticker {p} --intervals {','.join(needs_rebuild)}")
+
+    cmd_block = "No build actions needed." if not cmds else "\n".join(cmds)
+
+    # If no primaries yet, keep the panel quiet but open
+    if not prims:
+        matrix_rows = []
+        cols = [{'name': 'Ticker', 'id': 'Ticker'}]
+        banner_text = "Enter primary tickers to see readiness by interval."
+        banner_color = 'info'
+        banner_open = True
+
+    return (
+        banner_text, banner_color, banner_open,
+        matrix_rows, cols, cmd_block,
+        per_row_text, per_row_style
+    )
+
 
 @app.callback(
     Output('multi-primary-results', 'children'),
     Input('run-multi-primary', 'n_clicks'),
     State('multi-secondary-ticker', 'value'),
-    State('multi-primary-tickers', 'value'),
+    State({'type': 'primary-input', 'index': ALL}, 'value'),
+    State({'type': 'invert-switch', 'index': ALL}, 'value'),
+    State({'type': 'mute-switch', 'index': ALL}, 'value'),
     State('multi-primary-intervals', 'value')
 )
-def run_multi_primary_analysis(n_clicks, secondary, tickers_str, intervals):
+def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals, mute_vals, intervals):
     """
     Multi-Primary Signal Aggregator callback - PHASE 2A unified approach.
 
@@ -1048,84 +1600,82 @@ def run_multi_primary_analysis(n_clicks, secondary, tickers_str, intervals):
                    style={'color': '#888', 'textAlign': 'center', 'marginTop': '10px'})
         ])
 
-    # Validation
+    # Validate secondary
     if not secondary or not secondary.strip():
-        return html.Div([
-            html.P("Please enter a secondary ticker",
-                   style={'color': '#ff4444', 'textAlign': 'center'})
-        ])
+        return html.Div([html.P("Please enter a secondary ticker",
+                                style={'color': '#ff4444', 'textAlign': 'center'})])
 
-    if not tickers_str or not tickers_str.strip():
-        return html.Div([
-            html.P("Please enter primary tickers (comma-separated)",
-                   style={'color': '#ff4444', 'textAlign': 'center'})
-        ])
+    # Build primaries + flags from rows
+    primaries = []
+    invert_flags = []
+    mute_flags = []
+    for tval, ival, mval in zip(primaries_vals or [], invert_vals or [], mute_vals or []):
+        if tval and tval.strip():
+            primaries.append(tval.strip().upper())
+            invert_flags.append('invert' in (ival or []))
+            mute_flags.append('mute' in (mval or []))
 
-    if not intervals or len(intervals) == 0:
-        return html.Div([
-            html.P("Please select at least one interval",
-                   style={'color': '#ff4444', 'textAlign': 'center'})
-        ])
+    if not primaries:
+        return html.Div([html.P("Please enter at least one primary ticker",
+                                style={'color': '#ff4444', 'textAlign': 'center'})])
 
-    # Parse inputs
-    secondary = secondary.upper().strip()
-    tickers = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
+    # Active rows?
+    if all(mute_flags):
+        return html.Div([html.P("All primaries are muted. Unmute at least one.",
+                                style={'color': '#ff4444', 'textAlign': 'center'})])
 
-    logger.info(f"[Multi-Primary] Starting analysis: tickers={tickers}, secondary={secondary}, intervals={intervals}")
+    # Validate intervals
+    if not intervals:
+        return html.Div([html.P("Please select at least one interval",
+                                style={'color': '#ff4444', 'textAlign': 'center'})])
 
-    # =========================================================================
-    # Call _mp_eval_interval() for each interval (SpyMaster-matching logic)
-    # =========================================================================
-    table_data = []
+    secondary = secondary.strip().upper()
+    logger.info(f"[Multi-Primary] Starting analysis: primaries={primaries}, secondary={secondary}, intervals={intervals}")
+
+    rows = []
     for interval in intervals:
         try:
-            row = _mp_eval_interval(tickers, secondary, interval)
-            table_data.append(row)
+            r = _mp_eval_interval(
+                primaries=primaries,
+                secondary=secondary,
+                interval=interval,
+                invert_flags=invert_flags,
+                mute_flags=mute_flags
+            )
         except Exception as e:
             logger.error(f"[Multi-Primary] Error in {interval}: {e}", exc_info=True)
-            table_data.append({
-                'Interval': interval,
-                'Members': '',
-                'Status': f'ERROR: {str(e)[:50]}',
-                'Triggers': 0,
-                'Wins': 0,
-                'Losses': 0,
-                'Win %': 0.0,
-                'StdDev %': 0.0,
-                'Sharpe': 0.0,
-                't': 'N/A',
-                'p': 'N/A',
-                'Sig 90%': '',
-                'Sig 95%': '',
-                'Sig 99%': '',
-                'Avg Cap %': 0.0,
-                'Total %': 0.0,
-            })
+            r = {'Interval': interval, 'Members': ', '.join(primaries), 'Status': f'ERROR: {str(e)[:80]}'}
+        rows.append(r)
 
-    # =========================================================================
-    # Build Results Table
-    # =========================================================================
-    columns = [
+    # table columns
+    cols = [
         {'name': 'Interval', 'id': 'Interval'},
-        {'name': 'Members', 'id': 'Members'},
+        {'name': 'Members',  'id': 'Members'},
         {'name': 'Triggers', 'id': 'Triggers'},
-        {'name': 'Wins', 'id': 'Wins'},
-        {'name': 'Losses', 'id': 'Losses'},
-        {'name': 'Win %', 'id': 'Win %'},
-        {'name': 'StdDev %', 'id': 'StdDev %'},
-        {'name': 'Sharpe', 'id': 'Sharpe'},
-        {'name': 'Avg Cap %', 'id': 'Avg Cap %'},
-        {'name': 'Total %', 'id': 'Total %'},
-        {'name': 't', 'id': 't'},
-        {'name': 'p', 'id': 'p'},
-        {'name': 'Sig 90%', 'id': 'Sig 90%'},
-        {'name': 'Sig 95%', 'id': 'Sig 95%'},
-        {'name': 'Sig 99%', 'id': 'Sig 99%'},
+        {'name': 'Wins',     'id': 'Wins'},
+        {'name': 'Losses',   'id': 'Losses'},
+        {'name': 'Win %',    'id': 'Win %'},
+        {'name': 'Std Dev (%)', 'id': 'StdDev %'},  # display label, using your key
+        {'name': 'Sharpe',   'id': 'Sharpe'},
+        {'name': 'Avg %',    'id': 'Avg Cap %'},    # display label, using your key
+        {'name': 'Total %',  'id': 'Total %'},
+        {'name': 't',        'id': 't'},
+        {'name': 'p',        'id': 'p'},
+        {'name': 'Sig 90%',  'id': 'Sig 90%'},
+        {'name': 'Sig 95%',  'id': 'Sig 95%'},
+        {'name': 'Sig 99%',  'id': 'Sig 99%'},
+        {'name': 'Status',   'id': 'Status'},
     ]
 
+    # normalize missing keys
+    for r in rows:
+        for c in [c['id'] for c in cols]:
+            if c not in r:
+                r[c] = '' if c not in ('Triggers','Wins','Losses') else 0
+
     table = dash_table.DataTable(
-        data=table_data,
-        columns=columns,
+        data=rows,
+        columns=cols,
         style_table={'overflowX': 'auto'},
         style_cell={
             'textAlign': 'center',
@@ -1140,32 +1690,13 @@ def run_multi_primary_analysis(n_clicks, secondary, tickers_str, intervals):
             'color': '#80ff00',
             'border': '1px solid #80ff00'
         },
-        style_data_conditional=[
-            {
-                'if': {'column_id': 'Sharpe', 'filter_query': '{Sharpe} > 2'},
-                'backgroundColor': '#003300',
-                'color': '#00ff00',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'Sharpe', 'filter_query': '{Sharpe} > 4'},
-                'backgroundColor': '#004400',
-                'color': '#00ff00',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'Win %', 'filter_query': '{Win %} >= 60'},
-                'color': '#ffaa00',
-                'fontStyle': 'italic'
-            }
-        ]
     )
 
     return html.Div([
-        html.H4(f"Multi-Primary Results: {', '.join(tickers)} → {secondary}",
-                style={'color': '#80ff00', 'textAlign': 'center', 'marginBottom': '20px'}),
-        html.P(f"Combined signals applied to {secondary} daily prices",
-               style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px', 'marginBottom': '15px'}),
+        html.H4(f"Multi-Primary Results: {', '.join(primaries)} → {secondary}",
+                style={'color': '#80ff00', 'textAlign': 'center', 'marginBottom': '12px'}),
+        html.P("Signals and returns are computed on each interval's native calendar; 1d uses daily ffill parity.",
+               style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px', 'marginBottom': '12px'}),
         table
     ])
 
