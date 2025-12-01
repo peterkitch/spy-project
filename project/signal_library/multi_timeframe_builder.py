@@ -15,6 +15,7 @@ import sys
 import logging
 import pickle
 import argparse
+import time
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
@@ -50,6 +51,35 @@ EPS = 1e-12  # tie/equality tolerance for float parity
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Network timeout and retry configuration
+YF_TIMEOUT = int(os.getenv('CONFLUENCE_YF_TIMEOUT', '15'))   # seconds
+YF_RETRIES = int(os.getenv('CONFLUENCE_YF_RETRIES', '2'))    # total attempts
+
+def _yf_download_with_retry(*args, **kwargs):
+    """
+    Wrapper for yf.download with timeout and retry logic.
+
+    Prevents indefinite hangs by enforcing hard timeouts and retrying on failure.
+    """
+    kwargs.setdefault('progress', False)
+    kwargs.setdefault('threads', False)
+    kwargs.setdefault('timeout', YF_TIMEOUT)
+    last_exception = None
+
+    for attempt in range(1, YF_RETRIES + 1):
+        try:
+            return yf.download(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"yfinance download attempt {attempt}/{YF_RETRIES} failed: {e}")
+            if attempt < YF_RETRIES:
+                sleep_time = 1.5 * attempt
+                logger.info(f"Retrying in {sleep_time}s...")
+                time.sleep(sleep_time)
+            else:
+                logger.error(f"All {YF_RETRIES} download attempts failed")
+                raise last_exception
+
 
 def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') -> pd.DataFrame:
     """
@@ -73,8 +103,8 @@ def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') 
     if interval == '1y':
         # Yahoo doesn't provide 1y interval - resample from daily
         logger.info(f"{vendor}: Resampling daily -> yearly (YE-DEC: last trading day of calendar year)")
-        df_daily = yf.download(vendor, period='max', interval='1d',
-                              auto_adjust=False, progress=False, threads=False)
+        df_daily = _yf_download_with_retry(vendor, period='max', interval='1d',
+                                           auto_adjust=False)
 
         if df_daily is None or df_daily.empty:
             raise ValueError(f"No daily data available for {vendor}")
@@ -90,8 +120,8 @@ def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') 
     elif interval == '3mo':
         # Yahoo 3mo has misaligned quarter boundaries - resample from daily to align all tickers
         logger.info(f"{vendor}: Resampling daily -> quarterly (QS: standard calendar quarters Jan/Apr/Jul/Oct)")
-        df_daily = yf.download(vendor, period='max', interval='1d',
-                              auto_adjust=False, progress=False, threads=False)
+        df_daily = _yf_download_with_retry(vendor, period='max', interval='1d',
+                                           auto_adjust=False)
 
         if df_daily is None or df_daily.empty:
             raise ValueError(f"No daily data available for {vendor}")
@@ -105,8 +135,8 @@ def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') 
 
     else:
         # Use Yahoo native interval
-        df = yf.download(vendor, period='max', interval=interval,
-                        auto_adjust=False, progress=False, threads=False)
+        df = _yf_download_with_retry(vendor, period='max', interval=interval,
+                                     auto_adjust=False)
 
         if df is None or df.empty:
             raise ValueError(f"No {interval} data available for {vendor}")

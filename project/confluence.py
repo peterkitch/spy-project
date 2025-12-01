@@ -9,6 +9,7 @@ Port: 8056 (with fallback if occupied)
 import os
 import logging
 import glob
+import re
 from typing import Optional, Tuple, Dict
 from pathlib import Path
 from datetime import datetime
@@ -18,6 +19,7 @@ from dash import dcc, html, dash_table, Input, Output, State, no_update
 from dash.dependencies import ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import json
@@ -42,6 +44,135 @@ from signal_library.multi_timeframe_builder import fetch_interval_data
 LEVEL = os.environ.get('CONFLUENCE_LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(level=getattr(logging, LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
+
+# --- Security: Ticker Input Sanitization -------------------------------------
+# Regex pattern: 1-20 characters, uppercase letters, digits, dots, hyphens, underscores
+# Covers US tickers (AAPL), indices (^GSPC), international (.L, .TO), money market (-MM)
+SAFE_TICKER = re.compile(r"^[A-Z0-9\.\-_\^]{1,20}$")
+
+def _sanitize_ticker(ticker: str) -> str:
+    """
+    Sanitize and validate ticker input to prevent path traversal and injection attacks.
+
+    Args:
+        ticker: Raw ticker string from user input
+
+    Returns:
+        Sanitized uppercase ticker string
+
+    Raises:
+        ValueError: If ticker format is invalid
+    """
+    if not ticker:
+        raise ValueError("Ticker cannot be empty")
+
+    t = ticker.strip().upper()
+
+    if not SAFE_TICKER.match(t):
+        raise ValueError(f"Invalid ticker format: '{ticker}'. Must be 1-20 characters, alphanumeric with dots/hyphens/underscores/caret only.")
+
+    return t
+
+# --- Security: Interval Validation -------------------------------------------
+VALID_INTERVALS = {'1d', '1wk', '1mo', '3mo', '1y'}
+MAX_INTERVALS = 12  # Prevent compute blowup
+MAX_PRIMARIES = 12  # Prevent malicious payloads
+
+def _sanitize_intervals(intervals) -> list:
+    """
+    Validate and sanitize interval list.
+
+    Args:
+        intervals: List of interval strings from user input
+
+    Returns:
+        List of valid intervals (capped at MAX_INTERVALS)
+
+    Raises:
+        ValueError: If no valid intervals provided
+    """
+    ivs = intervals or []
+    out = [iv for iv in ivs if iv in VALID_INTERVALS]
+    if not out:
+        raise ValueError("No valid intervals selected. Must be one of: 1d, 1wk, 1mo, 3mo, 1y")
+    return out[:MAX_INTERVALS]
+
+# --- Performance: TTL Cache for Expensive IO Operations ----------------------
+from functools import wraps
+import time
+
+# Cache storage: {(func_name, key): (result, expiry_timestamp)}
+_IO_CACHE: Dict[Tuple[str, str], Tuple[any, float]] = {}
+DEFAULT_TTL = 600  # 10 minutes in seconds
+
+def _ttl_cache(ttl: int = DEFAULT_TTL):
+    """
+    Time-to-live cache decorator for expensive IO operations.
+
+    Args:
+        ttl: Time-to-live in seconds (default: 600 = 10 minutes)
+
+    Returns:
+        Decorator function
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Create cache key from function name, arguments, and kwargs
+            # For our use cases: func(ticker, interval, **kwargs)
+            if len(args) >= 2:
+                key_parts = [args[0], args[1]]
+                # Add kwargs to key if present (sorted for consistency)
+                if kwargs:
+                    key_parts.append(str(sorted(kwargs.items())))
+                cache_key = (func.__name__, "_".join(str(p) for p in key_parts))
+            elif len(args) == 1:
+                cache_key = (func.__name__, str(args[0]))
+            else:
+                # Can't cache - no arguments
+                return func(*args, **kwargs)
+
+            now = time.time()
+
+            # Check cache
+            if cache_key in _IO_CACHE:
+                cached_result, expiry = _IO_CACHE[cache_key]
+                if now < expiry:
+                    logger.debug(f"Cache HIT: {cache_key[0]}({cache_key[1]})")
+                    return cached_result
+                else:
+                    # Expired - remove
+                    logger.debug(f"Cache EXPIRED: {cache_key[0]}({cache_key[1]})")
+                    del _IO_CACHE[cache_key]
+
+            # Cache miss - call function
+            logger.debug(f"Cache MISS: {cache_key[0]}({cache_key[1]})")
+            result = func(*args, **kwargs)
+
+            # Store in cache with expiry
+            _IO_CACHE[cache_key] = (result, now + ttl)
+
+            return result
+        return wrapper
+    return decorator
+
+# Cached wrappers for expensive IO operations
+@_ttl_cache(ttl=600)  # 10 minutes
+def _cached_fetch_interval_data(ticker: str, interval: str, **kwargs):
+    """
+    Cached wrapper for fetch_interval_data.
+
+    Normalizes cache key by ensuring price_basis is always explicit,
+    preventing duplicate downloads when some callers omit it.
+    """
+    # Normalize cache key so all callers hit the same entry
+    kwargs.setdefault('price_basis', 'close')
+    return fetch_interval_data(ticker, interval, **kwargs)
+
+@_ttl_cache(ttl=600)  # 10 minutes
+def _cached_load_signal_library_interval(ticker: str, interval: str, **kwargs):
+    """Cached wrapper for load_signal_library_interval."""
+    return load_signal_library_interval(ticker, interval, **kwargs)
 
 # --- PHASE 2A: Multi-Primary core helpers (drop-in) -------------------------
 import math
@@ -117,64 +248,55 @@ def _probe_lib_info(ticker: str, interval: str) -> dict:
         fresh: bool,   # lib_end >= expected_end
       }
     """
-    # Temporarily suppress INFO logging AND warnings to prevent diagnostics spam
+    # Suppress pandas warnings locally, but DO NOT change global logger level
     import warnings
-    root_logger = logging.getLogger()
-    orig = root_logger.level
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=FutureWarning)
+        warnings.filterwarnings('ignore', category=UserWarning)
 
-    try:
-        root_logger.setLevel(logging.WARNING)
-        # Suppress FutureWarning and UserWarning from pandas operations
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=FutureWarning)
-            warnings.filterwarnings('ignore', category=UserWarning)
+        path = _locate_lib_file(ticker, interval)
+        info = {
+            'exists': False, 'pkl_path': path, 'pkl_mtime': None,
+            'lib_end': None, 'expected_end': None, 'stale': False, 'fresh': False
+        }
 
-            path = _locate_lib_file(ticker, interval)
-            info = {
-                'exists': False, 'pkl_path': path, 'pkl_mtime': None,
-                'lib_end': None, 'expected_end': None, 'stale': False, 'fresh': False
-            }
+        # get expected end from current price calendar for this interval
+        try:
+            df = _cached_fetch_interval_data(ticker, '1d' if interval == '1d' else interval)
+            if df is not None and not df.empty:
+                exp = _expected_last_complete_bar(df.index, interval)
+                if exp is not None:
+                    info['expected_end'] = pd.Timestamp(exp).tz_localize(None).date().isoformat()
+        except Exception:
+            pass
 
-            # get expected end from current price calendar for this interval
-            try:
-                df = fetch_interval_data(ticker, '1d' if interval == '1d' else interval)
-                if df is not None and not df.empty:
-                    exp = _expected_last_complete_bar(df.index, interval)
-                    if exp is not None:
-                        info['expected_end'] = pd.Timestamp(exp).tz_localize(None).date().isoformat()
-            except Exception:
-                pass
-
-            if not path:
-                return info
-
-            try:
-                lib = load_signal_library_interval(ticker, interval)
-                if not lib:
-                    return info
-                info['exists'] = True
-                if lib.get('dates'):
-                    dts = pd.to_datetime(lib['dates'])
-                    if hasattr(dts[0], 'tz') and dts[0].tz is not None:
-                        dts = pd.DatetimeIndex([d.tz_localize(None) for d in dts])
-                    lib_end = dts.max().date().isoformat()
-                    info['lib_end'] = lib_end
-                try:
-                    info['pkl_mtime'] = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    pass
-                # mark stale if both dates known and lib_end < expected_end
-                if info['lib_end'] and info['expected_end']:
-                    info['stale'] = pd.to_datetime(info['lib_end']) < pd.to_datetime(info['expected_end'])
-                    info['fresh'] = not info['stale']
-            except Exception:
-                # keep defaults
-                pass
-
+        if not path:
             return info
-    finally:
-        # Restore original logging level
-        root_logger.setLevel(orig)
+
+        try:
+            lib = _cached_load_signal_library_interval(ticker, interval)
+            if not lib:
+                return info
+            info['exists'] = True
+            if lib.get('dates'):
+                dts = pd.to_datetime(lib['dates'])
+                if hasattr(dts[0], 'tz') and dts[0].tz is not None:
+                    dts = pd.DatetimeIndex([d.tz_localize(None) for d in dts])
+                lib_end = dts.max().date().isoformat()
+                info['lib_end'] = lib_end
+            try:
+                info['pkl_mtime'] = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+            # mark stale if both dates known and lib_end < expected_end
+            if info['lib_end'] and info['expected_end']:
+                info['stale'] = pd.to_datetime(info['lib_end']) < pd.to_datetime(info['expected_end'])
+                info['fresh'] = not info['stale']
+        except Exception:
+            # keep defaults
+            pass
+
+        return info
 # ---------------------------------------------------------------------------
 
 def _mp_to_naive_days(idx_like) -> pd.DatetimeIndex:
@@ -302,9 +424,9 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
     # ---------- 1) Load secondary prices (interval-aware) ----------
     # Daily path stays as-is to preserve the validated parity
     if interval == '1d':
-        sec_df = fetch_interval_data(secondary, '1d')
+        sec_df = _cached_fetch_interval_data(secondary, '1d')
     else:
-        sec_df = fetch_interval_data(secondary, interval)
+        sec_df = _cached_fetch_interval_data(secondary, interval)
 
     if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
         return {'Interval': interval, 'Members': '', 'Status': f'NO_SECONDARY_DATA:{secondary}'}
@@ -327,7 +449,7 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
     series_map = {}
     invert_map = {}  # Track which tickers are inverted
     for t, inv in act:
-        lib = load_signal_library_interval(t, interval)
+        lib = _cached_load_signal_library_interval(t, interval)
         if not lib:
             continue
         dates = _mp_to_naive_days(lib.get('dates', []))
@@ -436,12 +558,15 @@ def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flag
     with unanimity rules, matching _mp_eval_interval's calendars.
     Returns a Series indexed by dates where the signal is evaluated.
     """
+    logger.info(f"[Combined Signals] ENTRY - {secondary} {interval}, primaries={primaries}")
     invert_flags = invert_flags or [False] * len(primaries)
     mute_flags   = mute_flags   or [False] * len(primaries)
 
     # Load secondary prices
-    sec_df = fetch_interval_data(secondary, '1d' if interval == '1d' else interval)
+    logger.info(f"[Combined Signals] Fetching secondary {secondary} prices...")
+    sec_df = _cached_fetch_interval_data(secondary, '1d' if interval == '1d' else interval)
     if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
+        logger.warning(f"[Combined Signals] Secondary {secondary} has no data, returning empty")
         return pd.Series(dtype=object)
     if isinstance(sec_df.columns, pd.MultiIndex):
         sec_df.columns = sec_df.columns.get_level_values(0)
@@ -450,15 +575,19 @@ def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flag
     if isinstance(close_data, pd.DataFrame):
         close_data = close_data.iloc[:, 0]
     sec_close = pd.Series(pd.to_numeric(close_data.values, errors='coerce'), index=sec_idx, dtype='float64')
+    logger.info(f"[Combined Signals] Secondary has {len(sec_close)} price dates")
 
     # Load primaries (native calendars; no alignment yet)
+    logger.info(f"[Combined Signals] Loading {len(primaries)} primaries...")
     series_map = {}
     inv_map = {}
-    for t, inv, m in zip(primaries, invert_flags, mute_flags):
+    for idx, (t, inv, m) in enumerate(zip(primaries, invert_flags, mute_flags)):
         if not t or m:
             continue
-        lib = load_signal_library_interval(t.strip().upper(), interval)
+        logger.info(f"[Combined Signals] Loading primary {idx+1}/{len(primaries)}: {t}")
+        lib = _cached_load_signal_library_interval(t.strip().upper(), interval)
         if not lib:
+            logger.warning(f"[Combined Signals] No library found for {t}")
             continue
         dates = _mp_to_naive_days(lib.get('dates', []))
         raw   = lib.get('primary_signals', lib.get('signals', []))
@@ -470,38 +599,53 @@ def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flag
             sigs = pd.Series(arr, index=sigs.index, dtype=object)
         series_map[t.strip().upper()] = sigs
         inv_map[t.strip().upper()]    = inv
+        logger.info(f"[Combined Signals] Loaded {len(sigs)} dates for {t}")
 
     if not series_map:
+        logger.warning(f"[Combined Signals] No valid primary libraries loaded")
         return pd.Series(dtype=object)
+
+    logger.info(f"[Combined Signals] Loaded {len(series_map)} primaries, combining signals...")
 
     if interval == '1d':
         # 1) intersect primaries
+        logger.info(f"[Combined Signals] 1d mode: intersecting primaries")
         prim_series = list(series_map.values())
         common_dates = sorted(set.intersection(*[set(s.index) for s in prim_series]))
         if not common_dates:
+            logger.warning(f"[Combined Signals] No common dates across primaries")
             return pd.Series(dtype=object)
+        logger.info(f"[Combined Signals] Found {len(common_dates)} common dates across primaries")
 
         # 2) combine on primary-intersection only
+        logger.info(f"[Combined Signals] Combining signals with unanimity...")
         sig_df = pd.DataFrame({t: series_map[t].reindex(common_dates) for t in series_map}, index=common_dates)
         combined = _mp_combine_unanimity_vectorized(sig_df).astype(str)
 
         # 3) intersect with secondary calendar (no ffill of signals)
+        logger.info(f"[Combined Signals] Intersecting with secondary calendar...")
         grid = pd.Index(common_dates).intersection(sec_close.index)
         if len(grid) == 0:
+            logger.warning(f"[Combined Signals] No overlap between primary and secondary calendars")
             return pd.Series(dtype=object)
+        logger.info(f"[Combined Signals] EXIT 1d - returning {len(grid)} combined signals")
 
         return combined.reindex(grid)
 
     else:
         # native interval: strict intersection across primaries and secondary
+        logger.info(f"[Combined Signals] Non-1d mode: strict intersection")
         common = set(sec_close.index)
         for s in series_map.values():
             common &= set(s.index)
         if not common:
+            logger.warning(f"[Combined Signals] No common dates across primaries and secondary")
             return pd.Series(dtype=object)
         dates = pd.DatetimeIndex(sorted(common))
+        logger.info(f"[Combined Signals] Found {len(dates)} common dates, combining...")
         sig_df = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
         combined = _mp_combine_unanimity_vectorized(sig_df).astype(str)
+        logger.info(f"[Combined Signals] EXIT {interval} - returning {len(combined)} combined signals")
         return combined
 
 def _compute_entry_dates_from_signals(dates: pd.DatetimeIndex, sigs: pd.Series) -> pd.Series:
@@ -528,12 +672,16 @@ def _mp_build_virtual_libraries(primaries, secondary, intervals, invert_flags=No
     Build a {interval: library_dict} for the SECONDARY using the combined multi-primary signals.
     Tagged as 'virtual-multi-primary' to allow downstream code to suppress pair overlays.
     """
+    logger.info(f"[Virtual Libs] Building for {secondary}, intervals={intervals}, primaries={primaries}")
     libs = {}
-    for iv in intervals:
+    for i, iv in enumerate(intervals):
+        logger.info(f"[Virtual Libs] Processing interval {i+1}/{len(intervals)}: {iv}")
         ser = _mp_build_combined_signal_series(primaries, secondary, iv, invert_flags, mute_flags)
         if ser is None or ser.empty:
+            logger.warning(f"[Virtual Libs] Empty series for {iv}, skipping")
             continue
         ser = ser.dropna()
+        logger.info(f"[Virtual Libs] Got {len(ser)} signal dates for {iv}")
 
         # Compute entry dates for time-in-signal display
         entry_dates = _compute_entry_dates_from_signals(ser.index, ser)
@@ -547,22 +695,39 @@ def _mp_build_virtual_libraries(primaries, secondary, intervals, invert_flags=No
             'primary_signals': ser.astype(str).tolist(),    # Alias
             'signal_entry_dates': entry_dates.tolist(),     # Enable time-in-signal
         }
+        logger.info(f"[Virtual Libs] Completed interval {iv}")
+    logger.info(f"[Virtual Libs] DONE - built {len(libs)} libraries")
     return libs
 # ---------------------------------------------------------------------------
 
 # Port fallback logic (Patch 4)
 _WANTED = int(os.environ.get('CONFLUENCE_PORT', '8056'))
 
-def _find_free_port(p: int) -> int:
-    """Find next available port if requested port is occupied."""
+def _find_free_port(p: int, max_attempts: int = 100) -> int:
+    """
+    Find next available port if requested port is occupied.
+
+    Args:
+        p: Starting port number
+        max_attempts: Maximum number of ports to try (default: 100)
+
+    Returns:
+        First available port number
+
+    Raises:
+        RuntimeError: If no free port found within max_attempts
+    """
     import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(('127.0.0.1', p))
-            return p
-        except OSError:
-            logger.warning(f"Port {p} occupied, trying {p+1}...")
-            return _find_free_port(p + 1)
+    for port in range(p, p + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('127.0.0.1', port))
+                if port != p:
+                    logger.warning(f"Port {p} occupied, trying {port}...")
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"Could not find free port in range {p}-{p+max_attempts-1}")
 
 APP_PORT = _find_free_port(_WANTED)
 APP_TITLE = "Multi-Timeframe Signal Confluence Analyzer"
@@ -583,6 +748,30 @@ app = dash.Dash(
 )
 
 app.title = APP_TITLE
+
+# --- Health and Version Endpoints for Production Monitoring ------------------
+from flask import jsonify
+
+__version__ = "1.0.0"  # Update this with actual version
+
+@app.server.route('/healthz')
+def healthz():
+    """Health check endpoint for monitoring and load balancers."""
+    return jsonify({
+        'status': 'healthy',
+        'service': APP_TITLE,
+        'port': APP_PORT,
+        'version': __version__
+    }), 200
+
+@app.server.route('/version')
+def version():
+    """Version information endpoint."""
+    return jsonify({
+        'version': __version__,
+        'service': APP_TITLE,
+        'python_version': f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}"
+    }), 200
 
 # Store the most recent Multi-Primary run (secondary, frames, context)
 # Used to bridge into the Analyze Confluence section
@@ -976,6 +1165,20 @@ multi_primary_section = dbc.Container([
                     'color': '#80ff00',
                     'border': '1px solid #80ff00'
                 },
+                style_data_conditional=[
+                    # Greenish for OK
+                    {'if': {'filter_query': 'contains({1d}, "[OK]")'}, 'backgroundColor': '#1f3a1f'},
+                    {'if': {'filter_query': 'contains({1wk}, "[OK]")'}, 'backgroundColor': '#1f3a1f'},
+                    {'if': {'filter_query': 'contains({1mo}, "[OK]")'}, 'backgroundColor': '#1f3a1f'},
+                    {'if': {'filter_query': 'contains({3mo}, "[OK]")'}, 'backgroundColor': '#1f3a1f'},
+                    {'if': {'filter_query': 'contains({1y}, "[OK]")'}, 'backgroundColor': '#1f3a1f'},
+                    # Reddish for STALE
+                    {'if': {'filter_query': 'contains({1d}, "[STALE]")'}, 'backgroundColor': '#3a1f1f'},
+                    {'if': {'filter_query': 'contains({1wk}, "[STALE]")'}, 'backgroundColor': '#3a1f1f'},
+                    {'if': {'filter_query': 'contains({1mo}, "[STALE]")'}, 'backgroundColor': '#3a1f1f'},
+                    {'if': {'filter_query': 'contains({3mo}, "[STALE]")'}, 'backgroundColor': '#3a1f1f'},
+                    {'if': {'filter_query': 'contains({1y}, "[STALE]")'}, 'backgroundColor': '#3a1f1f'},
+                ],
             ),
 
             html.Details([
@@ -983,7 +1186,12 @@ multi_primary_section = dbc.Container([
                 html.Pre(id='mp-build-commands', style={
                     'backgroundColor': '#0f0f0f', 'color': '#ccc', 'padding': '10px',
                     'border': '1px solid #333', 'borderRadius': '6px', 'whiteSpace': 'pre-wrap'
-                })
+                }),
+                dcc.Clipboard(
+                    target_id='mp-build-commands',
+                    title='Copy',
+                    style={'float': 'right', 'marginTop': '-32px', 'marginRight': '6px'}
+                )
             ], open=False, style={'marginTop': '8px'}),
         ]
     ),
@@ -1011,56 +1219,13 @@ app.layout = html.Div([
     # Hidden bridge store (must be part of layout)
     mp_bridge_store,
 
-    # Input Section
-    dbc.Container([
-        dbc.Row([
-            dbc.Col([
-                html.Label("Ticker Symbol:", style={'fontWeight': 'bold', 'color': '#ccc'}),
-                dcc.Input(
-                    id='ticker-input',
-                    type='text',
-                    value='SPY',
-                    placeholder='Enter ticker (e.g., SPY, QQQ, AAPL)',
-                    style={'width': '100%', 'padding': '8px', 'fontSize': '16px'}
-                ),
-            ], width=6),
-
-            dbc.Col([
-                html.Label("‎", style={'color': '#000'}),  # Spacer
-                html.Br(),
-                dbc.Button(
-                    "Analyze Confluence",
-                    id='analyze-btn',
-                    color='success',
-                    n_clicks=0,
-                    style={'width': '100%', 'fontSize': '16px', 'fontWeight': 'bold'}
-                ),
-            ], width=3),
-        ], style={'marginBottom': '20px'}),
-
-        # Timeframe Toggles
-        dbc.Row([
-            dbc.Col([
-                html.Label("Timeframes to Include:", style={'fontWeight': 'bold', 'color': '#ccc'}),
-                dcc.Checklist(
-                    id='timeframe-toggles',
-                    options=[
-                        {'label': ' Daily (1d)', 'value': '1d'},
-                        {'label': ' Weekly (1wk)', 'value': '1wk'},
-                        {'label': ' Monthly (1mo)', 'value': '1mo'},
-                        {'label': ' Quarterly (3mo)', 'value': '3mo'},
-                        {'label': ' Yearly (1y)', 'value': '1y'},
-                    ],
-                    value=['1d', '1wk', '1mo', '3mo', '1y'],  # All on by default
-                    labelStyle={'display': 'inline-block', 'marginRight': '20px', 'color': '#ccc'},
-                    style={'marginTop': '10px'}
-                ),
-            ]),
-        ]),
-    ], fluid=True, style={'marginBottom': '30px'}),
-
-    # Results Section
-    html.Div(id='results-container', style={'maxWidth': '1400px', 'margin': '0 auto'}),
+    # Results Section with loading indicator
+    dcc.Loading(
+        id='analyze-loading',
+        type='default',
+        children=html.Div(id='results-container',
+                          style={'maxWidth': '1400px', 'margin': '0 auto'})
+    ),
 
 ], style={'backgroundColor': '#1a1a1a', 'minHeight': '100vh', 'padding': '20px'})
 
@@ -1184,14 +1349,21 @@ def create_breakdown_table(breakdown: dict, time_in_signal: dict, libraries: dic
 def create_individual_chart(ticker: str, interval: str, library: dict) -> html.Div:
     """Create individual timeframe chart with price and cumulative combined capture."""
     try:
+        # SURGICAL FIX 4: Trim to last N points
+        MAX_GRAPH_POINTS = int(os.environ.get('MAX_GRAPH_POINTS', 500))
+
         # Fetch prices on-demand
-        df_prices = fetch_interval_data(ticker, interval, price_basis='close')
+        df_prices = _cached_fetch_interval_data(ticker, interval, price_basis='close')
 
         if df_prices is None or df_prices.empty:
             return html.Div([
                 html.H5(f"{interval.upper()} Chart", style={'color': '#80ff00'}),
                 html.P("No data available", style={'color': '#888'})
             ], style={'marginBottom': '20px'})
+
+        # Truncate to last N points before building chart
+        if len(df_prices) > MAX_GRAPH_POINTS:
+            df_prices = df_prices.iloc[-MAX_GRAPH_POINTS:]
 
         close = df_prices['Close']
 
@@ -1410,6 +1582,25 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
                 f"Top Short: {pair_str(pairs_info['top_short_pair'])} {pairs_info['top_short_capture']:.2f}%"
             )
 
+        # Add active pair SMA overlays (when not virtual)
+        if not is_virtual:
+            try:
+                sma_a, sma_b, pair_label = _build_dynamic_active_pair_smas(library, close)
+                fig.add_trace(go.Scatter(
+                    x=close.index, y=sma_a, name='Active SMA A',
+                    line=dict(width=1, dash='dot', color='#ffaa00'), opacity=0.8, yaxis='y1',
+                    customdata=pair_label,
+                    hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Pair: %{customdata}<br>SMA A: %{y:.2f}<extra></extra>'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=close.index, y=sma_b, name='Active SMA B',
+                    line=dict(width=1, dash='dot', color='#ff66aa'), opacity=0.8, yaxis='y1',
+                    customdata=pair_label,
+                    hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Pair: %{customdata}<br>SMA B: %{y:.2f}<extra></extra>'
+                ))
+            except Exception:
+                pass  # Graceful degradation if dynamic pairs unavailable
+
         # Layout with dual Y-axes
         fig.update_layout(
             title={
@@ -1445,121 +1636,6 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
             html.H5(f"{interval.upper()} Chart", style={'color': '#80ff00'}),
             html.P(f"Error loading chart: {str(e)}", style={'color': '#ff4444'})
         ], style={'marginBottom': '20px'})
-
-
-def create_confluence_timeline(aligned: pd.DataFrame) -> html.Div:
-    """Create combined confluence timeline chart (full history with smart sampling)."""
-    try:
-        # Smart sampling: full detail last year, reduced beyond that
-        idx = aligned.index
-        n = len(idx)
-
-        if n <= 2000:
-            dates = idx
-        else:
-            # Last 365 days: daily
-            last = idx[-365:]
-            # Days 365-730: weekly (every 5 business days)
-            mid = idx[-730:-365:5]
-            # Older: monthly (every 21 business days)
-            early = idx[:-730:21]
-            # Modern pandas: use concatenate instead of deprecated append
-            dates = pd.Index(np.concatenate([early.values, mid.values, last.values]))
-
-        tiers = []
-        alignment_pcts = []
-        breakdowns = []
-
-        for date in dates:
-            conf = calculate_confluence(aligned, date, min_active=2)
-            tiers.append(conf['tier'])
-            alignment_pcts.append(conf['alignment_pct'])
-            # Format breakdown as string for hover
-            bd_str = ', '.join([f"{k}:{v}" for k, v in conf.get('breakdown', {}).items()])
-            breakdowns.append(bd_str)
-
-        # Map tiers to colors (enhanced color scheme)
-        color_map = {
-            'Strong Buy': '#00ff00',     # Bright green
-            'Buy': '#66ff66',            # Medium green
-            'Weak Buy': '#b3ffb3',       # Light green
-            'Neutral': '#ffff00',        # Yellow
-            'Weak Short': '#ffb3b3',     # Light red
-            'Short': '#ff6666',          # Medium red
-            'Strong Short': '#ff0000',   # Bright red
-            'Unknown': '#888888'
-        }
-
-        colors = [color_map.get(t, '#888888') for t in tiers]
-
-        # Create figure
-        fig = go.Figure()
-
-        # Bar chart with rich hover data
-        fig.add_trace(go.Bar(
-            x=dates,
-            y=alignment_pcts,
-            marker_color=colors,
-            name='Alignment %',
-            customdata=list(zip(tiers, breakdowns)),
-            hovertemplate=(
-                '<b>%{x|%Y-%m-%d}</b><br>'
-                'Tier: %{customdata[0]}<br>'
-                'Alignment: %{y:.1f}%<br>'
-                '%{customdata[1]}<extra></extra>'
-            )
-        ))
-
-        # Add threshold lines
-        for threshold in [50, 75, 100]:
-            fig.add_hline(
-                y=threshold,
-                line=dict(width=1, dash='dot', color='#666'),
-                annotation_text=f"{threshold}%",
-                annotation_position="right"
-            )
-
-        # Add tier change markers
-        for i in range(1, len(dates)):
-            if tiers[i] != tiers[i-1]:
-                fig.add_vline(
-                    x=dates[i],
-                    line=dict(width=1, dash='dot', color='#444')
-                )
-
-        fig.update_layout(
-            title="Confluence Alignment Over Time (Full History)",
-            title_x=0.02,
-            xaxis_title="Date",
-            yaxis_title="Alignment %",
-            template="plotly_dark",
-            height=500,
-            hovermode='closest',
-            yaxis=dict(range=[0, 100]),
-            plot_bgcolor='#1a1a1a',
-            paper_bgcolor='#2a2a2a',
-            font=dict(color='#ccc'),
-            title_font=dict(color='#80ff00', size=18),
-            showlegend=False
-        )
-
-        return html.Div([
-            html.H4("Combined Confluence Timeline",
-                    style={'color': '#80ff00', 'marginTop': '40px', 'marginBottom': '20px'}),
-            dcc.Graph(figure=fig, config={'displayModeBar': True})
-        ], style={
-            'backgroundColor': '#2a2a2a',
-            'padding': '25px',
-            'borderRadius': '10px',
-            'marginBottom': '30px'
-        })
-
-    except Exception as e:
-        logger.error(f"Failed to create confluence timeline: {e}", exc_info=True)
-        return html.Div([
-            html.H4("Combined Confluence Timeline", style={'color': '#80ff00'}),
-            html.P(f"Error creating timeline: {str(e)}", style={'color': '#ff4444'})
-        ])
 
 
 # =============================================================================
@@ -1603,10 +1679,9 @@ def add_primary_row(n_clicks, children):
 def delete_primary_row(n_clicks_list, children):
     if not children or not n_clicks_list or not any(n_clicks_list):
         return no_update
-    ctx = dash.callback_context
-    if not ctx.triggered:
+    if not dash.ctx.triggered:
         return no_update
-    triggered = ctx.triggered[0]['prop_id'].split('.')[0]
+    triggered = dash.ctx.triggered[0]['prop_id'].split('.')[0]
     try:
         bid = json.loads(triggered)
         idx_to_delete = bid.get('index')
@@ -1644,18 +1719,57 @@ def delete_primary_row(n_clicks_list, children):
         Input('mp-rescan', 'n_clicks'),
         Input('run-multi-primary', 'n_clicks'),
     ],
-    prevent_initial_call=False
+    State('primary-rows-container', 'children'),
+    prevent_initial_call=True
 )
-def update_mp_diagnostics(primary_vals, intervals, secondary, rescan_clicks, run_clicks):
+def update_mp_diagnostics(primary_vals, intervals, secondary, rescan_clicks, run_clicks,
+                          rows_children):
     """
     Live diagnostics for multi-primary section with staleness detection.
     Shows PKL file dates, calendar-aware expected dates, and staleness badges.
     Dual-trigger: updates on both 'Rescan Libraries' and 'Run' button clicks.
     """
+    # Count expected number of primary-status elements for wildcard outputs
+    try:
+        expected = 0
+        for ch in (rows_children or []):
+            cid = (ch.get('props', {}) or {}).get('id', {})
+            if isinstance(cid, dict) and cid.get('type') == 'primary-row':
+                expected += 1
+    except Exception:
+        expected = len(primary_vals or [])
+
+    # Helper to ensure list has exact length for wildcard outputs
+    def _ensure_len(lst, n, filler):
+        lst = list(lst or [])
+        if len(lst) < n:
+            lst += [filler] * (n - len(lst))
+        elif len(lst) > n:
+            lst = lst[:n]
+        return lst
+
+    # Only do the heavy scan when explicitly requested
+    trig = getattr(dash.ctx, "triggered_id", None)
+    if trig not in ('mp-rescan', 'run-multi-primary'):
+        # MUST return proper-length lists for wildcard outputs, not no_update
+        empty_text = _ensure_len([], expected, '')
+        empty_style = _ensure_len([], expected, {'display': 'none'})
+        return (no_update, no_update, no_update,
+                no_update, no_update, no_update,
+                empty_text, empty_style)
+
     ivs = intervals or ['1d']
 
-    # Build availability matrix for primaries (only non-empty)
-    prims = [p.strip().upper() for p in (primary_vals or []) if p and p.strip()]
+    # Build availability matrix for primaries (only non-empty) with sanitization
+    prims = []
+    for p in (primary_vals or []):
+        if p and p.strip():
+            try:
+                prims.append(_sanitize_ticker(p))
+            except ValueError as e:
+                # Invalid ticker in diagnostics - skip it but could log
+                logger.warning(f"Skipping invalid ticker in diagnostics: {p} - {e}")
+                continue
     matrix_rows = []
     cols = [{'name': 'Ticker', 'id': 'Ticker'}] + [{'name': iv, 'id': iv} for iv in ivs]
     missing_msgs = []
@@ -1720,17 +1834,20 @@ def update_mp_diagnostics(primary_vals, intervals, secondary, rescan_clicks, run
         per_row_text.append('')
         per_row_style.append({'display': 'none'})
 
-    # Probe secondary price availability
+    # Probe secondary price availability with sanitization
     sec_issues = []
     if secondary and secondary.strip():
-        sec = secondary.strip().upper()
-        for iv in ivs:
-            try:
-                df = fetch_interval_data(sec, '1d' if iv == '1d' else iv)
-                if df is None or df.empty or 'Close' not in df.columns:
-                    sec_issues.append(f"{sec} {iv} prices unavailable")
-            except Exception as e:
-                sec_issues.append(f"{sec} {iv} fetch error: {str(e)[:80]}")
+        try:
+            sec = _sanitize_ticker(secondary)
+            for iv in ivs:
+                try:
+                    df = _cached_fetch_interval_data(sec, '1d' if iv == '1d' else iv)
+                    if df is None or df.empty or 'Close' not in df.columns:
+                        sec_issues.append(f"{sec} {iv} prices unavailable")
+                except Exception as e:
+                    sec_issues.append(f"{sec} {iv} fetch error: {str(e)[:80]}")
+        except ValueError as e:
+            sec_issues.append(f"Invalid secondary ticker: {str(e)}")
 
     # Banner content
     if missing_msgs or stale_msgs or sec_issues:
@@ -1780,6 +1897,14 @@ def update_mp_diagnostics(primary_vals, intervals, secondary, rescan_clicks, run
         banner_color = 'info'
         banner_open = True
 
+    # Guarantee correct lengths for wildcard outputs
+    per_row_text  = _ensure_len(per_row_text,  expected, '')
+    per_row_style = _ensure_len(per_row_style, expected, {'display': 'none'})
+
+    # Safety: ensure lists exist (never return no_update for wildcard outputs)
+    if not per_row_text:
+        per_row_text, per_row_style = [], []
+
     return (
         banner_text, banner_color, banner_open,
         matrix_rows, cols, cmd_block,
@@ -1809,20 +1934,31 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
                    style={'color': '#888', 'textAlign': 'center', 'marginTop': '10px'})
         ]), no_update)
 
-    # Validate secondary
-    if not secondary or not secondary.strip():
+    # Validate and sanitize secondary
+    try:
+        secondary = _sanitize_ticker(secondary) if secondary else None
+    except ValueError as e:
+        return (html.Div([html.P(f"Invalid secondary ticker: {str(e)}",
+                                 style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
+
+    if not secondary:
         return (html.Div([html.P("Please enter a secondary ticker",
                                  style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
-    # Build primaries + flags from rows
+    # Build primaries + flags from rows with sanitization
     primaries = []
     invert_flags = []
     mute_flags = []
     for tval, ival, mval in zip(primaries_vals or [], invert_vals or [], mute_vals or []):
         if tval and tval.strip():
-            primaries.append(tval.strip().upper())
-            invert_flags.append('invert' in (ival or []))
-            mute_flags.append('mute' in (mval or []))
+            try:
+                sanitized = _sanitize_ticker(tval)
+                primaries.append(sanitized)
+                invert_flags.append('invert' in (ival or []))
+                mute_flags.append('mute' in (mval or []))
+            except ValueError as e:
+                return (html.Div([html.P(f"Invalid primary ticker '{tval}': {str(e)}",
+                                         style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
     if not primaries:
         return (html.Div([html.P("Please enter at least one primary ticker",
@@ -1833,12 +1969,19 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
         return (html.Div([html.P("All primaries are muted. Unmute at least one.",
                                  style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
-    # Validate intervals
-    if not intervals:
-        return (html.Div([html.P("Please select at least one interval",
+    # Validate and sanitize intervals
+    try:
+        intervals = _sanitize_intervals(intervals)
+    except ValueError as e:
+        return (html.Div([html.P(f"Invalid intervals: {str(e)}",
                                  style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
 
-    secondary = secondary.strip().upper()
+    # Cap number of primaries to prevent compute blowup
+    if len(primaries) > MAX_PRIMARIES:
+        return (html.Div([html.P(f"Too many primaries (max {MAX_PRIMARIES}). Please reduce the number of tickers.",
+                                 style={'color': '#ff4444', 'textAlign': 'center'})]), no_update)
+
+    # secondary is already sanitized (uppercase, stripped)
     logger.info(f"[Multi-Primary] Starting analysis: primaries={primaries}, secondary={secondary}, intervals={intervals}")
 
     rows = []
@@ -1919,6 +2062,439 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
     ]), mp_ctx)
 
 
+# ========= New: Confluence history, performance, and master panel =========
+
+_BUY_TIERS   = {'Strong Buy', 'Buy', 'Weak Buy'}
+_SHORT_TIERS = {'Strong Short', 'Short', 'Weak Short'}
+
+def _tier_to_dir(tier: str) -> str:
+    if tier in _BUY_TIERS: return 'Buy'
+    if tier in _SHORT_TIERS: return 'Short'
+    return 'None'
+
+def _sig_to_num(s: str) -> int:
+    return 1 if s == 'Buy' else -1 if s == 'Short' else 0
+
+def _compute_confluence_history(aligned: pd.DataFrame, min_active: int = 2) -> pd.DataFrame:
+    """
+    Vectorized confluence history:
+      - Map signals to +1 (Buy), -1 (Short), 0 (None)
+      - active_count = non-zero signals per day
+      - alignment_pct = |sum(signs)| / active_count * 100
+      - dir = Buy / Short / None based on sign of the sum
+      - tier bucketed by thresholds (>=75 strong, >=50 base, >0 weak); Neutral if dir=None or active_count<min_active
+    """
+    if aligned is None or aligned.empty:
+        return pd.DataFrame(index=getattr(aligned, "index", pd.DatetimeIndex([])))
+
+    # Accept both string and numeric encodings, plus Python None
+    _map = {'Buy': 1, 'Short': -1, 'None': 0, 1: 1, -1: -1, 0: 0, None: 0}
+
+    # Column-wise map avoids the "invalid literal for int()" path
+    num = aligned.apply(lambda s: s.map(_map)).fillna(0).astype('int8')
+
+    active = (num != 0).sum(axis=1).astype('int16')
+    ssum   = num.sum(axis=1).astype('int16')
+
+    dir_series = pd.Series(
+        np.where(ssum > 0, 'Buy', np.where(ssum < 0, 'Short', 'None')),
+        index=aligned.index,
+        dtype=object
+    )
+
+    denom      = active.where(active > 0, other=np.nan)
+    align_pct  = (ssum.abs() / denom * 100.0).fillna(0.0)
+
+    strong = align_pct >= 75
+    base   = (align_pct >= 50) & (align_pct < 75)
+    weak   = (align_pct >  0) & (align_pct < 50)
+    ok     = active >= int(min_active)
+
+    tier = pd.Series('Neutral', index=aligned.index, dtype=object)
+    buy_mask   = (ssum > 0) & ok
+    short_mask = (ssum < 0) & ok
+    tier.loc[buy_mask   & strong] = 'Strong Buy'
+    tier.loc[buy_mask   & base  ] = 'Buy'
+    tier.loc[buy_mask   & weak  ] = 'Weak Buy'
+    tier.loc[short_mask & strong] = 'Strong Short'
+    tier.loc[short_mask & base  ] = 'Short'
+    tier.loc[short_mask & weak  ] = 'Weak Short'
+
+    return pd.DataFrame(
+        {
+            'tier':          tier,
+            'alignment_pct': align_pct.round(2),
+            'active_count':  active.astype(int),
+            'dir':           dir_series,
+        },
+        index=aligned.index
+    )
+
+def _build_confluence_strategy_equity(price_daily: pd.Series, conf_df: pd.DataFrame) -> pd.Series:
+    """
+    Long on Buy-tier, short on Short-tier, flat otherwise.
+    Return cumulative 'capture %' (sum of daily pct returns with sign).
+    """
+    rets = price_daily.pct_change().fillna(0.0) * 100.0
+    side = conf_df['dir'].map({'Buy': 1, 'Short': -1}).fillna(0).astype(int)
+    cap  = rets * side
+    return cap.cumsum()
+
+def _signals_heatmap_matrix(libraries: dict, aligned: pd.DataFrame):
+    """
+    Build a heatmap matrix for intervals x dates.
+    Returns: (Z, ivs, dates) where:
+      Z   in [0,1] for colors, shape (len(ivs), len(dates))
+    """
+    # SURGICAL FIX 3: Downsample heatmap if too many columns
+    MAX_HEATMAP_COLUMNS = int(os.environ.get('MAX_HEATMAP_COLUMNS', 1000))
+
+    ivs = [iv for iv in ['1d', '1wk', '1mo', '3mo', '1y']
+           if iv in libraries and iv in aligned.columns]
+    dates = aligned.index
+    if not ivs:
+        return np.zeros((0, 0)), [], dates
+
+    rows_num = []
+    for iv in ivs:
+        s = aligned[iv].astype(str).reindex(dates)
+        num = s.map({'Buy': 1, 'Short': -1}).fillna(0).astype(int).to_numpy()
+        rows_num.append((num + 1) / 2.0)  # -> 0, 0.5, 1
+    Z = np.array(rows_num, dtype=float)
+
+    # Downsample if date grid exceeds threshold
+    if len(dates) > MAX_HEATMAP_COLUMNS:
+        step = len(dates) // MAX_HEATMAP_COLUMNS
+        Z = Z[:, ::step][:, :MAX_HEATMAP_COLUMNS]
+        dates = dates[::step][:MAX_HEATMAP_COLUMNS]
+
+    return Z, ivs, dates
+
+def create_master_combined_chart(ticker: str, libraries: dict, aligned: pd.DataFrame) -> html.Div:
+    """
+    Row 1: Price (left) + Confluence PnL (right)
+    Row 2: Timeframe signal heatmap (red/grey/green)
+    Row 3: Alignment % line with threshold guides
+    """
+    # Price
+    t0 = time.perf_counter()
+    px = _cached_fetch_interval_data(ticker, '1d', price_basis='close')
+    logger.info("[Master] price fetch %.3fs", time.perf_counter()-t0)
+
+    if px is None or px.empty or 'Close' not in px.columns:
+        return html.Div([html.P("No daily price data for master chart.", style={'color': '#ff4444'})])
+
+    price = px['Close']
+    price.index = pd.DatetimeIndex(pd.to_datetime(price.index, utc=True)).tz_convert(None)
+
+    # Confluence history
+    t1 = time.perf_counter()
+    conf_df = _compute_confluence_history(aligned, min_active=2)
+    logger.info("[Master] confluence history %.3fs (rows=%d)", time.perf_counter()-t1, len(conf_df))
+
+    # Strategy equity from confluence
+    eq = _build_confluence_strategy_equity(price.reindex(conf_df.index).fillna(method='ffill'), conf_df)
+
+    # Heatmap
+    Z, ivs, dates = _signals_heatmap_matrix(libraries, aligned)
+
+    # Build figure
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        specs=[[{'secondary_y': True}], [{}], [{}]],
+        row_heights=[0.58, 0.25, 0.17]
+    )
+
+    # Row 1: Price + Equity
+    fig.add_trace(go.Scatter(x=price.index, y=price, name='Close', mode='lines',
+                             line=dict(width=2, color='#80ff00')), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=eq.index, y=eq, name='Confluence PnL (%)', mode='lines',
+                             line=dict(width=2, color='#00eaff')), row=1, col=1, secondary_y=True)
+
+    # Row 2: Heatmap of signals
+    if Z.size:
+        fig.add_trace(go.Heatmap(
+            x=dates, y=[iv.upper() for iv in ivs], z=Z,
+            zmin=0, zmax=1,
+            colorscale=[[0.0, '#ff3b3b'], [0.5, '#555555'], [1.0, '#00b050']],
+            showscale=False,
+            hovertemplate='%{y}<br>%{x|%Y-%m-%d}<extra></extra>'
+        ), row=2, col=1)
+
+    # Row 3: Alignment %
+    fig.add_trace(go.Scatter(
+        x=conf_df.index, y=conf_df['alignment_pct'], name='Alignment %', mode='lines',
+        line=dict(width=2, color='#cccc00'),
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Alignment: %{y:.1f}%<br>Tier: %{customdata}',
+        customdata=conf_df['tier']
+    ), row=3, col=1)
+
+    for yline in (50, 75, 100):
+        fig.add_hline(y=yline, line=dict(width=1, dash='dot', color='#666'),
+                      row=3, col=1)
+
+    # Add regime-shift markers (vertical lines when Buy/Short state flips)
+    # SURGICAL FIX 2: Cap vlines to avoid thousands of shapes
+    MAX_VLINES = int(os.environ.get('MAX_VLINES', 50))
+    DISABLE_VLINES = os.environ.get('DISABLE_VLINES', '0') == '1'
+
+    if not DISABLE_VLINES:
+        change_pts = conf_df.index[conf_df['dir'].ne(conf_df['dir'].shift(1))]
+        change_pts = change_pts[1:]  # skip first point
+        if len(change_pts) > MAX_VLINES:
+            # downsample: take evenly spaced subset
+            step = len(change_pts) // MAX_VLINES
+            change_pts = change_pts[::step][:MAX_VLINES]
+
+        for dt in change_pts:
+            fig.add_vline(x=dt, line=dict(width=1, dash='dot', color='#444'), row=1, col=1)
+            fig.add_vline(x=dt, line=dict(width=1, dash='dot', color='#444'), row=2, col=1)
+            fig.add_vline(x=dt, line=dict(width=1, dash='dot', color='#444'), row=3, col=1)
+
+    # Style
+    fig.update_layout(
+        title={'text': f"{ticker} — Master Multi‑Timeframe Panel",
+               'font': {'color': '#80ff00', 'size': 18}},
+        template='plotly_dark',
+        height=900,
+        hovermode='x unified',
+        plot_bgcolor='#1a1a1a',
+        paper_bgcolor='#2a2a2a',
+        font=dict(color='#ccc'),
+        legend=dict(x=0.01, y=0.99, bgcolor='rgba(0,0,0,0.5)'),
+        uirevision="master"
+    )
+    fig.update_yaxes(title_text="Price ($)", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="PnL (%)", ticksuffix="%", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Alignment %", row=3, col=1, range=[0, 100])
+
+    # Add zoom controls and range selector
+    fig.update_xaxes(
+        row=1, col=1, showspikes=True, spikethickness=1, spikedash='dot', spikecolor='#888',
+        rangeselector=dict(
+            buttons=[
+                dict(count=3, step="month", stepmode="backward", label="3M"),
+                dict(count=6, step="month", stepmode="backward", label="6M"),
+                dict(count=1, step="year",  stepmode="backward", label="1Y"),
+                dict(step="all", label="Max"),
+            ]
+        ),
+        rangeslider=dict(visible=True),
+        rangebreaks=[dict(bounds=["sat", "mon"])]
+    )
+
+    return html.Div([
+        html.H4("Master Combined Timeframe Chart",
+                style={'color': '#80ff00', 'marginTop': '20px', 'marginBottom': '10px'}),
+        dcc.Graph(figure=fig, config={'displayModeBar': True})
+    ])
+
+
+def _forward_returns(price: pd.Series, horizons=(5, 20, 60)) -> pd.DataFrame:
+    """
+    Vectorized forward returns in percent for each horizon.
+    R_k(t) = (Close[t+k]/Close[t] - 1)*100
+    """
+    out = {}
+    for k in horizons:
+        out[f'F+{k}'] = (price.shift(-k) / price - 1.0) * 100.0
+    return pd.DataFrame(out, index=price.index)
+
+def _expected_stats_from_state(price: pd.Series, conf_df: pd.DataFrame, today: pd.Timestamp,
+                               state_key: str = 'tier', horizons=(5,20,60),
+                               min_samples: int = 40, fallback: str = 'dir') -> dict:
+    """
+    Build forward-return cohort using all past dates with the SAME state as today.
+    If sample size < min_samples, fallback to broader cohort (e.g., 'dir').
+
+    Args:
+        price: Price series
+        conf_df: DataFrame with tier, dir, alignment_pct columns
+        today: Date to analyze
+        state_key: Column to match ('tier', 'dir', or 'align_bucket')
+        horizons: Forward return horizons in bars
+        min_samples: Minimum samples before fallback
+        fallback: Fallback key if samples too few ('dir' or 'align_bucket')
+
+    Returns:
+        Dict with effective_key, state_value, by_horizon stats, cohorts, sample_size
+    """
+    today = pd.to_datetime(today)
+    if today.tz is not None: today = today.tz_localize(None)
+
+    def _align_bucket(x):
+        return '>=75' if x >= 75 else '50-75' if x >= 50 else '<50'
+
+    # Prepare optional bucket if needed later
+    conf_df = conf_df.copy()
+    conf_df['align_bucket'] = conf_df['alignment_pct'].apply(_align_bucket)
+
+    chosen_key = state_key
+    state_today = conf_df.loc[today, chosen_key]
+    mask = conf_df[chosen_key].eq(state_today)
+
+    # Fallback if too few samples
+    if mask.sum() < min_samples:
+        if fallback == 'dir' and 'dir' in conf_df.columns:
+            chosen_key = 'dir'
+            state_today = conf_df.loc[today, chosen_key]
+            mask = conf_df[chosen_key].eq(state_today)
+        elif 'align_bucket' in conf_df.columns:
+            chosen_key = 'align_bucket'
+            state_today = conf_df.loc[today, chosen_key]
+            mask = conf_df[chosen_key].eq(state_today)
+
+    fr = _forward_returns(price, horizons=horizons)
+    cohorts = {h: fr.loc[mask, h].dropna() for h in fr.columns}
+
+    stats = {}
+    for h, ser in cohorts.items():
+        if ser.empty:
+            stats[h] = {'N': 0, 'Win%': 0.0, 'Mean': 0.0, 'Median': 0.0,
+                        'P05': 0.0, 'P25': 0.0, 'P75': 0.0, 'P95': 0.0}
+            continue
+        stats[h] = {
+            'N': int(len(ser)),
+            'Win%': round(float((ser > 0).mean() * 100.0), 2),
+            'Mean': round(float(ser.mean()), 2),
+            'Median': round(float(ser.median()), 2),
+            'P05': round(float(ser.quantile(0.05)), 2),
+            'P25': round(float(ser.quantile(0.25)), 2),
+            'P75': round(float(ser.quantile(0.75)), 2),
+            'P95': round(float(ser.quantile(0.95)), 2),
+        }
+
+    return {
+        'effective_key': chosen_key,
+        'state_value': state_today,
+        'by_horizon': stats,
+        'cohorts': cohorts,
+        'sample_size': int(next(iter(stats.values()))['N']) if stats else 0
+    }
+
+def create_expected_kpis(exp: dict) -> html.Div:
+    """
+    KPI row for F+5 / F+20 / F+60 with sample-aware color coding.
+    Green: N>=200; Yellow: 40<=N<200; Red: N<40. Border hue follows Median sign.
+    """
+    def _tile_style(s):
+        N = s['N']
+        med = s['Median']
+        base = '#2a2a2a'
+
+        # Sample size determines base border color
+        if N < 40:
+            border = '#cc3300'  # Red - unreliable
+        elif N < 200:
+            border = '#cccc00'  # Yellow - moderate
+        else:
+            border = '#2e8b57'  # Green - reliable
+
+        # Adjust border by median sign if enough samples
+        if N >= 40:
+            border = '#2e8b57' if med >= 0 else '#cc3300'
+
+        return {
+            'backgroundColor': base,
+            'border': f'2px solid {border}',
+            'borderRadius': '8px',
+            'padding': '12px'
+        }
+
+    tiles = []
+    for h in ['F+5', 'F+20', 'F+60']:
+        s = exp['by_horizon'][h]
+        tiles.append(
+            html.Div([
+                html.H5(h, style={'color': '#80ff00', 'marginBottom': '4px'}),
+                html.P(f"State: {exp['state_value']} ({exp['effective_key']})",
+                       style={'color': '#aaa', 'margin': 0, 'fontSize': '11px'}),
+                html.P(f"N: {s['N']}", style={'color': '#aaa', 'margin': '0'}),
+                html.P(f"Win%: {s['Win%']}%", style={'color': '#ccc', 'margin': '0'}),
+                html.P(f"Median: {s['Median']}%", style={'color': '#ccc', 'margin': '0'}),
+                html.P(f"[P05, P95]: [{s['P05']}%, {s['P95']}%]",
+                       style={'color': '#888', 'margin': '0', 'fontSize': '12px'}),
+            ], style=_tile_style(s))
+        )
+
+    return html.Div([
+        html.H4("Expected Performance (cohorts auto‑broaden if samples are thin)",
+                style={'color': '#80ff00', 'marginTop': '30px', 'marginBottom': '10px'}),
+        html.Div(tiles, style={'display': 'grid',
+                               'gridTemplateColumns': 'repeat(3, 1fr)', 'gap': '12px'})
+    ])
+
+def create_forward_distribution_figure(exp: dict) -> html.Div:
+    """
+    Box plots of forward returns at horizons for the matched cohort.
+    """
+    xs, ys = [], []
+    for h, ser in exp['cohorts'].items():
+        for v in ser:
+            xs.append(h); ys.append(v)
+
+    if not xs:
+        return html.Div([html.P("No cohort samples for this state.", style={'color':'#888'})])
+
+    fig = go.Figure()
+    for h in ['F+5','F+20','F+60']:
+        ser = exp['cohorts'].get(h, pd.Series(dtype=float))
+        if ser is None or ser.empty: continue
+        fig.add_trace(go.Box(y=ser.values, name=h, boxmean=True,
+                             hovertemplate=f"{h} return: %{{y:.2f}}%<extra></extra>"))
+
+    fig.update_layout(
+        title={'text': f"Forward Return Distributions — State: {exp['state_value']}",
+               'font': {'color':'#80ff00'}},
+        template='plotly_dark', height=350, showlegend=False,
+        plot_bgcolor='#1a1a1a', paper_bgcolor='#2a2a2a', font=dict(color='#ccc')
+    )
+    return html.Div([dcc.Graph(figure=fig, config={'displayModeBar': False})])
+
+def create_confluence_performance_panel(ticker: str, aligned: pd.DataFrame) -> html.Div:
+    """
+    Replaces the old 'Combined Confluence Timeline':
+      • shows KPI tiles and forward distributions for today's state
+      • adds a 'conditioned equity' curve that trades only when state==today
+    """
+    px = _cached_fetch_interval_data(ticker, '1d', price_basis='close')
+    if px is None or px.empty or 'Close' not in px.columns:
+        return html.Div([html.P("No daily data for performance panel.", style={'color':'#ff4444'})])
+
+    price = px['Close']
+    price.index = pd.DatetimeIndex(pd.to_datetime(price.index, utc=True)).tz_convert(None)
+
+    conf_df = _compute_confluence_history(aligned, min_active=2)
+    today = conf_df.index[-1]
+
+    # Expected-performance cohort (match today's TIER; auto-fallback to 'dir' if samples < 40)
+    exp = _expected_stats_from_state(
+        price.reindex(conf_df.index).ffill(), conf_df, today,
+        state_key='tier', min_samples=40, fallback='dir'
+    )
+
+    # Conditioned equity: trade only when the historical state equals today's state
+    state_mask = conf_df['tier'].eq(exp['state_value']).astype(int)
+    rets = price.pct_change().fillna(0.0) * 100.0
+    cond_cap = (rets * state_mask).cumsum()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=cond_cap.index, y=cond_cap, name='Conditioned PnL (%)',
+                             mode='lines', line=dict(width=2)))
+    fig.update_layout(
+        title={'text': f"Conditioned Equity (only when state=={exp['state_value']})",
+               'font': {'color':'#80ff00'}},
+        template='plotly_dark', height=300, showlegend=False,
+        plot_bgcolor='#1a1a1a', paper_bgcolor='#2a2a2a', font=dict(color='#ccc')
+    )
+
+    return html.Div([
+        create_expected_kpis(exp),
+        create_forward_distribution_figure(exp),
+        dcc.Graph(figure=fig, config={'displayModeBar': False})
+    ])
+
+
 def _render_analyze_view(ticker: str, selected_timeframes: list,
                          prebuilt_libraries: dict = None,
                          mode_banner: str = None) -> html.Div:
@@ -1931,6 +2507,10 @@ def _render_analyze_view(ticker: str, selected_timeframes: list,
         prebuilt_libraries: Optional dict of virtual libraries (from multi-primary bridge)
         mode_banner: Optional banner text to display at top (e.g. "Multi-Primary Applied Mode")
     """
+    # SURGICAL FIX 5 & 6: Light mode + timing logs
+    LIGHT_MODE = os.environ.get('LIGHT_MODE', '0') == '1'
+    t_start = time.perf_counter()
+
     if not ticker:
         return html.Div([
             html.P("Please enter a ticker symbol.",
@@ -1989,22 +2569,44 @@ def _render_analyze_view(ticker: str, selected_timeframes: list,
             )
 
         # Status card
+        t0 = time.perf_counter()
         components.append(create_status_card(confluence, current_date.date().isoformat()))
+        logger.info("[Render] status card %.3fs", time.perf_counter()-t0)
 
         # Breakdown table
+        t0 = time.perf_counter()
         components.append(create_breakdown_table(confluence['breakdown'], time_in_signal, libraries))
+        logger.info("[Render] breakdown table %.3fs", time.perf_counter()-t0)
+
+        if LIGHT_MODE:
+            # Skip all heavy chart rendering
+            logger.info("[Render] LIGHT_MODE enabled - skipping all charts")
+            logger.info("[Render] TOTAL %.3fs", time.perf_counter()-t_start)
+            return html.Div(components)
+
+        # NEW: Master combined timeframe panel
+        t0 = time.perf_counter()
+        components.append(create_master_combined_chart(ticker, libraries, aligned))
+        logger.info("[Render] master chart %.3fs", time.perf_counter()-t0)
 
         # Individual charts section
+        t0 = time.perf_counter()
         components.append(html.H4("Individual Timeframe Charts",
                                  style={'color': '#80ff00', 'marginTop': '40px', 'marginBottom': '20px'}))
 
         for interval in ['1d', '1wk', '1mo', '3mo', '1y']:
             if interval in libraries:
+                t_iv = time.perf_counter()
                 components.append(create_individual_chart(ticker, interval, libraries[interval]))
+                logger.info("[Render] individual chart %s %.3fs", interval, time.perf_counter()-t_iv)
+        logger.info("[Render] all individual charts %.3fs", time.perf_counter()-t0)
 
-        # Combined confluence timeline
-        components.append(create_confluence_timeline(aligned))
+        # NEW: Confluence → Performance panel (replaces old timeline)
+        t0 = time.perf_counter()
+        components.append(create_confluence_performance_panel(ticker, aligned))
+        logger.info("[Render] performance panel %.3fs", time.perf_counter()-t0)
 
+        logger.info("[Render] TOTAL %.3fs", time.perf_counter()-t_start)
         return html.Div(components)
 
     except Exception as e:
@@ -2019,23 +2621,6 @@ def _render_analyze_view(ticker: str, selected_timeframes: list,
 
 @app.callback(
     Output('results-container', 'children'),
-    Input('analyze-btn', 'n_clicks'),
-    State('ticker-input', 'value'),
-    State('timeframe-toggles', 'value')
-)
-def update_results(n_clicks, ticker, selected_timeframes):
-    """Main callback to update all results."""
-    if n_clicks == 0:
-        return html.Div([
-            html.P("Enter a ticker symbol and click 'Analyze Confluence' to begin.",
-                   style={'color': '#888', 'textAlign': 'center', 'fontSize': '18px', 'marginTop': '50px'})
-        ])
-
-    return _render_analyze_view(ticker, selected_timeframes)
-
-
-@app.callback(
-    Output('results-container', 'children', allow_duplicate=True),
     Input('mp-apply-to-analyze', 'n_clicks'),
     State('mp-last-run', 'data'),
     prevent_initial_call=True
@@ -2051,17 +2636,18 @@ def apply_mp_to_analyze(n_clicks, mp_ctx):
     if not n_clicks or not mp_ctx or not mp_ctx.get('secondary'):
         return no_update
 
-    # Extract full context from stored Multi-Primary run
+    t0 = time.time()
     secondary = mp_ctx['secondary']
     primaries = mp_ctx.get('primaries', [])
     intervals = mp_ctx.get('intervals') or ['1d', '1wk', '1mo', '3mo', '1y']
     invert_flags = mp_ctx.get('invert_flags', [False] * len(primaries))
     mute_flags = mp_ctx.get('mute_flags', [False] * len(primaries))
 
-    logger.info(f"[Bridge] Building virtual libraries: {primaries} -> {secondary} on {intervals}")
+    logger.info(f"[Bridge] start: building virtual libs for {primaries} -> {secondary} on {intervals}")
 
     try:
         # Build virtual libraries containing combined multi-primary signals
+        t_build = time.time()
         virtual_libs = _mp_build_virtual_libraries(
             primaries=primaries,
             secondary=secondary,
@@ -2069,6 +2655,7 @@ def apply_mp_to_analyze(n_clicks, mp_ctx):
             invert_flags=invert_flags,
             mute_flags=mute_flags
         )
+        logger.info(f"[Bridge] virtual libs built in {time.time()-t_build:.2f}s")
 
         if not virtual_libs:
             return html.Div([
@@ -2077,19 +2664,21 @@ def apply_mp_to_analyze(n_clicks, mp_ctx):
             ])
 
         # Create informative banner
-        primary_list = ', '.join(primaries)
-        banner = f"Multi-Primary Applied Mode: Combined unanimity signals from [{primary_list}] applied to {secondary}"
+        banner = f"Multi-Primary Applied Mode: Combined unanimity signals from [{', '.join(primaries)}] applied to {secondary}"
 
         # Render confluence view with virtual libraries
-        return _render_analyze_view(
+        t_render = time.time()
+        out = _render_analyze_view(
             ticker=secondary,
             selected_timeframes=intervals,
             prebuilt_libraries=virtual_libs,
             mode_banner=banner
         )
+        logger.info(f"[Bridge] render done in {time.time()-t_render:.2f}s, total {time.time()-t0:.2f}s")
+        return out
 
     except Exception as e:
-        logger.error(f"[Bridge] Error applying multi-primary to analyze: {e}", exc_info=True)
+        logger.error(f"[Bridge] error: {e}", exc_info=True)
         return html.Div([
             html.P(f"Error building confluence view: {str(e)}",
                    style={'color': '#ff4444', 'textAlign': 'center', 'fontSize': '18px'}),
@@ -2110,5 +2699,6 @@ if __name__ == '__main__':
         debug=False,
         port=APP_PORT,
         host='127.0.0.1',
-        use_reloader=False
+        use_reloader=False,
+        threaded=True
     )
