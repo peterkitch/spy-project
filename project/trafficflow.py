@@ -70,9 +70,15 @@ except Exception:
 # ---------- Config ----------
 # Strict A.S.O. intersection - no grace padding (SpyMaster parity)
 
+# Project-relative anchor: this file lives at project/trafficflow.py, so
+# Path(__file__).resolve().parent IS the project directory.
+_PROJECT_DIR = Path(__file__).resolve().parent
 PORT = int(os.environ.get("TRAFFICFLOW_PORT", "8055"))
 RUNS_ROOT = os.environ.get("STACKBUILDER_RUNS_ROOT", "output/stackbuilder")
-SPYMASTER_PKL_DIR = r"C:\Users\sport\Documents\PythonProjects\spy-project\project\cache\results"
+SPYMASTER_PKL_DIR = os.environ.get(
+    "PRJCT9_SPYMASTER_PKL_DIR",
+    str(_PROJECT_DIR / "cache" / "results"),
+)
 PRICE_CACHE_DIR = os.environ.get("PRICE_CACHE_DIR", "price_cache/daily")
 # PRICE_BASIS removed - always use raw Close prices
 RISK_FREE_ANNUAL = float(os.environ.get("RISK_FREE_ANNUAL", "5.0"))

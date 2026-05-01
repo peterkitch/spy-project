@@ -46,9 +46,12 @@ def _try_import():
 resolve_symbol, detect_ticker_type, load_signal_library = _try_import()
 
 # ---------- Config ----------
+# Project-relative anchor: this file lives at project/stackbuilder.py, so
+# Path(__file__).resolve().parent IS the project directory.
+_PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_SIGNAL_LIB_DIR = os.environ.get(
     'SIGNAL_LIBRARY_DIR',
-    r'C:\Users\sport\Documents\PythonProjects\spy-project\project\signal_library\data\stable'
+    str(_PROJECT_DIR / 'signal_library' / 'data' / 'stable')
 )
 DEFAULT_PRICE_CACHE_DIR = os.environ.get('PRICE_CACHE_DIR', 'price_cache/daily')  # e.g., {TICKER}.parquet
 MASTER_TICKERS_PATH = os.environ.get('YF_MASTER_TICKERS_PATH', os.environ.get('MASTER_TICKERS_PATH', 'global_ticker_library/data/master_tickers.txt'))
@@ -56,8 +59,11 @@ MASTER_TICKERS_PATH = os.environ.get('YF_MASTER_TICKERS_PATH', os.environ.get('M
 RUNS_ROOT = 'output/stackbuilder'
 RISK_FREE_ANNUAL = 5.0  # percent
 FLOAT_DTYPE = np.float64
-# ImpactSearch Excel defaults (override via CLI)
-DEFAULT_IMPACT_XLSX_DIR = r"C:\Users\sport\Documents\PythonProjects\spy-project\project\output\impactsearch"
+# ImpactSearch Excel defaults (override via CLI or env var)
+DEFAULT_IMPACT_XLSX_DIR = os.environ.get(
+    'PRJCT9_IMPACT_XLSX_DIR',
+    str(_PROJECT_DIR / 'output' / 'impactsearch')
+)
 # output format default; can be overridden by --output-format
 OUTPUT_FORMAT = os.environ.get("STACKBUILDER_OUTPUT_FORMAT", "xlsx").lower()
 DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
