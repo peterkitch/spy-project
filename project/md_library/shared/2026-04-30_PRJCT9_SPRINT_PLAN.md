@@ -115,8 +115,8 @@ Deliverables:
       describes the local Windows setup with generic placeholders,
       or remove the path where it serves no instructional purpose.
     - Committed artifact audit: inventory every tracked .pkl,
-      .json, .csv, .xlsx, .parquet, .db, .sqlite. Categorize each
-      as safe / sanitize / untrack-and-gitignore.
+      .json, .jsonl, .csv, .xlsx, .parquet, .db, .sqlite. Categorize
+      each as safe / sanitize / untrack-and-gitignore.
     - Git history scan: report (do not execute rewrite) any
       historical leakage of credentials, broker references, account
       identifiers, or PII beyond the intentional Gmail noted in
@@ -426,9 +426,8 @@ on origin/main:
 ```
 
 `git status --untracked-files=all` confirms no additional unignored
-files beyond the four QC items listed above. The tracked-file
-content under those untracked folders, surfaced by the same command,
-is:
+files beyond the four out-of-sprint untracked items listed above.
+The unignored file paths surfaced by the same command are:
 
 ```
 project/QC/BTC ETF EXT MASTER/btcbot.py
