@@ -89,12 +89,14 @@ conda activate spyproject2
 
 ### Running Tests
 ```bash
-# Phase 0 import smoke harness (run from the project/ directory so the
-# engines' relative log writes land under project/logs/, which is
-# already ignored by project/.gitignore).
+# From the repository root, enter project/ so the engines' relative
+# import-time log writes land under project/logs/, which is already
+# ignored by project/.gitignore.
 cd project
 python -m pytest test_scripts -q
 ```
+
+Phase 1 should anchor engine log handlers to project/logs instead of the current working directory; the `cd project` step is a temporary workaround.
 
 ### Running Applications
 
