@@ -268,8 +268,7 @@ REM ============================================================================
 REM Optimized Spymaster Launcher - Parallel Batch Processing
 REM ==============================================================================
 
-REM ---- Activate environment ----
-call "%USERPROFILE%\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat"
+REM ---- Activate environment (assumes Conda is initialized in your shell) ----
 call conda activate spyproject2
 
 REM ---- CRITICAL: Single-threaded BLAS for multi-process parallelism ----
@@ -295,8 +294,8 @@ set "PRICE_BASIS=Close"
 set "SPYMASTER_CB_TIMEOUT=1200"
 set "SPYMASTER_DISABLE_LIVE_FP=1"
 
-REM ---- Project folder ----
-cd /d "%USERPROFILE%\Documents\PythonProjects\spy-project\project"
+REM ---- Project folder (cd to your local clone's project subdir) ----
+cd /d "<your local spy-project clone>\project"
 
 REM ---- Run spymaster ----
 python spymaster.py

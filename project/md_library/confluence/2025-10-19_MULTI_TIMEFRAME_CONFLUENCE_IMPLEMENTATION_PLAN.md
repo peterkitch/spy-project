@@ -2460,8 +2460,8 @@ REM Performance settings (optional)
 set MKL_NUM_THREADS=8
 set OMP_NUM_THREADS=8
 
-REM Activate conda environment
-call %USERPROFILE%\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat spyproject2
+REM Activate conda environment (assumes Conda is initialized in your shell)
+call conda activate spyproject2
 
 REM Launch app
 echo Starting Confluence Analyzer...

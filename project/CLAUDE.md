@@ -55,14 +55,13 @@ This is a quantitative trading analysis web application built with Python and Da
 
 ## Development Environment
 
-**Operating System**: Windows (platform: win32)
-**Shell**: Windows Command Prompt (CMD)
+**Operating System**: Windows (platform: win32) — Linux/macOS clones should also work; the Windows-specific notes below only apply on win32.
+**Recommended Shell**: PowerShell 7+ (`pwsh`). CMD and Git Bash are supported but PowerShell is the canonical contributor shell. Older Git Bash workarounds are preserved as historical notes in `md_library/shared/2025-11-13_CONDA_ACTIVATION_IN_BASH_TOOL_SOLUTION.md` and `md_library/shared/2025-10-22_CLAUDE_TESTING_WINDOWS_PATH_SOLUTION.md`.
 **Python Environments**:
   - **spyproject2** (Primary) - Has Intel MKL, NumPy 1.26.4, optimized BLAS
   - **spyproject2_basic** (Alternative) - Generic BLAS, NumPy 2.2.6, no MKL
     - Note: This was formerly named `spyproject2_mkl` (misleading name has been corrected)
-**System Specs**: Intel Core i7-13700KF (16 cores), 32GB RAM
-**Conda Path**: `%USERPROFILE%\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat` (substitute your own username; the bundled NVIDIA MiniConda install lives under `%USERPROFILE%\AppData\Local\NVIDIA\MiniConda` on Windows)
+**Python environment setup**: create from `project/environment.yml` using Conda, Mamba, or Micromamba (`conda env create -f project/environment.yml`). Activate with `conda activate spyproject2`. Do not assume any particular Conda install location; the activate command works once your shell has Conda initialized. A pip-only path is available via `project/requirements.txt`.
 
 ### CRITICAL DATE AWARENESS ISSUE
 **IMPORTANT**: The system often shows incorrect dates. When creating MD files with date prefixes:
@@ -72,11 +71,12 @@ This is a quantitative trading analysis web application built with Python and Da
 - **Before creating any dated file**: Double-check the current date to avoid mislabeled files
 - **Existing mislabeled files**: Many MD files are incorrectly dated as "2025-01-*" or "2025-08-*" when they were actually created in September 2025
 
-### Important Windows CMD Notes:
-- Environment variables: Use `set VAR=value && command` syntax
-- File paths: Use backslashes or raw strings
-- Console encoding: cp1252 (avoid Unicode characters in output)
-- Working directory: `<your local clone>\spy-project\project` (e.g., `%USERPROFILE%\Documents\PythonProjects\spy-project\project`)
+### Windows shell notes:
+- Environment variables (PowerShell): `$env:VAR = "value"; command` (or `;` between statements)
+- Environment variables (CMD legacy): `set VAR=value && command`
+- File paths: Use backslashes (escape in Python strings) or forward slashes; both resolve under Windows
+- Console encoding: cp1252 (avoid Unicode characters in console output; see CLAUDE.md Unicode rule)
+- Working directory: `<your local spy-project clone>/project`
 
 ## Development Commands
 

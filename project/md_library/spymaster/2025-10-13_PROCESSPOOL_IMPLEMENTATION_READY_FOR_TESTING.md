@@ -82,7 +82,7 @@ process_ticker_queue()
 ### **CRITICAL: Clean Corrupted Cache First**
 
 ```cmd
-cd %USERPROFILE%\Documents\PythonProjects\spy-project\project
+cd <your local spy-project clone>\project
 
 rem Delete all corrupted cache from ThreadPool run
 rmdir /S /Q cache\results

@@ -188,16 +188,56 @@ phase.
 
 ### Documentation
 
-Replaced personal-username path segments with neutral placeholders
-that preserve instructional intent:
+Goal: current operational docs should be environment-agnostic.
+Personal-username path segments were removed AND prescriptive
+install-location guidance (e.g. "expects NVIDIA MiniConda under your
+user profile") was lifted off current docs. Historical docs that
+still describe an old workaround are clearly labeled as historical
+and use neutral placeholders inside.
 
-  - `Users\<old-username>`     -> `Users\<USERNAME>` (Windows backslash form)
-  - `Users/<old-username>`     -> `Users/<USERNAME>` (forward-slash / bash form)
-  - `C:\Users\<old-username>\AppData\...`        -> `%USERPROFILE%\AppData\...`
-  - `C:\Users\<old-username>\Documents\...`      -> `%USERPROFILE%\Documents\...`
-  - CLAUDE.md "Working directory" line: rewritten to
-    `<your local clone>\spy-project\project (e.g.,
-    %USERPROFILE%\Documents\PythonProjects\spy-project\project)`.
+The transformation, in two passes:
+
+  - First pass (commits `13d0339`, `f009684`): replaced literal
+    personal-username segments with neutral substitutes.
+      `Users\<old-username>` -> `Users\<USERNAME>`
+      `Users/<old-username>` -> `Users/<USERNAME>`
+      `C:\Users\<old-username>\AppData\...`   -> `%USERPROFILE%\AppData\...`
+      `C:\Users\<old-username>\Documents\...` -> `%USERPROFILE%\Documents\...`
+  - Second pass (this amendment): the first-pass replacements still
+    encoded a user-specific install model (NVIDIA MiniConda under
+    `%USERPROFILE%\AppData\Local\NVIDIA\MiniConda`) as if it were
+    canonical. That is not the right public posture. The second pass
+    re-edited those same locations to be environment-agnostic:
+      `%USERPROFILE%\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat ENV`
+        -> `conda activate ENV` (assumes Conda is initialized in
+           your shell)
+      `<conda-install-dir>` placeholder used inside historical docs
+        where the absolute path was load-bearing for the doc's
+        narrative (now clearly labeled as historical).
+      `<python-executable-from-your-env>` placeholder for the
+        2025-10-22 doc that documented invoking a specific
+        `python.exe` by full path.
+      `cd %USERPROFILE%\Documents\PythonProjects\spy-project\project`
+        -> `cd <your local spy-project clone>\project`
+      Two historical documents
+        (`2025-10-22_CLAUDE_TESTING_WINDOWS_PATH_SOLUTION.md` and
+        `2025-11-13_CONDA_ACTIVATION_IN_BASH_TOOL_SOLUTION.md`)
+        gained a "Historical note" header explicitly redirecting
+        readers to the current setup (PowerShell 7+ and
+        `project/environment.yml`).
+  - CLAUDE.md updates beyond path replacement:
+      Shell line switched from "Windows Command Prompt (CMD)" to
+        "Recommended Shell: PowerShell 7+ (`pwsh`)" with a pointer
+        to the historical Bash docs for legacy context.
+      System Specs line (specific CPU/RAM) removed from the public
+        Development Environment block; specific hardware was
+        contributor's local benchmark context, not a public
+        prerequisite.
+      "Conda Path" line replaced with environment-agnostic Python
+        environment setup pointing at `project/environment.yml` and
+        `project/requirements.txt`.
+      "Important Windows CMD Notes" subsection retitled "Windows
+        shell notes" and reframed to cover both PowerShell and CMD.
 
 Files edited (all under `project/`):
 
