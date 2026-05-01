@@ -276,13 +276,11 @@ if FASTPATH_AVAILABLE and _fp_mod is not None:
     # (get_primary_signals_fast reads _its_ module-level flag).
     _fp_mod.IMPACT_TRUST_LIBRARY = bool(IMPACT_TRUST_LIBRARY)
 
-    # Optional: propagate basis override so fast-path isn't blocked by basis drift
-    _allow_basis = os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS",
-                                  os.environ.get("IMPACT_FASTPATH_ALLOW_LIB_BASIS", "0"))
-    try:
-        _fp_mod.ALLOW_LIB_BASIS = str(_allow_basis).lower() in ("1", "true", "on", "yes")
-    except Exception:
-        pass
+    # The IMPACTSEARCH_ALLOW_LIB_BASIS / IMPACT_FASTPATH_ALLOW_LIB_BASIS
+    # escape hatch was removed in 1B-2A (ledger Entry 1) when the
+    # basis-mismatch override loophole was closed in
+    # signal_library/impact_fastpath.py. Raw Close is the only
+    # accepted price basis (spec §3); no propagation is needed.
 
 # Lightweight in-memory fast-path usage stats (for run summary)
 FASTPATH_STATS = {'total_primaries': 0, 'fastpath_used': 0, 'fallback_used': 0, 'fallback_reasons': {}}
@@ -305,8 +303,7 @@ print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
       f"IMPACT_TRUST_LIBRARY={IMPACT_TRUST_LIBRARY}  "
       f"price_basis=Close (raw)  "
       f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}  "
-      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','7')}  "
-      f"ALLOW_LIB_BASIS={os.environ.get('IMPACTSEARCH_ALLOW_LIB_BASIS','0')}")
+      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','7')}")
 
 # Import parity configuration
 try:

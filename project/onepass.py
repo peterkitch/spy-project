@@ -1769,30 +1769,24 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
             # Track bars before update
             if existing_signal_data:
                 bars_before = existing_signal_data.get('num_days', 0) or len(existing_signal_data.get('primary_signals', [])) or 0
-            # Enforce parity/basis BEFORE reuse. ENV must match the library.
+            # Enforce parity/basis BEFORE reuse. Raw Close is the only
+            # accepted price basis (spec §3, ledger Entry 1); the
+            # ONEPASS_ALLOW_LIB_BASIS escape hatch was removed.
             if existing_signal_data:
                 lib_basis = existing_signal_data.get('price_source')
                 lib_hash  = existing_signal_data.get('parity_hash')
-                env_hash  = compute_parity_hash(env_price_source, 'ticker')
+                env_hash  = compute_parity_hash(price_source, 'ticker')
 
-                # Check if opt-in override is enabled
-                if os.environ.get('ONEPASS_ALLOW_LIB_BASIS', '0').lower() in ('1', 'true', 'on'):
-                    # Allow library basis to override ENV basis
-                    if lib_basis:
-                        price_source = lib_basis
-                        logger.debug(f"Using library basis by opt-in (ONEPASS_ALLOW_LIB_BASIS=1): {price_source}")
-                    else:
-                        logger.debug(f"Library has no price_source; using ENV basis: {price_source}")
-                elif lib_basis != env_price_source or lib_hash != env_hash:
+                if lib_basis != price_source or lib_hash != env_hash:
                     logger.warning(
-                        f"{vendor_symbol}: library basis/hash differ from ENV "
-                        f"(lib_basis={lib_basis}, env_basis={env_price_source}, "
+                        f"{vendor_symbol}: library basis/hash differ from canonical "
+                        f"(lib_basis={lib_basis}, canonical={price_source}, "
                         f"lib_hash={str(lib_hash)[:8] if lib_hash else 'None'} vs env_hash={env_hash[:8]}). "
-                        "Forcing rebuild under ENV basis."
+                        "Forcing rebuild under canonical Close basis."
                     )
                     existing_signal_data = None  # force rebuild below
                 else:
-                    logger.debug(f"{vendor_symbol}: library basis matches ENV ({env_price_source}); reusing.")
+                    logger.debug(f"{vendor_symbol}: library basis matches canonical ({price_source}); reusing.")
             
         # Single-download path for current data (frozen clock + price_source)
         df_raw, resolved = fetch_data_raw(vendor_symbol)
