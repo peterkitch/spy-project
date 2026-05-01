@@ -8786,45 +8786,30 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     most_productive_buy_pair_text = f"Most Productive Buy Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}"
     most_productive_short_pair_text = f"Most Productive Short Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}"
 
-    # Buy metrics
+    # Buy + Short leader metrics: spec §13–§17 via canonical_scoring.
+    # Sharpe was previously computed with a CAGR-style annualization;
+    # delegation switches to the canonical avg-daily-capture * 252
+    # form per spec §16. Max Drawdown is not a canonical-scoring
+    # metric and stays computed inline below.
     buy_signals_shifted = buy_signals_leader.shift(1, fill_value=False)
     buy_returns_on_trigger_days = close_pct_change[buy_signals_shifted]
-    buy_trigger_days = int(buy_signals_shifted.sum())
-    buy_wins = int((buy_returns_on_trigger_days > 0).sum())
-    buy_losses = int((buy_returns_on_trigger_days <= 0).sum())
-    buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    avg_capture_buy = float(buy_returns_on_trigger_days.mean() * 100) if buy_trigger_days > 0 else 0
-    buy_capture = float(buy_returns_on_trigger_days.sum() * 100) if buy_trigger_days > 0 else 0
-    
-    # Calculate Buy Leader Sharpe Ratio and Max Drawdown
-    # Create a full series with 0s when not in position
+    _buy_caps = pd.Series(0.0, index=close_pct_change.index, dtype=float)
+    _buy_caps.loc[buy_signals_shifted] = close_pct_change.loc[buy_signals_shifted] * 100.0
+    _score_buy = _canonical_score_captures(
+        _buy_caps, buy_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    buy_trigger_days = _score_buy.trigger_days
+    buy_wins = _score_buy.wins
+    buy_losses = _score_buy.losses
+    buy_win_ratio = (_score_buy.win_rate / 100.0)  # display formats as ratio*100
+    avg_capture_buy = float(_score_buy.avg_daily_capture)
+    buy_capture = float(_score_buy.total_capture)
+    buy_leader_sharpe = float(_score_buy.sharpe)
+
+    # Max Drawdown - use cumulative returns with 0s when not in position
     buy_leader_daily_returns = close_pct_change.copy()
     buy_leader_daily_returns[~buy_signals_shifted] = 0
-    
-    # For Sharpe, we only use returns when in position
-    if buy_trigger_days > 0:
-        # Get returns only for days in position for statistics
-        returns_in_position = close_pct_change[buy_signals_shifted]
-        
-        # Calculate total return and annualized return
-        total_years = len(df) / 252  # Total years of data
-        if total_years > 0 and buy_capture != 0:
-            # Annualized return based on total capture and total time
-            buy_leader_annual_return = ((1 + buy_capture/100) ** (1/total_years)) - 1
-            
-            # Annualized volatility of daily returns when in position
-            if len(returns_in_position) > 0:
-                daily_vol = float(returns_in_position.std())
-                buy_leader_annual_std = daily_vol * np.sqrt(252)
-                buy_leader_sharpe = (buy_leader_annual_return - 0.05) / buy_leader_annual_std if buy_leader_annual_std > 0 else 0
-            else:
-                buy_leader_sharpe = 0
-        else:
-            buy_leader_sharpe = 0
-    else:
-        buy_leader_sharpe = 0
-    
-    # Max Drawdown - use cumulative returns with 0s when not in position
     buy_cumulative = (1 + buy_leader_daily_returns).cumprod()
     if len(buy_cumulative) > 0:
         buy_rolling_max = buy_cumulative.expanding().max()
@@ -8832,46 +8817,26 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         buy_leader_max_dd = float(buy_drawdowns.min())
     else:
         buy_leader_max_dd = 0
-    
-    # Short metrics
+
     short_signals_shifted = short_signals_leader.shift(1, fill_value=False)
     short_returns_on_trigger_days = -close_pct_change[short_signals_shifted]
-    short_trigger_days = int(short_signals_shifted.sum())
-    short_wins = int((short_returns_on_trigger_days > 0).sum())
-    short_losses = int((short_returns_on_trigger_days <= 0).sum())
-    short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    avg_capture_short = float(short_returns_on_trigger_days.mean() * 100) if short_trigger_days > 0 else 0
-    short_capture = float(short_returns_on_trigger_days.sum() * 100) if short_trigger_days > 0 else 0
-    
-    # Calculate Short Leader Sharpe Ratio and Max Drawdown
-    # Create a full series with 0s when not in position
+    _short_caps = pd.Series(0.0, index=close_pct_change.index, dtype=float)
+    _short_caps.loc[short_signals_shifted] = -close_pct_change.loc[short_signals_shifted] * 100.0
+    _score_short = _canonical_score_captures(
+        _short_caps, short_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    short_trigger_days = _score_short.trigger_days
+    short_wins = _score_short.wins
+    short_losses = _score_short.losses
+    short_win_ratio = (_score_short.win_rate / 100.0)
+    avg_capture_short = float(_score_short.avg_daily_capture)
+    short_capture = float(_score_short.total_capture)
+    short_leader_sharpe = float(_score_short.sharpe)
+
+    # Max Drawdown - use cumulative returns with 0s when not in position
     short_leader_daily_returns = -close_pct_change.copy()
     short_leader_daily_returns[~short_signals_shifted] = 0
-    
-    # For Sharpe, we only use returns when in position
-    if short_trigger_days > 0:
-        # Get returns only for days in position for statistics
-        returns_in_position = -close_pct_change[short_signals_shifted]
-        
-        # Calculate total return and annualized return
-        total_years = len(df) / 252  # Total years of data
-        if total_years > 0 and short_capture != 0:
-            # Annualized return based on total capture and total time
-            short_leader_annual_return = ((1 + short_capture/100) ** (1/total_years)) - 1
-            
-            # Annualized volatility of daily returns when in position
-            if len(returns_in_position) > 0:
-                daily_vol = float(returns_in_position.std())
-                short_leader_annual_std = daily_vol * np.sqrt(252)
-                short_leader_sharpe = (short_leader_annual_return - 0.05) / short_leader_annual_std if short_leader_annual_std > 0 else 0
-            else:
-                short_leader_sharpe = 0
-        else:
-            short_leader_sharpe = 0
-    else:
-        short_leader_sharpe = 0
-    
-    # Max Drawdown - use cumulative returns with 0s when not in position
     short_cumulative = (1 + short_leader_daily_returns).cumprod()
     if len(short_cumulative) > 0:
         short_rolling_max = short_cumulative.expanding().max()
@@ -9060,24 +9025,23 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
             sharpe_ratio = 0.0
             max_drawdown = 0.0
 
+    # Next-signal historical expectation: reuse canonical leader scores
+    # (avg_daily_capture is already in % points, win_rate is already %).
     if next_trading_signal_type == "Buy":
-        active_returns = buy_returns_on_trigger_days
+        _active_score = _score_buy
     elif next_trading_signal_type == "Short":
-        active_returns = short_returns_on_trigger_days
+        _active_score = _score_short
     else:
-        active_returns = np.array([])
+        _active_score = None
 
-    active_trigger_days = len(active_returns)
-    if active_trigger_days > 0:
-        performance_expectation = np.mean(active_returns)
-        active_wins = np.sum(active_returns > 0)
-        active_losses = np.sum(active_returns <= 0)
-        active_win_ratio = active_wins / active_trigger_days
+    if _active_score is not None and _active_score.trigger_days > 0:
         performance_expectation_text = (
-            f"Next Signal Performance Expectation: {performance_expectation * 100:.4f}% "
-            f"(Historical Trigger Days: {active_trigger_days}, Wins: {active_wins}, Losses: {active_losses}, Win Ratio: {active_win_ratio * 100:.2f}%)"
+            f"Next Signal Performance Expectation: {_active_score.avg_daily_capture:.4f}% "
+            f"(Historical Trigger Days: {_active_score.trigger_days}, "
+            f"Wins: {_active_score.wins}, Losses: {_active_score.losses}, "
+            f"Win Ratio: {_active_score.win_rate:.2f}%)"
         )
-        confidence_percentage_text = f"Historical Win Ratio for Next Signal: {active_win_ratio * 100:.2f}%"
+        confidence_percentage_text = f"Historical Win Ratio for Next Signal: {_active_score.win_rate:.2f}%"
     else:
         performance_expectation_text = "Next Signal Performance Expectation: N/A (No historical triggers)"
         confidence_percentage_text = "Historical Win Ratio for Next Signal: N/A (No historical triggers)"
