@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import logging
+from canonical_scoring import score_captures as _canonical_score_captures
 import random
 import warnings
 
@@ -1607,12 +1608,10 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
     # Daily returns (fill first diff as 0 to keep indices aligned)
     daily_returns = prices.pct_change().fillna(0)
 
-    # Vectorized capture
     buy_mask = signals.eq('Buy')
     short_mask = signals.eq('Short')
     trigger_mask = buy_mask | short_mask
-    trigger_days = int(trigger_mask.sum())
-    if trigger_days == 0:
+    if int(trigger_mask.sum()) == 0:
         logger.debug("No trigger days found, no metrics to report.")
         return None
 
@@ -1620,44 +1619,29 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
     daily_captures.loc[buy_mask] = daily_returns.loc[buy_mask] * 100.0
     daily_captures.loc[short_mask] = -daily_returns.loc[short_mask] * 100.0
 
-    # Stats over trigger days only
-    signal_captures = daily_captures[trigger_mask].dropna()
-    wins = (signal_captures > 0).sum()
-    losses = trigger_days - wins
-    win_ratio = (wins / trigger_days * 100.0) if trigger_days else 0.0
-    avg_daily_capture = signal_captures.mean() if trigger_days else 0.0
-    total_capture = signal_captures.sum() if trigger_days else 0.0
+    score = _canonical_score_captures(
+        daily_captures, trigger_mask,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
 
-    if trigger_days > 1:
-        std_dev = signal_captures.std(ddof=1)
-        risk_free_rate = 5.0
-        annualized_return = avg_daily_capture * 252.0
-        annualized_std = std_dev * np.sqrt(252.0)
-        sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std != 0 else 0.0
-        t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days)) if std_dev != 0 else None
-        # Spec §17: numerically stable t.sf form.
-        p_value = (2 * stats.t.sf(abs(t_statistic), df=trigger_days - 1)) if t_statistic else None
-    else:
-        std_dev = 0.0
-        sharpe_ratio = 0.0
-        t_statistic = None
-        p_value = None
-
+    p_value = score.p_value
     significant_90 = 'Yes' if (p_value is not None and p_value < 0.10) else 'No'
     significant_95 = 'Yes' if (p_value is not None and p_value < 0.05) else 'No'
     significant_99 = 'Yes' if (p_value is not None and p_value < 0.01) else 'No'
 
-    # Standardize names and types to match UI/OnePass
+    sharpe_v = float(score.sharpe) if np.isfinite(score.sharpe) else 0.0
+
+    # Standardize names and types to match UI/OnePass (full-precision floats)
     return {
-        'Total Capture (%)': float(total_capture),
-        'Avg Daily Capture (%)': float(avg_daily_capture),
-        'Trigger Days': int(trigger_days),
-        'Wins': int(wins),
-        'Losses': int(losses),
-        'Win Ratio (%)': float(win_ratio),
-        'Std Dev (%)': float(std_dev),
-        'Sharpe Ratio': float(sharpe_ratio) if np.isfinite(sharpe_ratio) else 0.0,
-        't-Statistic': 'N/A' if t_statistic is None else float(t_statistic),
+        'Total Capture (%)': float(score.total_capture),
+        'Avg Daily Capture (%)': float(score.avg_daily_capture),
+        'Trigger Days': score.trigger_days,
+        'Wins': score.wins,
+        'Losses': score.losses,
+        'Win Ratio (%)': float(score.win_rate),
+        'Std Dev (%)': float(score.std_dev),
+        'Sharpe Ratio': sharpe_v,
+        't-Statistic': 'N/A' if score.t_statistic is None else float(score.t_statistic),
         'p-Value': 'N/A' if p_value is None else float(p_value),
         'Significant 90%': significant_90,
         'Significant 95%': significant_95,
@@ -1770,7 +1754,7 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
     if ccc_series is None or len(ccc_series) == 0:
         return None
 
-    # Daily captures in percent
+    # Daily captures in percent (recovered from cumulative series)
     steps = ccc_series.diff().fillna(0.0)
     caps = steps.to_numpy()
 
@@ -1779,88 +1763,36 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
     # supply matching active_pairs labels for trigger counting.
     if active_pairs is None or len(active_pairs) != len(caps):
         return None
-    trig_mask = np.array([p.startswith('Buy') or p.startswith('Short')
-                          for p in active_pairs], dtype=bool)
+    trig_mask_arr = np.array([p.startswith('Buy') or p.startswith('Short')
+                              for p in active_pairs], dtype=bool)
 
-    trigger_days = int(trig_mask.sum())
-    signal_caps = caps[trig_mask]
+    score = _canonical_score_captures(
+        steps.astype(float),
+        pd.Series(trig_mask_arr, index=ccc_series.index),
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
 
-    # Remove non-finite values from captures for statistics
-    signal_caps = signal_caps[np.isfinite(signal_caps)]
-
-    # SpyMaster rule: wins are positive captures, losses = trigger_days - wins
-    # This ensures zero-capture days count as losses
-    wins = int((signal_caps > 0).sum())
-    losses = int(trigger_days - wins)  # This includes zero-capture days as losses
-    total = float(ccc_series.iloc[-1]) if np.isfinite(ccc_series.iloc[-1]) else 0.0
-
-    # Calculate metrics with guards
-    if trigger_days == 0:
-        avg_daily = 0.0
-        std = 0.0
-        sharpe = 0.0
-        t_stat = None
-        p_val = None
-    else:
-        avg_daily = float(signal_caps.mean()) if len(signal_caps) > 0 else 0.0
-
-        if trigger_days >= 2:
-            # Use NumPy directly to avoid pandas nanops warnings
-            with np.errstate(invalid='ignore', divide='ignore'):
-                std = float(np.std(signal_caps.values if hasattr(signal_caps, 'values') else signal_caps, ddof=1)) if len(signal_caps) > 1 else 0.0
-
-            if std > 0.0 and np.isfinite(std):
-                annualized_return = avg_daily * 252.0
-                annualized_std = std * np.sqrt(252.0)
-                risk_free_rate = 5.0
-                sharpe = _safe_div_impactsearch(annualized_return - risk_free_rate, annualized_std, 0.0)
-
-                # t-stat with safe division
-                t_stat = _safe_div_impactsearch(avg_daily, std / np.sqrt(trigger_days), 0.0)
-
-                # p-value calculation
-                try:
-                    if t_stat != 0.0:
-                        # Spec §17: numerically stable t.sf form.
-                        p_val = float(2.0 * stats.t.sf(abs(t_stat), df=trigger_days - 1))
-                    else:
-                        p_val = 1.0
-                except Exception:
-                    p_val = 1.0
-            else:
-                std = 0.0
-                sharpe = 0.0
-                t_stat = None
-                p_val = None
-        else:
-            # Only 1 trigger day - no variance-based stats
-            std = 0.0
-            sharpe = 0.0
-            t_stat = None
-            p_val = None
-
-    # Significance flags
+    p_val = score.p_value
     sig90 = 'Yes' if (p_val is not None and p_val < 0.10) else 'No'
     sig95 = 'Yes' if (p_val is not None and p_val < 0.05) else 'No'
     sig99 = 'Yes' if (p_val is not None and p_val < 0.01) else 'No'
 
-    # Win ratio with safe division
-    win_ratio = _safe_div_impactsearch(wins * 100.0, trigger_days, 0.0)
+    sharpe_rounded = round(score.sharpe, 2) if np.isfinite(score.sharpe) else 0.0
 
     return {
-        'Trigger Days': trigger_days,
-        'Wins': wins,
-        'Losses': losses,
-        'Win Ratio (%)': round(win_ratio, 2),
-        'Std Dev (%)': round(std, 4),
-        'Sharpe Ratio': round(sharpe, 2) if np.isfinite(sharpe) else 0.0,
-        't-Statistic': 'N/A' if t_stat is None else round(t_stat, 4),
+        'Trigger Days': score.trigger_days,
+        'Wins': score.wins,
+        'Losses': score.losses,
+        'Win Ratio (%)': round(score.win_rate, 2),
+        'Std Dev (%)': round(score.std_dev, 4),
+        'Sharpe Ratio': sharpe_rounded,
+        't-Statistic': 'N/A' if score.t_statistic is None else round(score.t_statistic, 4),
         'p-Value': 'N/A' if p_val is None else round(p_val, 4),
         'Significant 90%': sig90,
         'Significant 95%': sig95,
         'Significant 99%': sig99,
-        'Avg Daily Capture (%)': round(avg_daily, 4),
-        'Total Capture (%)': round(total, 4)
+        'Avg Daily Capture (%)': round(score.avg_daily_capture, 4),
+        'Total Capture (%)': round(score.total_capture, 4),
     }
 
 
