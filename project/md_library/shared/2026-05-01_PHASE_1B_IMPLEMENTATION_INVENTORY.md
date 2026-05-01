@@ -72,6 +72,9 @@ and `Adj Close` is eliminated.
 | `project/onepass.py` | 1215 | `fields = {'Adj Close', 'Close', 'Open', 'High', 'Low', 'Volume'}`. |
 | `project/impactsearch.py` | 1274, 1497 | Same field-set membership. |
 | `project/stale_check.py` | 79 | `for col in ["Close", "Adj Close", "Volume"]:`. |
+| `project/QC/Clone of Project 9/main.py` | 103 | `(c for c in ('Adj Close', 'adj close', 'Close', 'close') if c in df.columns)` — functional Adj-Close-preferring column lookup. **QC / live-execution-adjacent**. Phase 1B-2 must either remove the Adj fallback here or explicitly defer this directory with a scope note in the ledger. |
+| `project/QC/Clone of Project 9/main.py` | 918 | `for col in ["Adj Close", "adj close", "Close", "close"]:` — same Adj-Close-preferring functional lookup. **QC**; same disposition. |
+| `project/QC/Clone of Project 9/main.py` | 1509 | `for col_name in ['Adj Close', 'adj close', 'Close', 'close']:` — same Adj-Close-preferring functional lookup. **QC**; same disposition. |
 
 ### 2b. Doc / comment / historical mentions (no functional change)
 
@@ -79,8 +82,7 @@ and `Adj Close` is eliminated.
 |---|---|---|
 | `project/trafficflow.py` | 14, 83, 232 | Comment-only: "Always uses raw Close prices (no adjusted close)" / "PRICE_BASIS removed" / "Enforce raw Close only (never Adj Close)". |
 | `project/test_scripts/test_phase1a_baseline_lock.py` | 19 | Doc-only mention. |
-| `project/QC/Clone of Project 9/main.py` | 103, 918, 1509 | QC live-execution material. **Out of scope** — Phase -1 left this directory ignored. |
-| `project/signal_library/shared_integrity.py` | 273 | Comment-only mention. |
+| `project/signal_library/shared_integrity.py` | 273 | Comment-only mention: "This handles cases where vendors rebase Adjusted Close by multiplying ...". No functional scoring path. |
 
 ## 3. Canonical scoring call-site inventory
 
@@ -178,20 +180,42 @@ Explicit `ddof=1` (matches v0.5 spec §16):
 | `project/spymaster.py` | 9082 | `std_dev = np.std(signal_captures, ddof=1)` (preceded by an explicit comment about sample-std intent). |
 | `project/spymaster.py` | 11116 | `raw_std_dev = signal_captures.std(ddof=1) if trigger_days > 1 else 0.0`. |
 
-Implicit-ddof (defaults to ddof=0 for numpy / pandas):
+Implicit-ddof inventory. The default depends on the call target,
+not on whether the call looks "implicit":
 
-| File | Line | Site |
-|---|---|---|
-| `project/spymaster.py` | 1481 | `std_return = daily_returns.std()` — utility / position metric, not in the canonical scoring chain that feeds the result pkl. |
-| `project/spymaster.py` | 1542 | `std_daily_move = recent_30d.std() if len(recent_30d) > 1 else avg_daily_move_30d` — position display. |
-| `project/spymaster.py` | 8873, 8920 | `daily_vol = float(returns_in_position.std())` — position-level volatility display. |
-| `project/spymaster.py` | 10605 | `annualized_std = combined_returns.std() * np.sqrt(252)` — combined-strategy display, kept in decimal form. |
-| `project/spymaster.py` | 11668 | `std_dev = cap[trigger_mask].std() if trigger_days > 0 else 0` — **canonical-scoring site, implicit ddof=0**. |
-| `project/spymaster.py` | 12601 | `std_dev = trigger_captures.std() if trigger_days > 0 else 0` — **canonical-scoring site, implicit ddof=0**. |
+  - `numpy.ndarray.std()` and `numpy.std(arr)` default to `ddof=0`.
+  - `pandas.Series.std()` and `pandas.DataFrame.std()` default to
+    `ddof=1`.
 
-The two sites at `spymaster.py:11668` and `spymaster.py:12601`
-silently use ddof=0 (population std) inside what is shaped like a
-canonical-scoring block. The spec mandates ddof=1.
+To classify each implicit site, identify whether the receiver is a
+NumPy array or a pandas Series.
+
+| File | Line | Site | Receiver | Effective ddof |
+|---|---|---|---|---|
+| `project/spymaster.py` | 1481 | `std_return = daily_returns.std()` — utility / position metric, not in the canonical scoring chain. | pandas Series | 1 |
+| `project/spymaster.py` | 1542 | `std_daily_move = recent_30d.std() if len(recent_30d) > 1 else ...` — position display. | pandas Series | 1 |
+| `project/spymaster.py` | 8873, 8920 | `daily_vol = float(returns_in_position.std())` — position-level volatility display. | pandas Series | 1 |
+| `project/spymaster.py` | 10605 | `annualized_std = combined_returns.std() * np.sqrt(252)` — combined-strategy display. | pandas Series | 1 |
+| `project/spymaster.py` | 11668 | `std_dev = cap[trigger_mask].std() if trigger_days > 0 else 0` — **canonical-scoring site**. `cap` is a NumPy array (`cap = np.zeros_like(daily_returns, dtype='float64')` upstream), so this is **actually ddof=0**. | numpy ndarray | **0** |
+| `project/spymaster.py` | 12601 | `std_dev = trigger_captures.std() if trigger_days > 0 else 0` — canonical-scoring site. `trigger_captures` is a pandas Series in this block. | pandas Series | 1 |
+
+Behavior-changing sites for Phase 1B-2 (sites where the effective
+ddof differs from the spec's `ddof=1`):
+
+  - **`spymaster.py:11668`** — numpy ndarray, currently ddof=0. Phase
+    1B-2 must move to `ddof=1` (numeric delta expected).
+
+Cosmetic / clarity-only sites (already ddof=1 by virtue of the
+pandas Series default, but Phase 1B-2 should make ddof explicit
+for readability):
+
+  - `spymaster.py:1481, 1542, 8873, 8920, 10605, 12601` — explicit
+    `ddof=1` should be added; no numeric delta expected.
+
+The Phase 1A `spymaster` end-to-end paths are not pinned, so even
+the numeric delta at `spymaster.py:11668` will not flip a Phase 1A
+snapshot directly. The diff is observable through Phase 1B-2's
+end-to-end checks against the canonical scoring module.
 
 ## 6. cdf p-value inventory
 
@@ -208,7 +232,10 @@ should use the numerically stable equivalent `2 * stats.t.sf(...)`.
 | `project/stackbuilder.py` | 458 |
 | `project/trafficflow.py` | 1627, 2082, 2458, 2582, 2731 |
 
-No `stats.t.sf` usage exists anywhere in tracked code.
+No pre-existing engine scoring path used `stats.t.sf`. The new
+`project/canonical_scoring.py` module added in this PR is the first
+implementation of the spec's stable `t.sf`-based p-value formula in
+the repo; engines do not call it yet (Phase 1B-2 wires them up).
 
 ## 7. Zero-capture trigger-day inventory
 

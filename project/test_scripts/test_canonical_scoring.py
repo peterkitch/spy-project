@@ -322,6 +322,29 @@ def test_score_captures_direct_input_with_explicit_mask():
     assert s.cumulative_capture.iloc[-1].hex() == (0.5).hex()
 
 
+def test_score_captures_zeros_nontrigger_days_in_cumulative_and_total():
+    # Spec §14 enforcement: a caller passing a nonzero capture on a
+    # non-trigger day must not see that value contribute to total_capture
+    # or to the final cumulative_capture. The mask is the source of truth.
+    idx = DATES_5
+    # Day 4 carries a "leaked" nonzero capture but mask[4] is False.
+    cap = pd.Series([1.0, -1.0, 2.0, 0.5, 99.0], index=idx, dtype=float)
+    mask = pd.Series([True, True, True, True, False], index=idx)
+    s = score_captures(cap, mask)
+    # trigger_days counts only mask=True days.
+    assert s.trigger_days == 4
+    # The returned daily_capture must zero out the masked-off day.
+    assert s.daily_capture.loc[idx[4]].hex() == (0.0).hex()
+    # Untouched days preserve their values bit-for-bit.
+    assert s.daily_capture.loc[idx[0]].hex() == (1.0).hex()
+    assert s.daily_capture.loc[idx[2]].hex() == (2.0).hex()
+    # total_capture is the sum of the four trigger-day captures only.
+    expected_total = 1.0 + (-1.0) + 2.0 + 0.5  # 2.5
+    assert s.total_capture.hex() == expected_total.hex()
+    # Final cumulative_capture equals total_capture (spec §14).
+    assert s.cumulative_capture.iloc[-1].hex() == s.total_capture.hex()
+
+
 # ---------------------------------------------------------------------------
 # Test 14: normalize_signal_series accepts ints and is robust to noise
 # ---------------------------------------------------------------------------

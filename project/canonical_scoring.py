@@ -183,19 +183,25 @@ def score_captures(
         raise TypeError("trigger_mask must be a pandas Series")
     mask = trigger_mask.reindex(daily_capture.index).fillna(False).astype(bool)
 
-    cumulative = daily_capture.fillna(0.0).cumsum()
+    # Enforce spec §14: only trigger days contribute to captures and to the
+    # cumulative running sum. Any nonzero input on a non-trigger day is
+    # zeroed out so total_capture and the final cumulative value agree.
+    effective_daily_capture = daily_capture.fillna(0.0).astype(float).copy()
+    effective_daily_capture[~mask] = 0.0
+    cumulative = effective_daily_capture.cumsum()
 
-    trigger_caps = daily_capture[mask].astype(float)
+    trigger_caps = effective_daily_capture[mask]
     trigger_days = int(mask.sum())
 
     if trigger_days == 0:
         return CanonicalScore(
             trigger_days=0, wins=0, losses=0, win_rate=0.0,
-            avg_daily_capture=0.0, total_capture=float(cumulative.iloc[-1]) if len(cumulative) else 0.0,
+            avg_daily_capture=0.0,
+            total_capture=float(cumulative.iloc[-1]) if len(cumulative) else 0.0,
             std_dev=0.0, sharpe=0.0,
             t_statistic=None, p_value=None,
-            daily_capture=daily_capture.astype(float),
-            cumulative_capture=cumulative.astype(float),
+            daily_capture=effective_daily_capture,
+            cumulative_capture=cumulative,
         )
 
     wins = int((trigger_caps > 0).sum())
@@ -231,8 +237,8 @@ def score_captures(
         sharpe=sharpe,
         t_statistic=t_stat,
         p_value=p_val,
-        daily_capture=daily_capture.astype(float),
-        cumulative_capture=cumulative.astype(float),
+        daily_capture=effective_daily_capture,
+        cumulative_capture=cumulative,
     )
 
 
