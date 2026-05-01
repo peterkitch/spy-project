@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
@@ -345,6 +346,75 @@ def test_stackbuilder_combined_metrics_signals_baseline_pending_bug_fix():
 # ---------------------------------------------------------------------------
 # Category 4: ImpactSearch xlsx duplicate-export baseline
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Category 5: TrafficFlow baselines (added per Codex audit amendment)
+#
+# trafficflow._metrics_like_spymaster reads _PRICE_CACHE.get(secondary)
+# directly without normalization. To exercise the helper without network,
+# a pytest fixture preloads _PRICE_CACHE['SYN'] with a synthetic Close
+# DataFrame and monkeypatches _load_secondary_prices to raise
+# AssertionError if called. The cache key is removed in finally so module
+# state stays clean across tests.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _tf_synth_secondary(monkeypatch):
+    tf = _import("trafficflow")
+    sym = "SYN"
+    df = pd.DataFrame({"Close": CLOSE.values}, index=DATES)
+
+    def _no_fetch(*args, **kwargs):  # pragma: no cover (assertion path only)
+        raise AssertionError(
+            "trafficflow._load_secondary_prices was called; cache injection failed"
+        )
+
+    monkeypatch.setattr(tf, "_load_secondary_prices", _no_fetch)
+    tf._PRICE_CACHE[sym] = df.copy()
+    try:
+        yield (sym, df)
+    finally:
+        tf._PRICE_CACHE.pop(sym, None)
+
+
+def test_trafficflow_metrics_like_spymaster_baseline(_tf_synth_secondary):
+    sym, _df = _tf_synth_secondary
+    tf = _import("trafficflow")
+    out = tf._metrics_like_spymaster(sym, SIGNALS.copy())
+    assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_METRICS_LIKE_SPYMASTER
+
+
+def test_trafficflow_combine_signals_all_buy_baseline():
+    tf = _import("trafficflow")
+    a = pd.Series(["Buy"] * 5, index=DATES[:5])
+    b = pd.Series(["Buy"] * 5, index=DATES[:5])
+    out = tf._combine_signals([a, b])
+    assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_BUY
+
+
+def test_trafficflow_combine_signals_all_short_baseline():
+    tf = _import("trafficflow")
+    a = pd.Series(["Short"] * 5, index=DATES[:5])
+    b = pd.Series(["Short"] * 5, index=DATES[:5])
+    out = tf._combine_signals([a, b])
+    assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_SHORT
+
+
+def test_trafficflow_combine_signals_mixed_baseline():
+    tf = _import("trafficflow")
+    a = pd.Series(["Buy", "Short", "Buy", "None", "Buy"], index=DATES[:5])
+    b = pd.Series(["Short", "Buy", "Buy", "Short", "None"], index=DATES[:5])
+    out = tf._combine_signals([a, b])
+    assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_MIXED
+
+
+def test_trafficflow_combine_signals_all_none_baseline():
+    tf = _import("trafficflow")
+    a = pd.Series(["None"] * 5, index=DATES[:5])
+    b = pd.Series(["None"] * 5, index=DATES[:5])
+    out = tf._combine_signals([a, b])
+    assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_NONE
+
 
 def test_impactsearch_export_writes_duplicates_pending_bug_fix(tmp_path):
     # Pinned per Phase 1B Intentional Delta Ledger:

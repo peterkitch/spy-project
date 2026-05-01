@@ -43,6 +43,10 @@ Locked surfaces (Part B inventory results):
   - `impactsearch.export_results_to_excel` (filesystem behavior)
   - `confluence._mp_metrics`
   - `confluence._mp_combine_unanimity_vectorized`
+  - `trafficflow._combine_signals`
+  - `trafficflow._metrics_like_spymaster` (via in-memory `_PRICE_CACHE`
+    injection plus `monkeypatch` of `_load_secondary_prices` to assert
+    no fallback fetch)
 
 ## 3. Why no live ticker / yfinance data is used for committed baselines
 
@@ -117,8 +121,13 @@ Ticker labels in the fixtures (`AAA`, `BBB`, `P1_D`, `P2_D`,
 | confluence    | _mp_combine_unanimity_vectorized              | test_confluence_consensus_inverse_baseline                             | post-[I] applied               |
 | confluence    | _mp_combine_unanimity_vectorized              | test_confluence_consensus_muted_baseline                               | second primary all None        |
 | confluence    | _mp_combine_unanimity_vectorized              | test_confluence_consensus_all_none_baseline                            | both primaries None            |
+| trafficflow   | _metrics_like_spymaster                       | test_trafficflow_metrics_like_spymaster_baseline                       | cache-injection + monkeypatch  |
+| trafficflow   | _combine_signals                              | test_trafficflow_combine_signals_all_buy_baseline                      | unanimous Buy                  |
+| trafficflow   | _combine_signals                              | test_trafficflow_combine_signals_all_short_baseline                    | unanimous Short                |
+| trafficflow   | _combine_signals                              | test_trafficflow_combine_signals_mixed_baseline                        | mixed (None per consensus)     |
+| trafficflow   | _combine_signals                              | test_trafficflow_combine_signals_all_none_baseline                     | all None                       |
 
-22 baseline tests + 1 import smoke. All green under `spyproject2`.
+27 baseline tests + 1 import smoke. All green under `spyproject2`.
 
 ## 6. Known gaps (and why they are not tested in Phase 1A)
 
@@ -128,11 +137,17 @@ Ticker labels in the fixtures (`AAA`, `BBB`, `P1_D`, `P2_D`,
     exercises canonical scoring without standing up the cache. Phase
     1A does not stand up that cache; Phase 2 will own a parity suite
     that does.
-  - **TrafficFlow scoring path.** Same shape: TrafficFlow loads
-    StackBuilder leaderboards, Spymaster pkls, and yfinance prices,
-    none of which fit the offline-deterministic contract. Its inner
-    metric and combine helpers are largely shared with the helpers
-    above.
+  - **TrafficFlow scoring path.** Now covered (per Codex audit
+    amendment, 2026-05-01): `_combine_signals` is exercised
+    directly with synthetic primary signal series, and
+    `_metrics_like_spymaster` is exercised by preloading
+    `trafficflow._PRICE_CACHE['SYN']` with a synthetic Close
+    DataFrame inside a pytest fixture, while `monkeypatch` replaces
+    `trafficflow._load_secondary_prices` with a function that
+    raises `AssertionError` if called. The fixture removes the cache
+    key in `finally` so module state stays clean across tests. The
+    full StackBuilder leaderboard / Spymaster pkl loading chain
+    remains out of scope; it belongs to Phase 2's parity suite.
   - **Confluence end-to-end multi-timeframe scrub.** Out of Phase 1A
     scope; Phase 4 deliverable.
   - **StackBuilder full Phase-2-vs-Phase-3 reconstruction.** The full
@@ -225,11 +240,50 @@ markdown alongside its PR; Phase 1A does not pre-create it.
   - Re-running pytest produces byte-identical output. Three
     back-to-back runs were verified during Phase 1A authoring.
 
-## Phase 1B planning note
+## Phase 1B planning notes
 
-Confluence.py price_basis cleanup decision for Phase 1B: remove
-price_basis args/plumbing entirely rather than preserving a constant
-'close' compatibility marker. Existing caches should be rebuilt if
-needed; the spec says no Adj/raw selector remains.
+Pending Intentional Delta Ledger entries (drafted in Phase 1A; the
+ledger document itself is created in Phase 1B and references these
+entries):
 
-(Confluence.py is not edited in Phase 1A.)
+  - **StackBuilder Phase 2 vs Phase 3 scoring divergence** (BUG-FIX).
+    Closest callable surface pinned by
+    `test_stackbuilder_combined_metrics_signals_baseline_pending_bug_fix`.
+    Codex's prior 10-folder artifact verification is the binding
+    evidence; canonical-scoring unification eliminates the divergence
+    by construction.
+  - **ImpactSearch xlsx duplicate-row dedupe** (BUG-FIX). Pinned by
+    `test_impactsearch_export_writes_duplicates_pending_bug_fix`.
+    Current `export_results_to_excel` reads any existing xlsx and
+    concatenates new rows on top, producing duplicates on repeat
+    invocation.
+  - **Zero-capture trigger-day counting** (BUG-FIX).
+      - Old: some paths (notably
+        `stackbuilder.metrics_from_captures`,
+        `trafficflow._metrics_like_spymaster`, and the legacy
+        non-`active_pairs` fallback in `onepass._metrics_from_ccc`
+        and `impactsearch._metrics_from_ccc`) count triggers via
+        `captures != 0`, dropping zero-capture trigger days.
+      - New: triggers counted by signal state (`Buy` or `Short`);
+        zero-capture trigger days count as losses per spec §15.
+        The `active_pairs`-aware path in `_metrics_from_ccc` and
+        the consensus-driven path in `confluence._mp_metrics`
+        already align with the new convention.
+
+Other planning notes:
+
+  - **Confluence.py price_basis cleanup.** Remove price_basis
+    args/plumbing entirely rather than preserving a constant
+    `'close'` compatibility marker. Existing caches should be
+    rebuilt if needed; the spec says no Adj/raw selector remains.
+    (Confluence.py is not edited in Phase 1A.)
+  - **Capture averaging is a search heuristic, not canonical
+    scoring.** `stackbuilder._combined_metrics` averages member
+    capture series; this is appropriate for K-search ranking but
+    is not the canonical multi-primary scoring rule. Canonical
+    multi-primary scoring uses signal consensus per spec §18 (the
+    helper to use is `_combined_metrics_signals`, which combines
+    signals first and then computes captures from the consensus).
+    Phase 1B should prefer `_combined_metrics_signals` over
+    `_combined_metrics` for canonical K scoring; the K-search
+    heuristic remains a separate code path.

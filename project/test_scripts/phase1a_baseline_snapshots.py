@@ -68,6 +68,20 @@ SNAP_STACKBUILDER_COMBINED_METRICS = ('d', ((('s', 'combined'), ('S', ((('ts', '
 SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS_PENDING_BUG_FIX = ('d', ((('s', 'combined_caps'), ('S', ((('ts', '2024-01-02T00:00:00'), ('f', '0x0.0p+0')), (('ts', '2024-01-03T00:00:00'), ('f', '0x1.0000000000004p+0')), (('ts', '2024-01-04T00:00:00'), ('f', '0x0.0p+0')), (('ts', '2024-01-05T00:00:00'), ('f', '0x0.0p+0')), (('ts', '2024-01-08T00:00:00'), ('f', '-0x1.0000000000004p+1')), (('ts', '2024-01-09T00:00:00'), ('f', '0x0.0p+0')), (('ts', '2024-01-10T00:00:00'), ('f', '0x1.faee41e6a74a0p-1')), (('ts', '2024-01-11T00:00:00'), ('f', '0x1.f5f5f5f5f5f40p-2')), (('ts', '2024-01-12T00:00:00'), ('f', '0x1.7a533b455c11cp+0')), (('ts', '2024-01-16T00:00:00'), ('f', '0x1.f1165e7254810p+0'))))), (('s', 'metrics'), ('d', ((('s', 'Avg Daily Capture (%)'), ('f', '0x1.4cccccccccccdp-1')), (('s', 'Avg_raw'), ('f', '0x1.4cca12b82b3c3p-1')), (('s', 'Losses'), ('i', 1)), (('s', 'Sharpe Ratio'), ('f', '0x1.ccccccccccccdp+2')), (('s', 'Sharpe_raw'), ('f', '0x1.cd0ff05c15864p+2')), (('s', 'Significant 90%'), ('s', 'No')), (('s', 'Significant 95%'), ('s', 'No')), (('s', 'Significant 99%'), ('s', 'No')), (('s', 'Std Dev (%)'), ('f', '0x1.6374bc6a7ef9ep+0')), (('s', 'Total Capture (%)'), ('f', '0x1.f32fec56d5cfbp+1')), (('s', 'Total_raw'), ('f', '0x1.f32f1c1440da4p+1')), (('s', 'Trigger Days'), ('i', 6)), (('s', 'Win Ratio (%)'), ('f', '0x1.4d51eb851eb85p+6')), (('s', 'Wins'), ('i', 5)), (('s', 'p-Value'), ('f', '0x1.36ae7d566cf42p-2')), (('s', 'p_raw'), ('f', '0x1.36b6a1862eab0p-2')), (('s', 't-Statistic'), ('f', '0x1.258793dd97f63p+0')))))))
 
 # ---------------------------------------------------------------------------
+# Category 5: TrafficFlow baselines (cache-injection + monkeypatch path)
+# ---------------------------------------------------------------------------
+
+SNAP_TRAFFICFLOW_METRICS_LIKE_SPYMASTER = ('d', ((('s', 'Avg %'), ('f', '0x1.a83e425aee632p-2')), (('s', 'Losses'), ('i', 2)), (('s', 'Sharpe'), ('f', '0x1.1c28f5c28f5c3p+2')), (('s', 'Std Dev (%)'), ('f', '0x1.690ff97247454p+0')), (('s', 'Total %'), ('f', '0x1.73367a0f9096cp+1')), (('s', 'Triggers'), ('i', 7)), (('s', 'Win %'), ('f', '0x1.1db851eb851ecp+6')), (('s', 'Wins'), ('i', 5)), (('s', 'p'), ('f', '0x1.ddcc63f141206p-2'))))
+
+SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_BUY = ('S', ((('ts', '2024-01-02T00:00:00'), ('s', 'Buy')), (('ts', '2024-01-03T00:00:00'), ('s', 'Buy')), (('ts', '2024-01-04T00:00:00'), ('s', 'Buy')), (('ts', '2024-01-05T00:00:00'), ('s', 'Buy')), (('ts', '2024-01-08T00:00:00'), ('s', 'Buy'))))
+
+SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_SHORT = ('S', ((('ts', '2024-01-02T00:00:00'), ('s', 'Short')), (('ts', '2024-01-03T00:00:00'), ('s', 'Short')), (('ts', '2024-01-04T00:00:00'), ('s', 'Short')), (('ts', '2024-01-05T00:00:00'), ('s', 'Short')), (('ts', '2024-01-08T00:00:00'), ('s', 'Short'))))
+
+SNAP_TRAFFICFLOW_COMBINE_SIGNALS_MIXED = ('S', ((('ts', '2024-01-02T00:00:00'), ('s', 'None')), (('ts', '2024-01-03T00:00:00'), ('s', 'None')), (('ts', '2024-01-04T00:00:00'), ('s', 'Buy')), (('ts', '2024-01-05T00:00:00'), ('s', 'Short')), (('ts', '2024-01-08T00:00:00'), ('s', 'Buy'))))
+
+SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_NONE = ('S', ((('ts', '2024-01-02T00:00:00'), ('s', 'None')), (('ts', '2024-01-03T00:00:00'), ('s', 'None')), (('ts', '2024-01-04T00:00:00'), ('s', 'None')), (('ts', '2024-01-05T00:00:00'), ('s', 'None')), (('ts', '2024-01-08T00:00:00'), ('s', 'None'))))
+
+# ---------------------------------------------------------------------------
 # Category 4: ImpactSearch xlsx duplicate-export baseline (KNOWN BUG)
 # ---------------------------------------------------------------------------
 
