@@ -20,7 +20,11 @@ try:
 except ImportError:
     tqdm = None
 
-from canonical_scoring import combine_consensus_signals as _canonical_consensus
+from canonical_scoring import (
+    combine_consensus_signals as _canonical_consensus,
+    score_captures as _canonical_score_captures,
+    metrics_to_legacy_dict as _canonical_metrics_to_legacy_dict,
+)
 
 try:
     import yfinance as yf
@@ -425,11 +429,19 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
 def metrics_from_captures(captures: pd.Series, trigger_mask: Optional[pd.Series] = None) -> Optional[Dict[str, float]]:
     """Compute canonical metrics from a daily-capture series.
 
-    Spec §15 / ledger Entry 4: trigger days are signal-state based. When
-    `trigger_mask` is None, this helper falls back to `captures.ne(0.0)`,
-    which incorrectly drops zero-capture trigger days and is retained
-    only for compatibility with callers that have not yet been wired to
-    pass an explicit signal mask.
+    Delegates to canonical_scoring.score_captures (spec §13–§17).
+
+    DEPRECATION NOTE (single-arg fallback):
+      Canonical callers MUST pass an explicit `trigger_mask` constructed
+      from the signal-state series (Buy or Short). The single-arg form
+      `metrics_from_captures(captures)` is a legacy compatibility path
+      that uses `captures.ne(0.0)` as a stand-in mask, which incorrectly
+      drops zero-capture trigger days (spec §15: zero-capture days under
+      an active position are still trigger days, counted as losses).
+      The fallback is retained only to keep external callers compiling
+      until they have been plumbed with signal info; it will be removed
+      in a follow-up PR once every external caller passes a real
+      trigger mask.
     """
     if captures.empty:
         return None
@@ -437,47 +449,16 @@ def metrics_from_captures(captures: pd.Series, trigger_mask: Optional[pd.Series]
         mask = captures.ne(0.0)
     else:
         mask = trigger_mask.reindex(captures.index).fillna(False).astype(bool)
-    n = int(mask.sum())
-    if n == 0:
+    if int(mask.sum()) == 0:
         return None
-    vals = captures[mask].astype(FLOAT_DTYPE)
-    wins = int((vals > 0).sum())
-    losses = n - wins
-    win_ratio = (wins / n * 100.0) if n else 0.0
-    avg = float(vals.mean())
-    total = float(vals.sum())
-    std = float(vals.std(ddof=1)) if n > 1 else 0.0
-    if n > 1 and std != 0.0:
-        annual_ret = avg * 252.0
-        annual_std = std * math.sqrt(252.0)
-        sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std if annual_std != 0 else 0.0
-        t_stat = avg / (std / math.sqrt(n))
-        # Spec §17: numerically stable t.sf form.
-        p_val = float(2 * stats.t.sf(abs(t_stat), df=n - 1))
-    else:
-        sharpe, t_stat, p_val = 0.0, None, None
-    # keep full-precision for gating; present rounded in tables
-    out = {
-        'Trigger Days': n,
-        'Wins': wins,
-        'Losses': losses,
-        'Win Ratio (%)': round(win_ratio, 2),
-        'Std Dev (%)': round(std, 4),
-        'Sharpe Ratio': round(sharpe, 2),
-        'Avg Daily Capture (%)': round(avg, 4),
-        'Total Capture (%)': round(total, 4),
-        't-Statistic': round(t_stat, 4) if t_stat is not None else 'N/A',
-        'p-Value': round(p_val, 4) if p_val is not None else 'N/A',
-        'Significant 90%': 'Yes' if p_val is not None and p_val < 0.10 else 'No',
-        'Significant 95%': 'Yes' if p_val is not None and p_val < 0.05 else 'No',
-        'Significant 99%': 'Yes' if p_val is not None and p_val < 0.01 else 'No',
-        # raw fields for gating/ranking
-        'Sharpe_raw': float(sharpe),
-        'Avg_raw': float(avg),
-        'Total_raw': float(total),
-        'p_raw': float(p_val) if p_val is not None else None,
-    }
-    return out
+    score = _canonical_score_captures(
+        captures.astype(FLOAT_DTYPE),
+        mask,
+        risk_free_rate=RISK_FREE_ANNUAL,
+        periods_per_year=252,
+        ddof=1,
+    )
+    return _canonical_metrics_to_legacy_dict(score)
 
 # ---------- Phase 1: Preflight ----------
 def phase1_preflight(args, secondary: str, specified_primaries: Optional[List[str]] = None):
