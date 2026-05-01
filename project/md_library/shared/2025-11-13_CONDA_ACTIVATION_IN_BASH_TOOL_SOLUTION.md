@@ -6,8 +6,8 @@
 > PowerShell 7+ (`pwsh`) and the Python environment should be created
 > from `project/environment.yml`. The notes below are preserved for
 > historical reference only; do not treat the absolute install paths
-> as canonical. References to a specific NVIDIA MiniConda install
-> location are illustrative only and have been replaced with
+> as canonical. References to a specific local Conda install location
+> are illustrative only and have been replaced with
 > `<conda-install-dir>` placeholders.
 
 **Date**: 2025-11-13
