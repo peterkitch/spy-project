@@ -118,7 +118,18 @@ Reference inventory:
     scoring site computes std on a NumPy array and therefore
     silently uses ddof = 0 today. This entry harmonizes that one
     site numerically; the others are clarity-only.
-  - Status: stub, pending 1B-2.
+  - Status: numeric-delta site fixed in 1B-2A. The single ddof=0
+    canonical-scoring site `spymaster.py:11668` is now
+    `cap[trigger_mask].std(ddof=1) if trigger_days > 1 else 0`,
+    matching spec §16. The downstream Sharpe / t-stat / p-value
+    chain in that block already gates on `std_dev > 0`, so the
+    `trigger_days == 1` case continues to short-circuit to the
+    no-stats branch (no behaviour difference for that case). Phase
+    1A snapshots do not pin this code path, so no Phase 1A snapshot
+    flips. The remaining six implicit-but-already-ddof=1 pandas
+    Series sites in spymaster (1481, 1542, 8873, 8920, 10605,
+    12601) are pending a clarity-only `ddof=1`-explicit pass; they
+    are not numeric deltas.
 
 ## Entry 3: cdf -> sf p-value
 

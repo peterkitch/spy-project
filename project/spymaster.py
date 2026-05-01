@@ -11665,7 +11665,10 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         trigger_mask = buy_mask | short_mask
         avg_daily_capture = cap[trigger_mask].mean() if trigger_days > 0 else 0
         total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0
-        std_dev = cap[trigger_mask].std() if trigger_days > 0 else 0
+        # ddof=1 sample std per spec v0.5 §16. `cap` is a NumPy array,
+        # so the implicit default would have been ddof=0; this is a
+        # numeric correction (Phase 1B Intentional Delta Ledger entry 2).
+        std_dev = cap[trigger_mask].std(ddof=1) if trigger_days > 1 else 0
         # Ensure losses is calculated correctly
         losses = trigger_days - wins  # This ensures losses + wins = trigger_days
 
