@@ -103,21 +103,49 @@ Deliverables:
     environment-coupled identifiers that should not ship in a public
     research repo.
   - In Scope:
-    - Replace hardcoded Windows paths in trafficflow.py and
-      stackbuilder.py with portable equivalents.
-    - Audit remaining engines for similar environment-coupled
-      strings.
-    - Confirm public-safety of any user identifiers that remain.
+    - Full grep for hardcoded paths across the entire committed
+      surface: .py, .md, .bat, .json, .yml, .yaml, .lock, .txt,
+      .gitignore, .gitattributes, .spec, .ini, .cfg, .toml. Anything
+      tracked is in scope; nothing is exempted by file type.
+    - Replace machine-specific defaults with repo-relative defaults
+      plus environment-variable overrides, naming overrides
+      `PRJCT9_<PURPOSE>_DIR` so a single convention covers every
+      engine.
+    - Documentation path cleanup: rewrite any markdown that
+      describes the local Windows setup with generic placeholders,
+      or remove the path where it serves no instructional purpose.
+    - Committed artifact audit: inventory every tracked .pkl,
+      .json, .csv, .xlsx, .parquet, .db, .sqlite. Categorize each
+      as safe / sanitize / untrack-and-gitignore.
+    - Git history scan: report (do not execute rewrite) any
+      historical leakage of credentials, broker references, account
+      identifiers, or PII beyond the intentional Gmail noted in
+      Section 3 Locked Decisions.
+    - Phase -1 deliverable doc:
+      `md_library/shared/<DATE>_SECURITY_CLEANUP_PHASE_MINUS_1.md`
+      documenting findings, decisions, changes applied, and any new
+      env vars introduced.
   - Out of Scope:
     - History rewrite for previously committed paths.
     - Removal or rewrite of the gl_config.py email noted in
       Section 3 Locked Decisions (remains public).
     - Any algorithmic change.
   - Acceptance Criteria:
-    - No hardcoded user-profile paths remain in trafficflow.py or
-      stackbuilder.py.
-    - Engines run unchanged on a clean clone with no path edits.
-    - A short Phase -1 PR description enumerates each replacement.
+    - A complete stranger cloning the repo learns nothing personal
+      beyond Peter's GitHub username.
+    - All defaults work from a clean clone in a repo-relative
+      layout; engines run unchanged with no path edits required.
+    - `SECURITY_CLEANUP_PHASE_MINUS_1.md` committed at the
+      documented location.
+    - Git history sensitivity report delivered to Peter for a
+      separate rewrite decision (out of this phase's scope to act
+      on).
+    - Tracked artifact audit complete; any newly-untracked patterns
+      captured in `.gitignore` (or in `.git/info/exclude` where the
+      pattern would otherwise advertise local file structure
+      publicly).
+    - A short Phase -1 PR description enumerates each replacement
+      and links to the security cleanup doc.
   - ELI5: The repository will be public. Anything tied to one
     machine, like a path that names a user folder, leaks a detail
     that does not belong on the internet and breaks the repo for
@@ -204,8 +232,11 @@ Deliverables:
     - Parity tests across engines.
     - Lookahead-leak audits on every signal-to-return alignment.
     - Synthetic dataset tests with hand-verified expected outputs.
-    - Resurrection of the test_scripts/ directory as a tracked,
-      first-class part of the repo.
+    - Creation of a new tracked test suite under `test_scripts/`.
+      Any old stash scripts from prior work are reference-only and
+      may inform patterns or fixtures, but do not form the basis of
+      the new suite. Build fresh against the canonical scoring
+      function extracted in Phase 1.
   - Out of Scope:
     - Algorithm changes.
     - Performance tuning unrelated to test stability.
@@ -344,10 +375,14 @@ Deliverables:
 
   - Hardcoded Windows paths in trafficflow.py and stackbuilder.py:
     Phase -1 blocker.
-  - StackBuilder Phase 2 vs Phase 3 scoring mismatch: Phase 1 blocker.
-    The two phases score through different paths/settings, producing
-    a K1 result that disagrees with the same folder's rank_direct or
-    rank_inverse.
+  - StackBuilder Phase 2 vs Phase 3 scoring: code inspection shows
+    the two phases can score through different paths and settings,
+    potentially producing a K1 result that disagrees with the same
+    folder's rank_direct or rank_inverse. Artifact-level confirmation
+    is pending; the audit worktree did not contain project/output, so
+    this is a code-verified risk awaiting output-folder verification
+    on Peter's machine. Phase 1 blocker either way: canonical scoring
+    unification eliminates the divergence by construction.
   - TrafficFlow raw Close pricing: correct under new spec. Other
     engines align to it via Adj Close elimination.
   - Adj Close call sites needing cleanup in Phase 1: spymaster.py,
@@ -390,8 +425,10 @@ on origin/main:
 ?? project/md_library/shared/2025-12-19_EXECUTION_OVERHAUL_STOP_LOSS_FIX_IMPLEMENTATION.md
 ```
 
-`git status --untracked-files=all` confirms nothing is hidden behind
-the directory entries; the tracked-file content under those folders is:
+`git status --untracked-files=all` confirms no additional unignored
+files beyond the four QC items listed above. The tracked-file
+content under those untracked folders, surfaced by the same command,
+is:
 
 ```
 project/QC/BTC ETF EXT MASTER/btcbot.py
@@ -399,6 +436,14 @@ project/QC/BTC ETF MASTER/BTC ETF MASTER.py
 project/QC/BTC TREND MASTER/BTC TREND MASTER.py
 project/md_library/shared/2025-12-19_EXECUTION_OVERHAUL_STOP_LOSS_FIX_IMPLEMENTATION.md
 ```
+
+Ignored local artifacts exist on the working machine
+(`git ls-files -o -i --exclude-standard` surfaces examples like
+`.claude/settings.local.json`, `mcp-server/`, launcher batch files,
+QC backtests, QC local config, `__pycache__/`). These are
+intentionally ignored, are not visible to the public repo, and must
+NOT be added to sprint commits or to repo-level `.gitignore`
+changes.
 
 Sprint-relevance notes:
 
@@ -414,9 +459,25 @@ Sprint-relevance notes:
 
 Explicit guidance: the four untracked items above relate to live
 execution and are OUT of sprint scope. They MUST NOT be committed
-as part of any sprint phase. Recommendation: move to a private
-archive or add to `.git/info/exclude`. Peter decides separately,
-outside the sprint.
+as part of any sprint phase.
+
+Codex noted that two of the untracked QC scripts contain the
+intentional Gmail address noted in Section 3 Locked Decisions and
+reference broker/account model setup. These traits do not change
+the out-of-scope decision, but they reinforce that these files must
+NOT enter the public repo in any sprint phase.
+
+Recommended handling (Peter's call, outside the sprint):
+
+  - Move to a private archive directory outside the repo, OR
+  - Add to `.git/info/exclude` (machine-local ignore, not
+    committed), NOT to the tracked `.gitignore`. The tracked
+    `.gitignore` would advertise the file and folder patterns
+    publicly, which defeats the purpose of keeping these out of the
+    public repo. `.git/info/exclude` achieves the same `git status`
+    suppression without any public footprint.
+
+Do not add these QC paths to the tracked `.gitignore`.
 
 Statement: untracked files were observed for the purpose of this
 preflight only. This document was created without modifying,
