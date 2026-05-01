@@ -175,7 +175,10 @@ try:
 except Exception:
     stats = None
 
-from canonical_scoring import combine_consensus_signals as _canonical_consensus
+from canonical_scoring import (
+    combine_consensus_signals as _canonical_consensus,
+    score_captures as _canonical_score_captures,
+)
 
 RISK_FREE_ANNUAL = float(os.environ.get('CONFLUENCE_RISK_FREE_ANNUAL',
                                         os.environ.get('RISK_FREE_ANNUAL', '5.0')))
@@ -347,50 +350,43 @@ def _mp_forward_return_on_grid(close_on_grid: pd.Series) -> pd.Series:
     return out
 
 def _mp_metrics(captures: pd.Series, trig_mask: pd.Series, bars_per_year: int) -> dict:
-    trig_idx = captures.index[trig_mask]
-    n = int(len(trig_idx))
-    if n == 0:
+    """Compute multi-primary canonical metrics.
+
+    Delegates to canonical_scoring.score_captures (spec §13–§17).
+    Output keys retain confluence's display-table conventions
+    (e.g. 'Triggers', 'Sharpe', 'p', 'Sig 90%' with checkmarks).
+    """
+    if int(trig_mask.sum()) == 0:
         return {}
 
-    vals = captures.loc[trig_idx].astype(float)
-    wins = int((vals > 0).sum())
-    losses = n - wins  # includes exactly 0 as losses
-    win_pct = (wins / n * 100.0)
+    score = _canonical_score_captures(
+        captures.astype(float),
+        trig_mask,
+        risk_free_rate=RISK_FREE_ANNUAL,
+        periods_per_year=int(bars_per_year),
+        ddof=1,
+    )
 
-    avg = float(vals.mean())
-    total = float(vals.sum())
-    std = float(vals.std(ddof=1)) if n > 1 else 0.0
-
-    sharpe, t_stat, p_val = 0.0, None, None
-    if n > 1 and std != 0.0:
-        annual_ret = avg * float(bars_per_year)
-        annual_std = std * math.sqrt(float(bars_per_year))
-        if annual_std != 0:
-            sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std
-        if stats is not None:
-            t_stat = avg / (std / math.sqrt(n))
-            # Spec §17: numerically stable t.sf form.
-            p_val = float(2 * stats.t.sf(abs(t_stat), df=n - 1))
-
-    # Sig flags like SpyMaster table
-    sig90 = '✔' if (p_val is not None and p_val <= 0.10) else ''
-    sig95 = '✔' if (p_val is not None and p_val <= 0.05) else ''
-    sig99 = '✔' if (p_val is not None and p_val <= 0.01) else ''
+    p = score.p_value
+    # Sig flags like SpyMaster table (confluence uses <= and a checkmark)
+    sig90 = '✔' if (p is not None and p <= 0.10) else ''
+    sig95 = '✔' if (p is not None and p <= 0.05) else ''
+    sig99 = '✔' if (p is not None and p <= 0.01) else ''
 
     return {
-        'Triggers': n,
-        'Wins': wins,
-        'Losses': losses,
-        'Win %': round(win_pct, 2),
-        'StdDev %': round(std, 4),
-        'Sharpe': round(sharpe, 2),
-        't': round(t_stat, 4) if t_stat is not None else 'N/A',
-        'p': round(p_val, 4) if p_val is not None else 'N/A',
+        'Triggers': score.trigger_days,
+        'Wins': score.wins,
+        'Losses': score.losses,
+        'Win %': round(score.win_rate, 2),
+        'StdDev %': round(score.std_dev, 4),
+        'Sharpe': round(score.sharpe, 2),
+        't': round(score.t_statistic, 4) if score.t_statistic is not None else 'N/A',
+        'p': round(p, 4) if p is not None else 'N/A',
         'Sig 90%': sig90,
         'Sig 95%': sig95,
         'Sig 99%': sig99,
-        'Avg Cap %': round(avg, 4),
-        'Total %': round(total, 4),
+        'Avg Cap %': round(score.avg_daily_capture, 4),
+        'Total %': round(score.total_capture, 4),
     }
 
 def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_flags=None):
