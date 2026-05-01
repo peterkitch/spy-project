@@ -198,7 +198,7 @@ When testing scripts, always:
 ## Troubleshooting
 
 ### Issue: "No such file or directory"
-**Solution**: Check path format - use `/c/Users/...` not `C:\Users\...`
+**Solution**: Check path format - in Git Bash, use the forward-slash mount form (e.g. `/c/...`) rather than a backslash-style Windows path.
 
 ### Issue: "conda: command not found"
 **Solution**: Use full path to activate script with `source`, don't rely on conda being in PATH

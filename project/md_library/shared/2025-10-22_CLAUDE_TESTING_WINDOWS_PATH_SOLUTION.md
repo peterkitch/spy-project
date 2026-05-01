@@ -17,7 +17,7 @@
 
 Claude's Bash tool was unable to run Python tests in the conda environment despite multiple attempts using:
 - `cmd /c "activate.bat && python script.py"` - exits immediately, no output
-- `C:\Users\...\python.exe` - path not found (backslashes interpreted by bash)
+- A backslash-style Windows path to `python.exe` - path not found (backslashes interpreted by bash)
 - Background shells - not maintaining environment
 
 ## Solution

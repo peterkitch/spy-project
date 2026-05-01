@@ -40,8 +40,8 @@ Out of scope (sprint plan Section 3 / phase boundaries):
 ### Part B: hardcoded path matches
 
 Discovery used `git grep` over tracked files only (no raw filesystem
-walk). Patterns covered: literal `C:\Users\<old-username>`,
-`Users\<old-username>` and `Users/<old-username>` (Windows and
+walk). Patterns covered: absolute Windows user-profile paths
+containing the old contributor's username (Windows backslash and
 forward-slash forms), user-profile and Conda install segments, and
 local-clone repo-path segments.
 
@@ -67,11 +67,11 @@ Matches by category:
 ### Part C: tracked artifact audit
 
 Inventory across the eight target extensions, sourced from
-`git ls-files`:
+`git ls-files` at the repo root:
 
   - .pkl: 0
-  - .json: 0
-  - .jsonl: 1 (signal_library/data/changelog/changelog_20250813.jsonl)
+  - .json: 1 (devbox.json)
+  - .jsonl: 1 (project/signal_library/data/changelog/changelog_20250813.jsonl)
   - .csv: 0
   - .xlsx: 0
   - .parquet: 0
@@ -81,15 +81,22 @@ Inventory across the eight target extensions, sourced from
 Categorization (conservative; extension alone is not grounds to
 untrack):
 
-  - Safe: 1
+  - Safe: 2
   - Sanitize: 0
   - Untrack: 0
 
-The single artifact is a 10-line signal-library rebuild changelog.
-Sample row: `{"timestamp": "...", "ticker": "SPY", "action":
-"full_rebuild", "version": "3.0.0", "reason": "...",
-"acceptance_level": "REBUILD"}`. No PII, no credentials, no portfolio
-or account data. Legitimate project reference; remains tracked.
+`devbox.json` is Devbox tooling configuration: a `$schema` reference,
+a `packages` list (Python interpreter + a few PyPI packages), an
+`init_hook`, and named `scripts`. No PII, credentials, account data,
+broker references, or portfolio data. Legitimate tooling config;
+remains tracked.
+
+`changelog_20250813.jsonl` is a 10-line signal-library rebuild
+changelog. Sample row: `{"timestamp": "...", "ticker": "SPY",
+"action": "full_rebuild", "version": "3.0.0", "reason": "...",
+"acceptance_level": "REBUILD"}`. No PII, no credentials, no
+portfolio or account data. Legitimate project reference; remains
+tracked.
 
 ### Part D: public-history scan
 
@@ -253,9 +260,10 @@ Existing env vars touched (no rename, defaults still respected):
 
 ## Future contributor guidance
 
-  - Do NOT commit personal paths (e.g., `C:\Users\<you>\...`) or
-    PII into tracked files. Use `Path(__file__).resolve().parent`
-    or analogous parent walks for repo-relative defaults.
+  - Do NOT commit absolute personal paths (anything that names your
+    user-profile directory or your local clone location) or PII
+    into tracked files. Use `Path(__file__).resolve().parent` or
+    analogous parent walks for repo-relative defaults.
   - When a path legitimately varies per machine (caches, output
     roots, custom data locations), introduce an env var under the
     `PRJCT9_<PURPOSE>_DIR` convention and provide a project-relative

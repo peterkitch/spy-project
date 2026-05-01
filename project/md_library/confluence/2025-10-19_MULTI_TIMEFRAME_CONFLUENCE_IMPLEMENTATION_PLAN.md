@@ -380,7 +380,7 @@ def calculate_confluence(aligned_signals: pd.DataFrame, date: pd.Timestamp, min_
 ### File Structure
 
 ```
-spy-project/project/
+<repo root>/project/
 │
 ├── confluence.py                          # NEW: Standalone Dash app (port 8056)
 │
