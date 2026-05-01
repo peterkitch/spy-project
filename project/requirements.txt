@@ -119,3 +119,6 @@ altgraph==0.17.4
 # Selenium and web automation
 selenium==4.35.0
 webdriver-manager==4.0.2
+
+# Testing
+pytest==8.3.5

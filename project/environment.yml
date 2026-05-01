@@ -126,6 +126,9 @@ dependencies:
       
       # System monitoring
       - psutil==6.0.0
+
+      # Testing
+      - pytest==8.3.5
       
       # Platform-specific (optional, installed only if on Windows)
       # These will be skipped on Mac/Linux

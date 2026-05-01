@@ -87,6 +87,15 @@ conda env create -f environment.yml
 conda activate spyproject2
 ```
 
+### Running Tests
+```bash
+# Phase 0 import smoke harness (run from the project/ directory so the
+# engines' relative log writes land under project/logs/, which is
+# already ignored by project/.gitignore).
+cd project
+python -m pytest test_scripts -q
+```
+
 ### Running Applications
 
 #### Using the Optimized Launcher (Recommended)
