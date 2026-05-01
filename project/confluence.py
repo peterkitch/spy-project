@@ -369,7 +369,8 @@ def _mp_metrics(captures: pd.Series, trig_mask: pd.Series, bars_per_year: int) -
             sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std
         if stats is not None:
             t_stat = avg / (std / math.sqrt(n))
-            p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
+            # Spec §17: numerically stable t.sf form.
+            p_val = float(2 * stats.t.sf(abs(t_stat), df=n - 1))
 
     # Sig flags like SpyMaster table
     sig90 = '✔' if (p_val is not None and p_val <= 0.10) else ''

@@ -9033,7 +9033,8 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
             if trigger_days > 1 and std_dev != 0:
                 t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
                 degrees_of_freedom = trigger_days - 1
-                p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+                # Spec §17: numerically stable t.sf form.
+                p_value = 2 * stats.t.sf(abs(t_statistic), df=degrees_of_freedom)
 
                 # Don't print stats from callback for cached tickers to avoid issues
                 # Stats are already printed during processing
@@ -11070,7 +11071,8 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
                 if trigger_days > 1 and raw_std_dev > 0:
                     t_statistic_val = raw_avg_daily / (raw_std_dev / np.sqrt(trigger_days))
                     dfreedom = trigger_days - 1
-                    p_val = 2 * (1 - stats.t.cdf(abs(t_statistic_val), df=dfreedom))
+                    # Spec §17: numerically stable t.sf form.
+                    p_val = 2 * stats.t.sf(abs(t_statistic_val), df=dfreedom)
                     # Now round:
                     t_statistic = round(t_statistic_val, 4)
                     p_value = round(p_val, 4)
@@ -11618,11 +11620,11 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         risk_free_rate = 5.0  # 5% annual rate
         daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
         sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
-        # Calculate statistical significance
+        # Calculate statistical significance (spec §17: numerically stable t.sf form)
         if trigger_days > 1 and std_dev > 0:
             t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
             degrees_of_freedom = trigger_days - 1
-            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+            p_value = 2 * stats.t.sf(abs(t_statistic), df=degrees_of_freedom)
             t_statistic = round(t_statistic, 4)
             p_value = round(p_value, 4)
         else:
@@ -12551,11 +12553,11 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
                 sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
 
-                # Calculate statistical significance
+                # Calculate statistical significance (spec §17: numerically stable t.sf form)
                 if trigger_days > 1 and std_dev > 0:
                     t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
                     degrees_of_freedom = trigger_days - 1
-                    p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
+                    p_value = 2 * stats.t.sf(abs(t_statistic), df=degrees_of_freedom)
                     t_statistic = round(t_statistic, 4)
                     p_value = round(p_value, 4)
                 else:

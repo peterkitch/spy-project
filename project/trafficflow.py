@@ -1574,8 +1574,9 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
 
     daily_captures = pd.Series(cap, index=combined_signals.index)
 
-    # SPYMASTER TRIGGER MASK: Count non-zero captures (NOT signal mask)
-    trig_mask = daily_captures.to_numpy() != 0.0
+    # Spec §15: trigger days are days with active Buy/Short signals,
+    # including days with zero capture. Ledger Entry 4.
+    trig_mask = buy_mask | short_mask
     trigger_days = int(trig_mask.sum())
 
     if trigger_days == 0:
@@ -1598,14 +1599,16 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
     ann_std = std * np.sqrt(252.0) if std != 0.0 else 0.0
     sharpe = ((ann_ret - 5.0) / ann_std) if ann_std != 0.0 else 0.0  # 5% risk-free rate
 
-    # t-stat & p (two-sided)
+    # t-stat & p (two-sided), spec §17: numerically stable t.sf form.
     t_stat = (avg_cap / (std / np.sqrt(trigger_days))) if (std > 0 and trigger_days > 1) else 0.0
     try:
         from scipy import stats as _st
-        p_value = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(trigger_days - 1, 1))))
+        p_value = float(2 * _st.t.sf(abs(t_stat), df=max(trigger_days - 1, 1)))
     except Exception:
         p_value = 1.0
 
+    # spec §15: zero-capture days under an active position count as losses.
+    losses = trigger_days - wins
     win_pct = (wins / trigger_days * 100.0) if trigger_days else 0.0
 
     return {
@@ -2056,8 +2059,9 @@ def _subset_metrics_spymaster(
 
     t_stat = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
     try:
+        # Spec §17: numerically stable t.sf form.
         from scipy import stats as _st
-        p_val = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(n_trig - 1, 1))))
+        p_val = float(2 * _st.t.sf(abs(t_stat), df=max(n_trig - 1, 1)))
     except Exception:
         p_val = 1.0
 
@@ -2432,8 +2436,9 @@ def _averages_via_matrix(sig_df_cap: pd.DataFrame, sec_rets: pd.Series) -> Dict[
     with np.errstate(divide='ignore', invalid='ignore'):
         t_stat = np.where((std > 0) & (n > 1), avg / (std / np.sqrt(n)), 0.0)
     try:
-        from scipy import stats as _st  # vectorized CDF
-        p_vals = 2.0 * (1.0 - _st.t.cdf(np.abs(t_stat), df=np.maximum(n - 1.0, 1.0)))
+        # Spec §17: numerically stable t.sf form (vectorized).
+        from scipy import stats as _st
+        p_vals = 2.0 * _st.t.sf(np.abs(t_stat), df=np.maximum(n - 1.0, 1.0))
     except Exception:
         p_vals = np.ones_like(t_stat)
 
@@ -2555,9 +2560,10 @@ def _subset_metrics_spymaster_fast(secondary: str,
     ann_std = std * math.sqrt(252.0) if std != 0.0 else 0.0
     sharpe  = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
     try:
+        # Spec §17: numerically stable t.sf form.
         from scipy import stats as _st
         t_stat = (avg / (std / math.sqrt(trig_n))) if (std > 0 and trig_n > 1) else 0.0
-        p_val  = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(trig_n - 1, 1))))
+        p_val  = float(2 * _st.t.sf(abs(t_stat), df=max(trig_n - 1, 1)))
     except Exception:
         t_stat, p_val = 0.0, 1.0
 
@@ -2705,8 +2711,9 @@ def _subset_metrics_spymaster_bitmask(secondary: str,
     t_stat = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
 
     try:
+        # Spec §17: numerically stable t.sf form.
         from scipy import stats as _st
-        p_val = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(n_trig - 1, 1))))
+        p_val = float(2 * _st.t.sf(abs(t_stat), df=max(n_trig - 1, 1)))
     except Exception:
         p_val = 1.0
 

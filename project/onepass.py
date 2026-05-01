@@ -1469,14 +1469,13 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
     steps = ccc_series.diff().fillna(0.0)
     caps = steps.to_numpy()
 
-    # Trigger mask: prefer explicit signals; fallback to legacy non-zero caps
-    if active_pairs is not None and len(active_pairs) == len(caps):
-        # Count actual signal days (including zero-capture days)
-        trig_mask = np.array([p.startswith('Buy') or p.startswith('Short')
-                              for p in active_pairs], dtype=bool)
-    else:
-        # Legacy fallback (for backward compatibility)
-        trig_mask = np.abs(caps) > 0
+    # Trigger mask: spec §15 / ledger Entry 4 — signal-state based.
+    # The legacy `np.abs(caps) > 0` fallback is removed; callers must
+    # supply matching active_pairs labels for trigger counting.
+    if active_pairs is None or len(active_pairs) != len(caps):
+        return None
+    trig_mask = np.array([p.startswith('Buy') or p.startswith('Short')
+                          for p in active_pairs], dtype=bool)
 
     trigger_days = int(trig_mask.sum())
     signal_caps = caps[trig_mask]
@@ -1517,7 +1516,8 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
                 # p-value calculation
                 try:
                     if t_stat != 0.0:
-                        p_val = float(2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=trigger_days - 1)))
+                        # Spec §17: numerically stable t.sf form.
+                        p_val = float(2.0 * stats.t.sf(abs(t_stat), df=trigger_days - 1))
                     else:
                         p_val = 1.0
                 except Exception:
@@ -1654,7 +1654,8 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
         sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std != 0 else 0.0
 
         t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days)) if std_dev != 0 else None
-        p_value = (2 * (1 - stats.t.cdf(abs(t_statistic), df=trigger_days - 1))) if t_statistic else None
+        # Spec §17: numerically stable t.sf form.
+        p_value = (2 * stats.t.sf(abs(t_statistic), df=trigger_days - 1)) if t_statistic else None
     else:
         std_dev = 0.0
         sharpe_ratio = 0.0

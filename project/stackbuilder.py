@@ -422,10 +422,21 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
     captures.loc[short] = -sec_returns.loc[short]
     return captures.fillna(0.0)
 
-def metrics_from_captures(captures: pd.Series) -> Optional[Dict[str, float]]:
+def metrics_from_captures(captures: pd.Series, trigger_mask: Optional[pd.Series] = None) -> Optional[Dict[str, float]]:
+    """Compute canonical metrics from a daily-capture series.
+
+    Spec §15 / ledger Entry 4: trigger days are signal-state based. When
+    `trigger_mask` is None, this helper falls back to `captures.ne(0.0)`,
+    which incorrectly drops zero-capture trigger days and is retained
+    only for compatibility with callers that have not yet been wired to
+    pass an explicit signal mask.
+    """
     if captures.empty:
         return None
-    mask = captures.ne(0.0)
+    if trigger_mask is None:
+        mask = captures.ne(0.0)
+    else:
+        mask = trigger_mask.reindex(captures.index).fillna(False).astype(bool)
     n = int(mask.sum())
     if n == 0:
         return None
@@ -441,7 +452,8 @@ def metrics_from_captures(captures: pd.Series) -> Optional[Dict[str, float]]:
         annual_std = std * math.sqrt(252.0)
         sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std if annual_std != 0 else 0.0
         t_stat = avg / (std / math.sqrt(n))
-        p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
+        # Spec §17: numerically stable t.sf form.
+        p_val = float(2 * stats.t.sf(abs(t_stat), df=n - 1))
     else:
         sharpe, t_stat, p_val = 0.0, None, None
     # keep full-precision for gating; present rounded in tables
@@ -751,7 +763,9 @@ def _combined_metrics_signals(member_signals: List[Union[pd.Series, Tuple[pd.Ser
         present_all &= m
     comb_sig = comb_sig.where(present_all, 'None')
     combined_caps = _captures_from_signals(comb_sig, sec_rets)
-    m = metrics_from_captures(combined_caps)
+    # Spec §15 / ledger Entry 4: trigger days are signal-state based.
+    trigger_mask = comb_sig.isin(['Buy', 'Short'])
+    m = metrics_from_captures(combined_caps, trigger_mask=trigger_mask)
     return combined_caps, m
 
 def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None) -> Tuple[pd.DataFrame, List]:

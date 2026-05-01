@@ -171,31 +171,89 @@ Reference inventory:
 ## Entry 3: cdf -> sf p-value
 
   - Type: EXPECTED-BY-SPEC
-  - Old behavior: TBD in 1B-2 (see inventory §6; every p-value
-    site uses `2 * (1 - stats.t.cdf(abs(t), df=df))`).
-  - New behavior: TBD in 1B-2.
-  - Affected tests/snapshots: TBD in 1B-2.
+  - Old behavior: every canonical-scoring p-value site computed
+    `2 * (1 - stats.t.cdf(abs(t), df))`, the algebraic equivalent
+    of the spec's stable form but vulnerable to float subtractive
+    cancellation when `cdf(|t|)` is near 1.
+  - New behavior: every canonical-scoring p-value site now uses
+    `2 * stats.t.sf(abs(t), df))`, matching spec §17. Sites
+    converted in 1B-2A: `confluence.py:372`,
+    `impactsearch.py:1638, 1823`, `onepass.py:1519, 1656`,
+    `spymaster.py:9036, 11074, 11627, 12560`,
+    `stackbuilder.py:444`, `trafficflow.py:1605, 2063, 2440,
+    2565, 2715`. The vectorized site at `trafficflow.py:2440`
+    uses `t.sf(...)` in vectorized form.
+  - Affected tests/snapshots:
+      `SNAP_STACKBUILDER_METRICS_FROM_CAPTURES.p_raw`:
+      `0x1.ddc4c5daf1688p-2 -> 0x1.ddc4c5daf168ap-2` (2 ULPs).
+      `SNAP_STACKBUILDER_COMBINED_METRICS.metrics.p_raw`:
+      `0x1.e4bc2cbb3bc50p-1 -> 0x1.e4bc2cbb3bc51p-1` (1 ULP).
+      No other Phase 1A snapshot p-Value rounded to 4 decimals
+      moved (the cdf/sf delta is below display rounding for the
+      synthetic |t| values pinned). Other affected helpers
+      (`SNAP_ONEPASS_METRICS_FROM_CCC`,
+      `SNAP_IMPACTSEARCH_METRICS_FROM_CCC`,
+      `SNAP_CONFLUENCE_MP_METRICS`,
+      `SNAP_*_CALCULATE_METRICS_FROM_SIGNALS`) verified
+      bit-identical post-conversion.
   - ELI5: for very large t, `cdf(|t|)` is so close to 1.0 that
     `1 - cdf(|t|)` rounds to exactly zero in float64, and the
     resulting p-value is reported as exactly 0. SciPy's `t.sf`
     ("survival function") computes the same tail probability
     directly without that subtraction, so it stays a tiny but
     nonzero number for all t. The spec mandates the sf form.
-  - Status: stub, pending 1B-2.
+  - Status: implemented across all 15 engine canonical-scoring
+    p-value sites in 1B-2A.
 
 ## Entry 4: zero-capture trigger-day counting
 
   - Type: BUG-FIX
-  - Old behavior: TBD in 1B-2 (see inventory §7; sites
-    `stackbuilder.py:442`, `trafficflow.py:1600`, plus the legacy
-    fallback paths in onepass / impactsearch `_metrics_from_ccc`
-    drop zero-capture days from the trigger mask).
-  - New behavior: TBD in 1B-2 (signal-state trigger mask everywhere;
-    zero-capture trigger days count as losses).
-  - Affected tests/snapshots: TBD in 1B-2 (will at minimum touch
-    `test_stackbuilder_metrics_from_captures_baseline`,
-    `test_trafficflow_metrics_like_spymaster_baseline`, and the
-    legacy `_metrics_from_ccc` snapshots).
+  - Old behavior: four canonical-scoring sites computed the trigger
+    mask from the capture series rather than from signal state:
+    `stackbuilder.py:442` (`mask = captures.ne(0.0)` inside
+    `metrics_from_captures`), `trafficflow.py:1600`
+    (`trig_mask = daily_captures.to_numpy() != 0.0` inside
+    `_metrics_like_spymaster`), and the legacy non-`active_pairs`
+    fallback paths in `onepass.py:1487` and `impactsearch.py:1792`
+    (`trig_mask = np.abs(caps) > 0`).
+  - New behavior:
+      `metrics_from_captures` accepts an optional `trigger_mask`
+      parameter; when callers supply a signal-state mask, the
+      helper uses it as-is (spec §15). The single-arg
+      `metrics_from_captures(captures)` form is retained for
+      callers that have not yet been wired (the legacy
+      `captures.ne(0.0)` fallback runs only there).
+      `_combined_metrics_signals` in stackbuilder now constructs
+      and passes a signal-state mask (`comb_sig.isin(['Buy',
+      'Short'])`); both Phase 2 and Phase 3 call sites therefore
+      converge on signal-state counting.
+      `trafficflow._metrics_like_spymaster` now uses
+      `trig_mask = buy_mask | short_mask` directly (spec §15);
+      `losses = trigger_days - wins` so zero-capture trigger days
+      count as losses.
+      `onepass._metrics_from_ccc` and
+      `impactsearch._metrics_from_ccc` no longer fall back to the
+      `np.abs(caps) > 0` heuristic; when `active_pairs` is missing
+      they return `None` rather than producing a buggy count.
+  - Affected tests/snapshots:
+      `SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS_PENDING_BUG_FIX`
+      retired and replaced with
+      `SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS` (Trigger Days
+      6 -> 8; Losses 1 -> 3; Win Ratio, Sharpe, Std Dev,
+      t-Statistic, p-Value all flip; combined_caps unchanged). The
+      corresponding test was renamed to drop the
+      `_pending_bug_fix` suffix.
+      `SNAP_TRAFFICFLOW_METRICS_LIKE_SPYMASTER`: Triggers 7 -> 8;
+      Losses 2 -> 3; Avg, Sharpe, Std Dev, Total, Win %, t, p
+      all flip.
+      `SNAP_ONEPASS_METRICS_FROM_CCC_LEGACY` and
+      `SNAP_IMPACTSEARCH_METRICS_FROM_CCC_LEGACY`: both flip from
+      a full metrics dict to the `None` sentinel `('n',)` because
+      the legacy fallback returns `None` rather than a buggy count.
+      `SNAP_STACKBUILDER_METRICS_FROM_CAPTURES` is unchanged at
+      this entry's surface — it tests the single-arg form, which
+      retains the legacy `captures.ne(0.0)` mask. (Its 1-ULP
+      `p_raw` flip is from Entry 3 only.)
   - ELI5: a "trigger day" is any day where the strategy actually has
     a position (Buy or Short). Some current code asks "did the
     capture move on that day?" instead of "was there a position
@@ -204,7 +262,10 @@ Reference inventory:
     question correctly counts the day and the first one drops it.
     The spec is explicit: zero-return days under an active position
     are still trigger days, and they count as losses.
-  - Status: stub, pending 1B-2.
+  - Status: implemented in 1B-2A across the 4 enumerated sites.
+    Legacy fallback in `metrics_from_captures` is retained as a
+    deprecated single-arg form for callers that lack signal info;
+    in-engine callers now pass an explicit `trigger_mask`.
 
 ## Entry 5: StackBuilder Phase 2 vs Phase 3 scoring divergence
 
@@ -245,8 +306,8 @@ Reference inventory:
     unifies the calendar-grace rule across both phases so they
     can no longer disagree on which days are in scope.
   - Status: calendar-policy unification implemented in 1B-2A;
-    `_pending_bug_fix` test retirement deferred to the Entry 4
-    zero-capture commit (still in this PR).
+    `_pending_bug_fix` test retired in the same PR alongside
+    the Entry 4 zero-capture fix.
 
 ## Entry 6: ImpactSearch xlsx duplicate-row dedupe
 
@@ -324,18 +385,30 @@ Reference inventory:
   - Type: depends on linked entry (each baseline-flip is recorded
     by its parent ledger entry above; this is a meta-entry tracking
     the umbrella).
-  - Old behavior: TBD in 1B-2 — for each Phase 1A test that flips,
-    the prior snapshot constant in
-    `project/test_scripts/phase1a_baseline_snapshots.py`.
-  - New behavior: TBD in 1B-2 — the new snapshot constant captured
-    after the corresponding ledger entry lands.
-  - Affected tests/snapshots: TBD in 1B-2; this entry will be a
-    table of (test_name, ledger_entry, old_snap, new_snap). Each
-    snapshot replacement happens in a single ledger-attributable
-    commit whose message names the parent ledger entry.
+  - 1B-2A snapshot replacements (each on the same commit as its
+    parent ledger entry):
+      | Snapshot constant | Parent | Reason |
+      |---|---|---|
+      | `SNAP_STACKBUILDER_METRICS_FROM_CAPTURES` | Entry 3 | `p_raw` flipped 2 ULPs (cdf -> sf) |
+      | `SNAP_STACKBUILDER_COMBINED_METRICS` | Entry 3 | `metrics.p_raw` flipped 1 ULP (cdf -> sf) |
+      | `SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS_PENDING_BUG_FIX` -> `SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS` | Entries 4 + 5 | signal-state trigger mask + Phase 2/3 calendar unification (test renamed to drop `_pending_bug_fix`) |
+      | `SNAP_ONEPASS_METRICS_FROM_CCC_LEGACY` | Entry 4 | legacy `np.abs(caps) > 0` fallback removed; helper returns `None` |
+      | `SNAP_IMPACTSEARCH_METRICS_FROM_CCC_LEGACY` | Entry 4 | same as above |
+      | `SNAP_TRAFFICFLOW_METRICS_LIKE_SPYMASTER` | Entries 3 + 4 | signal-state trigger mask (Triggers 7 -> 8) + cdf -> sf |
+  - Snapshots verified bit-identical post-conversion (no flip
+    needed, included for audit completeness):
+    `SNAP_ONEPASS_METRICS_FROM_CCC`,
+    `SNAP_IMPACTSEARCH_METRICS_FROM_CCC`,
+    `SNAP_CONFLUENCE_MP_METRICS`,
+    `SNAP_ONEPASS_CALCULATE_METRICS_FROM_SIGNALS`,
+    `SNAP_IMPACTSEARCH_CALCULATE_METRICS_FROM_SIGNALS` — the
+    cdf/sf delta is below display rounding for the synthetic
+    `|t|` values pinned, and these helpers were already
+    signal-state based.
   - ELI5: any Phase 1A baseline test that changes its expected
     output during the rewire gets a one-line entry here naming
     which ledger item drove the change. This is the audit trail
     that lets a reviewer follow each diff back to a classified
     decision.
-  - Status: stub, pending 1B-2.
+  - Status: 1B-2A snapshot replacements landed; Entry-2-driven
+    spymaster snapshot is not pinned by Phase 1A (no flip).
