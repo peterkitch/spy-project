@@ -138,8 +138,8 @@ def _load_signal_library_quick(ticker: str):
             LOGGER.warning(f"Failed reading library for {ticker} at {p}: {e}")
     return None
 
-def _is_compatible(lib: dict, env_basis: str) -> tuple[bool, str]:
-    """Check if library is compatible with current environment settings."""
+def _is_compatible(lib: dict) -> tuple[bool, str]:
+    """Check if library is compatible with the canonical raw-Close basis."""
     if not isinstance(lib, dict):
         return False, "not_a_dict"
 
@@ -149,10 +149,11 @@ def _is_compatible(lib: dict, env_basis: str) -> tuple[bool, str]:
     if int(lib.get("max_sma_day", 0)) != MAX_SMA_DAY:
         return False, f"max_sma_day_mismatch (lib={lib.get('max_sma_day')} vs {MAX_SMA_DAY})"
 
-    # Allow opt-in tolerance for basis mismatches (mirrors ImpactSearch toggle)
+    # Spec v0.5 §3: raw `Close` is the only allowed price basis. Reject
+    # libraries built against any other basis (e.g. legacy Adj Close).
     allow_lib_basis = os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS", "0").lower() in ("1", "true", "on", "yes")
-    if lib.get("price_source") != env_basis and not allow_lib_basis:
-        return False, f"price_basis_mismatch (lib={lib.get('price_source')} vs {env_basis})"
+    if lib.get("price_source") != "Close" and not allow_lib_basis:
+        return False, f"price_basis_mismatch (lib={lib.get('price_source')} vs Close)"
 
     return True, "ok"
 
@@ -232,9 +233,6 @@ def get_primary_signals_fast(primary_ticker: str, secondary_index: pd.DatetimeIn
     if not IMPACT_TRUST_LIBRARY:
         return None, "fast_path_disabled"
 
-    # Determine expected price basis
-    env_basis = "Adj Close" if os.environ.get("PRICE_BASIS", "adj").lower() == "adj" else "Close"
-
     # Resolve ticker to vendor symbol
     vendor_symbol = _resolve_vendor_symbol(primary_ticker)
 
@@ -243,8 +241,8 @@ def get_primary_signals_fast(primary_ticker: str, secondary_index: pd.DatetimeIn
     if not lib:
         return None, f"no_library_for_{vendor_symbol}"
 
-    # Check compatibility
-    ok, why = _is_compatible(lib, env_basis)
+    # Check compatibility against the canonical raw-Close basis (spec §3).
+    ok, why = _is_compatible(lib)
     # Optional compatibility: accept library price_source even if ENV differs
     if (not ok) and why.startswith("price_basis_mismatch") and ALLOW_LIB_BASIS:
         ok, why = True, "basis_mismatch_overridden"

@@ -29,11 +29,56 @@ Reference inventory:
 ## Entry 1: Adj Close removal
 
   - Type: EXPECTED-BY-SPEC
-  - Old behavior: TBD in 1B-2 (see inventory §2a — ~15 distinct sites
-    across spymaster, onepass, impactsearch, stackbuilder, confluence,
-    signal_library, stale_check, plus boot logs and UI banners).
-  - New behavior: TBD in 1B-2.
-  - Affected tests/snapshots: TBD in 1B-2.
+  - Old behavior (pre-1B-2A):
+      `stale_check.py:79` initialised an `"Adj Close"` column even
+      though only `Close` was read.
+      `signal_library/multi_timeframe_builder.py` carried a
+      module-level `PRICE_BASIS = os.environ.get('PRICE_BASIS',
+      'close').lower()` env read, plus an `if price_basis == 'adj'`
+      Adj-Close-rename branch in `fetch_interval_data`, plus a
+      `'price_source': 'Close' if PRICE_BASIS == 'close' else
+      'Adj Close'` library field.
+      `signal_library/impact_fastpath.py` derived
+      `env_basis = "Adj Close" if os.environ.get("PRICE_BASIS",
+      "adj").lower() == "adj" else "Close"` and threaded it into
+      `_is_compatible` for library/env basis matching.
+  - New behavior (landed in 1B-2A first wave):
+      `stale_check.py` now extracts a pure
+      `_last_valid_close_from_history(hist, require_posvol)` helper
+      that initialises only `Close` and `Volume` columns; an Adj
+      Close column in the input no longer influences the result and
+      is never substituted for a missing Close.
+      `multi_timeframe_builder.fetch_interval_data` drops the
+      `price_basis` parameter and always selects `'Close'`. The
+      module-level `PRICE_BASIS` env read is removed. The library
+      schema field is fixed at `'Close'`.
+      `impact_fastpath._is_compatible(lib)` no longer takes a basis
+      parameter; it checks the library's `price_source` against the
+      canonical `"Close"` literal. The `IMPACTSEARCH_ALLOW_LIB_BASIS`
+      escape hatch is preserved.
+  - Affected tests/snapshots:
+      New: 7 `test_stale_check_close_basis.py` tests covering the
+      raw-Close positive path and four Adj-Close-fallback negative
+      paths plus volume-filter and edge-case behaviour.
+      No Phase 1A snapshot flips. Phase 1A pins synthetic-input
+      pure helpers that already operated only on `Close`; the sites
+      changed in this wave do not feed those snapshots.
+  - Remaining sites for 1B-2A follow-up commits:
+      `spymaster.py` (`_PRICE_BASIS` env read; PRICE_COLUMN; results
+      pkl `'price_basis'` and `'last_adj_close'` fields; refusal-
+      to-guess column-presence check; yfinance `auto_adjust=False`
+      and Adj-Close-fallback branches; reader at line 11858).
+      `onepass.py` (UI banner; `compute_parity_hash` default;
+      env-driven price-basis blocks at lines 1268–1325 and 1835).
+      `impactsearch.py` (boot log; cache-key basis tag at line
+      1122; env-driven price-basis blocks at lines 1359, 1414,
+      2056, 2437; UI banner at 2602).
+      `stackbuilder.py` (`load_secondary_prices` /
+      `_fetch_secondary_from_yf` `price_basis` parameter; UI default
+      `args.price_basis='adj'`; run-metadata field).
+      `confluence.py` (`price_basis` cache-key plumbing in the
+      cache-key normalizer and three `_cached_fetch_interval_data`
+      callers).
   - ELI5: yfinance's "Adj Close" column changes over time as
     dividends and splits get retroactively reapplied, so the same
     historical date can return slightly different prices on
@@ -41,7 +86,8 @@ Reference inventory:
     raw `Close` only and remove every Adj/raw selector. After this
     entry, every engine reads raw Close and there is no
     `PRICE_BASIS` env var or argument left to tweak.
-  - Status: stub, pending 1B-2.
+  - Status: partially landed (signal_library + stale_check). Engine
+    sites enumerated above are pending the next 1B-2A commits.
 
 ## Entry 2: ddof=0 / implicit ddof -> ddof=1
 

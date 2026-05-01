@@ -44,7 +44,6 @@ except ImportError:
 ENGINE_VERSION = "1.0.0"
 MAX_SMA_DAY = 114
 SIGNAL_LIBRARY_DIR = os.environ.get('SIGNAL_LIBRARY_DIR', 'signal_library/data/stable')
-PRICE_BASIS = os.environ.get('PRICE_BASIS', 'close').lower()
 EPS = 1e-12  # tie/equality tolerance for float parity
 
 # Logging setup
@@ -81,20 +80,22 @@ def _yf_download_with_retry(*args, **kwargs):
                 raise last_exception
 
 
-def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') -> pd.DataFrame:
+def fetch_interval_data(ticker: str, interval: str) -> pd.DataFrame:
     """
     Fetch OHLCV data for specified interval with T-1 skip applied.
 
     Args:
         ticker: Ticker symbol (e.g., 'SPY')
         interval: '1d', '1wk', '1mo', '3mo', or '1y'
-        price_basis: 'close' or 'adj' (default 'close')
 
     Returns:
         DataFrame with 'Close' column, indexed by date, T-1 skipped for non-daily
 
     Raises:
         ValueError: If interval not supported or data validation fails
+
+    Note: Raw `Close` is the only allowed price basis per spec v0.5 §3.
+    No Adj Close fallback.
     """
     vendor, _ = resolve_symbol(ticker)
     logger.info(f"Fetching {interval} data for {vendor}...")
@@ -145,10 +146,8 @@ def fetch_interval_data(ticker: str, interval: str, price_basis: str = 'close') 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Select price basis
-        if price_basis == 'adj' and 'Adj Close' in df.columns:
-            df = df[['Adj Close']].rename(columns={'Adj Close': 'Close'})
-        elif 'Close' in df.columns:
+        # Raw Close only (spec §3); no Adj Close fallback.
+        if 'Close' in df.columns:
             df = df[['Close']]
         else:
             raise ValueError(f"No Close column found for {vendor} {interval}. Columns: {list(df.columns)}")
@@ -276,7 +275,7 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
 
     # Fetch data with T-1 skip
     try:
-        df = fetch_interval_data(ticker, interval, price_basis=PRICE_BASIS)
+        df = fetch_interval_data(ticker, interval)
     except Exception as e:
         logger.error(f"Failed to fetch {ticker} {interval}: {e}")
         return None
@@ -330,7 +329,7 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
 
         # Constants
         'max_sma_day': MAX_SMA_DAY,
-        'price_source': 'Close' if PRICE_BASIS == 'close' else 'Adj Close',
+        'price_source': 'Close',  # raw Close only per spec §3
 
         # Timestamps
         'build_timestamp': datetime.now(timezone.utc).isoformat(),
