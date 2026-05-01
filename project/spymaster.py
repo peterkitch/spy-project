@@ -10306,23 +10306,38 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: N/A'), html.Span('Max Drawdown: N/A'), 
                html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'))
     
-    # Calculate Buy returns on days when Buy signal was active
+    # Manual SMA testing interface. Originally hand-written metric
+    # math; delegated to canonical_scoring in 1B-2A amendment 2 so
+    # this section serves as a parity tester. Any divergence between
+    # manual results and other engine results indicates a canonical
+    # scoring bug that surfaces interactively.
     buy_returns_on_trigger_days = daily_returns[buy_signals_shifted]
-    buy_trigger_days = buy_signals_shifted.sum()
-    buy_wins = (buy_returns_on_trigger_days > 0).sum()
-    buy_losses = (buy_returns_on_trigger_days <= 0).sum()
-    buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    buy_total_capture = buy_returns_on_trigger_days.sum() * 100 if buy_trigger_days > 0 else 0  # Convert to percentage
-    buy_avg_daily_capture = buy_total_capture / buy_trigger_days if buy_trigger_days > 0 else 0
+    _buy_caps_manual = pd.Series(0.0, index=daily_returns.index, dtype=float)
+    _buy_caps_manual.loc[buy_signals_shifted] = daily_returns.loc[buy_signals_shifted] * 100.0
+    _score_buy_manual = _canonical_score_captures(
+        _buy_caps_manual, buy_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    buy_trigger_days = _score_buy_manual.trigger_days
+    buy_wins = _score_buy_manual.wins
+    buy_losses = _score_buy_manual.losses
+    buy_win_ratio = (_score_buy_manual.win_rate / 100.0)
+    buy_total_capture = float(_score_buy_manual.total_capture)
+    buy_avg_daily_capture = float(_score_buy_manual.avg_daily_capture)
 
-    # Calculate Short returns on days when Short signal was active
     short_returns_on_trigger_days = -daily_returns[short_signals_shifted]
-    short_trigger_days = short_signals_shifted.sum()
-    short_wins = (short_returns_on_trigger_days > 0).sum()
-    short_losses = (short_returns_on_trigger_days <= 0).sum()
-    short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    short_total_capture = short_returns_on_trigger_days.sum() * 100 if short_trigger_days > 0 else 0  # Convert to percentage
-    short_avg_daily_capture = short_total_capture / short_trigger_days if short_trigger_days > 0 else 0
+    _short_caps_manual = pd.Series(0.0, index=daily_returns.index, dtype=float)
+    _short_caps_manual.loc[short_signals_shifted] = -daily_returns.loc[short_signals_shifted] * 100.0
+    _score_short_manual = _canonical_score_captures(
+        _short_caps_manual, short_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    short_trigger_days = _score_short_manual.trigger_days
+    short_wins = _score_short_manual.wins
+    short_losses = _score_short_manual.losses
+    short_win_ratio = (_score_short_manual.win_rate / 100.0)
+    short_total_capture = float(_score_short_manual.total_capture)
+    short_avg_daily_capture = float(_score_short_manual.avg_daily_capture)
 
     # Prepare detailed strings for display
     trigger_days_buy = f"Buy Trigger Days: {int(buy_trigger_days)}"
@@ -10485,16 +10500,25 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
     combined_wins = (combined_returns > 0).sum()
     overall_win_rate = (combined_wins / total_signals * 100) if total_signals > 0 else 0
     
-    # Use centralized grading function
-    
-    # Calculate Sharpe Ratio (assuming 252 trading days per year)
-    risk_free_rate = 0.05  # 5% annual, matching other parts of the codebase
+    # Manual SMA testing interface. Originally hand-written metric
+    # math; delegated to canonical_scoring in 1B-2A amendment 2 so
+    # this section serves as a parity tester. Any divergence between
+    # manual results and other engine results indicates a canonical
+    # scoring bug that surfaces interactively.
     if len(combined_returns) > 0:
-        annualized_return = combined_returns.mean() * 252  # Keep in decimal form
-        annualized_std = combined_returns.std() * np.sqrt(252)  # Keep in decimal form
-        sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std > 0 else 0
+        _combined_caps_pct = combined_returns.astype(float) * 100.0
+        _combined_trig_mask = (buy_signals_shifted | short_signals_shifted).reindex(
+            _combined_caps_pct.index, fill_value=False
+        )
+        _score_combined = _canonical_score_captures(
+            _combined_caps_pct, _combined_trig_mask,
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
+        sharpe_ratio = float(_score_combined.sharpe)
+        annualized_return = float(_score_combined.avg_daily_capture) * 252 / 100.0  # decimal for Calmar
     else:
         sharpe_ratio = 0
+        annualized_return = 0
     
     # Calculate Maximum Drawdown from equity curve with date range
     max_drawdown_start_date = None
