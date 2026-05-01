@@ -36,6 +36,8 @@ import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
+from canonical_scoring import combine_consensus_signals as _canonical_consensus
+
 # Optional imports; keep app usable without Dash for headless diagnostics
 try:
     from dash import Dash, html, dcc, Input, Output, dash_table
@@ -1398,43 +1400,19 @@ def _next_signal_from_pkl(primary: str, as_of: Optional[pd.Timestamp] = None) ->
 
 def _combine_signals(series_list: List[pd.Series]) -> pd.Series:
     """
-    Vectorized Spymaster rules:
+    Spymaster unanimity rules (delegates to canonical_scoring.combine_consensus_signals,
+    spec §18):
       - Treat None as 0, Buy as +1, Short as -1
-      - If count_nonzero == 0 â†’ None
-      - If sum == +count_nonzero â†’ Buy (all Buy)
-      - If sum == -count_nonzero â†’ Short (all Short)
-      - Else â†’ None (conflict or mixed)
-
-    Fully NumPy-vectorized for K>1 performance.
+      - count_nonzero == 0 -> None
+      - sum == +count_nonzero -> Buy
+      - sum == -count_nonzero -> Short
+      - Else -> None
     """
     if not series_list:
         return pd.Series(dtype="object")
-
-    # Get index from first series
-    idx = series_list[0].index
-
-    # Single series optimization
     if len(series_list) == 1:
-        return series_list[0].reindex(idx)
-
-    # Map signals to integers: Buy=1, Short=-1, None=0
-    map_dict = {"Buy": 1, "Short": -1, "None": 0}
-
-    # Build (n_days, k) int8 matrix using column_stack for efficiency
-    mat = np.column_stack([s.map(map_dict).to_numpy(dtype="int8", copy=False) for s in series_list])
-
-    # Count non-zero signals and sum per day
-    cnt = (mat != 0).sum(axis=1)
-    sm  = mat.sum(axis=1)
-
-    # Apply Spymaster's combination logic vectorized
-    out = np.full(len(idx), "None", dtype=object)
-    buy_mask   = (cnt > 0) & (sm ==  cnt)  # All signals are Buy
-    short_mask = (cnt > 0) & (sm == -cnt)  # All signals are Short
-    out[buy_mask] = "Buy"
-    out[short_mask] = "Short"
-
-    return pd.Series(out, index=idx, dtype="object")
+        return series_list[0].reindex(series_list[0].index)
+    return _canonical_consensus(series_list)
 
 # ---------- Spymaster parity: Signal-first approach (EXACT A.S.O. pipeline) ----------
 def _processed_signals_from_pkl(primary: str) -> pd.Series:

@@ -20,6 +20,8 @@ try:
 except ImportError:
     tqdm = None
 
+from canonical_scoring import combine_consensus_signals as _canonical_consensus
+
 try:
     import yfinance as yf
 except ImportError:
@@ -724,20 +726,13 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
     return s, present
 
 def _combine_signals(members: List[pd.Series]) -> pd.Series:
-    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix."""
+    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix.
+    Delegates to canonical_scoring.combine_consensus_signals (spec §18).
+    """
     if not members:
         return pd.Series(dtype=object)
     df = pd.concat(members, axis=1).fillna('None').astype(str)
-    mapper = {'Buy': 1, 'Short': -1}
-    # fast vectorized combine
-    arr = np.stack([df[c].map(mapper).fillna(0).astype(np.int8).to_numpy(dtype=np.int8) for c in df.columns], axis=1)
-    nz = (arr != 0)
-    cnt = nz.sum(axis=1)
-    ssum = arr.sum(axis=1)
-    out = np.where(cnt == 0, 'None',
-                   np.where(ssum == cnt, 'Buy',
-                            np.where(ssum == -cnt, 'Short', 'None')))
-    return pd.Series(out, index=df.index)
+    return _canonical_consensus([df[c] for c in df.columns])
 
 def _captures_from_signals(signals: pd.Series, sec_rets: pd.Series) -> pd.Series:
     sig = signals.reindex(sec_rets.index).fillna('None').astype(str)

@@ -181,6 +181,8 @@ try:
 except Exception:
     stats = None
 
+from canonical_scoring import combine_consensus_signals as _canonical_consensus
+
 RISK_FREE_ANNUAL = float(os.environ.get('CONFLUENCE_RISK_FREE_ANNUAL',
                                         os.environ.get('RISK_FREE_ANNUAL', '5.0')))
 # Annualization factors per interval for Sharpe
@@ -314,22 +316,11 @@ def _mp_decode_sig(x) -> str:
 def _mp_combine_unanimity_vectorized(sig_df: pd.DataFrame) -> pd.Series:
     """
     Buy=+1, Short=-1, None=0; unanimity on active members only (ignores None).
-    Vectorized, no pandas downcast warnings.
+    Delegates to canonical_scoring.combine_consensus_signals (spec §18).
     """
     if sig_df.empty:
         return pd.Series([], dtype=object)
-
-    m = {'Buy': 1, 'Short': -1, 'None': 0}
-    # Use map instead to replace to avoid FutureWarning
-    tmp = sig_df.apply(lambda s: s.map(m).fillna(0).astype('int8'))
-    arr = tmp.to_numpy(dtype=np.int16)
-
-    count = (arr != 0).sum(axis=1)
-    ssum  = arr.sum(axis=1)
-
-    out = np.where((count > 0) & (ssum == count), 'Buy',
-          np.where((count > 0) & (ssum == -count), 'Short', 'None'))
-    return pd.Series(out, index=sig_df.index, dtype=object)
+    return _canonical_consensus([sig_df[c] for c in sig_df.columns])
 
 def _mp_safe_daily_pct_change(close: pd.Series) -> pd.Series:
     prev = close.shift(1)
