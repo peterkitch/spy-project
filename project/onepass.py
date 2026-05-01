@@ -930,7 +930,7 @@ def perform_incremental_update(ticker, signal_data, new_df):
         logger.error(f"Incremental update failed for {ticker}: {e}")
         return None
 
-def compute_parity_hash(price_source='Adj Close', group_by_mode='column'):
+def compute_parity_hash(price_source='Close', group_by_mode='column'):
     """
     Compute a hash of all configuration parameters that affect signal generation.
     This ensures libraries are rebuilt when configuration changes.
@@ -973,8 +973,8 @@ def _persist_library_metadata(ticker, signal_data):
     except Exception:
         logger.exception(f"{ticker}: failed to persist library metadata")
 
-def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs, 
-                           primary_signals, df, accumulator_state=None, price_source='Adj Close', resolved_symbol=None):
+def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs,
+                           primary_signals, df, accumulator_state=None, price_source='Close', resolved_symbol=None):
     """
     Enhanced Signal Library save with primary_signals and accumulator state.
     This version stores everything needed for impactsearch to skip SMA computation.
@@ -1265,13 +1265,9 @@ def _coerce_to_close_frame(df, preferred=None):
 
     Args:
         df: DataFrame from yfinance
-        preferred: 'Adj Close' or 'Close' - which price basis to prefer
-                  If None, reads from PRICE_BASIS environment variable
+        preferred: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
     """
-    # Support environment variable for price basis if not explicitly provided
-    if preferred is None:
-        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        preferred = 'Adj Close' if price_basis == 'adj' else 'Close'
+    preferred = 'Close'
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -1316,13 +1312,9 @@ def fetch_data(ticker, reference_now=None, price_source=None):
     Args:
         ticker: The ticker symbol to fetch
         reference_now: Frozen analysis clock for consistent session checks
-        price_source: 'Adj Close' or 'Close' - which price basis to use
-                     If None, reads from PRICE_BASIS environment variable
+        price_source: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
     """
-    # Support environment variable for price basis if not explicitly provided
-    if price_source is None:
-        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
+    price_source = 'Close'
     if not ticker or not ticker.strip():
         return pd.DataFrame()
     # Use resolve_symbol to get correct vendor format
@@ -1831,15 +1823,8 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         
         # Check if we can use existing signals or perform incremental update
         existing_signal_data = None
-        # Authoritative basis comes from ENV (do NOT let libraries override this by default)
-        env_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        env_price_source = 'Adj Close' if env_basis == 'adj' else 'Close'
-        price_source = env_price_source
-
-        # Optional: Allow library basis to override ENV if explicitly enabled
-        if os.environ.get('ONEPASS_ALLOW_LIB_BASIS', '0').lower() in ('1', 'true', 'on'):
-            # Will check after loading library below
-            logger.debug("ONEPASS_ALLOW_LIB_BASIS is enabled - library basis may override ENV")
+        # Raw Close is the only authoritative basis (spec v0.5 §3, ledger Entry 1).
+        price_source = 'Close'
 
         had_library = check_signal_library_exists(vendor_symbol)
         outcome.had_library = had_library
@@ -2414,9 +2399,8 @@ def get_random_mix():
 # DASH APP LAYOUT
 ##################
 
-# --- UI: active price-basis banner (Adj Close vs Close) ---
-_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
-_BASIS_TEXT = 'Adj Close' if _BASIS == 'adj' else 'Close'
+# --- UI: price-basis banner (raw Close only, spec v0.5 §3) ---
+_BASIS_TEXT = 'Close'
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 

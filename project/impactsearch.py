@@ -302,7 +302,7 @@ if os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower() in ("1", "true", "o
 # Boot-time visibility for user - comprehensive fastpath configuration
 print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
       f"IMPACT_TRUST_LIBRARY={IMPACT_TRUST_LIBRARY}  "
-      f"PRICE_BASIS={os.environ.get('PRICE_BASIS','adj')}  "
+      f"price_basis=Close (raw)  "
       f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}  "
       f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','7')}  "
       f"ALLOW_LIB_BASIS={os.environ.get('IMPACTSEARCH_ALLOW_LIB_BASIS','0')}")
@@ -1117,10 +1117,9 @@ class CacheManager:
     
     @staticmethod
     def get_cache_path(ticker, data_type='data'):
-        """Generate cache file path with basis awareness"""
+        """Generate cache file path. Raw Close is the only price basis (spec §3)."""
         os.makedirs(CACHE_DIR, exist_ok=True)
-        basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        return os.path.join(CACHE_DIR, f"{ticker}_{data_type}_{basis}.pkl")
+        return os.path.join(CACHE_DIR, f"{ticker}_{data_type}_close.pkl")
     
     @staticmethod
     def is_cache_valid(cache_path):
@@ -1356,13 +1355,9 @@ def _coerce_to_close_frame(df, preferred=None):
 
     Args:
         df: DataFrame from yfinance
-        preferred: 'Adj Close' or 'Close' - which price basis to prefer
-                  If None, reads from PRICE_BASIS environment variable
+        preferred: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
     """
-    # Support environment variable for price basis if not explicitly provided
-    if preferred is None:
-        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        preferred = 'Adj Close' if price_basis == 'adj' else 'Close'
+    preferred = 'Close'
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -1411,16 +1406,12 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
         max_retries: Number of retry attempts
         return_symbol: If True, return tuple (df, resolved_ticker)
         reference_now: Optional fixed timestamp for consistent session checks
-        price_source: 'Adj Close' or 'Close' - which price basis to use
-                     If None, reads from PRICE_BASIS environment variable
-    
+        price_source: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
+
     Returns:
         DataFrame or tuple (DataFrame, resolved_ticker) if return_symbol=True
     """
-    # Support environment variable for price basis if not explicitly provided
-    if price_source is None:
-        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
+    price_source = 'Close'
     if not ticker or not ticker.strip():
         if return_symbol:
             return pd.DataFrame(), ticker
@@ -2052,20 +2043,12 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     primary_signals = None
     primary_dates = None
     
-    # Check if we have a library to get price_source from
-    # Support switching between 'Adj Close' and 'Close' via environment variable
-    price_basis_env = os.environ.get('PRICE_BASIS', 'adj').lower()
-    price_source = 'Adj Close' if price_basis_env == 'adj' else 'Close'
+    # Raw Close is the only price basis (spec v0.5 §3, ledger Entry 1).
+    price_source = 'Close'
     temp_lib = load_signal_library(prim_ticker)
-    # ENV overrides library unless explicitly allowed
-    if (os.environ.get('IMPACTSEARCH_ALLOW_LIB_BASIS', '0').lower() in ('1','true','on')
-        and temp_lib and 'price_source' in temp_lib):
-        price_source = temp_lib['price_source']
-        logger.debug(f"Using price_source from library: {price_source} (IMPACTSEARCH_ALLOW_LIB_BASIS=1)")
-    elif temp_lib and 'price_source' in temp_lib and temp_lib['price_source'] != price_source:
+    if temp_lib and 'price_source' in temp_lib and temp_lib['price_source'] != price_source:
         logger.info(
-            f"Ignoring library basis {temp_lib['price_source']} (env PRICE_BASIS={price_basis_env}); "
-            f"using {price_source}"
+            f"Ignoring library basis {temp_lib['price_source']}; using canonical {price_source}"
         )
     
     # Single download: get raw frame & resolved symbol once
@@ -2432,10 +2415,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     if sec_resolved != secondary_ticker:
         logger.info(f"Secondary ticker resolved {secondary_ticker} -> {sec_resolved}")
     
-    # Coerce secondary once (we use it read-only everywhere)
-    # Use same price basis as primary tickers
-    price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-    price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
+    # Coerce secondary once. Raw Close only (spec v0.5 §3).
+    price_source = 'Close'
     sec_df = _coerce_to_close_frame(sec_raw, preferred=price_source)
     # De-dup & sort to avoid rare vendor duplicate rows
     sec_df = sec_df[~sec_df.index.duplicated(keep='last')].sort_index()
@@ -2599,9 +2580,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     return metrics_list
 
 # Create Dash app
-# --- UI: active price-basis banner (Adj Close vs Close) ---
-_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
-_BASIS_TEXT = 'Adj Close' if _BASIS == 'adj' else 'Close'
+# --- UI: price-basis banner (raw Close only, spec v0.5 §3) ---
+_BASIS_TEXT = 'Close'
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 

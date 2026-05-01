@@ -222,7 +222,8 @@ def primary_universe(specified_tickers: Optional[List[str]] = None) -> List[str]
     return []
 
 # ---------- Data loading ----------
-def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
+# Raw Close only (spec v0.5 §3, ledger Entry 1).
+def _fetch_secondary_from_yf(secondary: str) -> pd.DataFrame:
     if yf is None:
         raise RuntimeError("yfinance not installed. Install with: pip install yfinance")
     sym = (secondary or "").upper()  # keep caret for indices like ^VIX
@@ -230,36 +231,24 @@ def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
     if df is None or len(df) == 0:
         raise RuntimeError(f"yfinance returned no data for {sym}")
     df = df.rename_axis('Date').reset_index().set_index('Date')
-    # tz-naive index
     df.index = pd.DatetimeIndex([pd.Timestamp(d).tz_localize(None) if getattr(pd.Timestamp(d), "tz", None) else pd.Timestamp(d) for d in df.index])
 
-    # Flatten MultiIndex columns if present (yfinance sometimes returns this)
     if isinstance(df.columns, pd.MultiIndex):
-        # For MultiIndex, take the first level
         df.columns = df.columns.get_level_values(0)
 
-    # Now find the close columns with simplified logic
     close_col = None
-    adj_close_col = None
     for col in df.columns:
-        col_lower = str(col).lower()
-        if col_lower == 'close':
+        if str(col).lower() == 'close':
             close_col = col
-        elif col_lower == 'adj close':
-            adj_close_col = col
+            break
 
-    if price_basis.lower().startswith('adj') and adj_close_col:
-        out = pd.DataFrame(df[adj_close_col]).rename(columns={adj_close_col: 'Close'})
-    elif close_col:
-        out = pd.DataFrame(df[close_col]).rename(columns={close_col: 'Close'})
-    else:
+    if close_col is None:
         raise RuntimeError(f"yfinance returned no Close column for {sym}. Columns: {list(df.columns)}")
-
+    out = pd.DataFrame(df[close_col]).rename(columns={close_col: 'Close'})
     return out.astype(FLOAT_DTYPE)
 
-def load_secondary_prices(secondary: str, price_basis: str) -> pd.DataFrame:
+def load_secondary_prices(secondary: str) -> pd.DataFrame:
     sec = (secondary or "").upper()
-    # Also try without caret for index symbols like ^VIX -> VIX
     sec_clean = sec.replace("^", "")
     cands = [
         os.path.join(DEFAULT_PRICE_CACHE_DIR, f"{sec}.parquet"),
@@ -274,22 +263,17 @@ def load_secondary_prices(secondary: str, price_basis: str) -> pd.DataFrame:
             if 'Date' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
                 df = df.set_index('Date')
-            # ensure tz-naive index to match signal library
             if hasattr(df.index, "tz") and df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             else:
                 df.index = pd.DatetimeIndex([pd.Timestamp(d).tz_localize(None) if getattr(pd.Timestamp(d), "tz", None) else pd.Timestamp(d) for d in df.index])
             df = df.sort_index()
-            if price_basis.lower().startswith('adj') and 'Adj Close' in df.columns:
-                out = pd.DataFrame(df['Adj Close']).rename(columns={'Adj Close':'Close'})
-            elif 'Close' in df.columns:
-                out = pd.DataFrame(df['Close'])
-            else:
-                raise ValueError(f"{p}: missing Close/Adj Close")
+            if 'Close' not in df.columns:
+                raise ValueError(f"{p}: missing Close")
+            out = pd.DataFrame(df['Close'])
             out = out[~out.index.duplicated(keep='last')].astype(FLOAT_DTYPE)
             return out
-    # No cache -> fetch once from yfinance (do not persist)
-    return _fetch_secondary_from_yf(sec, price_basis)
+    return _fetch_secondary_from_yf(sec)
 
 def pct_returns(close: pd.Series) -> pd.Series:
     return close.pct_change().fillna(0.0).astype(FLOAT_DTYPE) * 100.0  # percent
@@ -486,7 +470,7 @@ def metrics_from_captures(captures: pd.Series) -> Optional[Dict[str, float]]:
 # ---------- Phase 1: Preflight ----------
 def phase1_preflight(args, secondary: str, specified_primaries: Optional[List[str]] = None):
     vendor_secondary, _ = resolve_symbol(secondary)
-    sec_df = load_secondary_prices(vendor_secondary, args.price_basis)
+    sec_df = load_secondary_prices(vendor_secondary)
     if sec_df.empty:
         raise RuntimeError(f"Unable to load prices for {vendor_secondary}.")
     sec_rets = pct_returns(sec_df['Close'])
@@ -1272,7 +1256,7 @@ def run_dash(outdir: str, port: int = 8054):
                 secondary=sec, secondaries=None, primaries=None,
                 top_n=int(topn or 20), bottom_n=int(bottomn or 20), max_k=int(maxk or 6),
                 alpha=float(alpha or 0.05), min_marginal_capture=0.0,
-                threads='auto', outdir=RUNS_ROOT, price_basis='adj',
+                threads='auto', outdir=RUNS_ROOT,
                 fail_on_missing_cache=False, serve=False, port=8054,
                 prefer_impact_xlsx=prefer_fast, impact_xlsx_dir=xdir,
                 impact_xlsx_max_age_days=45,
@@ -1537,7 +1521,6 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                 'max_k': args.max_k,
                 'top_n': args.top_n,
                 'bottom_n': args.bottom_n,
-                'price_basis': args.price_basis,
                 'min_trigger_days': getattr(args, 'min_trigger_days', 30),
                 'sharpe_eps': getattr(args, 'sharpe_eps', 0.01),
                 'seed_by': getattr(args, 'seed_by', 'total_capture')
@@ -1715,7 +1698,6 @@ def parse_args(argv=None):
     p.add_argument('--save-stats', action='store_true', help='Save search statistics to JSON')
     p.add_argument('--threads', default=os.environ.get('STACKBUILDER_THREADS', 'auto'))
     p.add_argument('--outdir', default=RUNS_ROOT)
-    p.add_argument('--price-basis', default='adj', choices=['adj','close'])
     p.add_argument('--fail-on-missing-cache', action='store_true')
     p.add_argument('--serve', action='store_true', help='Start minimal Dash to display results')
     p.add_argument('--port', type=int, default=8054)

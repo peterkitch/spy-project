@@ -63,22 +63,56 @@ Reference inventory:
       No Phase 1A snapshot flips. Phase 1A pins synthetic-input
       pure helpers that already operated only on `Close`; the sites
       changed in this wave do not feed those snapshots.
-  - Remaining sites for 1B-2A follow-up commits:
-      `spymaster.py` (`_PRICE_BASIS` env read; PRICE_COLUMN; results
-      pkl `'price_basis'` and `'last_adj_close'` fields; refusal-
-      to-guess column-presence check; yfinance `auto_adjust=False`
-      and Adj-Close-fallback branches; reader at line 11858).
-      `onepass.py` (UI banner; `compute_parity_hash` default;
-      env-driven price-basis blocks at lines 1268–1325 and 1835).
-      `impactsearch.py` (boot log; cache-key basis tag at line
-      1122; env-driven price-basis blocks at lines 1359, 1414,
-      2056, 2437; UI banner at 2602).
-      `stackbuilder.py` (`load_secondary_prices` /
-      `_fetch_secondary_from_yf` `price_basis` parameter; UI default
-      `args.price_basis='adj'`; run-metadata field).
-      `confluence.py` (`price_basis` cache-key plumbing in the
-      cache-key normalizer and three `_cached_fetch_interval_data`
-      callers).
+  - Engine-site removals landed in 1B-2A (this commit):
+      `spymaster.py`: `_PRICE_BASIS` env read removed; `PRICE_COLUMN`
+      hardcoded to `'Close'`; refusal-to-guess column-presence check
+      simplified; yfinance call retained `auto_adjust=False` (the
+      Adj Close column it produces is now ignored); Adj-Close-fallback
+      branches in standardization removed; `results['price_basis']`
+      and `results['last_adj_close']` fields removed; the reader
+      that previously consulted `last_adj_close` now reads only
+      `last_close`.
+      `onepass.py`: UI banner hardcoded to `'Close'`;
+      `compute_parity_hash` default `price_source='Close'`;
+      `save_signal_library` default `price_source='Close'`;
+      env-driven price-basis blocks at the previously cited lines
+      replaced with `'Close'`; the `ONEPASS_ALLOW_LIB_BASIS` toggle
+      that gated library-basis override is removed.
+      `impactsearch.py`: boot log echoes `price_basis=Close (raw)`;
+      cache-key basis tag is now constant `'close'`; env-driven
+      price-basis blocks replaced with `'Close'`; UI banner
+      hardcoded to `'Close'`; the `IMPACTSEARCH_ALLOW_LIB_BASIS`
+      override branch in metrics path is removed.
+      `stackbuilder.py`: `load_secondary_prices` and
+      `_fetch_secondary_from_yf` no longer take a `price_basis`
+      parameter; the Adj/raw branching in both is removed; the
+      `--price-basis` CLI flag and `args.price_basis='adj'` UI
+      default are removed; the run-manifest `price_basis` field
+      is dropped.
+      `confluence.py`: cache-key normalizer no longer sets a
+      `price_basis` default; the three `_cached_fetch_interval_data`
+      callers no longer pass `price_basis='close'`.
+      `signal_library/impact_fastpath.py`: `ALLOW_LIB_BASIS` module
+      constant and the `IMPACTSEARCH_ALLOW_LIB_BASIS`-keyed env
+      override that bypassed `_is_compatible`'s price-basis check
+      are both removed; `_is_compatible` now rejects any library
+      whose `price_source != 'Close'` unconditionally. The
+      basis-mismatch override loophole is closed.
+  - Affected tests/snapshots: no Phase 1A baseline snapshot flips —
+    Phase 1A pinned helpers operate on synthetic Close-only inputs
+    that do not exercise the env-driven branches removed here. The
+    51-test baseline stayed green across this commit.
+  - Sites intentionally untouched: parser-helper field-set
+    memberships in `onepass.py:1215`, `impactsearch.py:1273, 1488`
+    that include `'Adj Close'` as a known yfinance column-name for
+    MultiIndex orientation detection (no SELECTION semantics);
+    rescale-cols list in `onepass.py:674` (operates harmlessly if
+    Adj Close is present in the frame); inline comments noting
+    the historical removal in `trafficflow.py:14, 83, 232`,
+    `signal_library/multi_timeframe_builder.py:98, 149`, and
+    `signal_library/shared_integrity.py:273`. QC clone sites
+    (`project/QC/Clone of Project 9/main.py:103, 918, 1509`)
+    deferred per scope note in inventory §2a.
   - ELI5: yfinance's "Adj Close" column changes over time as
     dividends and splits get retroactively reapplied, so the same
     historical date can return slightly different prices on
@@ -86,8 +120,9 @@ Reference inventory:
     raw `Close` only and remove every Adj/raw selector. After this
     entry, every engine reads raw Close and there is no
     `PRICE_BASIS` env var or argument left to tweak.
-  - Status: partially landed (signal_library + stale_check). Engine
-    sites enumerated above are pending the next 1B-2A commits.
+  - Status: implemented across signal_library, stale_check,
+    spymaster, onepass, impactsearch, stackbuilder, confluence,
+    and impact_fastpath in 1B-2A. QC clone deferred.
 
 ## Entry 2: ddof=0 / implicit ddof -> ddof=1
 

@@ -77,37 +77,18 @@ except Exception:
 # ---- ET tz constant used by market-clock helpers ----
 _ET_TZ = pytz.timezone("US/Eastern")
 
-# ---- Price basis configuration (Adj Close vs Close) ----
-# Controlled via PRICE_BASIS environment variable: 'adj' (default) or 'raw'
-_PRICE_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
-PRICE_COLUMN = 'Adj Close' if _PRICE_BASIS == 'adj' else 'Close'
+# ---- Price basis: raw Close only (spec v0.5 §3, ledger Entry 1) ----
+PRICE_COLUMN = 'Close'
 _BASIS_TEXT = PRICE_COLUMN  # for UI banner
 
-# --- Centralized price-series selector to enforce one-basis-only semantics ---
+# --- Centralized price-series selector: raw Close only ---
 def _price_series(df: pd.DataFrame, index=None) -> pd.Series:
-    """
-    Select the configured price series deterministically.
-    Reject cross-basis fallbacks to prevent mixing.
-    """
-    # If both appear, keep the configured, drop the other (warn)
-    if 'Close' in df.columns and 'Adj Close' in df.columns:
-        if PRICE_COLUMN not in df.columns:
-            logger.error("Both Close & Adj Close present but configured column missing; refusing to guess")
-            return pd.Series(dtype=float, index=(index or df.index))
-        # proceed; selection below forces the configured one
-    
-    for col in (PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')):
-        if col in df.columns:
-            s = df[col]
-            s = s.iloc[:,0] if isinstance(s, pd.DataFrame) else s
-            return (s.loc[index] if index is not None else s).astype(float)
-    
-    # As a last resort, accept normalized 'Close' only (already standardized upstream)
+    """Select the raw Close series. Adj Close is no longer accepted."""
     if 'Close' in df.columns:
         s = df['Close']
+        s = s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
         return (s.loc[index] if index is not None else s).astype(float)
-    
-    logger.error(f"_price_series: {PRICE_COLUMN} not available")
+    logger.error("_price_series: Close column not available")
     return pd.Series(dtype=float, index=(index or df.index))
 
 # --- DIAGNOSTIC UTILITIES -----------------------------------------------------
@@ -3946,7 +3927,7 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
                     period="max",
                     interval="1d",
                     progress=False,
-                    auto_adjust=False,   # keep both Close & Adj Close if available
+                    auto_adjust=False,   # keep raw Close column; Adj Close is ignored downstream
                     threads=False,       # more stable for large pulls
                     timeout=base_timeout
                 )
@@ -3974,53 +3955,28 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
     except Exception as e:
         logger.debug(f"Index cleanup issue for {ticker}: {e}")
 
-    # Standardize columns to always have 'Close' (based on PRICE_COLUMN setting)
+    # Standardize columns to always have raw 'Close' (spec v0.5 §3, ledger Entry 1)
     if not df.empty:
         standardized_df = pd.DataFrame(index=df.index)
-        
-        # Handle different column structures from yfinance
+
         if isinstance(df.columns, pd.MultiIndex):
-            # Multi-level columns (happens with some tickers)
-            # Select EXACTLY the configured basis (no substring matching)
-            target_names = {PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')}
             for col in df.columns.levels[0]:
-                if col in target_names:
+                if col == 'Close':
                     src = df[col]
                     src = src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src
                     standardized_df['Close'] = pd.to_numeric(src, errors='coerce')
-                    logger.debug(f"Standardized {ticker}: using '{col}' as price data")
+                    logger.debug(f"Standardized {ticker}: using 'Close' as price data")
                     break
-            else:
-                # Fallback ONLY to exact 'Close' (never Adj Close) if preferred not found
-                for col in df.columns.levels[0]:
-                    if col == 'Close':
-                        src = df[col]
-                        src = src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src
-                        standardized_df['Close'] = pd.to_numeric(src, errors='coerce')
-                        logger.debug(f"Standardized {ticker}: using 'Close' as price data (configured '{PRICE_COLUMN}' not available)")
-                        break
         else:
-            # Single-level columns (most common case)
-            # Try preferred price basis first (exact matches only)
-            if PRICE_COLUMN in df.columns:
-                standardized_df['Close'] = pd.to_numeric(df[PRICE_COLUMN], errors='coerce')
-                logger.debug(f"Standardized {ticker}: using '{PRICE_COLUMN}' as price data")
-            elif PRICE_COLUMN.replace(' ', '_') in df.columns:
-                standardized_df['Close'] = pd.to_numeric(df[PRICE_COLUMN.replace(' ', '_')], errors='coerce')
-                logger.debug(f"Standardized {ticker}: using '{PRICE_COLUMN.replace(' ', '_')}' as price data")
-            elif 'Close' in df.columns:
+            if 'Close' in df.columns:
                 standardized_df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-                logger.debug(f"Standardized {ticker}: using 'Close' as price data (configured '{PRICE_COLUMN}' not available)")
-            elif 'Adj Close' in df.columns and PRICE_COLUMN == 'Close':
-                # Do NOT cross-basis fallback; abort to prevent mixing
-                logger.error(f"Standardize {ticker}: requested RAW Close but Close missing (Adj present). Rejecting fallback.")
-                return pd.DataFrame()
+                logger.debug(f"Standardized {ticker}: using 'Close' as price data")
             else:
-                # Try case-insensitive search for exact 'close' only (not 'adj close')
+                # Case-insensitive match for exact 'close' (never 'adj close')
                 for col in df.columns:
                     if col.lower() == 'close':
                         standardized_df['Close'] = pd.to_numeric(df[col], errors='coerce')
-                        logger.debug(f"Standardized {ticker}: using '{col}' as price data (case-insensitive match)")
+                        logger.debug(f"Standardized {ticker}: using '{col}' (case-insensitive)")
                         break
         
         # Validate we got price data
@@ -5012,7 +4968,6 @@ def _precompute_results_impl(ticker, event, cancel_event=None):
             results['start_date'] = df.index[0]
             results['last_date'] = df.index[-1]
             results['total_trading_days'] = len(df)
-            results['price_basis'] = PRICE_COLUMN  # aid future audits
             # self-check tokens to detect cross-ticker contamination
             results['_ticker'] = ticker
             results['_row_count'] = len(df)
@@ -5085,20 +5040,8 @@ def _precompute_results_impl(ticker, event, cancel_event=None):
             except Exception:
                 last_close = None
 
-            try:
-                # Extract last price based on configured preference
-                if PRICE_COLUMN in df.columns:
-                    last_adj = float(df[PRICE_COLUMN].iloc[-1])
-                elif PRICE_COLUMN.replace(' ', '_') in df.columns:
-                    last_adj = float(df[PRICE_COLUMN.replace(' ', '_')].iloc[-1])
-                else:
-                    last_adj = None
-            except Exception:
-                last_adj = None
-
             results['last_close'] = last_close
-            results['last_adj_close'] = last_adj
-            results['last_price'] = float(last_adj if last_adj is not None else last_close) if (last_adj is not None or last_close is not None) else None
+            results['last_price'] = float(last_close) if last_close is not None else None
 
             # Leader-pair on/off flags on the last day (use tolerant ASOF lookups)
             buy_pair = results.get('top_buy_pair')
@@ -11858,9 +11801,7 @@ def batch_process_tickers(n_clicks, n_intervals, input_value, existing_table_dat
                 except Exception:
                     last_date_str = '—'
 
-            price_val = res.get('last_adj_close', None)
-            if price_val is None:
-                price_val = res.get('last_close', None)
+            price_val = res.get('last_close', None)
             # Show '—' for NaN/Inf instead of '$nan'
             try:
                 import numpy as np

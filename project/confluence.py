@@ -159,14 +159,8 @@ def _ttl_cache(ttl: int = DEFAULT_TTL):
 # Cached wrappers for expensive IO operations
 @_ttl_cache(ttl=600)  # 10 minutes
 def _cached_fetch_interval_data(ticker: str, interval: str, **kwargs):
-    """
-    Cached wrapper for fetch_interval_data.
-
-    Normalizes cache key by ensuring price_basis is always explicit,
-    preventing duplicate downloads when some callers omit it.
-    """
-    # Normalize cache key so all callers hit the same entry
-    kwargs.setdefault('price_basis', 'close')
+    """Cached wrapper for fetch_interval_data. Raw Close only (spec v0.5 §3)."""
+    kwargs.pop('price_basis', None)
     return fetch_interval_data(ticker, interval, **kwargs)
 
 @_ttl_cache(ttl=600)  # 10 minutes
@@ -1344,7 +1338,7 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
         MAX_GRAPH_POINTS = int(os.environ.get('MAX_GRAPH_POINTS', 500))
 
         # Fetch prices on-demand
-        df_prices = _cached_fetch_interval_data(ticker, interval, price_basis='close')
+        df_prices = _cached_fetch_interval_data(ticker, interval)
 
         if df_prices is None or df_prices.empty:
             return html.Div([
@@ -2169,7 +2163,7 @@ def create_master_combined_chart(ticker: str, libraries: dict, aligned: pd.DataF
     """
     # Price
     t0 = time.perf_counter()
-    px = _cached_fetch_interval_data(ticker, '1d', price_basis='close')
+    px = _cached_fetch_interval_data(ticker, '1d')
     logger.info("[Master] price fetch %.3fs", time.perf_counter()-t0)
 
     if px is None or px.empty or 'Close' not in px.columns:
@@ -2448,7 +2442,7 @@ def create_confluence_performance_panel(ticker: str, aligned: pd.DataFrame) -> h
       • shows KPI tiles and forward distributions for today's state
       • adds a 'conditioned equity' curve that trades only when state==today
     """
-    px = _cached_fetch_interval_data(ticker, '1d', price_basis='close')
+    px = _cached_fetch_interval_data(ticker, '1d')
     if px is None or px.empty or 'Close' not in px.columns:
         return html.Div([html.P("No daily data for performance panel.", style={'color':'#ff4444'})])
 

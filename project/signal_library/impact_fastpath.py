@@ -79,10 +79,6 @@ def _pickle_load_compat(file_obj):
 IMPACT_TRUST_LIBRARY = os.environ.get("IMPACT_TRUST_LIBRARY", "0").lower() in ("1", "true", "on", "yes")
 IMPACT_TRUST_MAX_AGE_HOURS = int(os.environ.get("IMPACT_TRUST_MAX_AGE_HOURS", "168"))
 PERSIST_SKIP_BARS_IMPACT = int(os.environ.get("PERSIST_SKIP_BARS", "1"))  # match OnePass T-1
-ALLOW_LIB_BASIS = os.environ.get(
-    "IMPACT_FASTPATH_ALLOW_LIB_BASIS",
-    os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS", "0")
-).lower() in ("1", "true", "on", "yes")
 IMPACT_CALENDAR_GRACE_DAYS = int(os.environ.get("IMPACT_CALENDAR_GRACE_DAYS", "7"))  # Allow 7-day grace for cross-market holidays
 
 # Constants matching onepass.py
@@ -151,8 +147,10 @@ def _is_compatible(lib: dict) -> tuple[bool, str]:
 
     # Spec v0.5 §3: raw `Close` is the only allowed price basis. Reject
     # libraries built against any other basis (e.g. legacy Adj Close).
-    allow_lib_basis = os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS", "0").lower() in ("1", "true", "on", "yes")
-    if lib.get("price_source") != "Close" and not allow_lib_basis:
+    # The IMPACTSEARCH_ALLOW_LIB_BASIS escape hatch was removed in 1B-2A
+    # (ledger Entry 1) because it allowed non-Close libraries to bypass
+    # the canonical basis check.
+    if lib.get("price_source") != "Close":
         return False, f"price_basis_mismatch (lib={lib.get('price_source')} vs Close)"
 
     return True, "ok"
@@ -242,10 +240,10 @@ def get_primary_signals_fast(primary_ticker: str, secondary_index: pd.DatetimeIn
         return None, f"no_library_for_{vendor_symbol}"
 
     # Check compatibility against the canonical raw-Close basis (spec §3).
+    # The basis-mismatch override loophole was removed in 1B-2A (ledger
+    # Entry 1) — libraries built against non-Close basis are no longer
+    # accepted, even with an env-var escape hatch.
     ok, why = _is_compatible(lib)
-    # Optional compatibility: accept library price_source even if ENV differs
-    if (not ok) and why.startswith("price_basis_mismatch") and ALLOW_LIB_BASIS:
-        ok, why = True, "basis_mismatch_overridden"
     if not ok:
         return None, f"incompatible:{why}"
 
