@@ -91,5 +91,9 @@ verify_*.py
 install_*.py
 cleanup_*.py
 
-# Test scripts directory
-test_scripts/
+# Test scripts directory:
+# - Existing local stash subdirectories stay ignored (test_scripts/*/).
+# - Top-level Python test files are trackable so Phase 0+ can land
+#   parity/import-smoke/synthetic tests at test_scripts/*.py.
+test_scripts/*/
+!test_scripts/*.py
