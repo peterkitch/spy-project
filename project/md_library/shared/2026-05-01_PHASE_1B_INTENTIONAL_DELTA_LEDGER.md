@@ -92,22 +92,33 @@ Reference inventory:
 ## Entry 2: ddof=0 / implicit ddof -> ddof=1
 
   - Type: EXPECTED-BY-SPEC
-  - Old behavior: TBD in 1B-2. Per inventory §5 the receiver type
-    matters: NumPy arrays default to `ddof=0`, pandas Series default
-    to `ddof=1`. The only canonical-scoring site whose effective ddof
-    differs from the spec is `spymaster.py:11668` (`cap` is a NumPy
-    array, currently ddof=0). The remaining implicit-ddof sites are
-    pandas Series receivers and are already ddof=1; making `ddof=1`
-    explicit at those sites is a clarity-only change.
-  - New behavior: TBD in 1B-2 (a canonical scoring call routes
-    through `canonical_scoring.score_signals` / `score_captures`,
-    which always use `ddof=1` by default).
-  - Affected tests/snapshots: TBD in 1B-2. The `spymaster.py:11668`
-    fix is the only ddof entry expected to introduce a numeric
-    delta. Phase 1A does not pin the Spymaster end-to-end path, so
-    even that delta will surface only via Phase 1B-2's end-to-end
-    checks; no Phase 1A snapshot file is expected to flip from this
-    entry alone.
+  - Old behavior: at `spymaster.py:11668` the per-trigger-day std
+    was computed as `cap[trigger_mask].std() if trigger_days > 1
+    else 0`, where `cap` is a NumPy array; NumPy arrays default to
+    `ddof=0` (divide by N), so this site silently used population
+    std despite spec §16 mandating sample std. Per inventory §5 the
+    other implicit-ddof sites in spymaster (1481, 1542, 8873, 8920,
+    10605, 12601) compute std on pandas Series, which already
+    defaults to `ddof=1`, so they were numerically correct but
+    unannotated.
+  - New behavior: `spymaster.py:11668` is now
+    `cap[trigger_mask].std(ddof=1) if trigger_days > 1 else 0`,
+    matching spec §16. A same-line comment marks the site as
+    Ledger Entry 2. Implementing commit: 56b0338 ("Phase 1B-2A:
+    fix ddof=0 canonical-scoring site in spymaster"). The downstream
+    Sharpe / t-stat / p-value chain in that block already gates on
+    `std_dev > 0`, so the `trigger_days == 1` case continues to
+    short-circuit to the no-stats branch (no behaviour difference
+    for that case).
+  - Affected tests/snapshots: no Phase 1A baseline snapshot flips —
+    Phase 1A does not pin the Spymaster end-to-end path that feeds
+    this site, so the 51-test baseline remained green across the
+    fix (verified post-56b0338). The other six implicit-but-already-
+    ddof=1 pandas Series sites in spymaster do not move
+    numerically; they are pending a clarity-only `ddof=1`-explicit
+    pass through canonical-scoring wiring. The numeric delta at
+    11668 will surface only via the engine-level smoke checks that
+    1B-2A wiring will introduce.
   - ELI5: standard deviation has two flavors. "Population" std (ddof
     = 0) divides by N; "sample" std (ddof = 1) divides by N - 1.
     Sample std is the correct choice when the trigger days we
@@ -118,18 +129,9 @@ Reference inventory:
     scoring site computes std on a NumPy array and therefore
     silently uses ddof = 0 today. This entry harmonizes that one
     site numerically; the others are clarity-only.
-  - Status: numeric-delta site fixed in 1B-2A. The single ddof=0
-    canonical-scoring site `spymaster.py:11668` is now
-    `cap[trigger_mask].std(ddof=1) if trigger_days > 1 else 0`,
-    matching spec §16. The downstream Sharpe / t-stat / p-value
-    chain in that block already gates on `std_dev > 0`, so the
-    `trigger_days == 1` case continues to short-circuit to the
-    no-stats branch (no behaviour difference for that case). Phase
-    1A snapshots do not pin this code path, so no Phase 1A snapshot
-    flips. The remaining six implicit-but-already-ddof=1 pandas
-    Series sites in spymaster (1481, 1542, 8873, 8920, 10605,
-    12601) are pending a clarity-only `ddof=1`-explicit pass; they
-    are not numeric deltas.
+  - Status: implemented for `spymaster.py:11668` (commit 56b0338);
+    canonical-scoring wiring of remaining clarity-only sites still
+    pending in this PR.
 
 ## Entry 3: cdf -> sf p-value
 
