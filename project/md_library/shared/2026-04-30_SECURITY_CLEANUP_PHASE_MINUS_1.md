@@ -40,8 +40,10 @@ Out of scope (sprint plan Section 3 / phase boundaries):
 ### Part B: hardcoded path matches
 
 Discovery used `git grep` over tracked files only (no raw filesystem
-walk). Patterns: `C:\Users\sport`, `Users\sport`, `Users/sport`,
-`AppData`, `MiniConda`, `spy-project\project`, `spy-project/project`.
+walk). Patterns covered: literal `C:\Users\<old-username>`,
+`Users\<old-username>` and `Users/<old-username>` (Windows and
+forward-slash forms), plus `AppData`, `MiniConda`, and
+`spy-project\project` / `spy-project/project` segments.
 
 Matches by category:
 
@@ -189,10 +191,10 @@ phase.
 Replaced personal-username path segments with neutral placeholders
 that preserve instructional intent:
 
-  - `Users\sport`     -> `Users\<USERNAME>` (Windows backslash form)
-  - `Users/sport`     -> `Users/<USERNAME>` (forward-slash / bash form)
-  - `C:\Users\sport\AppData\...`        -> `%USERPROFILE%\AppData\...`
-  - `C:\Users\sport\Documents\...`      -> `%USERPROFILE%\Documents\...`
+  - `Users\<old-username>`     -> `Users\<USERNAME>` (Windows backslash form)
+  - `Users/<old-username>`     -> `Users/<USERNAME>` (forward-slash / bash form)
+  - `C:\Users\<old-username>\AppData\...`        -> `%USERPROFILE%\AppData\...`
+  - `C:\Users\<old-username>\Documents\...`      -> `%USERPROFILE%\Documents\...`
   - CLAUDE.md "Working directory" line: rewritten to
     `<your local clone>\spy-project\project (e.g.,
     %USERPROFILE%\Documents\PythonProjects\spy-project\project)`.
