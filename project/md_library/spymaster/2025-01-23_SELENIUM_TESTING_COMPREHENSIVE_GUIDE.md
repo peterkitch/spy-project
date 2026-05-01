@@ -190,7 +190,7 @@ Charts may take significant time to render. The test includes:
 
 ```bash
 # From project root directory
-cd C:\Users\sport\Documents\PythonProjects\spy-project\project
+cd <your local spy-project clone>\project
 
 # Run comprehensive test
 python utils\spymaster\selenium_tests\test_spymaster_comprehensive.py

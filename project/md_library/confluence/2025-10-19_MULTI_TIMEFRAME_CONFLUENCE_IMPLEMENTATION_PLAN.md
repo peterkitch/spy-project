@@ -380,7 +380,7 @@ def calculate_confluence(aligned_signals: pd.DataFrame, date: pd.Timestamp, min_
 ### File Structure
 
 ```
-spy-project/project/
+<repo root>/project/
 │
 ├── confluence.py                          # NEW: Standalone Dash app (port 8056)
 │
@@ -2460,8 +2460,8 @@ REM Performance settings (optional)
 set MKL_NUM_THREADS=8
 set OMP_NUM_THREADS=8
 
-REM Activate conda environment
-call C:\Users\sport\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat spyproject2
+REM Activate conda environment (assumes Conda is initialized in your shell)
+call conda activate spyproject2
 
 REM Launch app
 echo Starting Confluence Analyzer...

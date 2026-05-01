@@ -1,5 +1,15 @@
 # Claude Testing Solution: Windows Python Path Format
 
+> **Historical note (2026-04-30 Phase -1):** this document records an
+> early workaround for invoking Python from the Claude Code Bash tool
+> on Windows by passing the full path to a Conda env's `python.exe`.
+> It is **not** the current recommended setup. The current contributor
+> shell is PowerShell 7+ (`pwsh`) and the Python environment should be
+> created from `project/environment.yml` and activated with
+> `conda activate spyproject2`, after which plain `python` resolves to
+> the right interpreter. The literal Conda install paths below have
+> been replaced with `<python-executable-from-your-env>` for reference.
+
 **Date**: 2025-10-22
 **Context**: Running automated tests from Claude Code on Windows with conda environments
 
@@ -7,7 +17,7 @@
 
 Claude's Bash tool was unable to run Python tests in the conda environment despite multiple attempts using:
 - `cmd /c "activate.bat && python script.py"` - exits immediately, no output
-- `C:\Users\...\python.exe` - path not found (backslashes interpreted by bash)
+- A backslash-style Windows path to `python.exe` - path not found (backslashes interpreted by bash)
 - Background shells - not maintaining environment
 
 ## Solution
@@ -15,7 +25,7 @@ Claude's Bash tool was unable to run Python tests in the conda environment despi
 **Use forward slashes in the full Python executable path:**
 
 ```bash
-C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
+<python-executable-from-your-env>
 ```
 
 ### Why This Works
@@ -27,7 +37,7 @@ C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
 ### Example Usage
 
 ```bash
-cd signal_library && C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe ../quick_parity_test.py --ticker SPY --interval 1d
+cd signal_library && <python-executable-from-your-env> ../quick_parity_test.py --ticker SPY --interval 1d
 ```
 
 ## Standard Test Command Pattern
@@ -35,7 +45,7 @@ cd signal_library && C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproje
 For any Python test script in the spyproject2 environment:
 
 ```bash
-cd [working_directory] && C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe [script_path] [args]
+cd [working_directory] && <python-executable-from-your-env> [script_path] [args]
 ```
 
 ### Key Points

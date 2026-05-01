@@ -419,7 +419,7 @@ python test_scripts/trafficflow/test_baseline_speed_10sec.py
 
 2. **Navigate to project**:
    ```cmd
-   cd C:\Users\sport\Documents\PythonProjects\spy-project\project
+   cd <your local spy-project clone>\project
    ```
 
 3. **Run parity tests**:

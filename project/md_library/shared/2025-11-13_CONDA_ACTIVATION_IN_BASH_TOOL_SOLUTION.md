@@ -1,5 +1,15 @@
 # Conda Environment Activation in Bash Tool - Complete Solution
 
+> **Historical note (2026-04-30 Phase -1):** this document records an
+> old Git Bash workaround for the Claude Code Bash tool. It is **not**
+> the current recommended setup. The current contributor shell is
+> PowerShell 7+ (`pwsh`) and the Python environment should be created
+> from `project/environment.yml`. The notes below are preserved for
+> historical reference only; do not treat the absolute install paths
+> as canonical. References to a specific local Conda install location
+> are illustrative only and have been replaced with
+> `<conda-install-dir>` placeholders.
+
 **Date**: 2025-11-13
 **Issue**: Repeated failures to activate conda environments when running Python scripts
 **Scope**: Cross-cutting issue affecting all scripts (spymaster, impactsearch, onepass, confluence, GTL)
@@ -41,8 +51,8 @@ This is the fundamental issue that causes all conda activation problems!
 
 ### Environment Specifics
 
-- **Conda Location**: `/c/Users/sport/AppData/Local/NVIDIA/MiniConda/`
-- **Activate Script**: `/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate`
+- **Conda Location**: `<conda-install-dir>/`
+- **Activate Script**: `<conda-install-dir>/Scripts/activate`
 - **Primary Environment**: `spyproject2` (has Intel MKL, NumPy 1.26.4, Dash, Plotly, all dependencies)
 - **Alternative Environment**: `spyproject2_basic` (generic BLAS, NumPy 2.2.6)
 
@@ -53,7 +63,7 @@ This is the fundamental issue that causes all conda activation problems!
 Use `source` to activate conda, then run your command:
 
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python script.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python script.py
 ```
 
 ### For Background/Long-Running Processes
@@ -61,7 +71,7 @@ source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproje
 Same pattern with background flag:
 
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python confluence.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python confluence.py
 # Run in background with run_in_background=true parameter
 ```
 
@@ -69,7 +79,7 @@ source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproje
 
 1. **Use `source`** (or `.` in bash) - NOT `call`
 2. **Unix-style paths** with forward slashes: `/c/Users/...`
-3. **Quote the path** to handle spaces: `"/c/Users/sport/AppData/..."`
+3. **Quote the path** to handle spaces: `"<conda-install-dir>"`
 4. **Chain with `&&`** to ensure activation succeeds before running Python
 5. **Specify environment name** after the activate script: `spyproject2`
 
@@ -77,25 +87,25 @@ source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproje
 
 ### Step 1: Verify Conda Activate Exists
 ```bash
-ls -la "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate"
+ls -la "<conda-install-dir>/Scripts/activate"
 # Should show: -rwxr-xr-x ... activate
 ```
 
 ### Step 2: Test Activation
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && which python
-# Should show: /c/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python
+source "<conda-install-dir>/Scripts/activate" spyproject2 && which python
+# Should show: <conda-install-dir>/envs/spyproject2/python
 ```
 
 ### Step 3: Verify Modules
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python -c "import dash; import plotly; print('Modules available')"
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python -c "import dash; import plotly; print('Modules available')"
 # Should print: Modules available
 ```
 
 ### Step 4: Run Script
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python confluence.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python confluence.py
 # Should start successfully
 ```
 
@@ -103,7 +113,7 @@ source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproje
 
 ### ❌ WRONG: Using Windows CMD Syntax
 ```bash
-call C:\Users\sport\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat spyproject2
+call <conda-install-dir>\Scripts\activate.bat spyproject2
 # Error: call: command not found
 ```
 
@@ -115,50 +125,50 @@ conda activate spyproject2 && python script.py
 
 ### ❌ WRONG: Windows-style paths with backslashes
 ```bash
-source "C:\Users\sport\AppData\Local\NVIDIA\MiniConda\Scripts\activate" spyproject2
+source "<conda-install-dir>\Scripts\activate" spyproject2
 # May cause path interpretation issues
 ```
 
 ### ❌ WRONG: Forgetting to chain with &&
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2
+source "<conda-install-dir>/Scripts/activate" spyproject2
 python script.py
 # Second command runs in a separate shell without activation
 ```
 
 ### ✅ CORRECT: Unix-style with source and chaining
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python script.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python script.py
 ```
 
 ## Script-Specific Examples
 
 ### Spymaster
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python spymaster.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python spymaster.py
 # Runs on port 8050 (default)
 ```
 
 ### ImpactSearch
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python impactsearch.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python impactsearch.py
 # Runs on port 8051
 ```
 
 ### OnePass
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python onepass.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python onepass.py
 ```
 
 ### Confluence
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python confluence.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python confluence.py
 # Runs on port 8056 (or fallback 8057 if occupied)
 ```
 
 ### Global Ticker Library
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && cd global_ticker_library && python run.py --validate-manual
+source "<conda-install-dir>/Scripts/activate" spyproject2 && cd global_ticker_library && python run.py --validate-manual
 ```
 
 ## Testing and Validation
@@ -178,7 +188,7 @@ When testing scripts, always:
 
 3. **Activate environment and run**:
    ```bash
-   source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python script.py
+   source "<conda-install-dir>/Scripts/activate" spyproject2 && python script.py
    ```
 
 4. **Check output** for successful startup:
@@ -188,7 +198,7 @@ When testing scripts, always:
 ## Troubleshooting
 
 ### Issue: "No such file or directory"
-**Solution**: Check path format - use `/c/Users/...` not `C:\Users\...`
+**Solution**: Check path format - in Git Bash, use the forward-slash mount form (e.g. `/c/...`) rather than a backslash-style Windows path.
 
 ### Issue: "conda: command not found"
 **Solution**: Use full path to activate script with `source`, don't rely on conda being in PATH
@@ -203,7 +213,7 @@ When testing scripts, always:
 
 **ALWAYS USE THIS PATTERN:**
 ```bash
-source "/c/Users/sport/AppData/Local/NVIDIA/MiniConda/Scripts/activate" spyproject2 && python <SCRIPT_NAME>.py
+source "<conda-install-dir>/Scripts/activate" spyproject2 && python <SCRIPT_NAME>.py
 ```
 
 **NEVER USE:**
