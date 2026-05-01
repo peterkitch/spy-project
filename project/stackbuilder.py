@@ -714,7 +714,12 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
     except Exception as e:
         print(f"[ERROR] Failed to load signals for {vendor}: {e}")
         raise RuntimeError(f"Ticker {vendor} signal library error: {e}") from e
-    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
+    # Unify calendar policy with Phase 2 (apply_signals_to_secondary) per
+    # Phase 1B Intentional Delta Ledger Entry 5 (StackBuilder Phase 2 vs
+    # Phase 3 scoring divergence). Phase 2 uses DEFAULT_GRACE_DAYS; Phase 3
+    # previously read the env var with a separate default of 0, producing
+    # divergent calendar masks for the same primary/secondary pair.
+    grace_days = DEFAULT_GRACE_DAYS
     if grace_days > 0:
         aligned = raw.reindex(sec_index, method='pad', tolerance=pd.Timedelta(days=grace_days))
     else:

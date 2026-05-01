@@ -174,18 +174,32 @@ Reference inventory:
 ## Entry 5: StackBuilder Phase 2 vs Phase 3 scoring divergence
 
   - Type: BUG-FIX
-  - Old behavior: TBD in 1B-2 (see inventory §15; Phase 2's
+  - Old behavior: per inventory §15, Phase 2's
     `apply_signals_to_secondary` uses `DEFAULT_GRACE_DAYS=7` while
-    Phase 3's `_signals_aligned_and_mask` defaults grace to `0`,
-    and the two paths score against different calendar-aligned
-    capture series for the same primary).
-  - New behavior: TBD in 1B-2 (one calendar-alignment policy and
-    one trigger-mask policy across both phases via the canonical
-    scoring module).
-  - Affected tests/snapshots: TBD in 1B-2 (the Phase 1A
-    `_pending_bug_fix` test
+    Phase 3's `_signals_aligned_and_mask` (`stackbuilder.py:717`)
+    read `IMPACT_CALENDAR_GRACE_DAYS` with a separate default of
+    `0`, producing divergent calendar-aligned capture series for
+    the same primary/secondary pair on dates that fell inside the
+    grace window for one phase but outside for the other.
+  - New behavior: `_signals_aligned_and_mask` now uses the same
+    `DEFAULT_GRACE_DAYS` constant Phase 2 already used, so both
+    phases apply identical calendar tolerance. The trigger-mask
+    side of the divergence (Phase 3's `present_all` zeroing vs
+    Phase 2's grace-padded captures) is now equivalent for any
+    pair where the grace policy produced the same aligned signal
+    series. Both phases continue to flow through
+    `metrics_from_captures`; the residual zero-capture trigger-day
+    issue at `metrics_from_captures` is a separate ledger Entry 4
+    fix and lands in the same PR.
+  - Affected tests/snapshots: no Phase 1A snapshot flip from this
+    change alone — the
     `test_stackbuilder_combined_metrics_signals_baseline_pending_bug_fix`
-    will flip; the suffix is dropped after this entry lands).
+    fixture has perfectly aligned member/secondary indices, so the
+    grace-days unification does not move its output. The
+    `_pending_bug_fix` suffix is retained on the test until
+    Entry 4 (zero-capture trigger counting) lands and produces the
+    canonical signal-state-based output. Renaming and snapshot
+    replacement happens with that commit.
   - ELI5: the same K=1 stack can return two different Sharpe and
     Total Capture numbers depending on whether you scored it
     through Phase 2's "rank everything" path or Phase 3's
@@ -193,8 +207,11 @@ Reference inventory:
     different rules for filling missing trading days. Codex
     sampled 10 real K=1 outputs and every one of them mismatched.
     The spec says one canonical scoring function; this entry
-    routes both phases through it.
-  - Status: stub, pending 1B-2.
+    unifies the calendar-grace rule across both phases so they
+    can no longer disagree on which days are in scope.
+  - Status: calendar-policy unification implemented in 1B-2A;
+    `_pending_bug_fix` test retirement deferred to the Entry 4
+    zero-capture commit (still in this PR).
 
 ## Entry 6: ImpactSearch xlsx duplicate-row dedupe
 
