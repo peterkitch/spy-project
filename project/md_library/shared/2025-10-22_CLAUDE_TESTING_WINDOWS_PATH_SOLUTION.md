@@ -15,7 +15,7 @@ Claude's Bash tool was unable to run Python tests in the conda environment despi
 **Use forward slashes in the full Python executable path:**
 
 ```bash
-C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
+C:/Users/<USERNAME>/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
 ```
 
 ### Why This Works
@@ -27,7 +27,7 @@ C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
 ### Example Usage
 
 ```bash
-cd signal_library && C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe ../quick_parity_test.py --ticker SPY --interval 1d
+cd signal_library && C:/Users/<USERNAME>/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe ../quick_parity_test.py --ticker SPY --interval 1d
 ```
 
 ## Standard Test Command Pattern
@@ -35,7 +35,7 @@ cd signal_library && C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproje
 For any Python test script in the spyproject2 environment:
 
 ```bash
-cd [working_directory] && C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe [script_path] [args]
+cd [working_directory] && C:/Users/<USERNAME>/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe [script_path] [args]
 ```
 
 ### Key Points

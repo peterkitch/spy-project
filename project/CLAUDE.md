@@ -62,7 +62,7 @@ This is a quantitative trading analysis web application built with Python and Da
   - **spyproject2_basic** (Alternative) - Generic BLAS, NumPy 2.2.6, no MKL
     - Note: This was formerly named `spyproject2_mkl` (misleading name has been corrected)
 **System Specs**: Intel Core i7-13700KF (16 cores), 32GB RAM
-**Conda Path**: `C:\Users\sport\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat`
+**Conda Path**: `%USERPROFILE%\AppData\Local\NVIDIA\MiniConda\Scripts\activate.bat` (substitute your own username; the bundled NVIDIA MiniConda install lives under `%USERPROFILE%\AppData\Local\NVIDIA\MiniConda` on Windows)
 
 ### CRITICAL DATE AWARENESS ISSUE
 **IMPORTANT**: The system often shows incorrect dates. When creating MD files with date prefixes:
@@ -76,7 +76,7 @@ This is a quantitative trading analysis web application built with Python and Da
 - Environment variables: Use `set VAR=value && command` syntax
 - File paths: Use backslashes or raw strings
 - Console encoding: cp1252 (avoid Unicode characters in output)
-- Working directory: C:\Users\sport\Documents\PythonProjects\spy-project\project
+- Working directory: `<your local clone>\spy-project\project` (e.g., `%USERPROFILE%\Documents\PythonProjects\spy-project\project`)
 
 ## Development Commands
 
