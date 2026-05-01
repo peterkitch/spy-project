@@ -19,6 +19,7 @@ import time
 import numpy as np
 import re
 from scipy import stats
+from canonical_scoring import score_captures as _canonical_score_captures
 import gc
 import threading
 
@@ -9007,53 +9008,33 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
                 if active_sig in ('Buy', 'Short')
             ])
 
-            if signal_captures.size > 0:
-                wins = int(np.sum(signal_captures > 0))  # Convert NumPy scalar to Python int
-                losses = trigger_days - wins  # Ensure wins + losses equals trigger days
-                win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0.0
-                avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0.0
-                # IMPORTANT: Use the final cumulative combined capture value, not the sum of daily captures
-                # The cumulative_combined_captures already tracks the cumulative performance
-                if 'cumulative_combined_captures' in results and len(results['cumulative_combined_captures']) > 0:
-                    total_capture = float(results['cumulative_combined_captures'].iloc[-1])
-                else:
-                    # Fallback to sum of daily captures if cumulative not available
-                    total_capture = signal_captures.sum() if trigger_days > 0 else 0.0
-
-                # Calculate standard deviation using ddof=1 for sample standard deviation
-                if trigger_days > 1:
-                    std_dev = np.std(signal_captures, ddof=1)
-                else:
-                    std_dev = 0.0
+            # Spec §13–§17: route through canonical_scoring.
+            _trig_mask_arr = np.array(trigger_mask, dtype=bool)
+            _caps_arr = np.asarray(cumulative_captures, dtype=float)
+            _score = _canonical_score_captures(
+                pd.Series(_caps_arr),
+                pd.Series(_trig_mask_arr),
+                risk_free_rate=5.0, periods_per_year=252, ddof=1,
+            )
+            wins = _score.wins
+            losses = _score.losses
+            win_ratio = _score.win_rate
+            avg_daily_capture = _score.avg_daily_capture
+            std_dev = _score.std_dev
+            sharpe_ratio = _score.sharpe
+            t_statistic = _score.t_statistic
+            p_value = _score.p_value
+            # IMPORTANT: Use the final cumulative combined capture value, not the sum of daily captures.
+            # The cumulative_combined_captures already tracks the cumulative performance and is
+            # numerically equivalent to the canonical total_capture for canonical capture series.
+            if 'cumulative_combined_captures' in results and len(results['cumulative_combined_captures']) > 0:
+                total_capture = float(results['cumulative_combined_captures'].iloc[-1])
             else:
-                wins = losses = 0
-                win_ratio = avg_daily_capture = total_capture = std_dev = 0.0
+                total_capture = _score.total_capture
 
-            # t-Statistic & p-value
-            if trigger_days > 1 and std_dev != 0:
-                t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
-                degrees_of_freedom = trigger_days - 1
-                # Spec §17: numerically stable t.sf form.
-                p_value = 2 * stats.t.sf(abs(t_statistic), df=degrees_of_freedom)
-
-                # Don't print stats from callback for cached tickers to avoid issues
-                # Stats are already printed during processing
-                pass
-            else:
-                t_statistic = None
-                p_value = None
-                if should_log:
-                    logger.info("\nStatistical Significance Analysis:")
-                    logger.info("Insufficient data to perform statistical significance analysis.\n")
-
-            # Annualized Sharpe Ratio logic consistent with other sections
-            risk_free_rate = 5.0
-            if trigger_days > 1 and std_dev != 0:
-                annualized_return = avg_daily_capture * 252
-                annualized_std = std_dev * np.sqrt(252)
-                sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std
-            else:
-                sharpe_ratio = 0.0
+            if (t_statistic is None or p_value is None) and should_log:
+                logger.info("\nStatistical Significance Analysis:")
+                logger.info("Insufficient data to perform statistical significance analysis.\n")
             
             # Calculate Maximum Drawdown for dynamic strategy
             if len(cumulative_captures) > 0:
@@ -11047,58 +11028,31 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             metrics = {'Ticker': ticker, 'Triggers': trigger_days}
 
             if trigger_days > 0:
-                signal_captures = daily_captures[buy_mask | short_mask]
-                wins = int((signal_captures > 0).sum())
-                losses = trigger_days - wins
-                win_ratio = round((wins / trigger_days * 100), 2) if trigger_days > 0 else 0.0
+                # Spec §13–§17: route through canonical_scoring.
+                _trig_mask = buy_mask | short_mask
+                _score = _canonical_score_captures(
+                    daily_captures, _trig_mask,
+                    risk_free_rate=5.0, periods_per_year=252, ddof=1,
+                )
 
-                # Compute raw (unrounded) values for the captures:
-                raw_avg_daily = signal_captures.mean() if trigger_days > 0 else 0.0
+                # Display total uses the cumulative final value (numerically
+                # equivalent to canonical total_capture for canonical capture
+                # series).
                 raw_total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0.0
 
-                # Compute standard deviation with ddof=1 for sample std if we have more than 1 trigger day:
-                raw_std_dev = signal_captures.std(ddof=1) if trigger_days > 1 else 0.0
-
-                # Sharpe ratio logic (annualized), using raw values first:
-                risk_free_rate = 5.0  # 5% annual
-                annualized_return = raw_avg_daily * 252
-                annualized_std = raw_std_dev * np.sqrt(252) if raw_std_dev > 0 else 0.0
-                raw_sharpe = 0.0
-                if annualized_std > 0:
-                    raw_sharpe = (annualized_return - risk_free_rate) / annualized_std
-
-                # Calculate t-stat and p-value with raw values:
-                if trigger_days > 1 and raw_std_dev > 0:
-                    t_statistic_val = raw_avg_daily / (raw_std_dev / np.sqrt(trigger_days))
-                    dfreedom = trigger_days - 1
-                    # Spec §17: numerically stable t.sf form.
-                    p_val = 2 * stats.t.sf(abs(t_statistic_val), df=dfreedom)
-                    # Now round:
-                    t_statistic = round(t_statistic_val, 4)
-                    p_value = round(p_val, 4)
-                else:
-                    t_statistic = None
-                    p_value = None
-
-                # Finally, round or format the metrics for display:
-                avg_daily_capture = round(raw_avg_daily, 4)
-                total_capture = round(raw_total_capture, 4)
-                std_dev = round(raw_std_dev, 4)
-                sharpe_ratio = round(raw_sharpe, 2)
-
                 metrics.update({
-                    'Wins': wins,
-                    'Losses': losses,
-                    'Win %': win_ratio,
-                    'StdDev %': std_dev,
-                    'Sharpe': sharpe_ratio,
-                    't': t_statistic if t_statistic is not None else 'N/A',
-                    'p': p_value if p_value is not None else 'N/A',
-                    'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                    'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                    'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                    'Avg Cap %': avg_daily_capture,
-                    'Total %': total_capture
+                    'Wins': _score.wins,
+                    'Losses': _score.losses,
+                    'Win %': round(_score.win_rate, 2),
+                    'StdDev %': round(_score.std_dev, 4),
+                    'Sharpe': round(_score.sharpe, 2),
+                    't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+                    'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+                    'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+                    'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+                    'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+                    'Avg Cap %': round(_score.avg_daily_capture, 4),
+                    'Total %': round(float(raw_total_capture), 4),
                 })
             else:
                 metrics.update({
@@ -11601,51 +11555,32 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
 
         cumulative_captures = pd.Series(cap, index=daily_returns.index).cumsum()
 
-        # Prepare metrics
-        trigger_days = (buy_mask | short_mask).sum()
-        wins = (cap > 0).sum()
-        losses = (cap <= 0).sum()
-        win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-        # Calculate metrics only on trigger days (buy or short)
+        # Spec §13–§17: route through canonical_scoring. Ledger Entry 2
+        # (the ddof=1 site at this block) is now naturally enforced by
+        # the canonical scoring module rather than an inline override.
         trigger_mask = buy_mask | short_mask
-        avg_daily_capture = cap[trigger_mask].mean() if trigger_days > 0 else 0
+        _score = _canonical_score_captures(
+            pd.Series(cap, index=daily_returns.index),
+            pd.Series(trigger_mask, index=daily_returns.index),
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
         total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0
-        # ddof=1 sample std per spec v0.5 §16. `cap` is a NumPy array,
-        # so the implicit default would have been ddof=0; this is a
-        # numeric correction (Phase 1B Intentional Delta Ledger entry 2).
-        std_dev = cap[trigger_mask].std(ddof=1) if trigger_days > 1 else 0
-        # Ensure losses is calculated correctly
-        losses = trigger_days - wins  # This ensures losses + wins = trigger_days
-
-        risk_free_rate = 5.0  # 5% annual rate
-        daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
-        sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
-        # Calculate statistical significance (spec §17: numerically stable t.sf form)
-        if trigger_days > 1 and std_dev > 0:
-            t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-            degrees_of_freedom = trigger_days - 1
-            p_value = 2 * stats.t.sf(abs(t_statistic), df=degrees_of_freedom)
-            t_statistic = round(t_statistic, 4)
-            p_value = round(p_value, 4)
-        else:
-            t_statistic = None
-            p_value = None
 
         metrics_data.append({
             'Ticker': secondary_ticker,
-            'Triggers': int(trigger_days),
-            'Wins': int(wins),
-            'Losses': int(losses),
-            'Win %': round(win_ratio, 2),
-            'StdDev %': round(std_dev, 4),
-            'Sharpe': round(sharpe_ratio, 2),
-            't': t_statistic if t_statistic is not None else 'N/A',
-            'p': p_value if p_value is not None else 'N/A',
-            'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-            'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-            'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-            'Avg Cap %': round(avg_daily_capture, 4),
-            'Total %': round(total_capture, 4)
+            'Triggers': _score.trigger_days,
+            'Wins': _score.wins,
+            'Losses': _score.losses,
+            'Win %': round(_score.win_rate, 2),
+            'StdDev %': round(_score.std_dev, 4),
+            'Sharpe': round(_score.sharpe, 2),
+            't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+            'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+            'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+            'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+            'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+            'Avg Cap %': round(_score.avg_daily_capture, 4),
+            'Total %': round(float(total_capture), 4)
         })
 
         # Add trace to figure
@@ -12530,57 +12465,35 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 daily_captures = pd.Series(cap, index=daily_returns.index)
 
                 # Calculate metrics
-                trigger_days = (buy_mask | short_mask).sum()
-                if trigger_days == 0:
+                trigger_mask = buy_mask | short_mask
+                if int(trigger_mask.sum()) == 0:
                     pbar.update(1)
                     continue  # Skip combinations with no triggers
 
-                # Calculate wins and losses
-                trigger_captures = daily_captures[buy_mask | short_mask]
-                wins = (trigger_captures > 0).sum()
-                losses = trigger_days - wins
-                win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-
-                # Calculate performance metrics
-                avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
-                total_capture = trigger_captures.sum() if trigger_days > 0 else 0
-                std_dev = trigger_captures.std() if trigger_days > 0 else 0
-
-                # Calculate Sharpe ratio
-                risk_free_rate = 5.0  # 5% annual rate
-                daily_rf_rate = risk_free_rate / 252
-                annualized_return = avg_daily_capture * 252
-                annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
-                sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
-
-                # Calculate statistical significance (spec §17: numerically stable t.sf form)
-                if trigger_days > 1 and std_dev > 0:
-                    t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-                    degrees_of_freedom = trigger_days - 1
-                    p_value = 2 * stats.t.sf(abs(t_statistic), df=degrees_of_freedom)
-                    t_statistic = round(t_statistic, 4)
-                    p_value = round(p_value, 4)
-                else:
-                    t_statistic = None
-                    p_value = None
+                # Spec §13–§17: route through canonical_scoring.
+                _score = _canonical_score_captures(
+                    daily_captures,
+                    pd.Series(trigger_mask, index=daily_returns.index),
+                    risk_free_rate=5.0, periods_per_year=252, ddof=1,
+                )
 
                 # Store results
                 results_list.append({
                     'id': idx,  # Add a unique identifier
                     'Combination': combination_labels[idx],
-                    'Triggers': int(trigger_days),
-                    'Wins': int(wins),
-                    'Losses': int(losses),
-                    'Win %': round(win_ratio, 2),
-                    'StdDev %': round(std_dev, 4),
-                    'Sharpe': round(sharpe_ratio, 2),
-                    't': t_statistic if t_statistic is not None else 'N/A',
-                    'p': p_value if p_value is not None else 'N/A',
-                    'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                    'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                    'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                    'Avg Cap %': round(avg_daily_capture, 4),
-                    'Total %': round(total_capture, 4)
+                    'Triggers': _score.trigger_days,
+                    'Wins': _score.wins,
+                    'Losses': _score.losses,
+                    'Win %': round(_score.win_rate, 2),
+                    'StdDev %': round(_score.std_dev, 4),
+                    'Sharpe': round(_score.sharpe, 2),
+                    't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+                    'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+                    'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+                    'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+                    'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+                    'Avg Cap %': round(_score.avg_daily_capture, 4),
+                    'Total %': round(_score.total_capture, 4)
                 })
 
                 # Update progress bar

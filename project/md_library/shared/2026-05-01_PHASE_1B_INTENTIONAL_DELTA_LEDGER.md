@@ -24,6 +24,22 @@ read the ledger and understand what changed and why.
 Reference inventory:
   project/md_library/shared/2026-05-01_PHASE_1B_IMPLEMENTATION_INVENTORY.md
 
+Canonical-scoring delegation amendment (1B-2A, post-32c6242):
+  In addition to the formula-law deltas captured in Entries 1–10,
+  every engine metric helper in stackbuilder, confluence,
+  trafficflow, onepass, impactsearch, and spymaster now routes
+  through `project/canonical_scoring.py` (`score_captures` /
+  `score_signals`). Inline Sharpe / t-stat / p-value / std /
+  win-rate / trigger-counting math has been removed from the
+  engines (see grep verification in the amendment commit
+  messages). The delegation is bit-equivalent for the synthetic
+  Phase 1A fixtures pinned by `test_phase1a_baseline_lock.py` —
+  no Phase 1A snapshot moved as a result of this delegation.
+  The single-arg `stackbuilder.metrics_from_captures(captures)`
+  fallback retains its `captures.ne(0.0)` legacy mask as
+  documented deprecated compatibility-only; canonical callers
+  pass an explicit `trigger_mask`.
+
 ---
 
 ## Entry 1: Adj Close removal
@@ -164,9 +180,18 @@ Reference inventory:
     scoring site computes std on a NumPy array and therefore
     silently uses ddof = 0 today. This entry harmonizes that one
     site numerically; the others are clarity-only.
-  - Status: implemented for `spymaster.py:11668` (commit 56b0338);
-    canonical-scoring wiring of remaining clarity-only sites still
-    pending in this PR.
+  - Status: implemented for `spymaster.py:11668` (commit 56b0338).
+    The 1B-2A canonical-scoring delegation amendment (Commit 5
+    of the amendment) routes the metric block at line 11668
+    through `canonical_scoring.score_captures` directly; the
+    inline `cap[trigger_mask].std(ddof=1)` line is removed in
+    favor of the delegation, which always uses `ddof=1` by
+    spec §16 default. Behavior is preserved (numerically
+    equivalent); the implementation path moves from inline math
+    to canonical scoring. The remaining six clarity-only pandas
+    Series sites in spymaster (1481, 1542, 8873, 8920, 10605,
+    12601) are utility-display sites outside the canonical
+    scoring chain and stay as-is.
 
 ## Entry 3: cdf -> sf p-value
 
