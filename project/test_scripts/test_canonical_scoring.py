@@ -353,3 +353,324 @@ def test_normalize_signal_series_handles_integer_codes_and_garbage():
     raw = pd.Series([1, -1, 0, "Buy", "  Short  ", "junk", None], dtype=object)
     out = normalize_signal_series(raw)
     assert list(out.values) == ["Buy", "Short", "None", "Buy", "Short", "None", "None"]
+
+
+# ===========================================================================
+# Phase 2B-1 expansion: edge-case synthetic correctness (C1-C13)
+# ===========================================================================
+#
+# Each test below pins a concrete edge case in the canonical scoring
+# contract, with assertions on CanonicalScore fields directly (not
+# legacy display dicts) so any future deviation surfaces here.
+# ---------------------------------------------------------------------------
+
+
+# C1 -------------------------------------------------------------------------
+
+def test_c1_score_signals_empty_series():
+    """Empty signals + empty returns -> zero-state contract."""
+    empty_idx = pd.DatetimeIndex([])
+    sig = pd.Series([], index=empty_idx, dtype=object)
+    ret = pd.Series([], index=empty_idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 0
+    assert s.wins == 0
+    assert s.losses == 0
+    assert s.win_rate == 0.0
+    assert s.avg_daily_capture == 0.0
+    assert s.total_capture == 0.0
+    assert s.std_dev == 0.0
+    assert s.sharpe == 0.0
+    assert s.t_statistic is None
+    assert s.p_value is None
+
+
+# C2 -------------------------------------------------------------------------
+
+def test_c2_score_signals_all_nan_returns():
+    """All-NaN return series with valid signals.
+
+    canonical_scoring.score_signals coerces NaN returns to 0
+    via fillna(0.0) (see _captures_from_signals_decimal). With
+    all-zero captures, trigger_days remains the count of
+    Buy/Short days, but wins=0 (no positive captures), losses
+    equals trigger_days, std_dev=0, sharpe=0, t_stat=None,
+    p_value=None.
+    """
+    idx = DATES_5
+    sig = pd.Series(["Buy", "Buy", "Short", "Short", "None"], index=idx)
+    ret = pd.Series([np.nan] * 5, index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 4
+    assert s.wins == 0
+    assert s.losses == 4
+    assert s.win_rate == 0.0
+    assert s.avg_daily_capture == 0.0
+    assert s.total_capture == 0.0
+    assert s.std_dev == 0.0
+    assert s.sharpe == 0.0
+    assert s.t_statistic is None
+    assert s.p_value is None
+
+
+# C3 -------------------------------------------------------------------------
+
+def test_c3_score_signals_all_nan_signals():
+    """All-NaN signal series -> all coerced to 'None' -> zero state."""
+    idx = DATES_5
+    sig = pd.Series([np.nan] * 5, index=idx, dtype=float)
+    ret = pd.Series([0.01] * 5, index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 0
+    assert s.wins == 0
+    assert s.losses == 0
+    assert s.t_statistic is None
+    assert s.p_value is None
+
+
+# C4 -------------------------------------------------------------------------
+
+def test_c4_score_captures_mask_reindex_missing_dates():
+    """trigger_mask has dates not in daily_capture index.
+
+    score_captures reindexes the mask to daily_capture.index with
+    fillna(False); dates absent from daily_capture simply don't
+    appear in the trigger set.
+    """
+    idx_caps = DATES_5
+    cap = pd.Series([0.5, -0.3, 0.0, 0.7, 0.1], index=idx_caps, dtype=float)
+    # Mask has only 3 dates from idx_caps PLUS 2 unrelated dates.
+    extra_idx = pd.DatetimeIndex(["2025-01-02", "2025-01-03"])
+    mask_idx = idx_caps[:3].append(extra_idx)
+    mask = pd.Series([True, True, True, True, True], index=mask_idx)
+    s = score_captures(cap, mask)
+    # Only the first 3 caps days are triggers; days 3, 4 default to
+    # False because they're not in mask.index after reindex.
+    assert s.trigger_days == 3
+
+
+# C5 -------------------------------------------------------------------------
+
+def test_c5_score_captures_mask_reindex_extra_dates():
+    """daily_capture has dates not in trigger_mask index -> non-trigger."""
+    idx = DATES_5
+    cap = pd.Series([0.5, -0.3, 0.0, 0.7, 0.1], index=idx, dtype=float)
+    # Mask only covers the first 2 dates; dates 2-4 should be False.
+    mask = pd.Series([True, True], index=idx[:2])
+    s = score_captures(cap, mask)
+    assert s.trigger_days == 2
+
+
+# C6 -------------------------------------------------------------------------
+
+def test_c6_score_signals_std_zero_all_identical_captures():
+    """All trigger captures identical -> std=0 -> sharpe=0, no t/p."""
+    idx = DATES_5
+    sig = pd.Series(["Buy"] * 5, index=idx)
+    # Constant return -> constant capture -> std=0.
+    ret = pd.Series([0.005] * 5, index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 5
+    assert s.std_dev == 0.0
+    assert s.sharpe == 0.0
+    assert s.t_statistic is None
+    assert s.p_value is None
+
+
+# C7 -------------------------------------------------------------------------
+
+def test_c7_score_signals_std_epsilon_stable():
+    """Tiny but nonzero variance -> Sharpe computes without
+    numerical instability."""
+    idx = DATES_10
+    sig = pd.Series(["Buy"] * 10, index=idx)
+    # Captures with std on the order of 1e-9 % points.
+    base = 0.001
+    eps_returns = [base + (i - 4.5) * 1e-12 for i in range(10)]
+    ret = pd.Series(eps_returns, index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 10
+    assert s.std_dev > 0.0
+    assert math.isfinite(s.std_dev)
+    assert math.isfinite(s.sharpe)
+    assert math.isfinite(s.t_statistic)
+    assert math.isfinite(s.p_value)
+    assert 0.0 <= s.p_value <= 1.0
+
+
+# C8 -------------------------------------------------------------------------
+
+def test_c8_score_signals_all_buy_triggers():
+    """Every day Buy -> trigger_days = total days."""
+    idx = DATES_10
+    sig = pd.Series(["Buy"] * 10, index=idx)
+    ret = pd.Series([0.001 * (i + 1) for i in range(10)], index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 10
+
+
+# C9 -------------------------------------------------------------------------
+
+def test_c9_score_signals_all_wins():
+    """All trigger captures positive -> wins = trigger_days."""
+    idx = DATES_5
+    sig = pd.Series(["Buy"] * 5, index=idx)
+    ret = pd.Series([0.005, 0.003, 0.007, 0.001, 0.009], index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 5
+    assert s.wins == 5
+    assert s.losses == 0
+    assert s.win_rate == 100.0
+
+
+# C10 ------------------------------------------------------------------------
+
+def test_c10_score_signals_all_losses():
+    """All trigger captures negative -> wins=0, losses=trigger_days."""
+    idx = DATES_5
+    sig = pd.Series(["Buy"] * 5, index=idx)
+    ret = pd.Series([-0.005, -0.003, -0.007, -0.001, -0.009], index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 5
+    assert s.wins == 0
+    assert s.losses == 5
+    assert s.win_rate == 0.0
+
+
+# C11 ------------------------------------------------------------------------
+
+def test_c11_zero_capture_trigger_days_count_as_losses():
+    """All trigger captures exactly 0 -> wins=0, losses=trigger_days.
+
+    Regression seal for ledger Entry 4 (zero-capture trigger day
+    counting). Spec §15: zero-return days under an active position
+    are still trigger days and count as losses.
+    """
+    idx = DATES_5
+    sig = pd.Series(["Buy"] * 5, index=idx)
+    ret = pd.Series([0.0] * 5, index=idx, dtype=float)
+    s = score_signals(sig, ret)
+    assert s.trigger_days == 5
+    assert s.wins == 0
+    assert s.losses == 5
+    assert s.win_rate == 0.0
+    assert s.std_dev == 0.0
+    assert s.sharpe == 0.0
+    assert s.t_statistic is None
+    assert s.p_value is None
+
+
+# C12 ------------------------------------------------------------------------
+
+def test_c12_p_value_cdf_underflow_vs_sf_nonzero():
+    """Extreme |t| where cdf underflows to 1.0 (giving p=0 by
+    subtraction) but sf produces a tiny but nonzero p.
+
+    Regression seal for ledger Entry 3 (cdf -> sf p-value).
+    """
+    big_t = 25.0
+    df_n = 50
+    cdf_form = 2.0 * (1.0 - _scipy_stats.t.cdf(abs(big_t), df=df_n))
+    sf_form = 2.0 * _scipy_stats.t.sf(abs(big_t), df=df_n)
+    # cdf-form numerically underflows; sf-form produces a tiny
+    # nonzero value. Canonical scoring uses sf, so p should be
+    # nonzero.
+    assert cdf_form == 0.0
+    assert 0.0 < sf_form < 1e-20
+
+    # Drive score_captures to a nontrivial check at boundary
+    # conditions: small std, large mean -> very large |t|.
+    # Build captures whose t-stat exceeds ~25 with df=50.
+    np.random.seed(2024)
+    base_cap = 1.0  # 1 % point per day
+    eps = 1e-3
+    caps_arr = base_cap + eps * np.random.RandomState(0).standard_normal(51)
+    idx = pd.bdate_range("2024-01-02", periods=51)
+    caps = pd.Series(caps_arr, index=idx, dtype=float)
+    mask = pd.Series([True] * 51, index=idx)
+    s = score_captures(caps, mask)
+    # The canonical p-value is the sf form; it must be a finite,
+    # non-None, very-small but nonzero float.
+    assert s.p_value is not None
+    assert math.isfinite(s.p_value)
+    assert s.p_value > 0.0
+
+
+# C13 ------------------------------------------------------------------------
+
+def _direction_to_signal(direction: str, base_signal: str) -> str:
+    """Apply direction tag to a base signal: D leaves it, I swaps,
+    M (mute) replaces with None."""
+    if direction == "M":
+        return "None"
+    if direction == "D":
+        return base_signal
+    if direction == "I":
+        return {"Buy": "Short", "Short": "Buy", "None": "None"}[base_signal]
+    raise ValueError(direction)
+
+
+def _expected_consensus(signals: list[str]) -> str:
+    """Spec §18: agreement -> that signal; disagreement or all-None -> None."""
+    nonzero = [s for s in signals if s != "None"]
+    if not nonzero:
+        return "None"
+    if all(s == nonzero[0] for s in nonzero):
+        return nonzero[0]
+    return "None"
+
+
+@pytest.mark.parametrize("n_primaries", [2, 3, 4, 5])
+def test_c13_consensus_DI_mute_combinations(n_primaries):
+    """Parametrized across {D, I, M} combinations for N primaries.
+
+    Strategy: rather than enumerating 3^N (243 at N=5) full grids,
+    pin a representative subset that covers every distinct shape
+    of agreement / disagreement / muting:
+      - all-D-Buy (unanimous Buy)
+      - all-D-Short (unanimous Short)
+      - all-I-Buy (unanimous Buy after inversion)
+      - all-M (everyone muted -> None)
+      - mixed: half D, half I against same base (cancel -> None)
+      - one-disagree: N-1 agree on Buy, one disagrees with Short
+      - one-mute among unanimous: N-1 D-Buy, one mute (still Buy)
+      - all-different: N members each with a distinct direction
+        cycling through D/I/M (where applicable)
+
+    For each shape, build a signal frame at one date and assert
+    combine_consensus_signals matches spec §18.
+    """
+    idx = pd.DatetimeIndex(["2024-01-02"])
+
+    cases = []  # list of (direction_list, base_signal, label)
+    cases.append((["D"] * n_primaries, "Buy", "all-D-Buy"))
+    cases.append((["D"] * n_primaries, "Short", "all-D-Short"))
+    cases.append((["I"] * n_primaries, "Buy", "all-I-Buy-(=Short)"))
+    cases.append((["M"] * n_primaries, "Buy", "all-M"))
+    # half D + half I against Buy base -> half Buy + half Short -> None
+    half_d = ["D"] * (n_primaries // 2)
+    half_i = ["I"] * (n_primaries - n_primaries // 2)
+    cases.append((half_d + half_i, "Buy", "half-D-half-I"))
+    # one disagree: N-1 D-Buy, last one I-Buy (=Short)
+    cases.append((["D"] * (n_primaries - 1) + ["I"], "Buy", "one-disagree"))
+    # one-mute among unanimous D-Buy
+    cases.append((["D"] * (n_primaries - 1) + ["M"], "Buy", "one-mute-rest-Buy"))
+    # cycling D/I/M (covers mixed-direction cases at higher N)
+    cycle = ["D", "I", "M"]
+    cases.append(([cycle[i % 3] for i in range(n_primaries)], "Buy", "DIM-cycle"))
+
+    for directions, base, label in cases:
+        member_signals = [
+            pd.Series([_direction_to_signal(d, base)], index=idx)
+            for d in directions
+        ]
+        consensus = combine_consensus_signals(member_signals)
+        actual = consensus.iloc[0]
+
+        expected = _expected_consensus(
+            [_direction_to_signal(d, base) for d in directions]
+        )
+        assert actual == expected, (
+            f"[N={n_primaries}, {label}] directions={directions} "
+            f"base={base} -> consensus={actual!r} (expected {expected!r})"
+        )
