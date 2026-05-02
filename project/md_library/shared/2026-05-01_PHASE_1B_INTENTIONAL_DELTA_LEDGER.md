@@ -502,20 +502,40 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
 ## Entry 8: sentinel pair standardization
 
   - Type: BUG-FIX
-  - Old behavior: TBD in 1B-2 (see inventory §8; the dead streaming
-    path uses `(1, 2)` / `(2, 1)`; live vectorized / leader
-    fallback uses `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` /
-    `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`).
-  - New behavior: TBD in 1B-2 (single MAX-SMA sentinel everywhere;
-    largely a side effect of removing the dead streaming path —
-    inventory §16).
-  - Affected tests/snapshots: TBD in 1B-2.
+  - Old behavior: see inventory §8. The dead streaming path in
+    Spymaster used `(1, 2)` for buy and `(2, 1)` for short as
+    sentinel placeholders, while the live vectorized / leader
+    fallback used `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` /
+    `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`. OnePass init/fallback sites
+    used the buy sentinel for short. TrafficFlow used `(1, 2)`
+    for both buy and short fallbacks.
+  - New behavior, two-stage:
+      Stage 1 (this commit, Spymaster): the dead streaming path
+      and its `(1, 2)` / `(2, 1)` sentinels are removed entirely
+      from `spymaster.py`. The streaming function definition,
+      the `use_streaming = False` flag, the
+      `_compute_daily_top_pairs_streaming()` body, the
+      `if use_streaming:` branch, and the related `work_estimate`
+      log line are gone. Vectorized path is the only path.
+      Stage 2 (next commit, OnePass + TrafficFlow): short-sentinel
+      sites in OnePass switch to `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`;
+      TrafficFlow `(1, 2)` fallback replaced with the canonical
+      MAX-SMA-1 form.
+  - Affected tests:
+      Stage 1: new `test_dead_streaming_path_removed.py` asserts
+      the function definition is gone, the `use_streaming` flag
+      is gone, the vectorized call remains, and no
+      `(1, 2) / (2, 1)` sentinel literals remain as fallback
+      assignments in `spymaster.py`.
+      Stage 2: see Entry 8 stage-2 commit notes.
   - ELI5: when the engine has no valid pair to choose on a given
-    day, it inserts a placeholder pair so downstream code does not
-    crash. Today the placeholder differs depending on which code
-    path inserted it. After this entry, there is one placeholder
-    everywhere, matching what `MAX_SMA_DAY` already chose.
-  - Status: stub, pending 1B-2.
+    day, it inserts a placeholder pair so downstream code does
+    not crash. Three different placeholders existed across the
+    engines (`(1, 2)`, `(2, 1)`, `(MAX_SMA_DAY, MAX_SMA_DAY - 1)`).
+    After this entry, every engine uses the MAX-SMA form.
+  - Status: stage 1 (Spymaster dead streaming path removal)
+    implemented in 1B-2B. Stage 2 (OnePass + TrafficFlow short
+    sentinels) lands in the next commit on this PR.
 
 ## Entry 9: TrafficFlow cache key normalization
 

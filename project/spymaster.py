@@ -4770,61 +4770,12 @@ def _precompute_results_impl(ticker, event, cancel_event=None):
                 sma_matrix[:, k - 1] = df[f'SMA_{k}'].values
 
             total_pairs = max_sma_day * (max_sma_day - 1)
-            # Decide approach; threshold keeps streaming only for truly small problems
-            work_estimate = int(len(dates)) * int(total_pairs)
-            use_streaming = False  # force vectorized path for correctness on small tickers
+            # Phase 1B-2B: dead streaming path removed. The streaming
+            # implementation was always disabled (use_streaming=False)
+            # and used non-canonical (1,2)/(2,1) sentinels per
+            # spec §appendix. Vectorized path is the only path now.
 
-            # -- Streaming (tiny problems): O(days * SMA^2), tiny only
-            def _compute_daily_top_pairs_streaming():
-                nonlocal daily_top_buy_pairs, daily_top_short_pairs
-                for day_idx in range(len(dates)):
-                    # Cooperative cancellation
-                    if (day_idx % CANCEL_POLL_EVERY_DAY) == 0:
-                        _check_cancel(f"streaming day {day_idx}")
-
-                    if day_idx == 0:
-                        daily_top_buy_pairs[dates[day_idx]] = ((1, 2), 0.0)
-                        daily_top_short_pairs[dates[day_idx]] = ((2, 1), 0.0)
-                        continue
-
-                    best_buy_capture = -np.inf
-                    best_buy_pair = None
-                    best_short_capture = -np.inf
-                    best_short_pair = None
-                    # Single-day increment in percent (consistent with vectorized path)
-                    today_return = float(returns[day_idx]) * 100.0
-
-                    # Only check cancel on the outer SMA loop to keep overhead low
-                    for i in range(1, max_sma_day + 1):
-                        if (i % 50) == 0:
-                            _check_cancel(f"streaming day {day_idx}, i={i}")
-
-                        for j in range(1, max_sma_day + 1):
-                            if i == j:
-                                continue
-
-                            sma_i_prev = sma_matrix[day_idx - 1, i - 1]
-                            sma_j_prev = sma_matrix[day_idx - 1, j - 1]
-                            if np.isnan(sma_i_prev) or np.isnan(sma_j_prev):
-                                continue
-
-                            if sma_i_prev > sma_j_prev:
-                                # Compare the *single-day* increment for BUY
-                                candidate = today_return
-                                if candidate >= best_buy_capture:
-                                    best_buy_capture = candidate
-                                    best_buy_pair = (i, j)
-                            elif sma_i_prev < sma_j_prev:
-                                # Compare the *single-day* increment for SHORT
-                                candidate = -today_return
-                                if candidate >= best_short_capture:
-                                    best_short_capture = candidate
-                                    best_short_pair = (i, j)
-
-                    daily_top_buy_pairs[dates[day_idx]] = (best_buy_pair or (1, 2), float(best_buy_capture if np.isfinite(best_buy_capture) else 0.0))
-                    daily_top_short_pairs[dates[day_idx]] = (best_short_pair or (2, 1), float(best_short_capture if np.isfinite(best_short_capture) else 0.0))
-
-            # -- Chunked vectorized (default path; fast and memory-aware)
+            # -- Chunked vectorized (only path; fast and memory-aware)
             def _compute_daily_top_pairs_vectorized():
                 nonlocal daily_top_buy_pairs, daily_top_short_pairs
                 
@@ -4946,11 +4897,7 @@ def _precompute_results_impl(ticker, event, cancel_event=None):
                     daily_top_buy_pairs[dates[d]] = ((int(buy_best_pair[d, 0]), int(buy_best_pair[d, 1])), float(buy_best_val[d]))
                     daily_top_short_pairs[dates[d]] = ((int(short_best_pair[d, 0]), int(short_best_pair[d, 1])), float(short_best_val[d]))
 
-            if use_streaming:
-                logger.debug(f"Using streaming approach: days={len(dates)}, pairs={total_pairs} (≈{work_estimate:,} ops)")
-                _compute_daily_top_pairs_streaming()
-            else:
-                _compute_daily_top_pairs_vectorized()
+            _compute_daily_top_pairs_vectorized()
 
             section_times['SMA Pairs Processing'] = _now_secs() - pair_t0
             write_status(ticker, {"status": "processing", "progress": 50, "cache_status": "stale"})
