@@ -132,6 +132,94 @@ def write_signal_library(
     return out
 
 
+def build_poison_price_series(
+    *,
+    length: int = 150,
+    poison_day: int = 120,
+    poison_value: float = 1e6,
+    base: float = 100.0,
+    drift: float = 0.0005,
+    seed: int = 7,
+    start: str = "2024-01-02",
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Build matched (un-poisoned, poisoned) price DataFrames.
+
+    Phase 2B-1 lookahead poison fixture.
+
+    Returns (df_clean, df_poisoned, poison_idx). Both DataFrames
+    share index and columns; only ``Close`` at ``poison_day``
+    differs. ``length`` defaults to 150 business days so SMA_113
+    and SMA_114 are well-defined by ``poison_day=120``.
+
+    The poison value is intentionally extreme (1e6) so any
+    lookahead bug — i.e. any path where day-T's signal depends
+    on day-T's Close — produces an obviously different signal.
+    """
+    if poison_day >= length:
+        raise ValueError(f"poison_day ({poison_day}) must be < length ({length})")
+    rng = np.random.default_rng(seed)
+    pct = rng.normal(loc=drift, scale=0.005, size=length)
+    closes = base * np.cumprod(1.0 + pct)
+    dates = pd.bdate_range(start=start, periods=length)
+    df_clean = pd.DataFrame({"Close": closes}, index=dates)
+    closes_poisoned = closes.copy()
+    closes_poisoned[poison_day] = poison_value
+    df_poisoned = pd.DataFrame({"Close": closes_poisoned}, index=dates)
+    return df_clean, df_poisoned, poison_day
+
+
+def make_synthetic_interval_library(
+    library_dir: Path,
+    *,
+    ticker: str = "AAA",
+    intervals: Sequence[str] = ("1d", "1wk", "1mo", "3mo", "1y"),
+    n_bars: int = 30,
+    engine_version: str = "1.0.0",
+) -> Dict[str, Path]:
+    """Phase 2B-1: write synthetic interval libraries for confluence.
+
+    Filenames match `signal_library.confluence_analyzer.load_signal_library_interval`:
+      1d:    ``<ticker>_stable_v{ver}.pkl``
+      else:  ``<ticker>_stable_v{ver}_{interval}.pkl``
+    where ``ver`` is ENGINE_VERSION with dots replaced by underscores
+    (e.g. ``1_0_0``).
+
+    Each library uses the canonical-sentinel
+    `make_signal_library_dict` builder; the per-interval index is a
+    business-day index of length ``n_bars``. Returns a dict mapping
+    interval -> on-disk path.
+    """
+    library_dir.mkdir(parents=True, exist_ok=True)
+    ver_tag = engine_version.replace(".", "_")
+    paths: Dict[str, Path] = {}
+    for interval in intervals:
+        if interval == "1d":
+            fname = f"{ticker}_stable_v{ver_tag}.pkl"
+        else:
+            fname = f"{ticker}_stable_v{ver_tag}_{interval}.pkl"
+        # Use a per-interval rolling start so the synthetic indices
+        # share the same trailing date but legitimately differ on
+        # earlier ones.
+        dates = pd.bdate_range(end="2024-12-30", periods=n_bars, freq="B")
+        # Cycle Buy/Short/None so confluence/alignment has non-trivial
+        # input.
+        sigs = [["Buy", "Short", "None"][i % 3] for i in range(n_bars)]
+        lib = make_signal_library_dict(
+            dates,
+            engine_version=engine_version,
+            primary_signals=sigs,
+        )
+        # confluence_analyzer normalizes 'signals' / 'dates' keys.
+        lib["signals"] = list(sigs)
+        lib["interval"] = interval
+        lib["ticker"] = ticker
+        out = library_dir / fname
+        with open(out, "wb") as fh:
+            pickle.dump(lib, fh)
+        paths[interval] = out
+    return paths
+
+
 def make_synthetic_pkl_for_spymaster(
     dates: pd.DatetimeIndex,
     *,
