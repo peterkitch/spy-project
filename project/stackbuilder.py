@@ -72,7 +72,7 @@ DEFAULT_IMPACT_XLSX_DIR = os.environ.get(
 )
 # output format default; can be overridden by --output-format
 OUTPUT_FORMAT = os.environ.get("STACKBUILDER_OUTPUT_FORMAT", "xlsx").lower()
-DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
+DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
 # runtime-mutable signal dir (set in main from CLI)
 SIGNAL_LIB_DIR_RUNTIME = DEFAULT_SIGNAL_LIB_DIR
 
@@ -1484,8 +1484,13 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         pass
 
     start_time = time.time()
-    # Enforce strict calendar by default for parity with spymaster
-    os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(getattr(args, 'grace_days', 0) or 0)
+    # Phase 1B-2B: respect args.grace_days when explicitly set, otherwise
+    # leave IMPACT_CALENDAR_GRACE_DAYS untouched so DEFAULT_GRACE_DAYS=10
+    # (spec §20) governs. Previously this line forced grace to 0 when
+    # args.grace_days was unset, defeating the default.
+    _grace_override = getattr(args, 'grace_days', None)
+    if _grace_override is not None:
+        os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(_grace_override)
     primaries_df, sec_rets, vendor_secondary = phase1_preflight(args, secondary, specified_primaries)
     ts = now_ts()
     # Clean secondary name for filesystem, but preserve '^' (safe on NTFS) per design

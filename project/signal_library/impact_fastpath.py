@@ -79,7 +79,7 @@ def _pickle_load_compat(file_obj):
 IMPACT_TRUST_LIBRARY = os.environ.get("IMPACT_TRUST_LIBRARY", "0").lower() in ("1", "true", "on", "yes")
 IMPACT_TRUST_MAX_AGE_HOURS = int(os.environ.get("IMPACT_TRUST_MAX_AGE_HOURS", "168"))
 PERSIST_SKIP_BARS_IMPACT = int(os.environ.get("PERSIST_SKIP_BARS", "1"))  # match OnePass T-1
-IMPACT_CALENDAR_GRACE_DAYS = int(os.environ.get("IMPACT_CALENDAR_GRACE_DAYS", "7"))  # Allow 7-day grace for cross-market holidays
+IMPACT_CALENDAR_GRACE_DAYS = int(os.environ.get("IMPACT_CALENDAR_GRACE_DAYS", "10"))  # spec §20: 10-day default grace for cross-market holidays
 
 # Constants matching onepass.py
 ENGINE_VERSION = "1.0.0"

@@ -309,7 +309,7 @@ print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
       f"IMPACT_TRUST_LIBRARY={IMPACT_TRUST_LIBRARY}  "
       f"price_basis=Close (raw)  "
       f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}  "
-      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','7')}")
+      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','10')}")
 
 # Import parity configuration
 try:
@@ -1961,7 +1961,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             logger.info(f"Processing {prim_ticker}... [FASTPATH: {fp_reason}]")
 
             # Align signals to secondary's index with carry-forward inside grace window
-            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
+            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
             if grace_days > 0:
                 aligned_signals = sig_series.reindex(
                     sec_df.index, method='pad', tolerance=pd.Timedelta(days=grace_days)
@@ -2311,7 +2311,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
 
     # Align primary signals to the SECONDARY calendar with optional grace window
-    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
+    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
     sig_series = pd.Series(primary_signals, index=pd.DatetimeIndex(primary_dates))
     if grace_days > 0:
         aligned = sig_series.reindex(sec_df.index, method='pad',

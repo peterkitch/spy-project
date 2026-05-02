@@ -25,8 +25,9 @@ Per-entry status (1B-2A delivery):
   - Entry 6 (ImpactSearch xlsx duplicate-row dedupe): implemented
     in 1B-2B (PR #133).
   - Entry 7 (calendar grace days default unification to 10):
-    deferred to 1B-2B per scope note (the path-level unification
-    landed in Entry 5).
+    implemented in 1B-2B (PR #133). Phase 2/3 path unification
+    landed in Entry 5 (1B-2A); the default value flip to 10 and
+    the run_for_secondary force-to-zero fix land here.
   - Entry 8 (sentinel pair standardization): deferred to 1B-2B
     (paired with the dead streaming-path removal).
   - Entry 9 (TrafficFlow cache key normalization): implemented
@@ -457,20 +458,46 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
 ## Entry 7: calendar grace days default unification
 
   - Type: EXPECTED-BY-SPEC
-  - Old behavior: TBD in 1B-2 (see inventory §9; defaults are
-    split — `7` in impactsearch / stackbuilder / impact_fastpath,
-    `0` at one stackbuilder site, `3` in QC).
-  - New behavior: TBD in 1B-2 (default `10` per spec §20).
-  - Affected tests/snapshots: TBD in 1B-2.
-  - ELI5: trading calendars differ across markets; "grace days" is
-    how far we let a missing day on one calendar pad against the
-    nearest valid day on another. The codebase has at least three
-    different defaults today, which contributes to the StackBuilder
-    Phase 2 vs Phase 3 divergence above. The spec mandates a
-    single default of 10. Grace days never change computed
-    metrics on overlapping days; they only affect which days
-    count.
-  - Status: stub, pending 1B-2.
+  - Old behavior: defaults were split — `7` in impactsearch
+    (boot-log echo, `_metrics_from_signals` alignment, secondary
+    coercion) and `signal_library/impact_fastpath` (calendar
+    coverage check), `7` for `stackbuilder.DEFAULT_GRACE_DAYS`,
+    and (most damaging) `stackbuilder.run_for_secondary` set
+    `os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(getattr(args,
+    'grace_days', 0) or 0)` which forced grace to 0 for any args
+    without an explicit `grace_days` attribute, defeating
+    `DEFAULT_GRACE_DAYS`. QC sets 3 (deferred per scope note).
+  - New behavior: every non-QC default is now 10 per spec §20:
+      `impactsearch.py:312` boot-log echo default 10.
+      `impactsearch.py:1964` `_metrics_from_signals` alignment
+      default 10.
+      `impactsearch.py:2314` secondary-coercion alignment default
+      10.
+      `signal_library/impact_fastpath.py:82`
+      `IMPACT_CALENDAR_GRACE_DAYS` constant default 10.
+      `stackbuilder.py:75` `DEFAULT_GRACE_DAYS` default 10.
+      `stackbuilder.py:1488-1492`
+      `run_for_secondary` no longer writes
+      `IMPACT_CALENDAR_GRACE_DAYS = 0` when `args.grace_days` is
+      unset; the env var is only set when the caller supplied an
+      explicit grace_days override. `DEFAULT_GRACE_DAYS=10` now
+      governs by default.
+  - Affected tests: new `test_grace_days_default.py`:
+      `test_stackbuilder_default_grace_days_is_10`,
+      `test_impact_fastpath_default_grace_days_is_10`,
+      `test_impactsearch_default_grace_days_is_10` (subprocess
+      probe of boot-log echo),
+      `test_stackbuilder_run_for_secondary_does_not_force_grace_zero`
+      (asserts the env var is untouched when args.grace_days is
+      unset, and is honored when explicitly supplied).
+  - ELI5: trading calendars differ across markets; "grace days"
+    is how far we let a missing day on one calendar pad against
+    the nearest valid day on another. The codebase had at least
+    three different defaults (7 / 0 / 3), which contributed to
+    the StackBuilder Phase 2 vs Phase 3 divergence. The spec
+    mandates a single default of 10. After this entry, every
+    non-QC engine uses 10 by default.
+  - Status: implemented in 1B-2B.
 
 ## Entry 8: sentinel pair standardization
 
