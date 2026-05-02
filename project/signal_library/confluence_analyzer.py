@@ -22,6 +22,10 @@ import pandas as pd
 # Constants
 SIGNAL_LIBRARY_DIR = os.environ.get('SIGNAL_LIBRARY_DIR', 'signal_library/data/stable')
 ENGINE_VERSION = "1.0.0"
+# Phase 2A: canonical sentinel pair per spec §appendix. Used as
+# missing-data fallback when a date is absent from the cached
+# daily_top_*_pairs maps.
+MAX_SMA_DAY = 114
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -71,11 +75,14 @@ def load_signal_library_interval(ticker: str, interval: str) -> Optional[dict]:
                 # Extract dates from daily_top_buy_pairs keys
                 dates = list(spymaster_data['daily_top_buy_pairs'].keys())
 
-                # Generate signals from daily pair maps (SpyMaster's dynamic pairs)
+                # Generate signals from daily pair maps (SpyMaster's dynamic pairs).
+                # Phase 2A: canonical sentinels per spec §appendix; previously
+                # both buy and short used the (114, 113) buy form, which
+                # could gate a tradable signal off finite SMA_113 / SMA_114.
                 signals = []
                 for date in dates:
-                    buy_pair, buy_cap = spymaster_data['daily_top_buy_pairs'].get(date, ((114, 113), 0.0))
-                    short_pair, short_cap = spymaster_data['daily_top_short_pairs'].get(date, ((114, 113), 0.0))
+                    buy_pair, buy_cap = spymaster_data['daily_top_buy_pairs'].get(date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0))
+                    short_pair, short_cap = spymaster_data['daily_top_short_pairs'].get(date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0))
 
                     # Determine signal based on yesterday's top pair (matches SpyMaster logic)
                     if buy_cap > short_cap:

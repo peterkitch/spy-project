@@ -412,9 +412,12 @@ def find_optimal_pairs(df: pd.DataFrame, interval: str) -> Tuple[Tuple[int, int]
 
     for idx in range(num_days):
         if idx == 0:
-            # First day: use sentinel pair (114, 113) matching spymaster
-            daily_top_buy_pairs[df.index[idx]] = ((114, 113), 0.0)
-            daily_top_short_pairs[df.index[idx]] = ((114, 113), 0.0)
+            # First day: canonical sentinels per spec §appendix.
+            # Phase 2A fix: previously used (114, 113) for both,
+            # which let SMA_113 / SMA_114 comparisons gate a tradable
+            # signal once history accumulated.
+            daily_top_buy_pairs[df.index[idx]] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+            daily_top_short_pairs[df.index[idx]] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
             continue
 
         # Use PREVIOUS day's SMAs to generate signals
@@ -620,11 +623,15 @@ def find_optimal_pairs_vectorized(df: pd.DataFrame, interval: str) -> Tuple[Tupl
     top_short_pair = _idx_to_pair(int(shr_best_idx[-1]))
 
     # Combined cumulative capture using dynamic daily pairs (yesterday's winners)
+    # Phase 2A: short sentinel must be (MAX_SMA_DAY - 1, MAX_SMA_DAY) per
+    # spec §appendix; previously this site reused the buy sentinel form
+    # for short, which could gate a tradable signal off finite SMA_113 /
+    # SMA_114 comparisons (same bug class as TrafficFlow / ImpactSearch).
     cumulative = 0.0
     for t in range(1, num_days):
         prev_date = dates[t - 1]
-        (pb_pair, pb_cap) = daily_top_buy_pairs.get(prev_date, ((114, 113), 0.0))
-        (ps_pair, ps_cap) = daily_top_short_pairs.get(prev_date, ((114, 113), 0.0))
+        (pb_pair, pb_cap) = daily_top_buy_pairs.get(prev_date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0))
+        (ps_pair, ps_cap) = daily_top_short_pairs.get(prev_date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0))
         prev = sma_matrix[t - 1]
 
         buy_ok = (np.isfinite(prev[pb_pair[0] - 1]) and
@@ -682,10 +689,11 @@ def generate_signal_series_dynamic(df: pd.DataFrame,
             signals.iloc[idx] = 'None'
             continue
 
-        # Get YESTERDAY's top pairs
+        # Get YESTERDAY's top pairs.
+        # Phase 2A: canonical sentinels per spec §appendix.
         prev_date = df.index[idx - 1]
-        (pb_pair, pb_cap) = daily_top_buy_pairs.get(prev_date, ((114, 113), 0.0))
-        (ps_pair, ps_cap) = daily_top_short_pairs.get(prev_date, ((114, 113), 0.0))
+        (pb_pair, pb_cap) = daily_top_buy_pairs.get(prev_date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0))
+        (ps_pair, ps_cap) = daily_top_short_pairs.get(prev_date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0))
 
         # Use YESTERDAY's SMAs to determine signals
         sma_prev = sma_matrix[idx - 1]

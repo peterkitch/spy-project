@@ -583,9 +583,61 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
           and the two `daily_top_*_pairs.get(...)` calls default
           to canonical MAX-SMA tuples
           (`test_impactsearch_uses_canonical_maxsma_sentinels`).
-  - Status: implemented in 1B-2B (stages 1 and 2). Engine
-    coverage: Spymaster (stage 1) + OnePass + TrafficFlow +
-    ImpactSearch (stage 2).
+  - Stage 3 (signal_library, Phase 2A PR #134):
+      The Phase 2A static regression guard `test_b2_daily_top_pairs_fallbacks_are_canonical`
+      surfaced two more files with the same buy-form-reused-for-short
+      bug:
+        `signal_library/multi_timeframe_builder.py:626-627`
+          (compute_dynamic_combined_capture_vectorized inner loop)
+        `signal_library/multi_timeframe_builder.py:687-688`
+          (generate_signal_series_dynamic per-day fallback)
+        `signal_library/confluence_analyzer.py:77-78`
+          (load_signal_library_interval signal-from-pkl)
+      All three used `((114, 113), 0.0)` for both buy and short,
+      letting SMA_113 / SMA_114 comparisons gate a tradable signal
+      from a missing-data fallback. Same class as the
+      ImpactSearch site fixed in 1B-2B amendment 1.
+      Phase 2A's sparse-cache scenario tests
+      (`test_sparse_cache_fallbacks.py`) then surfaced one more
+      site in the same file: `multi_timeframe_builder.py:415-417`
+      stored `((114, 113), 0.0)` for both buy and short on the
+      day-0 init store inside the streaming-pair loop. Same
+      class, just on the write side rather than the read side.
+      Phase 2A amendment (PR #134, post-Codex audit) added a
+      dedicated write-init static guard (B7,
+      `test_b7_daily_top_pairs_write_init_canonical`) which
+      caught one additional site:
+        `impactsearch.py:2218-2219`
+          Day-0 init at the top of the streaming pair loop
+          stored `((114, 113), 0.0)` for both buy and short.
+          Buy form was numerically correct but used a hardcoded
+          literal where MAX_SMA_DAY is in scope; short form was
+          wrong (buy-sentinel-reused-for-short).
+      Fix: both lines now use canonical inline tuples
+        buy:   ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+        short: ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
+      Static guard B7 enforces:
+        daily_top_buy_pairs[key]   = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+        daily_top_short_pairs[key] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
+      across all production files. Hardcoded numeric pairs
+      (even when numerically canonical) are rejected to push
+      every write-init through the named constant. B2 covers
+      the read-fallback shape; B7 covers the write-init shape.
+      Together they pin both sides of the bug class.
+      Fixes:
+        multi_timeframe_builder already had `MAX_SMA_DAY = 114` at
+        module scope; the two read sites and the one day-0 write
+        site now use canonical
+        `((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)` for buy and
+        `((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)` for short.
+        confluence_analyzer gained a module-level
+        `MAX_SMA_DAY = 114` constant; the single site uses the
+        same canonical inline tuples.
+  - Status: implemented in 1B-2B (stages 1 and 2) and Phase 2A
+    (stage 3). Engine coverage: Spymaster (stage 1) + OnePass +
+    TrafficFlow + ImpactSearch (stage 2) + signal_library
+    multi_timeframe_builder + signal_library confluence_analyzer
+    (stage 3).
 
 ## Entry 9: TrafficFlow cache key normalization
 
