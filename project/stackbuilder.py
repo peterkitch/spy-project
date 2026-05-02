@@ -1265,19 +1265,31 @@ def run_dash(outdir: str, port: int = 8054):
                 progress_path=ppath
             )
 
-            def _job():
+            # Phase 1B-2B: pass loop-iteration values into the worker
+            # explicitly via Thread args. The previous closure-over-loop
+            # body would have all started threads see the LAST iteration's
+            # `args`, `sec`, `ppath`, and `primaries` once the for-loop
+            # completed (Python late-binding closure semantics), causing
+            # threads launched early in the loop to run with the wrong
+            # secondary's parameters.
+            primaries_snapshot = list(primaries) if primaries else None
+
+            def _job(job_args, job_sec, job_ppath, job_primaries):
                 try:
-                    run_for_secondary(args, sec, specified_primaries=primaries if primaries else None)
+                    run_for_secondary(job_args, job_sec, specified_primaries=job_primaries)
                 except BaseException as e:
                     import traceback
-                    # Extract ticker name from error message if available
                     error_msg = str(e)
                     full_trace = traceback.format_exc()
-                    print(f"[ERROR] Job failed for {sec}:\n{full_trace}")
-                    _write_progress(ppath, status='failed', phase='error', percent=100.0,
-                                    message=f"Error for {sec}: {e.__class__.__name__}: {error_msg}")
+                    print(f"[ERROR] Job failed for {job_sec}:\n{full_trace}")
+                    _write_progress(job_ppath, status='failed', phase='error', percent=100.0,
+                                    message=f"Error for {job_sec}: {e.__class__.__name__}: {error_msg}")
 
-            threading.Thread(target=_job, daemon=True).start()
+            threading.Thread(
+                target=_job,
+                args=(args, sec, ppath, primaries_snapshot),
+                daemon=True,
+            ).start()
 
         # Return immediately; batch polling callback will stream progress for all jobs
         summary = f"Started {len(secondaries)} job(s): {', '.join(secondaries)}"

@@ -660,3 +660,41 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     project's own `logs/` directory regardless of where they
     were invoked from.
   - Status: implemented in 1B-2B.
+
+## 1B-2B-2: StackBuilder Dash batch closure bug
+
+  - Type: BUG-FIX
+  - Old behavior: in the multi-secondary Dash launch loop at
+    `stackbuilder.py:1239-1280`, the worker function `_job()` was
+    a closure over the loop variables `args`, `sec`, `ppath`, and
+    `primaries`. Python's late-binding closure semantics mean
+    every thread sees the LAST iteration's bindings once the
+    for-loop completes. Threads launched early therefore ran
+    against the wrong secondary's parameters.
+  - New behavior: `_job(job_args, job_sec, job_ppath, job_primaries)`
+    takes the loop values as positional parameters; the loop
+    body passes them via `threading.Thread(args=(...))`. A
+    `primaries_snapshot = list(primaries) if primaries else None`
+    snapshot is also taken so threads cannot mutate each other's
+    primary list.
+  - Affected tests: new `test_stackbuilder_closure.py`:
+      `test_closure_bug_reproduction` demonstrates that Python's
+      late-binding closure semantics still produce the bug
+      pattern (canary against language changes invalidating the
+      fix).
+      `test_threadargs_pattern_delivers_correct_values` exercises
+      the fix pattern in isolation.
+      `test_stackbuilder_dispatches_distinct_args_per_thread`
+      monkeypatches `run_for_secondary` to record its arguments,
+      drives the production loop body by hand, and asserts that
+      each thread's recorded `args.secondary`, `args.outdir`,
+      `sec`, and `specified_primaries` match its iteration —
+      with each thread seeing its own `args` object id (no
+      cross-binding leak).
+  - ELI5: when the user kicks off StackBuilder for several
+    tickers at once, the buggy code could re-run the LAST
+    ticker's settings against earlier tickers because of how
+    Python "remembers" loop variables inside nested functions.
+    The fix hands each background job its own copy of the
+    settings.
+  - Status: implemented in 1B-2B.
