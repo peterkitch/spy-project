@@ -36,7 +36,8 @@ Per-entry status:
     the run_for_secondary force-to-zero fix land here.
   - Entry 8 (sentinel pair standardization): implemented in
     1B-2B (PR #133, two-stage: Spymaster streaming-path removal
-    + OnePass / TrafficFlow short-sentinel canonicalization).
+    + OnePass / TrafficFlow / ImpactSearch sentinel
+    canonicalization).
   - Entry 9 (TrafficFlow cache key normalization): implemented
     in 1B-2B (PR #133).
   - Entry 10 (Phase 1A snapshot updates): implemented; see the
@@ -524,8 +525,9 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
       `_compute_daily_top_pairs_streaming()` body, the
       `if use_streaming:` branch, and the related `work_estimate`
       log line are gone. Vectorized path is the only path.
-      Stage 2 (next commit, OnePass + TrafficFlow): short-sentinel
-      sites in OnePass switch to `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`;
+      Stage 2 (next commit, OnePass + TrafficFlow + ImpactSearch):
+      short-sentinel sites in OnePass switch to
+      `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`;
       TrafficFlow `(1, 2)` fallback replaced with the canonical
       MAX-SMA-1 form.
   - Affected tests:
