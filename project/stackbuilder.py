@@ -378,15 +378,25 @@ def load_lib_or_none(t: str) -> Optional[dict]:
     return fallback_load_signal_library(t)
 
 # ---------- Signal application and metrics ----------
-def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series) -> pd.Series:
+def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series, *, return_mask: bool = False):
     """
     ImpactSearch-parity alignment:
       - align to secondary index
-      - carry forward signals within a grace window (default 7 calendar days)
+      - carry forward signals within a grace window (default 10 calendar days)
       - fill missing with 'None'
+
+    Phase 2B-2A: when ``return_mask=True`` the function returns
+    ``(captures, trigger_mask)`` where trigger_mask is a boolean
+    Series on ``sec_returns.index`` marking each Buy/Short signal day.
+    Default ``return_mask=False`` returns only ``captures`` for
+    backward compatibility with callers that compute their own mask
+    or use the legacy single-arg metrics_from_captures fallback.
     """
     if not primary_signals or not primary_dates or sec_returns.empty:
-        return pd.Series(dtype=FLOAT_DTYPE)
+        empty = pd.Series(dtype=FLOAT_DTYPE)
+        if return_mask:
+            return empty, pd.Series(dtype=bool)
+        return empty
 
     # Normalize indices (drop tz if present)
     idx = pd.DatetimeIndex(pd.to_datetime(primary_dates))
@@ -398,7 +408,7 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
 
     sigs = pd.Series(list(primary_signals), index=idx)
 
-    # Use configured grace window (default 7 days like ImpactSearch)
+    # Use configured grace window (default 10 days per spec §20)
     grace_days = DEFAULT_GRACE_DAYS
     if grace_days > 0:
         # Reindex with forward fill within tolerance window
@@ -424,7 +434,14 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
     captures = pd.Series(0.0, index=sec_returns.index, dtype=FLOAT_DTYPE)
     captures.loc[buy] = sec_returns.loc[buy]
     captures.loc[short] = -sec_returns.loc[short]
-    return captures.fillna(0.0)
+    captures = captures.fillna(0.0)
+    if return_mask:
+        trigger_mask = (buy | short).astype(bool)
+        # Reindex the boolean mask onto the captures index defensively
+        # (pandas may have a different index type after the operation).
+        trigger_mask = trigger_mask.reindex(captures.index, fill_value=False)
+        return captures, trigger_mask
+    return captures
 
 def metrics_from_captures(captures: pd.Series, trigger_mask: Optional[pd.Series] = None) -> Optional[Dict[str, float]]:
     """Compute canonical metrics from a daily-capture series.
@@ -507,8 +524,14 @@ def _score_primary(primary: str, sec_rets: pd.Series) -> Optional[Dict]:
     if isinstance(sigs[0], (int, np.integer)):
         dec = {1:'Buy', -1:'Short', 0:'None'}
         sigs = [dec.get(int(x), 'None') for x in sigs]
-    caps = apply_signals_to_secondary(sigs, dates, sec_rets)
-    m = metrics_from_captures(caps)
+    # Phase 2B-2A: derive an explicit signal-state trigger mask from the
+    # same alignment used to build captures, then pass it to
+    # metrics_from_captures so zero-return Buy/Short days count as
+    # losses (spec §15 / ledger Entry 4). Previously this site used the
+    # single-arg fallback whose captures.ne(0.0) mask dropped those
+    # days, producing Phase 2 vs Phase 3 K=1 metric divergence.
+    caps, trigger_mask = apply_signals_to_secondary(sigs, dates, sec_rets, return_mask=True)
+    m = metrics_from_captures(caps, trigger_mask=trigger_mask)
     if not m:  # Just check if we have metrics, not the trigger count
         return None
     # Log low trigger days as a warning
