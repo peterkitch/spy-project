@@ -425,9 +425,39 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     The spec says one canonical scoring function; this entry
     unifies the calendar-grace rule across both phases so they
     can no longer disagree on which days are in scope.
+  - Phase 2B-2A follow-up (PR #136):
+      Codex's pre-flight identified one remaining Phase 2 vs
+      Phase 3 divergence after the calendar-grace unification:
+      `_score_primary` (Phase 2's per-primary scorer at
+      `stackbuilder.py:497`) called the single-arg
+      `metrics_from_captures(caps)` form, which uses the legacy
+      `captures.ne(0.0)` mask and drops zero-return Buy/Short
+      trigger days. Phase 3's `_combined_metrics_signals`
+      already passed an explicit signal-state mask after 1B-2A,
+      so Phase 2 K=1 metrics diverged from Phase 3 K=1 metrics
+      whenever a primary had a zero-return trigger day against
+      the secondary.
+      Fix: refactor `apply_signals_to_secondary` with
+      `return_mask=True` so it returns the same aligned-signal
+      trigger mask alongside captures; thread the mask into
+      `metrics_from_captures(caps, trigger_mask=mask)` from
+      `_score_primary`. The legacy single-arg form is retained
+      for callers that don't have signal info.
+      Affected tests:
+        - `test_within_engine_parity.py::test_b1_stackbuilder_direct_k1_parity`
+          (Phase 2 rank_direct.iloc[0] now matches Phase 3 K=1
+          leaderboard on trigger_days, sharpe, total_capture,
+          p_value).
+        - `test_within_engine_parity.py::test_b2_stackbuilder_inverse_k1_parity`
+          (Phase 2 rank_inverse.iloc[0] matches Phase 3 K=1
+          leaderboard on trigger_days and total_capture; the
+          negate-and-view rank_inverse construction does NOT
+          give a real inverse-mode Sharpe due to the
+          risk-free-rate offset, documented in the test).
   - Status: calendar-policy unification implemented in 1B-2A;
     `_pending_bug_fix` test retired in the same PR alongside
-    the Entry 4 zero-capture fix.
+    the Entry 4 zero-capture fix; Phase 2 `_score_primary`
+    explicit-mask plumbing implemented in 2B-2A (PR #136).
 
 ## Entry 6: ImpactSearch xlsx duplicate-row dedupe
 
