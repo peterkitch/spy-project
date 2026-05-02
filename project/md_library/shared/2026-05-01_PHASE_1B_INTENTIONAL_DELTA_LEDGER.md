@@ -29,8 +29,8 @@ Per-entry status (1B-2A delivery):
     landed in Entry 5).
   - Entry 8 (sentinel pair standardization): deferred to 1B-2B
     (paired with the dead streaming-path removal).
-  - Entry 9 (TrafficFlow cache key normalization): deferred to
-    1B-2B.
+  - Entry 9 (TrafficFlow cache key normalization): implemented
+    in 1B-2B (PR #133).
   - Entry 10 (Phase 1A snapshot updates): implemented; see the
     snapshot replacement table in the entry body.
 
@@ -492,21 +492,36 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
 
 ## Entry 9: TrafficFlow cache key normalization
 
-  - Type: BUG-FIX if behavior-visible
-  - Old behavior: TBD in 1B-2 (see inventory §11; some read/write
-    sites use the literal `secondary` argument; `_load_secondary_prices`
-    writes only the uppercase form. A mixed-case lookup after an
-    uppercase write misses and falls through to a fetch).
-  - New behavior: TBD in 1B-2 (one normalization rule across all
-    cache reads and writes).
-  - Affected tests/snapshots: TBD in 1B-2 (Phase 1A's TrafficFlow
-    test uses `'SYN'`, which is already uppercase, so it does not
-    flip).
+  - Type: BUG-FIX
+  - Old behavior: `_PRICE_CACHE` reads and writes used the raw
+    `secondary` argument as the key in most engine call sites
+    (e.g. `_metrics_like_spymaster`, the subset-metrics helpers,
+    the K-extension passes). `_load_secondary_prices` and
+    `refresh_secondary_caches` normalized to uppercase before
+    writing. A mixed-case or whitespace-padded lookup after an
+    uppercase write therefore missed the cache and fell through
+    to a redundant fetch.
+  - New behavior: a `_price_cache_key(symbol)` helper at module
+    scope returns `str(symbol or "").strip().upper()`. Every
+    `_PRICE_CACHE.get(secondary)` and
+    `_PRICE_CACHE[secondary] = sec_df` site now goes through the
+    helper. `_load_secondary_prices` continues to normalize via
+    `_price_cache_key` (replacing the inline `(secondary or "").upper()`).
+    `refresh_secondary_caches` does the same for its symbol set.
+  - Affected tests: new
+    `test_trafficflow_price_cache_key_normalization`. Seeds
+    `_PRICE_CACHE` under the canonical uppercase key, monkeypatches
+    `_load_secondary_prices` to raise on call, then asserts that
+    lowercase (`"syn"`), padded (`" SYN "`), and canonical (`"SYN"`)
+    lookups all hit the same cached frame and produce identical
+    metric output. Phase 1A's existing TrafficFlow test uses
+    `"SYN"` (already canonical) and continues to pass unchanged.
   - ELI5: today, asking the cache for `"spy"` and asking for
     `"SPY"` can give different answers because the writer and the
     reader disagree on whether to uppercase the key. After this
-    entry, the cache is case-consistent.
-  - Status: stub, pending 1B-2.
+    entry, the cache is case-consistent: every read and write
+    flows through one normalizer.
+  - Status: implemented in 1B-2B.
 
 ## Entry 10: Phase 1A snapshot updates
 

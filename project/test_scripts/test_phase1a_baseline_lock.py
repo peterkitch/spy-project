@@ -414,6 +414,45 @@ def test_trafficflow_combine_signals_all_none_baseline():
     assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_NONE
 
 
+def test_trafficflow_price_cache_key_normalization(monkeypatch):
+    # 1B-2B (ledger Entry 9): _PRICE_CACHE reads/writes flow through
+    # _price_cache_key so a mixed-case or whitespace-padded lookup
+    # matches an uppercase write. _load_secondary_prices must not be
+    # called when the cache is already seeded under the canonical key.
+    tf = _import("trafficflow")
+
+    def _no_fetch(*args, **kwargs):  # pragma: no cover (assertion path)
+        raise AssertionError(
+            "trafficflow._load_secondary_prices was called; "
+            "cache-key normalization missed a hit"
+        )
+
+    monkeypatch.setattr(tf, "_load_secondary_prices", _no_fetch)
+    df = pd.DataFrame({"Close": CLOSE.values}, index=DATES)
+
+    canonical_key = tf._price_cache_key("SYN")
+    tf._PRICE_CACHE[canonical_key] = df.copy()
+    try:
+        # Helper itself: lowercase / mixed / padded all map to "SYN".
+        assert tf._price_cache_key("syn") == "SYN"
+        assert tf._price_cache_key(" Syn ") == "SYN"
+        assert tf._price_cache_key("SYN") == "SYN"
+
+        # Engine helper that reads _PRICE_CACHE: a lowercase secondary
+        # must hit the seeded uppercase entry without falling through
+        # to _load_secondary_prices.
+        out_lower = tf._metrics_like_spymaster("syn", SIGNALS.copy())
+        out_padded = tf._metrics_like_spymaster(" SYN ", SIGNALS.copy())
+        out_canon = tf._metrics_like_spymaster("SYN", SIGNALS.copy())
+
+        # All three lookups must produce the same metric output, since
+        # they all hit the same cached DataFrame.
+        assert freeze(out_lower) == freeze(out_canon)
+        assert freeze(out_padded) == freeze(out_canon)
+    finally:
+        tf._PRICE_CACHE.pop(canonical_key, None)
+
+
 def test_impactsearch_export_dedupes_by_primary_ticker(tmp_path):
     # 1B-2B (ledger Entry 6): export_results_to_excel now dedupes by
     # Primary Ticker (or Resolved/Fetched fallback) with keep="last",
