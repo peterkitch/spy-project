@@ -476,3 +476,297 @@ def production_python_files() -> List[Path]:
         PROJECT_DIR / "signal_library",
     ]
     return [p for p in iter_python_files(roots) if "QC" not in p.parts]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B-2A: parity helpers
+# ---------------------------------------------------------------------------
+#
+# These helpers support the within-engine and cross-engine parity tests
+# in test_within_engine_parity.py and test_cross_engine_parity.py. They
+# normalize per-engine display dicts to a single canonical key set so a
+# single canonical CanonicalScore can be compared against multiple engine
+# outputs.
+
+
+# Canonical key names used by the parity comparison helpers.
+_CANONICAL_KEYS = (
+    "trigger_days",
+    "wins",
+    "losses",
+    "win_rate",
+    "std_dev",
+    "sharpe",
+    "avg_daily_capture",
+    "total_capture",
+    "t_statistic",
+    "p_value",
+)
+
+
+# Per-engine mapping from display dict keys to canonical key names.
+# Engines whose display dicts already match the canonical names get the
+# identity mapping; only Confluence's compact display labels need
+# remapping.
+_ENGINE_KEY_MAPS: Dict[str, Dict[str, str]] = {
+    "onepass": {
+        "Trigger Days": "trigger_days",
+        "Wins": "wins",
+        "Losses": "losses",
+        "Win Ratio (%)": "win_rate",
+        "Std Dev (%)": "std_dev",
+        "Sharpe Ratio": "sharpe",
+        "Avg Daily Capture (%)": "avg_daily_capture",
+        "Total Capture (%)": "total_capture",
+        "t-Statistic": "t_statistic",
+        "p-Value": "p_value",
+    },
+    "impactsearch": {
+        "Trigger Days": "trigger_days",
+        "Wins": "wins",
+        "Losses": "losses",
+        "Win Ratio (%)": "win_rate",
+        "Std Dev (%)": "std_dev",
+        "Sharpe Ratio": "sharpe",
+        "Avg Daily Capture (%)": "avg_daily_capture",
+        "Total Capture (%)": "total_capture",
+        "t-Statistic": "t_statistic",
+        "p-Value": "p_value",
+    },
+    "stackbuilder": {
+        "Trigger Days": "trigger_days",
+        "Wins": "wins",
+        "Losses": "losses",
+        "Win Ratio (%)": "win_rate",
+        "Std Dev (%)": "std_dev",
+        "Sharpe Ratio": "sharpe",
+        "Avg Daily Capture (%)": "avg_daily_capture",
+        "Total Capture (%)": "total_capture",
+        "t-Statistic": "t_statistic",
+        "p-Value": "p_value",
+    },
+    "confluence": {
+        "Triggers": "trigger_days",
+        "Wins": "wins",
+        "Losses": "losses",
+        "Win %": "win_rate",
+        "StdDev %": "std_dev",
+        "Sharpe": "sharpe",
+        "Avg Cap %": "avg_daily_capture",
+        "Total %": "total_capture",
+        "t": "t_statistic",
+        "p": "p_value",
+    },
+}
+
+
+# Per-engine display rounding (decimals). Used by
+# assert_score_matches_metrics to choose the right tolerance when
+# comparing rounded display fields to a full-precision canonical score.
+_ENGINE_DISPLAY_ROUNDING: Dict[str, Dict[str, int]] = {
+    "onepass": {
+        "win_rate": 2,
+        "std_dev": 4,
+        "sharpe": 2,
+        "avg_daily_capture": 4,
+        "total_capture": 4,
+        "t_statistic": 4,
+        "p_value": 4,
+    },
+    "impactsearch": {
+        # impactsearch.calculate_metrics_from_signals returns
+        # full-precision floats (no rounding); _metrics_from_ccc rounds
+        # like onepass. We use the rounded form here; full-precision
+        # callers can override.
+        "win_rate": 2,
+        "std_dev": 4,
+        "sharpe": 2,
+        "avg_daily_capture": 4,
+        "total_capture": 4,
+        "t_statistic": 4,
+        "p_value": 4,
+    },
+    "stackbuilder": {
+        "win_rate": 2,
+        "std_dev": 4,
+        "sharpe": 2,
+        "avg_daily_capture": 4,
+        "total_capture": 4,
+        "t_statistic": 4,
+        "p_value": 4,
+    },
+    "confluence": {
+        "win_rate": 2,
+        "std_dev": 4,
+        "sharpe": 2,
+        "avg_daily_capture": 4,
+        "total_capture": 4,
+        "t_statistic": 4,
+        "p_value": 4,
+    },
+}
+
+
+def make_capture_mask_fixture(
+    *,
+    n_days: int = 10,
+    seed: int = 11,
+    include_zero_trigger_day: bool = True,
+    start: str = "2024-01-02",
+) -> Tuple[pd.Series, pd.Series]:
+    """Phase 2B-2A: build a deterministic capture series + signal mask.
+
+    Returns (captures_pct, trigger_mask):
+      - captures_pct: pd.Series of daily captures in PERCENT POINTS
+        (spec §13 unit), index is a business-day DatetimeIndex of length
+        n_days.
+      - trigger_mask: pd.Series of booleans on the same index. True
+        means the day was an active Buy/Short signal day.
+
+    When ``include_zero_trigger_day=True`` (default) at least one
+    trigger day in the mask carries a capture of exactly 0.0 (spec
+    §15: zero-return trigger day must count as a loss). The fixture
+    is used by both within-engine and cross-engine parity tests to
+    pin canonical-vs-engine consistency on this corner case.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start=start, periods=n_days)
+    raw_caps = rng.normal(loc=0.0, scale=1.0, size=n_days)
+    # First half are triggers, second half are non-trigger 'None' days.
+    mask_arr = np.array([True] * (n_days // 2 + 2) + [False] * (n_days - n_days // 2 - 2), dtype=bool)
+    if len(mask_arr) != n_days:
+        # Pad/trim defensively.
+        mask_arr = mask_arr[:n_days]
+        if len(mask_arr) < n_days:
+            mask_arr = np.concatenate([mask_arr, np.zeros(n_days - len(mask_arr), dtype=bool)])
+
+    # Force at least one trigger day to carry a zero capture.
+    if include_zero_trigger_day:
+        # Find the first trigger day and set its capture to 0.0.
+        trig_idx = np.where(mask_arr)[0]
+        if len(trig_idx) >= 2:
+            raw_caps[trig_idx[1]] = 0.0
+        elif len(trig_idx) == 1:
+            raw_caps[trig_idx[0]] = 0.0
+
+    # Captures are zero on non-trigger days (spec §13/§14 contract).
+    caps_arr = np.where(mask_arr, raw_caps, 0.0)
+    return (
+        pd.Series(caps_arr, index=dates, dtype=float, name="captures"),
+        pd.Series(mask_arr, index=dates, dtype=bool, name="trigger_mask"),
+    )
+
+
+def make_price_frame_from_returns(
+    returns: pd.Series,
+    *,
+    base: float = 100.0,
+) -> pd.DataFrame:
+    """Phase 2B-2A: convert a decimal-returns series to a Close-price frame.
+
+    ``returns`` must be a pd.Series of DECIMAL daily returns
+    (e.g. 0.01 for +1%). The first entry is treated as the day-0 return
+    and applied to ``base`` (so day-0 Close = base * (1 + returns[0])).
+
+    Returns a single-column DataFrame indexed identically to ``returns``
+    with a ``Close`` column suitable for ``onepass``/``impactsearch``
+    fixtures.
+    """
+    if not isinstance(returns, pd.Series):
+        raise TypeError("returns must be a pd.Series of decimal daily returns")
+    closes = base * np.cumprod(1.0 + returns.astype(float).to_numpy())
+    return pd.DataFrame({"Close": closes}, index=returns.index)
+
+
+def normalize_metric_dict(engine: str, metrics: Mapping) -> Dict[str, object]:
+    """Phase 2B-2A: normalize a per-engine display dict to canonical keys.
+
+    Unknown engines pass through with the canonical-key identity map.
+    Missing-from-display canonical keys come back absent. ``"N/A"``
+    sentinels for ``t_statistic`` / ``p_value`` are passed through
+    verbatim so callers can choose how to handle them.
+    """
+    if metrics is None:
+        return {}
+    key_map = _ENGINE_KEY_MAPS.get(engine, {})
+    out: Dict[str, object] = {}
+    for src, val in metrics.items():
+        canonical = key_map.get(src, src)
+        out[canonical] = val
+    return out
+
+
+def _half_decimal_unit(decimals: int) -> float:
+    return 0.5 * (10 ** (-decimals)) + 1e-12
+
+
+def assert_score_matches_metrics(score, metrics: Mapping, engine: str) -> None:
+    """Phase 2B-2A: assert engine display dict matches a canonical
+    ``CanonicalScore`` for the same input.
+
+    Comparison policy:
+      - Integer fields (``trigger_days``, ``wins``, ``losses``) compared
+        exactly.
+      - Float display fields compared against ``round(score.field,
+        decimals)`` with ``pytest.approx(..., abs=half_decimal_unit +
+        epsilon)`` so ULP-level rounding differences don't create false
+        diffs.
+      - ``t_statistic`` and ``p_value`` compared with the same
+        rounded-display tolerance when present and not the ``"N/A"``
+        sentinel; if either side is ``None`` / ``"N/A"``, they must
+        both signal absence.
+
+    Per-engine rounding is documented in ``_ENGINE_DISPLAY_ROUNDING``
+    above.
+    """
+    import pytest as _pytest  # local import; this helper is test-only
+
+    canon = normalize_metric_dict(engine, metrics)
+    rounding = _ENGINE_DISPLAY_ROUNDING.get(engine, {})
+
+    # Integer fields exact.
+    for k in ("trigger_days", "wins", "losses"):
+        if k in canon:
+            assert int(canon[k]) == int(getattr(score, k)), (
+                f"[{engine}] {k}: engine={canon[k]!r} vs canonical={getattr(score, k)!r}"
+            )
+
+    def _is_na(v) -> bool:
+        return v is None or v == "N/A"
+
+    # Float display fields: compare to round(score.field, decimals).
+    float_fields = (
+        "win_rate", "std_dev", "sharpe", "avg_daily_capture", "total_capture",
+    )
+    for k in float_fields:
+        if k not in canon:
+            continue
+        decimals = rounding.get(k, 6)
+        engine_val = float(canon[k])
+        canon_val = float(getattr(score, k))
+        rounded_canon = round(canon_val, decimals)
+        tol = _half_decimal_unit(decimals)
+        assert engine_val == _pytest.approx(rounded_canon, abs=tol), (
+            f"[{engine}] {k}: engine={engine_val!r} vs canonical "
+            f"rounded@{decimals}={rounded_canon!r} (raw={canon_val!r})"
+        )
+
+    # t_statistic / p_value: handle None / "N/A" sentinels both sides.
+    for k in ("t_statistic", "p_value"):
+        if k not in canon:
+            continue
+        engine_val = canon[k]
+        canon_val = getattr(score, k)
+        if _is_na(engine_val) or _is_na(canon_val):
+            assert _is_na(engine_val) and _is_na(canon_val), (
+                f"[{engine}] {k}: engine={engine_val!r} vs canonical={canon_val!r} "
+                "(one is N/A but not both)"
+            )
+            continue
+        decimals = rounding.get(k, 6)
+        rounded_canon = round(float(canon_val), decimals)
+        tol = _half_decimal_unit(decimals)
+        assert float(engine_val) == _pytest.approx(rounded_canon, abs=tol), (
+            f"[{engine}] {k}: engine={engine_val!r} vs canonical "
+            f"rounded@{decimals}={rounded_canon!r} (raw={canon_val!r})"
+        )
