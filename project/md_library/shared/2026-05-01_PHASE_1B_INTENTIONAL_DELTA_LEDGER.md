@@ -583,9 +583,30 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
           and the two `daily_top_*_pairs.get(...)` calls default
           to canonical MAX-SMA tuples
           (`test_impactsearch_uses_canonical_maxsma_sentinels`).
-  - Status: implemented in 1B-2B (stages 1 and 2). Engine
-    coverage: Spymaster (stage 1) + OnePass + TrafficFlow +
-    ImpactSearch (stage 2).
+  - Stage 3 (signal_library, Phase 2A PR #134):
+      The Phase 2A static regression guard `test_b2_daily_top_pairs_fallbacks_are_canonical`
+      surfaced two more sites with the same buy-form-reused-for-short
+      bug:
+        `signal_library/multi_timeframe_builder.py:626-627`
+        `signal_library/multi_timeframe_builder.py:687-688`
+        `signal_library/confluence_analyzer.py:81-82`
+      All three used `((114, 113), 0.0)` for both buy and short,
+      letting SMA_113 / SMA_114 comparisons gate a tradable signal
+      from a missing-data fallback. Same class as the
+      ImpactSearch site fixed in 1B-2B amendment 1.
+      Fixes:
+        multi_timeframe_builder already had `MAX_SMA_DAY = 114` at
+        module scope; the two sites now use canonical
+        `((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)` for buy and
+        `((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)` for short.
+        confluence_analyzer gained a module-level
+        `MAX_SMA_DAY = 114` constant; the single site uses the
+        same canonical inline tuples.
+  - Status: implemented in 1B-2B (stages 1 and 2) and Phase 2A
+    (stage 3). Engine coverage: Spymaster (stage 1) + OnePass +
+    TrafficFlow + ImpactSearch (stage 2) + signal_library
+    multi_timeframe_builder + signal_library confluence_analyzer
+    (stage 3).
 
 ## Entry 9: TrafficFlow cache key normalization
 
