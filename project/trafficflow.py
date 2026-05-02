@@ -1534,12 +1534,17 @@ def _session_sanity(secondary: str, members: List[str]) -> Dict[str, Any]:
 def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict[str, float]:
     """
     Compute metrics identically to Spymaster's A.S.O. block:
-      - prices := PRICE_COLUMN on combined_signals.index
+      - prices := raw Close on combined_signals.index
       - daily_returns := safe day return (zero when prev price invalid/<=0)
       - daily_captures := apply mask (Buy -> +ret, Short -> -ret, else 0)
-      - TriggerDays := count of non-zero captures (NOT signal mask)
-      - Wins/Losses by sign of trigger_captures
-      - Sharpe/StdDev/T/P on trigger_captures only
+      - TriggerDays := count of signal-state Buy/Short days (spec §13).
+        Per ledger Entry 4, zero-capture trigger days under an
+        active position are still counted.
+      - Wins/Losses: wins = positive-capture trigger days,
+        losses = trigger_days - wins (zero captures count as losses
+        per spec §15)
+      - Sharpe/StdDev/T/P sourced from canonical_scoring.score_captures
+        on trigger-day captures only.
     """
     # Load secondary prices
     px = _PRICE_CACHE.get(secondary)

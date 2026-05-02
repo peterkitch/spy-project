@@ -1,22 +1,48 @@
-# Phase 1B Intentional Delta Ledger (skeleton)
+# Phase 1B Intentional Delta Ledger
 
 Document date: 2026-05-01
-Branch: phase-1b-1-inventory-canonical-module
-Status: skeleton; all entries pending Phase 1B-2.
+Branch: phase-1b-2a-canonical-rewire
+Status: implemented in PR #132.
 
-This ledger is the public record of every behavior diff that lands
-during the Phase 1B canonical-scoring rewire. Each entry is one
-classified change. A baseline test that flips silently — without an
-entry in this ledger — is treated as a regression.
+Per-entry status (1B-2A delivery):
+  - Entry 1 (Adj Close removal): implemented across signal_library,
+    stale_check, spymaster, onepass, impactsearch, stackbuilder,
+    confluence, and impact_fastpath. QC clone deferred.
+  - Entry 2 (ddof=1 at spymaster.py:11668): implemented in commit
+    56b0338; the inline override was subsequently replaced by
+    canonical-scoring delegation in amendment 1 commit 4c61bce
+    (behaviour preserved).
+  - Entry 3 (cdf -> sf p-value): implemented across all 15 engine
+    canonical-scoring p-value sites.
+  - Entry 4 (zero-capture trigger-day counting): implemented at
+    the four enumerated sites. The single-arg
+    `stackbuilder.metrics_from_captures(captures)` deprecated
+    fallback retains the legacy `captures.ne(0.0)` mask.
+  - Entry 5 (Phase 2 vs Phase 3 scoring divergence): calendar-policy
+    unification implemented in commit 033aa93; the
+    `_pending_bug_fix` test was retired alongside the Entry 4
+    zero-capture fix.
+  - Entry 6 (ImpactSearch xlsx duplicate-row dedupe): deferred to
+    1B-2B per scope note.
+  - Entry 7 (calendar grace days default unification to 10):
+    deferred to 1B-2B per scope note (the path-level unification
+    landed in Entry 5).
+  - Entry 8 (sentinel pair standardization): deferred to 1B-2B
+    (paired with the dead streaming-path removal).
+  - Entry 9 (TrafficFlow cache key normalization): deferred to
+    1B-2B.
+  - Entry 10 (Phase 1A snapshot updates): implemented; see the
+    snapshot replacement table in the entry body.
 
-For each entry, Phase 1B-2 fills in:
+Format used for each entry below:
 
-  - Old behavior: the current main behavior, cited with file:line.
-  - New behavior: the post-rewire behavior, cited with file:line and
-    the canonical_scoring API used.
-  - Affected tests/snapshots: the Phase 1A tests / snapshots flipped
-    by this entry, plus any new Phase 1B-2 tests added.
-  - Status: stub | drafted | implemented | landed.
+  - Old behavior: the pre-rewire behavior, cited with file:line.
+  - New behavior: the post-rewire behavior, cited with file:line
+    and the canonical_scoring API used.
+  - Affected tests/snapshots: the Phase 1A tests / snapshots
+    flipped by this entry, plus any new Phase 1B-2 tests added.
+  - Status: implemented (this PR), or deferred (with target
+    sprint).
 
 Each entry also carries an ELI5 explanation so non-engineers can
 read the ledger and understand what changed and why.
@@ -24,7 +50,7 @@ read the ledger and understand what changed and why.
 Reference inventory:
   project/md_library/shared/2026-05-01_PHASE_1B_IMPLEMENTATION_INVENTORY.md
 
-Canonical-scoring delegation amendment (1B-2A, post-32c6242):
+Canonical-scoring delegation amendments (1B-2A, post-32c6242):
   In addition to the formula-law deltas captured in Entries 1–10,
   every engine metric helper in stackbuilder, confluence,
   trafficflow, onepass, impactsearch, and spymaster now routes
@@ -32,13 +58,69 @@ Canonical-scoring delegation amendment (1B-2A, post-32c6242):
   `score_signals`). Inline Sharpe / t-stat / p-value / std /
   win-rate / trigger-counting math has been removed from the
   engines (see grep verification in the amendment commit
-  messages). The delegation is bit-equivalent for the synthetic
-  Phase 1A fixtures pinned by `test_phase1a_baseline_lock.py` —
-  no Phase 1A snapshot moved as a result of this delegation.
-  The single-arg `stackbuilder.metrics_from_captures(captures)`
-  fallback retains its `captures.ne(0.0)` legacy mask as
-  documented deprecated compatibility-only; canonical callers
-  pass an explicit `trigger_mask`.
+  messages).
+
+  Documented exceptions where inline math is intentionally retained:
+
+    1. `stackbuilder.metrics_from_captures(captures)` single-arg
+       fallback at `stackbuilder.py:449` — kept as deprecated
+       compatibility-only with `captures.ne(0.0)` as a stand-in
+       trigger mask. Canonical callers pass an explicit
+       `trigger_mask`. Will be removed once every external
+       caller is plumbed with signal info.
+
+    2. Two spymaster Total Capture display sites
+       (`Total Capture (%)` in the dynamic-strategy block ~9020
+       and `Total %` in the per-ticker secondary block ~11030)
+       continue to source the displayed total from
+       `cumulative_combined_captures.iloc[-1]` rather than
+       `score.total_capture`. These are mathematically equivalent
+       for canonical capture series (non-trigger days zeroed)
+       and the cumulative-final-value preservation avoids
+       changing the displayed total wording.
+
+    3. Max Drawdown, Calmar Ratio, and CAGR-style annualizations
+       in spymaster's manual SMA + leader UI blocks. These are
+       not canonical-scoring metrics and the canonical module
+       does not expose them.
+
+  Bit-equivalence statement (Phase 1A fixtures):
+    The synthetic Phase 1A fixtures pinned by
+    `test_phase1a_baseline_lock.py` did not move as a result of
+    the engine-helper delegation in amendment 1 (verified). The
+    spymaster delegation in amendment 1 + amendment 2 covers
+    code paths that Phase 1A does not snapshot.
+
+  EXPECTED-BY-SPEC canonicalizations introduced by amendment 2
+  (no Phase 1A snapshot pins these paths):
+
+    - Buy-leader / Short-leader Sharpe (spymaster.py ~8800-8870):
+      previously computed with a CAGR-style annualization
+      `((1 + capture/100) ** (1/total_years)) - 1`. Now uses the
+      canonical `avg_daily_capture * 252 - rfr` form per spec
+      §16. The displayed Sharpe values in
+      `total_capture_buy_leader` / `total_capture_short_leader`
+      strings will differ for non-flat strategies.
+
+    - Manual SMA combined-strategy Sharpe (spymaster.py ~10505):
+      previously computed std on the FULL combined_returns series
+      (including zeros on non-trigger days). Now uses canonical
+      std on trigger-day captures only per spec §15-§16. The
+      displayed combined Sharpe will differ for strategies with
+      non-trigger gaps.
+
+    - Manual SMA per-pair buy/short metrics (spymaster.py ~10309):
+      delegation preserves the existing semantics
+      (`buy_signals_shifted` / `short_signals_shifted` were
+      already used to extract trigger captures); the displayed
+      values are bit-equivalent to the pre-amendment behaviour
+      for the same trigger mask, only the implementation path
+      moves.
+
+    - Next-signal performance-expectation text (spymaster.py
+      ~9063): now sourced from the same CanonicalScore as the
+      leader Sharpe block, so its avg_daily_capture and
+      win_rate values trace directly to canonical scoring.
 
 ---
 
