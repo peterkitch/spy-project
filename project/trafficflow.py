@@ -93,6 +93,16 @@ TF_SHOW_SESSION_SANITY = os.environ.get("TF_SHOW_SESSION_SANITY", "1").lower() i
 # Spymaster parity: ET timezone and price column
 _ET_TZ = pytz.timezone("US/Eastern")
 PRICE_COLUMN = "Close"  # Match Spymaster's raw close usage
+
+# Phase 1B-2B: canonical sentinel pair per spec §appendix.
+# Spymaster / OnePass use MAX_SMA_DAY=114; TrafficFlow consumes their
+# top-pair dicts and falls back to a sentinel only when a date is
+# missing from those dicts. The sentinel must not gate to a tradable
+# signal (SMA at MAX_SMA_DAY is NaN until enough history accumulates),
+# so we use the same constant.
+MAX_SMA_DAY = 114
+_BUY_SENTINEL = (MAX_SMA_DAY, MAX_SMA_DAY - 1)
+_SHORT_SENTINEL = (MAX_SMA_DAY - 1, MAX_SMA_DAY)
 # A.S.O. parity: When using active_pairs directly, signals represent "today's position"
 # which captures "today's return" (t-1 → t), so NO T+1 shift is ever needed
 
@@ -243,6 +253,18 @@ TF_CLOSE_BUFFER_MIN = int(os.environ.get('TF_CLOSE_BUFFER_MIN', '10'))  # minute
 # ---------- Performance caches ----------
 _PKL_CACHE: Dict[str, dict] = {}            # primary -> PKL dict
 _PRICE_CACHE: Dict[str, pd.DataFrame] = {}  # secondary -> Close df (Spymaster parity cache)
+
+
+def _price_cache_key(symbol) -> str:
+    """Phase 1B-2B: normalize _PRICE_CACHE keys.
+
+    Previously some readers/writers used the raw ``secondary`` argument
+    while others (notably ``_load_secondary_prices``) uppercased it,
+    which caused mixed-case lookups to miss after an uppercase write.
+    All cache reads and writes now go through this helper so the key
+    space is consistent.
+    """
+    return str(symbol or "").strip().upper()
 _SIGNAL_SERIES_CACHE: Dict[str, pd.Series] = {}  # primary -> processed signals (Spymaster parity)
 _LAST_REFRESH_N: int = -1                   # track Refresh button clicks
 _FORCE_PRICE_REFRESH: bool = False          # one-shot flag for forcing price refresh
@@ -1065,7 +1087,7 @@ def _load_secondary_prices(secondary: str,
     Load prices with in-memory + on-disk cache and strong full-history validation.
     No special treatment for primary==secondary.
     """
-    sec = (secondary or "").upper()
+    sec = _price_cache_key(secondary)
 
     # In-memory cache (validate before trusting)
     if not force and sec in _PRICE_CACHE:
@@ -1103,7 +1125,7 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
     Refresh disk caches **with full-history enforcement**.
     If existing cache is truncated, replace it. Otherwise do a small tail merge.
     """
-    uniq = sorted({(s or "").upper() for s in symbols})
+    uniq = sorted({_price_cache_key(s) for s in symbols})
     if not uniq or yf is None:
         return
 
@@ -1485,7 +1507,7 @@ def _session_sanity(secondary: str, members: List[str]) -> Dict[str, Any]:
         expected = (now_utc.normalize() - pd.Timedelta(days=1)).tz_localize(None)
 
     # Secondary price last date (from in‑mem cache or on‑disk cache)
-    px = _PRICE_CACHE.get(secondary)
+    px = _PRICE_CACHE.get(_price_cache_key(secondary))
     if px is None or px.empty:
         try:
             px = _read_cache_file(_choose_price_cache_path(secondary))
@@ -1547,10 +1569,10 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
         on trigger-day captures only.
     """
     # Load secondary prices
-    px = _PRICE_CACHE.get(secondary)
+    px = _PRICE_CACHE.get(_price_cache_key(secondary))
     if px is None:
         px = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = px
+        _PRICE_CACHE[_price_cache_key(secondary)] = px
 
     # Align to common index
     prices = px.reindex(combined_signals.index)[PRICE_COLUMN]
@@ -1784,9 +1806,9 @@ def _stream_primary_positions_and_captures(results: dict,
             continue
         prev = valid[i-1]
 
-        # yesterday's top pairs
-        bp = bdict.get(prev, ((1, 2), 0.0))
-        sp = sdict.get(prev, ((1, 2), 0.0))
+        # yesterday's top pairs (canonical MAX-SMA sentinels on miss)
+        bp = bdict.get(prev, (_BUY_SENTINEL, 0.0))
+        sp = sdict.get(prev, (_SHORT_SENTINEL, 0.0))
         (b_i, b_j), b_cap = bp
         (s_i, s_j), s_cap = sp
 
@@ -1894,10 +1916,10 @@ def _subset_metrics_spymaster(
     # Load secondary prices (or use precomputed)
     if _pre_idx is None or _pre_rets is None:
         # Legacy path: compute per-subset (slow)
-        sec_df = _PRICE_CACHE.get(secondary)
+        sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
         if sec_df is None:
             sec_df = _load_secondary_prices(secondary)
-            _PRICE_CACHE[secondary] = sec_df
+            _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
         if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
             return _empty_metrics(), _empty_dates()
 
@@ -2216,10 +2238,10 @@ def _signal_snapshot_for_members(secondary: str, members: List[str], cap_dt: Opt
       - cap_dt: Optional cap date for Today/Now/NEXT parity with metrics
     """
     # Load secondary prices and index
-    sec_df = _PRICE_CACHE.get(secondary)
+    sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
     if sec_df is None:
         sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = sec_df
+        _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
 
     if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
         return _empty_dates()
@@ -2307,10 +2329,10 @@ def _members_signals_df_and_returns(secondary: str, members: List[str],
     This is being tested - if parity breaks, this entire matrix path will be rejected.
     """
     # Load prices once
-    sec_df = _PRICE_CACHE.get(secondary)
+    sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
     if sec_df is None:
         sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = sec_df
+        _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
     if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
         return pd.DataFrame(), pd.Series(dtype="float64")
 
@@ -2434,10 +2456,10 @@ def _subset_metrics_spymaster_fast(secondary: str,
         return _empty_metrics(), _empty_dates()
 
     # 1) Secondary Close + cap (tz-naive, unique, sorted)
-    sec_df = _PRICE_CACHE.get(secondary)
+    sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
     if sec_df is None:
         sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = sec_df
+        _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
     if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
         return _empty_metrics(), _empty_dates()
     sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
@@ -2551,10 +2573,10 @@ def _subset_metrics_spymaster_bitmask(secondary: str,
         return _empty_metrics(), _empty_dates()
 
     # Secondary prices
-    sec_df = _PRICE_CACHE.get(secondary)
+    sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
     if sec_df is None:
         sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = sec_df
+        _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
     if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
         return _empty_metrics(), _empty_dates()
     sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
@@ -2707,10 +2729,10 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
         m, info = _subset_metrics_spymaster(secondary, metrics_members, eval_to_date=eval_to_date)
 
         # Load secondary to calculate tomorrow
-        sec_df = _PRICE_CACHE.get(secondary)
+        sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
         if sec_df is None:
             sec_df = _load_secondary_prices(secondary)
-            _PRICE_CACHE[secondary] = sec_df
+            _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
 
         # Calculate tomorrow from secondary index
         today_dt = info.get("live_date")
@@ -2758,10 +2780,10 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
         pass  # Signal preload warning handled silently
 
     # Preload secondary prices
-    sec_df = _PRICE_CACHE.get(secondary)
+    sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
     if sec_df is None:
         sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[secondary] = sec_df
+        _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
 
     # --- OPTIMIZATION DISABLED: Breaks financial precision requirements ---
     # Precomputed returns optimization causes 1-count differences in K>=2 subsets.

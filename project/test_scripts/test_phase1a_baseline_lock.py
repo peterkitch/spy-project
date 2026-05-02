@@ -414,16 +414,55 @@ def test_trafficflow_combine_signals_all_none_baseline():
     assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_NONE
 
 
-def test_impactsearch_export_writes_duplicates_pending_bug_fix(tmp_path):
-    # Pinned per Phase 1B Intentional Delta Ledger:
-    # "ImpactSearch xlsx duplicate-row dedupe" (BUG-FIX).
-    # The current export_results_to_excel implementation reads any
-    # existing file and concatenates the new rows on top. Calling it
-    # twice with the same metrics_list therefore produces duplicates.
-    # This snapshot encodes the current bug. Phase 1B replaces it.
+def test_trafficflow_price_cache_key_normalization(monkeypatch):
+    # 1B-2B (ledger Entry 9): _PRICE_CACHE reads/writes flow through
+    # _price_cache_key so a mixed-case or whitespace-padded lookup
+    # matches an uppercase write. _load_secondary_prices must not be
+    # called when the cache is already seeded under the canonical key.
+    tf = _import("trafficflow")
+
+    def _no_fetch(*args, **kwargs):  # pragma: no cover (assertion path)
+        raise AssertionError(
+            "trafficflow._load_secondary_prices was called; "
+            "cache-key normalization missed a hit"
+        )
+
+    monkeypatch.setattr(tf, "_load_secondary_prices", _no_fetch)
+    df = pd.DataFrame({"Close": CLOSE.values}, index=DATES)
+
+    canonical_key = tf._price_cache_key("SYN")
+    tf._PRICE_CACHE[canonical_key] = df.copy()
+    try:
+        # Helper itself: lowercase / mixed / padded all map to "SYN".
+        assert tf._price_cache_key("syn") == "SYN"
+        assert tf._price_cache_key(" Syn ") == "SYN"
+        assert tf._price_cache_key("SYN") == "SYN"
+
+        # Engine helper that reads _PRICE_CACHE: a lowercase secondary
+        # must hit the seeded uppercase entry without falling through
+        # to _load_secondary_prices.
+        out_lower = tf._metrics_like_spymaster("syn", SIGNALS.copy())
+        out_padded = tf._metrics_like_spymaster(" SYN ", SIGNALS.copy())
+        out_canon = tf._metrics_like_spymaster("SYN", SIGNALS.copy())
+
+        # All three lookups must produce the same metric output, since
+        # they all hit the same cached DataFrame.
+        assert freeze(out_lower) == freeze(out_canon)
+        assert freeze(out_padded) == freeze(out_canon)
+    finally:
+        tf._PRICE_CACHE.pop(canonical_key, None)
+
+
+def test_impactsearch_export_dedupes_by_primary_ticker(tmp_path):
+    # 1B-2B (ledger Entry 6): export_results_to_excel now dedupes by
+    # Primary Ticker (or Resolved/Fetched fallback) with keep="last",
+    # so re-running export against an existing xlsx replaces a
+    # ticker's row instead of doubling it. Sharpe-descending sort is
+    # preserved.
     isr = _import("impactsearch")
     out_path = tmp_path / "impact_dup.xlsx"
-    metrics = [
+
+    metrics_v1 = [
         {
             "Primary Ticker": "AAA",
             "Resolved/Fetched": "AAA",
@@ -461,13 +500,30 @@ def test_impactsearch_export_writes_duplicates_pending_bug_fix(tmp_path):
             "Total Capture (%)": -0.2000,
         },
     ]
-    isr.export_results_to_excel(str(out_path), metrics)
-    isr.export_results_to_excel(str(out_path), metrics)
+
+    # Second call: same primaries, changed metrics. The dedupe rule
+    # should retain v2's values, not v1's, and not double the rows.
+    metrics_v2 = [
+        {**metrics_v1[0], "Sharpe Ratio": 0.99, "Total Capture (%)": 1.5000},
+        {**metrics_v1[1], "Sharpe Ratio": 0.55, "Total Capture (%)": 0.4000},
+    ]
+
+    isr.export_results_to_excel(str(out_path), metrics_v1)
+    isr.export_results_to_excel(str(out_path), metrics_v2)
     df = pd.read_excel(out_path)
-    # Snapshot: dict of column -> list of values
-    payload = {
-        "row_count": int(len(df)),
-        "columns": list(df.columns),
-        "primary_tickers": list(df["Primary Ticker"].astype(str).values),
-    }
-    assert freeze(payload) == SNAP.SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX
+
+    # Row count is deduped, not doubled.
+    assert int(len(df)) == 2
+    # Both primaries present exactly once.
+    primaries = sorted(df["Primary Ticker"].astype(str).str.upper().tolist())
+    assert primaries == ["AAA", "BBB"]
+    # Retained rows are v2's values (the latest call wins).
+    sharpe_by_ticker = dict(zip(
+        df["Primary Ticker"].astype(str).str.upper(),
+        df["Sharpe Ratio"].astype(float),
+    ))
+    assert sharpe_by_ticker["AAA"] == pytest.approx(0.99)
+    assert sharpe_by_ticker["BBB"] == pytest.approx(0.55)
+    # Sharpe-descending sort preserved (AAA at 0.99 > BBB at 0.55).
+    assert df.iloc[0]["Primary Ticker"] == "AAA"
+    assert df.iloc[1]["Primary Ticker"] == "BBB"

@@ -72,7 +72,7 @@ DEFAULT_IMPACT_XLSX_DIR = os.environ.get(
 )
 # output format default; can be overridden by --output-format
 OUTPUT_FORMAT = os.environ.get("STACKBUILDER_OUTPUT_FORMAT", "xlsx").lower()
-DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
+DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
 # runtime-mutable signal dir (set in main from CLI)
 SIGNAL_LIB_DIR_RUNTIME = DEFAULT_SIGNAL_LIB_DIR
 
@@ -1247,11 +1247,15 @@ def run_dash(outdir: str, port: int = 8054):
 
             jobs.append({'secondary': sec, 'ppath': ppath})
 
+            # Phase 1B-2B: honor the Dash-launched outdir (from
+            # run_dash(outdir, port)) instead of hardcoding RUNS_ROOT.
+            # Falls back to RUNS_ROOT only if no Dash outdir was set.
+            _job_outdir = outdir if outdir else RUNS_ROOT
             args = SimpleNamespace(
                 secondary=sec, secondaries=None, primaries=None,
                 top_n=int(topn or 20), bottom_n=int(bottomn or 20), max_k=int(maxk or 6),
                 alpha=float(alpha or 0.05), min_marginal_capture=0.0,
-                threads='auto', outdir=RUNS_ROOT,
+                threads='auto', outdir=_job_outdir,
                 fail_on_missing_cache=False, serve=False, port=8054,
                 prefer_impact_xlsx=prefer_fast, impact_xlsx_dir=xdir,
                 impact_xlsx_max_age_days=45,
@@ -1265,19 +1269,31 @@ def run_dash(outdir: str, port: int = 8054):
                 progress_path=ppath
             )
 
-            def _job():
+            # Phase 1B-2B: pass loop-iteration values into the worker
+            # explicitly via Thread args. The previous closure-over-loop
+            # body would have all started threads see the LAST iteration's
+            # `args`, `sec`, `ppath`, and `primaries` once the for-loop
+            # completed (Python late-binding closure semantics), causing
+            # threads launched early in the loop to run with the wrong
+            # secondary's parameters.
+            primaries_snapshot = list(primaries) if primaries else None
+
+            def _job(job_args, job_sec, job_ppath, job_primaries):
                 try:
-                    run_for_secondary(args, sec, specified_primaries=primaries if primaries else None)
+                    run_for_secondary(job_args, job_sec, specified_primaries=job_primaries)
                 except BaseException as e:
                     import traceback
-                    # Extract ticker name from error message if available
                     error_msg = str(e)
                     full_trace = traceback.format_exc()
-                    print(f"[ERROR] Job failed for {sec}:\n{full_trace}")
-                    _write_progress(ppath, status='failed', phase='error', percent=100.0,
-                                    message=f"Error for {sec}: {e.__class__.__name__}: {error_msg}")
+                    print(f"[ERROR] Job failed for {job_sec}:\n{full_trace}")
+                    _write_progress(job_ppath, status='failed', phase='error', percent=100.0,
+                                    message=f"Error for {job_sec}: {e.__class__.__name__}: {error_msg}")
 
-            threading.Thread(target=_job, daemon=True).start()
+            threading.Thread(
+                target=_job,
+                args=(args, sec, ppath, primaries_snapshot),
+                daemon=True,
+            ).start()
 
         # Return immediately; batch polling callback will stream progress for all jobs
         summary = f"Started {len(secondaries)} job(s): {', '.join(secondaries)}"
@@ -1484,14 +1500,23 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         pass
 
     start_time = time.time()
-    # Enforce strict calendar by default for parity with spymaster
-    os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(getattr(args, 'grace_days', 0) or 0)
+    # Phase 1B-2B: respect args.grace_days when explicitly set, otherwise
+    # leave IMPACT_CALENDAR_GRACE_DAYS untouched so DEFAULT_GRACE_DAYS=10
+    # (spec §20) governs. Previously this line forced grace to 0 when
+    # args.grace_days was unset, defeating the default.
+    _grace_override = getattr(args, 'grace_days', None)
+    if _grace_override is not None:
+        os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(_grace_override)
     primaries_df, sec_rets, vendor_secondary = phase1_preflight(args, secondary, specified_primaries)
     ts = now_ts()
     # Clean secondary name for filesystem, but preserve '^' (safe on NTFS) per design
     vendor_secondary_clean = vendor_secondary.replace(".", "_")
-    # Create parent directory for this secondary ticker
-    secondary_parent = os.path.join(RUNS_ROOT, vendor_secondary_clean)
+    # Phase 1B-2B: honor args.outdir as the output root (CLI --outdir
+    # was previously ignored by run_for_secondary; CLI single-secondary
+    # and CLI multi-secondary paths therefore both wrote under
+    # RUNS_ROOT regardless of --outdir).
+    output_root = getattr(args, "outdir", None) or RUNS_ROOT
+    secondary_parent = os.path.join(output_root, vendor_secondary_clean)
     ensure_dir(secondary_parent)
     # Use temporary directory initially within the parent
     # Make temp folder unique per process to avoid collisions under parallel runs
@@ -1720,8 +1745,11 @@ def main(argv=None):
     elif args.secondary:
         secondaries = [args.secondary.strip()]
     else:
-        # Default behavior: launch Dash UI when no arguments provided
-        run_dash(None, port=args.port)
+        # Default behavior: launch Dash UI when no arguments provided.
+        # Phase 1B-2B: thread args.outdir through so the Dash callback
+        # writes under the user-specified --outdir instead of hardcoded
+        # RUNS_ROOT.
+        run_dash(args.outdir, port=args.port)
         return
 
     # Parse primary tickers if provided

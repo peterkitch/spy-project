@@ -79,9 +79,12 @@ console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
-# Create logs directory before FileHandler to avoid race condition
-os.makedirs('logs', exist_ok=True)
-file_handler = logging.FileHandler('logs/onepass.log', mode='w')
+# Anchor logs to project/logs regardless of cwd at import time
+# (Phase 1B-2B: log handler anchoring).
+from pathlib import Path as _LogPath
+_logs_dir = _LogPath(__file__).resolve().parent / "logs"
+_logs_dir.mkdir(parents=True, exist_ok=True)
+file_handler = logging.FileHandler(str(_logs_dir / 'onepass.log'), mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
@@ -776,7 +779,10 @@ def perform_incremental_update(ticker, signal_data, new_df):
                 prev_short_pair = last_short_data['pair']
                 prev_short_value = last_short_data['avg_capture']
             else:
-                prev_short_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # Initially same as buy sentinel
+                # Phase 1B-2B: canonical short sentinel is (msd-1, msd)
+                # per spec §appendix; previously this site used the buy
+                # sentinel form (msd, msd-1).
+                prev_short_pair = (MAX_SMA_DAY - 1, MAX_SMA_DAY)
                 prev_short_value = 0.0
             
             # Compute SMAs for working window
@@ -2119,12 +2125,16 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         daily_top_short_pairs = {}
         primary_signals = []  # Store signals for later saving
         
-        # Track previous day's top pairs for signal generation
-        # Use MAX_SMA_DAY sentinels for initialization (matching spymaster)
-        # IMPORTANT: Same pair for both buy and short (different comparison operators)
-        prev_buy_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # (114, 113)
+        # Track previous day's top pairs for signal generation.
+        # Phase 1B-2B: canonical sentinels per spec §appendix:
+        #   buy   sentinel = (MAX_SMA_DAY,     MAX_SMA_DAY - 1)
+        #   short sentinel = (MAX_SMA_DAY - 1, MAX_SMA_DAY)
+        # Both gate to a no-trade state via the `>= MAX_SMA_DAY` check
+        # below, but the short sentinel must use the inverted form so
+        # downstream pair-direction logic is consistent.
+        prev_buy_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)
         prev_buy_value = 0.0
-        prev_short_pair = (MAX_SMA_DAY, MAX_SMA_DAY - 1)  # Initially same as buy sentinel
+        prev_short_pair = (MAX_SMA_DAY - 1, MAX_SMA_DAY)
         prev_short_value = 0.0
         
         for idx, date in enumerate(df_eff.index):
@@ -2166,10 +2176,11 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
             
             # STEP 2: Update accumulators with TODAY's return and find TODAY's top pairs
             if idx == 0:
-                # Day 0: store sentinel values matching spymaster
-                # Spymaster uses SAME sentinel for both initially
-                daily_top_buy_pairs[date] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)  # (114, 113)
-                daily_top_short_pairs[date] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)  # (114, 113) - same as buy initially
+                # Day 0: store canonical sentinel values per spec §appendix.
+                # Buy and short use the inverted forms so downstream pair-
+                # direction logic is consistent.
+                daily_top_buy_pairs[date] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+                daily_top_short_pairs[date] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
                 # Return is 0 on day 0, so no accumulator updates needed
             else:
                 # Use PREVIOUS day's SMAs to compute signals for accumulator update

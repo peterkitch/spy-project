@@ -1,6 +1,7 @@
 import os
 import sys
 import importlib
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from scipy import stats
@@ -102,7 +103,12 @@ import socket
 # Each run can be isolated via env vars to support multi-instance execution.
 INSTANCE_NAME = os.environ.get("IMPACT_INSTANCE_NAME", f"pid{os.getpid()}")
 CACHE_ROOT = os.environ.get("IMPACT_CACHE_ROOT", "cache")
-LOGS_ROOT = os.environ.get("IMPACT_LOGS_ROOT", "logs")
+# Default LOGS_ROOT is anchored to project/logs so import-time log writes
+# do not leak into the caller's cwd (Phase 1B-2B: log handler anchoring).
+LOGS_ROOT = os.environ.get(
+    "IMPACT_LOGS_ROOT",
+    str(Path(__file__).resolve().parent / "logs"),
+)
 
 # Backpressure control for UI responsiveness
 RESULTS_SNAPSHOT_EVERY = int(os.environ.get("IMPACT_RESULTS_SNAPSHOT_EVERY", "250"))
@@ -303,7 +309,7 @@ print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
       f"IMPACT_TRUST_LIBRARY={IMPACT_TRUST_LIBRARY}  "
       f"price_basis=Close (raw)  "
       f"IMPACT_TRUST_MAX_AGE_HOURS={os.environ.get('IMPACT_TRUST_MAX_AGE_HOURS','168')}  "
-      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','7')}")
+      f"IMPACT_CALENDAR_GRACE_DAYS={os.environ.get('IMPACT_CALENDAR_GRACE_DAYS','10')}")
 
 # Import parity configuration
 try:
@@ -341,9 +347,11 @@ console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
-# Ensure logs directory exists before creating FileHandler
-os.makedirs('logs', exist_ok=True)
-file_handler = logging.FileHandler('logs/impactsearch.log', mode='w')
+# Anchor logs to project/logs regardless of cwd at import time
+# (Phase 1B-2B: log handler anchoring).
+_logs_dir = Path(__file__).resolve().parent / "logs"
+_logs_dir.mkdir(parents=True, exist_ok=True)
+file_handler = logging.FileHandler(str(_logs_dir / 'impactsearch.log'), mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
@@ -1856,13 +1864,35 @@ def export_results_to_excel(output_filename, metrics_list):
         new_df = pd.DataFrame(normalized_rows)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
 
+        # Phase 1B-2B: dedupe by Primary Ticker (or Resolved/Fetched
+        # fallback) so re-running export against an existing xlsx does
+        # not double-write rows. keep="last" preserves the latest
+        # metric values for any given ticker.
+        def _dedupe_key(row):
+            primary = row.get('Primary Ticker', '')
+            if pd.notna(primary) and str(primary).strip():
+                return str(primary).strip().upper()
+            resolved = row.get('Resolved/Fetched', '')
+            if pd.notna(resolved) and str(resolved).strip():
+                return str(resolved).strip().upper()
+            return ''
+
+        combined_df['__dedupe_key'] = combined_df.apply(_dedupe_key, axis=1)
+        # Drop rows with empty key first (no Primary Ticker AND no
+        # Resolved/Fetched), then dedupe by key keeping the last
+        # occurrence (which is the newest call's row).
+        non_empty_mask = combined_df['__dedupe_key'].astype(bool)
+        combined_df = combined_df[non_empty_mask | ~combined_df.duplicated('__dedupe_key', keep='last')]
+        combined_df = combined_df.drop_duplicates('__dedupe_key', keep='last')
+        combined_df = combined_df.drop(columns='__dedupe_key')
+
         # Coerce Sharpe to numeric before sorting to avoid float<->str errors
         if 'Sharpe Ratio' in combined_df.columns:
             combined_df['Sharpe Ratio'] = pd.to_numeric(combined_df['Sharpe Ratio'], errors='coerce')
             combined_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
-        combined_df = combined_df.reindex(columns=desired_order + 
+        combined_df = combined_df.reindex(columns=desired_order +
                                          [col for col in combined_df.columns if col not in desired_order])
 
         combined_df.to_excel(output_filename, index=False)
@@ -1931,7 +1961,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             logger.info(f"Processing {prim_ticker}... [FASTPATH: {fp_reason}]")
 
             # Align signals to secondary's index with carry-forward inside grace window
-            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
+            grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
             if grace_days > 0:
                 aligned_signals = sig_series.reindex(
                     sec_df.index, method='pad', tolerance=pd.Timedelta(days=grace_days)
@@ -2239,8 +2269,14 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                 previous_date = date
                 continue
 
-            buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((1,2),0.0))
-            short_pair, short_val = daily_top_short_pairs.get(previous_date, ((1,2),0.0))
+            # Phase 1B-2B: canonical MAX-SMA sentinels per spec §appendix.
+            # The previous (1, 2) fallback was unsafe because SMA_1 / SMA_2
+            # have finite values most days, so the gating below could
+            # accidentally produce a tradable signal from a missing-data
+            # fallback. MAX-SMA-day SMAs are NaN until enough history
+            # accumulates, so they correctly gate to no-trade.
+            buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0))
+            short_pair, short_val = daily_top_short_pairs.get(previous_date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0))
 
             # Get previous day's SMA values
             sma1_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[0]-1]
@@ -2281,7 +2317,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     logger.info(f"None signals: {signal_counts.get('None', 0)}")
 
     # Align primary signals to the SECONDARY calendar with optional grace window
-    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '7') or 7)
+    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
     sig_series = pd.Series(primary_signals, index=pd.DatetimeIndex(primary_dates))
     if grace_days > 0:
         aligned = sig_series.reindex(sec_df.index, method='pad',

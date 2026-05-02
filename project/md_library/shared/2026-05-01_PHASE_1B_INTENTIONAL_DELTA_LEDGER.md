@@ -1,10 +1,16 @@
 # Phase 1B Intentional Delta Ledger
 
 Document date: 2026-05-01
-Branch: phase-1b-2a-canonical-rewire
-Status: implemented in PR #132.
+Branches: phase-1b-2a-canonical-rewire (PR #132, merged),
+          phase-1b-2b-backlog (PR #133).
+Status: 1B-2A merged; 1B-2B backlog cleanup in flight.
+  - Entries 1-5 + 10: implemented in 1B-2A (PR #132).
+  - Entries 6-9: implemented in 1B-2B (PR #133).
+  - 1B-2B-1, 1B-2B-2, 1B-2B-3: implemented in 1B-2B (PR #133)
+    as backlog-cleanup entries below.
+  - QC clone Adj Close sites: still deferred per scope notes.
 
-Per-entry status (1B-2A delivery):
+Per-entry status:
   - Entry 1 (Adj Close removal): implemented across signal_library,
     stale_check, spymaster, onepass, impactsearch, stackbuilder,
     confluence, and impact_fastpath. QC clone deferred.
@@ -22,15 +28,18 @@ Per-entry status (1B-2A delivery):
     unification implemented in commit 033aa93; the
     `_pending_bug_fix` test was retired alongside the Entry 4
     zero-capture fix.
-  - Entry 6 (ImpactSearch xlsx duplicate-row dedupe): deferred to
-    1B-2B per scope note.
+  - Entry 6 (ImpactSearch xlsx duplicate-row dedupe): implemented
+    in 1B-2B (PR #133).
   - Entry 7 (calendar grace days default unification to 10):
-    deferred to 1B-2B per scope note (the path-level unification
-    landed in Entry 5).
-  - Entry 8 (sentinel pair standardization): deferred to 1B-2B
-    (paired with the dead streaming-path removal).
-  - Entry 9 (TrafficFlow cache key normalization): deferred to
-    1B-2B.
+    implemented in 1B-2B (PR #133). Phase 2/3 path unification
+    landed in Entry 5 (1B-2A); the default value flip to 10 and
+    the run_for_secondary force-to-zero fix land here.
+  - Entry 8 (sentinel pair standardization): implemented in
+    1B-2B (PR #133, two-stage: Spymaster streaming-path removal
+    + OnePass / TrafficFlow / ImpactSearch sentinel
+    canonicalization).
+  - Entry 9 (TrafficFlow cache key normalization): implemented
+    in 1B-2B (PR #133).
   - Entry 10 (Phase 1A snapshot updates): implemented; see the
     snapshot replacement table in the entry body.
 
@@ -423,73 +432,193 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
 ## Entry 6: ImpactSearch xlsx duplicate-row dedupe
 
   - Type: BUG-FIX
-  - Old behavior: TBD in 1B-2 (see inventory §14;
-    `impactsearch.py:1933–1947` reads any existing xlsx and
-    concatenates new rows on top with no dedupe).
-  - New behavior: TBD in 1B-2 (dedupe by `Primary Ticker`, or
-    overwrite-and-replace; final policy decided in 1B-2).
-  - Affected tests/snapshots: TBD in 1B-2 (the Phase 1A
-    `_pending_bug_fix` test
-    `test_impactsearch_export_writes_duplicates_pending_bug_fix`
-    will flip; the suffix is dropped after this entry lands).
+  - Old behavior: `impactsearch.export_results_to_excel` read any
+    existing xlsx and concatenated new rows on top with no dedupe.
+    Calling it twice with the same `metrics_list` therefore wrote
+    every row twice. The pre-fix Phase 1A snapshot
+    `SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX`
+    encoded `row_count = 4, primary_tickers = AAA, AAA, BBB, BBB`
+    for a 2-primary `metrics_list` exported twice.
+  - New behavior: after the read+concat, the combined frame is
+    deduped by `Primary Ticker` (uppercase-stripped), with
+    `Resolved/Fetched` as a fallback when `Primary Ticker` is
+    empty, using `keep="last"`. The latest call's metric values
+    win for any given ticker. Sharpe-descending sort is preserved
+    (the existing post-dedupe sort uses the deduped values).
+  - Affected tests/snapshots:
+      `test_impactsearch_export_writes_duplicates_pending_bug_fix`
+      retired and renamed to
+      `test_impactsearch_export_dedupes_by_primary_ticker`. The
+      replacement test calls export twice with the same primaries
+      and changed metric values, then asserts the deduped row
+      count is 2 (not 4), the retained values are the second
+      call's, and the Sharpe-descending sort is preserved.
+      `SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX`
+      removed from `phase1a_baseline_snapshots.py`; the new test
+      asserts dedupe semantics directly rather than via a
+      snapshot constant.
   - ELI5: today, if you re-run ImpactSearch and it writes to an
     xlsx that already exists, every row gets duplicated. After
-    this entry, a re-run produces the right number of rows.
-  - Status: stub, pending 1B-2.
+    this entry, a re-run replaces a ticker's row with the new
+    metrics instead of doubling.
+  - Status: implemented in 1B-2B.
 
 ## Entry 7: calendar grace days default unification
 
   - Type: EXPECTED-BY-SPEC
-  - Old behavior: TBD in 1B-2 (see inventory §9; defaults are
-    split — `7` in impactsearch / stackbuilder / impact_fastpath,
-    `0` at one stackbuilder site, `3` in QC).
-  - New behavior: TBD in 1B-2 (default `10` per spec §20).
-  - Affected tests/snapshots: TBD in 1B-2.
-  - ELI5: trading calendars differ across markets; "grace days" is
-    how far we let a missing day on one calendar pad against the
-    nearest valid day on another. The codebase has at least three
-    different defaults today, which contributes to the StackBuilder
-    Phase 2 vs Phase 3 divergence above. The spec mandates a
-    single default of 10. Grace days never change computed
-    metrics on overlapping days; they only affect which days
-    count.
-  - Status: stub, pending 1B-2.
+  - Old behavior: defaults were split — `7` in impactsearch
+    (boot-log echo, `_metrics_from_signals` alignment, secondary
+    coercion) and `signal_library/impact_fastpath` (calendar
+    coverage check), `7` for `stackbuilder.DEFAULT_GRACE_DAYS`,
+    and (most damaging) `stackbuilder.run_for_secondary` set
+    `os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(getattr(args,
+    'grace_days', 0) or 0)` which forced grace to 0 for any args
+    without an explicit `grace_days` attribute, defeating
+    `DEFAULT_GRACE_DAYS`. QC sets 3 (deferred per scope note).
+  - New behavior: every non-QC default is now 10 per spec §20:
+      `impactsearch.py:312` boot-log echo default 10.
+      `impactsearch.py:1964` `_metrics_from_signals` alignment
+      default 10.
+      `impactsearch.py:2314` secondary-coercion alignment default
+      10.
+      `signal_library/impact_fastpath.py:82`
+      `IMPACT_CALENDAR_GRACE_DAYS` constant default 10.
+      `stackbuilder.py:75` `DEFAULT_GRACE_DAYS` default 10.
+      `stackbuilder.py:1488-1492`
+      `run_for_secondary` no longer writes
+      `IMPACT_CALENDAR_GRACE_DAYS = 0` when `args.grace_days` is
+      unset; the env var is only set when the caller supplied an
+      explicit grace_days override. `DEFAULT_GRACE_DAYS=10` now
+      governs by default.
+  - Affected tests: new `test_grace_days_default.py`:
+      `test_stackbuilder_default_grace_days_is_10`,
+      `test_impact_fastpath_default_grace_days_is_10`,
+      `test_impactsearch_default_grace_days_is_10` (subprocess
+      probe of boot-log echo),
+      `test_stackbuilder_run_for_secondary_does_not_force_grace_zero`
+      (asserts the env var is untouched when args.grace_days is
+      unset, and is honored when explicitly supplied).
+  - ELI5: trading calendars differ across markets; "grace days"
+    is how far we let a missing day on one calendar pad against
+    the nearest valid day on another. The codebase had at least
+    three different defaults (7 / 0 / 3), which contributed to
+    the StackBuilder Phase 2 vs Phase 3 divergence. The spec
+    mandates a single default of 10. After this entry, every
+    non-QC engine uses 10 by default.
+  - Status: implemented in 1B-2B.
 
 ## Entry 8: sentinel pair standardization
 
   - Type: BUG-FIX
-  - Old behavior: TBD in 1B-2 (see inventory §8; the dead streaming
-    path uses `(1, 2)` / `(2, 1)`; live vectorized / leader
-    fallback uses `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` /
-    `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`).
-  - New behavior: TBD in 1B-2 (single MAX-SMA sentinel everywhere;
-    largely a side effect of removing the dead streaming path —
-    inventory §16).
-  - Affected tests/snapshots: TBD in 1B-2.
+  - Old behavior: see inventory §8. The dead streaming path in
+    Spymaster used `(1, 2)` for buy and `(2, 1)` for short as
+    sentinel placeholders, while the live vectorized / leader
+    fallback used `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` /
+    `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`. OnePass init/fallback sites
+    used the buy sentinel for short. TrafficFlow used `(1, 2)`
+    for both buy and short fallbacks.
+  - New behavior, two-stage:
+      Stage 1 (this commit, Spymaster): the dead streaming path
+      and its `(1, 2)` / `(2, 1)` sentinels are removed entirely
+      from `spymaster.py`. The streaming function definition,
+      the `use_streaming = False` flag, the
+      `_compute_daily_top_pairs_streaming()` body, the
+      `if use_streaming:` branch, and the related `work_estimate`
+      log line are gone. Vectorized path is the only path.
+      Stage 2 (next commit, OnePass + TrafficFlow + ImpactSearch):
+      short-sentinel sites in OnePass switch to
+      `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`;
+      TrafficFlow `(1, 2)` fallback replaced with the canonical
+      MAX-SMA-1 form.
+  - Affected tests:
+      Stage 1: new `test_dead_streaming_path_removed.py` asserts
+      the function definition is gone, the `use_streaming` flag
+      is gone, the vectorized call remains, and no
+      `(1, 2) / (2, 1)` sentinel literals remain as fallback
+      assignments in `spymaster.py`.
+      Stage 2: see Entry 8 stage-2 commit notes.
   - ELI5: when the engine has no valid pair to choose on a given
-    day, it inserts a placeholder pair so downstream code does not
-    crash. Today the placeholder differs depending on which code
-    path inserted it. After this entry, there is one placeholder
-    everywhere, matching what `MAX_SMA_DAY` already chose.
-  - Status: stub, pending 1B-2.
+    day, it inserts a placeholder pair so downstream code does
+    not crash. Three different placeholders existed across the
+    engines (`(1, 2)`, `(2, 1)`, `(MAX_SMA_DAY, MAX_SMA_DAY - 1)`).
+    After this entry, every engine uses the MAX-SMA form.
+  - Stage 2 (OnePass + TrafficFlow + ImpactSearch):
+      OnePass: three sites that previously used the buy sentinel
+      `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` for short are switched to
+      the canonical `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`:
+      `onepass.py:782` (signal-library reuse fallback),
+      `onepass.py:2133` (per-pair init for the canonical scoring
+      loop), and `onepass.py:2178` (day-0 store in
+      `daily_top_short_pairs`).
+      TrafficFlow: a module-level `MAX_SMA_DAY = 114` plus
+      `_BUY_SENTINEL` / `_SHORT_SENTINEL` constants are added.
+      The `bdict.get(prev, ((1, 2), 0.0))` /
+      `sdict.get(prev, ((1, 2), 0.0))` fallback at
+      `trafficflow.py:1810-1811` is replaced with
+      `(_BUY_SENTINEL, 0.0)` / `(_SHORT_SENTINEL, 0.0)`. The
+      `(1, 2)` literal was unsafe because SMA_1 / SMA_2 have
+      finite values most days, so the gating logic could
+      accidentally produce a tradable signal from a missing-data
+      sentinel.
+      ImpactSearch: the same class of bug surfaced at
+      `impactsearch.py:2272-2273`, where the per-date gating loop
+      that builds primary signals from cached
+      `daily_top_*_pairs` dicts used `((1, 2), 0.0)` as the
+      `dict.get` default for both buy and short. ImpactSearch
+      already imports `MAX_SMA_DAY = 114` at module scope, so
+      the fix uses inline canonical tuples
+      `((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)` for buy and
+      `((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)` for short. Missed
+      during the original 1B-2B sentinel inventory because the
+      adjacent alignment helper at `impactsearch.py:1651-1656`
+      was already canonical and the grep landed on that one.
+      New test assertions in `test_sentinel_standardization.py`:
+        - Spymaster has no `(1, 2) / (2, 1)` sentinel literals.
+        - OnePass short-sentinel assignments use the canonical
+          `MAX_SMA_DAY-1,MAX_SMA_DAY` form.
+        - TrafficFlow defines the canonical sentinel constants
+          and has no legacy sentinel literals.
+        - ImpactSearch has no `(1, 2) / (2, 1)` sentinel
+          literals (`test_impactsearch_no_legacy_sentinel_literals`)
+          and the two `daily_top_*_pairs.get(...)` calls default
+          to canonical MAX-SMA tuples
+          (`test_impactsearch_uses_canonical_maxsma_sentinels`).
+  - Status: implemented in 1B-2B (stages 1 and 2). Engine
+    coverage: Spymaster (stage 1) + OnePass + TrafficFlow +
+    ImpactSearch (stage 2).
 
 ## Entry 9: TrafficFlow cache key normalization
 
-  - Type: BUG-FIX if behavior-visible
-  - Old behavior: TBD in 1B-2 (see inventory §11; some read/write
-    sites use the literal `secondary` argument; `_load_secondary_prices`
-    writes only the uppercase form. A mixed-case lookup after an
-    uppercase write misses and falls through to a fetch).
-  - New behavior: TBD in 1B-2 (one normalization rule across all
-    cache reads and writes).
-  - Affected tests/snapshots: TBD in 1B-2 (Phase 1A's TrafficFlow
-    test uses `'SYN'`, which is already uppercase, so it does not
-    flip).
+  - Type: BUG-FIX
+  - Old behavior: `_PRICE_CACHE` reads and writes used the raw
+    `secondary` argument as the key in most engine call sites
+    (e.g. `_metrics_like_spymaster`, the subset-metrics helpers,
+    the K-extension passes). `_load_secondary_prices` and
+    `refresh_secondary_caches` normalized to uppercase before
+    writing. A mixed-case or whitespace-padded lookup after an
+    uppercase write therefore missed the cache and fell through
+    to a redundant fetch.
+  - New behavior: a `_price_cache_key(symbol)` helper at module
+    scope returns `str(symbol or "").strip().upper()`. Every
+    `_PRICE_CACHE.get(secondary)` and
+    `_PRICE_CACHE[secondary] = sec_df` site now goes through the
+    helper. `_load_secondary_prices` continues to normalize via
+    `_price_cache_key` (replacing the inline `(secondary or "").upper()`).
+    `refresh_secondary_caches` does the same for its symbol set.
+  - Affected tests: new
+    `test_trafficflow_price_cache_key_normalization`. Seeds
+    `_PRICE_CACHE` under the canonical uppercase key, monkeypatches
+    `_load_secondary_prices` to raise on call, then asserts that
+    lowercase (`"syn"`), padded (`" SYN "`), and canonical (`"SYN"`)
+    lookups all hit the same cached frame and produce identical
+    metric output. Phase 1A's existing TrafficFlow test uses
+    `"SYN"` (already canonical) and continues to pass unchanged.
   - ELI5: today, asking the cache for `"spy"` and asking for
     `"SPY"` can give different answers because the writer and the
     reader disagree on whether to uppercase the key. After this
-    entry, the cache is case-consistent.
-  - Status: stub, pending 1B-2.
+    entry, the cache is case-consistent: every read and write
+    flows through one normalizer.
+  - Status: implemented in 1B-2B.
 
 ## Entry 10: Phase 1A snapshot updates
 
@@ -523,3 +652,126 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     decision.
   - Status: 1B-2A snapshot replacements landed; Entry-2-driven
     spymaster snapshot is not pinned by Phase 1A (no flip).
+
+---
+
+# Phase 1B-2B backlog cleanup
+
+The following entries close out the deferred 1B-2A backlog. Each
+landed in PR #133 (branch `phase-1b-2b-backlog`).
+
+## 1B-2B-1: Engine log handler anchoring
+
+  - Type: BUG-FIX / OPS-FIX
+  - Old behavior: import-time `FileHandler` in `spymaster.py`,
+    `onepass.py`, and `impactsearch.py` opened `logs/<engine>.log`
+    relative to the caller's cwd. Running pytest from the repo
+    root therefore left a stray `logs/` directory under the repo
+    root. `impactsearch.py` also had a separate
+    `LOGS_ROOT = os.environ.get("IMPACT_LOGS_ROOT", "logs")`
+    default that triggered an `os.makedirs(LOGS_ROOT, ...)` at
+    import time with the same cwd-relative leakage.
+  - New behavior: the three engines anchor their import-time log
+    files to `Path(__file__).resolve().parent / "logs"` and call
+    `mkdir(parents=True, exist_ok=True)` on that path.
+    `impactsearch.LOGS_ROOT` defaults to the same anchored path
+    when `IMPACT_LOGS_ROOT` is not set. Callers can still override
+    with the env var (preserved for multi-instance usage).
+  - Affected tests: new `test_log_anchoring.py` runs each engine
+    import in a fresh subprocess from a temporary cwd outside
+    `project/`, asserting the subprocess cwd does not get a
+    `logs/` directory and `project/logs/<engine>.log` exists.
+  - ELI5: previously, "running" the test suite or any tooling
+    from the wrong working directory left an orphan `logs/`
+    folder there. Now the engines always write logs into the
+    project's own `logs/` directory regardless of where they
+    were invoked from.
+  - Status: implemented in 1B-2B.
+
+## 1B-2B-2: StackBuilder Dash batch closure bug
+
+  - Type: BUG-FIX
+  - Old behavior: in the multi-secondary Dash launch loop at
+    `stackbuilder.py:1239-1280`, the worker function `_job()` was
+    a closure over the loop variables `args`, `sec`, `ppath`, and
+    `primaries`. Python's late-binding closure semantics mean
+    every thread sees the LAST iteration's bindings once the
+    for-loop completes. Threads launched early therefore ran
+    against the wrong secondary's parameters.
+  - New behavior: `_job(job_args, job_sec, job_ppath, job_primaries)`
+    takes the loop values as positional parameters; the loop
+    body passes them via `threading.Thread(args=(...))`. A
+    `primaries_snapshot = list(primaries) if primaries else None`
+    snapshot is also taken so threads cannot mutate each other's
+    primary list.
+  - Affected tests: new `test_stackbuilder_closure.py`:
+      `test_closure_bug_reproduction` demonstrates that Python's
+      late-binding closure semantics still produce the bug
+      pattern (canary against language changes invalidating the
+      fix).
+      `test_threadargs_pattern_delivers_correct_values` exercises
+      the fix pattern in isolation.
+      `test_stackbuilder_dispatches_distinct_args_per_thread`
+      monkeypatches `run_for_secondary` to record its arguments,
+      drives the production loop body by hand, and asserts that
+      each thread's recorded `args.secondary`, `args.outdir`,
+      `sec`, and `specified_primaries` match its iteration —
+      with each thread seeing its own `args` object id (no
+      cross-binding leak).
+  - ELI5: when the user kicks off StackBuilder for several
+    tickers at once, the buggy code could re-run the LAST
+    ticker's settings against earlier tickers because of how
+    Python "remembers" loop variables inside nested functions.
+    The fix hands each background job its own copy of the
+    settings.
+  - Status: implemented in 1B-2B.
+
+## 1B-2B-3: StackBuilder --outdir honored
+
+  - Type: BUG-FIX
+  - Old behavior: the `--outdir` CLI flag was parsed and
+    `ensure_dir(args.outdir)` was called in `main()`, but
+    `run_for_secondary()` constructed `secondary_parent` as
+    `os.path.join(RUNS_ROOT, ...)` (hardcoded), ignoring the
+    user's `--outdir` setting. CLI single-secondary, CLI
+    multi-secondary, and Dash-launched flows therefore all wrote
+    under `output/stackbuilder` regardless of the flag. The Dash
+    callback also hardcoded `outdir=RUNS_ROOT` in the per-job
+    args, defeating the `outdir` parameter that `run_dash`
+    already accepted. `main()` called `run_dash(None, ...)` in
+    its no-arguments branch, dropping the user's `--outdir` on
+    the floor.
+  - New behavior:
+      `run_for_secondary` now uses
+      `output_root = getattr(args, "outdir", None) or RUNS_ROOT`
+      to build `secondary_parent`. The `RUNS_ROOT` fallback
+      preserves behavior when `args.outdir` is absent (e.g.
+      legacy callers).
+      The Dash callback's per-job args now set
+      `outdir = outdir if outdir else RUNS_ROOT`, threading the
+      `run_dash(outdir, port)` parameter into the job args.
+      `main()`'s no-args branch passes `args.outdir` into
+      `run_dash` instead of `None`, so the Dash UI uses the
+      user-supplied directory. The serve-after-CLI-run path
+      (`run_dash(run_dirs[-1], ...)`) is unchanged because it
+      passes a specific run directory rather than a root.
+  - Affected tests: new `test_stackbuilder_outdir.py`:
+      `test_run_for_secondary_uses_args_outdir`: stubs
+      `phase1_preflight` and intercepts the first
+      `ensure_dir` call to assert `secondary_parent` is built
+      under a custom `args.outdir = /tmp/custom_outdir/SPY`.
+      `test_run_for_secondary_falls_back_to_runs_root_when_outdir_none`:
+      asserts the legacy `RUNS_ROOT/SPY` path is used when
+      `args.outdir` is unset.
+      `test_dash_callback_threads_outdir_into_job_args`: source-
+      text assertions that the job-args block uses
+      `outdir=_job_outdir`, that `_job_outdir = outdir if outdir
+      else RUNS_ROOT` is computed from the run_dash parameter,
+      that `main()` calls `run_dash(args.outdir, ...)`, and
+      that the legacy `run_dash(None, ...)` call is gone.
+  - ELI5: the CLI accepted a `--outdir` flag but ignored it.
+    Multi-ticker runs and the Dash UI both wrote results to the
+    default `output/stackbuilder` directory regardless of where
+    the user pointed `--outdir`. After this entry, every output
+    path honors `--outdir`.
+  - Status: implemented in 1B-2B.

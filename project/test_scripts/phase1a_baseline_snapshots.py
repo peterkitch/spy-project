@@ -96,7 +96,10 @@ SNAP_TRAFFICFLOW_COMBINE_SIGNALS_MIXED = ('S', ((('ts', '2024-01-02T00:00:00'), 
 SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_NONE = ('S', ((('ts', '2024-01-02T00:00:00'), ('s', 'None')), (('ts', '2024-01-03T00:00:00'), ('s', 'None')), (('ts', '2024-01-04T00:00:00'), ('s', 'None')), (('ts', '2024-01-05T00:00:00'), ('s', 'None')), (('ts', '2024-01-08T00:00:00'), ('s', 'None'))))
 
 # ---------------------------------------------------------------------------
-# Category 4: ImpactSearch xlsx duplicate-export baseline (KNOWN BUG)
+# Category 4: ImpactSearch xlsx export baseline
 # ---------------------------------------------------------------------------
-
-SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX = ('d', ((('s', 'columns'), ('l', (('s', 'Primary Ticker'), ('s', 'Resolved/Fetched'), ('s', 'Library Source'), ('s', 'Trigger Days'), ('s', 'Wins'), ('s', 'Losses'), ('s', 'Win Ratio (%)'), ('s', 'Std Dev (%)'), ('s', 'Sharpe Ratio'), ('s', 't-Statistic'), ('s', 'p-Value'), ('s', 'Significant 90%'), ('s', 'Significant 95%'), ('s', 'Significant 99%'), ('s', 'Avg Daily Capture (%)'), ('s', 'Total Capture (%)')))), (('s', 'primary_tickers'), ('l', (('s', 'AAA'), ('s', 'AAA'), ('s', 'BBB'), ('s', 'BBB')))), (('s', 'row_count'), ('i', 4))))
+# 1B-2B (ledger Entry 6): the duplicate-row bug is fixed. The pinned
+# snapshot SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX
+# is retired. The replacement test
+# (test_impactsearch_export_dedupes_by_primary_ticker) asserts dedupe
+# semantics directly rather than via a snapshot constant.
