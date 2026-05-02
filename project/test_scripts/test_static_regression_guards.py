@@ -303,6 +303,87 @@ def test_b5_no_functional_adj_close_selector():
 # ---------------------------------------------------------------------------
 
 
+def test_b7_daily_top_pairs_write_init_canonical():
+    """Phase 2A amendment: write-init counterpart to B2.
+
+    B2 covers the read-fallback shape:
+        daily_top_*_pairs.get(key, ((..., ...), 0.0))
+    B7 covers the write-init shape:
+        daily_top_*_pairs[key] = ((..., ...), 0.0)
+
+    The C3 sparse-cache test at the multi_timeframe_builder day-0
+    init site (415-417) and the Codex audit at impactsearch.py:2218-2219
+    both surfaced production sites where the WRITE side stamped a
+    non-canonical sentinel pair. Read fallbacks alone don't cover
+    this — a write-side seed of (114, 113) for short is just as
+    bad: once it's in the dict, every subsequent read of that
+    date returns the buy-form-for-short bug.
+
+    Failures must use canonical literal forms or constants:
+        buy:   (MAX_SMA_DAY, MAX_SMA_DAY - 1)  or _BUY_SENTINEL
+        short: (MAX_SMA_DAY - 1, MAX_SMA_DAY)  or _SHORT_SENTINEL
+    """
+    files = production_python_files()
+
+    # Match `daily_top_<KIND>_pairs[<key>] = ((<i>, <j>), <cap>)`
+    # capturing the kind. We deliberately match only literal
+    # numeric inner pairs to avoid flagging cases where the
+    # right-hand side is a previously-validated variable.
+    site_pat = re.compile(
+        r"daily_top_(?P<kind>buy|short)_pairs\[[^\]]+\]\s*=\s*"
+        r"\(\s*\(\s*(?P<i>\w+(?:\s*-\s*\w+)?)\s*,\s*(?P<j>\w+(?:\s*-\s*\w+)?)\s*\)"
+    )
+
+    canonical_buy_inner = re.compile(
+        r"^\s*(?:MAX_SMA_DAY|114)\s*$"  # left index
+    )
+    # We accept canonical forms by checking that both inner
+    # tokens form one of the two canonical pairs.
+    failures = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = str(path.relative_to(PROJECT_DIR)).replace("\\", "/")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            m = site_pat.search(line)
+            if not m:
+                continue
+            kind = m.group("kind")
+            i_tok = m.group("i").strip()
+            j_tok = m.group("j").strip()
+            # Normalize whitespace inside the tokens.
+            i_norm = re.sub(r"\s+", "", i_tok)
+            j_norm = re.sub(r"\s+", "", j_tok)
+            is_buy = kind == "buy"
+            if is_buy:
+                ok = (i_norm == "MAX_SMA_DAY" and j_norm == "MAX_SMA_DAY-1")
+                # Numeric canonical (114, 113) acceptable only when
+                # MAX_SMA_DAY is not in scope. We reject it
+                # uniformly to push toward constants.
+            else:
+                ok = (i_norm == "MAX_SMA_DAY-1" and j_norm == "MAX_SMA_DAY")
+            if not ok:
+                failures.append((path, lineno, line))
+
+    if failures:
+        rel = lambda p: str(p.relative_to(PROJECT_DIR)).replace("\\", "/")
+        body = "\n".join(f"{rel(p)}:{ln}: {ln_.rstrip()}" for p, ln, ln_ in failures)
+        pytest.fail(
+            f"[B7-write-init-sentinels] {len(failures)} hit(s):\n"
+            f"{body}\n\n"
+            "Expected:\n"
+            "  daily_top_buy_pairs[key]   = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)\n"
+            "  daily_top_short_pairs[key] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)\n"
+            "Use the constant; do not hardcode numeric pairs.\n"
+            "Ledger: Entry 8 (sentinel pair standardization)\n"
+        )
+
+
 def test_b6_no_implicit_np_std_in_canonical_contexts():
     """Ban np.std(...) without an explicit ddof= argument in
     canonical metric contexts.

@@ -2214,9 +2214,15 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         for idx, date in enumerate(df.index):
             # Skip first day - can't trade without previous day's signals
             if idx == 0:
-                # PARITY FIX: Use sentinel pair (114, 113) to match spymaster and onepass
-                daily_top_buy_pairs[date] = ((114, 113), 0.0)
-                daily_top_short_pairs[date] = ((114, 113), 0.0)
+                # Phase 2A: canonical sentinels per spec §appendix; the
+                # write-init counterpart to the read fallback fixed in
+                # 1B-2B amendment 1 (impactsearch.py:2272-2273). Previously
+                # used (114, 113) for both buy and short, which let
+                # SMA_113 / SMA_114 comparisons gate a tradable signal
+                # once history accumulated. Static guard B7 flags this
+                # write-init shape going forward.
+                daily_top_buy_pairs[date] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+                daily_top_short_pairs[date] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
                 continue
             
             # Use PREVIOUS day's SMAs to generate signals

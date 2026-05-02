@@ -603,6 +603,27 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
       stored `((114, 113), 0.0)` for both buy and short on the
       day-0 init store inside the streaming-pair loop. Same
       class, just on the write side rather than the read side.
+      Phase 2A amendment (PR #134, post-Codex audit) added a
+      dedicated write-init static guard (B7,
+      `test_b7_daily_top_pairs_write_init_canonical`) which
+      caught one additional site:
+        `impactsearch.py:2218-2219`
+          Day-0 init at the top of the streaming pair loop
+          stored `((114, 113), 0.0)` for both buy and short.
+          Buy form was numerically correct but used a hardcoded
+          literal where MAX_SMA_DAY is in scope; short form was
+          wrong (buy-sentinel-reused-for-short).
+      Fix: both lines now use canonical inline tuples
+        buy:   ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+        short: ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
+      Static guard B7 enforces:
+        daily_top_buy_pairs[key]   = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+        daily_top_short_pairs[key] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
+      across all production files. Hardcoded numeric pairs
+      (even when numerically canonical) are rejected to push
+      every write-init through the named constant. B2 covers
+      the read-fallback shape; B7 covers the write-init shape.
+      Together they pin both sides of the bug class.
       Fixes:
         multi_timeframe_builder already had `MAX_SMA_DAY = 114` at
         module scope; the two read sites and the one day-0 write
