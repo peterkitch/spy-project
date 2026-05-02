@@ -1,6 +1,7 @@
 import os
 import sys
 import importlib
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from scipy import stats
@@ -102,7 +103,12 @@ import socket
 # Each run can be isolated via env vars to support multi-instance execution.
 INSTANCE_NAME = os.environ.get("IMPACT_INSTANCE_NAME", f"pid{os.getpid()}")
 CACHE_ROOT = os.environ.get("IMPACT_CACHE_ROOT", "cache")
-LOGS_ROOT = os.environ.get("IMPACT_LOGS_ROOT", "logs")
+# Default LOGS_ROOT is anchored to project/logs so import-time log writes
+# do not leak into the caller's cwd (Phase 1B-2B: log handler anchoring).
+LOGS_ROOT = os.environ.get(
+    "IMPACT_LOGS_ROOT",
+    str(Path(__file__).resolve().parent / "logs"),
+)
 
 # Backpressure control for UI responsiveness
 RESULTS_SNAPSHOT_EVERY = int(os.environ.get("IMPACT_RESULTS_SNAPSHOT_EVERY", "250"))
@@ -341,9 +347,11 @@ console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
-# Ensure logs directory exists before creating FileHandler
-os.makedirs('logs', exist_ok=True)
-file_handler = logging.FileHandler('logs/impactsearch.log', mode='w')
+# Anchor logs to project/logs regardless of cwd at import time
+# (Phase 1B-2B: log handler anchoring).
+_logs_dir = Path(__file__).resolve().parent / "logs"
+_logs_dir.mkdir(parents=True, exist_ok=True)
+file_handler = logging.FileHandler(str(_logs_dir / 'impactsearch.log'), mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)

@@ -523,3 +523,38 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     decision.
   - Status: 1B-2A snapshot replacements landed; Entry-2-driven
     spymaster snapshot is not pinned by Phase 1A (no flip).
+
+---
+
+# Phase 1B-2B backlog cleanup
+
+The following entries close out the deferred 1B-2A backlog. Each
+landed in PR #133 (branch `phase-1b-2b-backlog`).
+
+## 1B-2B-1: Engine log handler anchoring
+
+  - Type: BUG-FIX / OPS-FIX
+  - Old behavior: import-time `FileHandler` in `spymaster.py`,
+    `onepass.py`, and `impactsearch.py` opened `logs/<engine>.log`
+    relative to the caller's cwd. Running pytest from the repo
+    root therefore left a stray `logs/` directory under the repo
+    root. `impactsearch.py` also had a separate
+    `LOGS_ROOT = os.environ.get("IMPACT_LOGS_ROOT", "logs")`
+    default that triggered an `os.makedirs(LOGS_ROOT, ...)` at
+    import time with the same cwd-relative leakage.
+  - New behavior: the three engines anchor their import-time log
+    files to `Path(__file__).resolve().parent / "logs"` and call
+    `mkdir(parents=True, exist_ok=True)` on that path.
+    `impactsearch.LOGS_ROOT` defaults to the same anchored path
+    when `IMPACT_LOGS_ROOT` is not set. Callers can still override
+    with the env var (preserved for multi-instance usage).
+  - Affected tests: new `test_log_anchoring.py` runs each engine
+    import in a fresh subprocess from a temporary cwd outside
+    `project/`, asserting the subprocess cwd does not get a
+    `logs/` directory and `project/logs/<engine>.log` exists.
+  - ELI5: previously, "running" the test suite or any tooling
+    from the wrong working directory left an orphan `logs/`
+    folder there. Now the engines always write logs into the
+    project's own `logs/` directory regardless of where they
+    were invoked from.
+  - Status: implemented in 1B-2B.

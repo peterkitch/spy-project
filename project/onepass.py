@@ -79,9 +79,12 @@ console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
-# Create logs directory before FileHandler to avoid race condition
-os.makedirs('logs', exist_ok=True)
-file_handler = logging.FileHandler('logs/onepass.log', mode='w')
+# Anchor logs to project/logs regardless of cwd at import time
+# (Phase 1B-2B: log handler anchoring).
+from pathlib import Path as _LogPath
+_logs_dir = _LogPath(__file__).resolve().parent / "logs"
+_logs_dir.mkdir(parents=True, exist_ok=True)
+file_handler = logging.FileHandler(str(_logs_dir / 'onepass.log'), mode='w')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)

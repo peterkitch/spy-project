@@ -2845,10 +2845,12 @@ if not has_stream:
     logger.addHandler(console_handler)
 
 if not has_file:
-    # Ensure logs directory exists
-    os.makedirs('logs', exist_ok=True)
-    # Create file handler with UTF-8 encoding
-    file_handler = logging.FileHandler('logs/spymaster.log', encoding='utf-8')
+    # Anchor logs to project/logs regardless of cwd at import time
+    # (Phase 1B-2B: log handler anchoring).
+    from pathlib import Path as _LogPath
+    _logs_dir = _LogPath(__file__).resolve().parent / "logs"
+    _logs_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(str(_logs_dir / 'spymaster.log'), encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     file_handler.setFormatter(file_formatter)
