@@ -112,7 +112,15 @@ def test_d2_align_signals_to_daily(monkeypatch, _populated_intervals):
 
 def test_d3_calculate_confluence(monkeypatch, _populated_intervals):
     """calculate_confluence on the aligned frame produces a
-    confluence dict for a target date."""
+    confluence dict for a target date.
+
+    Phase 2B-2A hardening: enforce structural shape contract.
+      - Required keys present
+      - tier is one of the documented seven values
+      - count arithmetic invariants hold
+      - breakdown keys match aligned columns
+      - all breakdown values are valid signal labels
+    """
     library_dir, _paths = _populated_intervals
     from signal_library import confluence_analyzer as ca
 
@@ -125,10 +133,57 @@ def test_d3_calculate_confluence(monkeypatch, _populated_intervals):
         # against trailing-end edges).
         target = aligned.dropna(how="all").index[len(aligned) // 2]
         result = ca.calculate_confluence(aligned, target, min_active=2)
-        assert isinstance(result, dict)
-        # The function returns a dict with at least a confluence
-        # tier and the per-interval breakdown. Verify the call
-        # completed without crashing.
+
+        required_keys = {
+            "tier", "strength", "alignment_pct",
+            "buy_count", "short_count", "none_count",
+            "active_count", "total_count", "alignment_since", "breakdown",
+        }
+        missing = required_keys - set(result.keys())
+        assert not missing, f"calculate_confluence missing keys: {missing}"
+
+        valid_tiers = {
+            "Strong Buy", "Buy", "Weak Buy",
+            "Neutral",
+            "Weak Short", "Short", "Strong Short",
+        }
+        assert result["tier"] in valid_tiers, (
+            f"unknown tier {result['tier']!r}; expected one of {valid_tiers}"
+        )
+
+        # Numeric range / arithmetic invariants.
+        assert 0 <= result["alignment_pct"] <= 100, (
+            f"alignment_pct {result['alignment_pct']} out of [0, 100]"
+        )
+        b = int(result["buy_count"])
+        s = int(result["short_count"])
+        n = int(result["none_count"])
+        active = int(result["active_count"])
+        total = int(result["total_count"])
+        assert b + s == active, (
+            f"active_count mismatch: buy={b} + short={s} != active={active}"
+        )
+        assert b + s + n == total, (
+            f"total_count mismatch: buy={b} + short={s} + none={n} != total={total}"
+        )
+        assert n == total - active, (
+            f"none_count mismatch: total - active = {total - active} vs none={n}"
+        )
+        assert total == len(aligned.columns), (
+            f"total_count {total} != len(aligned.columns) {len(aligned.columns)}"
+        )
+
+        # breakdown shape: keys match aligned columns, values are valid labels.
+        breakdown = result["breakdown"]
+        assert set(breakdown.keys()) == set(aligned.columns), (
+            f"breakdown keys {set(breakdown.keys())} != aligned columns "
+            f"{set(aligned.columns)}"
+        )
+        valid_labels = {"Buy", "Short", "None"}
+        for col, lbl in breakdown.items():
+            assert lbl in valid_labels, (
+                f"breakdown[{col!r}] = {lbl!r}; expected one of {valid_labels}"
+            )
     finally:
         ca.SIGNAL_LIBRARY_DIR = pre_dir
 

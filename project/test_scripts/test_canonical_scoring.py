@@ -481,7 +481,13 @@ def test_c6_score_signals_std_zero_all_identical_captures():
 
 def test_c7_score_signals_std_epsilon_stable():
     """Tiny but nonzero variance -> Sharpe computes without
-    numerical instability."""
+    numerical instability.
+
+    Phase 2B-2A hardening: pin the std value (rather than just
+    asserting > 0) so any future ddof / variance-formula change
+    surfaces here. The value below was captured from the current
+    score_captures implementation on this exact fixture.
+    """
     idx = DATES_10
     sig = pd.Series(["Buy"] * 10, index=idx)
     # Captures with std on the order of 1e-9 % points.
@@ -490,7 +496,8 @@ def test_c7_score_signals_std_epsilon_stable():
     ret = pd.Series(eps_returns, index=idx, dtype=float)
     s = score_signals(sig, ret)
     assert s.trigger_days == 10
-    assert s.std_dev > 0.0
+    expected_std = 3.0276503397714194e-10
+    assert s.std_dev == pytest.approx(expected_std, rel=1e-9, abs=1e-15)
     assert math.isfinite(s.std_dev)
     assert math.isfinite(s.sharpe)
     assert math.isfinite(s.t_statistic)
@@ -622,55 +629,39 @@ def _expected_consensus(signals: list[str]) -> str:
 
 @pytest.mark.parametrize("n_primaries", [2, 3, 4, 5])
 def test_c13_consensus_DI_mute_combinations(n_primaries):
-    """Parametrized across {D, I, M} combinations for N primaries.
+    """Phase 2B-2A hardening: exhaustive 3^N coverage at N in {2..5}
+    with both base signals (Buy and Short) for symmetry.
 
-    Strategy: rather than enumerating 3^N (243 at N=5) full grids,
-    pin a representative subset that covers every distinct shape
-    of agreement / disagreement / muting:
-      - all-D-Buy (unanimous Buy)
-      - all-D-Short (unanimous Short)
-      - all-I-Buy (unanimous Buy after inversion)
-      - all-M (everyone muted -> None)
-      - mixed: half D, half I against same base (cancel -> None)
-      - one-disagree: N-1 agree on Buy, one disagrees with Short
-      - one-mute among unanimous: N-1 D-Buy, one mute (still Buy)
-      - all-different: N members each with a distinct direction
-        cycling through D/I/M (where applicable)
+    Total inner asserts: sum_{N=2..5} 2 * 3^N
+      = 2 * (9 + 27 + 81 + 243) = 720.
 
-    For each shape, build a signal frame at one date and assert
-    combine_consensus_signals matches spec §18.
+    For each (directions, base) tuple this builds a single-date
+    signal frame, runs combine_consensus_signals, and asserts the
+    output matches the spec §18 expected_consensus reference helper.
     """
+    import itertools
+
     idx = pd.DatetimeIndex(["2024-01-02"])
+    inner_asserts = 0
 
-    cases = []  # list of (direction_list, base_signal, label)
-    cases.append((["D"] * n_primaries, "Buy", "all-D-Buy"))
-    cases.append((["D"] * n_primaries, "Short", "all-D-Short"))
-    cases.append((["I"] * n_primaries, "Buy", "all-I-Buy-(=Short)"))
-    cases.append((["M"] * n_primaries, "Buy", "all-M"))
-    # half D + half I against Buy base -> half Buy + half Short -> None
-    half_d = ["D"] * (n_primaries // 2)
-    half_i = ["I"] * (n_primaries - n_primaries // 2)
-    cases.append((half_d + half_i, "Buy", "half-D-half-I"))
-    # one disagree: N-1 D-Buy, last one I-Buy (=Short)
-    cases.append((["D"] * (n_primaries - 1) + ["I"], "Buy", "one-disagree"))
-    # one-mute among unanimous D-Buy
-    cases.append((["D"] * (n_primaries - 1) + ["M"], "Buy", "one-mute-rest-Buy"))
-    # cycling D/I/M (covers mixed-direction cases at higher N)
-    cycle = ["D", "I", "M"]
-    cases.append(([cycle[i % 3] for i in range(n_primaries)], "Buy", "DIM-cycle"))
+    for directions in itertools.product(("D", "I", "M"), repeat=n_primaries):
+        for base in ("Buy", "Short"):
+            signals_list = [_direction_to_signal(d, base) for d in directions]
+            member_signals = [
+                pd.Series([s], index=idx) for s in signals_list
+            ]
+            actual = combine_consensus_signals(member_signals).iloc[0]
+            expected = _expected_consensus(signals_list)
+            assert actual == expected, (
+                f"[N={n_primaries}] directions={directions} base={base!r} "
+                f"signals={signals_list} -> consensus={actual!r} "
+                f"(expected {expected!r})"
+            )
+            inner_asserts += 1
 
-    for directions, base, label in cases:
-        member_signals = [
-            pd.Series([_direction_to_signal(d, base)], index=idx)
-            for d in directions
-        ]
-        consensus = combine_consensus_signals(member_signals)
-        actual = consensus.iloc[0]
-
-        expected = _expected_consensus(
-            [_direction_to_signal(d, base) for d in directions]
-        )
-        assert actual == expected, (
-            f"[N={n_primaries}, {label}] directions={directions} "
-            f"base={base} -> consensus={actual!r} (expected {expected!r})"
-        )
+    # Sanity: 2 * 3^N inner asserts at this N.
+    expected_count = 2 * (3 ** n_primaries)
+    assert inner_asserts == expected_count, (
+        f"expected {expected_count} inner asserts at N={n_primaries}, "
+        f"executed {inner_asserts}"
+    )
