@@ -54,11 +54,15 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
   In addition to the formula-law deltas captured in Entries 1–10,
   every engine metric helper in stackbuilder, confluence,
   trafficflow, onepass, impactsearch, and spymaster now routes
-  through `project/canonical_scoring.py` (`score_captures` /
-  `score_signals`). Inline Sharpe / t-stat / p-value / std /
-  win-rate / trigger-counting math has been removed from the
-  engines (see grep verification in the amendment commit
-  messages).
+  canonical metric scoring through
+  `project/canonical_scoring.py` (`score_captures` /
+  `score_signals`). Inline Sharpe, t-statistic, p-value, std-dev,
+  win-rate, and win/loss counting on capture series have been
+  removed from the engines wherever a canonical score is in
+  scope (see grep verification in the amendment commit messages).
+  Trigger-mask construction and pre-score early-exit guards
+  (e.g. `if int(trigger_mask.sum()) == 0: return`) remain inline
+  as necessary control flow rather than duplicate math.
 
   Documented exceptions where inline math is intentionally retained:
 

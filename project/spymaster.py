@@ -8963,17 +8963,8 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
             active_signals.append(current_position)
 
         if len(cumulative_captures) > 0:
-            # Create signal mask excluding first day (to match the shifted signals approach)
-            trigger_mask = [sig in ('Buy', 'Short') for sig in active_signals]
-            trigger_days = sum(trigger_mask)
-
-            # Extract signal_captures only for triggered days
-            signal_captures = np.array([
-                cap for cap, active_sig in zip(cumulative_captures, active_signals)
-                if active_sig in ('Buy', 'Short')
-            ])
-
             # Spec §13–§17: route through canonical_scoring.
+            trigger_mask = [sig in ('Buy', 'Short') for sig in active_signals]
             _trig_mask_arr = np.array(trigger_mask, dtype=bool)
             _caps_arr = np.asarray(cumulative_captures, dtype=float)
             _score = _canonical_score_captures(
@@ -8981,6 +8972,7 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
                 pd.Series(_trig_mask_arr),
                 risk_free_rate=5.0, periods_per_year=252, ddof=1,
             )
+            trigger_days = _score.trigger_days
             wins = _score.wins
             losses = _score.losses
             win_ratio = _score.win_rate
@@ -10493,13 +10485,6 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             hovertemplate='Date: %{x}<br>Combined Pair Capture: %{y:.2f}%<extra></extra>'
         ))
     
-    # Count actual trading days and wins from combined strategy
-    # Only count days where we had an active signal (not 'none')
-    total_signals = len([s for s in signals_followed if s != 'none'])
-    # Count wins: positive returns on signal days (returns are 0 on non-signal days)
-    combined_wins = (combined_returns > 0).sum()
-    overall_win_rate = (combined_wins / total_signals * 100) if total_signals > 0 else 0
-    
     # Manual SMA testing interface. Originally hand-written metric
     # math; delegated to canonical_scoring in 1B-2A amendment 2 so
     # this section serves as a parity tester. Any divergence between
@@ -10516,9 +10501,15 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
         )
         sharpe_ratio = float(_score_combined.sharpe)
         annualized_return = float(_score_combined.avg_daily_capture) * 252 / 100.0  # decimal for Calmar
+        total_signals = _score_combined.trigger_days
+        combined_wins = _score_combined.wins
+        overall_win_rate = float(_score_combined.win_rate)
     else:
         sharpe_ratio = 0
         annualized_return = 0
+        total_signals = 0
+        combined_wins = 0
+        overall_win_rate = 0.0
     
     # Calculate Maximum Drawdown from equity curve with date range
     max_drawdown_start_date = None
