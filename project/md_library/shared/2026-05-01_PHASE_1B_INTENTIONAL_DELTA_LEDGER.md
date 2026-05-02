@@ -1,10 +1,16 @@
 # Phase 1B Intentional Delta Ledger
 
 Document date: 2026-05-01
-Branch: phase-1b-2a-canonical-rewire
-Status: implemented in PR #132.
+Branches: phase-1b-2a-canonical-rewire (PR #132, merged),
+          phase-1b-2b-backlog (PR #133).
+Status: 1B-2A merged; 1B-2B backlog cleanup in flight.
+  - Entries 1-5 + 10: implemented in 1B-2A (PR #132).
+  - Entries 6-9: implemented in 1B-2B (PR #133).
+  - 1B-2B-1, 1B-2B-2, 1B-2B-3: implemented in 1B-2B (PR #133)
+    as backlog-cleanup entries below.
+  - QC clone Adj Close sites: still deferred per scope notes.
 
-Per-entry status (1B-2A delivery):
+Per-entry status:
   - Entry 1 (Adj Close removal): implemented across signal_library,
     stale_check, spymaster, onepass, impactsearch, stackbuilder,
     confluence, and impact_fastpath. QC clone deferred.
@@ -697,4 +703,54 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     Python "remembers" loop variables inside nested functions.
     The fix hands each background job its own copy of the
     settings.
+  - Status: implemented in 1B-2B.
+
+## 1B-2B-3: StackBuilder --outdir honored
+
+  - Type: BUG-FIX
+  - Old behavior: the `--outdir` CLI flag was parsed and
+    `ensure_dir(args.outdir)` was called in `main()`, but
+    `run_for_secondary()` constructed `secondary_parent` as
+    `os.path.join(RUNS_ROOT, ...)` (hardcoded), ignoring the
+    user's `--outdir` setting. CLI single-secondary, CLI
+    multi-secondary, and Dash-launched flows therefore all wrote
+    under `output/stackbuilder` regardless of the flag. The Dash
+    callback also hardcoded `outdir=RUNS_ROOT` in the per-job
+    args, defeating the `outdir` parameter that `run_dash`
+    already accepted. `main()` called `run_dash(None, ...)` in
+    its no-arguments branch, dropping the user's `--outdir` on
+    the floor.
+  - New behavior:
+      `run_for_secondary` now uses
+      `output_root = getattr(args, "outdir", None) or RUNS_ROOT`
+      to build `secondary_parent`. The `RUNS_ROOT` fallback
+      preserves behavior when `args.outdir` is absent (e.g.
+      legacy callers).
+      The Dash callback's per-job args now set
+      `outdir = outdir if outdir else RUNS_ROOT`, threading the
+      `run_dash(outdir, port)` parameter into the job args.
+      `main()`'s no-args branch passes `args.outdir` into
+      `run_dash` instead of `None`, so the Dash UI uses the
+      user-supplied directory. The serve-after-CLI-run path
+      (`run_dash(run_dirs[-1], ...)`) is unchanged because it
+      passes a specific run directory rather than a root.
+  - Affected tests: new `test_stackbuilder_outdir.py`:
+      `test_run_for_secondary_uses_args_outdir`: stubs
+      `phase1_preflight` and intercepts the first
+      `ensure_dir` call to assert `secondary_parent` is built
+      under a custom `args.outdir = /tmp/custom_outdir/SPY`.
+      `test_run_for_secondary_falls_back_to_runs_root_when_outdir_none`:
+      asserts the legacy `RUNS_ROOT/SPY` path is used when
+      `args.outdir` is unset.
+      `test_dash_callback_threads_outdir_into_job_args`: source-
+      text assertions that the job-args block uses
+      `outdir=_job_outdir`, that `_job_outdir = outdir if outdir
+      else RUNS_ROOT` is computed from the run_dash parameter,
+      that `main()` calls `run_dash(args.outdir, ...)`, and
+      that the legacy `run_dash(None, ...)` call is gone.
+  - ELI5: the CLI accepted a `--outdir` flag but ignored it.
+    Multi-ticker runs and the Dash UI both wrote results to the
+    default `output/stackbuilder` directory regardless of where
+    the user pointed `--outdir`. After this entry, every output
+    path honors `--outdir`.
   - Status: implemented in 1B-2B.

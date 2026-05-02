@@ -1247,11 +1247,15 @@ def run_dash(outdir: str, port: int = 8054):
 
             jobs.append({'secondary': sec, 'ppath': ppath})
 
+            # Phase 1B-2B: honor the Dash-launched outdir (from
+            # run_dash(outdir, port)) instead of hardcoding RUNS_ROOT.
+            # Falls back to RUNS_ROOT only if no Dash outdir was set.
+            _job_outdir = outdir if outdir else RUNS_ROOT
             args = SimpleNamespace(
                 secondary=sec, secondaries=None, primaries=None,
                 top_n=int(topn or 20), bottom_n=int(bottomn or 20), max_k=int(maxk or 6),
                 alpha=float(alpha or 0.05), min_marginal_capture=0.0,
-                threads='auto', outdir=RUNS_ROOT,
+                threads='auto', outdir=_job_outdir,
                 fail_on_missing_cache=False, serve=False, port=8054,
                 prefer_impact_xlsx=prefer_fast, impact_xlsx_dir=xdir,
                 impact_xlsx_max_age_days=45,
@@ -1507,8 +1511,12 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
     ts = now_ts()
     # Clean secondary name for filesystem, but preserve '^' (safe on NTFS) per design
     vendor_secondary_clean = vendor_secondary.replace(".", "_")
-    # Create parent directory for this secondary ticker
-    secondary_parent = os.path.join(RUNS_ROOT, vendor_secondary_clean)
+    # Phase 1B-2B: honor args.outdir as the output root (CLI --outdir
+    # was previously ignored by run_for_secondary; CLI single-secondary
+    # and CLI multi-secondary paths therefore both wrote under
+    # RUNS_ROOT regardless of --outdir).
+    output_root = getattr(args, "outdir", None) or RUNS_ROOT
+    secondary_parent = os.path.join(output_root, vendor_secondary_clean)
     ensure_dir(secondary_parent)
     # Use temporary directory initially within the parent
     # Make temp folder unique per process to avoid collisions under parallel runs
@@ -1737,8 +1745,11 @@ def main(argv=None):
     elif args.secondary:
         secondaries = [args.secondary.strip()]
     else:
-        # Default behavior: launch Dash UI when no arguments provided
-        run_dash(None, port=args.port)
+        # Default behavior: launch Dash UI when no arguments provided.
+        # Phase 1B-2B: thread args.outdir through so the Dash callback
+        # writes under the user-specified --outdir instead of hardcoded
+        # RUNS_ROOT.
+        run_dash(args.outdir, port=args.port)
         return
 
     # Parse primary tickers if provided
