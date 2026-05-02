@@ -22,8 +22,8 @@ Per-entry status (1B-2A delivery):
     unification implemented in commit 033aa93; the
     `_pending_bug_fix` test was retired alongside the Entry 4
     zero-capture fix.
-  - Entry 6 (ImpactSearch xlsx duplicate-row dedupe): deferred to
-    1B-2B per scope note.
+  - Entry 6 (ImpactSearch xlsx duplicate-row dedupe): implemented
+    in 1B-2B (PR #133).
   - Entry 7 (calendar grace days default unification to 10):
     deferred to 1B-2B per scope note (the path-level unification
     landed in Entry 5).
@@ -423,19 +423,36 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
 ## Entry 6: ImpactSearch xlsx duplicate-row dedupe
 
   - Type: BUG-FIX
-  - Old behavior: TBD in 1B-2 (see inventory §14;
-    `impactsearch.py:1933–1947` reads any existing xlsx and
-    concatenates new rows on top with no dedupe).
-  - New behavior: TBD in 1B-2 (dedupe by `Primary Ticker`, or
-    overwrite-and-replace; final policy decided in 1B-2).
-  - Affected tests/snapshots: TBD in 1B-2 (the Phase 1A
-    `_pending_bug_fix` test
-    `test_impactsearch_export_writes_duplicates_pending_bug_fix`
-    will flip; the suffix is dropped after this entry lands).
+  - Old behavior: `impactsearch.export_results_to_excel` read any
+    existing xlsx and concatenated new rows on top with no dedupe.
+    Calling it twice with the same `metrics_list` therefore wrote
+    every row twice. The pre-fix Phase 1A snapshot
+    `SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX`
+    encoded `row_count = 4, primary_tickers = AAA, AAA, BBB, BBB`
+    for a 2-primary `metrics_list` exported twice.
+  - New behavior: after the read+concat, the combined frame is
+    deduped by `Primary Ticker` (uppercase-stripped), with
+    `Resolved/Fetched` as a fallback when `Primary Ticker` is
+    empty, using `keep="last"`. The latest call's metric values
+    win for any given ticker. Sharpe-descending sort is preserved
+    (the existing post-dedupe sort uses the deduped values).
+  - Affected tests/snapshots:
+      `test_impactsearch_export_writes_duplicates_pending_bug_fix`
+      retired and renamed to
+      `test_impactsearch_export_dedupes_by_primary_ticker`. The
+      replacement test calls export twice with the same primaries
+      and changed metric values, then asserts the deduped row
+      count is 2 (not 4), the retained values are the second
+      call's, and the Sharpe-descending sort is preserved.
+      `SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX`
+      removed from `phase1a_baseline_snapshots.py`; the new test
+      asserts dedupe semantics directly rather than via a
+      snapshot constant.
   - ELI5: today, if you re-run ImpactSearch and it writes to an
     xlsx that already exists, every row gets duplicated. After
-    this entry, a re-run produces the right number of rows.
-  - Status: stub, pending 1B-2.
+    this entry, a re-run replaces a ticker's row with the new
+    metrics instead of doubling.
+  - Status: implemented in 1B-2B.
 
 ## Entry 7: calendar grace days default unification
 

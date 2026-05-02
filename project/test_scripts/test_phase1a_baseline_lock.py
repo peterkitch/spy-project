@@ -414,16 +414,16 @@ def test_trafficflow_combine_signals_all_none_baseline():
     assert freeze(out) == SNAP.SNAP_TRAFFICFLOW_COMBINE_SIGNALS_ALL_NONE
 
 
-def test_impactsearch_export_writes_duplicates_pending_bug_fix(tmp_path):
-    # Pinned per Phase 1B Intentional Delta Ledger:
-    # "ImpactSearch xlsx duplicate-row dedupe" (BUG-FIX).
-    # The current export_results_to_excel implementation reads any
-    # existing file and concatenates the new rows on top. Calling it
-    # twice with the same metrics_list therefore produces duplicates.
-    # This snapshot encodes the current bug. Phase 1B replaces it.
+def test_impactsearch_export_dedupes_by_primary_ticker(tmp_path):
+    # 1B-2B (ledger Entry 6): export_results_to_excel now dedupes by
+    # Primary Ticker (or Resolved/Fetched fallback) with keep="last",
+    # so re-running export against an existing xlsx replaces a
+    # ticker's row instead of doubling it. Sharpe-descending sort is
+    # preserved.
     isr = _import("impactsearch")
     out_path = tmp_path / "impact_dup.xlsx"
-    metrics = [
+
+    metrics_v1 = [
         {
             "Primary Ticker": "AAA",
             "Resolved/Fetched": "AAA",
@@ -461,13 +461,30 @@ def test_impactsearch_export_writes_duplicates_pending_bug_fix(tmp_path):
             "Total Capture (%)": -0.2000,
         },
     ]
-    isr.export_results_to_excel(str(out_path), metrics)
-    isr.export_results_to_excel(str(out_path), metrics)
+
+    # Second call: same primaries, changed metrics. The dedupe rule
+    # should retain v2's values, not v1's, and not double the rows.
+    metrics_v2 = [
+        {**metrics_v1[0], "Sharpe Ratio": 0.99, "Total Capture (%)": 1.5000},
+        {**metrics_v1[1], "Sharpe Ratio": 0.55, "Total Capture (%)": 0.4000},
+    ]
+
+    isr.export_results_to_excel(str(out_path), metrics_v1)
+    isr.export_results_to_excel(str(out_path), metrics_v2)
     df = pd.read_excel(out_path)
-    # Snapshot: dict of column -> list of values
-    payload = {
-        "row_count": int(len(df)),
-        "columns": list(df.columns),
-        "primary_tickers": list(df["Primary Ticker"].astype(str).values),
-    }
-    assert freeze(payload) == SNAP.SNAP_IMPACTSEARCH_EXPORT_WRITES_DUPLICATES_PENDING_BUG_FIX
+
+    # Row count is deduped, not doubled.
+    assert int(len(df)) == 2
+    # Both primaries present exactly once.
+    primaries = sorted(df["Primary Ticker"].astype(str).str.upper().tolist())
+    assert primaries == ["AAA", "BBB"]
+    # Retained rows are v2's values (the latest call wins).
+    sharpe_by_ticker = dict(zip(
+        df["Primary Ticker"].astype(str).str.upper(),
+        df["Sharpe Ratio"].astype(float),
+    ))
+    assert sharpe_by_ticker["AAA"] == pytest.approx(0.99)
+    assert sharpe_by_ticker["BBB"] == pytest.approx(0.55)
+    # Sharpe-descending sort preserved (AAA at 0.99 > BBB at 0.55).
+    assert df.iloc[0]["Primary Ticker"] == "AAA"
+    assert df.iloc[1]["Primary Ticker"] == "BBB"

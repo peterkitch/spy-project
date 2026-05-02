@@ -1864,13 +1864,35 @@ def export_results_to_excel(output_filename, metrics_list):
         new_df = pd.DataFrame(normalized_rows)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
 
+        # Phase 1B-2B: dedupe by Primary Ticker (or Resolved/Fetched
+        # fallback) so re-running export against an existing xlsx does
+        # not double-write rows. keep="last" preserves the latest
+        # metric values for any given ticker.
+        def _dedupe_key(row):
+            primary = row.get('Primary Ticker', '')
+            if pd.notna(primary) and str(primary).strip():
+                return str(primary).strip().upper()
+            resolved = row.get('Resolved/Fetched', '')
+            if pd.notna(resolved) and str(resolved).strip():
+                return str(resolved).strip().upper()
+            return ''
+
+        combined_df['__dedupe_key'] = combined_df.apply(_dedupe_key, axis=1)
+        # Drop rows with empty key first (no Primary Ticker AND no
+        # Resolved/Fetched), then dedupe by key keeping the last
+        # occurrence (which is the newest call's row).
+        non_empty_mask = combined_df['__dedupe_key'].astype(bool)
+        combined_df = combined_df[non_empty_mask | ~combined_df.duplicated('__dedupe_key', keep='last')]
+        combined_df = combined_df.drop_duplicates('__dedupe_key', keep='last')
+        combined_df = combined_df.drop(columns='__dedupe_key')
+
         # Coerce Sharpe to numeric before sorting to avoid float<->str errors
         if 'Sharpe Ratio' in combined_df.columns:
             combined_df['Sharpe Ratio'] = pd.to_numeric(combined_df['Sharpe Ratio'], errors='coerce')
             combined_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
-        combined_df = combined_df.reindex(columns=desired_order + 
+        combined_df = combined_df.reindex(columns=desired_order +
                                          [col for col in combined_df.columns if col not in desired_order])
 
         combined_df.to_excel(output_filename, index=False)
