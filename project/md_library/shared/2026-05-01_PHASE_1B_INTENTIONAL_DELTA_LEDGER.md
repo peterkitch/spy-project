@@ -28,8 +28,9 @@ Per-entry status (1B-2A delivery):
     implemented in 1B-2B (PR #133). Phase 2/3 path unification
     landed in Entry 5 (1B-2A); the default value flip to 10 and
     the run_for_secondary force-to-zero fix land here.
-  - Entry 8 (sentinel pair standardization): deferred to 1B-2B
-    (paired with the dead streaming-path removal).
+  - Entry 8 (sentinel pair standardization): implemented in
+    1B-2B (PR #133, two-stage: Spymaster streaming-path removal
+    + OnePass / TrafficFlow short-sentinel canonicalization).
   - Entry 9 (TrafficFlow cache key normalization): implemented
     in 1B-2B (PR #133).
   - Entry 10 (Phase 1A snapshot updates): implemented; see the
@@ -533,9 +534,31 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     not crash. Three different placeholders existed across the
     engines (`(1, 2)`, `(2, 1)`, `(MAX_SMA_DAY, MAX_SMA_DAY - 1)`).
     After this entry, every engine uses the MAX-SMA form.
-  - Status: stage 1 (Spymaster dead streaming path removal)
-    implemented in 1B-2B. Stage 2 (OnePass + TrafficFlow short
-    sentinels) lands in the next commit on this PR.
+  - Stage 2 (OnePass + TrafficFlow):
+      OnePass: three sites that previously used the buy sentinel
+      `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` for short are switched to
+      the canonical `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`:
+      `onepass.py:782` (signal-library reuse fallback),
+      `onepass.py:2133` (per-pair init for the canonical scoring
+      loop), and `onepass.py:2178` (day-0 store in
+      `daily_top_short_pairs`).
+      TrafficFlow: a module-level `MAX_SMA_DAY = 114` plus
+      `_BUY_SENTINEL` / `_SHORT_SENTINEL` constants are added.
+      The `bdict.get(prev, ((1, 2), 0.0))` /
+      `sdict.get(prev, ((1, 2), 0.0))` fallback at
+      `trafficflow.py:1810-1811` is replaced with
+      `(_BUY_SENTINEL, 0.0)` / `(_SHORT_SENTINEL, 0.0)`. The
+      `(1, 2)` literal was unsafe because SMA_1 / SMA_2 have
+      finite values most days, so the gating logic could
+      accidentally produce a tradable signal from a missing-data
+      sentinel.
+      New test: `test_sentinel_standardization.py` asserts
+      Spymaster has no `(1, 2) / (2, 1)` sentinel literals,
+      OnePass short-sentinel assignments use the canonical
+      `MAX_SMA_DAY-1,MAX_SMA_DAY` form, TrafficFlow defines the
+      canonical sentinel constants, and TrafficFlow has no
+      legacy sentinel literals.
+  - Status: implemented in 1B-2B (stages 1 and 2).
 
 ## Entry 9: TrafficFlow cache key normalization
 

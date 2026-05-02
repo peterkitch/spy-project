@@ -93,6 +93,16 @@ TF_SHOW_SESSION_SANITY = os.environ.get("TF_SHOW_SESSION_SANITY", "1").lower() i
 # Spymaster parity: ET timezone and price column
 _ET_TZ = pytz.timezone("US/Eastern")
 PRICE_COLUMN = "Close"  # Match Spymaster's raw close usage
+
+# Phase 1B-2B: canonical sentinel pair per spec §appendix.
+# Spymaster / OnePass use MAX_SMA_DAY=114; TrafficFlow consumes their
+# top-pair dicts and falls back to a sentinel only when a date is
+# missing from those dicts. The sentinel must not gate to a tradable
+# signal (SMA at MAX_SMA_DAY is NaN until enough history accumulates),
+# so we use the same constant.
+MAX_SMA_DAY = 114
+_BUY_SENTINEL = (MAX_SMA_DAY, MAX_SMA_DAY - 1)
+_SHORT_SENTINEL = (MAX_SMA_DAY - 1, MAX_SMA_DAY)
 # A.S.O. parity: When using active_pairs directly, signals represent "today's position"
 # which captures "today's return" (t-1 → t), so NO T+1 shift is ever needed
 
@@ -1796,9 +1806,9 @@ def _stream_primary_positions_and_captures(results: dict,
             continue
         prev = valid[i-1]
 
-        # yesterday's top pairs
-        bp = bdict.get(prev, ((1, 2), 0.0))
-        sp = sdict.get(prev, ((1, 2), 0.0))
+        # yesterday's top pairs (canonical MAX-SMA sentinels on miss)
+        bp = bdict.get(prev, (_BUY_SENTINEL, 0.0))
+        sp = sdict.get(prev, (_SHORT_SENTINEL, 0.0))
         (b_i, b_j), b_cap = bp
         (s_i, s_j), s_cap = sp
 
