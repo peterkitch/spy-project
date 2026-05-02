@@ -255,3 +255,87 @@ def test_d3_synthetic_pkl_size_under_1mb(_populated_spymaster_pkl):
     _tmp_path, _ticker, pkl_path = _populated_spymaster_pkl
     size = pkl_path.stat().st_size
     assert size < 1_000_000, f"synthetic PKL grew to {size} bytes; tighten the fixture"
+
+
+# ---------------------------------------------------------------------------
+# D2 (amendment): OnePass process_onepass_tickers with use_existing_signals
+# ---------------------------------------------------------------------------
+
+
+def test_d2_onepass_process_tickers_existing_signals_path(monkeypatch, tmp_path):
+    """Exercise process_onepass_tickers(["AAA"], use_existing_signals=True, ...).
+
+    This is the path that hit a NameError on `env_price_source` before
+    the 1B-2A amendment. The original PR #134 D2 only covered
+    `load_signal_library` directly; this test drives the FULL function
+    so the parity-check branch (lines 1781-1795 on main) actually runs
+    against a populated library.
+
+    We short-circuit cleanly via fetch_data_raw returning an empty
+    DataFrame, which is the SKIPPED_NO_DATA path immediately AFTER
+    the parity check. No network. No real SMA computation.
+
+    Regression seal: any future re-introduction of an undefined
+    variable or basis-check crash in the populated-library reuse
+    block would fail this test.
+    """
+    op = _get_module("onepass")
+
+    # Snapshot module globals before any mutation; restore on cleanup.
+    pre_signal_dir = op.SIGNAL_LIBRARY_DIR
+
+    try:
+        # Point the engine at a populated tmp dir.
+        monkeypatch.setattr(op, "SIGNAL_LIBRARY_DIR", str(tmp_path / "signal_library" / "data"))
+
+        # Write a valid library so check_signal_library_exists returns True
+        # and load_signal_library returns the dict.
+        dates = pd.bdate_range(start="2024-01-02", periods=20)
+        # Compute the parity hash the same way the engine does so the
+        # library passes the parity match (avoids the rebuild branch).
+        parity_hash = op.compute_parity_hash("Close", "ticker")
+        lib = make_signal_library_dict(dates, parity_hash=parity_hash)
+        path = Path(op._lib_path_for("AAA"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as fh:
+            pickle.dump(lib, fh)
+        assert path.exists()
+
+        # Sanity: check_signal_library_exists must return True.
+        assert op.check_signal_library_exists("AAA"), (
+            "fixture not visible to engine; SIGNAL_LIBRARY_DIR monkeypatch failed"
+        )
+
+        # Monkeypatch fetch_data_raw to return an empty DataFrame so the
+        # function exits via SKIPPED_NO_DATA right after the parity-check
+        # block. This isolates the test to the populated-library
+        # reuse path (lines 1772-1795 on main) without exercising the
+        # full SMA computation.
+        empty_df = pd.DataFrame()
+        monkeypatch.setattr(op, "fetch_data_raw", lambda ticker, **kw: (empty_df, ticker))
+
+        # Suppress tqdm output noise so test logs stay readable.
+        monkeypatch.setattr(op, "tqdm", lambda iterable, **kw: iterable)
+
+        # Reset RUN_REPORT to avoid carry-over from earlier tests in the
+        # same session.
+        monkeypatch.setattr(op, "RUN_REPORT", None)
+
+        # The actual call. If the parity-check block reintroduces
+        # `env_price_source` or another undefined variable, this will
+        # raise NameError immediately. Any other exception is also a
+        # regression — we expect a clean return.
+        metrics = op.process_onepass_tickers(
+            ["AAA"],
+            use_existing_signals=True,
+            emit_summary=False,
+            write_report_json=False,
+        )
+
+        # The empty-DF short-circuit means metrics is empty (no data to
+        # compute). The success criterion is purely "no exception".
+        assert metrics == [] or metrics is None or isinstance(metrics, list), (
+            f"unexpected metrics shape: {type(metrics).__name__}"
+        )
+    finally:
+        op.SIGNAL_LIBRARY_DIR = pre_signal_dir
