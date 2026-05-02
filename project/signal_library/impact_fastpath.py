@@ -79,10 +79,6 @@ def _pickle_load_compat(file_obj):
 IMPACT_TRUST_LIBRARY = os.environ.get("IMPACT_TRUST_LIBRARY", "0").lower() in ("1", "true", "on", "yes")
 IMPACT_TRUST_MAX_AGE_HOURS = int(os.environ.get("IMPACT_TRUST_MAX_AGE_HOURS", "168"))
 PERSIST_SKIP_BARS_IMPACT = int(os.environ.get("PERSIST_SKIP_BARS", "1"))  # match OnePass T-1
-ALLOW_LIB_BASIS = os.environ.get(
-    "IMPACT_FASTPATH_ALLOW_LIB_BASIS",
-    os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS", "0")
-).lower() in ("1", "true", "on", "yes")
 IMPACT_CALENDAR_GRACE_DAYS = int(os.environ.get("IMPACT_CALENDAR_GRACE_DAYS", "7"))  # Allow 7-day grace for cross-market holidays
 
 # Constants matching onepass.py
@@ -138,8 +134,8 @@ def _load_signal_library_quick(ticker: str):
             LOGGER.warning(f"Failed reading library for {ticker} at {p}: {e}")
     return None
 
-def _is_compatible(lib: dict, env_basis: str) -> tuple[bool, str]:
-    """Check if library is compatible with current environment settings."""
+def _is_compatible(lib: dict) -> tuple[bool, str]:
+    """Check if library is compatible with the canonical raw-Close basis."""
     if not isinstance(lib, dict):
         return False, "not_a_dict"
 
@@ -149,10 +145,13 @@ def _is_compatible(lib: dict, env_basis: str) -> tuple[bool, str]:
     if int(lib.get("max_sma_day", 0)) != MAX_SMA_DAY:
         return False, f"max_sma_day_mismatch (lib={lib.get('max_sma_day')} vs {MAX_SMA_DAY})"
 
-    # Allow opt-in tolerance for basis mismatches (mirrors ImpactSearch toggle)
-    allow_lib_basis = os.environ.get("IMPACTSEARCH_ALLOW_LIB_BASIS", "0").lower() in ("1", "true", "on", "yes")
-    if lib.get("price_source") != env_basis and not allow_lib_basis:
-        return False, f"price_basis_mismatch (lib={lib.get('price_source')} vs {env_basis})"
+    # Spec v0.5 §3: raw `Close` is the only allowed price basis. Reject
+    # libraries built against any other basis (e.g. legacy Adj Close).
+    # The IMPACTSEARCH_ALLOW_LIB_BASIS escape hatch was removed in 1B-2A
+    # (ledger Entry 1) because it allowed non-Close libraries to bypass
+    # the canonical basis check.
+    if lib.get("price_source") != "Close":
+        return False, f"price_basis_mismatch (lib={lib.get('price_source')} vs Close)"
 
     return True, "ok"
 
@@ -232,9 +231,6 @@ def get_primary_signals_fast(primary_ticker: str, secondary_index: pd.DatetimeIn
     if not IMPACT_TRUST_LIBRARY:
         return None, "fast_path_disabled"
 
-    # Determine expected price basis
-    env_basis = "Adj Close" if os.environ.get("PRICE_BASIS", "adj").lower() == "adj" else "Close"
-
     # Resolve ticker to vendor symbol
     vendor_symbol = _resolve_vendor_symbol(primary_ticker)
 
@@ -243,11 +239,11 @@ def get_primary_signals_fast(primary_ticker: str, secondary_index: pd.DatetimeIn
     if not lib:
         return None, f"no_library_for_{vendor_symbol}"
 
-    # Check compatibility
-    ok, why = _is_compatible(lib, env_basis)
-    # Optional compatibility: accept library price_source even if ENV differs
-    if (not ok) and why.startswith("price_basis_mismatch") and ALLOW_LIB_BASIS:
-        ok, why = True, "basis_mismatch_overridden"
+    # Check compatibility against the canonical raw-Close basis (spec §3).
+    # The basis-mismatch override loophole was removed in 1B-2A (ledger
+    # Entry 1) — libraries built against non-Close basis are no longer
+    # accepted, even with an env-var escape hatch.
+    ok, why = _is_compatible(lib)
     if not ok:
         return None, f"incompatible:{why}"
 

@@ -137,7 +137,6 @@ Critical environment variables for ImpactSearch optimization:
 - `IMPACT_TRUST_MAX_AGE_HOURS=720` - Production: 30 days cache validity
 - `IMPACT_TRUST_MAX_AGE_HOURS=168` - Conservative: 7 days cache validity
 - `IMPACT_CALENDAR_GRACE_DAYS=10` - Grace period for calendar adjustments
-- `IMPACTSEARCH_ALLOW_LIB_BASIS=1` - Allow library-based calculations
 
 **Note**: See `md_library/impactsearch/2025-09-16_IMPACTSEARCH_FASTPATH_OPTIMIZATION_IMPLEMENTATION.md` for fastpath gate mismatch fix details
 

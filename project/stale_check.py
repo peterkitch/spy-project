@@ -64,6 +64,37 @@ def load_symbols():
     return args, symbols
 
 
+def _last_valid_close_from_history(hist, require_posvol):
+    """Pure helper: derive (date|None, note) from a yfinance-like history df.
+
+    Reads only the raw `Close` column per spec §3. The `Volume` column
+    is consulted only when `require_posvol` is True.
+    """
+    if hist is None or hist.empty:
+        return None, "no_data:empty"
+
+    df = hist.copy()
+    for col in ["Close", "Volume"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    valid = df[df["Close"].notna() & np.isfinite(df["Close"])].copy()
+
+    if require_posvol and valid["Volume"].notna().any():
+        posvol = valid[valid["Volume"] > 0]
+        if not posvol.empty:
+            valid = posvol
+
+    if valid.empty:
+        return None, "no_valid_close"
+
+    last_dt = pd.to_datetime(valid.index[-1])
+    if last_dt.tzinfo is not None:
+        # normalize to naive UTC then to date
+        last_dt = last_dt.tz_convert("UTC").tz_localize(None)
+    return last_dt.date(), "ok:max"
+
+
 def last_valid_close_date(sym: str, require_posvol: bool):
     """
     Return (date|None, note)
@@ -72,29 +103,7 @@ def last_valid_close_date(sym: str, require_posvol: bool):
     try:
         t = yf.Ticker(sym)
         hist = t.history(period="max", interval="1d", auto_adjust=False)
-        if hist is None or hist.empty:
-            return None, "no_data:empty"
-
-        df = hist.copy()
-        for col in ["Close", "Adj Close", "Volume"]:
-            if col not in df.columns:
-                df[col] = np.nan
-
-        valid = df[df["Close"].notna() & np.isfinite(df["Close"])].copy()
-
-        if require_posvol and valid["Volume"].notna().any():
-            posvol = valid[valid["Volume"] > 0]
-            if not posvol.empty:
-                valid = posvol
-
-        if valid.empty:
-            return None, "no_valid_close"
-
-        last_dt = pd.to_datetime(valid.index[-1])
-        if last_dt.tzinfo is not None:
-            # normalize to naive UTC then to date
-            last_dt = last_dt.tz_convert("UTC").tz_localize(None)
-        return last_dt.date(), "ok:max"
+        return _last_valid_close_from_history(hist, require_posvol)
     except Exception as e:
         return None, f"error:{str(e)[:80]}"
 

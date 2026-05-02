@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import logging
+from canonical_scoring import score_captures as _canonical_score_captures
 
 # Optional: Show each deprecation warning only once to reduce spam
 if os.environ.get("ONEPASS_WARN_ONCE", "0").lower() in ("1", "true", "on"):
@@ -930,7 +931,7 @@ def perform_incremental_update(ticker, signal_data, new_df):
         logger.error(f"Incremental update failed for {ticker}: {e}")
         return None
 
-def compute_parity_hash(price_source='Adj Close', group_by_mode='column'):
+def compute_parity_hash(price_source='Close', group_by_mode='column'):
     """
     Compute a hash of all configuration parameters that affect signal generation.
     This ensures libraries are rebuilt when configuration changes.
@@ -973,8 +974,8 @@ def _persist_library_metadata(ticker, signal_data):
     except Exception:
         logger.exception(f"{ticker}: failed to persist library metadata")
 
-def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs, 
-                           primary_signals, df, accumulator_state=None, price_source='Adj Close', resolved_symbol=None):
+def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs,
+                           primary_signals, df, accumulator_state=None, price_source='Close', resolved_symbol=None):
     """
     Enhanced Signal Library save with primary_signals and accumulator state.
     This version stores everything needed for impactsearch to skip SMA computation.
@@ -1265,13 +1266,9 @@ def _coerce_to_close_frame(df, preferred=None):
 
     Args:
         df: DataFrame from yfinance
-        preferred: 'Adj Close' or 'Close' - which price basis to prefer
-                  If None, reads from PRICE_BASIS environment variable
+        preferred: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
     """
-    # Support environment variable for price basis if not explicitly provided
-    if preferred is None:
-        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        preferred = 'Adj Close' if price_basis == 'adj' else 'Close'
+    preferred = 'Close'
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -1316,13 +1313,9 @@ def fetch_data(ticker, reference_now=None, price_source=None):
     Args:
         ticker: The ticker symbol to fetch
         reference_now: Frozen analysis clock for consistent session checks
-        price_source: 'Adj Close' or 'Close' - which price basis to use
-                     If None, reads from PRICE_BASIS environment variable
+        price_source: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
     """
-    # Support environment variable for price basis if not explicitly provided
-    if price_source is None:
-        price_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        price_source = 'Adj Close' if price_basis == 'adj' else 'Close'
+    price_source = 'Close'
     if not ticker or not ticker.strip():
         return pd.DataFrame()
     # Use resolve_symbol to get correct vendor format
@@ -1473,98 +1466,47 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
     if ccc_series is None or len(ccc_series) == 0:
         return None
 
-    # Daily captures in percent
+    # Daily captures in percent (recovered from cumulative series)
     steps = ccc_series.diff().fillna(0.0)
     caps = steps.to_numpy()
 
-    # Trigger mask: prefer explicit signals; fallback to legacy non-zero caps
-    if active_pairs is not None and len(active_pairs) == len(caps):
-        # Count actual signal days (including zero-capture days)
-        trig_mask = np.array([p.startswith('Buy') or p.startswith('Short')
+    # Trigger mask: spec §15 / ledger Entry 4 — signal-state based.
+    # The legacy `np.abs(caps) > 0` fallback is removed; callers must
+    # supply matching active_pairs labels for trigger counting.
+    if active_pairs is None or len(active_pairs) != len(caps):
+        return None
+    trig_mask_arr = np.array([p.startswith('Buy') or p.startswith('Short')
                               for p in active_pairs], dtype=bool)
-    else:
-        # Legacy fallback (for backward compatibility)
-        trig_mask = np.abs(caps) > 0
 
-    trigger_days = int(trig_mask.sum())
-    signal_caps = caps[trig_mask]
+    score = _canonical_score_captures(
+        steps.astype(float),
+        pd.Series(trig_mask_arr, index=ccc_series.index),
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
 
-    # Remove non-finite values from captures for statistics
-    signal_caps = signal_caps[np.isfinite(signal_caps)]
-
-    # SpyMaster rule: wins are positive captures, losses = trigger_days - wins
-    # This ensures zero-capture days count as losses
-    wins = int((signal_caps > 0).sum())
-    losses = int(trigger_days - wins)  # This includes zero-capture days as losses
-    total = float(ccc_series.iloc[-1]) if np.isfinite(ccc_series.iloc[-1]) else 0.0
-
-    # Calculate metrics with guards
-    if trigger_days == 0:
-        avg_daily = 0.0
-        std = 0.0
-        sharpe = 0.0
-        t_stat = None
-        p_val = None
-    else:
-        avg_daily = float(signal_caps.mean()) if len(signal_caps) > 0 else 0.0
-
-        if trigger_days >= 2 and len(signal_caps) >= 2:
-            # Use NumPy directly to avoid pandas nanops warnings
-            with np.errstate(invalid='ignore', divide='ignore'):
-                std = float(np.std(signal_caps, ddof=1))
-
-            if std > 0.0 and np.isfinite(std):
-                annualized_return = avg_daily * 252.0
-                annualized_std = std * np.sqrt(252.0)
-                risk_free_rate = 5.0
-                sharpe = _safe_div(annualized_return - risk_free_rate, annualized_std, 0.0)
-
-                # t-stat with safe division
-                t_stat = _safe_div(avg_daily, std / np.sqrt(trigger_days), 0.0)
-
-                # p-value calculation
-                try:
-                    if t_stat != 0.0:
-                        p_val = float(2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=trigger_days - 1)))
-                    else:
-                        p_val = 1.0
-                except Exception:
-                    p_val = 1.0
-            else:
-                std = 0.0
-                sharpe = 0.0
-                t_stat = None
-                p_val = None
-        else:
-            # Only 1 trigger day - no variance-based stats
-            std = 0.0
-            sharpe = 0.0
-            t_stat = None
-            p_val = None
-
-    # Significance flags
+    # Significance flags (onepass uses '<' threshold)
+    p_val = score.p_value
     sig90 = 'Yes' if (p_val is not None and p_val < 0.10) else 'No'
     sig95 = 'Yes' if (p_val is not None and p_val < 0.05) else 'No'
     sig99 = 'Yes' if (p_val is not None and p_val < 0.01) else 'No'
 
-    # Win ratio with safe division
-    win_ratio = _safe_div(wins * 100.0, trigger_days, 0.0)
+    sharpe_rounded = round(score.sharpe, 2) if np.isfinite(score.sharpe) else 0.0
 
     return {
         'Primary Ticker': '',  # Will be filled by caller
-        'Trigger Days': trigger_days,
-        'Wins': wins,
-        'Losses': losses,
-        'Win Ratio (%)': round(win_ratio, 2),
-        'Std Dev (%)': round(std, 4),
-        'Sharpe Ratio': round(sharpe, 2) if np.isfinite(sharpe) else 0.0,
-        't-Statistic': 'N/A' if t_stat is None else round(t_stat, 4),
+        'Trigger Days': score.trigger_days,
+        'Wins': score.wins,
+        'Losses': score.losses,
+        'Win Ratio (%)': round(score.win_rate, 2),
+        'Std Dev (%)': round(score.std_dev, 4),
+        'Sharpe Ratio': sharpe_rounded,
+        't-Statistic': 'N/A' if score.t_statistic is None else round(score.t_statistic, 4),
         'p-Value': 'N/A' if p_val is None else round(p_val, 4),
         'Significant 90%': sig90,
         'Significant 95%': sig95,
         'Significant 99%': sig99,
-        'Avg Daily Capture (%)': round(avg_daily, 4),
-        'Total Capture (%)': round(total, 4)
+        'Avg Daily Capture (%)': round(score.avg_daily_capture, 4),
+        'Total Capture (%)': round(score.total_capture, 4),
     }
 
 def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_returns, persist_skip_bars=None):
@@ -1635,9 +1577,8 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
     buy_mask = signals.eq('Buy')
     short_mask = signals.eq('Short')
     trigger_mask = buy_mask | short_mask
-    trigger_days = int(trigger_mask.sum())
 
-    if trigger_days == 0:
+    if int(trigger_mask.sum()) == 0:
         logger.debug("No trigger days found, no metrics to report.")
         return None
 
@@ -1645,43 +1586,27 @@ def calculate_metrics_from_signals(primary_signals, primary_dates, df_for_return
     daily_captures.loc[buy_mask] = daily_returns.loc[buy_mask] * 100
     daily_captures.loc[short_mask] = -daily_returns.loc[short_mask] * 100
 
-    # Drop NaN values to avoid RuntimeWarning in statistics
-    signal_captures = daily_captures[trigger_mask].dropna()
+    score = _canonical_score_captures(
+        daily_captures, trigger_mask,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
 
-    wins = (signal_captures > 0).sum()
-    losses = trigger_days - wins
-    win_ratio = (wins / trigger_days * 100) if trigger_days else 0.0
-    avg_daily_capture = signal_captures.mean() if trigger_days else 0.0
-    total_capture = signal_captures.sum() if trigger_days else 0.0
-
-    if trigger_days > 1:
-        std_dev = signal_captures.std(ddof=1)
-        risk_free_rate = 5.0
-        annualized_return = avg_daily_capture * 252
-        annualized_std = std_dev * np.sqrt(252)
-        sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std != 0 else 0.0
-
-        t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days)) if std_dev != 0 else None
-        p_value = (2 * (1 - stats.t.cdf(abs(t_statistic), df=trigger_days - 1))) if t_statistic else None
-    else:
-        std_dev = 0.0
-        sharpe_ratio = 0.0
-        t_statistic = None
-        p_value = None
-
+    p_value = score.p_value
     significant_90 = 'Yes' if p_value and p_value < 0.10 else 'No'
     significant_95 = 'Yes' if p_value and p_value < 0.05 else 'No'
     significant_99 = 'Yes' if p_value and p_value < 0.01 else 'No'
 
+    t_statistic = score.t_statistic
+
     return {
-        'Trigger Days': trigger_days,
-        'Wins': int(wins),
-        'Losses': int(losses),
-        'Win Ratio (%)': round(win_ratio, 2),
-        'Std Dev (%)': round(std_dev, 4),
-        'Sharpe Ratio': round(sharpe_ratio, 2),
-        'Avg Daily Capture (%)': round(avg_daily_capture, 4),
-        'Total Capture (%)': round(total_capture, 4),
+        'Trigger Days': score.trigger_days,
+        'Wins': score.wins,
+        'Losses': score.losses,
+        'Win Ratio (%)': round(score.win_rate, 2),
+        'Std Dev (%)': round(score.std_dev, 4),
+        'Sharpe Ratio': round(score.sharpe, 2),
+        'Avg Daily Capture (%)': round(score.avg_daily_capture, 4),
+        'Total Capture (%)': round(score.total_capture, 4),
         't-Statistic': round(t_statistic, 4) if t_statistic else 'N/A',
         'p-Value': round(p_value, 4) if p_value else 'N/A',
         'Significant 90%': significant_90,
@@ -1831,15 +1756,8 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
         
         # Check if we can use existing signals or perform incremental update
         existing_signal_data = None
-        # Authoritative basis comes from ENV (do NOT let libraries override this by default)
-        env_basis = os.environ.get('PRICE_BASIS', 'adj').lower()
-        env_price_source = 'Adj Close' if env_basis == 'adj' else 'Close'
-        price_source = env_price_source
-
-        # Optional: Allow library basis to override ENV if explicitly enabled
-        if os.environ.get('ONEPASS_ALLOW_LIB_BASIS', '0').lower() in ('1', 'true', 'on'):
-            # Will check after loading library below
-            logger.debug("ONEPASS_ALLOW_LIB_BASIS is enabled - library basis may override ENV")
+        # Raw Close is the only authoritative basis (spec v0.5 §3, ledger Entry 1).
+        price_source = 'Close'
 
         had_library = check_signal_library_exists(vendor_symbol)
         outcome.had_library = had_library
@@ -1851,30 +1769,24 @@ def process_onepass_tickers(tickers_list, use_existing_signals=False,
             # Track bars before update
             if existing_signal_data:
                 bars_before = existing_signal_data.get('num_days', 0) or len(existing_signal_data.get('primary_signals', [])) or 0
-            # Enforce parity/basis BEFORE reuse. ENV must match the library.
+            # Enforce parity/basis BEFORE reuse. Raw Close is the only
+            # accepted price basis (spec §3, ledger Entry 1); the
+            # ONEPASS_ALLOW_LIB_BASIS escape hatch was removed.
             if existing_signal_data:
                 lib_basis = existing_signal_data.get('price_source')
                 lib_hash  = existing_signal_data.get('parity_hash')
-                env_hash  = compute_parity_hash(env_price_source, 'ticker')
+                env_hash  = compute_parity_hash(price_source, 'ticker')
 
-                # Check if opt-in override is enabled
-                if os.environ.get('ONEPASS_ALLOW_LIB_BASIS', '0').lower() in ('1', 'true', 'on'):
-                    # Allow library basis to override ENV basis
-                    if lib_basis:
-                        price_source = lib_basis
-                        logger.debug(f"Using library basis by opt-in (ONEPASS_ALLOW_LIB_BASIS=1): {price_source}")
-                    else:
-                        logger.debug(f"Library has no price_source; using ENV basis: {price_source}")
-                elif lib_basis != env_price_source or lib_hash != env_hash:
+                if lib_basis != price_source or lib_hash != env_hash:
                     logger.warning(
-                        f"{vendor_symbol}: library basis/hash differ from ENV "
-                        f"(lib_basis={lib_basis}, env_basis={env_price_source}, "
+                        f"{vendor_symbol}: library basis/hash differ from canonical "
+                        f"(lib_basis={lib_basis}, canonical={price_source}, "
                         f"lib_hash={str(lib_hash)[:8] if lib_hash else 'None'} vs env_hash={env_hash[:8]}). "
-                        "Forcing rebuild under ENV basis."
+                        "Forcing rebuild under canonical Close basis."
                     )
                     existing_signal_data = None  # force rebuild below
                 else:
-                    logger.debug(f"{vendor_symbol}: library basis matches ENV ({env_price_source}); reusing.")
+                    logger.debug(f"{vendor_symbol}: library basis matches canonical ({price_source}); reusing.")
             
         # Single-download path for current data (frozen clock + price_source)
         df_raw, resolved = fetch_data_raw(vendor_symbol)
@@ -2414,9 +2326,8 @@ def get_random_mix():
 # DASH APP LAYOUT
 ##################
 
-# --- UI: active price-basis banner (Adj Close vs Close) ---
-_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
-_BASIS_TEXT = 'Adj Close' if _BASIS == 'adj' else 'Close'
+# --- UI: price-basis banner (raw Close only, spec v0.5 §3) ---
+_BASIS_TEXT = 'Close'
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 

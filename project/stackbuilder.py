@@ -20,6 +20,12 @@ try:
 except ImportError:
     tqdm = None
 
+from canonical_scoring import (
+    combine_consensus_signals as _canonical_consensus,
+    score_captures as _canonical_score_captures,
+    metrics_to_legacy_dict as _canonical_metrics_to_legacy_dict,
+)
+
 try:
     import yfinance as yf
 except ImportError:
@@ -220,7 +226,8 @@ def primary_universe(specified_tickers: Optional[List[str]] = None) -> List[str]
     return []
 
 # ---------- Data loading ----------
-def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
+# Raw Close only (spec v0.5 §3, ledger Entry 1).
+def _fetch_secondary_from_yf(secondary: str) -> pd.DataFrame:
     if yf is None:
         raise RuntimeError("yfinance not installed. Install with: pip install yfinance")
     sym = (secondary or "").upper()  # keep caret for indices like ^VIX
@@ -228,36 +235,24 @@ def _fetch_secondary_from_yf(secondary: str, price_basis: str) -> pd.DataFrame:
     if df is None or len(df) == 0:
         raise RuntimeError(f"yfinance returned no data for {sym}")
     df = df.rename_axis('Date').reset_index().set_index('Date')
-    # tz-naive index
     df.index = pd.DatetimeIndex([pd.Timestamp(d).tz_localize(None) if getattr(pd.Timestamp(d), "tz", None) else pd.Timestamp(d) for d in df.index])
 
-    # Flatten MultiIndex columns if present (yfinance sometimes returns this)
     if isinstance(df.columns, pd.MultiIndex):
-        # For MultiIndex, take the first level
         df.columns = df.columns.get_level_values(0)
 
-    # Now find the close columns with simplified logic
     close_col = None
-    adj_close_col = None
     for col in df.columns:
-        col_lower = str(col).lower()
-        if col_lower == 'close':
+        if str(col).lower() == 'close':
             close_col = col
-        elif col_lower == 'adj close':
-            adj_close_col = col
+            break
 
-    if price_basis.lower().startswith('adj') and adj_close_col:
-        out = pd.DataFrame(df[adj_close_col]).rename(columns={adj_close_col: 'Close'})
-    elif close_col:
-        out = pd.DataFrame(df[close_col]).rename(columns={close_col: 'Close'})
-    else:
+    if close_col is None:
         raise RuntimeError(f"yfinance returned no Close column for {sym}. Columns: {list(df.columns)}")
-
+    out = pd.DataFrame(df[close_col]).rename(columns={close_col: 'Close'})
     return out.astype(FLOAT_DTYPE)
 
-def load_secondary_prices(secondary: str, price_basis: str) -> pd.DataFrame:
+def load_secondary_prices(secondary: str) -> pd.DataFrame:
     sec = (secondary or "").upper()
-    # Also try without caret for index symbols like ^VIX -> VIX
     sec_clean = sec.replace("^", "")
     cands = [
         os.path.join(DEFAULT_PRICE_CACHE_DIR, f"{sec}.parquet"),
@@ -272,22 +267,17 @@ def load_secondary_prices(secondary: str, price_basis: str) -> pd.DataFrame:
             if 'Date' in df.columns:
                 df['Date'] = pd.to_datetime(df['Date'])
                 df = df.set_index('Date')
-            # ensure tz-naive index to match signal library
             if hasattr(df.index, "tz") and df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             else:
                 df.index = pd.DatetimeIndex([pd.Timestamp(d).tz_localize(None) if getattr(pd.Timestamp(d), "tz", None) else pd.Timestamp(d) for d in df.index])
             df = df.sort_index()
-            if price_basis.lower().startswith('adj') and 'Adj Close' in df.columns:
-                out = pd.DataFrame(df['Adj Close']).rename(columns={'Adj Close':'Close'})
-            elif 'Close' in df.columns:
-                out = pd.DataFrame(df['Close'])
-            else:
-                raise ValueError(f"{p}: missing Close/Adj Close")
+            if 'Close' not in df.columns:
+                raise ValueError(f"{p}: missing Close")
+            out = pd.DataFrame(df['Close'])
             out = out[~out.index.duplicated(keep='last')].astype(FLOAT_DTYPE)
             return out
-    # No cache -> fetch once from yfinance (do not persist)
-    return _fetch_secondary_from_yf(sec, price_basis)
+    return _fetch_secondary_from_yf(sec)
 
 def pct_returns(close: pd.Series) -> pd.Series:
     return close.pct_change().fillna(0.0).astype(FLOAT_DTYPE) * 100.0  # percent
@@ -436,55 +426,44 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
     captures.loc[short] = -sec_returns.loc[short]
     return captures.fillna(0.0)
 
-def metrics_from_captures(captures: pd.Series) -> Optional[Dict[str, float]]:
+def metrics_from_captures(captures: pd.Series, trigger_mask: Optional[pd.Series] = None) -> Optional[Dict[str, float]]:
+    """Compute canonical metrics from a daily-capture series.
+
+    Delegates to canonical_scoring.score_captures (spec §13–§17).
+
+    DEPRECATION NOTE (single-arg fallback):
+      Canonical callers MUST pass an explicit `trigger_mask` constructed
+      from the signal-state series (Buy or Short). The single-arg form
+      `metrics_from_captures(captures)` is a legacy compatibility path
+      that uses `captures.ne(0.0)` as a stand-in mask, which incorrectly
+      drops zero-capture trigger days (spec §15: zero-capture days under
+      an active position are still trigger days, counted as losses).
+      The fallback is retained only to keep external callers compiling
+      until they have been plumbed with signal info; it will be removed
+      in a follow-up PR once every external caller passes a real
+      trigger mask.
+    """
     if captures.empty:
         return None
-    mask = captures.ne(0.0)
-    n = int(mask.sum())
-    if n == 0:
-        return None
-    vals = captures[mask].astype(FLOAT_DTYPE)
-    wins = int((vals > 0).sum())
-    losses = n - wins
-    win_ratio = (wins / n * 100.0) if n else 0.0
-    avg = float(vals.mean())
-    total = float(vals.sum())
-    std = float(vals.std(ddof=1)) if n > 1 else 0.0
-    if n > 1 and std != 0.0:
-        annual_ret = avg * 252.0
-        annual_std = std * math.sqrt(252.0)
-        sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std if annual_std != 0 else 0.0
-        t_stat = avg / (std / math.sqrt(n))
-        p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
+    if trigger_mask is None:
+        mask = captures.ne(0.0)
     else:
-        sharpe, t_stat, p_val = 0.0, None, None
-    # keep full-precision for gating; present rounded in tables
-    out = {
-        'Trigger Days': n,
-        'Wins': wins,
-        'Losses': losses,
-        'Win Ratio (%)': round(win_ratio, 2),
-        'Std Dev (%)': round(std, 4),
-        'Sharpe Ratio': round(sharpe, 2),
-        'Avg Daily Capture (%)': round(avg, 4),
-        'Total Capture (%)': round(total, 4),
-        't-Statistic': round(t_stat, 4) if t_stat is not None else 'N/A',
-        'p-Value': round(p_val, 4) if p_val is not None else 'N/A',
-        'Significant 90%': 'Yes' if p_val is not None and p_val < 0.10 else 'No',
-        'Significant 95%': 'Yes' if p_val is not None and p_val < 0.05 else 'No',
-        'Significant 99%': 'Yes' if p_val is not None and p_val < 0.01 else 'No',
-        # raw fields for gating/ranking
-        'Sharpe_raw': float(sharpe),
-        'Avg_raw': float(avg),
-        'Total_raw': float(total),
-        'p_raw': float(p_val) if p_val is not None else None,
-    }
-    return out
+        mask = trigger_mask.reindex(captures.index).fillna(False).astype(bool)
+    if int(mask.sum()) == 0:
+        return None
+    score = _canonical_score_captures(
+        captures.astype(FLOAT_DTYPE),
+        mask,
+        risk_free_rate=RISK_FREE_ANNUAL,
+        periods_per_year=252,
+        ddof=1,
+    )
+    return _canonical_metrics_to_legacy_dict(score)
 
 # ---------- Phase 1: Preflight ----------
 def phase1_preflight(args, secondary: str, specified_primaries: Optional[List[str]] = None):
     vendor_secondary, _ = resolve_symbol(secondary)
-    sec_df = load_secondary_prices(vendor_secondary, args.price_basis)
+    sec_df = load_secondary_prices(vendor_secondary)
     if sec_df.empty:
         raise RuntimeError(f"Unable to load prices for {vendor_secondary}.")
     sec_rets = pct_returns(sec_df['Close'])
@@ -712,7 +691,12 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
     except Exception as e:
         print(f"[ERROR] Failed to load signals for {vendor}: {e}")
         raise RuntimeError(f"Ticker {vendor} signal library error: {e}") from e
-    grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '0') or 0)
+    # Unify calendar policy with Phase 2 (apply_signals_to_secondary) per
+    # Phase 1B Intentional Delta Ledger Entry 5 (StackBuilder Phase 2 vs
+    # Phase 3 scoring divergence). Phase 2 uses DEFAULT_GRACE_DAYS; Phase 3
+    # previously read the env var with a separate default of 0, producing
+    # divergent calendar masks for the same primary/secondary pair.
+    grace_days = DEFAULT_GRACE_DAYS
     if grace_days > 0:
         aligned = raw.reindex(sec_index, method='pad', tolerance=pd.Timedelta(days=grace_days))
     else:
@@ -724,20 +708,13 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
     return s, present
 
 def _combine_signals(members: List[pd.Series]) -> pd.Series:
-    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix."""
+    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix.
+    Delegates to canonical_scoring.combine_consensus_signals (spec §18).
+    """
     if not members:
         return pd.Series(dtype=object)
     df = pd.concat(members, axis=1).fillna('None').astype(str)
-    mapper = {'Buy': 1, 'Short': -1}
-    # fast vectorized combine
-    arr = np.stack([df[c].map(mapper).fillna(0).astype(np.int8).to_numpy(dtype=np.int8) for c in df.columns], axis=1)
-    nz = (arr != 0)
-    cnt = nz.sum(axis=1)
-    ssum = arr.sum(axis=1)
-    out = np.where(cnt == 0, 'None',
-                   np.where(ssum == cnt, 'Buy',
-                            np.where(ssum == -cnt, 'Short', 'None')))
-    return pd.Series(out, index=df.index)
+    return _canonical_consensus([df[c] for c in df.columns])
 
 def _captures_from_signals(signals: pd.Series, sec_rets: pd.Series) -> pd.Series:
     sig = signals.reindex(sec_rets.index).fillna('None').astype(str)
@@ -767,7 +744,9 @@ def _combined_metrics_signals(member_signals: List[Union[pd.Series, Tuple[pd.Ser
         present_all &= m
     comb_sig = comb_sig.where(present_all, 'None')
     combined_caps = _captures_from_signals(comb_sig, sec_rets)
-    m = metrics_from_captures(combined_caps)
+    # Spec §15 / ledger Entry 4: trigger days are signal-state based.
+    trigger_mask = comb_sig.isin(['Buy', 'Short'])
+    m = metrics_from_captures(combined_caps, trigger_mask=trigger_mask)
     return combined_caps, m
 
 def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None) -> Tuple[pd.DataFrame, List]:
@@ -1272,7 +1251,7 @@ def run_dash(outdir: str, port: int = 8054):
                 secondary=sec, secondaries=None, primaries=None,
                 top_n=int(topn or 20), bottom_n=int(bottomn or 20), max_k=int(maxk or 6),
                 alpha=float(alpha or 0.05), min_marginal_capture=0.0,
-                threads='auto', outdir=RUNS_ROOT, price_basis='adj',
+                threads='auto', outdir=RUNS_ROOT,
                 fail_on_missing_cache=False, serve=False, port=8054,
                 prefer_impact_xlsx=prefer_fast, impact_xlsx_dir=xdir,
                 impact_xlsx_max_age_days=45,
@@ -1537,7 +1516,6 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                 'max_k': args.max_k,
                 'top_n': args.top_n,
                 'bottom_n': args.bottom_n,
-                'price_basis': args.price_basis,
                 'min_trigger_days': getattr(args, 'min_trigger_days', 30),
                 'sharpe_eps': getattr(args, 'sharpe_eps', 0.01),
                 'seed_by': getattr(args, 'seed_by', 'total_capture')
@@ -1715,7 +1693,6 @@ def parse_args(argv=None):
     p.add_argument('--save-stats', action='store_true', help='Save search statistics to JSON')
     p.add_argument('--threads', default=os.environ.get('STACKBUILDER_THREADS', 'auto'))
     p.add_argument('--outdir', default=RUNS_ROOT)
-    p.add_argument('--price-basis', default='adj', choices=['adj','close'])
     p.add_argument('--fail-on-missing-cache', action='store_true')
     p.add_argument('--serve', action='store_true', help='Start minimal Dash to display results')
     p.add_argument('--port', type=int, default=8054)

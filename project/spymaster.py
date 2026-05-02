@@ -19,6 +19,7 @@ import time
 import numpy as np
 import re
 from scipy import stats
+from canonical_scoring import score_captures as _canonical_score_captures
 import gc
 import threading
 
@@ -77,37 +78,18 @@ except Exception:
 # ---- ET tz constant used by market-clock helpers ----
 _ET_TZ = pytz.timezone("US/Eastern")
 
-# ---- Price basis configuration (Adj Close vs Close) ----
-# Controlled via PRICE_BASIS environment variable: 'adj' (default) or 'raw'
-_PRICE_BASIS = os.environ.get('PRICE_BASIS', 'adj').lower()
-PRICE_COLUMN = 'Adj Close' if _PRICE_BASIS == 'adj' else 'Close'
+# ---- Price basis: raw Close only (spec v0.5 §3, ledger Entry 1) ----
+PRICE_COLUMN = 'Close'
 _BASIS_TEXT = PRICE_COLUMN  # for UI banner
 
-# --- Centralized price-series selector to enforce one-basis-only semantics ---
+# --- Centralized price-series selector: raw Close only ---
 def _price_series(df: pd.DataFrame, index=None) -> pd.Series:
-    """
-    Select the configured price series deterministically.
-    Reject cross-basis fallbacks to prevent mixing.
-    """
-    # If both appear, keep the configured, drop the other (warn)
-    if 'Close' in df.columns and 'Adj Close' in df.columns:
-        if PRICE_COLUMN not in df.columns:
-            logger.error("Both Close & Adj Close present but configured column missing; refusing to guess")
-            return pd.Series(dtype=float, index=(index or df.index))
-        # proceed; selection below forces the configured one
-    
-    for col in (PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')):
-        if col in df.columns:
-            s = df[col]
-            s = s.iloc[:,0] if isinstance(s, pd.DataFrame) else s
-            return (s.loc[index] if index is not None else s).astype(float)
-    
-    # As a last resort, accept normalized 'Close' only (already standardized upstream)
+    """Select the raw Close series. Adj Close is no longer accepted."""
     if 'Close' in df.columns:
         s = df['Close']
+        s = s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
         return (s.loc[index] if index is not None else s).astype(float)
-    
-    logger.error(f"_price_series: {PRICE_COLUMN} not available")
+    logger.error("_price_series: Close column not available")
     return pd.Series(dtype=float, index=(index or df.index))
 
 # --- DIAGNOSTIC UTILITIES -----------------------------------------------------
@@ -3946,7 +3928,7 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
                     period="max",
                     interval="1d",
                     progress=False,
-                    auto_adjust=False,   # keep both Close & Adj Close if available
+                    auto_adjust=False,   # keep raw Close column; Adj Close is ignored downstream
                     threads=False,       # more stable for large pulls
                     timeout=base_timeout
                 )
@@ -3974,53 +3956,28 @@ def fetch_data(ticker, is_secondary=False, max_retries=4):
     except Exception as e:
         logger.debug(f"Index cleanup issue for {ticker}: {e}")
 
-    # Standardize columns to always have 'Close' (based on PRICE_COLUMN setting)
+    # Standardize columns to always have raw 'Close' (spec v0.5 §3, ledger Entry 1)
     if not df.empty:
         standardized_df = pd.DataFrame(index=df.index)
-        
-        # Handle different column structures from yfinance
+
         if isinstance(df.columns, pd.MultiIndex):
-            # Multi-level columns (happens with some tickers)
-            # Select EXACTLY the configured basis (no substring matching)
-            target_names = {PRICE_COLUMN, PRICE_COLUMN.replace(' ', '_')}
             for col in df.columns.levels[0]:
-                if col in target_names:
+                if col == 'Close':
                     src = df[col]
                     src = src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src
                     standardized_df['Close'] = pd.to_numeric(src, errors='coerce')
-                    logger.debug(f"Standardized {ticker}: using '{col}' as price data")
+                    logger.debug(f"Standardized {ticker}: using 'Close' as price data")
                     break
-            else:
-                # Fallback ONLY to exact 'Close' (never Adj Close) if preferred not found
-                for col in df.columns.levels[0]:
-                    if col == 'Close':
-                        src = df[col]
-                        src = src.iloc[:, 0] if getattr(src, 'ndim', 1) > 1 else src
-                        standardized_df['Close'] = pd.to_numeric(src, errors='coerce')
-                        logger.debug(f"Standardized {ticker}: using 'Close' as price data (configured '{PRICE_COLUMN}' not available)")
-                        break
         else:
-            # Single-level columns (most common case)
-            # Try preferred price basis first (exact matches only)
-            if PRICE_COLUMN in df.columns:
-                standardized_df['Close'] = pd.to_numeric(df[PRICE_COLUMN], errors='coerce')
-                logger.debug(f"Standardized {ticker}: using '{PRICE_COLUMN}' as price data")
-            elif PRICE_COLUMN.replace(' ', '_') in df.columns:
-                standardized_df['Close'] = pd.to_numeric(df[PRICE_COLUMN.replace(' ', '_')], errors='coerce')
-                logger.debug(f"Standardized {ticker}: using '{PRICE_COLUMN.replace(' ', '_')}' as price data")
-            elif 'Close' in df.columns:
+            if 'Close' in df.columns:
                 standardized_df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-                logger.debug(f"Standardized {ticker}: using 'Close' as price data (configured '{PRICE_COLUMN}' not available)")
-            elif 'Adj Close' in df.columns and PRICE_COLUMN == 'Close':
-                # Do NOT cross-basis fallback; abort to prevent mixing
-                logger.error(f"Standardize {ticker}: requested RAW Close but Close missing (Adj present). Rejecting fallback.")
-                return pd.DataFrame()
+                logger.debug(f"Standardized {ticker}: using 'Close' as price data")
             else:
-                # Try case-insensitive search for exact 'close' only (not 'adj close')
+                # Case-insensitive match for exact 'close' (never 'adj close')
                 for col in df.columns:
                     if col.lower() == 'close':
                         standardized_df['Close'] = pd.to_numeric(df[col], errors='coerce')
-                        logger.debug(f"Standardized {ticker}: using '{col}' as price data (case-insensitive match)")
+                        logger.debug(f"Standardized {ticker}: using '{col}' (case-insensitive)")
                         break
         
         # Validate we got price data
@@ -5012,7 +4969,6 @@ def _precompute_results_impl(ticker, event, cancel_event=None):
             results['start_date'] = df.index[0]
             results['last_date'] = df.index[-1]
             results['total_trading_days'] = len(df)
-            results['price_basis'] = PRICE_COLUMN  # aid future audits
             # self-check tokens to detect cross-ticker contamination
             results['_ticker'] = ticker
             results['_row_count'] = len(df)
@@ -5085,20 +5041,8 @@ def _precompute_results_impl(ticker, event, cancel_event=None):
             except Exception:
                 last_close = None
 
-            try:
-                # Extract last price based on configured preference
-                if PRICE_COLUMN in df.columns:
-                    last_adj = float(df[PRICE_COLUMN].iloc[-1])
-                elif PRICE_COLUMN.replace(' ', '_') in df.columns:
-                    last_adj = float(df[PRICE_COLUMN.replace(' ', '_')].iloc[-1])
-                else:
-                    last_adj = None
-            except Exception:
-                last_adj = None
-
             results['last_close'] = last_close
-            results['last_adj_close'] = last_adj
-            results['last_price'] = float(last_adj if last_adj is not None else last_close) if (last_adj is not None or last_close is not None) else None
+            results['last_price'] = float(last_close) if last_close is not None else None
 
             # Leader-pair on/off flags on the last day (use tolerant ASOF lookups)
             buy_pair = results.get('top_buy_pair')
@@ -8842,45 +8786,30 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     most_productive_buy_pair_text = f"Most Productive Buy Pair: SMA {top_buy_pair[0]} / SMA {top_buy_pair[1]}"
     most_productive_short_pair_text = f"Most Productive Short Pair: SMA {top_short_pair[0]} / SMA {top_short_pair[1]}"
 
-    # Buy metrics
+    # Buy + Short leader metrics: spec §13–§17 via canonical_scoring.
+    # Sharpe was previously computed with a CAGR-style annualization;
+    # delegation switches to the canonical avg-daily-capture * 252
+    # form per spec §16. Max Drawdown is not a canonical-scoring
+    # metric and stays computed inline below.
     buy_signals_shifted = buy_signals_leader.shift(1, fill_value=False)
     buy_returns_on_trigger_days = close_pct_change[buy_signals_shifted]
-    buy_trigger_days = int(buy_signals_shifted.sum())
-    buy_wins = int((buy_returns_on_trigger_days > 0).sum())
-    buy_losses = int((buy_returns_on_trigger_days <= 0).sum())
-    buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    avg_capture_buy = float(buy_returns_on_trigger_days.mean() * 100) if buy_trigger_days > 0 else 0
-    buy_capture = float(buy_returns_on_trigger_days.sum() * 100) if buy_trigger_days > 0 else 0
-    
-    # Calculate Buy Leader Sharpe Ratio and Max Drawdown
-    # Create a full series with 0s when not in position
+    _buy_caps = pd.Series(0.0, index=close_pct_change.index, dtype=float)
+    _buy_caps.loc[buy_signals_shifted] = close_pct_change.loc[buy_signals_shifted] * 100.0
+    _score_buy = _canonical_score_captures(
+        _buy_caps, buy_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    buy_trigger_days = _score_buy.trigger_days
+    buy_wins = _score_buy.wins
+    buy_losses = _score_buy.losses
+    buy_win_ratio = (_score_buy.win_rate / 100.0)  # display formats as ratio*100
+    avg_capture_buy = float(_score_buy.avg_daily_capture)
+    buy_capture = float(_score_buy.total_capture)
+    buy_leader_sharpe = float(_score_buy.sharpe)
+
+    # Max Drawdown - use cumulative returns with 0s when not in position
     buy_leader_daily_returns = close_pct_change.copy()
     buy_leader_daily_returns[~buy_signals_shifted] = 0
-    
-    # For Sharpe, we only use returns when in position
-    if buy_trigger_days > 0:
-        # Get returns only for days in position for statistics
-        returns_in_position = close_pct_change[buy_signals_shifted]
-        
-        # Calculate total return and annualized return
-        total_years = len(df) / 252  # Total years of data
-        if total_years > 0 and buy_capture != 0:
-            # Annualized return based on total capture and total time
-            buy_leader_annual_return = ((1 + buy_capture/100) ** (1/total_years)) - 1
-            
-            # Annualized volatility of daily returns when in position
-            if len(returns_in_position) > 0:
-                daily_vol = float(returns_in_position.std())
-                buy_leader_annual_std = daily_vol * np.sqrt(252)
-                buy_leader_sharpe = (buy_leader_annual_return - 0.05) / buy_leader_annual_std if buy_leader_annual_std > 0 else 0
-            else:
-                buy_leader_sharpe = 0
-        else:
-            buy_leader_sharpe = 0
-    else:
-        buy_leader_sharpe = 0
-    
-    # Max Drawdown - use cumulative returns with 0s when not in position
     buy_cumulative = (1 + buy_leader_daily_returns).cumprod()
     if len(buy_cumulative) > 0:
         buy_rolling_max = buy_cumulative.expanding().max()
@@ -8888,46 +8817,26 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         buy_leader_max_dd = float(buy_drawdowns.min())
     else:
         buy_leader_max_dd = 0
-    
-    # Short metrics
+
     short_signals_shifted = short_signals_leader.shift(1, fill_value=False)
     short_returns_on_trigger_days = -close_pct_change[short_signals_shifted]
-    short_trigger_days = int(short_signals_shifted.sum())
-    short_wins = int((short_returns_on_trigger_days > 0).sum())
-    short_losses = int((short_returns_on_trigger_days <= 0).sum())
-    short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    avg_capture_short = float(short_returns_on_trigger_days.mean() * 100) if short_trigger_days > 0 else 0
-    short_capture = float(short_returns_on_trigger_days.sum() * 100) if short_trigger_days > 0 else 0
-    
-    # Calculate Short Leader Sharpe Ratio and Max Drawdown
-    # Create a full series with 0s when not in position
+    _short_caps = pd.Series(0.0, index=close_pct_change.index, dtype=float)
+    _short_caps.loc[short_signals_shifted] = -close_pct_change.loc[short_signals_shifted] * 100.0
+    _score_short = _canonical_score_captures(
+        _short_caps, short_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    short_trigger_days = _score_short.trigger_days
+    short_wins = _score_short.wins
+    short_losses = _score_short.losses
+    short_win_ratio = (_score_short.win_rate / 100.0)
+    avg_capture_short = float(_score_short.avg_daily_capture)
+    short_capture = float(_score_short.total_capture)
+    short_leader_sharpe = float(_score_short.sharpe)
+
+    # Max Drawdown - use cumulative returns with 0s when not in position
     short_leader_daily_returns = -close_pct_change.copy()
     short_leader_daily_returns[~short_signals_shifted] = 0
-    
-    # For Sharpe, we only use returns when in position
-    if short_trigger_days > 0:
-        # Get returns only for days in position for statistics
-        returns_in_position = -close_pct_change[short_signals_shifted]
-        
-        # Calculate total return and annualized return
-        total_years = len(df) / 252  # Total years of data
-        if total_years > 0 and short_capture != 0:
-            # Annualized return based on total capture and total time
-            short_leader_annual_return = ((1 + short_capture/100) ** (1/total_years)) - 1
-            
-            # Annualized volatility of daily returns when in position
-            if len(returns_in_position) > 0:
-                daily_vol = float(returns_in_position.std())
-                short_leader_annual_std = daily_vol * np.sqrt(252)
-                short_leader_sharpe = (short_leader_annual_return - 0.05) / short_leader_annual_std if short_leader_annual_std > 0 else 0
-            else:
-                short_leader_sharpe = 0
-        else:
-            short_leader_sharpe = 0
-    else:
-        short_leader_sharpe = 0
-    
-    # Max Drawdown - use cumulative returns with 0s when not in position
     short_cumulative = (1 + short_leader_daily_returns).cumprod()
     if len(short_cumulative) > 0:
         short_rolling_max = short_cumulative.expanding().max()
@@ -9054,62 +8963,35 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
             active_signals.append(current_position)
 
         if len(cumulative_captures) > 0:
-            # Create signal mask excluding first day (to match the shifted signals approach)
+            # Spec §13–§17: route through canonical_scoring.
             trigger_mask = [sig in ('Buy', 'Short') for sig in active_signals]
-            trigger_days = sum(trigger_mask)
-
-            # Extract signal_captures only for triggered days
-            signal_captures = np.array([
-                cap for cap, active_sig in zip(cumulative_captures, active_signals)
-                if active_sig in ('Buy', 'Short')
-            ])
-
-            if signal_captures.size > 0:
-                wins = int(np.sum(signal_captures > 0))  # Convert NumPy scalar to Python int
-                losses = trigger_days - wins  # Ensure wins + losses equals trigger days
-                win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0.0
-                avg_daily_capture = signal_captures.mean() if trigger_days > 0 else 0.0
-                # IMPORTANT: Use the final cumulative combined capture value, not the sum of daily captures
-                # The cumulative_combined_captures already tracks the cumulative performance
-                if 'cumulative_combined_captures' in results and len(results['cumulative_combined_captures']) > 0:
-                    total_capture = float(results['cumulative_combined_captures'].iloc[-1])
-                else:
-                    # Fallback to sum of daily captures if cumulative not available
-                    total_capture = signal_captures.sum() if trigger_days > 0 else 0.0
-
-                # Calculate standard deviation using ddof=1 for sample standard deviation
-                if trigger_days > 1:
-                    std_dev = np.std(signal_captures, ddof=1)
-                else:
-                    std_dev = 0.0
+            _trig_mask_arr = np.array(trigger_mask, dtype=bool)
+            _caps_arr = np.asarray(cumulative_captures, dtype=float)
+            _score = _canonical_score_captures(
+                pd.Series(_caps_arr),
+                pd.Series(_trig_mask_arr),
+                risk_free_rate=5.0, periods_per_year=252, ddof=1,
+            )
+            trigger_days = _score.trigger_days
+            wins = _score.wins
+            losses = _score.losses
+            win_ratio = _score.win_rate
+            avg_daily_capture = _score.avg_daily_capture
+            std_dev = _score.std_dev
+            sharpe_ratio = _score.sharpe
+            t_statistic = _score.t_statistic
+            p_value = _score.p_value
+            # IMPORTANT: Use the final cumulative combined capture value, not the sum of daily captures.
+            # The cumulative_combined_captures already tracks the cumulative performance and is
+            # numerically equivalent to the canonical total_capture for canonical capture series.
+            if 'cumulative_combined_captures' in results and len(results['cumulative_combined_captures']) > 0:
+                total_capture = float(results['cumulative_combined_captures'].iloc[-1])
             else:
-                wins = losses = 0
-                win_ratio = avg_daily_capture = total_capture = std_dev = 0.0
+                total_capture = _score.total_capture
 
-            # t-Statistic & p-value
-            if trigger_days > 1 and std_dev != 0:
-                t_statistic = avg_daily_capture / (std_dev / np.sqrt(trigger_days))
-                degrees_of_freedom = trigger_days - 1
-                p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-
-                # Don't print stats from callback for cached tickers to avoid issues
-                # Stats are already printed during processing
-                pass
-            else:
-                t_statistic = None
-                p_value = None
-                if should_log:
-                    logger.info("\nStatistical Significance Analysis:")
-                    logger.info("Insufficient data to perform statistical significance analysis.\n")
-
-            # Annualized Sharpe Ratio logic consistent with other sections
-            risk_free_rate = 5.0
-            if trigger_days > 1 and std_dev != 0:
-                annualized_return = avg_daily_capture * 252
-                annualized_std = std_dev * np.sqrt(252)
-                sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std
-            else:
-                sharpe_ratio = 0.0
+            if (t_statistic is None or p_value is None) and should_log:
+                logger.info("\nStatistical Significance Analysis:")
+                logger.info("Insufficient data to perform statistical significance analysis.\n")
             
             # Calculate Maximum Drawdown for dynamic strategy
             if len(cumulative_captures) > 0:
@@ -9135,24 +9017,23 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
             sharpe_ratio = 0.0
             max_drawdown = 0.0
 
+    # Next-signal historical expectation: reuse canonical leader scores
+    # (avg_daily_capture is already in % points, win_rate is already %).
     if next_trading_signal_type == "Buy":
-        active_returns = buy_returns_on_trigger_days
+        _active_score = _score_buy
     elif next_trading_signal_type == "Short":
-        active_returns = short_returns_on_trigger_days
+        _active_score = _score_short
     else:
-        active_returns = np.array([])
+        _active_score = None
 
-    active_trigger_days = len(active_returns)
-    if active_trigger_days > 0:
-        performance_expectation = np.mean(active_returns)
-        active_wins = np.sum(active_returns > 0)
-        active_losses = np.sum(active_returns <= 0)
-        active_win_ratio = active_wins / active_trigger_days
+    if _active_score is not None and _active_score.trigger_days > 0:
         performance_expectation_text = (
-            f"Next Signal Performance Expectation: {performance_expectation * 100:.4f}% "
-            f"(Historical Trigger Days: {active_trigger_days}, Wins: {active_wins}, Losses: {active_losses}, Win Ratio: {active_win_ratio * 100:.2f}%)"
+            f"Next Signal Performance Expectation: {_active_score.avg_daily_capture:.4f}% "
+            f"(Historical Trigger Days: {_active_score.trigger_days}, "
+            f"Wins: {_active_score.wins}, Losses: {_active_score.losses}, "
+            f"Win Ratio: {_active_score.win_rate:.2f}%)"
         )
-        confidence_percentage_text = f"Historical Win Ratio for Next Signal: {active_win_ratio * 100:.2f}%"
+        confidence_percentage_text = f"Historical Win Ratio for Next Signal: {_active_score.win_rate:.2f}%"
     else:
         performance_expectation_text = "Next Signal Performance Expectation: N/A (No historical triggers)"
         confidence_percentage_text = "Historical Win Ratio for Next Signal: N/A (No historical triggers)"
@@ -10417,23 +10298,38 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
                'Buy Pair Results', 'Short Pair Results', 'Combined Performance', html.Span('Sharpe Ratio: N/A'), html.Span('Max Drawdown: N/A'), 
                html.Span('Calmar Ratio: N/A'), 'Total Signals: 0', html.Span('Overall Win Rate: N/A'))
     
-    # Calculate Buy returns on days when Buy signal was active
+    # Manual SMA testing interface. Originally hand-written metric
+    # math; delegated to canonical_scoring in 1B-2A amendment 2 so
+    # this section serves as a parity tester. Any divergence between
+    # manual results and other engine results indicates a canonical
+    # scoring bug that surfaces interactively.
     buy_returns_on_trigger_days = daily_returns[buy_signals_shifted]
-    buy_trigger_days = buy_signals_shifted.sum()
-    buy_wins = (buy_returns_on_trigger_days > 0).sum()
-    buy_losses = (buy_returns_on_trigger_days <= 0).sum()
-    buy_win_ratio = buy_wins / buy_trigger_days if buy_trigger_days > 0 else 0
-    buy_total_capture = buy_returns_on_trigger_days.sum() * 100 if buy_trigger_days > 0 else 0  # Convert to percentage
-    buy_avg_daily_capture = buy_total_capture / buy_trigger_days if buy_trigger_days > 0 else 0
+    _buy_caps_manual = pd.Series(0.0, index=daily_returns.index, dtype=float)
+    _buy_caps_manual.loc[buy_signals_shifted] = daily_returns.loc[buy_signals_shifted] * 100.0
+    _score_buy_manual = _canonical_score_captures(
+        _buy_caps_manual, buy_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    buy_trigger_days = _score_buy_manual.trigger_days
+    buy_wins = _score_buy_manual.wins
+    buy_losses = _score_buy_manual.losses
+    buy_win_ratio = (_score_buy_manual.win_rate / 100.0)
+    buy_total_capture = float(_score_buy_manual.total_capture)
+    buy_avg_daily_capture = float(_score_buy_manual.avg_daily_capture)
 
-    # Calculate Short returns on days when Short signal was active
     short_returns_on_trigger_days = -daily_returns[short_signals_shifted]
-    short_trigger_days = short_signals_shifted.sum()
-    short_wins = (short_returns_on_trigger_days > 0).sum()
-    short_losses = (short_returns_on_trigger_days <= 0).sum()
-    short_win_ratio = short_wins / short_trigger_days if short_trigger_days > 0 else 0
-    short_total_capture = short_returns_on_trigger_days.sum() * 100 if short_trigger_days > 0 else 0  # Convert to percentage
-    short_avg_daily_capture = short_total_capture / short_trigger_days if short_trigger_days > 0 else 0
+    _short_caps_manual = pd.Series(0.0, index=daily_returns.index, dtype=float)
+    _short_caps_manual.loc[short_signals_shifted] = -daily_returns.loc[short_signals_shifted] * 100.0
+    _score_short_manual = _canonical_score_captures(
+        _short_caps_manual, short_signals_shifted,
+        risk_free_rate=5.0, periods_per_year=252, ddof=1,
+    )
+    short_trigger_days = _score_short_manual.trigger_days
+    short_wins = _score_short_manual.wins
+    short_losses = _score_short_manual.losses
+    short_win_ratio = (_score_short_manual.win_rate / 100.0)
+    short_total_capture = float(_score_short_manual.total_capture)
+    short_avg_daily_capture = float(_score_short_manual.avg_daily_capture)
 
     # Prepare detailed strings for display
     trigger_days_buy = f"Buy Trigger Days: {int(buy_trigger_days)}"
@@ -10589,23 +10485,31 @@ def update_chart(ticker, sma_day_1, sma_day_2, sma_day_3, sma_day_4):
             hovertemplate='Date: %{x}<br>Combined Pair Capture: %{y:.2f}%<extra></extra>'
         ))
     
-    # Count actual trading days and wins from combined strategy
-    # Only count days where we had an active signal (not 'none')
-    total_signals = len([s for s in signals_followed if s != 'none'])
-    # Count wins: positive returns on signal days (returns are 0 on non-signal days)
-    combined_wins = (combined_returns > 0).sum()
-    overall_win_rate = (combined_wins / total_signals * 100) if total_signals > 0 else 0
-    
-    # Use centralized grading function
-    
-    # Calculate Sharpe Ratio (assuming 252 trading days per year)
-    risk_free_rate = 0.05  # 5% annual, matching other parts of the codebase
+    # Manual SMA testing interface. Originally hand-written metric
+    # math; delegated to canonical_scoring in 1B-2A amendment 2 so
+    # this section serves as a parity tester. Any divergence between
+    # manual results and other engine results indicates a canonical
+    # scoring bug that surfaces interactively.
     if len(combined_returns) > 0:
-        annualized_return = combined_returns.mean() * 252  # Keep in decimal form
-        annualized_std = combined_returns.std() * np.sqrt(252)  # Keep in decimal form
-        sharpe_ratio = (annualized_return - risk_free_rate) / annualized_std if annualized_std > 0 else 0
+        _combined_caps_pct = combined_returns.astype(float) * 100.0
+        _combined_trig_mask = (buy_signals_shifted | short_signals_shifted).reindex(
+            _combined_caps_pct.index, fill_value=False
+        )
+        _score_combined = _canonical_score_captures(
+            _combined_caps_pct, _combined_trig_mask,
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
+        sharpe_ratio = float(_score_combined.sharpe)
+        annualized_return = float(_score_combined.avg_daily_capture) * 252 / 100.0  # decimal for Calmar
+        total_signals = _score_combined.trigger_days
+        combined_wins = _score_combined.wins
+        overall_win_rate = float(_score_combined.win_rate)
     else:
         sharpe_ratio = 0
+        annualized_return = 0
+        total_signals = 0
+        combined_wins = 0
+        overall_win_rate = 0.0
     
     # Calculate Maximum Drawdown from equity curve with date range
     max_drawdown_start_date = None
@@ -11103,57 +11007,31 @@ def update_secondary_capture_chart(primary_ticker, secondary_tickers_input, inve
             metrics = {'Ticker': ticker, 'Triggers': trigger_days}
 
             if trigger_days > 0:
-                signal_captures = daily_captures[buy_mask | short_mask]
-                wins = int((signal_captures > 0).sum())
-                losses = trigger_days - wins
-                win_ratio = round((wins / trigger_days * 100), 2) if trigger_days > 0 else 0.0
+                # Spec §13–§17: route through canonical_scoring.
+                _trig_mask = buy_mask | short_mask
+                _score = _canonical_score_captures(
+                    daily_captures, _trig_mask,
+                    risk_free_rate=5.0, periods_per_year=252, ddof=1,
+                )
 
-                # Compute raw (unrounded) values for the captures:
-                raw_avg_daily = signal_captures.mean() if trigger_days > 0 else 0.0
+                # Display total uses the cumulative final value (numerically
+                # equivalent to canonical total_capture for canonical capture
+                # series).
                 raw_total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0.0
 
-                # Compute standard deviation with ddof=1 for sample std if we have more than 1 trigger day:
-                raw_std_dev = signal_captures.std(ddof=1) if trigger_days > 1 else 0.0
-
-                # Sharpe ratio logic (annualized), using raw values first:
-                risk_free_rate = 5.0  # 5% annual
-                annualized_return = raw_avg_daily * 252
-                annualized_std = raw_std_dev * np.sqrt(252) if raw_std_dev > 0 else 0.0
-                raw_sharpe = 0.0
-                if annualized_std > 0:
-                    raw_sharpe = (annualized_return - risk_free_rate) / annualized_std
-
-                # Calculate t-stat and p-value with raw values:
-                if trigger_days > 1 and raw_std_dev > 0:
-                    t_statistic_val = raw_avg_daily / (raw_std_dev / np.sqrt(trigger_days))
-                    dfreedom = trigger_days - 1
-                    p_val = 2 * (1 - stats.t.cdf(abs(t_statistic_val), df=dfreedom))
-                    # Now round:
-                    t_statistic = round(t_statistic_val, 4)
-                    p_value = round(p_val, 4)
-                else:
-                    t_statistic = None
-                    p_value = None
-
-                # Finally, round or format the metrics for display:
-                avg_daily_capture = round(raw_avg_daily, 4)
-                total_capture = round(raw_total_capture, 4)
-                std_dev = round(raw_std_dev, 4)
-                sharpe_ratio = round(raw_sharpe, 2)
-
                 metrics.update({
-                    'Wins': wins,
-                    'Losses': losses,
-                    'Win %': win_ratio,
-                    'StdDev %': std_dev,
-                    'Sharpe': sharpe_ratio,
-                    't': t_statistic if t_statistic is not None else 'N/A',
-                    'p': p_value if p_value is not None else 'N/A',
-                    'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                    'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                    'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                    'Avg Cap %': avg_daily_capture,
-                    'Total %': total_capture
+                    'Wins': _score.wins,
+                    'Losses': _score.losses,
+                    'Win %': round(_score.win_rate, 2),
+                    'StdDev %': round(_score.std_dev, 4),
+                    'Sharpe': round(_score.sharpe, 2),
+                    't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+                    'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+                    'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+                    'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+                    'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+                    'Avg Cap %': round(_score.avg_daily_capture, 4),
+                    'Total %': round(float(raw_total_capture), 4),
                 })
             else:
                 metrics.update({
@@ -11656,48 +11534,32 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
 
         cumulative_captures = pd.Series(cap, index=daily_returns.index).cumsum()
 
-        # Prepare metrics
-        trigger_days = (buy_mask | short_mask).sum()
-        wins = (cap > 0).sum()
-        losses = (cap <= 0).sum()
-        win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-        # Calculate metrics only on trigger days (buy or short)
+        # Spec §13–§17: route through canonical_scoring. Ledger Entry 2
+        # (the ddof=1 site at this block) is now naturally enforced by
+        # the canonical scoring module rather than an inline override.
         trigger_mask = buy_mask | short_mask
-        avg_daily_capture = cap[trigger_mask].mean() if trigger_days > 0 else 0
+        _score = _canonical_score_captures(
+            pd.Series(cap, index=daily_returns.index),
+            pd.Series(trigger_mask, index=daily_returns.index),
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
         total_capture = cumulative_captures.iloc[-1] if not cumulative_captures.empty else 0
-        std_dev = cap[trigger_mask].std() if trigger_days > 0 else 0
-        # Ensure losses is calculated correctly
-        losses = trigger_days - wins  # This ensures losses + wins = trigger_days
-
-        risk_free_rate = 5.0  # 5% annual rate
-        daily_rf_rate = risk_free_rate / 252  # Convert to daily rate
-        sharpe_ratio = ((avg_daily_capture - daily_rf_rate) / std_dev) * np.sqrt(252) if std_dev > 0 else 0
-        # Calculate statistical significance
-        if trigger_days > 1 and std_dev > 0:
-            t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-            degrees_of_freedom = trigger_days - 1
-            p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-            t_statistic = round(t_statistic, 4)
-            p_value = round(p_value, 4)
-        else:
-            t_statistic = None
-            p_value = None
 
         metrics_data.append({
             'Ticker': secondary_ticker,
-            'Triggers': int(trigger_days),
-            'Wins': int(wins),
-            'Losses': int(losses),
-            'Win %': round(win_ratio, 2),
-            'StdDev %': round(std_dev, 4),
-            'Sharpe': round(sharpe_ratio, 2),
-            't': t_statistic if t_statistic is not None else 'N/A',
-            'p': p_value if p_value is not None else 'N/A',
-            'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-            'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-            'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-            'Avg Cap %': round(avg_daily_capture, 4),
-            'Total %': round(total_capture, 4)
+            'Triggers': _score.trigger_days,
+            'Wins': _score.wins,
+            'Losses': _score.losses,
+            'Win %': round(_score.win_rate, 2),
+            'StdDev %': round(_score.std_dev, 4),
+            'Sharpe': round(_score.sharpe, 2),
+            't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+            'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+            'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+            'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+            'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+            'Avg Cap %': round(_score.avg_daily_capture, 4),
+            'Total %': round(float(total_capture), 4)
         })
 
         # Add trace to figure
@@ -11855,9 +11717,7 @@ def batch_process_tickers(n_clicks, n_intervals, input_value, existing_table_dat
                 except Exception:
                     last_date_str = '—'
 
-            price_val = res.get('last_adj_close', None)
-            if price_val is None:
-                price_val = res.get('last_close', None)
+            price_val = res.get('last_close', None)
             # Show '—' for NaN/Inf instead of '$nan'
             try:
                 import numpy as np
@@ -12584,57 +12444,35 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 daily_captures = pd.Series(cap, index=daily_returns.index)
 
                 # Calculate metrics
-                trigger_days = (buy_mask | short_mask).sum()
-                if trigger_days == 0:
+                trigger_mask = buy_mask | short_mask
+                if int(trigger_mask.sum()) == 0:
                     pbar.update(1)
                     continue  # Skip combinations with no triggers
 
-                # Calculate wins and losses
-                trigger_captures = daily_captures[buy_mask | short_mask]
-                wins = (trigger_captures > 0).sum()
-                losses = trigger_days - wins
-                win_ratio = (wins / trigger_days * 100) if trigger_days > 0 else 0
-
-                # Calculate performance metrics
-                avg_daily_capture = trigger_captures.mean() if trigger_days > 0 else 0
-                total_capture = trigger_captures.sum() if trigger_days > 0 else 0
-                std_dev = trigger_captures.std() if trigger_days > 0 else 0
-
-                # Calculate Sharpe ratio
-                risk_free_rate = 5.0  # 5% annual rate
-                daily_rf_rate = risk_free_rate / 252
-                annualized_return = avg_daily_capture * 252
-                annualized_std = std_dev * np.sqrt(252) if std_dev > 0 else 0
-                sharpe_ratio = ((annualized_return - risk_free_rate) / annualized_std) if annualized_std > 0 else 0
-
-                # Calculate statistical significance
-                if trigger_days > 1 and std_dev > 0:
-                    t_statistic = (avg_daily_capture) / (std_dev / np.sqrt(trigger_days))
-                    degrees_of_freedom = trigger_days - 1
-                    p_value = 2 * (1 - stats.t.cdf(abs(t_statistic), df=degrees_of_freedom))
-                    t_statistic = round(t_statistic, 4)
-                    p_value = round(p_value, 4)
-                else:
-                    t_statistic = None
-                    p_value = None
+                # Spec §13–§17: route through canonical_scoring.
+                _score = _canonical_score_captures(
+                    daily_captures,
+                    pd.Series(trigger_mask, index=daily_returns.index),
+                    risk_free_rate=5.0, periods_per_year=252, ddof=1,
+                )
 
                 # Store results
                 results_list.append({
                     'id': idx,  # Add a unique identifier
                     'Combination': combination_labels[idx],
-                    'Triggers': int(trigger_days),
-                    'Wins': int(wins),
-                    'Losses': int(losses),
-                    'Win %': round(win_ratio, 2),
-                    'StdDev %': round(std_dev, 4),
-                    'Sharpe': round(sharpe_ratio, 2),
-                    't': t_statistic if t_statistic is not None else 'N/A',
-                    'p': p_value if p_value is not None else 'N/A',
-                    'Sig 90%': 'Yes' if p_value is not None and p_value < 0.10 else 'No',
-                    'Sig 95%': 'Yes' if p_value is not None and p_value < 0.05 else 'No',
-                    'Sig 99%': 'Yes' if p_value is not None and p_value < 0.01 else 'No',
-                    'Avg Cap %': round(avg_daily_capture, 4),
-                    'Total %': round(total_capture, 4)
+                    'Triggers': _score.trigger_days,
+                    'Wins': _score.wins,
+                    'Losses': _score.losses,
+                    'Win %': round(_score.win_rate, 2),
+                    'StdDev %': round(_score.std_dev, 4),
+                    'Sharpe': round(_score.sharpe, 2),
+                    't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+                    'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+                    'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+                    'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+                    'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+                    'Avg Cap %': round(_score.avg_daily_capture, 4),
+                    'Total %': round(_score.total_capture, 4)
                 })
 
                 # Update progress bar

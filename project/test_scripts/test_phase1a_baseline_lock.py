@@ -327,20 +327,18 @@ def test_stackbuilder_combined_metrics_baseline():
         SNAP.SNAP_STACKBUILDER_COMBINED_METRICS
 
 
-def test_stackbuilder_combined_metrics_signals_baseline_pending_bug_fix():
-    # Pinned per Phase 1B Intentional Delta Ledger:
-    # "StackBuilder Phase 2 vs Phase 3 scoring divergence" (BUG-FIX).
-    # This snapshot exercises _combined_metrics_signals, the closest
-    # callable surface to the artifact-confirmed K=1 mismatch. The
-    # current output is encoded as-is; Phase 1B will replace it after
-    # the canonical scoring rewire and classify the diff in the ledger.
+def test_stackbuilder_combined_metrics_signals_baseline():
+    # 1B-2A (ledger Entries 4 + 5): the captures-based trigger mask and
+    # the Phase 2 vs Phase 3 calendar-grace divergence are both addressed.
+    # `_combined_metrics_signals` now passes an explicit signal-state
+    # trigger mask and shares the Phase 2 grace policy.
     sb = _import("stackbuilder")
     combined_caps, metrics = sb._combined_metrics_signals(
         [MEMBER_SIG_A.copy(), MEMBER_SIG_B.copy()],
         SEC_RETS_PCT.copy(),
     )
     assert freeze({"combined_caps": combined_caps, "metrics": metrics}) == \
-        SNAP.SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS_PENDING_BUG_FIX
+        SNAP.SNAP_STACKBUILDER_COMBINED_METRICS_SIGNALS
 
 
 # ---------------------------------------------------------------------------

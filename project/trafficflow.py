@@ -36,6 +36,11 @@ import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
+from canonical_scoring import (
+    combine_consensus_signals as _canonical_consensus,
+    score_captures as _canonical_score_captures,
+)
+
 # Optional imports; keep app usable without Dash for headless diagnostics
 try:
     from dash import Dash, html, dcc, Input, Output, dash_table
@@ -1398,43 +1403,19 @@ def _next_signal_from_pkl(primary: str, as_of: Optional[pd.Timestamp] = None) ->
 
 def _combine_signals(series_list: List[pd.Series]) -> pd.Series:
     """
-    Vectorized Spymaster rules:
+    Spymaster unanimity rules (delegates to canonical_scoring.combine_consensus_signals,
+    spec §18):
       - Treat None as 0, Buy as +1, Short as -1
-      - If count_nonzero == 0 â†’ None
-      - If sum == +count_nonzero â†’ Buy (all Buy)
-      - If sum == -count_nonzero â†’ Short (all Short)
-      - Else â†’ None (conflict or mixed)
-
-    Fully NumPy-vectorized for K>1 performance.
+      - count_nonzero == 0 -> None
+      - sum == +count_nonzero -> Buy
+      - sum == -count_nonzero -> Short
+      - Else -> None
     """
     if not series_list:
         return pd.Series(dtype="object")
-
-    # Get index from first series
-    idx = series_list[0].index
-
-    # Single series optimization
     if len(series_list) == 1:
-        return series_list[0].reindex(idx)
-
-    # Map signals to integers: Buy=1, Short=-1, None=0
-    map_dict = {"Buy": 1, "Short": -1, "None": 0}
-
-    # Build (n_days, k) int8 matrix using column_stack for efficiency
-    mat = np.column_stack([s.map(map_dict).to_numpy(dtype="int8", copy=False) for s in series_list])
-
-    # Count non-zero signals and sum per day
-    cnt = (mat != 0).sum(axis=1)
-    sm  = mat.sum(axis=1)
-
-    # Apply Spymaster's combination logic vectorized
-    out = np.full(len(idx), "None", dtype=object)
-    buy_mask   = (cnt > 0) & (sm ==  cnt)  # All signals are Buy
-    short_mask = (cnt > 0) & (sm == -cnt)  # All signals are Short
-    out[buy_mask] = "Buy"
-    out[short_mask] = "Short"
-
-    return pd.Series(out, index=idx, dtype="object")
+        return series_list[0].reindex(series_list[0].index)
+    return _canonical_consensus(series_list)
 
 # ---------- Spymaster parity: Signal-first approach (EXACT A.S.O. pipeline) ----------
 def _processed_signals_from_pkl(primary: str) -> pd.Series:
@@ -1553,12 +1534,17 @@ def _session_sanity(secondary: str, members: List[str]) -> Dict[str, Any]:
 def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict[str, float]:
     """
     Compute metrics identically to Spymaster's A.S.O. block:
-      - prices := PRICE_COLUMN on combined_signals.index
+      - prices := raw Close on combined_signals.index
       - daily_returns := safe day return (zero when prev price invalid/<=0)
       - daily_captures := apply mask (Buy -> +ret, Short -> -ret, else 0)
-      - TriggerDays := count of non-zero captures (NOT signal mask)
-      - Wins/Losses by sign of trigger_captures
-      - Sharpe/StdDev/T/P on trigger_captures only
+      - TriggerDays := count of signal-state Buy/Short days (spec §13).
+        Per ledger Entry 4, zero-capture trigger days under an
+        active position are still counted.
+      - Wins/Losses: wins = positive-capture trigger days,
+        losses = trigger_days - wins (zero captures count as losses
+        per spec §15)
+      - Sharpe/StdDev/T/P sourced from canonical_scoring.score_captures
+        on trigger-day captures only.
     """
     # Load secondary prices
     px = _PRICE_CACHE.get(secondary)
@@ -1596,50 +1582,32 @@ def _metrics_like_spymaster(secondary: str, combined_signals: pd.Series) -> Dict
 
     daily_captures = pd.Series(cap, index=combined_signals.index)
 
-    # SPYMASTER TRIGGER MASK: Count non-zero captures (NOT signal mask)
-    trig_mask = daily_captures.to_numpy() != 0.0
-    trigger_days = int(trig_mask.sum())
+    # Spec §15: trigger days are days with active Buy/Short signals,
+    # including days with zero capture. Ledger Entry 4.
+    trig_mask_arr = buy_mask | short_mask
+    trig_mask = pd.Series(trig_mask_arr, index=combined_signals.index)
 
-    if trigger_days == 0:
+    if int(trig_mask.sum()) == 0:
         return {
             "Triggers": 0, "Wins": 0, "Losses": 0, "Win %": 0.0,
             "Std Dev (%)": 0.0, "Sharpe": 0.0, "Avg %": 0.0, "Total %": 0.0, "p": 1.0
         }
 
-    trigger_caps = daily_captures[trig_mask]
-    wins = int((trigger_caps > 0).sum())
-    losses = int((trigger_caps < 0).sum())
-
-    # Stats on trigger_captures only (Spymaster A.S.O. behavior)
-    avg_cap = float(trigger_caps.mean())
-    total_pct = float(trigger_caps.sum())
-    std = float(trigger_caps.std(ddof=1)) if trigger_days > 1 else 0.0
-
-    # Sharpe calculation
-    ann_ret = avg_cap * 252.0
-    ann_std = std * np.sqrt(252.0) if std != 0.0 else 0.0
-    sharpe = ((ann_ret - 5.0) / ann_std) if ann_std != 0.0 else 0.0  # 5% risk-free rate
-
-    # t-stat & p (two-sided)
-    t_stat = (avg_cap / (std / np.sqrt(trigger_days))) if (std > 0 and trigger_days > 1) else 0.0
-    try:
-        from scipy import stats as _st
-        p_value = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(trigger_days - 1, 1))))
-    except Exception:
-        p_value = 1.0
-
-    win_pct = (wins / trigger_days * 100.0) if trigger_days else 0.0
+    score = _canonical_score_captures(
+        daily_captures, trig_mask,
+        risk_free_rate=RISK_FREE_ANNUAL, periods_per_year=252, ddof=1,
+    )
 
     return {
-        "Triggers": trigger_days,
-        "Wins": wins,
-        "Losses": losses,
-        "Win %": round(win_pct, 2),
-        "Std Dev (%)": round(std, 4),
-        "Sharpe": round(sharpe, 2),
-        "Avg %": round(avg_cap, 4),
-        "Total %": round(total_pct, 4),
-        "p": round(p_value, 4),
+        "Triggers": score.trigger_days,
+        "Wins": score.wins,
+        "Losses": score.losses,
+        "Win %": round(score.win_rate, 2),
+        "Std Dev (%)": round(score.std_dev, 4),
+        "Sharpe": round(score.sharpe, 2),
+        "Avg %": round(score.avg_daily_capture, 4),
+        "Total %": round(score.total_capture, 4),
+        "p": round(score.p_value, 4) if score.p_value is not None else 1.0,
     }
 
 
@@ -2061,27 +2029,15 @@ def _subset_metrics_spymaster(
     if not trig_mask.any():
         return _empty_metrics(), _empty_dates()
 
-    tc = cap[trig_mask]
     common_dates_array = pd.DatetimeIndex(common_dates)
     trig_idx = common_dates_array[trig_mask]
     sig_slice = combined_signals[trig_mask]
 
-    n_trig = int(len(tc))
-    wins = int(np.sum(tc > 0))
-    losses = int(n_trig - wins)
-    avg_cap = float(tc.mean())
-    total = float(tc.sum())
-    std = float(np.std(tc, ddof=1)) if n_trig > 1 else 0.0
-    ann_ret = avg_cap * 252.0
-    ann_std = std * np.sqrt(252.0) if std != 0.0 else 0.0
-    sharpe = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
-
-    t_stat = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
-    try:
-        from scipy import stats as _st
-        p_val = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(n_trig - 1, 1))))
-    except Exception:
-        p_val = 1.0
+    score = _canonical_score_captures(
+        pd.Series(cap, index=common_dates_array),
+        pd.Series(trig_mask, index=common_dates_array),
+        risk_free_rate=RISK_FREE_ANNUAL, periods_per_year=252, ddof=1,
+    )
 
     info = {
         "prev_date": trig_idx[-2] if len(trig_idx) >= 2 else None,
@@ -2091,11 +2047,13 @@ def _subset_metrics_spymaster(
     }
 
     met = {
-        'Triggers': n_trig, 'Wins': wins, 'Losses': losses,
-        'Win %': round(100*wins/max(n_trig,1), 2),
-        'Std Dev (%)': round(std, 4), 'Sharpe': round(sharpe, 2),
-        'T': round(t_stat, 4), 'Avg %': round(avg_cap, 4),
-        'Total %': round(total, 4), 'p': round(p_val, 4),
+        'Triggers': score.trigger_days, 'Wins': score.wins, 'Losses': score.losses,
+        'Win %': round(score.win_rate, 2),
+        'Std Dev (%)': round(score.std_dev, 4), 'Sharpe': round(score.sharpe, 2),
+        'T': round(score.t_statistic, 4) if score.t_statistic is not None else 0.0,
+        'Avg %': round(score.avg_daily_capture, 4),
+        'Total %': round(score.total_capture, 4),
+        'p': round(score.p_value, 4) if score.p_value is not None else 1.0,
     }
 
     return met, info
@@ -2388,93 +2346,73 @@ def _members_signals_df_and_returns(secondary: str, members: List[str],
 
 def _averages_via_matrix(sig_df_cap: pd.DataFrame, sec_rets: pd.Series) -> Dict[str, Any]:
     """
-    Vectorized computation of AVERAGES across all non-empty subsets.
-    Combiner rule = unanimity with None-neutral (Buy only if no Short present; vice versa).
+    Compute AVERAGES across all non-empty member subsets.
+
+    Per-subset metrics are sourced from canonical_scoring.score_captures
+    (spec §13–§17). The unanimity combiner with None-neutral (Buy only
+    if no Short present; vice versa) is applied per subset before
+    scoring.
     """
     if sig_df_cap is None or sig_df_cap.empty or sec_rets is None or sec_rets.empty:
         return _empty_metrics()
 
-    # Encode signals to {-1,0,+1}
     S = sig_df_cap.replace({'Buy': 1, 'Short': -1}).where(sig_df_cap.isin(['Buy','Short']), 0)
     S = S.to_numpy(dtype=TF_MATRIX_DTYPE, copy=False)  # [N x K]
     N, K = S.shape
-
-    # Build subset selection matrix M: [K x (2^K - 1)]
     S_count = (1 << K) - 1
-    # guard K explosion
     if S_count <= 0:
         return _empty_metrics()
-    M = np.zeros((K, S_count), dtype="uint8")
-    for j, mask in enumerate(range(1, S_count + 1)):
-        # column j uses bitmask "mask"
-        # bit i selects member i
-        for i in range(K):
-            if (mask >> i) & 1:
-                M[i, j] = 1
 
-    # Counts of +1 and -1 per day for every subset
-    Ppos = (S == 1).astype("uint8")     # [N x K]
-    Pneg = (S == -1).astype("uint8")    # [N x K]
-    pos_cnt = Ppos @ M                  # [N x S]
-    neg_cnt = Pneg @ M                  # [N x S]
+    r = sec_rets.to_numpy(dtype="float64")  # [N]
 
-    # Combined signal per subset column: +1 if any Buy and no Short; -1 if any Short and no Buy; else 0
-    pos_any = pos_cnt > 0
-    neg_any = neg_cnt > 0
-    combined = np.zeros_like(pos_cnt, dtype=TF_MATRIX_DTYPE)     # [N x S]
-    combined[np.where(pos_any & ~neg_any)] = 1
-    combined[np.where(neg_any & ~pos_any)] = -1
+    triggers_l, wins_l, losses_l = [], [], []
+    win_pct_l, std_l, sharpe_l = [], [], []
+    avg_l, total_l, p_l = [], [], []
 
-    # Captures matrix on same-day returns
-    r = sec_rets.to_numpy(dtype="float64").reshape(-1, 1)        # [N x 1]
-    caps = combined.astype("float64") * r                        # [N x S]
+    for mask in range(1, S_count + 1):
+        cols = [i for i in range(K) if (mask >> i) & 1]
+        Ssub = S[:, cols]
+        pos_cnt = (Ssub == 1).sum(axis=1)
+        neg_cnt = (Ssub == -1).sum(axis=1)
+        combined = np.zeros(N, dtype=TF_MATRIX_DTYPE)
+        combined[(pos_cnt > 0) & (neg_cnt == 0)] = 1
+        combined[(neg_cnt > 0) & (pos_cnt == 0)] = -1
+        cap_subset = combined.astype("float64") * r
+        trig = combined != 0
 
-    # Trigger mask and stats per subset (vectorized)
-    m = combined != 0                                           # [N x S]
-    n = m.sum(axis=0).astype("float64")                         # [S]
-    # avoid divide-by-zero
-    nz = n > 0
-    # wins/losses
-    wins = ((caps > 0) & m).sum(axis=0).astype("float64")
-    losses = n - wins
-    win_pct = np.where(nz, wins / n * 100.0, 0.0)
-    # sums
-    sum_x  = (caps * m).sum(axis=0)                             # equals Total % over triggers
-    sum_x2 = ((caps * caps) * m).sum(axis=0)
-    avg    = np.where(nz, sum_x / n, 0.0)
-    total  = sum_x
-    # std with ddof=1 where n>1
-    var = np.where(n > 1, (sum_x2 - (sum_x * sum_x) / n) / (n - 1.0), 0.0)
-    var = np.where(var > 0, var, 0.0)
-    std = np.sqrt(var)
-    # Sharpe and t
-    ann_ret = avg * 252.0
-    ann_std = np.where(std > 0, std * np.sqrt(252.0), 0.0)
-    sharpe  = np.where(ann_std > 0, (ann_ret - RISK_FREE_ANNUAL) / ann_std, 0.0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        t_stat = np.where((std > 0) & (n > 1), avg / (std / np.sqrt(n)), 0.0)
-    try:
-        from scipy import stats as _st  # vectorized CDF
-        p_vals = 2.0 * (1.0 - _st.t.cdf(np.abs(t_stat), df=np.maximum(n - 1.0, 1.0)))
-    except Exception:
-        p_vals = np.ones_like(t_stat)
+        captures_s = pd.Series(cap_subset, index=sec_rets.index)
+        trig_s = pd.Series(trig, index=sec_rets.index)
 
-    # AVERAGES across subsets (unweighted)
-    def _mean_safe(x):  # ignore NaNs/infs
+        score = _canonical_score_captures(
+            captures_s, trig_s,
+            risk_free_rate=RISK_FREE_ANNUAL, periods_per_year=252, ddof=1,
+        )
+
+        triggers_l.append(score.trigger_days)
+        wins_l.append(score.wins)
+        losses_l.append(score.losses)
+        win_pct_l.append(score.win_rate)
+        std_l.append(score.std_dev)
+        sharpe_l.append(score.sharpe)
+        avg_l.append(score.avg_daily_capture)
+        total_l.append(score.total_capture)
+        p_l.append(score.p_value if score.p_value is not None else 1.0)
+
+    def _mean_safe(x):
         x = np.asarray(x, dtype="float64")
         x[~np.isfinite(x)] = np.nan
         return float(np.nanmean(x)) if x.size else 0.0
 
     out = {
-        "Triggers": int(_mean_safe(n) + 0.5),  # Spymaster-style round-up; avoids banker's rounding
-        "Wins":     int(_mean_safe(wins) + 0.5),
-        "Losses":   int(_mean_safe(losses) + 0.5),
-        "Win %":    round(_mean_safe(win_pct), 2),
-        "Std Dev (%)": round(_mean_safe(std), 4),
-        "Sharpe":      round(_mean_safe(sharpe), 2),
-        "Avg %":       round(_mean_safe(avg), 4),  # Standardized key
-        "Total %":     round(_mean_safe(total), 4),
-        "p":           round(_mean_safe(p_vals), 4),
+        "Triggers":    int(_mean_safe(triggers_l) + 0.5),
+        "Wins":        int(_mean_safe(wins_l) + 0.5),
+        "Losses":      int(_mean_safe(losses_l) + 0.5),
+        "Win %":       round(_mean_safe(win_pct_l), 2),
+        "Std Dev (%)": round(_mean_safe(std_l), 4),
+        "Sharpe":      round(_mean_safe(sharpe_l), 2),
+        "Avg %":       round(_mean_safe(avg_l), 4),
+        "Total %":     round(_mean_safe(total_l), 4),
+        "p":           round(_mean_safe(p_l), 4),
     }
     return out
 
@@ -2567,21 +2505,11 @@ def _subset_metrics_spymaster_fast(secondary: str,
     if not trig_mask.any():
         return _empty_metrics(), _empty_dates()
 
-    tc = cap[trig_mask]
-    trig_n = int(tc.size)
-
-    wins = int((tc > 0).sum()); losses = int(trig_n - wins)
-    avg  = float(tc.mean()); total = float(tc.sum())
-    std  = float(tc.std(ddof=1)) if trig_n > 1 else 0.0
-    ann_ret = avg * 252.0
-    ann_std = std * math.sqrt(252.0) if std != 0.0 else 0.0
-    sharpe  = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
-    try:
-        from scipy import stats as _st
-        t_stat = (avg / (std / math.sqrt(trig_n))) if (std > 0 and trig_n > 1) else 0.0
-        p_val  = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(trig_n - 1, 1))))
-    except Exception:
-        t_stat, p_val = 0.0, 1.0
+    score = _canonical_score_captures(
+        pd.Series(cap, index=sec_index[common]),
+        pd.Series(trig_mask, index=sec_index[common]),
+        risk_free_rate=RISK_FREE_ANNUAL, periods_per_year=252, ddof=1,
+    )
 
     # Simple info snapshot using last two common dates
     prev_dt = sec_index[common[-2]] if common.size >= 2 else None
@@ -2591,16 +2519,16 @@ def _subset_metrics_spymaster_fast(secondary: str,
                ("Short" if (common.size >= 2 and final_short[-2]) else "None"))
 
     met = {
-        "Triggers": trig_n,
-        "Wins": wins,
-        "Losses": losses,
-        "Win %": round(100*wins/max(trig_n,1), 2),
-        "Std Dev (%)": round(std, 4),
-        "Sharpe": round(sharpe, 2),
-        "T": round(t_stat, 4),
-        "Avg %": round(avg, 4),  # Standardized key for K>=2 combiner
-        "Total %": round(total, 4),
-        "p": round(p_val, 4),
+        "Triggers": score.trigger_days,
+        "Wins": score.wins,
+        "Losses": score.losses,
+        "Win %": round(score.win_rate, 2),
+        "Std Dev (%)": round(score.std_dev, 4),
+        "Sharpe": round(score.sharpe, 2),
+        "T": round(score.t_statistic, 4) if score.t_statistic is not None else 0.0,
+        "Avg %": round(score.avg_daily_capture, 4),  # Standardized key for K>=2 combiner
+        "Total %": round(score.total_capture, 4),
+        "p": round(score.p_value, 4) if score.p_value is not None else 1.0,
     }
     info = {"prev_date": prev_dt, "live_date": live_dt, "prev_sig": prev_sig, "live_sig": live_sig}
     return met, info
@@ -2714,34 +2642,22 @@ def _subset_metrics_spymaster_bitmask(secondary: str,
     if not trig_mask.any():
         return _empty_metrics(), _empty_dates()
 
-    tc = cap[trig_mask]
-    n_trig = int(tc.size)
-    wins = int(np.sum(tc > 0))
-    losses = int(n_trig - wins)
-    avg_cap = float(tc.mean()) if n_trig > 0 else 0.0
-    total = float(tc.sum())
-    std = float(np.std(tc, ddof=1)) if n_trig > 1 else 0.0
-    ann_ret = avg_cap * 252.0
-    ann_std = std * np.sqrt(252.0) if std != 0.0 else 0.0
-    sharpe = ((ann_ret - RISK_FREE_ANNUAL) / ann_std) if ann_std != 0.0 else 0.0
-    t_stat = (avg_cap / (std / np.sqrt(n_trig))) if (std > 0 and n_trig > 1) else 0.0
-
-    try:
-        from scipy import stats as _st
-        p_val = float(2 * (1 - _st.t.cdf(abs(t_stat), df=max(n_trig - 1, 1))))
-    except Exception:
-        p_val = 1.0
+    score = _canonical_score_captures(
+        pd.Series(cap, index=sec_rets.index),
+        pd.Series(trig_mask, index=sec_rets.index),
+        risk_free_rate=RISK_FREE_ANNUAL, periods_per_year=252, ddof=1,
+    )
 
     out = {
-        "Triggers": n_trig,
-        "Wins": wins,
-        "Losses": losses,
-        "Win %": round(100.0 * wins / max(n_trig, 1), 2),
-        "Std Dev (%)": round(std, 4),
-        "Sharpe": round(sharpe, 2),
-        "Avg %": round(avg_cap, 4),
-        "Total %": round(total, 4),
-        "p": round(p_val, 4),
+        "Triggers": score.trigger_days,
+        "Wins": score.wins,
+        "Losses": score.losses,
+        "Win %": round(score.win_rate, 2),
+        "Std Dev (%)": round(score.std_dev, 4),
+        "Sharpe": round(score.sharpe, 2),
+        "Avg %": round(score.avg_daily_capture, 4),
+        "Total %": round(score.total_capture, 4),
+        "p": round(score.p_value, 4) if score.p_value is not None else 1.0,
     }
 
     info = {

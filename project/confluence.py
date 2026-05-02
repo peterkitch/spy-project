@@ -159,14 +159,8 @@ def _ttl_cache(ttl: int = DEFAULT_TTL):
 # Cached wrappers for expensive IO operations
 @_ttl_cache(ttl=600)  # 10 minutes
 def _cached_fetch_interval_data(ticker: str, interval: str, **kwargs):
-    """
-    Cached wrapper for fetch_interval_data.
-
-    Normalizes cache key by ensuring price_basis is always explicit,
-    preventing duplicate downloads when some callers omit it.
-    """
-    # Normalize cache key so all callers hit the same entry
-    kwargs.setdefault('price_basis', 'close')
+    """Cached wrapper for fetch_interval_data. Raw Close only (spec v0.5 §3)."""
+    kwargs.pop('price_basis', None)
     return fetch_interval_data(ticker, interval, **kwargs)
 
 @_ttl_cache(ttl=600)  # 10 minutes
@@ -180,6 +174,11 @@ try:
     from scipy import stats
 except Exception:
     stats = None
+
+from canonical_scoring import (
+    combine_consensus_signals as _canonical_consensus,
+    score_captures as _canonical_score_captures,
+)
 
 RISK_FREE_ANNUAL = float(os.environ.get('CONFLUENCE_RISK_FREE_ANNUAL',
                                         os.environ.get('RISK_FREE_ANNUAL', '5.0')))
@@ -314,22 +313,11 @@ def _mp_decode_sig(x) -> str:
 def _mp_combine_unanimity_vectorized(sig_df: pd.DataFrame) -> pd.Series:
     """
     Buy=+1, Short=-1, None=0; unanimity on active members only (ignores None).
-    Vectorized, no pandas downcast warnings.
+    Delegates to canonical_scoring.combine_consensus_signals (spec §18).
     """
     if sig_df.empty:
         return pd.Series([], dtype=object)
-
-    m = {'Buy': 1, 'Short': -1, 'None': 0}
-    # Use map instead to replace to avoid FutureWarning
-    tmp = sig_df.apply(lambda s: s.map(m).fillna(0).astype('int8'))
-    arr = tmp.to_numpy(dtype=np.int16)
-
-    count = (arr != 0).sum(axis=1)
-    ssum  = arr.sum(axis=1)
-
-    out = np.where((count > 0) & (ssum == count), 'Buy',
-          np.where((count > 0) & (ssum == -count), 'Short', 'None'))
-    return pd.Series(out, index=sig_df.index, dtype=object)
+    return _canonical_consensus([sig_df[c] for c in sig_df.columns])
 
 def _mp_safe_daily_pct_change(close: pd.Series) -> pd.Series:
     prev = close.shift(1)
@@ -362,49 +350,43 @@ def _mp_forward_return_on_grid(close_on_grid: pd.Series) -> pd.Series:
     return out
 
 def _mp_metrics(captures: pd.Series, trig_mask: pd.Series, bars_per_year: int) -> dict:
-    trig_idx = captures.index[trig_mask]
-    n = int(len(trig_idx))
-    if n == 0:
+    """Compute multi-primary canonical metrics.
+
+    Delegates to canonical_scoring.score_captures (spec §13–§17).
+    Output keys retain confluence's display-table conventions
+    (e.g. 'Triggers', 'Sharpe', 'p', 'Sig 90%' with checkmarks).
+    """
+    if int(trig_mask.sum()) == 0:
         return {}
 
-    vals = captures.loc[trig_idx].astype(float)
-    wins = int((vals > 0).sum())
-    losses = n - wins  # includes exactly 0 as losses
-    win_pct = (wins / n * 100.0)
+    score = _canonical_score_captures(
+        captures.astype(float),
+        trig_mask,
+        risk_free_rate=RISK_FREE_ANNUAL,
+        periods_per_year=int(bars_per_year),
+        ddof=1,
+    )
 
-    avg = float(vals.mean())
-    total = float(vals.sum())
-    std = float(vals.std(ddof=1)) if n > 1 else 0.0
-
-    sharpe, t_stat, p_val = 0.0, None, None
-    if n > 1 and std != 0.0:
-        annual_ret = avg * float(bars_per_year)
-        annual_std = std * math.sqrt(float(bars_per_year))
-        if annual_std != 0:
-            sharpe = (annual_ret - RISK_FREE_ANNUAL) / annual_std
-        if stats is not None:
-            t_stat = avg / (std / math.sqrt(n))
-            p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
-
-    # Sig flags like SpyMaster table
-    sig90 = '✔' if (p_val is not None and p_val <= 0.10) else ''
-    sig95 = '✔' if (p_val is not None and p_val <= 0.05) else ''
-    sig99 = '✔' if (p_val is not None and p_val <= 0.01) else ''
+    p = score.p_value
+    # Sig flags like SpyMaster table (confluence uses <= and a checkmark)
+    sig90 = '✔' if (p is not None and p <= 0.10) else ''
+    sig95 = '✔' if (p is not None and p <= 0.05) else ''
+    sig99 = '✔' if (p is not None and p <= 0.01) else ''
 
     return {
-        'Triggers': n,
-        'Wins': wins,
-        'Losses': losses,
-        'Win %': round(win_pct, 2),
-        'StdDev %': round(std, 4),
-        'Sharpe': round(sharpe, 2),
-        't': round(t_stat, 4) if t_stat is not None else 'N/A',
-        'p': round(p_val, 4) if p_val is not None else 'N/A',
+        'Triggers': score.trigger_days,
+        'Wins': score.wins,
+        'Losses': score.losses,
+        'Win %': round(score.win_rate, 2),
+        'StdDev %': round(score.std_dev, 4),
+        'Sharpe': round(score.sharpe, 2),
+        't': round(score.t_statistic, 4) if score.t_statistic is not None else 'N/A',
+        'p': round(p, 4) if p is not None else 'N/A',
         'Sig 90%': sig90,
         'Sig 95%': sig95,
         'Sig 99%': sig99,
-        'Avg Cap %': round(avg, 4),
-        'Total %': round(total, 4),
+        'Avg Cap %': round(score.avg_daily_capture, 4),
+        'Total %': round(score.total_capture, 4),
     }
 
 def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_flags=None):
@@ -1353,7 +1335,7 @@ def create_individual_chart(ticker: str, interval: str, library: dict) -> html.D
         MAX_GRAPH_POINTS = int(os.environ.get('MAX_GRAPH_POINTS', 500))
 
         # Fetch prices on-demand
-        df_prices = _cached_fetch_interval_data(ticker, interval, price_basis='close')
+        df_prices = _cached_fetch_interval_data(ticker, interval)
 
         if df_prices is None or df_prices.empty:
             return html.Div([
@@ -2178,7 +2160,7 @@ def create_master_combined_chart(ticker: str, libraries: dict, aligned: pd.DataF
     """
     # Price
     t0 = time.perf_counter()
-    px = _cached_fetch_interval_data(ticker, '1d', price_basis='close')
+    px = _cached_fetch_interval_data(ticker, '1d')
     logger.info("[Master] price fetch %.3fs", time.perf_counter()-t0)
 
     if px is None or px.empty or 'Close' not in px.columns:
@@ -2457,7 +2439,7 @@ def create_confluence_performance_panel(ticker: str, aligned: pd.DataFrame) -> h
       • shows KPI tiles and forward distributions for today's state
       • adds a 'conditioned equity' curve that trades only when state==today
     """
-    px = _cached_fetch_interval_data(ticker, '1d', price_basis='close')
+    px = _cached_fetch_interval_data(ticker, '1d')
     if px is None or px.empty or 'Close' not in px.columns:
         return html.Div([html.P("No daily data for performance panel.", style={'color':'#ff4444'})])
 
