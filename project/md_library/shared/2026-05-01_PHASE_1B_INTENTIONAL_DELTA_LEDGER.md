@@ -585,18 +585,28 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
           (`test_impactsearch_uses_canonical_maxsma_sentinels`).
   - Stage 3 (signal_library, Phase 2A PR #134):
       The Phase 2A static regression guard `test_b2_daily_top_pairs_fallbacks_are_canonical`
-      surfaced two more sites with the same buy-form-reused-for-short
+      surfaced two more files with the same buy-form-reused-for-short
       bug:
         `signal_library/multi_timeframe_builder.py:626-627`
+          (compute_dynamic_combined_capture_vectorized inner loop)
         `signal_library/multi_timeframe_builder.py:687-688`
-        `signal_library/confluence_analyzer.py:81-82`
+          (generate_signal_series_dynamic per-day fallback)
+        `signal_library/confluence_analyzer.py:77-78`
+          (load_signal_library_interval signal-from-pkl)
       All three used `((114, 113), 0.0)` for both buy and short,
       letting SMA_113 / SMA_114 comparisons gate a tradable signal
       from a missing-data fallback. Same class as the
       ImpactSearch site fixed in 1B-2B amendment 1.
+      Phase 2A's sparse-cache scenario tests
+      (`test_sparse_cache_fallbacks.py`) then surfaced one more
+      site in the same file: `multi_timeframe_builder.py:415-417`
+      stored `((114, 113), 0.0)` for both buy and short on the
+      day-0 init store inside the streaming-pair loop. Same
+      class, just on the write side rather than the read side.
       Fixes:
         multi_timeframe_builder already had `MAX_SMA_DAY = 114` at
-        module scope; the two sites now use canonical
+        module scope; the two read sites and the one day-0 write
+        site now use canonical
         `((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)` for buy and
         `((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)` for short.
         confluence_analyzer gained a module-level

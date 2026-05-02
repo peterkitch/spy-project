@@ -412,9 +412,12 @@ def find_optimal_pairs(df: pd.DataFrame, interval: str) -> Tuple[Tuple[int, int]
 
     for idx in range(num_days):
         if idx == 0:
-            # First day: use sentinel pair (114, 113) matching spymaster
-            daily_top_buy_pairs[df.index[idx]] = ((114, 113), 0.0)
-            daily_top_short_pairs[df.index[idx]] = ((114, 113), 0.0)
+            # First day: canonical sentinels per spec §appendix.
+            # Phase 2A fix: previously used (114, 113) for both,
+            # which let SMA_113 / SMA_114 comparisons gate a tradable
+            # signal once history accumulated.
+            daily_top_buy_pairs[df.index[idx]] = ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+            daily_top_short_pairs[df.index[idx]] = ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
             continue
 
         # Use PREVIOUS day's SMAs to generate signals
