@@ -339,3 +339,88 @@ def test_d2_onepass_process_tickers_existing_signals_path(monkeypatch, tmp_path)
         )
     finally:
         op.SIGNAL_LIBRARY_DIR = pre_signal_dir
+
+
+# ---------------------------------------------------------------------------
+# D-StackBuilder: populated-library smoke for stackbuilder
+# ---------------------------------------------------------------------------
+
+
+def test_d_stackbuilder_load_lib_and_signals_aligned(monkeypatch, tmp_path):
+    """StackBuilder populated-library smoke.
+
+    Exercises:
+      - stackbuilder.load_lib_or_none() against a tmp library
+      - stackbuilder._signals_aligned_and_mask() producing
+        signal-state Buy/Short -> True, None -> False mask
+
+    StackBuilder.load_lib_or_none first calls onepass.load_signal_library,
+    which uses onepass.SIGNAL_LIBRARY_DIR. We monkeypatch that to
+    tmp_path so the fixture lib is found via the primary path. We
+    also monkeypatch stackbuilder.SIGNAL_LIB_DIR_RUNTIME for the
+    fallback path symmetrically.
+    """
+    sb = _get_module("stackbuilder")
+    op = _get_module("onepass")
+
+    pre_op_dir = op.SIGNAL_LIBRARY_DIR
+    pre_sb_runtime = sb.SIGNAL_LIB_DIR_RUNTIME
+
+    try:
+        signal_root = tmp_path / "signal_library" / "data"
+        monkeypatch.setattr(op, "SIGNAL_LIBRARY_DIR", str(signal_root))
+        monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(signal_root / "stable"))
+
+        # Build a small library with a mixed signal series so we can
+        # observe Buy/Short -> True, None -> False masking.
+        dates = pd.bdate_range(start="2024-01-02", periods=10)
+        signals = ["None", "Buy", "Buy", "None", "Short", "Short", "None", "Buy", "Short", "None"]
+        parity_hash = op.compute_parity_hash("Close", "ticker")
+        lib = make_signal_library_dict(
+            dates,
+            primary_signals=signals,
+            parity_hash=parity_hash,
+        )
+        path = Path(op._lib_path_for("AAA"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as fh:
+            pickle.dump(lib, fh)
+        assert path.exists()
+
+        # 1) load_lib_or_none returns the populated library.
+        loaded = sb.load_lib_or_none("AAA")
+        assert isinstance(loaded, dict), (
+            f"load_lib_or_none returned {type(loaded).__name__}; expected dict"
+        )
+        assert loaded.get("price_source") == "Close"
+        assert loaded.get("max_sma_day") == 114
+        assert len(loaded["primary_signals"]) == 10
+
+        # 2) _signals_aligned_and_mask completes without error and
+        # produces a mask aligned to sec_index where True at every
+        # date that has a Buy/Short in the source library.
+        sec_index = pd.DatetimeIndex(dates)
+        s, present = sb._signals_aligned_and_mask("AAA", "D", sec_index)
+        assert isinstance(s, pd.Series)
+        assert isinstance(present, pd.Series)
+        assert len(s) == len(sec_index)
+        assert len(present) == len(sec_index)
+        # Reindex preserves the order of sec_index. With a non-truncated
+        # library and grace_days >= 0 the present mask should be True on
+        # every date in sec_index.
+        assert bool(present.all()), (
+            f"present mask should be True everywhere for an aligned "
+            f"library; got: {present.tolist()}"
+        )
+        # Signal-state assertions: positions where the source had Buy/Short
+        # must end up as Buy/Short in the aligned series; positions with
+        # None remain None.
+        expected_signals = pd.Series(signals, index=sec_index)
+        for date in sec_index:
+            assert s.loc[date] == expected_signals.loc[date], (
+                f"signal mismatch at {date}: aligned={s.loc[date]!r} "
+                f"vs expected={expected_signals.loc[date]!r}"
+            )
+    finally:
+        op.SIGNAL_LIBRARY_DIR = pre_op_dir
+        sb.SIGNAL_LIB_DIR_RUNTIME = pre_sb_runtime
