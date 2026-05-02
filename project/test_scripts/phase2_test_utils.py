@@ -168,6 +168,58 @@ def build_poison_price_series(
     return df_clean, df_poisoned, poison_day
 
 
+def make_synthetic_interval_library(
+    library_dir: Path,
+    *,
+    ticker: str = "AAA",
+    intervals: Sequence[str] = ("1d", "1wk", "1mo", "3mo", "1y"),
+    n_bars: int = 30,
+    engine_version: str = "1.0.0",
+) -> Dict[str, Path]:
+    """Phase 2B-1: write synthetic interval libraries for confluence.
+
+    Filenames match `signal_library.confluence_analyzer.load_signal_library_interval`:
+      1d:    ``<ticker>_stable_v{ver}.pkl``
+      else:  ``<ticker>_stable_v{ver}_{interval}.pkl``
+    where ``ver`` is ENGINE_VERSION with dots replaced by underscores
+    (e.g. ``1_0_0``).
+
+    Each library uses the canonical-sentinel
+    `make_signal_library_dict` builder; the per-interval index is a
+    business-day index of length ``n_bars``. Returns a dict mapping
+    interval -> on-disk path.
+    """
+    library_dir.mkdir(parents=True, exist_ok=True)
+    ver_tag = engine_version.replace(".", "_")
+    paths: Dict[str, Path] = {}
+    for interval in intervals:
+        if interval == "1d":
+            fname = f"{ticker}_stable_v{ver_tag}.pkl"
+        else:
+            fname = f"{ticker}_stable_v{ver_tag}_{interval}.pkl"
+        # Use a per-interval rolling start so the synthetic indices
+        # share the same trailing date but legitimately differ on
+        # earlier ones.
+        dates = pd.bdate_range(end="2024-12-30", periods=n_bars, freq="B")
+        # Cycle Buy/Short/None so confluence/alignment has non-trivial
+        # input.
+        sigs = [["Buy", "Short", "None"][i % 3] for i in range(n_bars)]
+        lib = make_signal_library_dict(
+            dates,
+            engine_version=engine_version,
+            primary_signals=sigs,
+        )
+        # confluence_analyzer normalizes 'signals' / 'dates' keys.
+        lib["signals"] = list(sigs)
+        lib["interval"] = interval
+        lib["ticker"] = ticker
+        out = library_dir / fname
+        with open(out, "wb") as fh:
+            pickle.dump(lib, fh)
+        paths[interval] = out
+    return paths
+
+
 def make_synthetic_pkl_for_spymaster(
     dates: pd.DatetimeIndex,
     *,
