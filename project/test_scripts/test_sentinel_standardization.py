@@ -26,6 +26,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 SPYMASTER_TEXT = (PROJECT_DIR / "spymaster.py").read_text(encoding="utf-8")
 ONEPASS_TEXT = (PROJECT_DIR / "onepass.py").read_text(encoding="utf-8")
 TRAFFICFLOW_TEXT = (PROJECT_DIR / "trafficflow.py").read_text(encoding="utf-8")
+IMPACTSEARCH_TEXT = (PROJECT_DIR / "impactsearch.py").read_text(encoding="utf-8")
 
 
 def test_spymaster_no_streaming_sentinels():
@@ -86,3 +87,36 @@ def test_trafficflow_no_legacy_sentinel_literals():
     # No `((1, 2), 0.0)` or `((2, 1), 0.0)` remaining in trafficflow.
     assert not re.search(r"\(\s*\(\s*1\s*,\s*2\s*\)\s*,\s*0\.0\s*\)", TRAFFICFLOW_TEXT)
     assert not re.search(r"\(\s*\(\s*2\s*,\s*1\s*\)\s*,\s*0\.0\s*\)", TRAFFICFLOW_TEXT)
+
+
+def test_impactsearch_no_legacy_sentinel_literals():
+    # 1B-2B amendment: impactsearch.py:2272 had a (1, 2) fallback
+    # sentinel inside the per-date gating loop that builds primary
+    # signals from cached daily_top_*_pairs dicts. Same class of bug
+    # as TrafficFlow had -- (1, 2) is unsafe because SMA_1 / SMA_2 are
+    # finite most days. No (1, 2) / (2, 1) sentinel literals should
+    # remain in impactsearch.py.
+    assert not re.search(r"\(\s*\(\s*1\s*,\s*2\s*\)\s*,\s*0\.0\s*\)", IMPACTSEARCH_TEXT)
+    assert not re.search(r"\(\s*\(\s*2\s*,\s*1\s*\)\s*,\s*0\.0\s*\)", IMPACTSEARCH_TEXT)
+
+
+def test_impactsearch_uses_canonical_maxsma_sentinels():
+    # The two `daily_top_*_pairs.get(...)` calls inside the per-date
+    # gating loop must default to canonical MAX-SMA sentinel tuples.
+    # Buy: (MAX_SMA_DAY, MAX_SMA_DAY - 1). Short: (MAX_SMA_DAY - 1, MAX_SMA_DAY).
+    buy_default = re.search(
+        r"daily_top_buy_pairs\.get\([^,]+,\s*\(\s*\(\s*MAX_SMA_DAY\s*,\s*MAX_SMA_DAY\s*-\s*1\s*\)\s*,\s*0\.0\s*\)\s*\)",
+        IMPACTSEARCH_TEXT,
+    )
+    short_default = re.search(
+        r"daily_top_short_pairs\.get\([^,]+,\s*\(\s*\(\s*MAX_SMA_DAY\s*-\s*1\s*,\s*MAX_SMA_DAY\s*\)\s*,\s*0\.0\s*\)\s*\)",
+        IMPACTSEARCH_TEXT,
+    )
+    assert buy_default is not None, (
+        "impactsearch.py daily_top_buy_pairs.get() default does not "
+        "match the canonical (MAX_SMA_DAY, MAX_SMA_DAY - 1) form"
+    )
+    assert short_default is not None, (
+        "impactsearch.py daily_top_short_pairs.get() default does not "
+        "match the canonical (MAX_SMA_DAY - 1, MAX_SMA_DAY) form"
+    )

@@ -540,7 +540,7 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     not crash. Three different placeholders existed across the
     engines (`(1, 2)`, `(2, 1)`, `(MAX_SMA_DAY, MAX_SMA_DAY - 1)`).
     After this entry, every engine uses the MAX-SMA form.
-  - Stage 2 (OnePass + TrafficFlow):
+  - Stage 2 (OnePass + TrafficFlow + ImpactSearch):
       OnePass: three sites that previously used the buy sentinel
       `(MAX_SMA_DAY, MAX_SMA_DAY - 1)` for short are switched to
       the canonical `(MAX_SMA_DAY - 1, MAX_SMA_DAY)`:
@@ -558,13 +558,32 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
       finite values most days, so the gating logic could
       accidentally produce a tradable signal from a missing-data
       sentinel.
-      New test: `test_sentinel_standardization.py` asserts
-      Spymaster has no `(1, 2) / (2, 1)` sentinel literals,
-      OnePass short-sentinel assignments use the canonical
-      `MAX_SMA_DAY-1,MAX_SMA_DAY` form, TrafficFlow defines the
-      canonical sentinel constants, and TrafficFlow has no
-      legacy sentinel literals.
-  - Status: implemented in 1B-2B (stages 1 and 2).
+      ImpactSearch: the same class of bug surfaced at
+      `impactsearch.py:2272-2273`, where the per-date gating loop
+      that builds primary signals from cached
+      `daily_top_*_pairs` dicts used `((1, 2), 0.0)` as the
+      `dict.get` default for both buy and short. ImpactSearch
+      already imports `MAX_SMA_DAY = 114` at module scope, so
+      the fix uses inline canonical tuples
+      `((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)` for buy and
+      `((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)` for short. Missed
+      during the original 1B-2B sentinel inventory because the
+      adjacent alignment helper at `impactsearch.py:1651-1656`
+      was already canonical and the grep landed on that one.
+      New test assertions in `test_sentinel_standardization.py`:
+        - Spymaster has no `(1, 2) / (2, 1)` sentinel literals.
+        - OnePass short-sentinel assignments use the canonical
+          `MAX_SMA_DAY-1,MAX_SMA_DAY` form.
+        - TrafficFlow defines the canonical sentinel constants
+          and has no legacy sentinel literals.
+        - ImpactSearch has no `(1, 2) / (2, 1)` sentinel
+          literals (`test_impactsearch_no_legacy_sentinel_literals`)
+          and the two `daily_top_*_pairs.get(...)` calls default
+          to canonical MAX-SMA tuples
+          (`test_impactsearch_uses_canonical_maxsma_sentinels`).
+  - Status: implemented in 1B-2B (stages 1 and 2). Engine
+    coverage: Spymaster (stage 1) + OnePass + TrafficFlow +
+    ImpactSearch (stage 2).
 
 ## Entry 9: TrafficFlow cache key normalization
 

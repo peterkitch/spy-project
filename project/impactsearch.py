@@ -2269,8 +2269,14 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                 previous_date = date
                 continue
 
-            buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((1,2),0.0))
-            short_pair, short_val = daily_top_short_pairs.get(previous_date, ((1,2),0.0))
+            # Phase 1B-2B: canonical MAX-SMA sentinels per spec §appendix.
+            # The previous (1, 2) fallback was unsafe because SMA_1 / SMA_2
+            # have finite values most days, so the gating below could
+            # accidentally produce a tradable signal from a missing-data
+            # fallback. MAX-SMA-day SMAs are NaN until enough history
+            # accumulates, so they correctly gate to no-trade.
+            buy_pair, buy_val = daily_top_buy_pairs.get(previous_date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0))
+            short_pair, short_val = daily_top_short_pairs.get(previous_date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0))
 
             # Get previous day's SMA values
             sma1_buy = sma_matrix[df.index.get_loc(previous_date), buy_pair[0]-1]
