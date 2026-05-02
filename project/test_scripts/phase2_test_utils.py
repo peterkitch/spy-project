@@ -132,6 +132,42 @@ def write_signal_library(
     return out
 
 
+def build_poison_price_series(
+    *,
+    length: int = 150,
+    poison_day: int = 120,
+    poison_value: float = 1e6,
+    base: float = 100.0,
+    drift: float = 0.0005,
+    seed: int = 7,
+    start: str = "2024-01-02",
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Build matched (un-poisoned, poisoned) price DataFrames.
+
+    Phase 2B-1 lookahead poison fixture.
+
+    Returns (df_clean, df_poisoned, poison_idx). Both DataFrames
+    share index and columns; only ``Close`` at ``poison_day``
+    differs. ``length`` defaults to 150 business days so SMA_113
+    and SMA_114 are well-defined by ``poison_day=120``.
+
+    The poison value is intentionally extreme (1e6) so any
+    lookahead bug — i.e. any path where day-T's signal depends
+    on day-T's Close — produces an obviously different signal.
+    """
+    if poison_day >= length:
+        raise ValueError(f"poison_day ({poison_day}) must be < length ({length})")
+    rng = np.random.default_rng(seed)
+    pct = rng.normal(loc=drift, scale=0.005, size=length)
+    closes = base * np.cumprod(1.0 + pct)
+    dates = pd.bdate_range(start=start, periods=length)
+    df_clean = pd.DataFrame({"Close": closes}, index=dates)
+    closes_poisoned = closes.copy()
+    closes_poisoned[poison_day] = poison_value
+    df_poisoned = pd.DataFrame({"Close": closes_poisoned}, index=dates)
+    return df_clean, df_poisoned, poison_day
+
+
 def make_synthetic_pkl_for_spymaster(
     dates: pd.DatetimeIndex,
     *,
