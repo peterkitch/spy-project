@@ -10,37 +10,52 @@ before doing any work in `project/`.
 
 ### 1. Pinned Python interpreter (CRITICAL)
 
-The project's pinned interpreter is:
+The project's pinned audit interpreter on this machine is:
 
 ```
 C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe
 ```
 
-This is a Python 3.12 conda env (`spyproject2`) with the exact
-pinned `numpy==2.2.6`, `scipy==1.13.1`, `pandas==2.3.2`,
-`pytest==8.3.5` versions the Phase 1A baseline-lock and other
-ULP-sensitive snapshots were captured under.
+This is a Python 3.12 conda env (`spyproject2`) used for the Phase
+1A baseline-lock snapshots and the sprint audit test suite. On this
+machine it currently reports:
+
+  - Python 3.12.2
+  - NumPy 1.26.4, MKL-backed (`mkl-sdl`, Intel MKL 2023.1)
+  - pandas 2.2.1
+  - SciPy 1.13.1
+  - pytest 8.3.5
+
+The important contract is the interpreter path and the runtime it
+actually provides, not the aspirational versions in `environment.yml`
+/ `requirements.txt`. Those files currently list newer NumPy/pandas
+pins and should not be used to recreate the audit environment without
+an explicit revalidation pass.
+
+The NumPy 1.26.4 pin in `spyproject2` is intentional on this machine:
+older project performance notes identify `spyproject2` as the
+MKL-backed primary environment and `spyproject2_basic` as the generic
+BLAS / NumPy 2.2.6 alternative. MKL materially improves the heavy
+numerical workloads used by PRJCT9, especially large matrix and SMA
+workloads.
 
 **The env is NOT on PATH by default.** A bare `python` or
-`python -m pytest` invocation resolves to
-`C:\Python313\python.exe`, which has no project deps installed
-and cannot run the suite. Floating-point ULP drift between
-scipy 1.13.1 and the latest scipy with Python 3.13 wheels
-flips Phase 1A baseline-lock snapshots, so re-installing newer
-pins into a different Python is not a shortcut — it breaks
-the audit contract.
+`python -m pytest` invocation may resolve to
+`C:\Python313\python.exe`, which is not the project audit
+environment. Python 3.13 also cannot use the SciPy 1.13.1 wheel set
+used for the baseline-lock contract.
 
-Always invoke as:
+Always invoke tests as:
 
 ```
 "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -m pytest test_scripts -q
 "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -m py_compile <file>.py
 ```
 
-If the env directory is missing, **STOP and report** — do not
-attempt to recreate it from `requirements.txt` or
-`environment.yml` without confirming the exact version pins
-match the audit contract, especially `scipy==1.13.1`.
+If this env directory is missing, **STOP and report**. Do not
+recreate it from `requirements.txt` or `environment.yml` and do not
+rebaseline snapshots under a different NumPy/SciPy/pandas stack
+without explicit authorization.
 
 ### 2. Single-command bash discipline
 
