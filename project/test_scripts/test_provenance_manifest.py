@@ -1233,3 +1233,126 @@ def test_3b2a_strict_runtime_mismatch_pickle(tmp_path):
     data2, result2 = pm.load_verified_pickle_artifact(p, strict=True, cache=False)
     assert result2.ok is False
     assert any("numpy" in str(m[0]) for m in result2.mismatches)
+
+
+# ===========================================================================
+# Phase 3B-2A: StackBuilder run_manifest enrichment
+# ===========================================================================
+
+
+def test_3b2a_stackbuilder_input_manifest_collector(tmp_path):
+    """Collector accumulates content_hashes from manifested loads,
+    counts legacy/missing inputs, and resets when finalized."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    stackbuilder._start_input_manifest_collection()
+    # Manifested libs -> content_hash should land in the collector. The
+    # two libs MUST differ so their content_hashes differ; ticker is in
+    # the manifest, not in the canonical content body.
+    dates = pd.bdate_range(start="2024-01-02", periods=10)
+    lib_a = make_signal_library_dict(
+        dates, primary_signals=["Buy"] * len(dates),
+    )
+    pm.attach_manifest(
+        lib_a, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="AAA",
+    )
+    lib_b = make_signal_library_dict(
+        dates, primary_signals=["Short"] * len(dates),
+    )
+    pm.attach_manifest(
+        lib_b, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="BBB",
+    )
+    legacy = make_signal_library_dict(dates)  # no manifest
+
+    stackbuilder._record_input_lib(lib_a)
+    stackbuilder._record_input_lib(lib_b)
+    stackbuilder._record_input_lib(lib_a)  # duplicate -> set dedupes
+    stackbuilder._record_input_lib(legacy)
+    stackbuilder._record_input_lib(None)
+    snap = stackbuilder._finalize_input_manifest_collection()
+    assert len(snap["input_manifest_hashes"]) == 2  # deduped
+    assert snap["input_legacy_count"] == 1
+    assert snap["input_missing_manifest_count"] == 1
+    # After finalize, recording is a no-op until next start.
+    stackbuilder._record_input_lib(lib_a)
+    snap2 = stackbuilder._finalize_input_manifest_collection()
+    assert snap2["input_manifest_hashes"] == []
+    assert snap2["input_legacy_count"] == 0
+    assert snap2["input_missing_manifest_count"] == 0
+
+
+def test_3b2a_stackbuilder_output_artifact_entry(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    # CSV: row_count and column_schema should be populated.
+    csv_path = tmp_path / "rank_direct.csv"
+    csv_path.write_text(
+        "Primary Ticker,Total Capture (%)\n"
+        "SPY,123.4\n"
+        "QQQ,210.5\n",
+        encoding="utf-8",
+    )
+    entry = stackbuilder._output_artifact_entry(str(tmp_path), "rank_direct")
+    assert entry is not None
+    assert entry["filename"] == "rank_direct.csv"
+    assert entry["format"] == "csv"
+    assert entry["row_count"] == 2
+    assert entry["column_schema"] == [
+        {"name": "Primary Ticker"},
+        {"name": "Total Capture (%)"},
+    ]
+    assert entry["file_sha256"] == pm.file_sha256(csv_path)
+    # Missing artifact -> None.
+    assert stackbuilder._output_artifact_entry(str(tmp_path), "missing") is None
+
+
+def test_3b2a_stackbuilder_build_output_artifacts(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    (tmp_path / "rank_all.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (tmp_path / "rank_direct.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (tmp_path / "cohort.csv").write_text("a\n1\n", encoding="utf-8")
+    (tmp_path / "combo_leaderboard.csv").write_text("a\n1\n", encoding="utf-8")
+    (tmp_path / "summary.json").write_text(json.dumps({"x": 1}), encoding="utf-8")
+    artifacts = stackbuilder._build_output_artifacts(str(tmp_path))
+    names = sorted(a["name"] for a in artifacts)
+    assert names == [
+        "cohort", "combo_leaderboard", "rank_all", "rank_direct", "summary",
+    ]
+    for a in artifacts:
+        assert a["file_sha256"]
+        assert a["produced_at"]
+
+
+def test_3b2a_stackbuilder_run_manifest_preserves_legacy_keys():
+    """A synthetic enrichment over a known-shaped legacy manifest must
+    keep the Phase 3A keys callers depend on (no run_manifest readers
+    exist outside stackbuilder, but downstream tooling may grow over
+    time). This test pins the legacy keys at the producer site.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    legacy_keys = {"secondary", "started_at", "params", "outputs"}
+    enriched_keys = {
+        "schema_version", "artifact_kind", "artifact_type",
+        "producer_engine", "engine_version", "run_id",
+        "git_commit", "git_dirty", "package_versions",
+        "build_timestamp", "builder_identity", "host_platform",
+        "cli_args", "status", "output_artifacts",
+        "input_manifest_hashes", "input_legacy_count",
+        "input_missing_manifest_count", "input_secondary_hash",
+        "finished_at", "elapsed_seconds",
+    }
+    # Source-text grep: ensure both blocks of legacy keys + enriched
+    # keys appear in stackbuilder's run_for_secondary writer.
+    source = (PROJECT_DIR / "stackbuilder.py").read_text(encoding="utf-8")
+    for key in legacy_keys | enriched_keys:
+        assert f"'{key}'" in source or f'"{key}"' in source, (
+            f"Expected stackbuilder.py to set manifest key '{key}'"
+        )
