@@ -1026,3 +1026,171 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     the user pointed `--outdir`. After this entry, every output
     path honors `--outdir`.
   - Status: implemented in 1B-2B.
+
+
+## Phase 3A: Provenance Manifests (Signal Libraries)
+
+  - Type: ADDITIVE-PROVENANCE (no behavior change to scoring math).
+  - Old behavior: signal-library pickles carried only ad-hoc fields
+    (`engine_version`, `max_sma_day`, `parity_hash`, `data_fingerprint`,
+    `head_tail_snapshot`). Consumers checked engine_version + max_sma_day
+    + price_source piecemeal; there was no single artifact-level
+    fingerprint pinning the source data, the run parameters, the
+    repository state, and the runtime versions together. A library
+    rebuilt with a different scipy/pandas/numpy minor version would
+    silently swap into reuse with no detection at the load boundary.
+  - New behavior: all signal-library producers attach a
+    ``_manifest`` dict (and a sibling ``.manifest.json`` sidecar) at
+    write time, and all signal-library consumers verify the manifest
+    immediately after the raw ``pickle.load`` and before any reuse.
+
+    Central helper: ``project/provenance_manifest.py``. Public surface:
+
+      - ``MANIFEST_SCHEMA_VERSION = 1``
+      - ``MANIFEST_FIELD = "_manifest"``
+      - ``VOLATILE_LIBRARY_KEYS = {"_manifest", "build_timestamp"}``
+      - ``VerificationResult(ok, legacy, mismatches, warnings)``
+      - ``build_manifest(library_dict, *, artifact_type, ticker, ...) -> dict``
+      - ``attach_manifest(library_dict, sidecar_path, ...) -> (dict, dict)``
+      - ``read_manifest(library_dict, sidecar_path=None) -> dict | None``
+      - ``verify_manifest(library_dict, sidecar_path=None, *,
+        strict=False, requested_params=None,
+        current_source_close=None) -> VerificationResult``
+      - ``content_hash(library_dict) -> str``
+      - ``source_close_hash(close_series) -> str | None``
+      - ``refresh_or_attach_manifest(library_dict, sidecar_path, ...)
+        -> (dict, dict, bool)`` — used by metadata-repair persists.
+
+    Manifest schema (stable):
+      ``schema_version, artifact_type, ticker, resolved_symbol, interval,
+       date_range_start, date_range_end, row_count, source_data
+       (hash_method, source_close_hash, row_count, start, end), params,
+       engine_version, git_commit, git_dirty, package_versions,
+       content_hash``
+
+    Manifest schema (volatile, excluded from content_hash):
+      ``build_timestamp, builder_identity, host_platform``
+
+    Hash contract:
+
+      - ``content_hash`` is SHA-256 of the canonical JSON of the library
+        dict with ``VOLATILE_LIBRARY_KEYS`` excluded. ``_manifest``
+        exclusion is required to keep the hash from being self-
+        referential. ``build_timestamp`` exclusion is required because
+        existing libraries already carry a top-level wall-clock build
+        timestamp; including it would flip the hash on every save even
+        for identical payloads.
+      - Numpy arrays are reduced to ``(dtype, shape, sha256(bytes))``;
+        pandas Series and DatetimeIndex similarly. NaN/Inf are encoded
+        explicitly so they do not silently coerce to JSON null.
+      - ``source_close_hash`` digests the price series by dtype, value
+        bytes, and index bytes. Returns None when no usable Close is
+        available — the producer signal that a source comparison
+        cannot be performed.
+
+    Producer sites (write manifest before pickle.dump):
+
+      - ``onepass.save_signal_library`` — manifest params capture
+        MAX_SMA_DAY, price_source, group_by_mode, persist_skip_bars,
+        tiebreak_rule, auto_adjust=False, parity_hash. ``source_close``
+        is the post-T-1-skip ``df['Close']`` so the hashed source
+        matches the persisted signals/dates byte-for-byte.
+      - ``onepass._ensure_signal_alignment_and_persist`` and
+        ``onepass._persist_library_metadata`` — metadata-repair
+        persists. Both call ``refresh_or_attach_manifest``: when no
+        ``source_close`` is available, the existing ``source_data``
+        block is preserved verbatim (no fabrication of source hashes
+        mid-flight). ``params.repair_kind`` distinguishes the two.
+      - ``signal_library/multi_timeframe_builder.save_signal_library``
+        — non-daily interval libraries (``1wk``, ``1mo``, ``3mo``,
+        ``1y``). The post-fetch Close is threaded from
+        ``generate_signals_for_interval`` via a transient
+        ``_source_close_transient`` library key, popped before
+        ``pickle.dump``. ``artifact_type =
+        "interval_signal_library"``.
+
+    Consumer sites (verify manifest after pickle.load, before reuse):
+
+      - ``onepass.load_signal_library`` — manifest mismatch returns
+        ``None`` (caller rebuilds). Legacy libraries warn and proceed.
+      - ``impactsearch.load_signal_library`` — manifest mismatch
+        returns ``None`` (caller falls back to slow path). Legacy
+        warns and proceeds.
+      - ``signal_library/impact_fastpath._load_signal_library_quick``
+        — manifest mismatch disables the fast path for that ticker
+        (returns ``None`` so the caller falls back). Legacy warns.
+      - ``stackbuilder.fallback_load_signal_library`` — manifest
+        mismatch skips to the next candidate. ``load_lib_or_none``
+        routes through ``onepass.load_signal_library`` first
+        (verified there); falls back to ``fallback_load_signal_library``.
+      - ``signal_library/confluence_analyzer.load_signal_library_interval``
+        — manifest mismatch returns ``None`` for that interval. The
+        spymaster cache fallback inside the same function remains
+        un-verified for now (Spymaster PKL manifests are Phase 3B).
+
+    Legacy-compatibility contract (Part E):
+
+      - Library has no ``_manifest`` and no sidecar JSON ->
+        ``VerificationResult(ok=True, legacy=True)``. Caller may
+        proceed; a warning is logged so legacy libraries surface in
+        observability without being rejected.
+      - Embedded vs. sidecar drift -> warn, prefer embedded. The
+        embedded manifest is atomic with the pickle (single fsync
+        cliff); the sidecar can lag.
+      - No mass rebuild in 3A. New manifests appear on the next
+        normal rebuild/write at any producer site.
+      - Reading a legacy library does NOT inject a fake legacy
+        manifest. The library is unchanged in memory.
+
+    Static guard (B12):
+
+      - Added ``test_b12_signal_library_consumers_use_verify_manifest``
+        in ``project/test_scripts/test_static_regression_guards.py``.
+        Uses an AST walk scoped to each named consumer function, not a
+        broad file grep. Fails when any of the five guarded functions
+        contains a load path that does not call ``verify_manifest`` /
+        ``_verify_manifest`` somewhere in the function body.
+      - Allowlist (recorded in the test docstring): ``provenance_manifest``
+        itself, ``test_scripts/``, and non-signal-library pickle
+        consumers explicitly deferred to Phase 3B (spymaster PKLs,
+        trafficflow's signal-library quick load, ImpactSearch
+        CacheManager, the spymaster-cache fallback inside
+        ``confluence_analyzer.load_signal_library_interval``).
+
+    Affected tests/snapshots:
+
+      - New ``project/test_scripts/test_provenance_manifest.py``: F1-F10
+        helper-only tests + F11-F15 consumer hooks + F16 metadata-repair
+        preservation + F17 B12-catches-violation. ~18 new tests
+        total. No Phase 1A baseline-lock snapshot churn — Phase 3A is
+        purely additive provenance.
+
+  - Phase 3B deferrals (NOT in 3A scope):
+      - StackBuilder run_manifest enrichment + Excel/CSV export
+        provenance.
+      - OnePass / ImpactSearch xlsx output manifests.
+      - Spymaster PKL manifests (cache/results/*.pkl).
+      - TrafficFlow durable outputs.
+      - Confluence durable outputs (the analyzer reads signal-library
+        manifests in 3A, but does not produce its own confluence-
+        artifact manifests).
+      - Strict CLI / backfill controls (``strict=True`` plumbing).
+      - Mass rebuild of legacy libraries.
+      - B11 ``compute_signals`` delete-or-shift-correct decision (this
+        deferral is unchanged from the Phase 2B preflight — Phase 3A
+        does not touch B11).
+      - QC clone files.
+
+  - ELI5: every saved signal library now carries a tamper-evident
+    receipt — a ``_manifest`` dict embedded in the pickle plus a
+    JSON sidecar. The receipt records what code built the library
+    (engine version, git commit, runtime package versions), what
+    inputs it consumed (a hash of the source Close series, the date
+    range, run parameters), and a content_hash of the artifact
+    itself. When the library is later loaded, the receipt is checked
+    against the artifact and the requested run parameters; mismatches
+    force a rebuild. Older libraries without a receipt are still
+    accepted, but they log a warning so the next clean rebuild
+    upgrades them.
+  - Status: implemented in Phase 3A (this PR). Phase 3 is NOT
+    complete after 3A — see Phase 3B deferrals above.

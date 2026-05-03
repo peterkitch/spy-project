@@ -591,3 +591,51 @@ def test_f15_confluence_interval_consumer_verifies(tmp_path, monkeypatch):
     )
     legacy = confluence_analyzer.load_signal_library_interval("CCC", "1wk")
     assert legacy is not None
+
+
+# ---------------------------------------------------------------------------
+# F17: B12 static guard catches unverified pickle.load
+# ---------------------------------------------------------------------------
+
+
+def test_f17_b12_guard_catches_unverified_consumer(tmp_path):
+    """Reuse the B12 helper from test_static_regression_guards to confirm
+    a synthetic consumer that pickle.loads without verify_manifest is
+    flagged.
+    """
+    sys.path.insert(0, str(PROJECT_DIR / "test_scripts"))
+    from test_static_regression_guards import (  # type: ignore
+        _function_calls_name, _find_function,
+    )
+    import ast
+
+    # A 'consumer' that loads pickle but never calls verify_manifest
+    bad_source = (
+        "import pickle\n"
+        "def load_signal_library(ticker):\n"
+        "    with open('foo.pkl', 'rb') as f:\n"
+        "        return pickle.load(f)\n"
+    )
+    tree = ast.parse(bad_source)
+    func = _find_function(tree, "load_signal_library")
+    assert func is not None
+    assert not _function_calls_name(
+        func, ("verify_manifest", "_verify_manifest")
+    ), "Expected the bad consumer to be flagged (no verify_manifest call)."
+
+    # A 'consumer' that does call verify_manifest
+    good_source = (
+        "import pickle\n"
+        "from provenance_manifest import verify_manifest as _verify_manifest\n"
+        "def load_signal_library(ticker):\n"
+        "    with open('foo.pkl', 'rb') as f:\n"
+        "        data = pickle.load(f)\n"
+        "    _verify_manifest(data)\n"
+        "    return data\n"
+    )
+    tree2 = ast.parse(good_source)
+    func2 = _find_function(tree2, "load_signal_library")
+    assert func2 is not None
+    assert _function_calls_name(
+        func2, ("verify_manifest", "_verify_manifest")
+    ), "Expected the good consumer to pass the B12 check."
