@@ -2,6 +2,202 @@
 
 **MANDATORY INSTRUCTIONS FOR CLAUDE CODE** - These rules MUST be followed automatically without user prompting.
 
+## PRJCT9 SPRINT OPERATIONAL CONTEXT
+
+This section captures the durable operational shape of the
+Phase 1B / Phase 2 / Phase 3 sprint on this repo. Read this
+before doing any work in `project/`.
+
+### 1. Pinned Python interpreter (CRITICAL)
+
+The project's pinned interpreter is:
+
+```
+C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe
+```
+
+This is a Python 3.12 conda env (`spyproject2`) with the exact
+pinned `numpy==2.2.6`, `scipy==1.13.1`, `pandas==2.3.2`,
+`pytest==8.3.5` versions the Phase 1A baseline-lock and other
+ULP-sensitive snapshots were captured under.
+
+**The env is NOT on PATH by default.** A bare `python` or
+`python -m pytest` invocation resolves to
+`C:\Python313\python.exe`, which has no project deps installed
+and cannot run the suite. Floating-point ULP drift between
+scipy 1.13.1 and the latest scipy with Python 3.13 wheels
+flips Phase 1A baseline-lock snapshots, so re-installing newer
+pins into a different Python is not a shortcut — it breaks
+the audit contract.
+
+Always invoke as:
+
+```
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -m pytest test_scripts -q
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -m py_compile <file>.py
+```
+
+If the env directory is missing, **STOP and report** — do not
+attempt to recreate it from `requirements.txt` or
+`environment.yml` without confirming the exact version pins
+match the audit contract, especially `scipy==1.13.1`.
+
+### 2. Single-command bash discipline
+
+For the duration of this sprint, every Bash tool invocation
+must run a single command. **No `;`-chain, `&&`-chain,
+`||`-chain, or pipe-chain compounds.**
+
+Run independent commands in parallel (multiple Bash tool
+calls in a single message) rather than chaining them. Heredocs
+for multi-line strings (e.g. commit messages) are fine — that
+is input to a single command, not chaining.
+
+The dedicated tools (Read, Edit, Write, Glob, Grep) are
+preferred over Bash whenever they fit.
+
+### 3. Do NOT use `git -c commit.gpgsign=false`
+
+GPG signing is not configured anywhere on this machine
+(verified at all scopes via `git config --get`). The
+`git -c commit.gpgsign=false` prefix is cargo-culting that
+slipped in earlier in the sprint; it has been removed.
+
+Use plain `git commit` (with heredocs for multi-line
+messages). The `Bash(git -c:*)` allowlist entry in
+`project/.claude/settings.local.json` stays as a defensive
+provision but should not be exercised routinely. If a
+future commit ever genuinely needs to bypass GPG, diagnose
+the root cause (config drift, hook misconfig) rather than
+adding the prefix back as a workaround.
+
+### 4. Three-voice sprint workflow
+
+The sprint runs as a three-voice collaboration. Each PR
+cycles through:
+
+  1. **web Claude** drafts a Codex preflight prompt for the
+     upcoming PR scope.
+  2. **Codex** runs the preflight in a parallel session and
+     returns scope confirmations, risk callouts, and any
+     out-of-scope items to defer.
+  3. **web Claude** drafts a Claude Code implementation
+     prompt based on Codex's preflight.
+  4. **Claude Code** (this voice, in the project's terminal)
+     implements according to the prompt.
+  5. **Codex** audits the resulting PR and returns findings.
+  6. Amendment cycles between web Claude, Claude Code, and
+     Codex as needed.
+  7. **Merge via squash, preserve branch** (no
+     `--delete-branch`). Branches stay on origin as a
+     visual audit trail of the sprint.
+
+When the user signals "preflight is with Codex" or "audit
+prompt is with Codex," idle. Don't run anything. When the
+user pastes an implementation or amendment prompt, that's
+authorization to start the work. Merge only on explicit
+authorization ("PR #N MERGE"). Squash-merge command:
+`gh pr merge <N> --squash` — never `--delete-branch`. After
+merge, `git checkout main` then `git pull --ff-only origin
+main`, and respond with the standard 7-point template
+(squash confirmation, merge commit hash, title, local HEAD,
+status, branch preserved on origin, surprises).
+
+### 5. Authoritative documents
+
+When implementing, debugging, or auditing, these are the
+sources of truth:
+
+  - **Algorithm spec (formal contract):**
+    `project/md_library/shared/2026-04-30_PRJCT9_ALGORITHM_SPEC_v0_5.md`
+    Spec sections are referenced by § number throughout the
+    codebase (e.g. §13 capture units, §15 zero-capture
+    trigger-day rule, §16 ddof=1 sample std, §17 sf-form
+    p-value, §18 combine-consensus rule, §20 calendar grace
+    days default).
+  - **Intentional Delta Ledger (audit trail):**
+    `project/md_library/shared/2026-05-01_PHASE_1B_INTENTIONAL_DELTA_LEDGER.md`
+    Every numerically-observable behavior change made during
+    the sprint is recorded here as a numbered Entry with old
+    behavior, new behavior, affected tests/snapshots, ELI5
+    paragraph, and status.
+  - **Implementation inventory (call-site map):**
+    `project/md_library/shared/2026-05-01_PHASE_1B_IMPLEMENTATION_INVENTORY.md`
+    Cross-references engine call sites by spec section.
+  - **Canonical scoring module:**
+    `project/canonical_scoring.py`
+    Single source of truth for metric math (`score_captures`,
+    `score_signals`, `combine_consensus_signals`,
+    `metrics_to_legacy_dict`, `CanonicalScore`). Engine
+    helpers delegate here. Inline Sharpe / std / p-value /
+    win-rate math has been removed from engines wherever a
+    canonical score is in scope; documented exceptions live
+    in the ledger preamble.
+
+When in doubt: spec wins, then ledger, then inventory, then
+code. If code disagrees with spec, the code is wrong unless
+an explicit ledger entry classifies the divergence.
+
+### 6. Sprint state (as of 2026-05-03)
+
+Phase 0 → Phase 2B-2B merged to `main`:
+
+  - #128 Phase -1 (token sweep)
+  - #129 Phase 0 (spec v0.5, env, import smoke)
+  - #130 Phase 1A (baseline lock + snapshots + coverage)
+  - #131 Phase 1B-1 (inventory + canonical scoring module +
+    ledger skeleton)
+  - #132 Phase 1B-2A (canonical scoring rewire + Adj Close
+    removal)
+  - #133 Phase 1B-2B (backlog cleanup)
+  - #134 Phase 2A (test infrastructure + static guards)
+  - #135 Phase 2B-1 (lookahead audits + canonical correctness
+    expansion + confluence smoke)
+  - #136 Phase 2B-2A (parity suites + StackBuilder
+    `_score_primary` zero-capture fix)
+  - #137 Phase 2B-2B (grace plumbing refactor +
+    rank_inverse structural fix in normal path and xlsx
+    fast-path + xlsx loud-fail test pinning)
+
+**Next: Phase 3 — Provenance Manifests.** End-to-end
+provenance: every produced artifact (rank tables, combo
+leaderboard, signal libraries, metric exports) gets a
+manifest pinning the input SHA, engine version, spec
+section coverage, and run parameters. Phase 3 is unblocked
+now that the golden test suite (139 tests) is closed.
+
+**Phase 4: Cross-Ticker Confluence Dashboard.** UI that
+visualizes confluence across multiple tickers
+simultaneously. Depends on Phase 3 manifests for
+reproducibility.
+
+**Phase 5: Honest Validation Report.**
+
+**Phase 6: PRJCT9.com.**
+
+Confirm current state with `git log -10 --oneline main`;
+this section may lag reality if PRs land without an update.
+
+### 7. Deferred work items
+
+These items have been intentionally deferred. When working
+on the named gate phase, surface them so they can be
+scheduled or explicitly re-deferred.
+
+  - **B11 `compute_signals` delete-or-shift-correct
+    (deferred to Phase 3):** the function in spymaster has
+    a dead-code static guard
+    (`test_b11_spymaster_compute_signals_uncalled` in
+    `project/test_scripts/test_lookahead_guards.py`) but
+    the function body has a shift-correctness question.
+    Either delete the function or fix the shift and change
+    the guard from "uncalled" to "shift-correct."
+  - **QC clone Adj Close sites:** at
+    `project/QC/Clone of Project 9/main.py:103, 918, 1509`.
+    QC clone is a frozen historical snapshot, intentionally
+    excluded from the Entry 1 (Adj Close removal) sweep.
+    Revisit only on explicit scope expansion.
+
 ## AUTOMATIC BEHAVIORS - DO NOT DEVIATE
 
 ### File Creation Rules (NEVER VIOLATE)
