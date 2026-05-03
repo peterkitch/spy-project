@@ -998,3 +998,41 @@ def test_3b1_pickle_load_compat_smoke(tmp_path, sample_library):
         loaded = pm.pickle_load_compat(f)
     assert isinstance(loaded, dict)
     assert loaded.get("primary_signals") == sample_library["primary_signals"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3B-1: B12 raw-pickle-load scanner contract
+# ---------------------------------------------------------------------------
+
+
+def test_3b1_b12_synthetic_bad_raw_load_is_caught(tmp_path):
+    """Feed _scan_raw_pickle_loads a file with an unallowlisted raw
+    ``pickle.load(...)`` call and confirm the scanner reports it.
+    Symmetric: a file that uses ``pickle_load_compat`` instead is clean.
+    """
+    sys.path.insert(0, str(PROJECT_DIR / "test_scripts"))
+    from test_static_regression_guards import _scan_raw_pickle_loads  # type: ignore
+
+    bad = tmp_path / "bad_consumer.py"
+    bad.write_text(
+        "import pickle\n"
+        "def load_lib(p):\n"
+        "    with open(p, 'rb') as f:\n"
+        "        return pickle.load(f)\n",
+        encoding="utf-8",
+    )
+    hits = _scan_raw_pickle_loads(bad)
+    assert hits, "Expected scanner to flag the raw pickle.load call"
+    assert "pickle.load" in hits[0][1]
+
+    good = tmp_path / "good_consumer.py"
+    good.write_text(
+        "from provenance_manifest import pickle_load_compat\n"
+        "def load_lib(p):\n"
+        "    with open(p, 'rb') as f:\n"
+        "        return pickle_load_compat(f)\n",
+        encoding="utf-8",
+    )
+    assert not _scan_raw_pickle_loads(good), (
+        "Expected pickle_load_compat to NOT trip the raw-load scanner"
+    )
