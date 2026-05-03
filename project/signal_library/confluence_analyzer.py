@@ -19,16 +19,24 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-# Phase 3A: provenance verification for the signal-library load path.
-# The spymaster cache fallback (line ~73) remains pre-3A; manifests for
-# Spymaster PKLs are deferred to Phase 3B.
+# Phase 3B-1: provenance verification for the signal-library load path
+# now routes through ``load_verified_signal_library``. The Spymaster
+# cache fallback (Phase 3B-2 scope) was extracted into
+# ``_load_spymaster_cache_fallback`` below so the tightened B12
+# raw-pickle-load guard can allowlist it precisely.
 try:
-    from provenance_manifest import verify_manifest as _verify_manifest
+    from provenance_manifest import (
+        verify_manifest as _verify_manifest,
+        load_verified_signal_library as _load_verified_signal_library,
+    )
 except ImportError:
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
-    from provenance_manifest import verify_manifest as _verify_manifest
+    from provenance_manifest import (
+        verify_manifest as _verify_manifest,
+        load_verified_signal_library as _load_verified_signal_library,
+    )
 
 # Constants
 SIGNAL_LIBRARY_DIR = os.environ.get('SIGNAL_LIBRARY_DIR', 'signal_library/data/stable')
@@ -43,11 +51,74 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
+    """Phase 3B-2 scope: Spymaster ``cache/results/*.pkl`` fallback for the
+    1d interval.
+
+    Spymaster PKLs are not yet provenance-manifested; this helper keeps the
+    raw ``pickle.load`` isolated from the signal-library branch so the
+    Phase 3B-1 B12 guard can allowlist *only* this helper. When Phase 3B-2
+    introduces Spymaster PKL manifests, the body of this helper will be
+    migrated to ``load_verified_signal_library`` and the allowlist entry
+    can be retired.
+    """
+    spymaster_path = os.path.join(
+        'cache', 'results', f'{ticker}_precomputed_results.pkl'
+    )
+    if not os.path.exists(spymaster_path):
+        return None
+    try:
+        with open(spymaster_path, 'rb') as f:
+            spymaster_data = pickle.load(f)  # noqa: B12 — Phase 3B-2 deferred
+
+        # Extract dates from daily_top_buy_pairs keys
+        dates = list(spymaster_data['daily_top_buy_pairs'].keys())
+
+        # Generate signals from daily pair maps (SpyMaster's dynamic pairs).
+        # Phase 2A: canonical sentinels per spec §appendix; previously
+        # both buy and short used the (114, 113) buy form, which
+        # could gate a tradable signal off finite SMA_113 / SMA_114.
+        signals = []
+        for date in dates:
+            buy_pair, buy_cap = spymaster_data['daily_top_buy_pairs'].get(
+                date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0)
+            )
+            short_pair, short_cap = spymaster_data['daily_top_short_pairs'].get(
+                date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0)
+            )
+
+            # Determine signal based on yesterday's top pair (matches SpyMaster logic)
+            if buy_cap > short_cap:
+                signals.append('Buy')
+            elif short_cap > buy_cap:
+                signals.append('Short')
+            else:
+                signals.append('None')
+
+        # Build compatible library structure
+        library = {
+            'dates': dates,
+            'signals': signals,
+            'primary_signals': signals,  # Alias
+            'source': 'spymaster_cache',
+        }
+
+        logger.info(
+            f"Loaded {ticker} 1d from spymaster cache: {len(signals)} bars"
+        )
+        return library
+
+    except Exception as e:
+        logger.error(f"Failed to load spymaster cache {spymaster_path}: {e}")
+        return None
+
+
 def load_signal_library_interval(ticker: str, interval: str) -> Optional[dict]:
     """
     Load a single interval's signal library from disk.
 
-    For 1d interval, falls back to spymaster cache if signal library doesn't exist.
+    For 1d interval, falls back to ``_load_spymaster_cache_fallback`` if
+    the signal library doesn't exist (Phase 3B-2 scope).
 
     Args:
         ticker: Ticker symbol (e.g., 'SPY')
@@ -64,89 +135,48 @@ def load_signal_library_interval(ticker: str, interval: str) -> Optional[dict]:
 
     filepath = os.path.join(SIGNAL_LIBRARY_DIR, filename)
 
-    # Try loading from signal library first
+    # Try loading from signal library first via the central verified loader.
     if os.path.exists(filepath):
         try:
-            with open(filepath, 'rb') as f:
-                library = pickle.load(f)
-            if not isinstance(library, dict):
-                logger.error(
-                    f"Invalid signal library format for {ticker} {interval} "
-                    f"at {filepath}: expected dict, got {type(library).__name__}"
-                )
-                return None
-            # Phase 3A: provenance manifest verification. Legacy
-            # libraries are accepted with a warning; manifest mismatches
-            # are treated as missing for this interval.
-            _vresult = _verify_manifest(
-                library,
-                sidecar_path=filepath,
+            library, _vresult = _load_verified_signal_library(
+                filepath,
                 requested_params={
-                    'engine_version': library.get('engine_version'),
-                    'price_source': library.get('price_source', 'Close'),
+                    'price_source': 'Close',
                     'interval': interval,
                 },
             )
-            if _vresult.legacy:
-                logger.warning(
-                    f"{ticker} {interval}: legacy signal library at "
-                    f"{filepath} (no provenance manifest)."
-                )
-            elif not _vresult.ok:
-                logger.warning(
-                    f"{ticker} {interval}: provenance manifest mismatch "
-                    f"at {filepath}: {_vresult.mismatches}. Treating as "
-                    f"missing."
-                )
-                return None
-            logger.debug(f"Loaded {ticker} {interval}: {len(library.get('signals', []))} bars")
-            return library
         except Exception as e:
             logger.error(f"Failed to load {filepath}: {e}")
             return None
+        if library is None:
+            for kind, expected, actual in _vresult.mismatches:
+                logger.error(
+                    f"{ticker} {interval}: load failure at {filepath}: "
+                    f"{kind} {expected} {actual}"
+                )
+            return None
+        if _vresult.legacy:
+            logger.warning(
+                f"{ticker} {interval}: legacy signal library at "
+                f"{filepath} (no provenance manifest)."
+            )
+        elif not _vresult.ok:
+            logger.warning(
+                f"{ticker} {interval}: provenance manifest mismatch "
+                f"at {filepath}: {_vresult.mismatches}. Treating as "
+                f"missing."
+            )
+            return None
+        logger.debug(
+            f"Loaded {ticker} {interval}: {len(library.get('signals', []))} bars"
+        )
+        return library
 
-    # For 1d interval, fallback to spymaster cache
+    # For 1d interval, fallback to spymaster cache (Phase 3B-2 scope).
     if interval == '1d':
-        spymaster_path = os.path.join('cache', 'results', f'{ticker}_precomputed_results.pkl')
-        if os.path.exists(spymaster_path):
-            try:
-                with open(spymaster_path, 'rb') as f:
-                    spymaster_data = pickle.load(f)
-
-                # Extract dates from daily_top_buy_pairs keys
-                dates = list(spymaster_data['daily_top_buy_pairs'].keys())
-
-                # Generate signals from daily pair maps (SpyMaster's dynamic pairs).
-                # Phase 2A: canonical sentinels per spec §appendix; previously
-                # both buy and short used the (114, 113) buy form, which
-                # could gate a tradable signal off finite SMA_113 / SMA_114.
-                signals = []
-                for date in dates:
-                    buy_pair, buy_cap = spymaster_data['daily_top_buy_pairs'].get(date, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0))
-                    short_pair, short_cap = spymaster_data['daily_top_short_pairs'].get(date, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0))
-
-                    # Determine signal based on yesterday's top pair (matches SpyMaster logic)
-                    if buy_cap > short_cap:
-                        signals.append('Buy')
-                    elif short_cap > buy_cap:
-                        signals.append('Short')
-                    else:
-                        signals.append('None')
-
-                # Build compatible library structure
-                library = {
-                    'dates': dates,
-                    'signals': signals,
-                    'primary_signals': signals,  # Alias
-                    'source': 'spymaster_cache'
-                }
-
-                logger.info(f"Loaded {ticker} 1d from spymaster cache: {len(signals)} bars")
-                return library
-
-            except Exception as e:
-                logger.error(f"Failed to load spymaster cache {spymaster_path}: {e}")
-                return None
+        fallback = _load_spymaster_cache_fallback(ticker)
+        if fallback is not None:
+            return fallback
 
     logger.warning(f"Library not found: {filepath}")
     return None

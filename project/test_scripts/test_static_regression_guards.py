@@ -482,25 +482,133 @@ def _find_function(tree: ast.AST, name: str) -> "ast.FunctionDef | None":
     return None
 
 
+# Phase 3B-1 B12 allowlist: each entry is (relative_path, line, reason).
+# Lines are matched against the AST ``lineno`` of the ``Call`` node, which
+# is the line of the ``pickle.load`` call. Update the line numbers when
+# the surrounding code shifts; allowlisting whole files is reserved for
+# the central provenance loader.
+_B12_RAW_LOAD_ALLOWLIST: tuple = (
+    # Central NumPy 1.x/2.x compatibility loader. This IS the verified
+    # loader; B12 is enforced everywhere else.
+    ("provenance_manifest.py", None,
+     "central pickle_load_compat / load_verified_signal_library — Phase 3B-1"),
+    # Spymaster PKL consumers deferred to Phase 3B-2. These are not
+    # signal libraries; output-manifest schema for cache/results PKLs
+    # lands in 3B-2.
+    ("spymaster.py", 3629, "Spymaster cache PKL — Phase 3B-2 deferred"),
+    ("spymaster.py", 4036, "Spymaster cache PKL — Phase 3B-2 deferred"),
+    ("spymaster.py", 4383, "Spymaster cache PKL — Phase 3B-2 deferred"),
+    ("spymaster.py", 8512, "Spymaster cache PKL — Phase 3B-2 deferred"),
+    # TrafficFlow Spymaster PKL consumer — Phase 3B-2 deferred.
+    ("trafficflow.py", 1349, "TrafficFlow Spymaster PKL — Phase 3B-2 deferred"),
+    # Confluence Spymaster cache fallback helper. Phase 3B-1 extracted
+    # this into _load_spymaster_cache_fallback so the allowlist is
+    # surgical; the signal-library branch in the same file is verified.
+    ("signal_library/confluence_analyzer.py", 72,
+     "_load_spymaster_cache_fallback — Phase 3B-2 deferred Spymaster PKL"),
+)
+
+
+def _production_python_files_for_b12() -> "list[Path]":
+    """Production .py files in scope for the raw-pickle-load scan.
+
+    Excludes test_scripts/, the provenance helper itself (allowlisted via
+    file entry), and QC clones (already excluded by production_python_files).
+    """
+    return [p for p in production_python_files()]
+
+
+def _scan_raw_pickle_loads(path: Path) -> "list[tuple[int, str]]":
+    """Return ``(lineno, source_line)`` for every ``pickle.load(...)`` Call
+    inside ``path``. Comments are tolerated by AST parsing automatically.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text, filename=str(path))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+    lines = text.splitlines()
+    hits: list = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Attribute) and f.attr == "load":
+            base = f.value
+            if isinstance(base, ast.Name) and base.id == "pickle":
+                src = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+                hits.append((node.lineno, src.rstrip()))
+    return hits
+
+
+def test_b12_no_raw_pickle_load_outside_central_loader():
+    """Phase 3B-1 B12: ban raw ``pickle.load(...)`` in production code
+    outside the central provenance loader and an explicit, line-precise
+    allowlist for Phase 3B-2 deferred surfaces.
+
+    Failure message
+    ---------------
+    Raw pickle.load in production code outside the central provenance
+    loader contract. Use ``provenance_manifest.load_verified_signal_library``
+    for signal libraries. Output / Spymaster PKL loaders are Phase 3B-2
+    scope; allowlist only with explicit reason.
+
+    Allowlist policy
+    ----------------
+    - ``provenance_manifest.py`` is allowlisted as a whole file (it IS
+      the central loader; raw pickle.load lives there by design).
+    - Every other entry is line-precise. Update the line number when the
+      surrounding code shifts. Do NOT widen to whole-file allowlists.
+    """
+    files = _production_python_files_for_b12()
+    file_allow: dict = {}
+    line_allow: dict = {}
+    for rel, lineno, reason in _B12_RAW_LOAD_ALLOWLIST:
+        rel_norm = rel.replace("\\", "/")
+        if lineno is None:
+            file_allow[rel_norm] = reason
+        else:
+            line_allow.setdefault(rel_norm, {})[int(lineno)] = reason
+
+    failures: list = []
+    for path in files:
+        rel = str(path.relative_to(PROJECT_DIR)).replace("\\", "/")
+        if rel in file_allow:
+            continue
+        for lineno, src in _scan_raw_pickle_loads(path):
+            allowed = line_allow.get(rel, {})
+            if lineno in allowed:
+                continue
+            failures.append((rel, lineno, src))
+
+    if failures:
+        body = "\n".join(
+            f"{rel}:{lineno}: {src}" for rel, lineno, src in failures
+        )
+        pytest.fail(
+            f"[B12-raw-pickle-load] {len(failures)} unallowlisted hit(s):\n"
+            f"{body}\n\n"
+            "Raw pickle.load in production code outside the central provenance "
+            "loader contract. Use provenance_manifest.load_verified_signal_library "
+            "for signal libraries. Output/Spymaster PKL loaders are Phase 3B-2 "
+            "scope; allowlist only with explicit reason.\n\n"
+            "Current allowlist (file:line -> reason):\n"
+            + "\n".join(
+                f"  {rel}:{lineno or '*'} -> {reason}"
+                for rel, lineno, reason in _B12_RAW_LOAD_ALLOWLIST
+            )
+            + "\n\nLedger: Phase 3B-1 entry — perf cache + central loader + tightened B12\n"
+        )
+
+
 def test_b12_signal_library_consumers_use_verify_manifest():
-    """Phase 3A B12: every named signal-library consumer must call
-    ``verify_manifest`` after the raw pickle.load and before reuse.
+    """Phase 3A B12 (preserved as a stricter inner gate): every named
+    signal-library consumer must still call ``verify_manifest`` directly
+    or via ``load_verified_signal_library``.
 
-    Scoped function-by-function so the spymaster-cache pickle.load
-    inside ``confluence_analyzer.load_signal_library_interval`` (a
-    Phase 3B-scope branch) is naturally tolerated as long as the
-    function body also performs a verify_manifest call on the
-    signal-library branch.
-
-    Allowlist:
-      - provenance_manifest.py (the helper itself)
-      - test_scripts/ (test harnesses)
-      - non-signal-library pickle consumers deferred to Phase 3B:
-          spymaster.py PKLs (line ~3629, ~4036, ~4383, ~8512),
-          trafficflow.py:1349 (signal-library quick load deferred),
-          impactsearch CacheManager (impactsearch.py:1148/1162),
-          confluence_analyzer.py:73 (Spymaster cache fallback inside
-          load_signal_library_interval).
+    The Phase 3B-1 raw-load scan catches anything new; this function-
+    scoped check stays as a defense-in-depth assertion that the five
+    named consumer functions specifically still satisfy the contract.
     """
     guarded: Sequence[tuple[str, str]] = (
         ("onepass.py", "load_signal_library"),
@@ -514,6 +622,13 @@ def test_b12_signal_library_consumers_use_verify_manifest():
         "_verify_manifest",
         "provenance_manifest.verify_manifest",
         "pm.verify_manifest",
+        # Phase 3B-1: the central loader bundles open + load + verify, so a
+        # consumer that calls it satisfies the "verifies before reuse"
+        # contract just as well as a direct verify_manifest call.
+        "load_verified_signal_library",
+        "_load_verified_signal_library",
+        "provenance_manifest.load_verified_signal_library",
+        "pm.load_verified_signal_library",
     )
 
     failures = []

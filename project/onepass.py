@@ -23,6 +23,7 @@ from provenance_manifest import (
     attach_manifest as _attach_manifest,
     refresh_or_attach_manifest as _refresh_or_attach_manifest,
     verify_manifest as _verify_manifest,
+    load_verified_signal_library as _load_verified_signal_library,
 )
 
 # Import shared modules for parity with impactsearch
@@ -1219,44 +1220,60 @@ def load_signal_library(ticker):
         
         for candidate in candidates:
             filepath = _lib_path_for(candidate)
-            
-            if os.path.exists(filepath):
-                try:
-                    with open(filepath, 'rb') as f:
-                        # Suppress NumPy deprecation warning from old pickle files
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                                  message=".*numpy.core.numeric.*")
-                            warnings.filterwarnings("ignore", category=DeprecationWarning,
-                                                  message=".*numpy._core.numeric.*")
-                            signal_data = pickle.load(f)
 
-                        # Defensive type check to prevent 'str' object has no attribute 'get' errors
-                        if not isinstance(signal_data, dict):
-                            logger.error(f"Invalid signal library format for {ticker}: expected dict, got {type(signal_data).__name__}")
-                            continue
-                except (pickle.UnpicklingError, EOFError) as e:
-                    logger.error(f"Corrupt Signal Library for {ticker}: {e}")
-                    # Rename corrupt file for debugging
-                    corrupt_filepath = filepath + '.corrupt'
-                    os.replace(filepath, corrupt_filepath)
-                    logger.info(f"Renamed corrupt file to {corrupt_filepath}")
-                    continue  # Try next candidate
-                
-                # Phase 3A: provenance manifest verification. Legacy
-                # libraries (no manifest) are allowed with a warning;
-                # libraries whose manifest disagrees with the requested
-                # params are rejected so the caller rebuilds.
-                _vresult = _verify_manifest(
-                    signal_data,
-                    sidecar_path=filepath,
+            if os.path.exists(filepath):
+                # Phase 3B-1: route through the central verified loader.
+                # The loader bundles open + pickle_load_compat + type check
+                # + verify_manifest, with the LRU content_hash cache keyed
+                # by (resolved_path, mtime_ns, size).
+                signal_data, _vresult = _load_verified_signal_library(
+                    filepath,
                     requested_params={
                         'engine_version': ENGINE_VERSION,
                         'MAX_SMA_DAY': MAX_SMA_DAY,
-                        'price_source': signal_data.get('price_source', 'Close'),
-                        'parity_hash': signal_data.get('parity_hash'),
+                        'price_source': 'Close',
                     },
                 )
+                if signal_data is None:
+                    # Corrupt-file quarantine: preserve OnePass's existing
+                    # rename-to-.corrupt behavior on UnpicklingError /
+                    # EOFError. Other load_error subtypes are logged but
+                    # not quarantined.
+                    load_err = next(
+                        (m for m in _vresult.mismatches if m[0] == "load_error"),
+                        None,
+                    )
+                    if load_err and load_err[1] in ("UnpicklingError", "EOFError"):
+                        logger.error(
+                            f"Corrupt Signal Library for {ticker}: {load_err[2]}"
+                        )
+                        try:
+                            corrupt_filepath = filepath + '.corrupt'
+                            os.replace(filepath, corrupt_filepath)
+                            logger.info(
+                                f"Renamed corrupt file to {corrupt_filepath}"
+                            )
+                        except OSError as exc:
+                            logger.error(
+                                f"Failed to quarantine corrupt library: {exc}"
+                            )
+                        continue
+                    if any(m[0] == "type_error" for m in _vresult.mismatches):
+                        type_err = next(
+                            m for m in _vresult.mismatches
+                            if m[0] == "type_error"
+                        )
+                        logger.error(
+                            f"Invalid signal library format for {ticker}: "
+                            f"expected {type_err[1]}, got {type_err[2]}"
+                        )
+                        continue
+                    logger.error(
+                        f"Failed to load Signal Library for {ticker}: "
+                        f"{_vresult.mismatches}"
+                    )
+                    continue
+
                 if _vresult.legacy:
                     logger.warning(
                         f"{ticker}: legacy signal library (no provenance "

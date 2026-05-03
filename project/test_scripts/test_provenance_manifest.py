@@ -639,3 +639,400 @@ def test_f17_b12_guard_catches_unverified_consumer(tmp_path):
     assert _function_calls_name(
         func2, ("verify_manifest", "_verify_manifest")
     ), "Expected the good consumer to pass the B12 check."
+
+
+# ===========================================================================
+# Phase 3B-1: content_hash performance cache
+# ===========================================================================
+
+
+@pytest.fixture
+def cache_lib_on_disk(tmp_path, sample_library, sample_close):
+    """Manifested library written to disk; returns (path, lib)."""
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        params={"engine_version": "1.0.0", "MAX_SMA_DAY": 114},
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    return p, sample_library
+
+
+def test_3b1_cache_uncached_path_detects_in_memory_mutation(sample_library):
+    """verify_manifest with cache_path=None must still recompute, so
+    in-memory mutations between attach and verify are caught.
+    """
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+    )
+    pm.manifest_hash_cache_clear()
+    sample_library["primary_signals"] = ["Short"] * len(
+        sample_library["primary_signals"]
+    )
+    result = pm.verify_manifest(sample_library)  # no cache_path
+    assert result.ok is False
+    assert any(m[0] == "content_hash" for m in result.mismatches)
+
+
+def test_3b1_cache_repeat_load_hits(cache_lib_on_disk):
+    p, _ = cache_lib_on_disk
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    pm.load_verified_signal_library(p)
+    info = pm.manifest_hash_cache_info()
+    assert info["hits"] >= 1
+    assert info["misses"] == 1
+    assert info["current_size"] == 1
+
+
+def test_3b1_cache_aliases_resolve_to_same_key(cache_lib_on_disk, monkeypatch):
+    p, _ = cache_lib_on_disk
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    # Same file via a relative path that resolves to the same absolute path.
+    monkeypatch.chdir(p.parent)
+    pm.load_verified_signal_library(Path(p.name))
+    info = pm.manifest_hash_cache_info()
+    assert info["hits"] >= 1
+    assert info["misses"] == 1
+
+
+def test_3b1_cache_different_paths_miss_separately(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    p1 = tmp_path / "a.pkl"
+    p2 = tmp_path / "b.pkl"
+    with open(p1, "wb") as f:
+        pickle.dump(sample_library, f)
+    with open(p2, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p1)
+    pm.load_verified_signal_library(p2)
+    info = pm.manifest_hash_cache_info()
+    assert info["misses"] == 2
+    assert info["hits"] == 0
+    assert info["current_size"] == 2
+
+
+def test_3b1_cache_size_change_invalidates(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    # Append bytes -> size changes -> cache key changes -> miss again.
+    with open(p, "ab") as f:
+        f.write(b"\x00")
+    pm.load_verified_signal_library(p)  # will fail unpickle but still attempts load
+    info = pm.manifest_hash_cache_info()
+    # Expect a second miss (or unchanged hits because the second load
+    # errored before content_hash). Either way: hits did not grow.
+    assert info["hits"] == 0
+
+
+def test_3b1_cache_mtime_change_invalidates(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    # Bump mtime; size unchanged.
+    st = os.stat(p)
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    pm.load_verified_signal_library(p)
+    info = pm.manifest_hash_cache_info()
+    assert info["misses"] == 2
+    assert info["hits"] == 0
+
+
+def test_3b1_cache_atomic_replace_invalidates(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    # Sleep just past the filesystem mtime resolution to force a delta.
+    time.sleep(1.05)
+    # Different payload (mutated copy) so the new content_hash differs.
+    mutated = dict(sample_library)
+    mutated["primary_signals"] = ["Buy"] * len(sample_library["primary_signals"])
+    pm.attach_manifest(
+        mutated, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+    )
+    tmp_replacement = tmp_path / "lib.pkl.tmp"
+    with open(tmp_replacement, "wb") as f:
+        pickle.dump(mutated, f)
+    os.replace(tmp_replacement, p)
+    _, result = pm.load_verified_signal_library(p)
+    assert result.ok is True  # mutated lib has its own valid manifest
+    info = pm.manifest_hash_cache_info()
+    assert info["misses"] == 2  # original + replaced
+    assert info["hits"] == 0
+
+
+def test_3b1_cache_inplace_rewrite_invalidates(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    time.sleep(1.05)
+    sample_library["primary_signals"] = ["Buy"] * len(
+        sample_library["primary_signals"]
+    )
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+    )
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.load_verified_signal_library(p)
+    info = pm.manifest_hash_cache_info()
+    assert info["misses"] == 2
+    assert info["hits"] == 0
+
+
+def test_3b1_cache_lru_eviction(tmp_path, sample_library, sample_close, monkeypatch):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    # Shrink the LRU bound for the duration of the test.
+    monkeypatch.setattr(pm, "_MANIFEST_HASH_CACHE_MAX", 3)
+    pm.manifest_hash_cache_clear()
+    paths = []
+    for i in range(4):
+        p = tmp_path / f"lib_{i}.pkl"
+        with open(p, "wb") as f:
+            pickle.dump(sample_library, f)
+        paths.append(p)
+        pm.load_verified_signal_library(p)
+    info = pm.manifest_hash_cache_info()
+    assert info["current_size"] == 3
+    assert info["evictions"] >= 1
+    assert info["max_size"] == 3
+
+
+def test_3b1_cache_env_var_disable(tmp_path, sample_library, sample_close, monkeypatch):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    monkeypatch.setenv("PRJCT9_DISABLE_MANIFEST_HASH_CACHE", "1")
+    pm.manifest_hash_cache_clear()
+    pm.load_verified_signal_library(p)
+    pm.load_verified_signal_library(p)
+    info = pm.manifest_hash_cache_info()
+    # No insertions while disabled, no hits either.
+    assert info["hits"] == 0
+    assert info["misses"] == 0
+    assert info["current_size"] == 0
+    assert info["enabled"] is False
+
+
+def test_3b1_cache_threaded_smoke(cache_lib_on_disk):
+    """Concurrent loads from many threads must not raise; stats remain sane."""
+    import threading
+    p, _ = cache_lib_on_disk
+    pm.manifest_hash_cache_clear()
+    errs = []
+
+    def worker():
+        try:
+            for _ in range(20):
+                pm.load_verified_signal_library(p)
+        except Exception as exc:  # noqa: BLE001
+            errs.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errs, errs
+    info = pm.manifest_hash_cache_info()
+    assert info["misses"] >= 1
+    assert info["hits"] >= 1
+    # Same path -> at most one entry.
+    assert info["current_size"] == 1
+
+
+# ===========================================================================
+# Phase 3B-1: central verified loader
+# ===========================================================================
+
+
+def test_3b1_loader_success_and_cache(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        params={"engine_version": "1.0.0", "MAX_SMA_DAY": 114},
+        source_close=sample_close,
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    pm.manifest_hash_cache_clear()
+    lib, result = pm.load_verified_signal_library(
+        p,
+        requested_params={"engine_version": "1.0.0", "MAX_SMA_DAY": 114},
+    )
+    assert lib is not None
+    assert result.ok is True
+    assert not result.legacy
+    info = pm.manifest_hash_cache_info()
+    assert info["misses"] == 1
+
+
+def test_3b1_loader_legacy(tmp_path, sample_library):
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)  # no manifest
+    lib, result = pm.load_verified_signal_library(p)
+    assert lib is not None
+    assert result.ok is True
+    assert result.legacy is True
+
+
+def test_3b1_loader_mismatch(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    sample_library["primary_signals"] = ["Short"] * len(
+        sample_library["primary_signals"]
+    )
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    lib, result = pm.load_verified_signal_library(p)
+    assert lib is not None
+    assert result.ok is False
+    assert any(m[0] == "content_hash" for m in result.mismatches)
+
+
+def test_3b1_loader_load_error_corrupt(tmp_path):
+    p = tmp_path / "corrupt.pkl"
+    p.write_bytes(b"\x80\x04not a real pickle")
+    lib, result = pm.load_verified_signal_library(p)
+    assert lib is None
+    assert result.ok is False
+    assert result.legacy is False
+    assert any(m[0] == "load_error" for m in result.mismatches)
+
+
+def test_3b1_loader_type_error_non_dict(tmp_path):
+    p = tmp_path / "string.pkl"
+    with open(p, "wb") as f:
+        pickle.dump("not-a-dict", f)
+    lib, result = pm.load_verified_signal_library(p)
+    assert lib is None
+    assert result.ok is False
+    assert any(m[0] == "type_error" for m in result.mismatches)
+
+
+def test_3b1_loader_strict_runtime_mismatch(tmp_path, sample_library, sample_close):
+    pm.attach_manifest(
+        sample_library, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="SPY",
+        source_close=sample_close,
+    )
+    # Forge a runtime mismatch by editing the embedded manifest's
+    # package_versions before persist.
+    sample_library["_manifest"]["package_versions"]["numpy"] = "0.0.0"
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    # strict=False: warn-only.
+    lib, result = pm.load_verified_signal_library(p, strict=False)
+    assert lib is not None
+    assert result.ok is True
+    assert any("numpy" in str(w) for w in result.warnings)
+    # strict=True: same drift escalates to a mismatch.
+    lib2, result2 = pm.load_verified_signal_library(p, strict=True, cache=False)
+    assert lib2 is not None
+    assert result2.ok is False
+    assert any("numpy" in str(m[0]) for m in result2.mismatches)
+
+
+def test_3b1_pickle_load_compat_smoke(tmp_path, sample_library):
+    p = tmp_path / "lib.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(sample_library, f)
+    with open(p, "rb") as f:
+        loaded = pm.pickle_load_compat(f)
+    assert isinstance(loaded, dict)
+    assert loaded.get("primary_signals") == sample_library["primary_signals"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3B-1: B12 raw-pickle-load scanner contract
+# ---------------------------------------------------------------------------
+
+
+def test_3b1_b12_synthetic_bad_raw_load_is_caught(tmp_path):
+    """Feed _scan_raw_pickle_loads a file with an unallowlisted raw
+    ``pickle.load(...)`` call and confirm the scanner reports it.
+    Symmetric: a file that uses ``pickle_load_compat`` instead is clean.
+    """
+    sys.path.insert(0, str(PROJECT_DIR / "test_scripts"))
+    from test_static_regression_guards import _scan_raw_pickle_loads  # type: ignore
+
+    bad = tmp_path / "bad_consumer.py"
+    bad.write_text(
+        "import pickle\n"
+        "def load_lib(p):\n"
+        "    with open(p, 'rb') as f:\n"
+        "        return pickle.load(f)\n",
+        encoding="utf-8",
+    )
+    hits = _scan_raw_pickle_loads(bad)
+    assert hits, "Expected scanner to flag the raw pickle.load call"
+    assert "pickle.load" in hits[0][1]
+
+    good = tmp_path / "good_consumer.py"
+    good.write_text(
+        "from provenance_manifest import pickle_load_compat\n"
+        "def load_lib(p):\n"
+        "    with open(p, 'rb') as f:\n"
+        "        return pickle_load_compat(f)\n",
+        encoding="utf-8",
+    )
+    assert not _scan_raw_pickle_loads(good), (
+        "Expected pickle_load_compat to NOT trip the raw-load scanner"
+    )

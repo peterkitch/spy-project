@@ -6,6 +6,21 @@ manifests for StackBuilder runs, OnePass / ImpactSearch xlsx exports,
 Spymaster PKLs, TrafficFlow, and Confluence durable outputs are deferred to
 Phase 3B.
 
+Phase 3B-1 additions:
+
+  - ``manifest_hash`` LRU cache keyed by ``(resolved_path, st_mtime_ns,
+    st_size)``. ``content_hash`` is recomputed only on cache miss; thread-
+    safe via an ``RLock``. Used only when callers explicitly supply
+    ``cache_path`` (the central loader does), so in-memory mutation
+    detection on direct ``verify_manifest`` calls is unaffected.
+  - ``pickle_load_compat`` — central NumPy 1.x / 2.x pickle compatibility
+    loader. Replaces the per-engine helpers in ``impactsearch.py`` and
+    ``signal_library/impact_fastpath.py``.
+  - ``load_verified_signal_library(path, ...)`` — central verified loader.
+    Returns ``(library_dict, VerificationResult)`` and bundles the raw
+    ``pickle.load``, type-check, and ``verify_manifest`` call. Each
+    consumer keeps its own reject/warn/quarantine policy.
+
 Design notes (preflight risks 1-7):
 
   - VOLATILE_LIBRARY_KEYS lists the library-level keys excluded from
@@ -41,9 +56,13 @@ import json
 import logging
 import math
 import os
+import pickle
 import platform
 import subprocess
 import sys
+import threading
+import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +76,185 @@ LOGGER = logging.getLogger(__name__)
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FIELD = "_manifest"
 VOLATILE_LIBRARY_KEYS: frozenset[str] = frozenset({"_manifest", "build_timestamp"})
+
+
+# ---------------------------------------------------------------------------
+# Phase 3B-1: content_hash performance cache
+# ---------------------------------------------------------------------------
+#
+# The cache is keyed by a tuple of (resolved_path, st_mtime_ns, st_size).
+# Atomic ``os.replace`` and in-place rewrites both move at least one of
+# mtime_ns / size, which invalidates the entry. We deliberately do NOT
+# infer the cache key from sidecar_path -- callers must explicitly supply
+# ``cache_path`` (and they do so only after they have just ``pickle.load``-ed
+# the file via the central loader). This keeps verify_manifest's in-memory
+# mutation contract intact for the legacy direct-call shape.
+
+_MANIFEST_HASH_CACHE: "OrderedDict[Tuple[str, int, int], str]" = OrderedDict()
+_MANIFEST_HASH_CACHE_MAX = 256
+_MANIFEST_HASH_CACHE_LOCK = threading.RLock()
+_MANIFEST_HASH_CACHE_STATS = {
+    "hits": 0,
+    "misses": 0,
+    "evictions": 0,
+}
+_DISABLE_CACHE_ENV = "PRJCT9_DISABLE_MANIFEST_HASH_CACHE"
+
+
+def _cache_enabled() -> bool:
+    return os.environ.get(_DISABLE_CACHE_ENV, "0").lower() not in (
+        "1", "true", "on", "yes",
+    )
+
+
+def manifest_hash_cache_clear() -> None:
+    """Drop every cached content_hash and reset stats."""
+    with _MANIFEST_HASH_CACHE_LOCK:
+        _MANIFEST_HASH_CACHE.clear()
+        _MANIFEST_HASH_CACHE_STATS.update(hits=0, misses=0, evictions=0)
+
+
+def manifest_hash_cache_info() -> dict:
+    """Return a snapshot of cache stats."""
+    with _MANIFEST_HASH_CACHE_LOCK:
+        return {
+            "hits": _MANIFEST_HASH_CACHE_STATS["hits"],
+            "misses": _MANIFEST_HASH_CACHE_STATS["misses"],
+            "evictions": _MANIFEST_HASH_CACHE_STATS["evictions"],
+            "current_size": len(_MANIFEST_HASH_CACHE),
+            "max_size": _MANIFEST_HASH_CACHE_MAX,
+            "enabled": _cache_enabled(),
+        }
+
+
+def _cache_key_for(cache_path: Any) -> Optional[Tuple[str, int, int]]:
+    """Resolve ``cache_path`` to a stat-derived cache key, or None on error."""
+    try:
+        resolved = str(Path(cache_path).resolve(strict=False))
+        st = os.stat(resolved)
+        return (resolved, int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return None
+
+
+def _cached_content_hash(
+    library_dict: Mapping[str, Any], cache_path: Any
+) -> str:
+    """Return the canonical content_hash, using the LRU cache when possible.
+
+    Falls back to direct recomputation when:
+      - the cache is disabled via ``PRJCT9_DISABLE_MANIFEST_HASH_CACHE``,
+      - ``cache_path`` is None,
+      - the path cannot be stat-ed.
+    """
+    if cache_path is None or not _cache_enabled():
+        return content_hash(library_dict)
+    key = _cache_key_for(cache_path)
+    if key is None:
+        return content_hash(library_dict)
+    with _MANIFEST_HASH_CACHE_LOCK:
+        if key in _MANIFEST_HASH_CACHE:
+            _MANIFEST_HASH_CACHE.move_to_end(key)
+            _MANIFEST_HASH_CACHE_STATS["hits"] += 1
+            return _MANIFEST_HASH_CACHE[key]
+        _MANIFEST_HASH_CACHE_STATS["misses"] += 1
+    # Compute outside the lock; the canonical_blob walk can be expensive.
+    digest = content_hash(library_dict)
+    with _MANIFEST_HASH_CACHE_LOCK:
+        _MANIFEST_HASH_CACHE[key] = digest
+        _MANIFEST_HASH_CACHE.move_to_end(key)
+        if len(_MANIFEST_HASH_CACHE) > _MANIFEST_HASH_CACHE_MAX:
+            _MANIFEST_HASH_CACHE.popitem(last=False)
+            _MANIFEST_HASH_CACHE_STATS["evictions"] += 1
+    return digest
+
+
+# ---------------------------------------------------------------------------
+# Phase 3B-1: NumPy 1.x / 2.x pickle compatibility (central)
+# ---------------------------------------------------------------------------
+#
+# These shims previously lived in ``impactsearch.py`` and
+# ``signal_library/impact_fastpath.py``. Centralizing them lets the new
+# ``load_verified_signal_library`` be the single signal-library load path,
+# which in turn enables the tightened B12 raw-pickle-load static guard.
+
+_PICKLE_COMPAT_INSTALLED = False
+_PICKLE_COMPAT_LOCK = threading.Lock()
+
+
+def _install_numpy_pickle_compat_shims() -> None:
+    """Alias ``numpy.core.*`` ↔ ``numpy._core.*`` so 1.x/2.x pickles cross-load.
+
+    Idempotent; safe to call repeatedly. No-op if NumPy is missing.
+    """
+    global _PICKLE_COMPAT_INSTALLED
+    try:
+        import numpy as _np
+    except Exception:
+        return
+    major = int((_np.__version__.split(".")[0] or "1"))
+    pairs_1x = [
+        ("numpy._core", "numpy.core"),
+        ("numpy._core.numeric", "numpy.core.numeric"),
+        ("numpy._core.multiarray", "numpy.core.multiarray"),
+        ("numpy._core._multiarray_umath", "numpy.core._multiarray_umath"),
+        ("numpy._core.umath", "numpy.core.umath"),
+        ("numpy._core.arrayprint", "numpy.core.arrayprint"),
+        ("numpy._core.fromnumeric", "numpy.core.fromnumeric"),
+        ("numpy._core.shape_base", "numpy.core.shape_base"),
+    ]
+    pairs_2x = [
+        ("numpy.core", "numpy._core"),
+        ("numpy.core.numeric", "numpy._core.numeric"),
+        ("numpy.core.multiarray", "numpy._core.multiarray"),
+        ("numpy.core._multiarray_umath", "numpy._core._multiarray_umath"),
+        ("numpy.core.umath", "numpy._core.umath"),
+        ("numpy.core.arrayprint", "numpy._core.arrayprint"),
+        ("numpy.core.fromnumeric", "numpy._core.fromnumeric"),
+        ("numpy.core.shape_base", "numpy._core.shape_base"),
+    ]
+    pairs = pairs_1x if major < 2 else pairs_2x
+    for alias_mod, target_mod in pairs:
+        try:
+            if target_mod not in sys.modules:
+                importlib.import_module(target_mod)
+            sys.modules.setdefault(alias_mod, sys.modules[target_mod])
+        except Exception:
+            pass
+    _PICKLE_COMPAT_INSTALLED = True
+
+
+def _ensure_pickle_compat() -> None:
+    if _PICKLE_COMPAT_INSTALLED:
+        return
+    with _PICKLE_COMPAT_LOCK:
+        if not _PICKLE_COMPAT_INSTALLED:
+            _install_numpy_pickle_compat_shims()
+
+
+# Install once at import time so cold pickles unpickle on first try.
+_install_numpy_pickle_compat_shims()
+
+
+def pickle_load_compat(file_obj) -> Any:
+    """Single ``pickle.load`` site allowed by B12.
+
+    Wraps ``pickle.load`` with the cross-version NumPy shim retry: on a
+    ``ModuleNotFoundError`` for ``numpy._core`` / ``numpy.core``, install
+    the shims and rewind/retry once.
+    """
+    try:
+        return pickle.load(file_obj)  # noqa: B12 — central compat loader
+    except ModuleNotFoundError as exc:
+        msg = str(exc)
+        if "numpy._core" in msg or "numpy.core" in msg:
+            _ensure_pickle_compat()
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+            return pickle.load(file_obj)  # noqa: B12 — central compat loader
+        raise
 
 # Sidecar file extension appended to the pickle path.
 SIDECAR_SUFFIX = ".manifest.json"
@@ -626,6 +824,7 @@ def verify_manifest(
     strict: bool = False,
     requested_params: Optional[Mapping[str, Any]] = None,
     current_source_close: Any = None,
+    cache_path: Any = None,
 ) -> VerificationResult:
     """Verify the manifest embedded in ``library_dict`` (with sidecar fallback).
 
@@ -645,6 +844,11 @@ def verify_manifest(
         provided (Risk 2).
       - Git / package mismatches: warn under strict=False, fail under
         strict=True.
+      - ``cache_path`` (Phase 3B-1) -> when supplied, the central loader's
+        path is used to look up the previously-computed content_hash via
+        the LRU cache keyed by ``(resolved_path, mtime_ns, size)``. Direct
+        callers that pass ``cache_path=None`` keep the strict in-memory
+        recomputation; the central loader supplies it explicitly.
 
     Returns a ``VerificationResult``; truthy when ``ok``.
     """
@@ -661,7 +865,7 @@ def verify_manifest(
 
     # 1) content_hash check
     expected = manifest.get("content_hash")
-    actual = content_hash(library_dict)
+    actual = _cached_content_hash(library_dict, cache_path)
     if expected is None:
         warnings.append("manifest_missing_content_hash")
     elif expected != actual:
@@ -781,6 +985,97 @@ def refresh_or_attach_manifest(
     return library_dict, new_manifest, True
 
 
+# ---------------------------------------------------------------------------
+# Phase 3B-1: central verified signal-library loader
+# ---------------------------------------------------------------------------
+
+
+def load_verified_signal_library(
+    path: Any,
+    *,
+    requested_params: Optional[Mapping[str, Any]] = None,
+    strict: bool = False,
+    expected_type: type = dict,
+    cache: bool = True,
+) -> Tuple[Optional[Any], VerificationResult]:
+    """Load a signal-library pickle and verify its provenance manifest.
+
+    Bundles the four steps every signal-library consumer used to do by
+    hand: open + ``pickle_load_compat`` + type-check + ``verify_manifest``.
+    Each consumer keeps its own policy for what to do with the result
+    (rebuild, slow-path fallback, skip candidate, fast-path disable).
+
+    Returns ``(library_dict, VerificationResult)``. On a load error, the
+    library is ``None`` and the result has ``ok=False, legacy=False`` with
+    a single ``("load_error", error_type, message)`` mismatch so the caller
+    can branch on the corrupt-file case (e.g. quarantine to ``.corrupt``).
+
+    Parameters:
+      - ``path``: pickle path, used both for ``open`` and for the manifest
+        sidecar lookup / hash cache key.
+      - ``requested_params``: forwarded to ``verify_manifest``.
+      - ``strict``: forwarded to ``verify_manifest``.
+      - ``expected_type``: typically ``dict``. A non-matching loaded value
+        produces ``("type_error", expected, actual)``.
+      - ``cache``: when True, the path's stat-derived key feeds the LRU
+        content_hash cache. Disable when the caller wants a guaranteed
+        recomputation (the env-var disable also does this globally).
+    """
+    try:
+        with open(path, "rb") as fh:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", category=DeprecationWarning,
+                    message=".*numpy.core.numeric.*",
+                )
+                warnings.filterwarnings(
+                    "ignore", category=DeprecationWarning,
+                    message=".*numpy._core.numeric.*",
+                )
+                # Suppress generic DeprecationWarnings the per-engine loaders
+                # also suppressed; the shimmed pickle path can emit them on
+                # legacy libraries.
+                warnings.filterwarnings(
+                    "ignore", category=DeprecationWarning,
+                )
+                data = pickle_load_compat(fh)
+    except (pickle.UnpicklingError, EOFError) as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+    except ModuleNotFoundError as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+    except OSError as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+
+    if not isinstance(data, expected_type):
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[(
+                "type_error",
+                expected_type.__name__ if hasattr(expected_type, "__name__")
+                else str(expected_type),
+                type(data).__name__,
+            )],
+        )
+
+    result = verify_manifest(
+        data,
+        sidecar_path=path,
+        strict=strict,
+        requested_params=requested_params,
+        cache_path=path if cache else None,
+    )
+    return data, result
+
+
 __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "MANIFEST_FIELD",
@@ -793,4 +1088,9 @@ __all__ = [
     "refresh_or_attach_manifest",
     "content_hash",
     "source_close_hash",
+    # Phase 3B-1
+    "manifest_hash_cache_clear",
+    "manifest_hash_cache_info",
+    "pickle_load_compat",
+    "load_verified_signal_library",
 ]

@@ -7,75 +7,20 @@ import numpy as np
 from scipy import stats
 import logging
 from canonical_scoring import score_captures as _canonical_score_captures
-from provenance_manifest import verify_manifest as _verify_manifest
+from provenance_manifest import (
+    verify_manifest as _verify_manifest,
+    load_verified_signal_library as _load_verified_signal_library,
+    pickle_load_compat as _pickle_load_compat,
+)
 import random
 import warnings
 
-# NumPy 1.x <-> 2.x pickle-compat shims (robust import + alias, both directions)
-def _install_numpy_pickle_compat_shims():
-    """
-    Deterministically import & alias NumPy's internal module paths so pickles
-    serialized under NumPy 2.x (numpy._core.*) or 1.x (numpy.core.*) can load.
-    """
-    import numpy as _np
-    major = int((_np.__version__.split('.')[0] or '1'))
-
-    # (module_to_alias, module_target) pairs to try
-    # When running on NumPy 1.x, we alias numpy._core.* -> numpy.core.*
-    # When running on NumPy 2.x, we alias numpy.core.* -> numpy._core.*
-    pairs_1x = [
-        ("numpy._core", "numpy.core"),
-        ("numpy._core.numeric", "numpy.core.numeric"),
-        ("numpy._core.multiarray", "numpy.core.multiarray"),
-        ("numpy._core._multiarray_umath", "numpy.core._multiarray_umath"),
-        ("numpy._core.umath", "numpy.core.umath"),
-        ("numpy._core.arrayprint", "numpy.core.arrayprint"),
-        ("numpy._core.fromnumeric", "numpy.core.fromnumeric"),
-        ("numpy._core.shape_base", "numpy.core.shape_base"),
-    ]
-    pairs_2x = [
-        ("numpy.core", "numpy._core"),
-        ("numpy.core.numeric", "numpy._core.numeric"),
-        ("numpy.core.multiarray", "numpy._core.multiarray"),
-        ("numpy.core._multiarray_umath", "numpy._core._multiarray_umath"),
-        ("numpy.core.umath", "numpy._core.umath"),
-        ("numpy.core.arrayprint", "numpy._core.arrayprint"),
-        ("numpy.core.fromnumeric", "numpy._core.fromnumeric"),
-        ("numpy.core.shape_base", "numpy._core.shape_base"),
-    ]
-
-    pairs = pairs_1x if major < 2 else pairs_2x
-    for alias_mod, target_mod in pairs:
-        try:
-            # Import the target if needed, then alias
-            if target_mod not in sys.modules:
-                importlib.import_module(target_mod)
-            sys.modules.setdefault(alias_mod, sys.modules[target_mod])
-        except Exception:
-            # Best-effort: ignore missing leaf modules in some NumPy builds
-            pass
-    logging.debug("Installed robust NumPy pickle compatibility shims (major=%d)", major)
-
-# Eagerly install shims at import-time (harmless if already on matching major)
-_install_numpy_pickle_compat_shims()
-
-# Centralized, shim-aware pickle loader
-def _pickle_load_compat(file_obj):
-    """
-    Load a pickle with NumPy 1.x/2.x compatibility.
-    Retries after installing shims if a ModuleNotFoundError occurs.
-    """
-    try:
-        return pickle.load(file_obj)
-    except ModuleNotFoundError as e:
-        if "numpy._core" in str(e) or "numpy.core" in str(e):
-            _install_numpy_pickle_compat_shims()
-            try:
-                file_obj.seek(0)
-            except Exception:
-                pass
-            return pickle.load(file_obj)
-        raise
+# Phase 3B-1: NumPy 1.x/2.x pickle-compat shims now live in
+# provenance_manifest.pickle_load_compat. The central helper is imported as
+# ``_pickle_load_compat`` above, so existing call sites in this module
+# (CacheManager.load_from_cache) keep working without further edits. A
+# duplicate eager-install is no longer required because importing
+# provenance_manifest also performs the install.
 
 # Optional: Show each deprecation warning only once to reduce spam
 if os.environ.get("IMPACTSEARCH_WARN_ONCE", "0").lower() in ("1", "true", "on"):
@@ -1209,40 +1154,53 @@ def load_signal_library(ticker):
         
         for candidate in candidates:
             filepath = _lib_path_for(candidate)
-            
-            if os.path.exists(filepath):
-                try:
-                    with open(filepath, 'rb') as f:
-                        # Suppress noisy warnings; use shim-aware loader
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings("ignore", category=DeprecationWarning)
-                            signal_data = _pickle_load_compat(f)
 
-                        # Defensive type check to prevent 'str' object has no attribute 'get' errors
-                        if not isinstance(signal_data, dict):
-                            logger.error(f"Invalid signal library format for {ticker}: expected dict, got {type(signal_data).__name__}")
-                            continue
-                except (pickle.UnpicklingError, EOFError) as e:
-                    logger.error(f"Corrupt Signal Library for {ticker}: {e}")
-                    # Quarantine corrupt file for debugging
-                    corrupt_filepath = filepath + '.corrupt'
-                    os.replace(filepath, corrupt_filepath)
-                    logger.info(f"Renamed corrupt file to {corrupt_filepath}")
-                    continue  # Try next candidate
-                
-                # Phase 3A: provenance manifest verification. Legacy
-                # libraries are allowed with a warning. Manifest
-                # mismatches are treated as missing — caller falls back
-                # to the slow path.
-                _vresult = _verify_manifest(
-                    signal_data,
-                    sidecar_path=filepath,
+            if os.path.exists(filepath):
+                # Phase 3B-1: route through the central verified loader.
+                signal_data, _vresult = _load_verified_signal_library(
+                    filepath,
                     requested_params={
                         'engine_version': ENGINE_VERSION,
                         'MAX_SMA_DAY': MAX_SMA_DAY,
-                        'price_source': signal_data.get('price_source', 'Close'),
+                        'price_source': 'Close',
                     },
                 )
+                if signal_data is None:
+                    load_err = next(
+                        (m for m in _vresult.mismatches if m[0] == "load_error"),
+                        None,
+                    )
+                    if load_err and load_err[1] in ("UnpicklingError", "EOFError"):
+                        logger.error(
+                            f"Corrupt Signal Library for {ticker}: {load_err[2]}"
+                        )
+                        try:
+                            corrupt_filepath = filepath + '.corrupt'
+                            os.replace(filepath, corrupt_filepath)
+                            logger.info(
+                                f"Renamed corrupt file to {corrupt_filepath}"
+                            )
+                        except OSError as exc:
+                            logger.error(
+                                f"Failed to quarantine corrupt library: {exc}"
+                            )
+                        continue
+                    if any(m[0] == "type_error" for m in _vresult.mismatches):
+                        type_err = next(
+                            m for m in _vresult.mismatches
+                            if m[0] == "type_error"
+                        )
+                        logger.error(
+                            f"Invalid signal library format for {ticker}: "
+                            f"expected {type_err[1]}, got {type_err[2]}"
+                        )
+                        continue
+                    logger.error(
+                        f"Failed to load Signal Library for {ticker}: "
+                        f"{_vresult.mismatches}"
+                    )
+                    continue
+
                 if _vresult.legacy:
                     logger.warning(
                         f"{ticker}: legacy signal library (no provenance "
@@ -1267,11 +1225,11 @@ def load_signal_library(ticker):
 
                 if stored_version == ENGINE_VERSION and stored_max_sma == MAX_SMA_DAY:
                     logger.info(f"Signal Library loaded for {ticker} from {filepath}")
-                    
+
                     # Check if this is the enhanced V2 format with primary_signals
                     if 'primary_signals' in signal_data:
                         logger.info(f"  Enhanced V2 format detected with {len(signal_data['primary_signals'])} signals")
-                    
+
                     return signal_data
                 else:
                     logger.warning(f"Signal Library rejected for {ticker} due to version/config mismatch")
