@@ -73,6 +73,21 @@ DEFAULT_IMPACT_XLSX_DIR = os.environ.get(
 # output format default; can be overridden by --output-format
 OUTPUT_FORMAT = os.environ.get("STACKBUILDER_OUTPUT_FORMAT", "xlsx").lower()
 DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
+
+
+def _effective_grace_days(grace_days):
+    """Resolve a per-call grace override against DEFAULT_GRACE_DAYS.
+
+    Phase 2B-2B: explicit grace plumbing (Entry 7 amendment). Callers
+    pass ``grace_days=None`` to mean "use the spec-default 10 days";
+    any concrete int (including 0) is honored as-is. ``run_for_secondary``
+    resolves the value once from ``args.grace_days`` and threads the
+    concrete int through ``phase2_rank_all`` / ``phase3_build_stacks``
+    instead of mutating ``os.environ['IMPACT_CALENDAR_GRACE_DAYS']``.
+    """
+    return DEFAULT_GRACE_DAYS if grace_days is None else int(grace_days)
+
+
 # runtime-mutable signal dir (set in main from CLI)
 SIGNAL_LIB_DIR_RUNTIME = DEFAULT_SIGNAL_LIB_DIR
 
@@ -378,7 +393,7 @@ def load_lib_or_none(t: str) -> Optional[dict]:
     return fallback_load_signal_library(t)
 
 # ---------- Signal application and metrics ----------
-def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series, *, return_mask: bool = False):
+def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series, *, return_mask: bool = False, grace_days: Optional[int] = None):
     """
     ImpactSearch-parity alignment:
       - align to secondary index
@@ -391,6 +406,11 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
     Default ``return_mask=False`` returns only ``captures`` for
     backward compatibility with callers that compute their own mask
     or use the legacy single-arg metrics_from_captures fallback.
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg. ``None``
+    falls back to ``DEFAULT_GRACE_DAYS`` via ``_effective_grace_days``;
+    any int (including 0) is honored as-is. Run-orchestration
+    resolves the value once and threads it through.
     """
     if not primary_signals or not primary_dates or sec_returns.empty:
         empty = pd.Series(dtype=FLOAT_DTYPE)
@@ -408,8 +428,8 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
 
     sigs = pd.Series(list(primary_signals), index=idx)
 
-    # Use configured grace window (default 10 days per spec §20)
-    grace_days = DEFAULT_GRACE_DAYS
+    # Resolve grace window: explicit kwarg wins; None -> DEFAULT_GRACE_DAYS.
+    grace_days = _effective_grace_days(grace_days)
     if grace_days > 0:
         # Reindex with forward fill within tolerance window
         aligned = sigs.reindex(sidx, method='pad', tolerance=pd.Timedelta(days=grace_days))
@@ -511,7 +531,7 @@ def phase1_preflight(args, secondary: str, specified_primaries: Optional[List[st
     return primaries_df, sec_rets, vendor_secondary
 
 # ---------- Phase 2: Rank All ----------
-def _score_primary(primary: str, sec_rets: pd.Series) -> Optional[Dict]:
+def _score_primary(primary: str, sec_rets: pd.Series, *, grace_days: Optional[int] = None) -> Optional[Dict]:
     vendor, _ = resolve_symbol(primary)
     lib = load_lib_or_none(vendor)
     if not lib:
@@ -530,7 +550,7 @@ def _score_primary(primary: str, sec_rets: pd.Series) -> Optional[Dict]:
     # losses (spec §15 / ledger Entry 4). Previously this site used the
     # single-arg fallback whose captures.ne(0.0) mask dropped those
     # days, producing Phase 2 vs Phase 3 K=1 metric divergence.
-    caps, trigger_mask = apply_signals_to_secondary(sigs, dates, sec_rets, return_mask=True)
+    caps, trigger_mask = apply_signals_to_secondary(sigs, dates, sec_rets, return_mask=True, grace_days=grace_days)
     m = metrics_from_captures(caps, trigger_mask=trigger_mask)
     if not m:  # Just check if we have metrics, not the trigger count
         return None
@@ -540,8 +560,14 @@ def _score_primary(primary: str, sec_rets: pd.Series) -> Optional[Dict]:
     m['Primary Ticker'] = vendor
     return m
 
-def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None):
-    """Phase 2: Rank all primaries against secondary with progress tracking."""
+def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None, *, grace_days: Optional[int] = None):
+    """Phase 2: Rank all primaries against secondary with progress tracking.
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg threaded
+    through to ``_score_primary`` and from there to
+    ``apply_signals_to_secondary``. ``None`` falls back to
+    ``DEFAULT_GRACE_DAYS``.
+    """
     # Fast-path: use ImpactSearch .xlsx if requested and available
     if getattr(args, "prefer_impact_xlsx", False):
         sec = (secondary or getattr(args, "secondary", "") or "").upper()
@@ -598,7 +624,7 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
         print(f"[PHASE2] Scoring {total} primary tickers against {secondary}...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_score_primary, t, sec_rets): t for t in primaries_df['Primary Ticker']}
+        futures = {ex.submit(_score_primary, t, sec_rets, grace_days=grace_days): t for t in primaries_df['Primary Ticker']}
 
         # Use tqdm if available, otherwise simple counter
         if tqdm and not getattr(args, 'no_progress', False):
@@ -658,7 +684,7 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     return rank_all, rank_direct, rank_inverse
 
 # ---------- Phase 3: Stack Builder ----------
-def _captures_for(primary: str, mode: str, sec_rets: pd.Series) -> pd.Series:
+def _captures_for(primary: str, mode: str, sec_rets: pd.Series, *, grace_days: Optional[int] = None) -> pd.Series:
     vendor, _ = resolve_symbol(primary)
     lib = load_lib_or_none(vendor)
     if not lib:
@@ -670,7 +696,7 @@ def _captures_for(primary: str, mode: str, sec_rets: pd.Series) -> pd.Series:
     if isinstance(sigs[0], (int, np.integer)):
         dec = {1:'Buy', -1:'Short', 0:'None'}
         sigs = [dec.get(int(x), 'None') for x in sigs]
-    caps = apply_signals_to_secondary(sigs, dates, sec_rets)
+    caps = apply_signals_to_secondary(sigs, dates, sec_rets, grace_days=grace_days)
     return (-caps if mode == 'I' else caps).astype(FLOAT_DTYPE)
 
 def _combined_metrics(member_caps: List[pd.Series]) -> Tuple[pd.Series, Optional[Dict]]:
@@ -691,8 +717,14 @@ def _combined_metrics(member_caps: List[pd.Series]) -> Tuple[pd.Series, Optional
     return combined, m
 
 # NEW: signal-level helpers with strict-calendar mask (spymaster-parity)
-def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex) -> Tuple[pd.Series, pd.Series]:
-    """Return (signals_aligned_to_sec_index, present_mask_before_fill)."""
+def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex, *, grace_days: Optional[int] = None) -> Tuple[pd.Series, pd.Series]:
+    """Return (signals_aligned_to_sec_index, present_mask_before_fill).
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg. ``None``
+    falls back to ``DEFAULT_GRACE_DAYS``; explicit ints (including 0)
+    are honored verbatim. Calendar policy stays unified with Phase 2's
+    ``apply_signals_to_secondary`` (Entry 5).
+    """
     vendor, _ = resolve_symbol(primary)
     try:
         lib = load_lib_or_none(vendor)
@@ -716,10 +748,9 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
         raise RuntimeError(f"Ticker {vendor} signal library error: {e}") from e
     # Unify calendar policy with Phase 2 (apply_signals_to_secondary) per
     # Phase 1B Intentional Delta Ledger Entry 5 (StackBuilder Phase 2 vs
-    # Phase 3 scoring divergence). Phase 2 uses DEFAULT_GRACE_DAYS; Phase 3
-    # previously read the env var with a separate default of 0, producing
-    # divergent calendar masks for the same primary/secondary pair.
-    grace_days = DEFAULT_GRACE_DAYS
+    # Phase 3 scoring divergence). Both phases now resolve grace via the
+    # same ``_effective_grace_days`` helper (Entry 7 amendment, 2B-2B).
+    grace_days = _effective_grace_days(grace_days)
     if grace_days > 0:
         aligned = raw.reindex(sec_index, method='pad', tolerance=pd.Timedelta(days=grace_days))
     else:
@@ -772,10 +803,14 @@ def _combined_metrics_signals(member_signals: List[Union[pd.Series, Tuple[pd.Ser
     m = metrics_from_captures(combined_caps, trigger_mask=trigger_mask)
     return combined_caps, m
 
-def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None) -> Tuple[pd.DataFrame, List]:
+def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None, *, grace_days: Optional[int] = None) -> Tuple[pd.DataFrame, List]:
     """Beam+exhaustive search over top/bottom cohort with both modes.
     progress_cb: optional callback for reporting progress
     Returns: (leaderboard_df, final_members_list)
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg threaded
+    through to ``_signals_aligned_and_mask`` for every (ticker, mode)
+    in the cohort. ``None`` falls back to ``DEFAULT_GRACE_DAYS``.
     """
     topN, botN = int(args.top_n), int(args.bottom_n)
     min_td = int(getattr(args, 'min_trigger_days', 30))
@@ -820,7 +855,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     for _, r in cohort.iterrows():
         t, m = r['Primary Ticker'], r['Mode']
         if (t, m) not in sig_cache:
-            sig_cache[(t, m)] = _signals_aligned_and_mask(t, m, sec_rets.index)
+            sig_cache[(t, m)] = _signals_aligned_and_mask(t, m, sec_rets.index, grace_days=grace_days)
     def sigs_for(t, m): return sig_cache.get((t, m), (pd.Series('None', index=sec_rets.index),
                                                         pd.Series(False, index=sec_rets.index)))
 
@@ -1511,7 +1546,7 @@ def run_dash(outdir: str, port: int = 8054):
     app.run_server(debug=False, port=port, use_reloader=False)
 
 # ---------- Orchestration ----------
-def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[str]] = None) -> str:
+def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[str]] = None, *, grace_days: Optional[int] = None) -> str:
     # Ensure worker processes inherit the same runtime configuration as the parent.
     global OUTPUT_FORMAT, SIGNAL_LIB_DIR_RUNTIME, VERBOSE, COMBINE_INTERSECTION
     try:
@@ -1523,13 +1558,19 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         pass
 
     start_time = time.time()
-    # Phase 1B-2B: respect args.grace_days when explicitly set, otherwise
-    # leave IMPACT_CALENDAR_GRACE_DAYS untouched so DEFAULT_GRACE_DAYS=10
-    # (spec §20) governs. Previously this line forced grace to 0 when
-    # args.grace_days was unset, defeating the default.
-    _grace_override = getattr(args, 'grace_days', None)
-    if _grace_override is not None:
-        os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(_grace_override)
+    # Phase 2B-2B: resolve grace once and thread it explicitly through
+    # phase2_rank_all and phase3_build_stacks. Previously this site
+    # mutated os.environ['IMPACT_CALENDAR_GRACE_DAYS'] when
+    # args.grace_days was set, leaking grace state into worker
+    # subprocesses and any subsequent in-process callers. The env
+    # write is removed; an explicit kwarg-only ``grace_days`` parameter
+    # on this function takes precedence over args.grace_days, and an
+    # unset value falls back to DEFAULT_GRACE_DAYS via
+    # _effective_grace_days.
+    effective_grace = _effective_grace_days(
+        grace_days if grace_days is not None
+        else getattr(args, 'grace_days', None)
+    )
     primaries_df, sec_rets, vendor_secondary = phase1_preflight(args, secondary, specified_primaries)
     ts = now_ts()
     # Clean secondary name for filesystem, but preserve '^' (safe on NTFS) per design
@@ -1574,7 +1615,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         _write_progress(ppath, status='running', phase='ranking', percent=25.0,
                         message=f'Ranking {len(primaries_df)} primaries against {vendor_secondary}...',
                         outdir=temp_outdir, secondary=vendor_secondary)
-        rank_all, rank_direct, rank_inverse = phase2_rank_all(args, primaries_df, sec_rets, temp_outdir, secondary=vendor_secondary, progress_path=ppath)
+        rank_all, rank_direct, rank_inverse = phase2_rank_all(args, primaries_df, sec_rets, temp_outdir, secondary=vendor_secondary, progress_path=ppath, grace_days=effective_grace)
 
         cohort_sz = args.top_n + args.bottom_n
         _write_progress(ppath, status='running', phase='stacking', percent=60.0,
@@ -1597,7 +1638,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
 
         # Pass progress callback to phase3
         leaderboard, final_members = phase3_build_stacks(
-            args, rank_direct, rank_inverse, sec_rets, temp_outdir, progress_cb=_k_progress
+            args, rank_direct, rank_inverse, sec_rets, temp_outdir, progress_cb=_k_progress, grace_days=effective_grace
         )
 
         _write_progress(ppath, status='running', phase='finalizing', percent=90.0,
@@ -1722,8 +1763,11 @@ def parse_args(argv=None):
                    help='Metric to optimize for K>=2 (defaults to seed-by if not specified)')
     p.add_argument('--allow-decreasing', action='store_true',
                    help='Allow metric to decrease across K levels (find best at each K independently)')
-    p.add_argument('--grace-days', type=int, default=0,
-                   help='Max calendar pad when aligning primary signals to secondary (0 = strict, spymaster-parity)')
+    p.add_argument('--grace-days', type=int, default=None,
+                   help=('Max calendar pad when aligning primary signals to '
+                         'secondary. Unset (None) uses DEFAULT_GRACE_DAYS=10 '
+                         'per spec §20; explicit 0 means strict mode '
+                         '(spymaster-parity).'))
     p.add_argument('--search', choices=['greedy','beam','exhaustive'], default='beam',
                    help='Combinatorics strategy for K>1')
     p.add_argument('--beam-width', type=int, default=12,

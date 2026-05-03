@@ -1,14 +1,20 @@
 """
-Phase 1B-2B: calendar grace days default unification.
+Phase 1B-2B / 2B-2B: calendar grace days plumbing.
 
-Spec §20 mandates a default of 10 days. Previously the non-QC engines
-were split (7 / 0). These tests assert each engine's default grace
-days is 10 when ``IMPACT_CALENDAR_GRACE_DAYS`` is unset, and that
-StackBuilder's runtime override no longer forces the env var to 0
-when ``args.grace_days`` is not explicitly supplied.
+Spec §20 mandates a default of 10 days. Phase 1B-2B unified the
+non-QC engine constants. Phase 2B-2B refactored StackBuilder so the
+grace value is threaded explicitly through ``run_for_secondary`` ->
+``phase2_rank_all`` -> ``_score_primary`` ->
+``apply_signals_to_secondary`` and ``phase3_build_stacks`` ->
+``_signals_aligned_and_mask``. The env-var mutation in
+``run_for_secondary`` was removed; ``args.grace_days=None`` now means
+"use ``DEFAULT_GRACE_DAYS=10``" rather than "force env to 0".
 
-The constant-default tests use subprocesses so prior in-process
-imports don't mask a hardcoded module-level read.
+These tests cover:
+  - module-level defaults are 10 across the non-QC engines (1B-2B)
+  - parser ``--grace-days`` default is None (2B-2B)
+  - explicit grace=0 / grace=5 reach phase2_rank_all and
+    phase3_build_stacks without any env-var write (2B-2B)
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 
@@ -89,59 +96,196 @@ def test_impactsearch_default_grace_days_is_10():
     )
 
 
-def test_stackbuilder_run_for_secondary_does_not_force_grace_zero(monkeypatch):
-    # Phase 1B-2B: previously run_for_secondary() did
-    #   os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(getattr(args, 'grace_days', 0) or 0)
-    # which forced grace to 0 for any args without an explicit
-    # grace_days attribute, defeating DEFAULT_GRACE_DAYS=10.
-    #
-    # The new behavior leaves the env var untouched unless
-    # args.grace_days is explicitly set, so DEFAULT_GRACE_DAYS governs.
-    stackbuilder = importlib.import_module("stackbuilder")
-    if not hasattr(stackbuilder, "phase1_preflight"):
+def _force_load_stackbuilder():
+    """Resolve the project-level stackbuilder.py module, defeating any
+    test_scripts/stackbuilder/ namespace shadow."""
+    sb = importlib.import_module("stackbuilder")
+    needs_force = not hasattr(sb, "phase1_preflight")
+    if not needs_force:
+        try:
+            mod_file = Path(sb.__file__).resolve() if sb.__file__ else None
+        except Exception:
+            mod_file = None
+        if mod_file != (PROJECT_DIR / "stackbuilder.py").resolve():
+            needs_force = True
+    if needs_force:
         spec = importlib.util.spec_from_file_location(
             "stackbuilder", str(PROJECT_DIR / "stackbuilder.py")
         )
-        stackbuilder = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(stackbuilder)
+        sb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sb)
+    return sb
 
-    # Save and restore any pre-existing env var. Production code under
-    # test writes to os.environ directly (not via monkeypatch), so we
-    # take responsibility for cleanup. run_for_secondary also mutates
-    # the module-level COMBINE_INTERSECTION based on args.combine_mode;
-    # save/restore so this test does not pollute other tests.
-    pre_existing = os.environ.pop("IMPACT_CALENDAR_GRACE_DAYS", None)
-    pre_combine = stackbuilder.COMBINE_INTERSECTION
-    pre_signal_dir = getattr(stackbuilder, "SIGNAL_LIB_DIR_RUNTIME", None)
-    pre_verbose = stackbuilder.VERBOSE
+
+_REQUIRED_RUN_ARGS = dict(
+    alpha=0.05,
+    max_k=1,
+    top_n=0,
+    bottom_n=0,
+    min_trigger_days=30,
+    sharpe_eps=1e-6,
+    seed_by="total_capture",
+    output_format="xlsx",
+    signal_lib_dir=None,
+    verbose=False,
+    combine_mode="intersection",
+    outdir=None,
+)
+
+
+def _hydrate_args(ns):
+    """Attach the minimum attributes ``run_for_secondary`` reads from
+    args between preflight and phase2 (manifest write, progress, etc.).
+    Existing attributes on ``ns`` are preserved."""
+    for k, v in _REQUIRED_RUN_ARGS.items():
+        if not hasattr(ns, k):
+            setattr(ns, k, v)
+    return ns
+
+
+def _drive_run_for_secondary(monkeypatch, args, *, capture_grace=True):
+    """Drive ``run_for_secondary`` past phase1 and stop before phase2/3
+    do work; capture the ``grace_days`` kwarg each phase received.
+
+    Phase 2B-2B helper. Returns ``(phase2_grace, phase3_grace)``. Raises
+    if ``run_for_secondary`` stops before either phase is reached.
+    """
+    sb = _force_load_stackbuilder()
+    _hydrate_args(args)
+    pre_combine = sb.COMBINE_INTERSECTION
+    pre_signal_dir = getattr(sb, "SIGNAL_LIB_DIR_RUNTIME", None)
+    pre_verbose = sb.VERBOSE
+    pre_env = os.environ.pop("IMPACT_CALENDAR_GRACE_DAYS", None)
+
+    captured = {"phase2": "<unreached>", "phase3": "<unreached>"}
+
+    def _fake_preflight(_args, _sec, _specified_primaries=None):
+        # Return an empty primaries DF + empty returns so phase2 has
+        # nothing to do; phase3 likewise short-circuits.
+        empty_primaries = pd.DataFrame({"Primary Ticker": []})
+        sec_rets = pd.Series(dtype=float)
+        return empty_primaries, sec_rets, "X"
+
+    def _fake_phase2(*pargs, **pkwargs):
+        captured["phase2"] = pkwargs.get("grace_days", "<missing>")
+        # Return three empty frames in (rank_all, rank_direct, rank_inverse) shape.
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    def _fake_phase3(*pargs, **pkwargs):
+        captured["phase3"] = pkwargs.get("grace_days", "<missing>")
+        # Return (leaderboard, members) shape; raise immediately after
+        # capture so we don't have to fake out the rest of the pipeline.
+        raise RuntimeError("stop after phase3 grace capture")
 
     try:
-        # Patch phase1_preflight to short-circuit before doing any IO.
-        def _stop(*args, **kwargs):
-            raise RuntimeError("stop after env set")
-
-        monkeypatch.setattr(stackbuilder, "phase1_preflight", _stop)
-
-        # args without grace_days attribute -> env var should NOT be set
-        args = SimpleNamespace(secondary="X")
-        with pytest.raises(RuntimeError, match="stop after env set"):
-            stackbuilder.run_for_secondary(args, "X", specified_primaries=["AAA"])
-
-        assert "IMPACT_CALENDAR_GRACE_DAYS" not in os.environ, (
-            "run_for_secondary should not write IMPACT_CALENDAR_GRACE_DAYS "
-            "when args.grace_days is unset"
-        )
-
-        # args.grace_days = 5 -> env var SHOULD be set to '5'
-        args2 = SimpleNamespace(secondary="X", grace_days=5)
-        with pytest.raises(RuntimeError, match="stop after env set"):
-            stackbuilder.run_for_secondary(args2, "X", specified_primaries=["AAA"])
-        assert os.environ.get("IMPACT_CALENDAR_GRACE_DAYS") == "5"
+        monkeypatch.setattr(sb, "phase1_preflight", _fake_preflight)
+        monkeypatch.setattr(sb, "phase2_rank_all", _fake_phase2)
+        monkeypatch.setattr(sb, "phase3_build_stacks", _fake_phase3)
+        with pytest.raises(RuntimeError, match="stop after phase3 grace capture"):
+            sb.run_for_secondary(args, "X", specified_primaries=["AAA"])
+        if capture_grace:
+            assert "IMPACT_CALENDAR_GRACE_DAYS" not in os.environ, (
+                "run_for_secondary must not mutate "
+                "IMPACT_CALENDAR_GRACE_DAYS env var (Phase 2B-2B)"
+            )
+        return captured["phase2"], captured["phase3"]
     finally:
         os.environ.pop("IMPACT_CALENDAR_GRACE_DAYS", None)
-        if pre_existing is not None:
-            os.environ["IMPACT_CALENDAR_GRACE_DAYS"] = pre_existing
-        stackbuilder.COMBINE_INTERSECTION = pre_combine
+        if pre_env is not None:
+            os.environ["IMPACT_CALENDAR_GRACE_DAYS"] = pre_env
+        sb.COMBINE_INTERSECTION = pre_combine
         if pre_signal_dir is not None:
-            stackbuilder.SIGNAL_LIB_DIR_RUNTIME = pre_signal_dir
-        stackbuilder.VERBOSE = pre_verbose
+            sb.SIGNAL_LIB_DIR_RUNTIME = pre_signal_dir
+        sb.VERBOSE = pre_verbose
+
+
+def test_stackbuilder_run_for_secondary_does_not_write_env(monkeypatch):
+    """Phase 2B-2B: run_for_secondary no longer mutates
+    ``IMPACT_CALENDAR_GRACE_DAYS``. Whether ``args.grace_days`` is unset
+    (expect default 10 to flow through) or explicitly set (e.g. 5,
+    expect 5 to flow through), the env var must remain untouched."""
+    # Case 1: no grace_days attribute -> default DEFAULT_GRACE_DAYS=10
+    args = SimpleNamespace(secondary="X")
+    p2, p3 = _drive_run_for_secondary(monkeypatch, args)
+    assert int(p2) == 10, f"phase2 expected grace_days=10 (default), got {p2!r}"
+    assert int(p3) == 10, f"phase3 expected grace_days=10 (default), got {p3!r}"
+
+    # Case 2: explicit grace_days=5 -> 5 reaches both phases, env still untouched
+    args2 = SimpleNamespace(secondary="X", grace_days=5)
+    p2, p3 = _drive_run_for_secondary(monkeypatch, args2)
+    assert int(p2) == 5, f"phase2 expected grace_days=5, got {p2!r}"
+    assert int(p3) == 5, f"phase3 expected grace_days=5, got {p3!r}"
+
+
+def test_stackbuilder_explicit_grace_zero_strict_mode(monkeypatch):
+    """Phase 2B-2B: explicit grace=0 (strict mode) reaches both phases
+    verbatim and is NOT silently coerced to the default 10."""
+    args = SimpleNamespace(secondary="X", grace_days=0)
+    p2, p3 = _drive_run_for_secondary(monkeypatch, args)
+    assert int(p2) == 0, f"phase2 expected grace_days=0 (strict), got {p2!r}"
+    assert int(p3) == 0, f"phase3 expected grace_days=0 (strict), got {p3!r}"
+
+
+def test_stackbuilder_kwarg_grace_overrides_args(monkeypatch):
+    """Phase 2B-2B: explicit ``grace_days=`` kwarg on
+    ``run_for_secondary`` itself takes precedence over
+    ``args.grace_days``. This is the orchestration override path
+    documented in the function docstring; it does not change the
+    Dash callback or CLI semantics, but pins the helper-level
+    contract."""
+    sb = _force_load_stackbuilder()
+    pre_combine = sb.COMBINE_INTERSECTION
+    pre_signal_dir = getattr(sb, "SIGNAL_LIB_DIR_RUNTIME", None)
+    pre_verbose = sb.VERBOSE
+    pre_env = os.environ.pop("IMPACT_CALENDAR_GRACE_DAYS", None)
+    captured = {"phase2": None, "phase3": None}
+
+    def _fake_preflight(*a, **k):
+        return pd.DataFrame({"Primary Ticker": []}), pd.Series(dtype=float), "X"
+
+    def _fake_phase2(*a, **k):
+        captured["phase2"] = k.get("grace_days")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    def _fake_phase3(*a, **k):
+        captured["phase3"] = k.get("grace_days")
+        raise RuntimeError("stop")
+
+    try:
+        monkeypatch.setattr(sb, "phase1_preflight", _fake_preflight)
+        monkeypatch.setattr(sb, "phase2_rank_all", _fake_phase2)
+        monkeypatch.setattr(sb, "phase3_build_stacks", _fake_phase3)
+        # args.grace_days=2, but kwarg override=7 wins.
+        args = _hydrate_args(SimpleNamespace(secondary="X", grace_days=2))
+        with pytest.raises(RuntimeError, match="stop"):
+            sb.run_for_secondary(args, "X", specified_primaries=["AAA"], grace_days=7)
+        assert int(captured["phase2"]) == 7
+        assert int(captured["phase3"]) == 7
+        assert "IMPACT_CALENDAR_GRACE_DAYS" not in os.environ
+    finally:
+        os.environ.pop("IMPACT_CALENDAR_GRACE_DAYS", None)
+        if pre_env is not None:
+            os.environ["IMPACT_CALENDAR_GRACE_DAYS"] = pre_env
+        sb.COMBINE_INTERSECTION = pre_combine
+        if pre_signal_dir is not None:
+            sb.SIGNAL_LIB_DIR_RUNTIME = pre_signal_dir
+        sb.VERBOSE = pre_verbose
+
+
+def test_parse_args_grace_default_none():
+    """Phase 2B-2B: parser ``--grace-days`` default flipped from 0 to
+    None so an unset CLI invocation routes through
+    ``DEFAULT_GRACE_DAYS=10`` rather than forcing strict mode."""
+    sb = _force_load_stackbuilder()
+    # No --grace-days on the command line.
+    args = sb.parse_args(["--secondary", "SPY"])
+    assert args.grace_days is None, (
+        f"expected --grace-days default None, got {args.grace_days!r}"
+    )
+    # Explicit 0 still parses to 0 (strict mode).
+    args = sb.parse_args(["--secondary", "SPY", "--grace-days", "0"])
+    assert args.grace_days == 0
+    # Explicit 5 still parses to 5.
+    args = sb.parse_args(["--secondary", "SPY", "--grace-days", "5"])
+    assert args.grace_days == 5

@@ -33,7 +33,10 @@ Per-entry status:
   - Entry 7 (calendar grace days default unification to 10):
     implemented in 1B-2B (PR #133). Phase 2/3 path unification
     landed in Entry 5 (1B-2A); the default value flip to 10 and
-    the run_for_secondary force-to-zero fix land here.
+    the run_for_secondary force-to-zero fix land here. Phase
+    2B-2B (PR #137) amendment removes the residual env-write,
+    flips parser default to None, and threads explicit
+    ``grace_days`` kwargs through the Phase 2 / Phase 3 chain.
   - Entry 8 (sentinel pair standardization): implemented in
     1B-2B (PR #133, two-stage: Spymaster streaming-path removal
     + OnePass / TrafficFlow / ImpactSearch sentinel
@@ -535,7 +538,64 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     the StackBuilder Phase 2 vs Phase 3 divergence. The spec
     mandates a single default of 10. After this entry, every
     non-QC engine uses 10 by default.
-  - Status: implemented in 1B-2B.
+  - Phase 2B-2B amendment (PR #137):
+      Codex's 2B preflight surfaced the remaining sharp edge in
+      the 1B-2B fix: `run_for_secondary` still mutated
+      `os.environ['IMPACT_CALENDAR_GRACE_DAYS']` when the user
+      supplied an explicit `args.grace_days`. The env mutation
+      leaked grace state into worker subprocesses, persisted
+      after `run_for_secondary` returned, and made the value
+      hard to reason about for any in-process caller that did
+      not snapshot/restore the env around the call. Parser
+      default `0` also still meant a CLI invocation without
+      `--grace-days` resolved to strict mode rather than the
+      spec-default 10.
+      Refactor (Option C scope):
+        New helper `_effective_grace_days(grace_days)` resolves
+        `None` to `DEFAULT_GRACE_DAYS` and honors any concrete
+        int (including 0) verbatim. Six functions gained a
+        kwarg-only `grace_days=None` parameter and thread the
+        concrete value through:
+          run_for_secondary
+          phase2_rank_all
+          _score_primary
+          apply_signals_to_secondary
+          _captures_for
+          phase3_build_stacks
+          _signals_aligned_and_mask
+        Parser `--grace-days` default flips from `0` to `None`;
+        help text documents `None -> DEFAULT_GRACE_DAYS=10` and
+        `0` as strict mode. `run_for_secondary` resolves
+        effective grace once via
+          effective_grace = _effective_grace_days(
+              grace_days if grace_days is not None
+              else getattr(args, 'grace_days', None)
+          )
+        and passes the concrete int into Phase 2 and Phase 3
+        instead of writing to `os.environ`. The env write is
+        removed.
+      Affected tests:
+        `test_grace_days_default.py` rewritten:
+          - `test_stackbuilder_run_for_secondary_does_not_write_env`
+            (replaces the prior `..._does_not_force_grace_zero`):
+            asserts the env var is never written and that
+            default (10) and explicit (5) values both reach
+            `phase2_rank_all` and `phase3_build_stacks` via
+            kwarg.
+          - `test_stackbuilder_explicit_grace_zero_strict_mode`:
+            grace=0 reaches both phases verbatim.
+          - `test_stackbuilder_kwarg_grace_overrides_args`:
+            explicit `grace_days=` kwarg on
+            `run_for_secondary` overrides `args.grace_days`.
+          - `test_parse_args_grace_default_none`: parser
+            default flipped to `None`.
+        The pre-existing module-default tests
+        (`test_stackbuilder_default_grace_days_is_10` etc.)
+        continue to pass unchanged; they pin the constant, not
+        the orchestration plumbing.
+  - Status: 1B-2B for default flip + first env-write
+    suppression; 2B-2B for explicit kwarg threading + complete
+    env-write removal + parser default flip to None.
 
 ## Entry 8: sentinel pair standardization
 
