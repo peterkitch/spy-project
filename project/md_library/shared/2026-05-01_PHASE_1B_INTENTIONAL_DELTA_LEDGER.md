@@ -1194,3 +1194,136 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     upgrades them.
   - Status: implemented in Phase 3A (this PR). Phase 3 is NOT
     complete after 3A — see Phase 3B deferrals above.
+
+
+## Phase 3B-1: Manifest performance cache + central verified loader + B12 tightening
+
+  - Type: ADDITIVE-PROVENANCE (no behavior change to scoring math).
+    Carry-forwards from Phase 3A; output / Spymaster PKL manifests
+    remain Phase 3B-2 scope.
+
+  - Old behavior:
+      - Each signal-library consumer recomputed ``content_hash`` on
+        every load. The hash walks the canonical payload (numpy
+        arrays digested as ``(dtype, shape, sha256(bytes))``, pandas
+        Series / DatetimeIndex similarly), which is bounded but
+        adds ~30 ms per 2000-bar library load. StackBuilder runs
+        through ThreadPoolExecutor over many libraries; the
+        per-load cost compounded.
+      - ``impactsearch.py`` and ``signal_library/impact_fastpath.py``
+        each carried a private ~30-line copy of the NumPy 1.x / 2.x
+        pickle-compat shim plus a private ``_pickle_load_compat``
+        wrapper. Both inlined a raw ``pickle.load`` call.
+      - The five signal-library consumers each open + load + type-check
+        + verify_manifest by hand. Five copies of the same boilerplate.
+      - Phase 3A B12 was function-scoped: it asserted that each of the
+        five named consumer functions called ``verify_manifest`` in its
+        body. A new consumer function added without B12 awareness, or
+        a new pickle.load site outside the named functions, would slip
+        through.
+
+  - New behavior:
+      - ``project/provenance_manifest.py`` adds an LRU
+        ``content_hash`` cache keyed by
+        ``(resolved_path, st_mtime_ns, st_size)``. ``content_hash``
+        is recomputed only on cache miss. The cache is consulted
+        only when callers explicitly supply ``cache_path`` to
+        ``verify_manifest``; direct in-memory callers (the legacy
+        helper-test shape) keep the strict recomputation contract.
+      - LRU bound: 256 entries (``_MANIFEST_HASH_CACHE_MAX``).
+      - Thread-safe via an ``RLock``. ``content_hash`` is computed
+        outside the lock so concurrent loads do not serialize on
+        the canonical-blob walk.
+      - Env-var disable:
+        ``PRJCT9_DISABLE_MANIFEST_HASH_CACHE=1`` forces recompute
+        and skips cache insertion / hit-miss accounting.
+      - Public surface: ``manifest_hash_cache_clear()`` and
+        ``manifest_hash_cache_info()`` (hits / misses / evictions /
+        current_size / max_size / enabled).
+      - NumPy 1.x / 2.x pickle compatibility centralized as
+        ``provenance_manifest.pickle_load_compat``. Importing the
+        module installs the shims as a side effect (idempotent).
+        Per-engine duplicate definitions in ``impactsearch.py`` and
+        ``signal_library/impact_fastpath.py`` were removed.
+      - Central verified loader:
+        ``load_verified_signal_library(path, *, requested_params,
+        strict, expected_type, cache)`` returns
+        ``(library_dict, VerificationResult)``. It bundles open +
+        ``pickle_load_compat`` + type-check + ``verify_manifest``,
+        feeding the path through to the cache. Load errors
+        (``UnpicklingError``, ``EOFError``, ``ModuleNotFoundError``,
+        ``OSError``) surface as a single ``("load_error", type, msg)``
+        mismatch; non-dict loads as ``("type_error", expected, actual)``.
+        Each consumer keeps its own corrupt-file quarantine and
+        manifest-mismatch policy.
+
+      Migrated consumer sites (Phase 3B-1):
+        - ``onepass.load_signal_library``
+        - ``impactsearch.load_signal_library``
+        - ``signal_library/impact_fastpath._load_signal_library_quick``
+        - ``stackbuilder.fallback_load_signal_library``
+        - ``signal_library/confluence_analyzer.load_signal_library_interval``
+          (signal-library branch only — the Spymaster cache fallback
+          was extracted into ``_load_spymaster_cache_fallback`` so the
+          tightened B12 can allowlist *only* that helper as a Phase
+          3B-2 deferred surface.)
+
+      Tightened B12 (``test_b12_no_raw_pickle_load_outside_central_loader``):
+        - AST scan across every production .py file in scope.
+        - Bans raw ``pickle.load(...)`` outside an explicit allowlist.
+        - File allowlist:
+          * ``provenance_manifest.py`` — the central loader itself.
+        - Line-precise allowlist (Phase 3B-2 deferred surfaces):
+          * ``spymaster.py:3629, 4036, 4383, 8512`` — Spymaster cache PKLs.
+          * ``trafficflow.py:1349`` — TrafficFlow Spymaster PKL consumer.
+          * ``signal_library/confluence_analyzer.py:72`` —
+            ``_load_spymaster_cache_fallback``.
+        - The function-scoped Phase 3A B12 is preserved as a stricter
+          inner gate
+          (``test_b12_signal_library_consumers_use_verify_manifest``).
+
+  - Affected tests/snapshots:
+      - ``project/test_scripts/test_provenance_manifest.py``: +20
+        cache and central-loader tests covering uncached mutation
+        detection, hit/miss patterns, alias resolution, size /
+        mtime / atomic-replace / in-place rewrite invalidation, LRU
+        eviction, env-var disable, threaded smoke, central loader
+        success / legacy / mismatch / corrupt / type-error / strict
+        runtime mismatch, ``pickle_load_compat`` smoke, and a
+        synthetic B12 helper test.
+      - ``project/test_scripts/test_static_regression_guards.py``:
+        new ``test_b12_no_raw_pickle_load_outside_central_loader``
+        with the line-precise allowlist; existing function-scoped
+        B12 retained.
+      - 159 baseline -> 179 with Phase 3B-1.
+
+  - Phase 3B-2 surface (NOT in 3B-1 scope):
+      - StackBuilder run_manifest enrichment + Excel/CSV export
+        provenance.
+      - OnePass / ImpactSearch xlsx output manifests + xlsx upsert
+        provenance.
+      - Spymaster PKL manifests (``cache/results/*.pkl``).
+      - TrafficFlow Spymaster PKL verification.
+      - Confluence durable outputs and the
+        ``_load_spymaster_cache_fallback`` allowlist retirement.
+      - CLI strict-mode controls (``--manifest-strict`` plumbing).
+      - Mass rebuild of legacy libraries.
+      - B11 ``compute_signals`` decision (still deferred).
+      - QC clone files.
+
+  - ELI5: re-loading the same signal library twice in a row used to
+    re-walk every byte of the canonical payload to recompute the
+    artifact hash. Phase 3B-1 keeps the most recent 256 such hashes
+    in a small lookup table keyed by ``(path, modification time,
+    size)``. If any of those three change — atomic replace, in-place
+    rewrite, even a touch — the entry is invalidated and the hash
+    recomputes from scratch. Mid-flight mutation in memory still
+    forces a recompute because that path bypasses the cache. As a
+    side benefit, every signal-library load now goes through one
+    centrally maintained loader with NumPy 1.x/2.x compatibility,
+    and a stricter static guard (``B12``) catches any future
+    raw-pickle.load leak in production code.
+  - Status: implemented in Phase 3B-1 (this PR). Phase 3 is NOT
+    complete after 3B-1 — Phase 3B-2 covers output manifests and
+    the remaining Spymaster / TrafficFlow / Confluence deferred
+    surfaces.
