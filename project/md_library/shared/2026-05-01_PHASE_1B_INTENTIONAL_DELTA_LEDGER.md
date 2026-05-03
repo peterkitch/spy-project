@@ -33,7 +33,10 @@ Per-entry status:
   - Entry 7 (calendar grace days default unification to 10):
     implemented in 1B-2B (PR #133). Phase 2/3 path unification
     landed in Entry 5 (1B-2A); the default value flip to 10 and
-    the run_for_secondary force-to-zero fix land here.
+    the run_for_secondary force-to-zero fix land here. Phase
+    2B-2B (PR #137) amendment removes the residual env-write,
+    flips parser default to None, and threads explicit
+    ``grace_days`` kwargs through the Phase 2 / Phase 3 chain.
   - Entry 8 (sentinel pair standardization): implemented in
     1B-2B (PR #133, two-stage: Spymaster streaming-path removal
     + OnePass / TrafficFlow / ImpactSearch sentinel
@@ -535,7 +538,64 @@ Canonical-scoring delegation amendments (1B-2A, post-32c6242):
     the StackBuilder Phase 2 vs Phase 3 divergence. The spec
     mandates a single default of 10. After this entry, every
     non-QC engine uses 10 by default.
-  - Status: implemented in 1B-2B.
+  - Phase 2B-2B amendment (PR #137):
+      Codex's 2B preflight surfaced the remaining sharp edge in
+      the 1B-2B fix: `run_for_secondary` still mutated
+      `os.environ['IMPACT_CALENDAR_GRACE_DAYS']` when the user
+      supplied an explicit `args.grace_days`. The env mutation
+      leaked grace state into worker subprocesses, persisted
+      after `run_for_secondary` returned, and made the value
+      hard to reason about for any in-process caller that did
+      not snapshot/restore the env around the call. Parser
+      default `0` also still meant a CLI invocation without
+      `--grace-days` resolved to strict mode rather than the
+      spec-default 10.
+      Refactor (Option C scope):
+        New helper `_effective_grace_days(grace_days)` resolves
+        `None` to `DEFAULT_GRACE_DAYS` and honors any concrete
+        int (including 0) verbatim. Six functions gained a
+        kwarg-only `grace_days=None` parameter and thread the
+        concrete value through:
+          run_for_secondary
+          phase2_rank_all
+          _score_primary
+          apply_signals_to_secondary
+          _captures_for
+          phase3_build_stacks
+          _signals_aligned_and_mask
+        Parser `--grace-days` default flips from `0` to `None`;
+        help text documents `None -> DEFAULT_GRACE_DAYS=10` and
+        `0` as strict mode. `run_for_secondary` resolves
+        effective grace once via
+          effective_grace = _effective_grace_days(
+              grace_days if grace_days is not None
+              else getattr(args, 'grace_days', None)
+          )
+        and passes the concrete int into Phase 2 and Phase 3
+        instead of writing to `os.environ`. The env write is
+        removed.
+      Affected tests:
+        `test_grace_days_default.py` rewritten:
+          - `test_stackbuilder_run_for_secondary_does_not_write_env`
+            (replaces the prior `..._does_not_force_grace_zero`):
+            asserts the env var is never written and that
+            default (10) and explicit (5) values both reach
+            `phase2_rank_all` and `phase3_build_stacks` via
+            kwarg.
+          - `test_stackbuilder_explicit_grace_zero_strict_mode`:
+            grace=0 reaches both phases verbatim.
+          - `test_stackbuilder_kwarg_grace_overrides_args`:
+            explicit `grace_days=` kwarg on
+            `run_for_secondary` overrides `args.grace_days`.
+          - `test_parse_args_grace_default_none`: parser
+            default flipped to `None`.
+        The pre-existing module-default tests
+        (`test_stackbuilder_default_grace_days_is_10` etc.)
+        continue to pass unchanged; they pin the constant, not
+        the orchestration plumbing.
+  - Status: 1B-2B for default flip + first env-write
+    suppression; 2B-2B for explicit kwarg threading + complete
+    env-write removal + parser default flip to None.
 
 ## Entry 8: sentinel pair standardization
 
@@ -807,6 +867,115 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     The fix hands each background job its own copy of the
     settings.
   - Status: implemented in 1B-2B.
+
+## 2B-2B-1: StackBuilder rank_inverse structural correction
+
+  - Type: BUG-FIX
+  - Old behavior: `phase2_rank_all` constructed `rank_inverse` by
+    copying `rank_all` and negating three numeric columns:
+    ``Avg Daily Capture (%)``, ``Total Capture (%)``, and
+    ``Sharpe Ratio``. The resulting Sharpe values were
+    mathematically incorrect because the canonical Sharpe formula
+    contains a risk-free-rate offset:
+        Sharpe_direct  = (avg_daily * 252 - rfr) / std_dev
+        Sharpe_inverse = (-avg_daily * 252 - rfr) / std_dev
+    Negating only the displayed Sharpe gives
+    -(avg_daily * 252 - rfr) / std_dev, which differs from the
+    real inverse-mode Sharpe by 2 * rfr / std_dev. The same flaw
+    applied to ``p-Value`` (left untouched while Sharpe was
+    negated, producing inconsistent significance vs ranking).
+    Codex's PR #136 audit flagged this as a structural bug, and
+    Phase 2B-2A's `test_b2_stackbuilder_inverse_k1_parity` had to
+    skip Sharpe parity assertions to accommodate it (asserted only
+    `trigger_days` and `total_capture`, which DO match exactly
+    under negate-and-view because the RFR term cancels out and
+    captures sign-flip cleanly).
+  - New behavior: Phase 2 normal path now scores both modes from
+    the same loaded primary library:
+        ``_flip_signals(signals)``: relabel Buy<->Short, leave
+        None untouched. Accepts string-form or int8-form payloads
+        and returns the same shape.
+        ``_load_primary_signals(primary)``: returns
+        ``(vendor, sigs, dates)`` once per primary, decoding
+        int8 to string labels before return so direct and
+        inverse paths can share the decoded payload without
+        duplicate IO.
+        ``_score_primary_from_signals(vendor, sigs, dates,
+        sec_rets, *, mode='D'|'I', grace_days=None)``: scores
+        pre-decoded signals in the requested mode. ``mode='I'``
+        flips signals before alignment so the resulting
+        Sharpe / p-value / std-dev / win-rate / trigger-mask are
+        all real inverse-mode scores. Any value other than 'D' /
+        'I' raises ``ValueError``.
+        ``_score_primary_both_modes(primary, sec_rets, *,
+        grace_days=None)``: returns
+        ``(direct_metrics, inverse_metrics)`` from a single
+        library load. Used by ``phase2_rank_all`` so the normal
+        path doesn't pay 2x IO cost.
+        ``_score_primary(primary, sec_rets, *, mode='D',
+        grace_days=None)`` gains the ``mode`` kwarg for callers
+        that want a single mode at a time.
+    `phase2_rank_all` normal path now collects two row lists
+    (direct and inverse) per primary, builds ``rank_all`` and
+    ``rank_direct`` from direct rows, and ``rank_inverse`` from
+    real inverse-mode rows. The rank DataFrame schema is
+    unchanged: no ``Mode`` column on ``rank_all`` /
+    ``rank_direct`` / ``rank_inverse``;
+    ``phase3_build_stacks`` continues to attach
+    ``Mode`` to its cohort copies (``top['Mode'] = 'D'``,
+    ``bottom['Mode'] = 'I'``).
+    xlsx fast-path: direct ``rank_all`` / ``rank_direct`` still
+    come from the ImpactSearch Excel verbatim (after schema
+    coercion), but ``rank_inverse`` is now recomputed from
+    signal libraries via ``_score_primary_from_signals(...,
+    mode='I')`` for each ticker in the xlsx cohort. Negate-and-
+    view is removed from this branch as well.
+    Missing-library fallback (xlsx fast-path): a ticker whose
+    signal library is missing or corrupt, or whose inverse-mode
+    score returns ``None`` (e.g. zero trigger days), is skipped
+    from ``rank_inverse`` with a single-line warning that names
+    up to the first 10 tickers. The run fails loudly only when
+    ``args.bottom_n > 0`` and no usable inverse-mode rows
+    survived; the user is told to verify signal libraries
+    exist or to drop ``--prefer-impact-xlsx``. This is the
+    "least disruptive documented behavior" alternative from the
+    Phase 2B-2B preflight scope: xlsx fast-paths typically run
+    against a curated cohort whose libraries are available, so
+    skipping is the expected outcome for the rare missing case;
+    the loud bottom_n>0 failure prevents the silent regression
+    case where the user requested an inverse-mode cohort and
+    got an empty one.
+  - Affected tests:
+      ``test_within_engine_parity.py::test_b2_stackbuilder_inverse_k1_parity``
+      now asserts full canonical parity with Phase 3 K=1 inverse
+      (``trigger_days``, ``sharpe``, ``total_capture``,
+      ``p_value``) — the same contract B1 enforces on the direct
+      path. The prior test docstring's caveat about the RFR
+      asymmetry has been retired.
+      New: ``test_b2b_rank_inverse_not_negate_symmetry_when_rfr_nonzero``
+      pins the regression signal: with non-zero RFR, the
+      displayed inverse Sharpe must NOT equal -direct Sharpe
+      (modulo display rounding); negate-and-view would produce
+      delta ~ 0. Also asserts trigger_days symmetry.
+      New: ``test_b2c_xlsx_fastpath_inverse_recomputed_not_negated``
+      monkeypatches ``try_load_rank_from_impact_xlsx`` to return
+      a synthetic xlsx with deliberately-provocative direct
+      values, then asserts ``rank_inverse`` rows match
+      ``_score_primary_from_signals(..., mode='I')`` rather than
+      the sign-flipped xlsx values.
+  - ELI5: previously, "inverse" rank rows for the same primary
+    were built by flipping the sign of three displayed numbers
+    on the direct row. That worked for total capture and avg
+    daily capture (which really do flip sign cleanly) but it
+    was wrong for Sharpe, because Sharpe's formula has a
+    risk-free-rate term that doesn't change sign when you flip
+    signals. The fix runs the inverse strategy through the same
+    scoring code as the direct strategy, after flipping
+    Buy<->Short on the primary signals. Now the inverse Sharpe
+    is the actual Sharpe you'd see if you traded the inverse
+    strategy, not a sign-flipped view of the direct one.
+  - Status: normal path implemented in 2B-2B (PR #137 commit 2);
+    xlsx fast-path implemented in 2B-2B (PR #137 commit 3).
 
 ## 1B-2B-3: StackBuilder --outdir honored
 

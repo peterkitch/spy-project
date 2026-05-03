@@ -73,6 +73,21 @@ DEFAULT_IMPACT_XLSX_DIR = os.environ.get(
 # output format default; can be overridden by --output-format
 OUTPUT_FORMAT = os.environ.get("STACKBUILDER_OUTPUT_FORMAT", "xlsx").lower()
 DEFAULT_GRACE_DAYS = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
+
+
+def _effective_grace_days(grace_days):
+    """Resolve a per-call grace override against DEFAULT_GRACE_DAYS.
+
+    Phase 2B-2B: explicit grace plumbing (Entry 7 amendment). Callers
+    pass ``grace_days=None`` to mean "use the spec-default 10 days";
+    any concrete int (including 0) is honored as-is. ``run_for_secondary``
+    resolves the value once from ``args.grace_days`` and threads the
+    concrete int through ``phase2_rank_all`` / ``phase3_build_stacks``
+    instead of mutating ``os.environ['IMPACT_CALENDAR_GRACE_DAYS']``.
+    """
+    return DEFAULT_GRACE_DAYS if grace_days is None else int(grace_days)
+
+
 # runtime-mutable signal dir (set in main from CLI)
 SIGNAL_LIB_DIR_RUNTIME = DEFAULT_SIGNAL_LIB_DIR
 
@@ -378,7 +393,7 @@ def load_lib_or_none(t: str) -> Optional[dict]:
     return fallback_load_signal_library(t)
 
 # ---------- Signal application and metrics ----------
-def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series, *, return_mask: bool = False):
+def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series, *, return_mask: bool = False, grace_days: Optional[int] = None):
     """
     ImpactSearch-parity alignment:
       - align to secondary index
@@ -391,6 +406,11 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
     Default ``return_mask=False`` returns only ``captures`` for
     backward compatibility with callers that compute their own mask
     or use the legacy single-arg metrics_from_captures fallback.
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg. ``None``
+    falls back to ``DEFAULT_GRACE_DAYS`` via ``_effective_grace_days``;
+    any int (including 0) is honored as-is. Run-orchestration
+    resolves the value once and threads it through.
     """
     if not primary_signals or not primary_dates or sec_returns.empty:
         empty = pd.Series(dtype=FLOAT_DTYPE)
@@ -408,8 +428,8 @@ def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, 
 
     sigs = pd.Series(list(primary_signals), index=idx)
 
-    # Use configured grace window (default 10 days per spec §20)
-    grace_days = DEFAULT_GRACE_DAYS
+    # Resolve grace window: explicit kwarg wins; None -> DEFAULT_GRACE_DAYS.
+    grace_days = _effective_grace_days(grace_days)
     if grace_days > 0:
         # Reindex with forward fill within tolerance window
         aligned = sigs.reindex(sidx, method='pad', tolerance=pd.Timedelta(days=grace_days))
@@ -511,37 +531,157 @@ def phase1_preflight(args, secondary: str, specified_primaries: Optional[List[st
     return primaries_df, sec_rets, vendor_secondary
 
 # ---------- Phase 2: Rank All ----------
-def _score_primary(primary: str, sec_rets: pd.Series) -> Optional[Dict]:
+def _flip_signals(signals):
+    """Phase 2B-2B: relabel Buy<->Short, leave None untouched.
+
+    Used to convert a primary's direct signals into the equivalent
+    inverse-mode signals so that downstream scoring produces a real
+    inverse-mode metric (Sharpe with the correct risk-free-rate sign,
+    proper trigger-mask, etc.) rather than the legacy negate-and-view
+    of direct metrics.
+
+    Accepts a list/iterable of string labels or int8-encoded values.
+    Returns the same shape: list of strings ('Buy', 'Short', 'None')
+    when input is strings; list of ints (1, -1, 0) when input is ints.
+    Empty / None input passes through unchanged.
+    """
+    if signals is None:
+        return signals
+    seq = list(signals)
+    if not seq:
+        return seq
+    if isinstance(seq[0], (int, np.integer)):
+        # Int form: 1=Buy, -1=Short, 0=None. Negate 1<->-1; preserve 0.
+        return [(-int(s) if int(s) in (-1, 1) else 0) for s in seq]
+    # String form.
+    out = []
+    for s in seq:
+        if s == 'Buy':
+            out.append('Short')
+        elif s == 'Short':
+            out.append('Buy')
+        else:
+            out.append('None')
+    return out
+
+
+def _load_primary_signals(primary: str) -> Tuple[str, Optional[List[str]], Optional[List]]:
+    """Phase 2B-2B: load + decode a primary's signal library once.
+
+    Returns ``(vendor, sigs, dates)`` where ``sigs`` is a list of
+    string labels ('Buy' / 'Short' / 'None') and ``dates`` is the
+    library's original date list. ``sigs`` and ``dates`` are ``None``
+    if no library is available or the library is missing required
+    fields. Centralizing this load lets ``phase2_rank_all`` score
+    both modes from the same payload without duplicating IO.
+    """
     vendor, _ = resolve_symbol(primary)
     lib = load_lib_or_none(vendor)
     if not lib:
-        print(f"[WARN] No signal library found for {vendor}")
-        return None
+        return vendor, None, None
     sigs = lib.get('primary_signals') or lib.get('primary_signals_int8')
     dates = lib.get('dates') or lib.get('date_index')
     if not sigs or not dates:
-        return None
+        return vendor, None, None
     if isinstance(sigs[0], (int, np.integer)):
-        dec = {1:'Buy', -1:'Short', 0:'None'}
+        dec = {1: 'Buy', -1: 'Short', 0: 'None'}
         sigs = [dec.get(int(x), 'None') for x in sigs]
-    # Phase 2B-2A: derive an explicit signal-state trigger mask from the
-    # same alignment used to build captures, then pass it to
+    return vendor, list(sigs), list(dates)
+
+
+def _score_primary_from_signals(
+    vendor: str,
+    sigs: List[str],
+    dates: List,
+    sec_rets: pd.Series,
+    *,
+    mode: str = 'D',
+    grace_days: Optional[int] = None,
+) -> Optional[Dict]:
+    """Phase 2B-2B: score pre-decoded signals against ``sec_rets`` in
+    either direct (``mode='D'``) or inverse (``mode='I'``) mode.
+
+    For ``mode='I'`` the signals are flipped Buy<->Short before
+    alignment so the resulting metrics are real inverse-mode scores
+    (correct Sharpe RFR sign, correct trigger mask, etc.). Any value
+    other than 'D' / 'I' raises ``ValueError``.
+    """
+    if mode not in ('D', 'I'):
+        raise ValueError(f"_score_primary_from_signals: mode must be 'D' or 'I', got {mode!r}")
+    use_sigs = sigs if mode == 'D' else _flip_signals(sigs)
+    # Phase 2B-2A: derive an explicit signal-state trigger mask from
+    # the same alignment used to build captures, then pass it to
     # metrics_from_captures so zero-return Buy/Short days count as
-    # losses (spec §15 / ledger Entry 4). Previously this site used the
-    # single-arg fallback whose captures.ne(0.0) mask dropped those
-    # days, producing Phase 2 vs Phase 3 K=1 metric divergence.
-    caps, trigger_mask = apply_signals_to_secondary(sigs, dates, sec_rets, return_mask=True)
+    # losses (spec §15 / ledger Entry 4).
+    caps, trigger_mask = apply_signals_to_secondary(
+        use_sigs, dates, sec_rets, return_mask=True, grace_days=grace_days,
+    )
     m = metrics_from_captures(caps, trigger_mask=trigger_mask)
-    if not m:  # Just check if we have metrics, not the trigger count
+    if not m:
         return None
-    # Log low trigger days as a warning
     if m['Trigger Days'] <= 100:
-        print(f"[WARN] {vendor} has only {m['Trigger Days']} trigger days against secondary")
+        suffix = '' if mode == 'D' else f' (mode={mode})'
+        print(f"[WARN] {vendor} has only {m['Trigger Days']} trigger days against secondary{suffix}")
     m['Primary Ticker'] = vendor
     return m
 
-def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None):
-    """Phase 2: Rank all primaries against secondary with progress tracking."""
+
+def _score_primary(primary: str, sec_rets: pd.Series, *, mode: str = 'D', grace_days: Optional[int] = None) -> Optional[Dict]:
+    """Phase 2B-2B: load + score a single primary in either direct or
+    inverse mode. ``mode='D'`` (default) preserves prior behavior.
+    ``mode='I'`` flips signals Buy<->Short before scoring so the
+    resulting metrics are real inverse-mode scores rather than a
+    negate-and-view of direct metrics.
+
+    Callers that need both modes for the same primary should prefer
+    ``_load_primary_signals`` + two ``_score_primary_from_signals``
+    calls to avoid duplicate IO.
+    """
+    if mode not in ('D', 'I'):
+        raise ValueError(f"_score_primary: mode must be 'D' or 'I', got {mode!r}")
+    vendor, sigs, dates = _load_primary_signals(primary)
+    if sigs is None:
+        if mode == 'D':
+            print(f"[WARN] No signal library found for {vendor}")
+        return None
+    return _score_primary_from_signals(
+        vendor, sigs, dates, sec_rets, mode=mode, grace_days=grace_days,
+    )
+
+
+def _score_primary_both_modes(
+    primary: str,
+    sec_rets: pd.Series,
+    *,
+    grace_days: Optional[int] = None,
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Phase 2B-2B: load a primary once and score it in both modes.
+
+    Returns ``(direct_metrics_or_None, inverse_metrics_or_None)``.
+    Used by ``phase2_rank_all`` so a single library load services
+    both ``rank_direct`` (direct) and ``rank_inverse`` (real
+    inverse-mode) construction.
+    """
+    vendor, sigs, dates = _load_primary_signals(primary)
+    if sigs is None:
+        print(f"[WARN] No signal library found for {vendor}")
+        return None, None
+    direct = _score_primary_from_signals(
+        vendor, sigs, dates, sec_rets, mode='D', grace_days=grace_days,
+    )
+    inverse = _score_primary_from_signals(
+        vendor, sigs, dates, sec_rets, mode='I', grace_days=grace_days,
+    )
+    return direct, inverse
+
+def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None, *, grace_days: Optional[int] = None):
+    """Phase 2: Rank all primaries against secondary with progress tracking.
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg threaded
+    through to ``_score_primary`` and from there to
+    ``apply_signals_to_secondary``. ``None`` falls back to
+    ``DEFAULT_GRACE_DAYS``.
+    """
     # Fast-path: use ImpactSearch .xlsx if requested and available
     if getattr(args, "prefer_impact_xlsx", False):
         sec = (secondary or getattr(args, "secondary", "") or "").upper()
@@ -561,11 +701,67 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                     raise SystemExit(f"[FATAL] None of the entered primaries are present in the ImpactSearch Excel for {secondary}.")
 
             rank_direct = rank_all.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
-            rank_inverse = rank_all.copy()
-            for col in ['Avg Daily Capture (%)','Total Capture (%)','Sharpe Ratio']:
-                if col in rank_inverse.columns:
-                    rank_inverse[col] = pd.to_numeric(rank_inverse[col], errors='coerce') * -1.0
-            rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
+            # Phase 2B-2B: rank_inverse on the xlsx fast-path is now
+            # recomputed from signal libraries via real inverse-mode
+            # scoring (signals flipped Buy<->Short before alignment),
+            # not via negate-and-view of direct metrics. This pins
+            # rank_inverse to the same canonical Sharpe / p-value
+            # form that the normal path produces. Tickers whose
+            # signal library is missing or corrupt are skipped from
+            # rank_inverse with a warning; the run fails loudly only
+            # if the user requested a non-zero bottom_n and no
+            # usable inverse-mode rows survived.
+            inverse_rows: List[Dict] = []
+            inverse_missing: List[str] = []
+            for primary in rank_direct['Primary Ticker'].astype(str).tolist():
+                vendor, sigs, dates = _load_primary_signals(primary)
+                if sigs is None:
+                    inverse_missing.append(vendor)
+                    continue
+                inv = _score_primary_from_signals(
+                    vendor, sigs, dates, sec_rets,
+                    mode='I', grace_days=grace_days,
+                )
+                if inv is None:
+                    inverse_missing.append(vendor)
+                    continue
+                inverse_rows.append(inv)
+
+            if inverse_missing:
+                print(
+                    f"[PHASE2] xlsx fast-path: {len(inverse_missing)} ticker(s) "
+                    f"omitted from rank_inverse due to missing/corrupt signal "
+                    f"library or zero-trigger inverse: {inverse_missing[:10]}"
+                    f"{' ...' if len(inverse_missing) > 10 else ''}"
+                )
+
+            requested_bottom_n = int(getattr(args, 'bottom_n', 0) or 0)
+            if not inverse_rows and requested_bottom_n > 0:
+                raise SystemExit(
+                    f"[FATAL] xlsx fast-path: requested bottom_n="
+                    f"{requested_bottom_n} but no inverse-mode rows could be "
+                    f"computed for any of the {len(rank_direct)} primaries in "
+                    f"the ImpactSearch Excel. Verify signal libraries exist "
+                    f"under {getattr(args, 'signal_lib_dir', SIGNAL_LIB_DIR_RUNTIME)} "
+                    f"or run without --prefer-impact-xlsx."
+                )
+
+            if inverse_rows:
+                rank_inverse = pd.DataFrame(inverse_rows)
+                # Reindex to rank_all column schema where possible so
+                # downstream consumers' column-access contracts hold.
+                shared_cols = [c for c in rank_all.columns if c in rank_inverse.columns]
+                rank_inverse = rank_inverse.reindex(columns=rank_all.columns)
+                # Sort by canonical key for consistency with the normal path.
+                if 'Total Capture (%)' in rank_inverse.columns:
+                    rank_inverse = rank_inverse.sort_values(
+                        by='Total Capture (%)', ascending=False
+                    ).reset_index(drop=True)
+                else:
+                    rank_inverse = rank_inverse.reset_index(drop=True)
+            else:
+                rank_inverse = pd.DataFrame(columns=rank_all.columns)
+
             write_table(rank_all, os.path.join(outdir, 'rank_all'))
             write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
             write_table(rank_inverse, os.path.join(outdir, 'rank_inverse'))
@@ -590,15 +786,26 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                                f"Expected a file like '{secondary or args.secondary}_analysis.xlsx'. "
                                f"Uncheck 'Use ImpactSearch .xlsx' to compute from signal libraries.")
     max_workers = None if args.threads == 'auto' else int(args.threads)
-    rows = []
-    missing = []
+    rows_direct: List[Dict] = []
+    rows_inverse: List[Dict] = []
+    missing: List[str] = []
     total = len(primaries_df['Primary Ticker'])
 
     if VERBOSE:
         print(f"[PHASE2] Scoring {total} primary tickers against {secondary}...")
 
+    # Phase 2B-2B: score both modes per primary from a single library
+    # load. rank_inverse is now built from real inverse-mode scores
+    # (signals flipped Buy<->Short before alignment) rather than a
+    # negate-and-view of direct metrics. The negate-and-view produces
+    # an incorrect Sharpe because the risk-free-rate term doesn't
+    # change sign under metric negation; flipping signals first and
+    # rescoring resolves that asymmetry.
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_score_primary, t, sec_rets): t for t in primaries_df['Primary Ticker']}
+        futures = {
+            ex.submit(_score_primary_both_modes, t, sec_rets, grace_days=grace_days): t
+            for t in primaries_df['Primary Ticker']
+        }
 
         # Use tqdm if available, otherwise simple counter
         if tqdm and not getattr(args, 'no_progress', False):
@@ -612,11 +819,14 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
         step = max(50, max(1, total // 200))
         for i, fut in enumerate(iterator, 1):
             ticker = futures[fut]
-            res = fut.result()
-            if res:
-                rows.append(res)
-            else:
+            direct_m, inverse_m = fut.result()
+            if direct_m is None and inverse_m is None:
                 missing.append(ticker)
+            else:
+                if direct_m is not None:
+                    rows_direct.append(direct_m)
+                if inverse_m is not None:
+                    rows_inverse.append(inverse_m)
 
             # Progress reporting with counters
             now = time.time()
@@ -640,17 +850,31 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     if missing:
         print(f"[INFO] {len(missing)} tickers had no valid metrics or missing signal libraries")
 
-    if not rows:
+    if not rows_direct:
         raise SystemExit("[FATAL] No primaries produced valid metrics.")
 
-    rank_all = pd.DataFrame(rows)
+    # rank_all and rank_direct: direct-mode metrics. rank_inverse:
+    # real inverse-mode metrics (separate scoring path; column schema
+    # matches rank_all/rank_direct so downstream consumers — including
+    # phase3_build_stacks — keep their existing column-access
+    # contracts).
+    rank_all = pd.DataFrame(rows_direct)
     rank_direct = rank_all.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
 
-    rank_inverse = rank_all.copy()
-    # flip sign for ranking; p-Value and Trigger Days unchanged
-    for col in ['Avg Daily Capture (%)','Total Capture (%)','Sharpe Ratio']:
-        rank_inverse[col] = rank_inverse[col].astype(float) * -1.0
-    rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
+    if rows_inverse:
+        rank_inverse = pd.DataFrame(rows_inverse)
+        # Reindex columns so rank_inverse has the same shape as
+        # rank_direct (defensive: every row was built by
+        # _score_primary_from_signals on the same metrics dict
+        # template, so columns should already match).
+        rank_inverse = rank_inverse.reindex(columns=rank_all.columns)
+        rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
+    else:
+        # No usable inverse-mode rows. Emit an empty DF with the same
+        # column schema so downstream consumers don't blow up on
+        # column access. phase3_build_stacks will simply find an
+        # empty bottom cohort if bottom_n > 0.
+        rank_inverse = pd.DataFrame(columns=rank_all.columns)
 
     write_table(rank_all, os.path.join(outdir, 'rank_all'))
     write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
@@ -658,7 +882,7 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     return rank_all, rank_direct, rank_inverse
 
 # ---------- Phase 3: Stack Builder ----------
-def _captures_for(primary: str, mode: str, sec_rets: pd.Series) -> pd.Series:
+def _captures_for(primary: str, mode: str, sec_rets: pd.Series, *, grace_days: Optional[int] = None) -> pd.Series:
     vendor, _ = resolve_symbol(primary)
     lib = load_lib_or_none(vendor)
     if not lib:
@@ -670,7 +894,7 @@ def _captures_for(primary: str, mode: str, sec_rets: pd.Series) -> pd.Series:
     if isinstance(sigs[0], (int, np.integer)):
         dec = {1:'Buy', -1:'Short', 0:'None'}
         sigs = [dec.get(int(x), 'None') for x in sigs]
-    caps = apply_signals_to_secondary(sigs, dates, sec_rets)
+    caps = apply_signals_to_secondary(sigs, dates, sec_rets, grace_days=grace_days)
     return (-caps if mode == 'I' else caps).astype(FLOAT_DTYPE)
 
 def _combined_metrics(member_caps: List[pd.Series]) -> Tuple[pd.Series, Optional[Dict]]:
@@ -691,8 +915,14 @@ def _combined_metrics(member_caps: List[pd.Series]) -> Tuple[pd.Series, Optional
     return combined, m
 
 # NEW: signal-level helpers with strict-calendar mask (spymaster-parity)
-def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex) -> Tuple[pd.Series, pd.Series]:
-    """Return (signals_aligned_to_sec_index, present_mask_before_fill)."""
+def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex, *, grace_days: Optional[int] = None) -> Tuple[pd.Series, pd.Series]:
+    """Return (signals_aligned_to_sec_index, present_mask_before_fill).
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg. ``None``
+    falls back to ``DEFAULT_GRACE_DAYS``; explicit ints (including 0)
+    are honored verbatim. Calendar policy stays unified with Phase 2's
+    ``apply_signals_to_secondary`` (Entry 5).
+    """
     vendor, _ = resolve_symbol(primary)
     try:
         lib = load_lib_or_none(vendor)
@@ -716,10 +946,9 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
         raise RuntimeError(f"Ticker {vendor} signal library error: {e}") from e
     # Unify calendar policy with Phase 2 (apply_signals_to_secondary) per
     # Phase 1B Intentional Delta Ledger Entry 5 (StackBuilder Phase 2 vs
-    # Phase 3 scoring divergence). Phase 2 uses DEFAULT_GRACE_DAYS; Phase 3
-    # previously read the env var with a separate default of 0, producing
-    # divergent calendar masks for the same primary/secondary pair.
-    grace_days = DEFAULT_GRACE_DAYS
+    # Phase 3 scoring divergence). Both phases now resolve grace via the
+    # same ``_effective_grace_days`` helper (Entry 7 amendment, 2B-2B).
+    grace_days = _effective_grace_days(grace_days)
     if grace_days > 0:
         aligned = raw.reindex(sec_index, method='pad', tolerance=pd.Timedelta(days=grace_days))
     else:
@@ -772,10 +1001,14 @@ def _combined_metrics_signals(member_signals: List[Union[pd.Series, Tuple[pd.Ser
     m = metrics_from_captures(combined_caps, trigger_mask=trigger_mask)
     return combined_caps, m
 
-def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None) -> Tuple[pd.DataFrame, List]:
+def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None, *, grace_days: Optional[int] = None) -> Tuple[pd.DataFrame, List]:
     """Beam+exhaustive search over top/bottom cohort with both modes.
     progress_cb: optional callback for reporting progress
     Returns: (leaderboard_df, final_members_list)
+
+    Phase 2B-2B: ``grace_days`` is now an explicit kwarg threaded
+    through to ``_signals_aligned_and_mask`` for every (ticker, mode)
+    in the cohort. ``None`` falls back to ``DEFAULT_GRACE_DAYS``.
     """
     topN, botN = int(args.top_n), int(args.bottom_n)
     min_td = int(getattr(args, 'min_trigger_days', 30))
@@ -820,7 +1053,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     for _, r in cohort.iterrows():
         t, m = r['Primary Ticker'], r['Mode']
         if (t, m) not in sig_cache:
-            sig_cache[(t, m)] = _signals_aligned_and_mask(t, m, sec_rets.index)
+            sig_cache[(t, m)] = _signals_aligned_and_mask(t, m, sec_rets.index, grace_days=grace_days)
     def sigs_for(t, m): return sig_cache.get((t, m), (pd.Series('None', index=sec_rets.index),
                                                         pd.Series(False, index=sec_rets.index)))
 
@@ -1511,7 +1744,7 @@ def run_dash(outdir: str, port: int = 8054):
     app.run_server(debug=False, port=port, use_reloader=False)
 
 # ---------- Orchestration ----------
-def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[str]] = None) -> str:
+def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[str]] = None, *, grace_days: Optional[int] = None) -> str:
     # Ensure worker processes inherit the same runtime configuration as the parent.
     global OUTPUT_FORMAT, SIGNAL_LIB_DIR_RUNTIME, VERBOSE, COMBINE_INTERSECTION
     try:
@@ -1523,13 +1756,19 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         pass
 
     start_time = time.time()
-    # Phase 1B-2B: respect args.grace_days when explicitly set, otherwise
-    # leave IMPACT_CALENDAR_GRACE_DAYS untouched so DEFAULT_GRACE_DAYS=10
-    # (spec §20) governs. Previously this line forced grace to 0 when
-    # args.grace_days was unset, defeating the default.
-    _grace_override = getattr(args, 'grace_days', None)
-    if _grace_override is not None:
-        os.environ['IMPACT_CALENDAR_GRACE_DAYS'] = str(_grace_override)
+    # Phase 2B-2B: resolve grace once and thread it explicitly through
+    # phase2_rank_all and phase3_build_stacks. Previously this site
+    # mutated os.environ['IMPACT_CALENDAR_GRACE_DAYS'] when
+    # args.grace_days was set, leaking grace state into worker
+    # subprocesses and any subsequent in-process callers. The env
+    # write is removed; an explicit kwarg-only ``grace_days`` parameter
+    # on this function takes precedence over args.grace_days, and an
+    # unset value falls back to DEFAULT_GRACE_DAYS via
+    # _effective_grace_days.
+    effective_grace = _effective_grace_days(
+        grace_days if grace_days is not None
+        else getattr(args, 'grace_days', None)
+    )
     primaries_df, sec_rets, vendor_secondary = phase1_preflight(args, secondary, specified_primaries)
     ts = now_ts()
     # Clean secondary name for filesystem, but preserve '^' (safe on NTFS) per design
@@ -1574,7 +1813,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         _write_progress(ppath, status='running', phase='ranking', percent=25.0,
                         message=f'Ranking {len(primaries_df)} primaries against {vendor_secondary}...',
                         outdir=temp_outdir, secondary=vendor_secondary)
-        rank_all, rank_direct, rank_inverse = phase2_rank_all(args, primaries_df, sec_rets, temp_outdir, secondary=vendor_secondary, progress_path=ppath)
+        rank_all, rank_direct, rank_inverse = phase2_rank_all(args, primaries_df, sec_rets, temp_outdir, secondary=vendor_secondary, progress_path=ppath, grace_days=effective_grace)
 
         cohort_sz = args.top_n + args.bottom_n
         _write_progress(ppath, status='running', phase='stacking', percent=60.0,
@@ -1597,7 +1836,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
 
         # Pass progress callback to phase3
         leaderboard, final_members = phase3_build_stacks(
-            args, rank_direct, rank_inverse, sec_rets, temp_outdir, progress_cb=_k_progress
+            args, rank_direct, rank_inverse, sec_rets, temp_outdir, progress_cb=_k_progress, grace_days=effective_grace
         )
 
         _write_progress(ppath, status='running', phase='finalizing', percent=90.0,
@@ -1722,8 +1961,11 @@ def parse_args(argv=None):
                    help='Metric to optimize for K>=2 (defaults to seed-by if not specified)')
     p.add_argument('--allow-decreasing', action='store_true',
                    help='Allow metric to decrease across K levels (find best at each K independently)')
-    p.add_argument('--grace-days', type=int, default=0,
-                   help='Max calendar pad when aligning primary signals to secondary (0 = strict, spymaster-parity)')
+    p.add_argument('--grace-days', type=int, default=None,
+                   help=('Max calendar pad when aligning primary signals to '
+                         'secondary. Unset (None) uses DEFAULT_GRACE_DAYS=10 '
+                         'per spec §20; explicit 0 means strict mode '
+                         '(spymaster-parity).'))
     p.add_argument('--search', choices=['greedy','beam','exhaustive'], default='beam',
                    help='Combinatorics strategy for K>1')
     p.add_argument('--beam-width', type=int, default=12,
