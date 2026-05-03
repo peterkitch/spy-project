@@ -868,6 +868,93 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     settings.
   - Status: implemented in 1B-2B.
 
+## 2B-2B-1: StackBuilder rank_inverse structural correction
+
+  - Type: BUG-FIX
+  - Old behavior: `phase2_rank_all` constructed `rank_inverse` by
+    copying `rank_all` and negating three numeric columns:
+    ``Avg Daily Capture (%)``, ``Total Capture (%)``, and
+    ``Sharpe Ratio``. The resulting Sharpe values were
+    mathematically incorrect because the canonical Sharpe formula
+    contains a risk-free-rate offset:
+        Sharpe_direct  = (avg_daily * 252 - rfr) / std_dev
+        Sharpe_inverse = (-avg_daily * 252 - rfr) / std_dev
+    Negating only the displayed Sharpe gives
+    -(avg_daily * 252 - rfr) / std_dev, which differs from the
+    real inverse-mode Sharpe by 2 * rfr / std_dev. The same flaw
+    applied to ``p-Value`` (left untouched while Sharpe was
+    negated, producing inconsistent significance vs ranking).
+    Codex's PR #136 audit flagged this as a structural bug, and
+    Phase 2B-2A's `test_b2_stackbuilder_inverse_k1_parity` had to
+    skip Sharpe parity assertions to accommodate it (asserted only
+    `trigger_days` and `total_capture`, which DO match exactly
+    under negate-and-view because the RFR term cancels out and
+    captures sign-flip cleanly).
+  - New behavior: Phase 2 normal path now scores both modes from
+    the same loaded primary library:
+        ``_flip_signals(signals)``: relabel Buy<->Short, leave
+        None untouched. Accepts string-form or int8-form payloads
+        and returns the same shape.
+        ``_load_primary_signals(primary)``: returns
+        ``(vendor, sigs, dates)`` once per primary, decoding
+        int8 to string labels before return so direct and
+        inverse paths can share the decoded payload without
+        duplicate IO.
+        ``_score_primary_from_signals(vendor, sigs, dates,
+        sec_rets, *, mode='D'|'I', grace_days=None)``: scores
+        pre-decoded signals in the requested mode. ``mode='I'``
+        flips signals before alignment so the resulting
+        Sharpe / p-value / std-dev / win-rate / trigger-mask are
+        all real inverse-mode scores. Any value other than 'D' /
+        'I' raises ``ValueError``.
+        ``_score_primary_both_modes(primary, sec_rets, *,
+        grace_days=None)``: returns
+        ``(direct_metrics, inverse_metrics)`` from a single
+        library load. Used by ``phase2_rank_all`` so the normal
+        path doesn't pay 2x IO cost.
+        ``_score_primary(primary, sec_rets, *, mode='D',
+        grace_days=None)`` gains the ``mode`` kwarg for callers
+        that want a single mode at a time.
+    `phase2_rank_all` normal path now collects two row lists
+    (direct and inverse) per primary, builds ``rank_all`` and
+    ``rank_direct`` from direct rows, and ``rank_inverse`` from
+    real inverse-mode rows. The rank DataFrame schema is
+    unchanged: no ``Mode`` column on ``rank_all`` /
+    ``rank_direct`` / ``rank_inverse``;
+    ``phase3_build_stacks`` continues to attach
+    ``Mode`` to its cohort copies (``top['Mode'] = 'D'``,
+    ``bottom['Mode'] = 'I'``).
+    The xlsx fast-path is addressed in a follow-up commit
+    (PR #137 commit 3): direct ``rank_all`` / ``rank_direct``
+    still come from the xlsx, but ``rank_inverse`` is recomputed
+    from signal libraries via ``_score_primary_from_signals(...,
+    mode='I')`` rather than via negate-and-view.
+  - Affected tests:
+      ``test_within_engine_parity.py::test_b2_stackbuilder_inverse_k1_parity``
+      now asserts full canonical parity with Phase 3 K=1 inverse
+      (``trigger_days``, ``sharpe``, ``total_capture``,
+      ``p_value``) — the same contract B1 enforces on the direct
+      path. The prior test docstring's caveat about the RFR
+      asymmetry has been retired.
+      New: ``test_b2b_rank_inverse_not_negate_symmetry_when_rfr_nonzero``
+      pins the regression signal: with non-zero RFR, the
+      displayed inverse Sharpe must NOT equal -direct Sharpe
+      (modulo display rounding); negate-and-view would produce
+      delta ~ 0. Also asserts trigger_days symmetry.
+  - ELI5: previously, "inverse" rank rows for the same primary
+    were built by flipping the sign of three displayed numbers
+    on the direct row. That worked for total capture and avg
+    daily capture (which really do flip sign cleanly) but it
+    was wrong for Sharpe, because Sharpe's formula has a
+    risk-free-rate term that doesn't change sign when you flip
+    signals. The fix runs the inverse strategy through the same
+    scoring code as the direct strategy, after flipping
+    Buy<->Short on the primary signals. Now the inverse Sharpe
+    is the actual Sharpe you'd see if you traded the inverse
+    strategy, not a sign-flipped view of the direct one.
+  - Status: normal path implemented in 2B-2B (PR #137 commit 2);
+    xlsx fast-path follows in PR #137 commit 3.
+
 ## 1B-2B-3: StackBuilder --outdir honored
 
   - Type: BUG-FIX

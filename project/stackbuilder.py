@@ -531,34 +531,148 @@ def phase1_preflight(args, secondary: str, specified_primaries: Optional[List[st
     return primaries_df, sec_rets, vendor_secondary
 
 # ---------- Phase 2: Rank All ----------
-def _score_primary(primary: str, sec_rets: pd.Series, *, grace_days: Optional[int] = None) -> Optional[Dict]:
+def _flip_signals(signals):
+    """Phase 2B-2B: relabel Buy<->Short, leave None untouched.
+
+    Used to convert a primary's direct signals into the equivalent
+    inverse-mode signals so that downstream scoring produces a real
+    inverse-mode metric (Sharpe with the correct risk-free-rate sign,
+    proper trigger-mask, etc.) rather than the legacy negate-and-view
+    of direct metrics.
+
+    Accepts a list/iterable of string labels or int8-encoded values.
+    Returns the same shape: list of strings ('Buy', 'Short', 'None')
+    when input is strings; list of ints (1, -1, 0) when input is ints.
+    Empty / None input passes through unchanged.
+    """
+    if signals is None:
+        return signals
+    seq = list(signals)
+    if not seq:
+        return seq
+    if isinstance(seq[0], (int, np.integer)):
+        # Int form: 1=Buy, -1=Short, 0=None. Negate 1<->-1; preserve 0.
+        return [(-int(s) if int(s) in (-1, 1) else 0) for s in seq]
+    # String form.
+    out = []
+    for s in seq:
+        if s == 'Buy':
+            out.append('Short')
+        elif s == 'Short':
+            out.append('Buy')
+        else:
+            out.append('None')
+    return out
+
+
+def _load_primary_signals(primary: str) -> Tuple[str, Optional[List[str]], Optional[List]]:
+    """Phase 2B-2B: load + decode a primary's signal library once.
+
+    Returns ``(vendor, sigs, dates)`` where ``sigs`` is a list of
+    string labels ('Buy' / 'Short' / 'None') and ``dates`` is the
+    library's original date list. ``sigs`` and ``dates`` are ``None``
+    if no library is available or the library is missing required
+    fields. Centralizing this load lets ``phase2_rank_all`` score
+    both modes from the same payload without duplicating IO.
+    """
     vendor, _ = resolve_symbol(primary)
     lib = load_lib_or_none(vendor)
     if not lib:
-        print(f"[WARN] No signal library found for {vendor}")
-        return None
+        return vendor, None, None
     sigs = lib.get('primary_signals') or lib.get('primary_signals_int8')
     dates = lib.get('dates') or lib.get('date_index')
     if not sigs or not dates:
-        return None
+        return vendor, None, None
     if isinstance(sigs[0], (int, np.integer)):
-        dec = {1:'Buy', -1:'Short', 0:'None'}
+        dec = {1: 'Buy', -1: 'Short', 0: 'None'}
         sigs = [dec.get(int(x), 'None') for x in sigs]
-    # Phase 2B-2A: derive an explicit signal-state trigger mask from the
-    # same alignment used to build captures, then pass it to
+    return vendor, list(sigs), list(dates)
+
+
+def _score_primary_from_signals(
+    vendor: str,
+    sigs: List[str],
+    dates: List,
+    sec_rets: pd.Series,
+    *,
+    mode: str = 'D',
+    grace_days: Optional[int] = None,
+) -> Optional[Dict]:
+    """Phase 2B-2B: score pre-decoded signals against ``sec_rets`` in
+    either direct (``mode='D'``) or inverse (``mode='I'``) mode.
+
+    For ``mode='I'`` the signals are flipped Buy<->Short before
+    alignment so the resulting metrics are real inverse-mode scores
+    (correct Sharpe RFR sign, correct trigger mask, etc.). Any value
+    other than 'D' / 'I' raises ``ValueError``.
+    """
+    if mode not in ('D', 'I'):
+        raise ValueError(f"_score_primary_from_signals: mode must be 'D' or 'I', got {mode!r}")
+    use_sigs = sigs if mode == 'D' else _flip_signals(sigs)
+    # Phase 2B-2A: derive an explicit signal-state trigger mask from
+    # the same alignment used to build captures, then pass it to
     # metrics_from_captures so zero-return Buy/Short days count as
-    # losses (spec §15 / ledger Entry 4). Previously this site used the
-    # single-arg fallback whose captures.ne(0.0) mask dropped those
-    # days, producing Phase 2 vs Phase 3 K=1 metric divergence.
-    caps, trigger_mask = apply_signals_to_secondary(sigs, dates, sec_rets, return_mask=True, grace_days=grace_days)
+    # losses (spec §15 / ledger Entry 4).
+    caps, trigger_mask = apply_signals_to_secondary(
+        use_sigs, dates, sec_rets, return_mask=True, grace_days=grace_days,
+    )
     m = metrics_from_captures(caps, trigger_mask=trigger_mask)
-    if not m:  # Just check if we have metrics, not the trigger count
+    if not m:
         return None
-    # Log low trigger days as a warning
     if m['Trigger Days'] <= 100:
-        print(f"[WARN] {vendor} has only {m['Trigger Days']} trigger days against secondary")
+        suffix = '' if mode == 'D' else f' (mode={mode})'
+        print(f"[WARN] {vendor} has only {m['Trigger Days']} trigger days against secondary{suffix}")
     m['Primary Ticker'] = vendor
     return m
+
+
+def _score_primary(primary: str, sec_rets: pd.Series, *, mode: str = 'D', grace_days: Optional[int] = None) -> Optional[Dict]:
+    """Phase 2B-2B: load + score a single primary in either direct or
+    inverse mode. ``mode='D'`` (default) preserves prior behavior.
+    ``mode='I'`` flips signals Buy<->Short before scoring so the
+    resulting metrics are real inverse-mode scores rather than a
+    negate-and-view of direct metrics.
+
+    Callers that need both modes for the same primary should prefer
+    ``_load_primary_signals`` + two ``_score_primary_from_signals``
+    calls to avoid duplicate IO.
+    """
+    if mode not in ('D', 'I'):
+        raise ValueError(f"_score_primary: mode must be 'D' or 'I', got {mode!r}")
+    vendor, sigs, dates = _load_primary_signals(primary)
+    if sigs is None:
+        if mode == 'D':
+            print(f"[WARN] No signal library found for {vendor}")
+        return None
+    return _score_primary_from_signals(
+        vendor, sigs, dates, sec_rets, mode=mode, grace_days=grace_days,
+    )
+
+
+def _score_primary_both_modes(
+    primary: str,
+    sec_rets: pd.Series,
+    *,
+    grace_days: Optional[int] = None,
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Phase 2B-2B: load a primary once and score it in both modes.
+
+    Returns ``(direct_metrics_or_None, inverse_metrics_or_None)``.
+    Used by ``phase2_rank_all`` so a single library load services
+    both ``rank_direct`` (direct) and ``rank_inverse`` (real
+    inverse-mode) construction.
+    """
+    vendor, sigs, dates = _load_primary_signals(primary)
+    if sigs is None:
+        print(f"[WARN] No signal library found for {vendor}")
+        return None, None
+    direct = _score_primary_from_signals(
+        vendor, sigs, dates, sec_rets, mode='D', grace_days=grace_days,
+    )
+    inverse = _score_primary_from_signals(
+        vendor, sigs, dates, sec_rets, mode='I', grace_days=grace_days,
+    )
+    return direct, inverse
 
 def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None, *, grace_days: Optional[int] = None):
     """Phase 2: Rank all primaries against secondary with progress tracking.
@@ -616,15 +730,26 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                                f"Expected a file like '{secondary or args.secondary}_analysis.xlsx'. "
                                f"Uncheck 'Use ImpactSearch .xlsx' to compute from signal libraries.")
     max_workers = None if args.threads == 'auto' else int(args.threads)
-    rows = []
-    missing = []
+    rows_direct: List[Dict] = []
+    rows_inverse: List[Dict] = []
+    missing: List[str] = []
     total = len(primaries_df['Primary Ticker'])
 
     if VERBOSE:
         print(f"[PHASE2] Scoring {total} primary tickers against {secondary}...")
 
+    # Phase 2B-2B: score both modes per primary from a single library
+    # load. rank_inverse is now built from real inverse-mode scores
+    # (signals flipped Buy<->Short before alignment) rather than a
+    # negate-and-view of direct metrics. The negate-and-view produces
+    # an incorrect Sharpe because the risk-free-rate term doesn't
+    # change sign under metric negation; flipping signals first and
+    # rescoring resolves that asymmetry.
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_score_primary, t, sec_rets, grace_days=grace_days): t for t in primaries_df['Primary Ticker']}
+        futures = {
+            ex.submit(_score_primary_both_modes, t, sec_rets, grace_days=grace_days): t
+            for t in primaries_df['Primary Ticker']
+        }
 
         # Use tqdm if available, otherwise simple counter
         if tqdm and not getattr(args, 'no_progress', False):
@@ -638,11 +763,14 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
         step = max(50, max(1, total // 200))
         for i, fut in enumerate(iterator, 1):
             ticker = futures[fut]
-            res = fut.result()
-            if res:
-                rows.append(res)
-            else:
+            direct_m, inverse_m = fut.result()
+            if direct_m is None and inverse_m is None:
                 missing.append(ticker)
+            else:
+                if direct_m is not None:
+                    rows_direct.append(direct_m)
+                if inverse_m is not None:
+                    rows_inverse.append(inverse_m)
 
             # Progress reporting with counters
             now = time.time()
@@ -666,17 +794,31 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     if missing:
         print(f"[INFO] {len(missing)} tickers had no valid metrics or missing signal libraries")
 
-    if not rows:
+    if not rows_direct:
         raise SystemExit("[FATAL] No primaries produced valid metrics.")
 
-    rank_all = pd.DataFrame(rows)
+    # rank_all and rank_direct: direct-mode metrics. rank_inverse:
+    # real inverse-mode metrics (separate scoring path; column schema
+    # matches rank_all/rank_direct so downstream consumers — including
+    # phase3_build_stacks — keep their existing column-access
+    # contracts).
+    rank_all = pd.DataFrame(rows_direct)
     rank_direct = rank_all.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
 
-    rank_inverse = rank_all.copy()
-    # flip sign for ranking; p-Value and Trigger Days unchanged
-    for col in ['Avg Daily Capture (%)','Total Capture (%)','Sharpe Ratio']:
-        rank_inverse[col] = rank_inverse[col].astype(float) * -1.0
-    rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
+    if rows_inverse:
+        rank_inverse = pd.DataFrame(rows_inverse)
+        # Reindex columns so rank_inverse has the same shape as
+        # rank_direct (defensive: every row was built by
+        # _score_primary_from_signals on the same metrics dict
+        # template, so columns should already match).
+        rank_inverse = rank_inverse.reindex(columns=rank_all.columns)
+        rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
+    else:
+        # No usable inverse-mode rows. Emit an empty DF with the same
+        # column schema so downstream consumers don't blow up on
+        # column access. phase3_build_stacks will simply find an
+        # empty bottom cohort if bottom_n > 0.
+        rank_inverse = pd.DataFrame(columns=rank_all.columns)
 
     write_table(rank_all, os.path.join(outdir, 'rank_all'))
     write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
