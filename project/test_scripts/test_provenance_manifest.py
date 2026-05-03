@@ -371,3 +371,223 @@ def test_f16_metadata_repair_persist_preserves_manifest(tmp_path, monkeypatch):
     with open(saved_path, "rb") as f:
         loaded = pickle.load(f)
     assert loaded["_manifest"]["source_data"] == original_source
+
+
+# ---------------------------------------------------------------------------
+# Consumer hook helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_lib_for_consumer(
+    library_dir: Path,
+    ticker: str,
+    *,
+    engine_version: str = "1.0.0",
+    price_source: str = "Close",
+    parity_hash: str = "PHASE3A_PARITY_HASH",
+    with_manifest: bool = True,
+    mutate_after_attach: bool = False,
+    interval: str = "1d",
+) -> Path:
+    """Build a tiny signal library on disk and (optionally) attach a manifest.
+
+    Used by the C1-C5 consumer hook tests. Filenames mirror the engine
+    naming convention: ``<ticker>_stable_v1_0_0.pkl`` for daily,
+    ``<ticker>_stable_v1_0_0_<interval>.pkl`` otherwise.
+    """
+    library_dir.mkdir(parents=True, exist_ok=True)
+    dates = pd.bdate_range(start="2024-01-02", periods=20)
+    closes = make_synthetic_close_prices(dates)
+    sigs = ["Buy", "Short", "None"] * (len(dates) // 3) + ["None"] * (
+        len(dates) % 3
+    )
+    lib = make_signal_library_dict(
+        dates,
+        engine_version=engine_version,
+        price_source=price_source,
+        parity_hash=parity_hash,
+        primary_signals=sigs,
+    )
+    lib["signals"] = list(sigs)
+    lib["interval"] = interval
+    lib["ticker"] = ticker
+    lib["build_timestamp"] = "2025-01-01T00:00:00"
+
+    if interval == "1d":
+        fname = f"{ticker}_stable_v{engine_version.replace('.', '_')}.pkl"
+    else:
+        fname = (
+            f"{ticker}_stable_v{engine_version.replace('.', '_')}"
+            f"_{interval}.pkl"
+        )
+    path = library_dir / fname
+
+    if with_manifest:
+        pm.attach_manifest(
+            lib,
+            path,
+            artifact_type=(
+                "signal_library_daily" if interval == "1d"
+                else "interval_signal_library"
+            ),
+            ticker=ticker,
+            interval=interval,
+            params={
+                "engine_version": engine_version,
+                "MAX_SMA_DAY": 114,
+                "price_source": price_source,
+                "parity_hash": parity_hash,
+                "interval": interval,
+            },
+            source_close=closes,
+            engine_version=engine_version,
+        )
+        if mutate_after_attach:
+            # Tamper after manifest attach -> content_hash mismatch.
+            lib["primary_signals"] = ["Short"] * len(lib["primary_signals"])
+
+    with open(path, "wb") as f:
+        pickle.dump(lib, f)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# F11: onepass consumer verification hook
+# ---------------------------------------------------------------------------
+
+
+def test_f11_onepass_consumer_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    library_dir = tmp_path / "stable"
+    monkeypatch.setattr(onepass, "SIGNAL_LIBRARY_DIR", str(tmp_path))
+
+    # Valid manifest -> load succeeds.
+    _write_lib_for_consumer(
+        library_dir, "AAA",
+        parity_hash=onepass.compute_parity_hash(),
+    )
+    lib = onepass.load_signal_library("AAA")
+    assert lib is not None
+    assert lib["ticker"] == "AAA"
+
+    # Tampered library (manifest mismatch) -> load returns None.
+    _write_lib_for_consumer(
+        library_dir, "BBB",
+        parity_hash=onepass.compute_parity_hash(),
+        mutate_after_attach=True,
+    )
+    assert onepass.load_signal_library("BBB") is None
+
+    # Legacy library (no manifest) -> load still works (warning).
+    _write_lib_for_consumer(
+        library_dir, "CCC",
+        parity_hash=onepass.compute_parity_hash(),
+        with_manifest=False,
+    )
+    legacy = onepass.load_signal_library("CCC")
+    assert legacy is not None
+    assert legacy["ticker"] == "CCC"
+
+
+# ---------------------------------------------------------------------------
+# F12: impactsearch consumer verification hook
+# ---------------------------------------------------------------------------
+
+
+def test_f12_impactsearch_consumer_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    library_dir = tmp_path / "stable"
+    monkeypatch.setattr(impactsearch, "SIGNAL_LIBRARY_DIR", str(tmp_path))
+
+    _write_lib_for_consumer(library_dir, "AAA")
+    lib = impactsearch.load_signal_library("AAA")
+    assert lib is not None
+
+    _write_lib_for_consumer(library_dir, "BBB", mutate_after_attach=True)
+    assert impactsearch.load_signal_library("BBB") is None
+
+    _write_lib_for_consumer(library_dir, "CCC", with_manifest=False)
+    legacy = impactsearch.load_signal_library("CCC")
+    assert legacy is not None
+
+
+# ---------------------------------------------------------------------------
+# F13: impact_fastpath consumer verification hook
+# ---------------------------------------------------------------------------
+
+
+def test_f13_impact_fastpath_consumer_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import impact_fastpath
+
+    library_dir = tmp_path / "stable"
+    monkeypatch.setattr(impact_fastpath, "SIGNAL_LIBRARY_DIR", str(tmp_path))
+
+    _write_lib_for_consumer(library_dir, "AAA")
+    lib = impact_fastpath._load_signal_library_quick("AAA")
+    assert lib is not None
+
+    _write_lib_for_consumer(library_dir, "BBB", mutate_after_attach=True)
+    assert impact_fastpath._load_signal_library_quick("BBB") is None
+
+    _write_lib_for_consumer(library_dir, "CCC", with_manifest=False)
+    legacy = impact_fastpath._load_signal_library_quick("CCC")
+    assert legacy is not None
+
+
+# ---------------------------------------------------------------------------
+# F14: stackbuilder consumer verification hook
+# ---------------------------------------------------------------------------
+
+
+def test_f14_stackbuilder_fallback_load_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    library_dir = tmp_path / "stable"
+    monkeypatch.setattr(stackbuilder, "SIGNAL_LIB_DIR_RUNTIME", str(library_dir))
+
+    _write_lib_for_consumer(library_dir, "AAA")
+    lib = stackbuilder.fallback_load_signal_library("AAA")
+    assert lib is not None
+
+    _write_lib_for_consumer(library_dir, "BBB", mutate_after_attach=True)
+    assert stackbuilder.fallback_load_signal_library("BBB") is None
+
+    _write_lib_for_consumer(library_dir, "CCC", with_manifest=False)
+    legacy = stackbuilder.fallback_load_signal_library("CCC")
+    assert legacy is not None
+
+
+# ---------------------------------------------------------------------------
+# F15: confluence interval consumer verification hook
+# ---------------------------------------------------------------------------
+
+
+def test_f15_confluence_interval_consumer_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    library_dir = tmp_path / "stable"
+    monkeypatch.setattr(confluence_analyzer, "SIGNAL_LIBRARY_DIR",
+                        str(library_dir))
+
+    # Use a non-daily interval so we do not hit the spymaster fallback.
+    _write_lib_for_consumer(library_dir, "AAA", interval="1wk")
+    lib = confluence_analyzer.load_signal_library_interval("AAA", "1wk")
+    assert lib is not None
+
+    _write_lib_for_consumer(
+        library_dir, "BBB", interval="1wk", mutate_after_attach=True
+    )
+    assert confluence_analyzer.load_signal_library_interval("BBB", "1wk") is None
+
+    _write_lib_for_consumer(
+        library_dir, "CCC", interval="1wk", with_manifest=False
+    )
+    legacy = confluence_analyzer.load_signal_library_interval("CCC", "1wk")
+    assert legacy is not None

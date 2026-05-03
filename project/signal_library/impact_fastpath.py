@@ -14,6 +14,17 @@ import logging
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
+# Phase 3A: provenance verification. provenance_manifest lives at
+# project/, which is on sys.path when impactsearch.py imports
+# this module from project/.
+try:
+    from provenance_manifest import verify_manifest as _verify_manifest
+except ImportError:
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+    from provenance_manifest import verify_manifest as _verify_manifest
+
 LOGGER = logging.getLogger(__name__)
 
 # NumPy 1.x <-> 2.x pickle-compat shims (robust import + alias, both directions)
@@ -115,6 +126,11 @@ def _load_signal_library_quick(ticker: str):
     """
     Load signal library without any yfinance calls.
     Tries both the ticker and dot-to-dash variant.
+
+    Phase 3A: verifies the provenance manifest immediately after the
+    raw load and type check. Manifest mismatches are surfaced as a
+    None return so the fast path falls back to the slow path; legacy
+    libraries (no manifest) are accepted with a warning.
     """
     candidates = [ticker]
     if "." in ticker:
@@ -129,7 +145,33 @@ def _load_signal_library_quick(ticker: str):
                     with warnings.catch_warnings():
                         warnings.filterwarnings("ignore", category=DeprecationWarning)
                         data = _pickle_load_compat(f)
-                    return data
+                if not isinstance(data, dict):
+                    LOGGER.warning(
+                        f"Invalid signal library format for {ticker} at {p}: "
+                        f"expected dict, got {type(data).__name__}"
+                    )
+                    continue
+                _vresult = _verify_manifest(
+                    data,
+                    sidecar_path=p,
+                    requested_params={
+                        'engine_version': ENGINE_VERSION,
+                        'MAX_SMA_DAY': MAX_SMA_DAY,
+                        'price_source': data.get('price_source', 'Close'),
+                    },
+                )
+                if _vresult.legacy:
+                    LOGGER.warning(
+                        f"{ticker}: legacy signal library (no provenance "
+                        f"manifest) at {p} — accepting for fast-path."
+                    )
+                elif not _vresult.ok:
+                    LOGGER.warning(
+                        f"{ticker}: provenance manifest mismatch at {p}: "
+                        f"{_vresult.mismatches}. Disabling fast-path."
+                    )
+                    return None
+                return data
         except Exception as e:
             LOGGER.warning(f"Failed reading library for {ticker} at {p}: {e}")
     return None

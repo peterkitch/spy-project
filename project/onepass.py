@@ -1243,6 +1243,33 @@ def load_signal_library(ticker):
                     logger.info(f"Renamed corrupt file to {corrupt_filepath}")
                     continue  # Try next candidate
                 
+                # Phase 3A: provenance manifest verification. Legacy
+                # libraries (no manifest) are allowed with a warning;
+                # libraries whose manifest disagrees with the requested
+                # params are rejected so the caller rebuilds.
+                _vresult = _verify_manifest(
+                    signal_data,
+                    sidecar_path=filepath,
+                    requested_params={
+                        'engine_version': ENGINE_VERSION,
+                        'MAX_SMA_DAY': MAX_SMA_DAY,
+                        'price_source': signal_data.get('price_source', 'Close'),
+                        'parity_hash': signal_data.get('parity_hash'),
+                    },
+                )
+                if _vresult.legacy:
+                    logger.warning(
+                        f"{ticker}: legacy signal library (no provenance "
+                        f"manifest) at {filepath} — accepting but flag "
+                        f"for rebuild."
+                    )
+                elif not _vresult.ok:
+                    logger.warning(
+                        f"{ticker}: provenance manifest mismatch at "
+                        f"{filepath}: {_vresult.mismatches}. Forcing rebuild."
+                    )
+                    return None
+
                 # Verify version compatibility
                 if signal_data.get('engine_version') == ENGINE_VERSION and \
                    signal_data.get('max_sma_day') == MAX_SMA_DAY:
