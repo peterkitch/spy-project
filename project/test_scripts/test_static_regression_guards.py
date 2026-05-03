@@ -503,12 +503,9 @@ def _find_function(tree: ast.AST, name: str) -> "ast.FunctionDef | None":
 _B12_RAW_LOAD_ALLOWLIST: tuple = (
     ("provenance_manifest.py", None,
      "central pickle_load_compat / load_verified_* — Phase 3B-1+2A"),
-    # Below entries retire in subsequent commits within Phase 3B-2A:
-    #   commit 5: trafficflow.py:1349
+    # Below entry retires in commit 6 within Phase 3B-2A:
     #   commit 6: signal_library/confluence_analyzer.py:72
-    # Spymaster's 4 raw-load sites are already retired by this commit.
-    ("trafficflow.py", 1349,
-     "TrafficFlow Spymaster PKL — retires in 3B-2A commit 5"),
+    # Spymaster (4 sites) and TrafficFlow (1 site) are already retired.
     ("signal_library/confluence_analyzer.py", 72,
      "_load_spymaster_cache_fallback — retires in 3B-2A commit 6"),
 )

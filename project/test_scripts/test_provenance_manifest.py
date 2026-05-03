@@ -1503,3 +1503,45 @@ def test_3b2a_spymaster_atomic_replace_preserves_embedded(tmp_path):
     assert data is not None
     assert result.ok is True
     assert not result.legacy
+
+
+# ===========================================================================
+# Phase 3B-2A: TrafficFlow Spymaster PKL consumer
+# ===========================================================================
+
+
+def test_3b2a_trafficflow_spymaster_consumer_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    pkl_dir = tmp_path / "cache" / "results"
+    pkl_dir.mkdir(parents=True)
+    monkeypatch.setattr(trafficflow, "SPYMASTER_PKL_DIR", str(pkl_dir))
+    # Reset the in-memory cache so each sub-case is independent.
+    trafficflow._PKL_CACHE.clear()
+
+    # Manifested -> loads, populates cache.
+    p_ok = pkl_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p_ok, ticker="AAA")
+    pm.manifest_hash_cache_clear()
+    data = trafficflow.load_spymaster_pkl("AAA")
+    assert data is not None
+    assert "AAA" in trafficflow._PKL_CACHE
+
+    # Tampered -> rejected, NOT cached.
+    p_bad = pkl_dir / "BBB_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_bad, ticker="BBB", mutate_after_attach=True,
+    )
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("BBB") is None
+    assert "BBB" not in trafficflow._PKL_CACHE
+
+    # Legacy (no manifest) -> loads, populates cache.
+    p_legacy = pkl_dir / "CCC_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_legacy, ticker="CCC", with_manifest=False,
+    )
+    legacy = trafficflow.load_spymaster_pkl("CCC")
+    assert legacy is not None
+    assert "CCC" in trafficflow._PKL_CACHE
