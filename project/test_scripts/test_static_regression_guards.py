@@ -514,6 +514,13 @@ def test_b12_signal_library_consumers_use_verify_manifest():
         "_verify_manifest",
         "provenance_manifest.verify_manifest",
         "pm.verify_manifest",
+        # Phase 3B-1: the central loader bundles open + load + verify, so a
+        # consumer that calls it satisfies the "verifies before reuse"
+        # contract just as well as a direct verify_manifest call.
+        "load_verified_signal_library",
+        "_load_verified_signal_library",
+        "provenance_manifest.load_verified_signal_library",
+        "pm.load_verified_signal_library",
     )
 
     failures = []

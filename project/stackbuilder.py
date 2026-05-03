@@ -25,7 +25,10 @@ from canonical_scoring import (
     score_captures as _canonical_score_captures,
     metrics_to_legacy_dict as _canonical_metrics_to_legacy_dict,
 )
-from provenance_manifest import verify_manifest as _verify_manifest
+from provenance_manifest import (
+    verify_manifest as _verify_manifest,
+    load_verified_signal_library as _load_verified_signal_library,
+)
 
 try:
     import yfinance as yf
@@ -375,42 +378,37 @@ def list_signal_library_candidates(ticker: str) -> List[str]:
 
 def fallback_load_signal_library(ticker: str) -> Optional[dict]:
     """
-    Phase 3A: glob-based fallback loader for signal libraries when
-    onepass.load_signal_library is unavailable. Verifies the provenance
-    manifest immediately after the raw load; manifest mismatches are
-    treated as missing (try the next candidate). Legacy libraries (no
-    manifest) are accepted with a warning.
+    Phase 3B-1: glob-based fallback loader for signal libraries when
+    onepass.load_signal_library is unavailable. Routes through the
+    central verified loader so the raw pickle.load, type check, and
+    manifest verification all live in provenance_manifest. Manifest
+    mismatches skip the candidate; legacy libraries warn and load.
     """
     for p in list_signal_library_candidates(ticker):
         try:
-            import pickle
-            with open(p, 'rb') as f:
-                lib = pickle.load(f)
-            if not isinstance(lib, dict):
-                continue
-            _vresult = _verify_manifest(
-                lib,
-                sidecar_path=p,
+            lib, _vresult = _load_verified_signal_library(
+                p,
                 requested_params={
-                    'engine_version': lib.get('engine_version'),
-                    'price_source': lib.get('price_source', 'Close'),
+                    'price_source': 'Close',
                 },
             )
-            if _vresult.legacy:
-                # Legacy libraries (pre-Phase-3A) load with a warning.
-                # Print to stderr-equivalent via the existing print
-                # infrastructure rather than logger to match the rest
-                # of stackbuilder's IO pattern.
-                print(f"[WARN] {ticker}: legacy signal library at {p} "
-                      f"(no provenance manifest)")
-                return lib
-            if not _vresult.ok:
-                print(f"[WARN] {ticker}: provenance manifest mismatch at "
-                      f"{p}: {_vresult.mismatches}. Skipping.")
-                continue
-            return lib
         except Exception:
             continue
+        if lib is None:
+            continue
+        if _vresult.legacy:
+            # Legacy libraries (pre-Phase-3A) load with a warning.
+            # Print to stderr-equivalent via the existing print
+            # infrastructure rather than logger to match the rest
+            # of stackbuilder's IO pattern.
+            print(f"[WARN] {ticker}: legacy signal library at {p} "
+                  f"(no provenance manifest)")
+            return lib
+        if not _vresult.ok:
+            print(f"[WARN] {ticker}: provenance manifest mismatch at "
+                  f"{p}: {_vresult.mismatches}. Skipping.")
+            continue
+        return lib
     return None
 
 def load_lib_or_none(t: str) -> Optional[dict]:
