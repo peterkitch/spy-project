@@ -1047,3 +1047,189 @@ def test_3b1_b12_synthetic_bad_raw_load_is_caught(tmp_path):
     assert not _scan_raw_pickle_loads(good), (
         "Expected pickle_load_compat to NOT trip the raw-load scanner"
     )
+
+
+# ===========================================================================
+# Phase 3B-2A: output manifest helper + verified loaders
+# ===========================================================================
+
+
+def _build_sample_output_pickle(tmp_path, *, content):
+    """Producer-side helper: build a manifested pickle artifact + sidecar.
+
+    Returns (path, manifest). Mirrors the producer pattern:
+      1. build core manifest (content_obj = the dict to pickle, sans _manifest)
+      2. embed manifest in dict
+      3. pickle.dump
+      4. compute file_sha256 of the final pickle
+      5. write sidecar with artifact_file_sha256
+    """
+    p = tmp_path / "output.pkl"
+    manifest = pm.build_output_manifest(
+        artifact_type="spymaster_precomputed_results",
+        producer_engine="spymaster",
+        engine_version="1.0.0",
+        params={"MAX_SMA_DAY": 114},
+        content_obj=content,
+    )
+    payload = dict(content)
+    payload["_manifest"] = manifest
+    with open(p, "wb") as f:
+        pickle.dump(payload, f)
+    pm.write_output_manifest(p, manifest, include_file_sha256=True)
+    return p, manifest
+
+
+def test_3b2a_output_manifest_required_fields():
+    m = pm.build_output_manifest(
+        artifact_type="stackbuilder_run",
+        producer_engine="stackbuilder",
+        engine_version="1.0.0",
+        params={"max_combo_size": 3},
+        cli_args={"primary": "SPY"},
+        content_obj={"rows": [1, 2, 3]},
+    )
+    expected = {
+        "schema_version", "artifact_kind", "artifact_type",
+        "producer_engine", "engine_version", "params", "cli_args",
+        "ui_args", "input_manifest_hashes", "input_secondary_hash",
+        "output_schema", "git_commit", "git_dirty", "package_versions",
+        "build_timestamp", "builder_identity", "host_platform",
+        "content_hash",
+    }
+    assert expected <= set(m.keys())
+    assert m["artifact_kind"] == pm.ARTIFACT_KIND_OUTPUT
+    assert m["producer_engine"] == "stackbuilder"
+    assert m["content_hash"] is not None
+
+
+def test_3b2a_file_sha256_sidecar_verification(tmp_path):
+    content = {"rows": [1, 2, 3], "ticker": "SPY"}
+    p, manifest = _build_sample_output_pickle(tmp_path, content=content)
+    sidecar = pm._sidecar_path_for(p)
+    assert sidecar.exists()
+    sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_data["artifact_file_sha256"]
+    assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(p)
+    # The embedded manifest must NOT include the final pickle file SHA.
+    with open(p, "rb") as f:
+        loaded = pickle.load(f)
+    assert "artifact_file_sha256" not in loaded["_manifest"], (
+        "Embedded manifest must not self-reference its own file SHA"
+    )
+
+
+def test_3b2a_embedded_pickle_manifest_verifies(tmp_path):
+    content = {"rows": [1, 2, 3], "ticker": "SPY"}
+    p, manifest = _build_sample_output_pickle(tmp_path, content=content)
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert not result.legacy
+
+
+def test_3b2a_legacy_pickle_loads_ok_legacy(tmp_path):
+    p = tmp_path / "legacy.pkl"
+    with open(p, "wb") as f:
+        pickle.dump({"foo": "bar"}, f)  # no manifest
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data == {"foo": "bar"}
+    assert result.ok is True
+    assert result.legacy is True
+
+
+def test_3b2a_pickle_content_hash_mismatch(tmp_path):
+    content = {"rows": [1, 2, 3]}
+    p, _ = _build_sample_output_pickle(tmp_path, content=content)
+    # Tamper: rewrite the pickle with mutated content but the OLD manifest.
+    with open(p, "rb") as f:
+        loaded = pickle.load(f)
+    loaded["rows"] = [9, 9, 9]
+    with open(p, "wb") as f:
+        pickle.dump(loaded, f)
+    # Refresh the sidecar's artifact_file_sha256 so the file-byte check
+    # passes; we want to isolate the logical content_hash mismatch.
+    sidecar_path = pm._sidecar_path_for(p)
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_data["artifact_file_sha256"] = pm.file_sha256(p)
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    data, result = pm.load_verified_pickle_artifact(p, cache=False)
+    assert result.ok is False
+    fields = [m[0] for m in result.mismatches]
+    assert "content_hash" in fields
+
+
+def test_3b2a_pickle_file_sha256_mismatch(tmp_path):
+    content = {"rows": [1, 2, 3]}
+    p, _ = _build_sample_output_pickle(tmp_path, content=content)
+    sidecar_path = pm._sidecar_path_for(p)
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_data["artifact_file_sha256"] = "0" * 64
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is False
+    fields = [m[0] for m in result.mismatches]
+    assert "artifact_file_sha256" in fields
+
+
+def test_3b2a_json_artifact_verification(tmp_path):
+    """A non-self JSON artifact with a sidecar manifest verifies cleanly."""
+    payload = {"top_buy_pair": [10, 1], "top_short_pair": [1, 10]}
+    p = tmp_path / "summary.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    manifest = pm.build_output_manifest(
+        artifact_type="stackbuilder_summary",
+        producer_engine="stackbuilder",
+        engine_version="1.0.0",
+        content_obj=payload,
+    )
+    pm.write_output_manifest(p, manifest, include_file_sha256=True)
+    data, result = pm.load_verified_json_artifact(p)
+    assert data == payload
+    assert result.ok is True
+    # Tamper: rewrite the JSON file with a different object.
+    p.write_text(json.dumps({"different": True}), encoding="utf-8")
+    data, result = pm.load_verified_json_artifact(p)
+    assert result.ok is False
+    fields = [m[0] for m in result.mismatches]
+    assert "artifact_file_sha256" in fields or "content_hash" in fields
+
+
+def test_3b2a_strict_runtime_mismatch_pickle(tmp_path):
+    content = {"rows": [1, 2, 3]}
+    p, _ = _build_sample_output_pickle(tmp_path, content=content)
+    # Forge a runtime mismatch in the embedded manifest.
+    with open(p, "rb") as f:
+        loaded = pickle.load(f)
+    loaded["_manifest"]["package_versions"]["numpy"] = "0.0.0"
+    with open(p, "wb") as f:
+        pickle.dump(loaded, f)
+    # Refresh sidecar so file_sha256 matches and only runtime drift is seen.
+    sidecar_path = pm._sidecar_path_for(p)
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_data["package_versions"]["numpy"] = "0.0.0"
+    sidecar_data["artifact_file_sha256"] = pm.file_sha256(p)
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    # Refresh embedded content_hash so we isolate the runtime drift.
+    with open(p, "rb") as f:
+        loaded2 = pickle.load(f)
+    embedded_manifest = loaded2["_manifest"]
+    raw_content = {k: v for k, v in loaded2.items() if k != "_manifest"}
+    embedded_manifest["content_hash"] = pm.content_hash(loaded2)
+    loaded2["_manifest"] = embedded_manifest
+    with open(p, "wb") as f:
+        pickle.dump(loaded2, f)
+    sidecar_data["artifact_file_sha256"] = pm.file_sha256(p)
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    # strict=False: warn-only.
+    pm.manifest_hash_cache_clear()
+    data, result = pm.load_verified_pickle_artifact(p, strict=False, cache=False)
+    assert data is not None
+    assert result.ok is True
+    assert any("numpy" in str(w) for w in result.warnings)
+    # strict=True: fail.
+    pm.manifest_hash_cache_clear()
+    data2, result2 = pm.load_verified_pickle_artifact(p, strict=True, cache=False)
+    assert result2.ok is False
+    assert any("numpy" in str(m[0]) for m in result2.mismatches)
