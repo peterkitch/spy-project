@@ -924,11 +924,27 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     ``phase3_build_stacks`` continues to attach
     ``Mode`` to its cohort copies (``top['Mode'] = 'D'``,
     ``bottom['Mode'] = 'I'``).
-    The xlsx fast-path is addressed in a follow-up commit
-    (PR #137 commit 3): direct ``rank_all`` / ``rank_direct``
-    still come from the xlsx, but ``rank_inverse`` is recomputed
-    from signal libraries via ``_score_primary_from_signals(...,
-    mode='I')`` rather than via negate-and-view.
+    xlsx fast-path: direct ``rank_all`` / ``rank_direct`` still
+    come from the ImpactSearch Excel verbatim (after schema
+    coercion), but ``rank_inverse`` is now recomputed from
+    signal libraries via ``_score_primary_from_signals(...,
+    mode='I')`` for each ticker in the xlsx cohort. Negate-and-
+    view is removed from this branch as well.
+    Missing-library fallback (xlsx fast-path): a ticker whose
+    signal library is missing or corrupt, or whose inverse-mode
+    score returns ``None`` (e.g. zero trigger days), is skipped
+    from ``rank_inverse`` with a single-line warning that names
+    up to the first 10 tickers. The run fails loudly only when
+    ``args.bottom_n > 0`` and no usable inverse-mode rows
+    survived; the user is told to verify signal libraries
+    exist or to drop ``--prefer-impact-xlsx``. This is the
+    "least disruptive documented behavior" alternative from the
+    Phase 2B-2B preflight scope: xlsx fast-paths typically run
+    against a curated cohort whose libraries are available, so
+    skipping is the expected outcome for the rare missing case;
+    the loud bottom_n>0 failure prevents the silent regression
+    case where the user requested an inverse-mode cohort and
+    got an empty one.
   - Affected tests:
       ``test_within_engine_parity.py::test_b2_stackbuilder_inverse_k1_parity``
       now asserts full canonical parity with Phase 3 K=1 inverse
@@ -941,6 +957,12 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
       displayed inverse Sharpe must NOT equal -direct Sharpe
       (modulo display rounding); negate-and-view would produce
       delta ~ 0. Also asserts trigger_days symmetry.
+      New: ``test_b2c_xlsx_fastpath_inverse_recomputed_not_negated``
+      monkeypatches ``try_load_rank_from_impact_xlsx`` to return
+      a synthetic xlsx with deliberately-provocative direct
+      values, then asserts ``rank_inverse`` rows match
+      ``_score_primary_from_signals(..., mode='I')`` rather than
+      the sign-flipped xlsx values.
   - ELI5: previously, "inverse" rank rows for the same primary
     were built by flipping the sign of three displayed numbers
     on the direct row. That worked for total capture and avg
@@ -953,7 +975,7 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     is the actual Sharpe you'd see if you traded the inverse
     strategy, not a sign-flipped view of the direct one.
   - Status: normal path implemented in 2B-2B (PR #137 commit 2);
-    xlsx fast-path follows in PR #137 commit 3.
+    xlsx fast-path implemented in 2B-2B (PR #137 commit 3).
 
 ## 1B-2B-3: StackBuilder --outdir honored
 

@@ -701,11 +701,67 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                     raise SystemExit(f"[FATAL] None of the entered primaries are present in the ImpactSearch Excel for {secondary}.")
 
             rank_direct = rank_all.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
-            rank_inverse = rank_all.copy()
-            for col in ['Avg Daily Capture (%)','Total Capture (%)','Sharpe Ratio']:
-                if col in rank_inverse.columns:
-                    rank_inverse[col] = pd.to_numeric(rank_inverse[col], errors='coerce') * -1.0
-            rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
+            # Phase 2B-2B: rank_inverse on the xlsx fast-path is now
+            # recomputed from signal libraries via real inverse-mode
+            # scoring (signals flipped Buy<->Short before alignment),
+            # not via negate-and-view of direct metrics. This pins
+            # rank_inverse to the same canonical Sharpe / p-value
+            # form that the normal path produces. Tickers whose
+            # signal library is missing or corrupt are skipped from
+            # rank_inverse with a warning; the run fails loudly only
+            # if the user requested a non-zero bottom_n and no
+            # usable inverse-mode rows survived.
+            inverse_rows: List[Dict] = []
+            inverse_missing: List[str] = []
+            for primary in rank_direct['Primary Ticker'].astype(str).tolist():
+                vendor, sigs, dates = _load_primary_signals(primary)
+                if sigs is None:
+                    inverse_missing.append(vendor)
+                    continue
+                inv = _score_primary_from_signals(
+                    vendor, sigs, dates, sec_rets,
+                    mode='I', grace_days=grace_days,
+                )
+                if inv is None:
+                    inverse_missing.append(vendor)
+                    continue
+                inverse_rows.append(inv)
+
+            if inverse_missing:
+                print(
+                    f"[PHASE2] xlsx fast-path: {len(inverse_missing)} ticker(s) "
+                    f"omitted from rank_inverse due to missing/corrupt signal "
+                    f"library or zero-trigger inverse: {inverse_missing[:10]}"
+                    f"{' ...' if len(inverse_missing) > 10 else ''}"
+                )
+
+            requested_bottom_n = int(getattr(args, 'bottom_n', 0) or 0)
+            if not inverse_rows and requested_bottom_n > 0:
+                raise SystemExit(
+                    f"[FATAL] xlsx fast-path: requested bottom_n="
+                    f"{requested_bottom_n} but no inverse-mode rows could be "
+                    f"computed for any of the {len(rank_direct)} primaries in "
+                    f"the ImpactSearch Excel. Verify signal libraries exist "
+                    f"under {getattr(args, 'signal_lib_dir', SIGNAL_LIB_DIR_RUNTIME)} "
+                    f"or run without --prefer-impact-xlsx."
+                )
+
+            if inverse_rows:
+                rank_inverse = pd.DataFrame(inverse_rows)
+                # Reindex to rank_all column schema where possible so
+                # downstream consumers' column-access contracts hold.
+                shared_cols = [c for c in rank_all.columns if c in rank_inverse.columns]
+                rank_inverse = rank_inverse.reindex(columns=rank_all.columns)
+                # Sort by canonical key for consistency with the normal path.
+                if 'Total Capture (%)' in rank_inverse.columns:
+                    rank_inverse = rank_inverse.sort_values(
+                        by='Total Capture (%)', ascending=False
+                    ).reset_index(drop=True)
+                else:
+                    rank_inverse = rank_inverse.reset_index(drop=True)
+            else:
+                rank_inverse = pd.DataFrame(columns=rank_all.columns)
+
             write_table(rank_all, os.path.join(outdir, 'rank_all'))
             write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
             write_table(rank_inverse, os.path.join(outdir, 'rank_inverse'))

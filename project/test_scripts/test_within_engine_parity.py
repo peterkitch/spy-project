@@ -377,6 +377,133 @@ def test_b2b_rank_inverse_not_negate_symmetry_when_rfr_nonzero(
 # ---------------------------------------------------------------------------
 
 
+def test_b2c_xlsx_fastpath_inverse_recomputed_not_negated(
+    monkeypatch, tmp_path,
+):
+    """Phase 2B-2B: xlsx fast-path rank_inverse must be recomputed
+    from signal libraries (mode='I'), not negated from rank_all.
+
+    Test setup:
+      - Synthetic primary signal library on disk (tmp).
+      - Synthetic sec_rets.
+      - Monkeypatched try_load_rank_from_impact_xlsx to return a
+        synthetic DataFrame with columns the production code reads.
+        The rank_all values are deliberately set to numbers that are
+        NOT the canonical direct-mode metrics for the primary, so a
+        negate-and-view path would produce rank_inverse that is the
+        sign-flipped synthetic numbers — which would fail the
+        canonical-equality assertion.
+      - phase2_rank_all called with prefer_impact_xlsx=True.
+
+    Assertion: rank_inverse rows match
+    _score_primary_from_signals(..., mode='I') for each ticker, NOT
+    the negated rank_all rows.
+    """
+    sb = _get_module("stackbuilder")
+    op = _get_module("onepass")
+
+    pre_op_dir = op.SIGNAL_LIBRARY_DIR
+    pre_sb_runtime = sb.SIGNAL_LIB_DIR_RUNTIME
+
+    try:
+        # 1) Populated signal library for primary AAA on tmp dir.
+        signal_root = tmp_path / "signal_library" / "data"
+        monkeypatch.setattr(op, "SIGNAL_LIBRARY_DIR", str(signal_root))
+        monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(signal_root / "stable"))
+
+        returns = _build_returns_with_zero_trigger()
+        dates = returns.index
+        signals = ["None", "Buy", "Buy", "Buy", "Buy", "Short", "Short", "None", "Buy", "Short"]
+        parity_hash = op.compute_parity_hash("Close", "ticker")
+        lib = make_signal_library_dict(
+            dates, primary_signals=signals, parity_hash=parity_hash,
+        )
+        path = Path(op._lib_path_for("AAA"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as fh:
+            pickle.dump(lib, fh)
+
+        sec_rets = returns.copy()
+
+        # 2) Synthetic xlsx-shaped DataFrame with PROVOCATIVE direct
+        # values: a negate-and-view path would produce
+        # rank_inverse[Sharpe] = -7.5 etc., which we'll show is NOT
+        # the actual mode='I' Sharpe.
+        xlsx_df = pd.DataFrame([
+            {
+                "Primary Ticker": "AAA",
+                "Avg Daily Capture (%)": 0.10,
+                "Total Capture (%)": 1.0,
+                "Sharpe Ratio": 7.5,
+                "Win Ratio (%)": 60.0,
+                "Std Dev (%)": 0.5,
+                "Trigger Days": 8,
+                "p-Value": 0.04,
+            },
+        ])
+
+        def _fake_try_load(*a, **k):
+            return xlsx_df.copy()
+
+        monkeypatch.setattr(sb, "try_load_rank_from_impact_xlsx", _fake_try_load)
+
+        primaries_df = pd.DataFrame({"Primary Ticker": ["AAA"]})
+        args = SimpleNamespace(
+            secondary="ZZZ",
+            prefer_impact_xlsx=True,
+            impact_xlsx_dir="<unused>",
+            impact_xlsx_max_age_days=45,
+            threads="auto",
+            no_progress=True,
+            bottom_n=1,
+            signal_lib_dir=str(signal_root / "stable"),
+        )
+        out = tempfile.mkdtemp(prefix="phase2b2b_b2c_")
+        try:
+            rank_all, rank_direct, rank_inverse = sb.phase2_rank_all(
+                args, primaries_df, sec_rets, outdir=out, secondary="ZZZ",
+                progress_path=None,
+            )
+
+            # rank_all and rank_direct come from the xlsx verbatim
+            # (after schema coercions): rank_all["Sharpe Ratio"] should
+            # be 7.5.
+            assert float(rank_all.iloc[0]["Sharpe Ratio"]) == pytest.approx(7.5)
+
+            # rank_inverse: must NOT be the negate-and-view of rank_all.
+            # Compute the expected mode='I' canonical row directly and
+            # compare structural fields.
+            vendor, sigs, dates_loaded = sb._load_primary_signals("AAA")
+            assert sigs is not None
+            expected = sb._score_primary_from_signals(
+                vendor, sigs, dates_loaded, sec_rets, mode='I',
+            )
+            assert expected is not None
+
+            assert not rank_inverse.empty
+            inv_row = rank_inverse.iloc[0].to_dict()
+
+            # Structural equality on canonical fields.
+            assert int(inv_row["Trigger Days"]) == int(expected["Trigger Days"])
+            for k in ("Avg Daily Capture (%)", "Total Capture (%)", "Sharpe Ratio"):
+                assert float(inv_row[k]) == pytest.approx(float(expected[k]), abs=5e-3), (
+                    f"[B2c] rank_inverse[{k!r}]={inv_row[k]} vs "
+                    f"_score_primary_from_signals(mode='I')[{k!r}]={expected[k]}"
+                )
+
+            # Negate-and-view check: rank_inverse Sharpe must NOT be
+            # -7.5 (which is what the prior code would have produced).
+            assert float(inv_row["Sharpe Ratio"]) != pytest.approx(-7.5, abs=5e-3), (
+                "[B2c] rank_inverse Sharpe matches negated xlsx Sharpe; "
+                "fast-path appears to still use negate-and-view"
+            )
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+    finally:
+        op.SIGNAL_LIBRARY_DIR = pre_op_dir
+        sb.SIGNAL_LIB_DIR_RUNTIME = pre_sb_runtime
+
+
 def test_b3_impactsearch_fastpath_metrics_parity(monkeypatch, tmp_path):
     """The fast-path-loaded primary signals run through the same
     metrics-wrapper produce metrics consistent with the canonical
