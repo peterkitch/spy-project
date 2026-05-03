@@ -504,6 +504,97 @@ def test_b2c_xlsx_fastpath_inverse_recomputed_not_negated(
         sb.SIGNAL_LIB_DIR_RUNTIME = pre_sb_runtime
 
 
+def test_b2d_xlsx_fastpath_inverse_missing_libraries_loud_fail(
+    monkeypatch, tmp_path,
+):
+    """Phase 2B-2B amendment: xlsx fast-path must raise SystemExit
+    with actionable guidance when ``args.bottom_n > 0`` AND no
+    usable inverse-mode rows could be computed for any ticker in
+    the xlsx cohort.
+
+    The fallback contract (ledger entry 2B-2B-1, xlsx fast-path
+    section): tickers whose signal libraries are missing or whose
+    inverse score returns ``None`` are skipped from rank_inverse
+    with a warning, and the run fails loudly only when the user
+    requested a non-zero bottom cohort and no inverse rows
+    survived. This pins that loud-fail path so a future refactor
+    can't silently swap the SystemExit for an empty rank_inverse.
+
+    Test setup:
+      - Synthetic xlsx-shaped DataFrame (1 ticker), monkeypatched
+        into try_load_rank_from_impact_xlsx.
+      - _load_primary_signals monkeypatched to return
+        (vendor, None, None) for every ticker, simulating a
+        completely missing signal-library directory.
+      - args.bottom_n = 1 (the user explicitly asked for an
+        inverse cohort).
+      - phase2_rank_all called with prefer_impact_xlsx=True.
+
+    Assertion: SystemExit, message contains the actionable
+    guidance substrings ``"Verify"`` and ``"--prefer-impact-xlsx"``.
+    """
+    sb = _get_module("stackbuilder")
+
+    # Synthetic xlsx-shaped DataFrame; values are irrelevant to
+    # this test because we're forcing the inverse loop to fail
+    # before any successful row lands.
+    xlsx_df = pd.DataFrame([
+        {
+            "Primary Ticker": "AAA",
+            "Avg Daily Capture (%)": 0.10,
+            "Total Capture (%)": 1.0,
+            "Sharpe Ratio": 7.5,
+            "Win Ratio (%)": 60.0,
+            "Std Dev (%)": 0.5,
+            "Trigger Days": 8,
+            "p-Value": 0.04,
+        },
+    ])
+
+    def _fake_try_load(*a, **k):
+        return xlsx_df.copy()
+
+    def _fake_load_primary_signals(primary):
+        # Return the no-library shape: vendor stripped/upcased,
+        # sigs and dates both None. This is exactly what the
+        # production helper returns when load_lib_or_none yields
+        # None or the library is missing required fields.
+        return str(primary).upper(), None, None
+
+    monkeypatch.setattr(sb, "try_load_rank_from_impact_xlsx", _fake_try_load)
+    monkeypatch.setattr(sb, "_load_primary_signals", _fake_load_primary_signals)
+
+    primaries_df = pd.DataFrame({"Primary Ticker": ["AAA"]})
+    args = SimpleNamespace(
+        secondary="ZZZ",
+        prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>",
+        impact_xlsx_max_age_days=45,
+        threads="auto",
+        no_progress=True,
+        bottom_n=1,  # user requested an inverse cohort
+        signal_lib_dir=str(tmp_path / "no_such_dir"),
+    )
+
+    out = tempfile.mkdtemp(prefix="phase2b2b_b2d_")
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            sb.phase2_rank_all(
+                args, primaries_df, pd.Series(dtype=float),
+                outdir=out, secondary="ZZZ", progress_path=None,
+            )
+        msg = str(excinfo.value)
+        assert "Verify" in msg, (
+            f"[B2d] SystemExit message missing 'Verify' guidance: {msg!r}"
+        )
+        assert "--prefer-impact-xlsx" in msg, (
+            f"[B2d] SystemExit message missing '--prefer-impact-xlsx' "
+            f"guidance: {msg!r}"
+        )
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_b3_impactsearch_fastpath_metrics_parity(monkeypatch, tmp_path):
     """The fast-path-loaded primary signals run through the same
     metrics-wrapper produce metrics consistent with the canonical
