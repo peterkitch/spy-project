@@ -764,6 +764,14 @@ def test_3b1_cache_mtime_change_invalidates(tmp_path, sample_library, sample_clo
 
 
 def test_3b1_cache_atomic_replace_invalidates(tmp_path, sample_library, sample_close):
+    """Atomic ``os.replace`` invalidates the LRU cache via mtime delta.
+
+    Phase 3B-2A tightening: explicit ``os.utime`` controls mtime instead
+    of ``time.sleep(1.05)`` past the FS mtime resolution. The replacement
+    payload is the *same bytes* as the original so size is guaranteed
+    unchanged — the cache miss therefore depends on the mtime key
+    component, not the size key component.
+    """
     pm.attach_manifest(
         sample_library, sidecar_path=None,
         artifact_type="signal_library_daily", ticker="SPY",
@@ -772,29 +780,33 @@ def test_3b1_cache_atomic_replace_invalidates(tmp_path, sample_library, sample_c
     p = tmp_path / "lib.pkl"
     with open(p, "wb") as f:
         pickle.dump(sample_library, f)
+    original_size = p.stat().st_size
+    original_mtime_ns = p.stat().st_mtime_ns
     pm.manifest_hash_cache_clear()
     pm.load_verified_signal_library(p)
-    # Sleep just past the filesystem mtime resolution to force a delta.
-    time.sleep(1.05)
-    # Different payload (mutated copy) so the new content_hash differs.
-    mutated = dict(sample_library)
-    mutated["primary_signals"] = ["Buy"] * len(sample_library["primary_signals"])
-    pm.attach_manifest(
-        mutated, sidecar_path=None,
-        artifact_type="signal_library_daily", ticker="SPY",
-    )
+    # Same bytes -> same size -> only mtime can drive invalidation.
+    payload_bytes = p.read_bytes()
     tmp_replacement = tmp_path / "lib.pkl.tmp"
-    with open(tmp_replacement, "wb") as f:
-        pickle.dump(mutated, f)
+    tmp_replacement.write_bytes(payload_bytes)
     os.replace(tmp_replacement, p)
-    _, result = pm.load_verified_signal_library(p)
-    assert result.ok is True  # mutated lib has its own valid manifest
+    # Bump mtime explicitly past the original; same-size guarantee
+    # ensures the cache key only differs in the mtime component.
+    new_mtime_ns = original_mtime_ns + 2_000_000_000
+    os.utime(p, ns=(new_mtime_ns, new_mtime_ns))
+    assert p.stat().st_size == original_size
+    pm.load_verified_signal_library(p)
     info = pm.manifest_hash_cache_info()
-    assert info["misses"] == 2  # original + replaced
+    assert info["misses"] == 2  # original + post-replace
     assert info["hits"] == 0
 
 
 def test_3b1_cache_inplace_rewrite_invalidates(tmp_path, sample_library, sample_close):
+    """In-place rewrite invalidates the LRU cache via mtime delta.
+
+    Phase 3B-2A tightening: the in-place rewrite writes the same bytes
+    back, then ``os.utime`` bumps mtime explicitly. Size unchanged, so
+    the cache miss is unambiguously driven by the mtime key.
+    """
     pm.attach_manifest(
         sample_library, sidecar_path=None,
         artifact_type="signal_library_daily", ticker="SPY",
@@ -803,18 +815,17 @@ def test_3b1_cache_inplace_rewrite_invalidates(tmp_path, sample_library, sample_
     p = tmp_path / "lib.pkl"
     with open(p, "wb") as f:
         pickle.dump(sample_library, f)
+    original_size = p.stat().st_size
+    original_mtime_ns = p.stat().st_mtime_ns
     pm.manifest_hash_cache_clear()
     pm.load_verified_signal_library(p)
-    time.sleep(1.05)
-    sample_library["primary_signals"] = ["Buy"] * len(
-        sample_library["primary_signals"]
-    )
-    pm.attach_manifest(
-        sample_library, sidecar_path=None,
-        artifact_type="signal_library_daily", ticker="SPY",
-    )
+    # Same bytes again, same size; only mtime drives invalidation.
+    payload_bytes = p.read_bytes()
     with open(p, "wb") as f:
-        pickle.dump(sample_library, f)
+        f.write(payload_bytes)
+    new_mtime_ns = original_mtime_ns + 2_000_000_000
+    os.utime(p, ns=(new_mtime_ns, new_mtime_ns))
+    assert p.stat().st_size == original_size
     pm.load_verified_signal_library(p)
     info = pm.manifest_hash_cache_info()
     assert info["misses"] == 2
