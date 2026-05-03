@@ -26,6 +26,23 @@ import warnings
 import gc
 import math
 
+# Phase 3A: provenance manifest helper. The provenance_manifest module
+# lives at project/, which is on sys.path when this builder runs as
+# ``python -m signal_library.multi_timeframe_builder`` from project/.
+try:
+    from provenance_manifest import attach_manifest as _attach_manifest
+except ImportError:
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+    from provenance_manifest import attach_manifest as _attach_manifest
+
+# Transient library key used to thread the source Close series from
+# generate_signals_for_interval (where df is in scope) into
+# save_signal_library (where the pickle path is computed). Popped before
+# pickle.dump so it does not appear on disk.
+_SOURCE_CLOSE_TRANSIENT_KEY = "_source_close_transient"
+
 # Suppress DataFrame fragmentation warnings (known issue with iterative SMA calculations)
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 # Suppress timezone conversion warnings
@@ -361,6 +378,11 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
     }
 
     logger.info(f"{ticker} {interval}: Library generated [OK] (Buy pair: {top_buy_pair}, Short pair: {top_short_pair})")
+
+    # Phase 3A: stash the post-fetch Close so save_signal_library can hash
+    # it during manifest attach. Popped before pickle.dump.
+    if 'Close' in df.columns:
+        library[_SOURCE_CLOSE_TRANSIENT_KEY] = df['Close'].copy()
 
     return library
 
@@ -821,6 +843,29 @@ def save_signal_library(library: dict, interval: str, force_overwrite: bool = Fa
 
     # Ensure directory exists
     os.makedirs(SIGNAL_LIBRARY_DIR, exist_ok=True)
+
+    # Phase 3A: attach provenance manifest. Pop the transient
+    # source-close series (stashed by generate_signals_for_interval) so
+    # it does not land on disk; pass it to attach_manifest so the
+    # manifest's source_data block carries a real source hash.
+    source_close = library.pop(_SOURCE_CLOSE_TRANSIENT_KEY, None)
+    manifest_params = {
+        'MAX_SMA_DAY': MAX_SMA_DAY,
+        'price_source': 'Close',
+        'interval': interval,
+        'auto_adjust': False,
+        't1_skip_policy': 'fetch_t1_skip',
+    }
+    _attach_manifest(
+        library,
+        filepath,
+        artifact_type='interval_signal_library',
+        ticker=ticker,
+        interval=interval,
+        params=manifest_params,
+        source_close=source_close,
+        engine_version=ENGINE_VERSION,
+    )
 
     # Save with pickle
     with open(filepath, 'wb') as f:

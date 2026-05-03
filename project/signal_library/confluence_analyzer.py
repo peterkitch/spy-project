@@ -19,6 +19,17 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+# Phase 3A: provenance verification for the signal-library load path.
+# The spymaster cache fallback (line ~73) remains pre-3A; manifests for
+# Spymaster PKLs are deferred to Phase 3B.
+try:
+    from provenance_manifest import verify_manifest as _verify_manifest
+except ImportError:
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+    from provenance_manifest import verify_manifest as _verify_manifest
+
 # Constants
 SIGNAL_LIBRARY_DIR = os.environ.get('SIGNAL_LIBRARY_DIR', 'signal_library/data/stable')
 ENGINE_VERSION = "1.0.0"
@@ -58,6 +69,36 @@ def load_signal_library_interval(ticker: str, interval: str) -> Optional[dict]:
         try:
             with open(filepath, 'rb') as f:
                 library = pickle.load(f)
+            if not isinstance(library, dict):
+                logger.error(
+                    f"Invalid signal library format for {ticker} {interval} "
+                    f"at {filepath}: expected dict, got {type(library).__name__}"
+                )
+                return None
+            # Phase 3A: provenance manifest verification. Legacy
+            # libraries are accepted with a warning; manifest mismatches
+            # are treated as missing for this interval.
+            _vresult = _verify_manifest(
+                library,
+                sidecar_path=filepath,
+                requested_params={
+                    'engine_version': library.get('engine_version'),
+                    'price_source': library.get('price_source', 'Close'),
+                    'interval': interval,
+                },
+            )
+            if _vresult.legacy:
+                logger.warning(
+                    f"{ticker} {interval}: legacy signal library at "
+                    f"{filepath} (no provenance manifest)."
+                )
+            elif not _vresult.ok:
+                logger.warning(
+                    f"{ticker} {interval}: provenance manifest mismatch "
+                    f"at {filepath}: {_vresult.mismatches}. Treating as "
+                    f"missing."
+                )
+                return None
             logger.debug(f"Loaded {ticker} {interval}: {len(library.get('signals', []))} bars")
             return library
         except Exception as e:

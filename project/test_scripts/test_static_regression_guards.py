@@ -15,6 +15,7 @@ rule, and the related ledger entry.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Sequence
@@ -438,4 +439,114 @@ def test_b6_no_implicit_np_std_in_canonical_contexts():
             "Expected: np.std(arr, ddof=1) in canonical metric contexts; "
             "ddof must be explicit (spec §16).\n"
             "Ledger: Entry 2 (ddof=1)\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B12: signal-library consumers must verify provenance manifests
+# ---------------------------------------------------------------------------
+
+
+def _function_calls_name(func_node: ast.AST, target_names: Sequence[str]) -> bool:
+    """Return True if ``func_node`` contains a Call whose callable is one
+    of the names in ``target_names`` (matched as bare Name, attribute
+    suffix, or full ``module.attr`` chain).
+    """
+    target_set = set(target_names)
+    for sub in ast.walk(func_node):
+        if not isinstance(sub, ast.Call):
+            continue
+        f = sub.func
+        if isinstance(f, ast.Name) and f.id in target_set:
+            return True
+        if isinstance(f, ast.Attribute):
+            # match either bare attribute (`.verify_manifest`) or full chain
+            if f.attr in target_set:
+                return True
+            chain = []
+            cur = f
+            while isinstance(cur, ast.Attribute):
+                chain.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                chain.append(cur.id)
+            if ".".join(reversed(chain)) in target_set:
+                return True
+    return False
+
+
+def _find_function(tree: ast.AST, name: str) -> "ast.FunctionDef | None":
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def test_b12_signal_library_consumers_use_verify_manifest():
+    """Phase 3A B12: every named signal-library consumer must call
+    ``verify_manifest`` after the raw pickle.load and before reuse.
+
+    Scoped function-by-function so the spymaster-cache pickle.load
+    inside ``confluence_analyzer.load_signal_library_interval`` (a
+    Phase 3B-scope branch) is naturally tolerated as long as the
+    function body also performs a verify_manifest call on the
+    signal-library branch.
+
+    Allowlist:
+      - provenance_manifest.py (the helper itself)
+      - test_scripts/ (test harnesses)
+      - non-signal-library pickle consumers deferred to Phase 3B:
+          spymaster.py PKLs (line ~3629, ~4036, ~4383, ~8512),
+          trafficflow.py:1349 (signal-library quick load deferred),
+          impactsearch CacheManager (impactsearch.py:1148/1162),
+          confluence_analyzer.py:73 (Spymaster cache fallback inside
+          load_signal_library_interval).
+    """
+    guarded: Sequence[tuple[str, str]] = (
+        ("onepass.py", "load_signal_library"),
+        ("impactsearch.py", "load_signal_library"),
+        ("signal_library/impact_fastpath.py", "_load_signal_library_quick"),
+        ("signal_library/confluence_analyzer.py", "load_signal_library_interval"),
+        ("stackbuilder.py", "fallback_load_signal_library"),
+    )
+    verify_targets = (
+        "verify_manifest",
+        "_verify_manifest",
+        "provenance_manifest.verify_manifest",
+        "pm.verify_manifest",
+    )
+
+    failures = []
+    for rel, fn_name in guarded:
+        path = PROJECT_DIR / rel
+        if not path.exists():
+            failures.append(f"{rel}: file missing")
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError as exc:
+            failures.append(f"{rel}: failed to parse — {exc}")
+            continue
+        target = _find_function(tree, fn_name)
+        if target is None:
+            failures.append(f"{rel}: function `{fn_name}` not found")
+            continue
+        if not _function_calls_name(target, verify_targets):
+            failures.append(
+                f"{rel}:{fn_name} — uses raw pickle.load but does not call "
+                f"verify_manifest. Phase 3A requires manifest verification "
+                f"immediately after the raw load and before reuse."
+            )
+
+    if failures:
+        body = "\n".join(failures)
+        pytest.fail(
+            f"[B12-signal-library-consumer-verify] {len(failures)} hit(s):\n"
+            f"{body}\n\n"
+            "Expected: each guarded consumer calls verify_manifest after "
+            "the raw pickle.load and before returning the library.\n"
+            "Allowlist: provenance_manifest.py, tests, non-signal-library "
+            "pickle consumers deferred to 3B (Spymaster PKLs, TrafficFlow, "
+            "Confluence durable outputs).\n"
+            "Ledger: Phase 3A entry — provenance manifests (signal libraries)\n"
         )
