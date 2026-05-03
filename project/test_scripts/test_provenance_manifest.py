@@ -1356,3 +1356,150 @@ def test_3b2a_stackbuilder_run_manifest_preserves_legacy_keys():
         assert f"'{key}'" in source or f'"{key}"' in source, (
             f"Expected stackbuilder.py to set manifest key '{key}'"
         )
+
+
+# ===========================================================================
+# Phase 3B-2A: Spymaster PKL manifest (producer / consumer)
+# ===========================================================================
+
+
+def _build_synthetic_spymaster_pkl(
+    path,
+    *,
+    ticker: str = "AAA",
+    with_manifest: bool = True,
+    mutate_after_attach: bool = False,
+):
+    """Build a synthetic Spymaster precomputed-results PKL on disk.
+
+    Mirrors the producer pattern in ``spymaster.save_precomputed_results``:
+    embed the manifest, pickle.dump, then write the sidecar with
+    artifact_file_sha256 over final bytes. Used by Spymaster + TrafficFlow
+    + Confluence consumer tests.
+    """
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    payload = {
+        "_ticker": ticker,
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [100.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), float(i + 1))
+                                for i, d in enumerate(dates)},
+        "daily_top_short_pairs": {d: ((113, 114), float(i + 1))
+                                  for i, d in enumerate(dates)},
+        "top_buy_pair": (10, 1),
+        "top_short_pair": (1, 10),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+        "data_fingerprint": "fp-" + ticker,
+    }
+    if with_manifest:
+        manifest = pm.build_output_manifest(
+            artifact_type="spymaster_precomputed_results",
+            producer_engine="spymaster",
+            engine_version="1.0.0",
+            params={"ticker": ticker, "max_sma_day": 114, "price_source": "Close"},
+            content_obj=payload,
+        )
+        payload[pm.MANIFEST_FIELD] = manifest
+    if mutate_after_attach and with_manifest:
+        payload["top_buy_pair"] = (99, 99)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+    if with_manifest:
+        pm.write_output_manifest(
+            path, payload[pm.MANIFEST_FIELD], include_file_sha256=True,
+        )
+    return payload
+
+
+def test_3b2a_spymaster_producer_writes_embedded_and_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    # Redirect cache/results to tmp_path so the producer write is sandboxed.
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    results = {
+        "_ticker": "AAA",
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [100.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), 1.0) for d in dates},
+        "daily_top_short_pairs": {d: ((113, 114), 1.0) for d in dates},
+        "top_buy_pair": (10, 1),
+        "top_short_pair": (1, 10),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+    }
+    spymaster.save_precomputed_results("AAA", results)
+
+    pkl_path = cache_dir / "AAA_precomputed_results.pkl"
+    assert pkl_path.exists()
+    sidecar = pm._sidecar_path_for(pkl_path)
+    assert sidecar.exists()
+    sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(pkl_path)
+    with open(pkl_path, "rb") as f:
+        loaded = pickle.load(f)
+    assert pm.MANIFEST_FIELD in loaded
+    embedded = loaded[pm.MANIFEST_FIELD]
+    assert "artifact_file_sha256" not in embedded, (
+        "Embedded Spymaster manifest must not self-reference its file SHA"
+    )
+    assert embedded["producer_engine"] == "spymaster"
+    assert embedded["artifact_type"] == "spymaster_precomputed_results"
+
+
+def test_3b2a_spymaster_consumer_loads_manifested(tmp_path):
+    p = tmp_path / "AAA_precomputed_results.pkl"
+    payload = _build_synthetic_spymaster_pkl(p, ticker="AAA")
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert not result.legacy
+    assert data["top_buy_pair"] == (10, 1)
+
+
+def test_3b2a_spymaster_legacy_loads_with_warning(tmp_path):
+    p = tmp_path / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", with_manifest=False)
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert result.legacy is True
+
+
+def test_3b2a_spymaster_mismatch_via_internal_consumer(tmp_path, monkeypatch):
+    """Tampered Spymaster PKL must surface as cache miss in
+    ``_quick_last_fingerprint`` (representative internal consumer)."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    p = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", mutate_after_attach=True)
+    pm.manifest_hash_cache_clear()
+    fp = spymaster._quick_last_fingerprint("AAA")
+    assert fp is None  # mismatch -> cache miss
+
+
+def test_3b2a_spymaster_atomic_replace_preserves_embedded(tmp_path):
+    """Two-file write tolerance: even if the sidecar is missing after a
+    torn write, the embedded pickle manifest verifies cleanly."""
+    p = tmp_path / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA")
+    sidecar = pm._sidecar_path_for(p)
+    sidecar.unlink()
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert not result.legacy

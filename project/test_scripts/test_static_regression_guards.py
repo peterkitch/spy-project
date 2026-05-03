@@ -482,30 +482,35 @@ def _find_function(tree: ast.AST, name: str) -> "ast.FunctionDef | None":
     return None
 
 
-# Phase 3B-1 B12 allowlist: each entry is (relative_path, line, reason).
+# Phase 3B-2A B12 allowlist: each entry is (relative_path, line, reason).
 # Lines are matched against the AST ``lineno`` of the ``Call`` node, which
 # is the line of the ``pickle.load`` call. Update the line numbers when
 # the surrounding code shifts; allowlisting whole files is reserved for
 # the central provenance loader.
+#
+# Retired in Phase 3B-2A:
+#   - spymaster.py: all 4 raw-load sites (cache PKL consumers) migrated
+#     to load_verified_pickle_artifact via the sanctioned standalone-rule
+#     exception (see ledger Phase 3B-2A entry).
+#   - trafficflow.py: load_spymaster_pkl migrated.
+#   - signal_library/confluence_analyzer.py: _load_spymaster_cache_fallback
+#     migrated.
+#
+# Final 3B-2A state: only the central provenance loader internals are
+# allowlisted. Every other production .py file must route through
+# load_verified_signal_library / load_verified_pickle_artifact /
+# load_verified_json_artifact / pickle_load_compat.
 _B12_RAW_LOAD_ALLOWLIST: tuple = (
-    # Central NumPy 1.x/2.x compatibility loader. This IS the verified
-    # loader; B12 is enforced everywhere else.
     ("provenance_manifest.py", None,
-     "central pickle_load_compat / load_verified_signal_library — Phase 3B-1"),
-    # Spymaster PKL consumers deferred to Phase 3B-2. These are not
-    # signal libraries; output-manifest schema for cache/results PKLs
-    # lands in 3B-2.
-    ("spymaster.py", 3629, "Spymaster cache PKL — Phase 3B-2 deferred"),
-    ("spymaster.py", 4036, "Spymaster cache PKL — Phase 3B-2 deferred"),
-    ("spymaster.py", 4383, "Spymaster cache PKL — Phase 3B-2 deferred"),
-    ("spymaster.py", 8512, "Spymaster cache PKL — Phase 3B-2 deferred"),
-    # TrafficFlow Spymaster PKL consumer — Phase 3B-2 deferred.
-    ("trafficflow.py", 1349, "TrafficFlow Spymaster PKL — Phase 3B-2 deferred"),
-    # Confluence Spymaster cache fallback helper. Phase 3B-1 extracted
-    # this into _load_spymaster_cache_fallback so the allowlist is
-    # surgical; the signal-library branch in the same file is verified.
+     "central pickle_load_compat / load_verified_* — Phase 3B-1+2A"),
+    # Below entries retire in subsequent commits within Phase 3B-2A:
+    #   commit 5: trafficflow.py:1349
+    #   commit 6: signal_library/confluence_analyzer.py:72
+    # Spymaster's 4 raw-load sites are already retired by this commit.
+    ("trafficflow.py", 1349,
+     "TrafficFlow Spymaster PKL — retires in 3B-2A commit 5"),
     ("signal_library/confluence_analyzer.py", 72,
-     "_load_spymaster_cache_fallback — Phase 3B-2 deferred Spymaster PKL"),
+     "_load_spymaster_cache_fallback — retires in 3B-2A commit 6"),
 )
 
 
