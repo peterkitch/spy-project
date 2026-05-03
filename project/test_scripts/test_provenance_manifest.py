@@ -1545,3 +1545,44 @@ def test_3b2a_trafficflow_spymaster_consumer_verifies(tmp_path, monkeypatch):
     legacy = trafficflow.load_spymaster_pkl("CCC")
     assert legacy is not None
     assert "CCC" in trafficflow._PKL_CACHE
+
+
+# ===========================================================================
+# Phase 3B-2A: Confluence Spymaster fallback consumer
+# ===========================================================================
+
+
+def test_3b2a_confluence_spymaster_fallback_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    # _load_spymaster_cache_fallback resolves the path relative to cwd.
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    # Manifested -> returns the rebuilt library structure with signals.
+    p_ok = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p_ok, ticker="AAA")
+    pm.manifest_hash_cache_clear()
+    lib = confluence_analyzer._load_spymaster_cache_fallback("AAA")
+    assert lib is not None
+    assert lib.get("source") == "spymaster_cache"
+    assert lib.get("signals")
+
+    # Tampered -> None.
+    p_bad = cache_dir / "BBB_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_bad, ticker="BBB", mutate_after_attach=True,
+    )
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("BBB") is None
+
+    # Legacy -> proceeds.
+    p_legacy = cache_dir / "CCC_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_legacy, ticker="CCC", with_manifest=False,
+    )
+    legacy = confluence_analyzer._load_spymaster_cache_fallback("CCC")
+    assert legacy is not None
+    assert legacy.get("source") == "spymaster_cache"

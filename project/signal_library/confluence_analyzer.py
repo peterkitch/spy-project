@@ -28,6 +28,7 @@ try:
     from provenance_manifest import (
         verify_manifest as _verify_manifest,
         load_verified_signal_library as _load_verified_signal_library,
+        load_verified_pickle_artifact as _load_verified_pickle_artifact,
     )
 except ImportError:
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +37,7 @@ except ImportError:
     from provenance_manifest import (
         verify_manifest as _verify_manifest,
         load_verified_signal_library as _load_verified_signal_library,
+        load_verified_pickle_artifact as _load_verified_pickle_artifact,
     )
 
 # Constants
@@ -52,15 +54,12 @@ logger = logging.getLogger(__name__)
 
 
 def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
-    """Phase 3B-2 scope: Spymaster ``cache/results/*.pkl`` fallback for the
-    1d interval.
+    """Spymaster ``cache/results/*.pkl`` fallback for the 1d interval.
 
-    Spymaster PKLs are not yet provenance-manifested; this helper keeps the
-    raw ``pickle.load`` isolated from the signal-library branch so the
-    Phase 3B-1 B12 guard can allowlist *only* this helper. When Phase 3B-2
-    introduces Spymaster PKL manifests, the body of this helper will be
-    migrated to ``load_verified_signal_library`` and the allowlist entry
-    can be retired.
+    Phase 3B-2A: routes through ``load_verified_pickle_artifact``. Legacy
+    PKLs (no manifest) load with the central loader's warning and proceed
+    so existing pre-3B-2A caches keep working; manifest mismatches return
+    None for that interval so the caller treats the fallback as missing.
     """
     spymaster_path = os.path.join(
         'cache', 'results', f'{ticker}_precomputed_results.pkl'
@@ -68,9 +67,25 @@ def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
     if not os.path.exists(spymaster_path):
         return None
     try:
-        with open(spymaster_path, 'rb') as f:
-            spymaster_data = pickle.load(f)  # noqa: B12 — Phase 3B-2 deferred
-
+        spymaster_data, vresult = _load_verified_pickle_artifact(spymaster_path)
+    except Exception as e:
+        logger.error(f"Failed to load spymaster cache {spymaster_path}: {e}")
+        return None
+    if spymaster_data is None or (not vresult.legacy and not vresult.ok):
+        if spymaster_data is None:
+            for kind, expected, actual in vresult.mismatches:
+                logger.error(
+                    f"{ticker}: spymaster cache load failure "
+                    f"{spymaster_path}: {kind} {expected} {actual}"
+                )
+        else:
+            logger.warning(
+                f"{ticker}: spymaster cache provenance mismatch at "
+                f"{spymaster_path}: {vresult.mismatches}. Treating as "
+                f"missing."
+            )
+        return None
+    try:
         # Extract dates from daily_top_buy_pairs keys
         dates = list(spymaster_data['daily_top_buy_pairs'].keys())
 
@@ -107,9 +122,8 @@ def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
             f"Loaded {ticker} 1d from spymaster cache: {len(signals)} bars"
         )
         return library
-
     except Exception as e:
-        logger.error(f"Failed to load spymaster cache {spymaster_path}: {e}")
+        logger.error(f"Failed to project spymaster cache {spymaster_path}: {e}")
         return None
 
 
