@@ -19,6 +19,12 @@ import dash_bootstrap_components as dbc
 import yfinance as yf
 from tqdm import tqdm
 
+from provenance_manifest import (
+    attach_manifest as _attach_manifest,
+    refresh_or_attach_manifest as _refresh_or_attach_manifest,
+    verify_manifest as _verify_manifest,
+)
+
 # Import shared modules for parity with impactsearch
 from signal_library.shared_symbols import normalize_ticker, detect_ticker_type, resolve_symbol
 # T-1 policy: shared_market_hours no longer needed - we can fetch anytime
@@ -545,6 +551,27 @@ def _ensure_signal_alignment_and_persist(ticker, signal_data):
         vendor_symbol, _ = resolve_symbol(ticker)
         library_path = _lib_path_for(vendor_symbol)
         os.makedirs(os.path.dirname(library_path), exist_ok=True)
+
+        # Phase 3A: refresh provenance manifest. No source_close is in
+        # scope at this repair site, so any existing source_data block
+        # is preserved (do not fabricate a new source hash).
+        _refresh_or_attach_manifest(
+            signal_data,
+            library_path,
+            artifact_type='signal_library_daily',
+            ticker=ticker,
+            resolved_symbol=signal_data.get('resolved_symbol') or vendor_symbol,
+            interval='1d',
+            params={
+                'MAX_SMA_DAY': signal_data.get('max_sma_day', MAX_SMA_DAY),
+                'price_source': signal_data.get('price_source', 'Close'),
+                'persist_skip_bars': signal_data.get('meta', {}).get(
+                    'persist_skip_bars', PERSIST_SKIP_BARS),
+                'parity_hash': signal_data.get('parity_hash'),
+                'repair_kind': 'signal_alignment',
+            },
+            engine_version=signal_data.get('engine_version', ENGINE_VERSION),
+        )
         with open(library_path, 'wb') as f:
             pickle.dump(signal_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         saved_signal_data = signal_data
@@ -973,6 +1000,28 @@ def _persist_library_metadata(ticker, signal_data):
         # Always persist to the SAME root path + filename as main saves.
         path = _lib_path_for(vendor_symbol)
         os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        # Phase 3A: refresh provenance manifest. Same rationale as in
+        # _ensure_signal_alignment_and_persist — no source_close at this
+        # call site, so existing source_data is preserved.
+        _refresh_or_attach_manifest(
+            signal_data,
+            path,
+            artifact_type='signal_library_daily',
+            ticker=ticker,
+            resolved_symbol=signal_data.get('resolved_symbol') or vendor_symbol,
+            interval='1d',
+            params={
+                'MAX_SMA_DAY': signal_data.get('max_sma_day', MAX_SMA_DAY),
+                'price_source': signal_data.get('price_source', 'Close'),
+                'persist_skip_bars': signal_data.get('meta', {}).get(
+                    'persist_skip_bars', PERSIST_SKIP_BARS),
+                'parity_hash': signal_data.get('parity_hash'),
+                'repair_kind': 'metadata',
+            },
+            engine_version=signal_data.get('engine_version', ENGINE_VERSION),
+        )
+
         with open(path, 'wb') as f:
             pickle.dump(signal_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         persist_skip = signal_data.get('meta', {}).get('persist_skip_bars')
@@ -1107,15 +1156,39 @@ def save_signal_library(ticker, daily_top_buy_pairs, daily_top_short_pairs,
         # Save to pickle file (will switch to Parquet/NPZ in Phase 2)
         filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
         filepath = os.path.join(stable_dir, filename)
-        
+
+        # Phase 3A: attach provenance manifest before pickle.dump.
+        # Use the post-T-1-skip ``df`` so source_close matches the
+        # signals/dates persisted alongside it.
+        manifest_params = {
+            'MAX_SMA_DAY': MAX_SMA_DAY,
+            'price_source': price_source,
+            'group_by_mode': 'ticker',
+            'persist_skip_bars': PERSIST_SKIP_BARS,
+            'tiebreak_rule': TIEBREAK_RULE,
+            'auto_adjust': False,
+            'parity_hash': signal_data['parity_hash'],
+        }
+        _attach_manifest(
+            signal_data,
+            filepath,
+            artifact_type='signal_library_daily',
+            ticker=ticker,
+            resolved_symbol=resolved_symbol or ticker,
+            interval='1d',
+            params=manifest_params,
+            source_close=df['Close'] if 'Close' in df.columns else None,
+            engine_version=ENGINE_VERSION,
+        )
+
         # Atomic write: save to temp file first, then rename
         temp_filepath = filepath + ".tmp"
         with open(temp_filepath, 'wb') as f:
             pickle.dump(signal_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
+
         # Atomic replace
         os.replace(temp_filepath, filepath)
-        
+
         logger.info(f"Enhanced Signal Library saved for {ticker} to {filepath}")
         logger.info(f"  - {len(primary_signals)} signals stored")
         logger.info(f"  - Fingerprint: {full_fingerprint[:16]}...")

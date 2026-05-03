@@ -321,3 +321,53 @@ def test_f_refresh_preserves_source_data_when_no_source(sample_library, sample_c
     assert new_manifest["source_data"] == original_source
     # And content_hash was refreshed against the mutated payload.
     assert new_manifest["content_hash"] == pm.content_hash(sample_library)
+
+
+# ---------------------------------------------------------------------------
+# F16: metadata-repair persist preserves existing manifest
+# ---------------------------------------------------------------------------
+
+
+def test_f16_metadata_repair_persist_preserves_manifest(tmp_path, monkeypatch):
+    """When _persist_library_metadata runs over a library that already
+    carries a manifest (set at the original save), the repair must
+    refresh content_hash but preserve the existing source_data block —
+    no source_close is in scope at the repair site.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    dates = pd.bdate_range(start="2024-01-02", periods=20)
+    closes = make_synthetic_close_prices(dates)
+    sigs = ["Buy", "Short", "None"] * (len(dates) // 3) + ["None"] * (
+        len(dates) % 3
+    )
+    lib = make_signal_library_dict(dates, primary_signals=sigs)
+    lib["build_timestamp"] = "2025-01-01T00:00:00"
+    # Simulate the producer-attached manifest (with real source_data).
+    pm.attach_manifest(
+        lib, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="AAA",
+        params={"MAX_SMA_DAY": 114, "price_source": "Close"},
+        source_close=closes,
+    )
+    original_source = dict(lib["_manifest"]["source_data"])
+
+    # Point onepass's library dir at tmp_path so the persist writes
+    # land there. _lib_path_for is a module-level helper; monkey-patch
+    # SIGNAL_LIBRARY_DIR to tmp_path.
+    monkeypatch.setattr(onepass, "SIGNAL_LIBRARY_DIR", str(tmp_path))
+
+    # Mutate a non-volatile metadata field so content_hash will change.
+    lib.setdefault("meta", {})["persist_skip_bars"] = 99
+    onepass._persist_library_metadata("AAA", lib)
+
+    # Source preserved, content_hash refreshed.
+    assert lib["_manifest"]["source_data"] == original_source
+    assert lib["_manifest"]["content_hash"] == pm.content_hash(lib)
+    # Pickle landed on disk with the manifest embedded.
+    saved_path = Path(onepass._lib_path_for("AAA"))
+    assert saved_path.exists()
+    with open(saved_path, "rb") as f:
+        loaded = pickle.load(f)
+    assert loaded["_manifest"]["source_data"] == original_source
