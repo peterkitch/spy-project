@@ -2029,3 +2029,132 @@ def test_3b2b_inspect_preexisting_xlsx_manifest(tmp_path):
     df_bad = pd.DataFrame([{"Primary Ticker": "QQQ"}])
     df_bad.to_excel(pkl, index=False, engine="openpyxl")
     assert pm.inspect_preexisting_xlsx_manifest(pkl) == "mismatched"
+
+
+# ===========================================================================
+# Phase 3B-2B: OnePass XLSX manifest (producer)
+# ===========================================================================
+
+
+def _onepass_metrics(ticker, **overrides):
+    """Minimal OnePass-shaped metrics dict for export tests."""
+    base = {
+        "Primary Ticker": ticker,
+        "Trigger Days": 100,
+        "Wins": 60,
+        "Losses": 40,
+        "Win Ratio (%)": 60.0,
+        "Std Dev (%)": 1.5,
+        "Sharpe Ratio": 1.2,
+        "t-Statistic": 2.5,
+        "p-Value": 0.01,
+        "Significant 90%": "Yes",
+        "Significant 95%": "Yes",
+        "Significant 99%": "No",
+        "Avg Daily Capture (%)": 0.05,
+        "Total Capture (%)": 5.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_3b2b_onepass_xlsx_fresh_writes_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "fresh.xlsx"
+    onepass.export_results_to_excel(
+        str(output), [_onepass_metrics("SPY"), _onepass_metrics("QQQ")]
+    )
+    sidecar = pm._sidecar_path_for(output)
+    assert sidecar.exists()
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["artifact_type"] == "onepass_xlsx"
+    assert manifest["producer_engine"] == "onepass"
+    assert manifest["preexisting_manifest_status"] == "none"
+    assert manifest["preexisting_row_count"] == 0
+    assert manifest["legacy_row_count"] == 0
+    assert manifest["current_run_row_count"] == 2
+    assert sorted(manifest["current_run_keys"]["preview"]) == ["QQQ", "SPY"]
+    # End-to-end load_verified_xlsx_artifact verifies clean.
+    df, vresult = pm.load_verified_xlsx_artifact(output)
+    assert df is not None
+    assert vresult.ok is True
+    assert not vresult.legacy
+
+
+def test_3b2b_onepass_xlsx_existing_with_retained_row_legacy_one(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "retained.xlsx"
+    # Seed with two tickers (run 1).
+    onepass.export_results_to_excel(
+        str(output),
+        [_onepass_metrics("SPY"), _onepass_metrics("OLD")],
+    )
+    # Run 2: only update SPY -> OLD should be retained as a legacy row.
+    onepass.export_results_to_excel(
+        str(output),
+        [_onepass_metrics("SPY", **{"Sharpe Ratio": 2.5})],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 1, (
+        f"Expected 1 legacy row, got {manifest['legacy_row_count']}"
+    )
+    assert manifest["current_run_row_count"] == 1
+    assert manifest["current_run_keys"]["preview"] == ["SPY"]
+    # The preexisting run-1 manifest should classify as valid since the
+    # workbook + sidecar pair were written by the same producer.
+    assert manifest["preexisting_manifest_status"] == "valid"
+    # Workbook should contain both rows.
+    final_df = pd.read_excel(output, engine="openpyxl")
+    assert sorted(final_df["Primary Ticker"].tolist()) == ["OLD", "SPY"]
+
+
+def test_3b2b_onepass_xlsx_full_refresh_legacy_zero(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "refresh.xlsx"
+    onepass.export_results_to_excel(
+        str(output),
+        [_onepass_metrics("SPY"), _onepass_metrics("QQQ")],
+    )
+    # Run 2 touches both keys -> 0 legacy rows.
+    onepass.export_results_to_excel(
+        str(output),
+        [
+            _onepass_metrics("SPY", **{"Sharpe Ratio": 2.0}),
+            _onepass_metrics("QQQ", **{"Sharpe Ratio": 1.5}),
+        ],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 0
+
+
+def test_3b2b_onepass_xlsx_mismatched_preexisting_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "mismatched.xlsx"
+    onepass.export_results_to_excel(
+        str(output), [_onepass_metrics("SPY")]
+    )
+    # Tamper with the workbook bytes BEFORE the next run runs.
+    df_bad = pd.read_excel(output, engine="openpyxl")
+    df_bad.loc[0, "Sharpe Ratio"] = 99.99
+    df_bad.to_excel(output, index=False, engine="openpyxl")
+    # Run 2 should detect the preexisting workbook+sidecar mismatch.
+    onepass.export_results_to_excel(
+        str(output), [_onepass_metrics("QQQ")]
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["preexisting_manifest_status"] == "mismatched"

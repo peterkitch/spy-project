@@ -24,6 +24,9 @@ from provenance_manifest import (
     refresh_or_attach_manifest as _refresh_or_attach_manifest,
     verify_manifest as _verify_manifest,
     load_verified_signal_library as _load_verified_signal_library,
+    build_xlsx_output_manifest as _build_xlsx_output_manifest,
+    inspect_preexisting_xlsx_manifest as _inspect_preexisting_xlsx_manifest,
+    SIDECAR_SUFFIX as _SIDECAR_SUFFIX,
 )
 
 # Import shared modules for parity with impactsearch
@@ -1831,11 +1834,48 @@ def export_results_to_excel(output_filename, metrics_list):
             na_position='last'
         )
 
+    # Phase 3B-2B: classify any preexisting workbook+sidecar pair BEFORE
+    # we overwrite, so the new manifest can record where this run started.
+    _preexisting_status = _inspect_preexisting_xlsx_manifest(output_filename)
+    _preexisting_row_count = int(len(existing)) if not existing.empty else 0
+
     # Write fresh file (idempotent), single sheet
     with pd.ExcelWriter(output_filename, engine="openpyxl", mode="w") as writer:
         combined[ALL_COLS].to_excel(writer, sheet_name="OnePass", index=False)
 
     logger.info(f"Results successfully exported. {len(combined)} tickers in file.")
+
+    # Phase 3B-2B: write sidecar manifest next to the workbook. Reload the
+    # written file so full_workbook_content_hash reflects on-disk content
+    # (round-trip through openpyxl normalizes some dtypes that an
+    # in-memory hash would not capture).
+    try:
+        final_df = pd.read_excel(output_filename, engine="openpyxl")
+        manifest = _build_xlsx_output_manifest(
+            artifact_type="onepass_xlsx",
+            producer_engine="onepass",
+            engine_version=ENGINE_VERSION,
+            output_columns=ALL_COLS,
+            key_columns=["Primary Ticker"],
+            current_run_df=new_df[ALL_COLS],
+            final_df=final_df,
+            artifact_path=output_filename,
+            preexisting_status=_preexisting_status,
+            preexisting_row_count=_preexisting_row_count,
+            params={
+                "MAX_SMA_DAY": MAX_SMA_DAY,
+                "price_source": "Close",
+                "engine_version": ENGINE_VERSION,
+            },
+        )
+        sidecar_path = output_filename + _SIDECAR_SUFFIX
+        with open(sidecar_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, sort_keys=True, indent=2)
+    except Exception as _xlsx_manifest_exc:
+        logger.warning(
+            f"Failed to write OnePass XLSX provenance sidecar: "
+            f"{_xlsx_manifest_exc}"
+        )
 
 def process_onepass_tickers(tickers_list, use_existing_signals=False,
                             *, emit_summary=True, write_report_json=True):
