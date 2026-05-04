@@ -2161,6 +2161,167 @@ def test_3b2b_onepass_xlsx_mismatched_preexisting_sidecar(tmp_path, monkeypatch)
 
 
 # ===========================================================================
+# Phase 3B-2B: StackBuilder --strict-manifests + fast-path verification
+# ===========================================================================
+
+
+def _seed_impactsearch_xlsx(tmp_path, secondary, *, with_manifest=True):
+    """Write a synthetic ImpactSearch XLSX (and optional manifest) under
+    a folder StackBuilder's try_load_rank_from_impact_xlsx will scan.
+    """
+    workbook = tmp_path / f"{secondary}_analysis.xlsx"
+    df = pd.DataFrame([
+        {
+            "Primary Ticker": "AAA",
+            "Avg Daily Capture (%)": 0.10,
+            "Total Capture (%)": 1.0,
+            "Sharpe Ratio": 1.5,
+            "Win Ratio (%)": 60.0,
+            "Std Dev (%)": 0.5,
+            "Trigger Days": 8,
+            "p-Value": 0.04,
+        },
+    ])
+    df.to_excel(workbook, index=False, engine="openpyxl")
+    if with_manifest:
+        manifest = pm.build_xlsx_output_manifest(
+            artifact_type="impactsearch_xlsx",
+            producer_engine="impactsearch",
+            engine_version="1.0.0",
+            output_columns=list(df.columns),
+            key_columns=["Primary Ticker", "Resolved/Fetched"],
+            current_run_df=df.copy(),
+            final_df=df,
+            artifact_path=workbook,
+            preexisting_status="none",
+            preexisting_row_count=0,
+        )
+        sidecar = workbook.with_name(workbook.name + pm.SIDECAR_SUFFIX)
+        sidecar.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return workbook
+
+
+def test_3b2b_stackbuilder_fastpath_strict_legacy_rejected(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    _seed_impactsearch_xlsx(tmp_path, "ZZZ", with_manifest=False)
+    # Non-strict: legacy is accepted.
+    df_ns = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=False,
+    )
+    assert isinstance(df_ns, pd.DataFrame)
+    # Strict: legacy is rejected.
+    df_strict = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=True,
+    )
+    assert df_strict is None
+
+
+def test_3b2b_stackbuilder_fastpath_mismatched_always_rejected(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    workbook = _seed_impactsearch_xlsx(tmp_path, "ZZZ", with_manifest=True)
+    # Tamper the workbook bytes after the manifest was written.
+    df_bad = pd.read_excel(workbook, engine="openpyxl")
+    df_bad.loc[0, "Sharpe Ratio"] = 99.99
+    df_bad.to_excel(workbook, index=False, engine="openpyxl")
+    # Mismatch is rejected even under non-strict.
+    df_ns = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=False,
+    )
+    assert df_ns is None
+    df_strict = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=True,
+    )
+    assert df_strict is None
+
+
+def test_3b2b_stackbuilder_strict_no_primaries_systemexit(monkeypatch):
+    """When fast-path is rejected under --strict-manifests AND no
+    primaries are provided, phase2_rank_all raises SystemExit."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        stackbuilder, "try_load_rank_from_impact_xlsx",
+        lambda *a, **k: None,
+    )
+    args = SimpleNamespace(
+        secondary="ZZZ",
+        prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>",
+        impact_xlsx_max_age_days=45,
+        strict_manifests=True,
+        no_progress=True,
+        bottom_n=1,
+        signal_lib_dir="<unused>",
+    )
+    primaries_df = pd.DataFrame(columns=["Primary Ticker"])
+    sec_rets = pd.Series(dtype=float)
+    with pytest.raises(SystemExit) as exc_info:
+        stackbuilder.phase2_rank_all(
+            args, primaries_df, sec_rets, outdir=str(PROJECT_DIR / "logs"),
+            secondary="ZZZ", progress_path=None,
+        )
+    assert "--strict-manifests" in str(exc_info.value)
+
+
+def test_3b2b_stackbuilder_strict_primaries_provided_falls_through(
+    tmp_path, monkeypatch
+):
+    """When fast-path is rejected under --strict-manifests but primaries
+    ARE provided, phase2_rank_all does NOT SystemExit; it falls through
+    to the slow path. We monkeypatch _score_primary_both_modes to terminate
+    the slow path quickly with all-None results.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        stackbuilder, "try_load_rank_from_impact_xlsx",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        stackbuilder, "_score_primary_both_modes",
+        lambda *a, **k: (None, None),
+    )
+    args = SimpleNamespace(
+        secondary="ZZZ",
+        prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>",
+        impact_xlsx_max_age_days=45,
+        strict_manifests=True,
+        no_progress=True,
+        bottom_n=0,
+        signal_lib_dir="<unused>",
+        threads="auto",
+    )
+    primaries_df = pd.DataFrame({"Primary Ticker": ["AAA"]})
+    sec_rets = pd.Series([0.01, -0.01, 0.02], name="returns")
+    out = tmp_path / "out"
+    out.mkdir()
+    # Should NOT raise SystemExit; slow-path returns empty results.
+    try:
+        stackbuilder.phase2_rank_all(
+            args, primaries_df, sec_rets, outdir=str(out),
+            secondary="ZZZ", progress_path=None,
+        )
+    except SystemExit as exc:
+        # The only SystemExit allowed here is the empty-results one
+        # downstream; the strict no-primaries SystemExit must NOT fire
+        # because primaries WERE provided.
+        assert "--strict-manifests" not in str(exc)
+
+
+# ===========================================================================
 # Phase 3B-2B: ImpactSearch XLSX manifest (producer)
 # ===========================================================================
 
