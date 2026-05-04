@@ -9817,7 +9817,12 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         years = time_delta.days / 365.25  # Account for leap years
     else:
         years = 1  # Default to 1 year if no dates
-    
+
+    annualized_return = (
+        PerformanceMetrics.calculate_annualized_return(total_capture, years)
+        if years > 0 else 0
+    )
+
     # Use centralized grading function with dynamic strategy metrics and time period
     # Note: win_ratio is already calculated from the full dynamic strategy
     grade, grade_color = PerformanceMetrics.calculate_grade(
@@ -10030,8 +10035,7 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     
     # Strategy Confidence Badge already created earlier for grade badge
     
-    # Create Quick Stats Cards with annualized return
-    annualized_return = PerformanceMetrics.calculate_annualized_return(total_capture, years) if years > 0 else 0
+    # Create Quick Stats Cards with annualized return (computed earlier alongside `years`)
     quick_stats = {
         "Total Return": total_capture,
         "Annual Return": annualized_return,
