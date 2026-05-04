@@ -558,6 +558,7 @@ def try_load_rank_from_impact_xlsx(
     max_age_days: int,
     *,
     strict_manifests: bool = False,
+    rejection_out: Optional[Dict[str, Any]] = None,
 ) -> Optional[pd.DataFrame]:
     """Load ImpactSearch Excel ONLY if it matches the selected secondary ticker.
 
@@ -570,6 +571,14 @@ def try_load_rank_from_impact_xlsx(
       - non-strict + legacy_row_count > 0 -> warn, use fast-path
       - strict + missing/legacy/mismatched -> reject fast-path (None)
       - strict + legacy_row_count > 0 -> reject fast-path (None)
+
+    Post Phase 3 cleanup: if ``rejection_out`` is supplied, the caller
+    receives structured rejection info on a None return so it can
+    distinguish "not found" from "found but rejected as stale" (and emit
+    an actionable error message). Keys populated: ``reason`` (str),
+    plus reason-specific fields (e.g. ``path``, ``age_days``,
+    ``max_age_days`` for ``"stale"``). Absent / empty dict means "no
+    rejection recorded by this call".
     """
     try:
         if not dirpath or not os.path.isdir(dirpath):
@@ -602,6 +611,11 @@ def try_load_rank_from_impact_xlsx(
         age_days = (time.time() - mtime) / 86400.0
         if max_age_days and age_days > max_age_days:
             print(f"[INFO] ImpactSearch XLSX too old (> {max_age_days}d): {best}")
+            if rejection_out is not None:
+                rejection_out['reason'] = 'stale'
+                rejection_out['path'] = best
+                rejection_out['age_days'] = age_days
+                rejection_out['max_age_days'] = max_age_days
             return None
 
         # Phase 3B-2B: manifest verification before fast-path use.
@@ -1005,11 +1019,16 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     strict_manifests = bool(getattr(args, "strict_manifests", False))
     if getattr(args, "prefer_impact_xlsx", False):
         sec = (secondary or getattr(args, "secondary", "") or "").upper()
+        # Capture structured rejection info so a stale-rejection produces an
+        # accurate error below instead of a misleading "No ImpactSearch Excel
+        # found" message.
+        xlsx_rejection: Dict[str, Any] = {}
         rank_all = try_load_rank_from_impact_xlsx(
             sec=sec,
             dirpath=getattr(args, "impact_xlsx_dir", DEFAULT_IMPACT_XLSX_DIR),
             max_age_days=int(getattr(args, "impact_xlsx_max_age_days", 45)),
             strict_manifests=strict_manifests,
+            rejection_out=xlsx_rejection,
         )
         # Phase 3B-2B: under --strict-manifests, a fast-path rejection
         # with NO user-provided primaries is a fatal error -- there is
@@ -1133,7 +1152,21 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                     f"{len(primaries_df)} caller-provided primaries."
                 )
             else:
-                # Do NOT compute 70k+ primaries if user asked for fast-path
+                # Do NOT compute 70k+ primaries if user asked for fast-path.
+                # Distinguish "found but rejected as stale" from "not found"
+                # so the user gets actionable guidance rather than chasing a
+                # missing file that actually exists but is too old.
+                if xlsx_rejection.get('reason') == 'stale':
+                    raise RuntimeError(
+                        f"ImpactSearch Excel found for secondary "
+                        f"'{secondary or args.secondary}' but rejected as stale:\n"
+                        f"  {xlsx_rejection['path']}\n"
+                        f"  age={xlsx_rejection['age_days']:.0f}d > "
+                        f"max_age_days={xlsx_rejection['max_age_days']}.\n"
+                        f"Refresh the workbook, raise "
+                        f"--impact-xlsx-max-age-days, or disable Use "
+                        f"ImpactSearch .xlsx."
+                    )
                 raise RuntimeError(f"No ImpactSearch Excel found for secondary '{secondary or args.secondary}' in "
                                    f"{getattr(args,'impact_xlsx_dir', DEFAULT_IMPACT_XLSX_DIR)}. "
                                    f"Expected a file like '{secondary or args.secondary}_analysis.xlsx'. "
