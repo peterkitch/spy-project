@@ -2590,3 +2590,105 @@ def test_3b2b_confluence_strict_env_truthy_parsing(monkeypatch):
     monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", "0")
     monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "1")
     assert confluence_analyzer._strict_manifests_enabled() is True
+
+
+# ===========================================================================
+# Phase 3B-2B amendment: type-tagged + boundary-safe canonical encoding
+# ===========================================================================
+
+
+def test_3b2b_canonical_cell_int_vs_str_no_collision():
+    """``1`` and ``"1"`` must produce different canonical encodings AND
+    different workbook hashes. Pre-amendment used repr() for ints and
+    str() for strings; both produced ``"1"``."""
+    assert pm._xlsx_canonical_cell(1) != pm._xlsx_canonical_cell("1")
+    h_int = pm._canonical_workbook_hash(pd.DataFrame([{"x": 1}]))
+    h_str = pm._canonical_workbook_hash(pd.DataFrame([{"x": "1"}]))
+    assert h_int != h_str
+
+
+def test_3b2b_canonical_cell_bool_vs_str_no_collision():
+    """``True`` / ``False`` must NOT collide with ``"True"`` / ``"False"``."""
+    assert pm._xlsx_canonical_cell(True) != pm._xlsx_canonical_cell("True")
+    assert pm._xlsx_canonical_cell(False) != pm._xlsx_canonical_cell("False")
+    h_t = pm._canonical_workbook_hash(pd.DataFrame([{"x": True}]))
+    h_ts = pm._canonical_workbook_hash(pd.DataFrame([{"x": "True"}]))
+    assert h_t != h_ts
+    h_f = pm._canonical_workbook_hash(pd.DataFrame([{"x": False}]))
+    h_fs = pm._canonical_workbook_hash(pd.DataFrame([{"x": "False"}]))
+    assert h_f != h_fs
+
+
+def test_3b2b_canonical_cell_float_vs_str_no_collision():
+    assert pm._xlsx_canonical_cell(1.0) != pm._xlsx_canonical_cell("1.0")
+    h_f = pm._canonical_workbook_hash(pd.DataFrame([{"x": 1.0}]))
+    h_s = pm._canonical_workbook_hash(pd.DataFrame([{"x": "1.0"}]))
+    assert h_f != h_s
+
+
+def test_3b2b_canonical_cell_timestamp_vs_iso_str_no_collision():
+    ts = pd.Timestamp("2026-05-04T00:00:00")
+    iso = "2026-05-04T00:00:00"
+    assert pm._xlsx_canonical_cell(ts) != pm._xlsx_canonical_cell(iso)
+    # Build the workbook directly without going through openpyxl since
+    # writing a Timestamp + reading it back can normalize the dtype; we
+    # want to assert the hash function itself does the right thing.
+    h_ts = pm._canonical_workbook_hash(pd.DataFrame([{"x": ts}]))
+    h_iso = pm._canonical_workbook_hash(pd.DataFrame([{"x": iso}]))
+    assert h_ts != h_iso
+
+
+def test_3b2b_canonical_cell_sentinel_literal_vs_sentinel():
+    """A literal string like ``"none:"`` or ``"int:5"`` must not collide
+    with the corresponding real tagged value."""
+    assert pm._xlsx_canonical_cell("none:") != pm._xlsx_canonical_cell(None)
+    assert pm._xlsx_canonical_cell("nan:") != pm._xlsx_canonical_cell(float("nan"))
+    assert pm._xlsx_canonical_cell("bool:True") != pm._xlsx_canonical_cell(True)
+    assert pm._xlsx_canonical_cell("int:5") != pm._xlsx_canonical_cell(5)
+    assert pm._xlsx_canonical_cell("float:1.0") != pm._xlsx_canonical_cell(1.0)
+    ts = pd.Timestamp("2026-05-04T00:00:00")
+    assert (
+        pm._xlsx_canonical_cell(f"timestamp:{ts.isoformat()}")
+        != pm._xlsx_canonical_cell(ts)
+    )
+    assert pm._xlsx_canonical_cell('str:"abc"') != pm._xlsx_canonical_cell("abc")
+
+
+def test_3b2b_canonical_cell_numpy_scalars_tagged():
+    assert pm._xlsx_canonical_cell(np.int64(1)) != pm._xlsx_canonical_cell("1")
+    assert pm._xlsx_canonical_cell(np.float64(1.0)) != pm._xlsx_canonical_cell("1.0")
+    assert pm._xlsx_canonical_cell(np.bool_(True)) != pm._xlsx_canonical_cell("True")
+    # NumPy scalars must produce the same encoding as their Python counterparts
+    # for true type-equivalence (np.int64(1) and Python int(1) are both ``int``-tagged).
+    assert pm._xlsx_canonical_cell(np.int64(1)) == pm._xlsx_canonical_cell(1)
+    assert pm._xlsx_canonical_cell(np.float64(1.0)) == pm._xlsx_canonical_cell(1.0)
+    assert pm._xlsx_canonical_cell(np.bool_(True)) == pm._xlsx_canonical_cell(True)
+
+
+def test_3b2b_canonical_workbook_hash_cell_boundary_safe():
+    """Cell content containing the legacy ``|`` delimiter (or newlines)
+    must not allow cross-boundary collisions."""
+    df_left = pd.DataFrame([{"A": "x|", "B": "y"}])
+    df_right = pd.DataFrame([{"A": "x", "B": "|y"}])
+    assert (
+        pm._canonical_workbook_hash(df_left)
+        != pm._canonical_workbook_hash(df_right)
+    )
+    # Newline in cell content must not bleed into the row separator.
+    df_nl = pd.DataFrame([{"A": "x\n", "B": "y"}, {"A": "z", "B": "w"}])
+    df_other = pd.DataFrame([{"A": "x", "B": "y"}, {"A": "\nz", "B": "w"}])
+    assert (
+        pm._canonical_workbook_hash(df_nl)
+        != pm._canonical_workbook_hash(df_other)
+    )
+
+
+def test_3b2b_xlsx_upsert_fills_empty_cell_changes_hash():
+    """Filling a previously-empty cell during an upsert must change the
+    workbook hash. This is the partial-upsert empty-cell invariant."""
+    df_empty = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": np.nan}])
+    df_filled = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": 1.5}])
+    assert (
+        pm._canonical_workbook_hash(df_empty)
+        != pm._canonical_workbook_hash(df_filled)
+    )

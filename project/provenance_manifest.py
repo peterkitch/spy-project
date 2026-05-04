@@ -1507,50 +1507,65 @@ def load_verified_json_artifact(
 #   - artifact_file_sha256 digests raw XLSX bytes; sidecar-only tamper
 #     check.
 #
-# Sidecar naming: <artifact>.manifest.json (e.g. SPY_analysis.xlsx ->
-# SPY_analysis.manifest.json) — matches the existing sidecar convention
-# established by Phase 3A signal libraries.
-
-_XLSX_NAN_SENTINEL = "\x00__NAN__\x00"
-_XLSX_NONE_SENTINEL = "\x00__NONE__\x00"
+# Sidecar naming: <artifact>.xlsx.manifest.json (e.g. SPY_analysis.xlsx ->
+# SPY_analysis.xlsx.manifest.json) — matches the existing sidecar
+# convention established by Phase 3A signal libraries.
 
 
 def _xlsx_canonical_cell(value: Any) -> str:
-    """Canonical string form for a single workbook cell.
+    """Type-tagged canonical string form for a single workbook cell.
 
-    Distinguishes None / NaN / empty string from each other so an
-    upsert that fills a previously-empty cell produces a different
-    hash than the original.
+    Phase 3B-2B amendment: every encoding carries a ``<type>:`` prefix
+    so ``1`` (int) and ``"1"`` (str) — and the matching bool / float /
+    timestamp variants — produce distinct encodings. String payloads
+    are JSON-quoted via ``json.dumps`` so a literal ``"int:5"`` does
+    not collide with the real ``5`` encoding, and string content
+    containing quotes / backslashes / control characters / sentinel-
+    like literals is unambiguous.
+
+    ``bool`` is dispatched BEFORE ``int`` because ``isinstance(True,
+    int)`` is True (bool inherits from int in Python). NumPy scalars
+    (``np.bool_``, ``np.integer``, ``np.floating``) follow the same
+    contract as their Python counterparts. ``pd.isna`` is tried before
+    string fallback so pandas-flavored missing values (NaT, pd.NA,
+    NaN inside object columns) collapse to the ``"nan:"`` tag.
     """
     if value is None:
-        return _XLSX_NONE_SENTINEL
-    if isinstance(value, float):
-        if math.isnan(value):
-            return _XLSX_NAN_SENTINEL
-        if math.isinf(value):
-            return "+inf" if value > 0 else "-inf"
-        # Round-trip through repr for canonical float text.
-        return repr(value)
-    if isinstance(value, (np.floating,)):
-        f = float(value)
-        if math.isnan(f):
-            return _XLSX_NAN_SENTINEL
-        if math.isinf(f):
-            return "+inf" if f > 0 else "-inf"
-        return repr(f)
-    if isinstance(value, (np.integer, int, bool)):
-        return repr(value)
-    if isinstance(value, (pd.Timestamp, datetime)):
-        try:
-            return value.isoformat()
-        except Exception:
-            return str(value)
+        return "none:"
+
+    # ``pd.isna`` covers NaT, pd.NA, and NaN values that didn't hit the
+    # numeric branches below (e.g. object-typed NaN). Bool / int / str
+    # would all answer False to pd.isna, so this is safe to run first.
     try:
         if pd.isna(value):
-            return _XLSX_NAN_SENTINEL
+            return "nan:"
     except (TypeError, ValueError):
         pass
-    return str(value)
+
+    if isinstance(value, (bool, np.bool_)):
+        return f"bool:{bool(value)}"
+
+    if isinstance(value, (np.integer, int)):
+        return f"int:{int(value)}"
+
+    if isinstance(value, (np.floating, float)):
+        f = float(value)
+        if math.isnan(f):
+            return "nan:"
+        if math.isinf(f):
+            return "float:+inf" if f > 0 else "float:-inf"
+        return f"float:{repr(f)}"
+
+    if isinstance(value, (pd.Timestamp, datetime)):
+        try:
+            return f"timestamp:{value.isoformat()}"
+        except Exception:
+            return f"str:{json.dumps(str(value), ensure_ascii=True)}"
+
+    if isinstance(value, str):
+        return f"str:{json.dumps(value, ensure_ascii=True)}"
+
+    return f"str:{json.dumps(str(value), ensure_ascii=True)}"
 
 
 def _canonical_workbook_hash(df: "pd.DataFrame") -> str:
@@ -1560,18 +1575,29 @@ def _canonical_workbook_hash(df: "pd.DataFrame") -> str:
     value (row-major, in column order). Preserves row order so an
     export that re-sorts the workbook produces a different hash even
     if the row content is unchanged.
+
+    Phase 3B-2B amendment: each row is serialized as a JSON list of
+    type-tagged cell encodings rather than ``"|"``-delimited raw
+    strings. This eliminates the boundary-collision class where cell
+    content containing ``"|"`` or newlines could let
+    ``["x|", "y"]`` and ``["x", "|y"]`` produce the same hash.
     """
     h = hashlib.sha256()
     cols = [str(c) for c in df.columns]
     h.update(b"cols|")
-    h.update(json.dumps(cols, sort_keys=False).encode("utf-8"))
+    h.update(json.dumps(cols, sort_keys=False, ensure_ascii=True).encode("utf-8"))
     h.update(b"|rows|")
     h.update(str(len(df)).encode("utf-8"))
     h.update(b"|")
     for _, row in df.iterrows():
-        for col in df.columns:
-            h.update(_xlsx_canonical_cell(row[col]).encode("utf-8"))
-            h.update(b"|")
+        encoded_row = [_xlsx_canonical_cell(row[col]) for col in df.columns]
+        h.update(
+            json.dumps(
+                encoded_row,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
         h.update(b"\n")
     return h.hexdigest()
 

@@ -1854,3 +1854,84 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
   Status: implemented in Phase 3B-2B (this PR). **Phase 3 is
   COMPLETE.** Phase 4 (Cross-Ticker Confluence Dashboard) is now
   unblocked.
+
+### Phase 3B-2B amendment (PR #144): canonical-cell type tags + boundary-safe row hashing
+
+  Codex audit on PR #144 found one blocker plus one adjacent risk in the
+  XLSX canonical encoder. Both were fixed in-flight on the same PR.
+
+  **Blocker — type-vs-string collisions in `_xlsx_canonical_cell`:**
+    - Old (29e45f0 commits 1-6): the encoder used `repr()` for
+      ints / bools / numpy scalars, `repr()` for floats, `isoformat()`
+      for timestamps, and a bare `str()` fallback for strings. With no
+      type tag and no string-payload escaping, real distinct cells
+      produced colliding encodings:
+        * `1` (int) and `"1"` (str) -> both `"1"`
+        * `True` and `"True"` -> both `"True"`
+        * `1.0` (float) and `"1.0"` -> both `"1.0"`
+        * `pd.Timestamp("2026-05-04T00:00:00")` and the matching ISO
+          string -> both `"2026-05-04T00:00:00"`
+      A workbook that swapped a typed cell for its string twin would
+      produce the same `full_workbook_content_hash`.
+    - New (amendment): every encoding carries an explicit `<type>:`
+      prefix (`none:`, `nan:`, `bool:<True|False>`, `int:<n>`,
+      `float:<repr(f)>`, `timestamp:<iso>`, `str:<json.dumps(s)>`).
+      String payloads go through `json.dumps(ensure_ascii=True)` so
+      quotes / backslashes / control characters / sentinel-like
+      literals are unambiguously escaped. ``bool`` is dispatched
+      BEFORE ``int`` because ``isinstance(True, int)`` is True
+      (bool inherits from int in Python). NumPy scalars
+      (``np.bool_``, ``np.integer``, ``np.floating``) follow the
+      same contract as their Python counterparts. ``pd.isna`` is
+      tried before string fallback so pandas-flavored missing values
+      (NaT, pd.NA, NaN inside object columns) collapse to ``"nan:"``.
+    - Side benefit: the prior ``\x00__NONE__\x00`` /
+      ``\x00__NAN__\x00`` sentinels are retired in favor of the
+      tagged ``"none:"`` / ``"nan:"`` strings, which are
+      ``json.dumps``-safe and human-readable in failure messages.
+
+  **Adjacent risk — row-boundary ambiguity in `_canonical_workbook_hash`:**
+    - Old: row encoding concatenated raw cell strings with ``"|"``
+      delimiters: ``cell1|cell2|cell3|\n``. A row like
+      ``["x|", "y"]`` produced bytes ``"x||y|"``, identical to what
+      ``["x", "|y"]`` produced. Newlines in cell content could
+      similarly bleed across the row separator.
+    - New: each row is serialized as a JSON list of tagged cell
+      encodings (``json.dumps(encoded_row, ensure_ascii=True,
+      separators=(",", ":"))``). Cell boundaries are unambiguous;
+      delimiter / newline content inside cells cannot bleed across
+      cells or across rows.
+
+  **Comment correction:**
+    - Pre-amendment comment block at line ~1510 said the sidecar
+      naming was ``<artifact>.manifest.json`` (e.g. ``SPY_analysis.xlsx
+      -> SPY_analysis.manifest.json``). The actual sidecar suffix is
+      ``.xlsx.manifest.json``: ``SPY_analysis.xlsx ->
+      SPY_analysis.xlsx.manifest.json``. Comment corrected.
+
+  **Backwards compatibility:**
+    PR #144 has not shipped. No on-disk legacy XLSX manifests exist
+    yet at the new schema, so the encoder change has zero legacy
+    impact. A repo-wide grep confirmed no existing test contained a
+    hardcoded XLSX hash value that the new encoder would invalidate.
+
+  **Regression tests (8 new):**
+    - ``test_3b2b_canonical_cell_int_vs_str_no_collision``
+    - ``test_3b2b_canonical_cell_bool_vs_str_no_collision``
+    - ``test_3b2b_canonical_cell_float_vs_str_no_collision``
+    - ``test_3b2b_canonical_cell_timestamp_vs_iso_str_no_collision``
+    - ``test_3b2b_canonical_cell_sentinel_literal_vs_sentinel``
+    - ``test_3b2b_canonical_cell_numpy_scalars_tagged``
+    - ``test_3b2b_canonical_workbook_hash_cell_boundary_safe``
+    - ``test_3b2b_xlsx_upsert_fills_empty_cell_changes_hash``
+
+  All 6 collision tests + the boundary-safe test failed under
+  29e45f0 and pass after the fix. The sentinel-literal test
+  (``test_3b2b_canonical_cell_sentinel_literal_vs_sentinel``) and
+  the empty-cell upsert test
+  (``test_3b2b_xlsx_upsert_fills_empty_cell_changes_hash``) also
+  passed under the old encoder by accident (the old NaN/None
+  sentinels happened to be ``\x00``-bracketed, not collidable with
+  the literal text); they remain as documented invariants.
+
+  Status: implemented in PR #144 amendment commit 7.
