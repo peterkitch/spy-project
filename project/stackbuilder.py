@@ -31,6 +31,7 @@ from provenance_manifest import (
     load_verified_signal_library as _load_verified_signal_library,
     build_output_manifest as _build_output_manifest,
     file_sha256 as _file_sha256,
+    load_verified_xlsx_artifact as _load_verified_xlsx_artifact,
     MANIFEST_SCHEMA_VERSION as _MANIFEST_SCHEMA_VERSION,
     ARTIFACT_KIND_OUTPUT as _ARTIFACT_KIND_OUTPUT,
 )
@@ -130,9 +131,18 @@ def _finalize_input_manifest_collection(
             _INPUT_COLLECTOR_VAR.reset(token)
         except (ValueError, LookupError):
             # Token came from a different Context (e.g. captured by
-            # copy_context().run on a worker thread). Fall back to a
-            # plain clear; the worker's local copy will be discarded
-            # when the worker context is released.
+            # copy_context().run on a worker thread). Phase 3B-2B:
+            # surface this with a logged warning instead of silently
+            # falling back, so the audit trail records a possible
+            # ContextVar mismanagement signal. Fall back to a plain
+            # clear afterwards; the worker's local copy will be
+            # discarded when the worker context is released.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Cross-context input-manifest collector token reset "
+                "detected; clearing current collector. This may "
+                "indicate ContextVar mismanagement."
+            )
             _INPUT_COLLECTOR_VAR.set(None)
     else:
         _INPUT_COLLECTOR_VAR.set(None)
@@ -542,8 +552,25 @@ def _standardize_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("ImpactSearch XLSX missing required columns")
     return out[have].copy()
 
-def try_load_rank_from_impact_xlsx(sec: str, dirpath: str, max_age_days: int) -> Optional[pd.DataFrame]:
-    """Load ImpactSearch Excel ONLY if it matches the selected secondary ticker."""
+def try_load_rank_from_impact_xlsx(
+    sec: str,
+    dirpath: str,
+    max_age_days: int,
+    *,
+    strict_manifests: bool = False,
+) -> Optional[pd.DataFrame]:
+    """Load ImpactSearch Excel ONLY if it matches the selected secondary ticker.
+
+    Phase 3B-2B: optional manifest verification via
+    ``load_verified_xlsx_artifact``. Behavior:
+
+      - non-strict + missing/legacy manifest -> warn, use fast-path
+      - non-strict + present-but-mismatched manifest -> warn, reject
+        fast-path (return None) so the caller falls back to slow path
+      - non-strict + legacy_row_count > 0 -> warn, use fast-path
+      - strict + missing/legacy/mismatched -> reject fast-path (None)
+      - strict + legacy_row_count > 0 -> reject fast-path (None)
+    """
     try:
         if not dirpath or not os.path.isdir(dirpath):
             return None
@@ -577,8 +604,49 @@ def try_load_rank_from_impact_xlsx(sec: str, dirpath: str, max_age_days: int) ->
             print(f"[INFO] ImpactSearch XLSX too old (> {max_age_days}d): {best}")
             return None
 
-        df = pd.read_excel(best, engine="openpyxl")
-        df = _standardize_rank_columns(df)
+        # Phase 3B-2B: manifest verification before fast-path use.
+        verified_df, vresult = _load_verified_xlsx_artifact(
+            best, strict=strict_manifests,
+        )
+        if verified_df is None:
+            # Hard load error (corrupt workbook, missing file). Reject.
+            print(
+                f"[WARN] ImpactSearch XLSX load error at {best}: "
+                f"{vresult.mismatches}"
+            )
+            return None
+        if vresult.legacy:
+            if strict_manifests:
+                print(
+                    f"[STRICT] ImpactSearch XLSX has no provenance manifest "
+                    f"at {best}; rejecting fast-path under "
+                    f"--strict-manifests."
+                )
+                return None
+            print(
+                f"[WARN] ImpactSearch XLSX has no provenance manifest at "
+                f"{best} (legacy); proceeding with fast-path."
+            )
+        elif not vresult.ok:
+            # Manifest exists but does not verify -- always reject the
+            # fast-path (mismatches indicate the workbook bytes or
+            # logical content disagree with the recorded manifest).
+            print(
+                f"[WARN] ImpactSearch XLSX provenance manifest mismatch at "
+                f"{best}: {vresult.mismatches}. Rejecting fast-path."
+            )
+            return None
+        # legacy_row_count warnings under non-strict still allow fast-path;
+        # strict mode treats them as mismatches above.
+        for w in vresult.warnings:
+            if isinstance(w, tuple) and w and "legacy_row_count" in str(w[0]):
+                print(
+                    f"[WARN] ImpactSearch XLSX has {w[2]} retained "
+                    f"legacy row(s) at {best}; partial provenance "
+                    f"coverage. Rerun ImpactSearch to refresh."
+                )
+
+        df = _standardize_rank_columns(verified_df)
         for c in ['Avg Daily Capture (%)','Total Capture (%)','Sharpe Ratio','Win Ratio (%)','Std Dev (%)','Trigger Days']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -934,13 +1002,31 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     ``DEFAULT_GRACE_DAYS``.
     """
     # Fast-path: use ImpactSearch .xlsx if requested and available
+    strict_manifests = bool(getattr(args, "strict_manifests", False))
     if getattr(args, "prefer_impact_xlsx", False):
         sec = (secondary or getattr(args, "secondary", "") or "").upper()
         rank_all = try_load_rank_from_impact_xlsx(
             sec=sec,
             dirpath=getattr(args, "impact_xlsx_dir", DEFAULT_IMPACT_XLSX_DIR),
-            max_age_days=int(getattr(args, "impact_xlsx_max_age_days", 45))
+            max_age_days=int(getattr(args, "impact_xlsx_max_age_days", 45)),
+            strict_manifests=strict_manifests,
         )
+        # Phase 3B-2B: under --strict-manifests, a fast-path rejection
+        # with NO user-provided primaries is a fatal error -- there is
+        # no slow-path cohort to fall back to. Caller-provided primaries
+        # let the slow path recompute.
+        if (
+            rank_all is None
+            and strict_manifests
+            and (primaries_df is None or len(primaries_df) == 0)
+        ):
+            raise SystemExit(
+                f"[FATAL] --strict-manifests rejected the ImpactSearch "
+                f"XLSX fast-path for {sec}, and no primary tickers were "
+                f"provided for slow-path recomputation. Provide primaries, "
+                f"repair/regenerate the XLSX manifest, or rerun without "
+                f"--strict-manifests."
+            )
         if isinstance(rank_all, pd.DataFrame) and len(rank_all):
             # If UI primaries provided, filter Excel to that cohort before any ranking
             if primaries_df is not None and not primaries_df.empty:
@@ -1031,11 +1117,27 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                 )
             return rank_all, rank_direct, rank_inverse
         else:
-            # Do NOT compute 70k+ primaries if user asked for fast-path
-            raise RuntimeError(f"No ImpactSearch Excel found for secondary '{secondary or args.secondary}' in "
-                               f"{getattr(args,'impact_xlsx_dir', DEFAULT_IMPACT_XLSX_DIR)}. "
-                               f"Expected a file like '{secondary or args.secondary}_analysis.xlsx'. "
-                               f"Uncheck 'Use ImpactSearch .xlsx' to compute from signal libraries.")
+            # Phase 3B-2B: under --strict-manifests with caller-provided
+            # primaries, fall through to the slow path so the run can
+            # recompute against the exact primaries cohort. The 70K-
+            # primary guard below still applies when no primaries were
+            # provided at all -- that case raises SystemExit above.
+            if (
+                strict_manifests
+                and primaries_df is not None
+                and len(primaries_df) > 0
+            ):
+                print(
+                    f"[FASTPATH] --strict-manifests rejected the ImpactSearch "
+                    f"XLSX for {sec}; falling through to slow path with "
+                    f"{len(primaries_df)} caller-provided primaries."
+                )
+            else:
+                # Do NOT compute 70k+ primaries if user asked for fast-path
+                raise RuntimeError(f"No ImpactSearch Excel found for secondary '{secondary or args.secondary}' in "
+                                   f"{getattr(args,'impact_xlsx_dir', DEFAULT_IMPACT_XLSX_DIR)}. "
+                                   f"Expected a file like '{secondary or args.secondary}_analysis.xlsx'. "
+                                   f"Uncheck 'Use ImpactSearch .xlsx' to compute from signal libraries.")
     max_workers = None if args.threads == 'auto' else int(args.threads)
     rows_direct: List[Dict] = []
     rows_inverse: List[Dict] = []
@@ -2296,6 +2398,17 @@ def parse_args(argv=None):
     p.add_argument('--prefer-impact-xlsx', action='store_true', help='Prefer ImpactSearch .xlsx ranking if available')
     p.add_argument('--impact-xlsx-dir', default=DEFAULT_IMPACT_XLSX_DIR, help='Folder with ImpactSearch .xlsx exports')
     p.add_argument('--impact-xlsx-max-age-days', type=int, default=45)
+    # Phase 3B-2B: strict manifest verification for the ImpactSearch
+    # XLSX fast-path. Default off; when enabled, legacy/missing/mismatched
+    # workbooks are rejected and the run falls back to the slow path or
+    # exits with a fatal error if no primaries were provided.
+    p.add_argument(
+        '--strict-manifests', action='store_true', default=False,
+        help=(
+            "Require verified manifests for manifest-aware fast paths; "
+            "reject legacy/missing/mismatched ImpactSearch XLSX in strict mode."
+        ),
+    )
     p.add_argument('--output-format', choices=['xlsx','parquet','csv'], default=OUTPUT_FORMAT)
     # Parallelism across secondaries
     p.add_argument('--jobs', default=os.environ.get('STACKBUILDER_JOBS', '1'),

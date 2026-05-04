@@ -1488,6 +1488,455 @@ def load_verified_json_artifact(
     return data, result
 
 
+# ---------------------------------------------------------------------------
+# Phase 3B-2B: XLSX manifest helpers + load_verified_xlsx_artifact
+# ---------------------------------------------------------------------------
+#
+# XLSX artifacts (OnePass and ImpactSearch result workbooks) are upsert-
+# style: a run typically combines newly-computed rows with previously
+# persisted rows in the same workbook. Provenance therefore needs to
+# distinguish "rows produced by THIS run" from "rows retained from a
+# prior run." See ledger Phase 3B-2B entry for the legacy_row_count
+# semantics.
+#
+# Hash contract (DECISION 2):
+#   - full_workbook_content_hash digests parsed-DataFrame logical content
+#     (row order preserved; columns serialized in DataFrame order;
+#     NaN/None normalized) — NOT raw XLSX bytes. The ZIP container
+#     embeds writer metadata that drifts across openpyxl versions.
+#   - artifact_file_sha256 digests raw XLSX bytes; sidecar-only tamper
+#     check.
+#
+# Sidecar naming: <artifact>.xlsx.manifest.json (e.g. SPY_analysis.xlsx ->
+# SPY_analysis.xlsx.manifest.json) — matches the existing sidecar
+# convention established by Phase 3A signal libraries.
+
+
+def _xlsx_canonical_cell(value: Any) -> str:
+    """Type-tagged canonical string form for a single workbook cell.
+
+    Phase 3B-2B amendment: every encoding carries a ``<type>:`` prefix
+    so ``1`` (int) and ``"1"`` (str) — and the matching bool / float /
+    timestamp variants — produce distinct encodings. String payloads
+    are JSON-quoted via ``json.dumps`` so a literal ``"int:5"`` does
+    not collide with the real ``5`` encoding, and string content
+    containing quotes / backslashes / control characters / sentinel-
+    like literals is unambiguous.
+
+    ``bool`` is dispatched BEFORE ``int`` because ``isinstance(True,
+    int)`` is True (bool inherits from int in Python). NumPy scalars
+    (``np.bool_``, ``np.integer``, ``np.floating``) follow the same
+    contract as their Python counterparts. ``pd.isna`` is tried before
+    string fallback so pandas-flavored missing values (NaT, pd.NA,
+    NaN inside object columns) collapse to the ``"nan:"`` tag.
+    """
+    if value is None:
+        return "none:"
+
+    # ``pd.isna`` covers NaT, pd.NA, and NaN values that didn't hit the
+    # numeric branches below (e.g. object-typed NaN). Bool / int / str
+    # would all answer False to pd.isna, so this is safe to run first.
+    try:
+        if pd.isna(value):
+            return "nan:"
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (bool, np.bool_)):
+        return f"bool:{bool(value)}"
+
+    if isinstance(value, (np.integer, int)):
+        return f"int:{int(value)}"
+
+    if isinstance(value, (np.floating, float)):
+        f = float(value)
+        if math.isnan(f):
+            return "nan:"
+        if math.isinf(f):
+            return "float:+inf" if f > 0 else "float:-inf"
+        return f"float:{repr(f)}"
+
+    if isinstance(value, (pd.Timestamp, datetime)):
+        try:
+            return f"timestamp:{value.isoformat()}"
+        except Exception:
+            return f"str:{json.dumps(str(value), ensure_ascii=True)}"
+
+    if isinstance(value, str):
+        return f"str:{json.dumps(value, ensure_ascii=True)}"
+
+    return f"str:{json.dumps(str(value), ensure_ascii=True)}"
+
+
+def _canonical_workbook_hash(df: "pd.DataFrame") -> str:
+    """SHA-256 over a deterministic encoding of the parsed workbook.
+
+    Hashes column names (in DataFrame order) followed by every cell
+    value (row-major, in column order). Preserves row order so an
+    export that re-sorts the workbook produces a different hash even
+    if the row content is unchanged.
+
+    Phase 3B-2B amendment: each row is serialized as a JSON list of
+    type-tagged cell encodings rather than ``"|"``-delimited raw
+    strings. This eliminates the boundary-collision class where cell
+    content containing ``"|"`` or newlines could let
+    ``["x|", "y"]`` and ``["x", "|y"]`` produce the same hash.
+    """
+    h = hashlib.sha256()
+    cols = [str(c) for c in df.columns]
+    h.update(b"cols|")
+    h.update(json.dumps(cols, sort_keys=False, ensure_ascii=True).encode("utf-8"))
+    h.update(b"|rows|")
+    h.update(str(len(df)).encode("utf-8"))
+    h.update(b"|")
+    for _, row in df.iterrows():
+        encoded_row = [_xlsx_canonical_cell(row[col]) for col in df.columns]
+        h.update(
+            json.dumps(
+                encoded_row,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _xlsx_key_strings(
+    df: "pd.DataFrame", key_columns: Sequence[str]
+) -> "list[str]":
+    """Per-row normalized key string.
+
+    For each row, the first non-empty value among ``key_columns`` is
+    stripped and uppercased. Rows with no non-empty key resolve to the
+    empty string; callers decide whether to drop them. This mirrors the
+    OnePass and ImpactSearch dedupe logic.
+    """
+    out: list = []
+    cols_present = [c for c in key_columns if c in df.columns]
+    for _, row in df.iterrows():
+        chosen = ""
+        for col in cols_present:
+            val = row[col]
+            try:
+                if pd.isna(val):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            sval = str(val).strip()
+            if sval:
+                chosen = sval.upper()
+                break
+        out.append(chosen)
+    return out
+
+
+def _hash_key_tuples(keys: Sequence[str]) -> str:
+    """Stable digest over a set of key strings (sorted for set-identity)."""
+    h = hashlib.sha256()
+    for k in sorted(set(keys)):
+        h.update(k.encode("utf-8"))
+        h.update(b"|")
+    return h.hexdigest()
+
+
+def _compute_legacy_row_count(
+    final_df: "pd.DataFrame",
+    current_keys: Sequence[str],
+    key_columns: Sequence[str],
+) -> int:
+    """Rows in ``final_df`` whose normalized key is NOT in ``current_keys``.
+
+    Phase 3B-2B legacy_row_count semantics: legacy means "retained from
+    a prior run, untouched by THIS run." A full refresh that touches
+    every final key produces 0; a partial upsert that only touches
+    some keys produces a non-zero count equal to the rows that came
+    from the prior workbook and were not re-written this run.
+    """
+    if final_df is None or len(final_df) == 0:
+        return 0
+    current_set = {k for k in current_keys if k}
+    final_keys = _xlsx_key_strings(final_df, key_columns)
+    return sum(1 for k in final_keys if k and k not in current_set)
+
+
+def _current_run_input_hash(
+    current_run_df: "pd.DataFrame",
+    key_columns: Sequence[str],
+    output_columns: Sequence[str],
+) -> str:
+    """Hash of the normalized current-run input rows.
+
+    This is exporter-input provenance (DECISION 5): the rows handed to
+    the XLSX writer AFTER schema normalization but BEFORE upsert merge.
+    It does NOT cover the underlying yfinance data — that remains the
+    domain of signal-library content_hashes.
+    """
+    if current_run_df is None or len(current_run_df) == 0:
+        return hashlib.sha256(b"empty-run").hexdigest()
+    # Build a stable projection in the export order.
+    projected_cols = [c for c in output_columns if c in current_run_df.columns]
+    proj = current_run_df.reindex(columns=projected_cols)
+    h = hashlib.sha256()
+    h.update(b"cols|")
+    h.update(json.dumps(projected_cols, sort_keys=False).encode("utf-8"))
+    h.update(b"|key_cols|")
+    h.update(json.dumps(list(key_columns), sort_keys=False).encode("utf-8"))
+    h.update(b"|content|")
+    h.update(_canonical_workbook_hash(proj).encode("utf-8"))
+    return h.hexdigest()
+
+
+def inspect_preexisting_xlsx_manifest(path: Any) -> str:
+    """Classify a workbook + sidecar pair before overwriting.
+
+    Returns one of: ``"none"`` (no workbook or no sidecar),
+    ``"legacy"`` (sidecar exists but lacks XLSX-shape fields),
+    ``"valid"`` (sidecar verifies against workbook bytes + content),
+    ``"mismatched"`` (sidecar exists but does not verify).
+    """
+    p = Path(path)
+    sidecar = _read_sidecar(_sidecar_path_for(p))
+    if not p.exists() or sidecar is None:
+        return "none"
+    # XLSX-shape sidecars carry full_workbook_content_hash.
+    expected_keys = ("full_workbook_content_hash", "artifact_file_sha256")
+    if not all(k in sidecar for k in expected_keys):
+        return "legacy"
+    # Verify byte-level integrity.
+    try:
+        cur_sha = file_sha256(p)
+    except OSError:
+        return "mismatched"
+    if cur_sha != sidecar.get("artifact_file_sha256"):
+        return "mismatched"
+    # Verify logical content.
+    try:
+        df = pd.read_excel(p, engine="openpyxl")
+    except Exception:
+        return "mismatched"
+    if _canonical_workbook_hash(df) != sidecar.get("full_workbook_content_hash"):
+        return "mismatched"
+    return "valid"
+
+
+def build_xlsx_output_manifest(
+    *,
+    artifact_type: str,
+    producer_engine: str,
+    engine_version: str,
+    output_columns: Sequence[str],
+    key_columns: Sequence[str],
+    current_run_df: "pd.DataFrame",
+    final_df: "pd.DataFrame",
+    artifact_path: Any,
+    preexisting_status: str,
+    preexisting_row_count: int,
+    params: Optional[Mapping[str, Any]] = None,
+    cli_args: Optional[Mapping[str, Any]] = None,
+    repo_root: Optional[Path] = None,
+) -> dict:
+    """Construct an XLSX-flavored output manifest.
+
+    Combines the standard ``build_output_manifest`` envelope with
+    XLSX-specific upsert provenance fields. The caller is responsible
+    for writing the workbook BEFORE calling this builder so the file
+    bytes / final_df reflect the post-upsert state.
+    """
+    artifact_path = Path(artifact_path)
+    current_keys = _xlsx_key_strings(current_run_df, key_columns)
+    current_run_keys = {
+        "key_columns": list(key_columns),
+        "key_hash": _hash_key_tuples(current_keys),
+        "count": int(sum(1 for k in current_keys if k)),
+        "preview": sorted({k for k in current_keys if k})[:20],
+    }
+    output_schema = {
+        "columns": [str(c) for c in output_columns],
+        "final_row_count": int(len(final_df)) if final_df is not None else 0,
+    }
+    workbook_hash = _canonical_workbook_hash(final_df)
+    file_sha = file_sha256(artifact_path) if artifact_path.exists() else None
+    legacy_count = _compute_legacy_row_count(
+        final_df, current_keys, key_columns,
+    )
+    base = build_output_manifest(
+        artifact_type=artifact_type,
+        producer_engine=producer_engine,
+        engine_version=engine_version,
+        params=params,
+        cli_args=cli_args,
+        output_schema=output_schema,
+        content_obj=None,
+        artifact_kind=ARTIFACT_KIND_OUTPUT,
+        repo_root=repo_root,
+    )
+    base["current_run_input_hash"] = _current_run_input_hash(
+        current_run_df, key_columns, output_columns,
+    )
+    base["current_run_row_count"] = int(
+        len(current_run_df) if current_run_df is not None else 0
+    )
+    base["current_run_keys"] = current_run_keys
+    base["full_workbook_content_hash"] = workbook_hash
+    base["artifact_file_sha256"] = file_sha
+    base["preexisting_manifest_status"] = preexisting_status
+    base["preexisting_row_count"] = int(preexisting_row_count)
+    base["legacy_row_count"] = int(legacy_count)
+    # Keep content_hash coherent with the output-manifest convention so
+    # the standard verification path can run alongside the XLSX-specific
+    # checks.
+    base["content_hash"] = workbook_hash
+    return base
+
+
+def load_verified_xlsx_artifact(
+    path: Any,
+    *,
+    requested_params: Optional[Mapping[str, Any]] = None,
+    strict: bool = False,
+) -> Tuple[Optional["pd.DataFrame"], VerificationResult]:
+    """Load an XLSX artifact and verify it against its sidecar manifest.
+
+    Returns ``(df, VerificationResult)``. On a load error the DataFrame
+    is None and the result has ``ok=False``. Missing sidecar yields
+    ``ok=True, legacy=True`` under non-strict; ``ok=False, legacy=True``
+    under strict.
+
+    Phase 3B-2B XLSX verification adds two checks beyond the standard
+    output-manifest path:
+
+      - ``full_workbook_content_hash`` over the parsed DataFrame must
+        match the sidecar (DECISION 2).
+      - ``legacy_row_count`` non-zero is a warn under non-strict, and
+        a mismatch under strict (DECISION 1 — strict consumers must not
+        treat a partial upsert as fully verified).
+
+    ``requested_params['current_run_input_hash']`` and
+    ``requested_params['artifact_type']`` are honored as exact-match
+    checks when supplied.
+    """
+    artifact_path = Path(path)
+    try:
+        df = pd.read_excel(artifact_path, engine="openpyxl")
+    except FileNotFoundError as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+    except Exception as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+
+    sidecar = _read_sidecar(_sidecar_path_for(artifact_path))
+    if sidecar is None:
+        # Missing sidecar: legacy under non-strict, mismatch under strict.
+        warnings_ = ["no_manifest (legacy xlsx artifact)"]
+        if strict:
+            return df, VerificationResult(
+                ok=False, legacy=True,
+                mismatches=[("xlsx_no_manifest", "expected sidecar", "missing")],
+                warnings=warnings_,
+            )
+        return df, VerificationResult(
+            ok=True, legacy=True, warnings=warnings_,
+        )
+
+    mismatches: list = []
+    warnings_: list = []
+
+    # Workbook content hash
+    expected_workbook = sidecar.get("full_workbook_content_hash")
+    actual_workbook = _canonical_workbook_hash(df)
+    if expected_workbook is None:
+        warnings_.append("manifest_missing_full_workbook_content_hash")
+    elif expected_workbook != actual_workbook:
+        mismatches.append(
+            ("full_workbook_content_hash", expected_workbook, actual_workbook),
+        )
+
+    # File-byte tamper check
+    expected_file = sidecar.get("artifact_file_sha256")
+    if expected_file:
+        try:
+            actual_file = file_sha256(artifact_path)
+        except OSError as exc:
+            warnings_.append(("file_sha256_unreadable", str(exc)))
+            actual_file = None
+        if actual_file and actual_file != expected_file:
+            mismatches.append(
+                ("artifact_file_sha256", expected_file, actual_file),
+            )
+
+    # content_hash (mirrors workbook hash by convention)
+    expected_content = sidecar.get("content_hash")
+    if expected_content is not None and expected_content != actual_workbook:
+        mismatches.append(("content_hash", expected_content, actual_workbook))
+
+    # Requested-params exact-match checks
+    if requested_params is not None:
+        req = dict(requested_params)
+        req_input_hash = req.pop("current_run_input_hash", None)
+        if req_input_hash is not None:
+            cur_input = sidecar.get("current_run_input_hash")
+            if req_input_hash != cur_input:
+                mismatches.append(
+                    ("current_run_input_hash", cur_input, req_input_hash),
+                )
+        req_type = req.pop("artifact_type", None)
+        if req_type is not None:
+            cur_type = sidecar.get("artifact_type")
+            if req_type != cur_type:
+                mismatches.append(
+                    ("artifact_type", cur_type, req_type),
+                )
+        # Remaining params -> standard subset comparison
+        if req:
+            m_params = sidecar.get("params") or {}
+            for diff in _params_subset_diff(req, m_params):
+                mismatches.append((f"params.{diff[0]}", diff[1], diff[2]))
+
+    # legacy_row_count: warn under non-strict, mismatch under strict
+    legacy_count = sidecar.get("legacy_row_count")
+    if isinstance(legacy_count, int) and legacy_count > 0:
+        entry = ("legacy_row_count", 0, legacy_count)
+        if strict:
+            mismatches.append(entry)
+        else:
+            warnings_.append(entry)
+
+    # preexisting_manifest_status="mismatched" -> warn / fail
+    pre_status = sidecar.get("preexisting_manifest_status")
+    if pre_status == "mismatched":
+        entry = ("preexisting_manifest_status", "valid|none|legacy", pre_status)
+        if strict:
+            mismatches.append(entry)
+        else:
+            warnings_.append(entry)
+
+    # Runtime / package drift — reuse output-manifest pattern.
+    runtime_versions = _capture_package_versions()
+    m_versions = sidecar.get("package_versions") or {}
+    for pkg in _TRACKED_PACKAGES + ("python",):
+        m_ver = m_versions.get(pkg)
+        cur_ver = runtime_versions.get(pkg)
+        if m_ver and cur_ver and m_ver != cur_ver:
+            entry = (f"package_versions.{pkg}", m_ver, cur_ver)
+            if strict:
+                mismatches.append(entry)
+            else:
+                warnings_.append(entry)
+
+    return df, VerificationResult(
+        ok=not mismatches,
+        legacy=False,
+        mismatches=mismatches,
+        warnings=warnings_,
+    )
+
+
 __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "MANIFEST_FIELD",
@@ -1513,4 +1962,8 @@ __all__ = [
     "write_output_manifest",
     "load_verified_pickle_artifact",
     "load_verified_json_artifact",
+    # Phase 3B-2B
+    "build_xlsx_output_manifest",
+    "load_verified_xlsx_artifact",
+    "inspect_preexisting_xlsx_manifest",
 ]

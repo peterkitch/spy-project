@@ -11,6 +11,9 @@ from provenance_manifest import (
     verify_manifest as _verify_manifest,
     load_verified_signal_library as _load_verified_signal_library,
     pickle_load_compat as _pickle_load_compat,
+    build_xlsx_output_manifest as _build_xlsx_output_manifest,
+    inspect_preexisting_xlsx_manifest as _inspect_preexisting_xlsx_manifest,
+    SIDECAR_SUFFIX as _SIDECAR_SUFFIX,
 )
 import random
 import warnings
@@ -1844,6 +1847,10 @@ def export_results_to_excel(output_filename, metrics_list):
                 row[key] = value
         normalized_rows.append(row)
     
+    # Phase 3B-2B: classify any preexisting workbook+sidecar BEFORE the
+    # overwrite so the new manifest can record the prior status.
+    _preexisting_status = _inspect_preexisting_xlsx_manifest(output_filename)
+
     if os.path.exists(output_filename):
         existing_df = pd.read_excel(output_filename)
         new_df = pd.DataFrame(normalized_rows)
@@ -1881,6 +1888,8 @@ def export_results_to_excel(output_filename, metrics_list):
                                          [col for col in combined_df.columns if col not in desired_order])
 
         combined_df.to_excel(output_filename, index=False)
+        _preexisting_row_count = int(len(existing_df))
+        _current_run_df_for_manifest = pd.DataFrame(normalized_rows)
     else:
         df = pd.DataFrame(normalized_rows)
 
@@ -1890,12 +1899,47 @@ def export_results_to_excel(output_filename, metrics_list):
             df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
-        df = df.reindex(columns=desired_order + 
+        df = df.reindex(columns=desired_order +
                        [col for col in df.columns if col not in desired_order])
 
         df.to_excel(output_filename, index=False)
+        _preexisting_row_count = 0
+        _current_run_df_for_manifest = df.copy()
 
     logger.info("Results successfully exported.")
+
+    # Phase 3B-2B: write sidecar manifest next to the workbook. ImpactSearch
+    # dedupes by Primary Ticker (with Resolved/Fetched fallback for rows
+    # missing a Primary Ticker), so key_columns reflects that priority.
+    try:
+        final_df = pd.read_excel(output_filename, engine="openpyxl")
+        final_columns = list(final_df.columns)
+        manifest = _build_xlsx_output_manifest(
+            artifact_type="impactsearch_xlsx",
+            producer_engine="impactsearch",
+            engine_version=ENGINE_VERSION,
+            output_columns=final_columns,
+            key_columns=["Primary Ticker", "Resolved/Fetched"],
+            current_run_df=_current_run_df_for_manifest,
+            final_df=final_df,
+            artifact_path=output_filename,
+            preexisting_status=_preexisting_status,
+            preexisting_row_count=_preexisting_row_count,
+            params={
+                "MAX_SMA_DAY": MAX_SMA_DAY,
+                "price_source": "Close",
+                "engine_version": ENGINE_VERSION,
+                "key_priority": "Primary Ticker > Resolved/Fetched",
+            },
+        )
+        sidecar_path = output_filename + _SIDECAR_SUFFIX
+        with open(sidecar_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, sort_keys=True, indent=2)
+    except Exception as _xlsx_manifest_exc:
+        logger.warning(
+            f"Failed to write ImpactSearch XLSX provenance sidecar: "
+            f"{_xlsx_manifest_exc}"
+        )
 
 def process_single_ticker_wrapper(args):
     """Wrapper for multiprocessing compatibility"""

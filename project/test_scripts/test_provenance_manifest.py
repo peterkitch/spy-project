@@ -1842,3 +1842,853 @@ def test_3b2a_spymaster_save_failure_fallback_copy2_succeeds(tmp_path, monkeypat
     )
     sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(pkl_path)
+
+
+# ===========================================================================
+# Phase 3B-2B: XLSX manifest helper + load_verified_xlsx_artifact
+# ===========================================================================
+
+
+def _write_xlsx_with_manifest(
+    path,
+    *,
+    df,
+    artifact_type,
+    producer_engine,
+    output_columns,
+    key_columns,
+    current_run_df=None,
+    preexisting_status="none",
+    preexisting_row_count=0,
+    params=None,
+):
+    """Test helper: write a workbook + sidecar manifest pair."""
+    df.to_excel(path, index=False, engine="openpyxl")
+    if current_run_df is None:
+        current_run_df = df.copy()
+    manifest = pm.build_xlsx_output_manifest(
+        artifact_type=artifact_type,
+        producer_engine=producer_engine,
+        engine_version="1.0.0",
+        output_columns=output_columns,
+        key_columns=key_columns,
+        current_run_df=current_run_df,
+        final_df=df,
+        artifact_path=path,
+        preexisting_status=preexisting_status,
+        preexisting_row_count=preexisting_row_count,
+        params=params or {},
+    )
+    sidecar = path.with_name(path.name + pm.SIDECAR_SUFFIX)
+    sidecar.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def test_3b2b_canonical_workbook_hash_is_deterministic():
+    df = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe": 1.2, "Notes": None},
+        {"Primary Ticker": "QQQ", "Sharpe": 0.8, "Notes": "ok"},
+    ])
+    h1 = pm._canonical_workbook_hash(df)
+    h2 = pm._canonical_workbook_hash(df.copy())
+    assert h1 == h2
+
+
+def test_3b2b_canonical_workbook_hash_distinguishes_nan_none_empty():
+    base = pd.DataFrame([{"A": 1.0, "B": "x"}])
+    df_empty = pd.DataFrame([{"A": 1.0, "B": ""}])
+    df_none = pd.DataFrame([{"A": 1.0, "B": None}])
+    h_base = pm._canonical_workbook_hash(base)
+    h_empty = pm._canonical_workbook_hash(df_empty)
+    h_none = pm._canonical_workbook_hash(df_none)
+    assert h_base != h_empty
+    assert h_base != h_none
+    assert h_empty != h_none
+
+
+def test_3b2b_xlsx_key_strings_priority_and_normalization():
+    df = pd.DataFrame([
+        {"Primary Ticker": "  spy ", "Resolved/Fetched": "spy"},
+        {"Primary Ticker": "", "Resolved/Fetched": "qqq"},
+        {"Primary Ticker": None, "Resolved/Fetched": None},
+        {"Primary Ticker": "AAPL", "Resolved/Fetched": "aapl"},
+    ])
+    keys = pm._xlsx_key_strings(df, ["Primary Ticker", "Resolved/Fetched"])
+    assert keys == ["SPY", "QQQ", "", "AAPL"]
+
+
+def test_3b2b_compute_legacy_row_count():
+    final = pd.DataFrame([
+        {"Primary Ticker": "SPY"},
+        {"Primary Ticker": "QQQ"},
+        {"Primary Ticker": "OLD"},
+    ])
+    legacy = pm._compute_legacy_row_count(
+        final, ["SPY", "QQQ"], ["Primary Ticker"],
+    )
+    assert legacy == 1
+    full = pm._compute_legacy_row_count(
+        final, ["SPY", "QQQ", "OLD"], ["Primary Ticker"],
+    )
+    assert full == 0
+
+
+def test_3b2b_load_verified_xlsx_fresh_happy_path(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe Ratio": 1.2},
+        {"Primary Ticker": "QQQ", "Sharpe Ratio": 0.8},
+    ])
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker", "Sharpe Ratio"],
+        key_columns=["Primary Ticker"],
+    )
+    loaded, result = pm.load_verified_xlsx_artifact(pkl)
+    assert loaded is not None
+    assert result.ok is True
+    assert not result.legacy
+
+
+def test_3b2b_load_verified_xlsx_missing_sidecar_legacy_vs_strict(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([{"Primary Ticker": "SPY"}])
+    df.to_excel(pkl, index=False, engine="openpyxl")
+    loaded, result = pm.load_verified_xlsx_artifact(pkl)
+    assert loaded is not None
+    assert result.ok is True
+    assert result.legacy is True
+    loaded2, result2 = pm.load_verified_xlsx_artifact(pkl, strict=True)
+    assert loaded2 is not None
+    assert result2.ok is False
+    assert result2.legacy is True
+
+
+def test_3b2b_load_verified_xlsx_workbook_content_mismatch(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": 1.2}])
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker", "Sharpe Ratio"],
+        key_columns=["Primary Ticker"],
+    )
+    df_bad = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": 99.9}])
+    df_bad.to_excel(pkl, index=False, engine="openpyxl")
+    loaded, result = pm.load_verified_xlsx_artifact(pkl)
+    fields = [m[0] for m in result.mismatches]
+    assert result.ok is False
+    assert (
+        "full_workbook_content_hash" in fields
+        or "artifact_file_sha256" in fields
+    )
+
+
+def test_3b2b_load_verified_xlsx_legacy_row_count_warn_vs_strict(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe Ratio": 1.2},
+        {"Primary Ticker": "OLD", "Sharpe Ratio": 0.5},
+    ])
+    current = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe Ratio": 1.2},
+    ])
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker", "Sharpe Ratio"],
+        key_columns=["Primary Ticker"],
+        current_run_df=current,
+    )
+    _, result = pm.load_verified_xlsx_artifact(pkl)
+    assert result.ok is True
+    assert any("legacy_row_count" in str(w) for w in result.warnings)
+    _, result2 = pm.load_verified_xlsx_artifact(pkl, strict=True)
+    assert result2.ok is False
+    fields = [m[0] for m in result2.mismatches]
+    assert "legacy_row_count" in fields
+
+
+def test_3b2b_inspect_preexisting_xlsx_manifest(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "none"
+    df = pd.DataFrame([{"Primary Ticker": "SPY"}])
+    df.to_excel(pkl, index=False, engine="openpyxl")
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "none"
+    sidecar = pkl.with_name(pkl.name + pm.SIDECAR_SUFFIX)
+    sidecar.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "legacy"
+    sidecar.unlink()
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker"], key_columns=["Primary Ticker"],
+    )
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "valid"
+    df_bad = pd.DataFrame([{"Primary Ticker": "QQQ"}])
+    df_bad.to_excel(pkl, index=False, engine="openpyxl")
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "mismatched"
+
+
+# ===========================================================================
+# Phase 3B-2B: OnePass XLSX manifest (producer)
+# ===========================================================================
+
+
+def _onepass_metrics(ticker, **overrides):
+    """Minimal OnePass-shaped metrics dict for export tests."""
+    base = {
+        "Primary Ticker": ticker,
+        "Trigger Days": 100,
+        "Wins": 60,
+        "Losses": 40,
+        "Win Ratio (%)": 60.0,
+        "Std Dev (%)": 1.5,
+        "Sharpe Ratio": 1.2,
+        "t-Statistic": 2.5,
+        "p-Value": 0.01,
+        "Significant 90%": "Yes",
+        "Significant 95%": "Yes",
+        "Significant 99%": "No",
+        "Avg Daily Capture (%)": 0.05,
+        "Total Capture (%)": 5.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_3b2b_onepass_xlsx_fresh_writes_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "fresh.xlsx"
+    onepass.export_results_to_excel(
+        str(output), [_onepass_metrics("SPY"), _onepass_metrics("QQQ")]
+    )
+    sidecar = pm._sidecar_path_for(output)
+    assert sidecar.exists()
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["artifact_type"] == "onepass_xlsx"
+    assert manifest["producer_engine"] == "onepass"
+    assert manifest["preexisting_manifest_status"] == "none"
+    assert manifest["preexisting_row_count"] == 0
+    assert manifest["legacy_row_count"] == 0
+    assert manifest["current_run_row_count"] == 2
+    assert sorted(manifest["current_run_keys"]["preview"]) == ["QQQ", "SPY"]
+    # End-to-end load_verified_xlsx_artifact verifies clean.
+    df, vresult = pm.load_verified_xlsx_artifact(output)
+    assert df is not None
+    assert vresult.ok is True
+    assert not vresult.legacy
+
+
+def test_3b2b_onepass_xlsx_existing_with_retained_row_legacy_one(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "retained.xlsx"
+    # Seed with two tickers (run 1).
+    onepass.export_results_to_excel(
+        str(output),
+        [_onepass_metrics("SPY"), _onepass_metrics("OLD")],
+    )
+    # Run 2: only update SPY -> OLD should be retained as a legacy row.
+    onepass.export_results_to_excel(
+        str(output),
+        [_onepass_metrics("SPY", **{"Sharpe Ratio": 2.5})],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 1, (
+        f"Expected 1 legacy row, got {manifest['legacy_row_count']}"
+    )
+    assert manifest["current_run_row_count"] == 1
+    assert manifest["current_run_keys"]["preview"] == ["SPY"]
+    # The preexisting run-1 manifest should classify as valid since the
+    # workbook + sidecar pair were written by the same producer.
+    assert manifest["preexisting_manifest_status"] == "valid"
+    # Workbook should contain both rows.
+    final_df = pd.read_excel(output, engine="openpyxl")
+    assert sorted(final_df["Primary Ticker"].tolist()) == ["OLD", "SPY"]
+
+
+def test_3b2b_onepass_xlsx_full_refresh_legacy_zero(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "refresh.xlsx"
+    onepass.export_results_to_excel(
+        str(output),
+        [_onepass_metrics("SPY"), _onepass_metrics("QQQ")],
+    )
+    # Run 2 touches both keys -> 0 legacy rows.
+    onepass.export_results_to_excel(
+        str(output),
+        [
+            _onepass_metrics("SPY", **{"Sharpe Ratio": 2.0}),
+            _onepass_metrics("QQQ", **{"Sharpe Ratio": 1.5}),
+        ],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 0
+
+
+def test_3b2b_onepass_xlsx_mismatched_preexisting_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import onepass
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "mismatched.xlsx"
+    onepass.export_results_to_excel(
+        str(output), [_onepass_metrics("SPY")]
+    )
+    # Tamper with the workbook bytes BEFORE the next run runs.
+    df_bad = pd.read_excel(output, engine="openpyxl")
+    df_bad.loc[0, "Sharpe Ratio"] = 99.99
+    df_bad.to_excel(output, index=False, engine="openpyxl")
+    # Run 2 should detect the preexisting workbook+sidecar mismatch.
+    onepass.export_results_to_excel(
+        str(output), [_onepass_metrics("QQQ")]
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["preexisting_manifest_status"] == "mismatched"
+
+
+# ===========================================================================
+# Phase 3B-2B: StackBuilder --strict-manifests + fast-path verification
+# ===========================================================================
+
+
+def _seed_impactsearch_xlsx(tmp_path, secondary, *, with_manifest=True):
+    """Write a synthetic ImpactSearch XLSX (and optional manifest) under
+    a folder StackBuilder's try_load_rank_from_impact_xlsx will scan.
+    """
+    workbook = tmp_path / f"{secondary}_analysis.xlsx"
+    df = pd.DataFrame([
+        {
+            "Primary Ticker": "AAA",
+            "Avg Daily Capture (%)": 0.10,
+            "Total Capture (%)": 1.0,
+            "Sharpe Ratio": 1.5,
+            "Win Ratio (%)": 60.0,
+            "Std Dev (%)": 0.5,
+            "Trigger Days": 8,
+            "p-Value": 0.04,
+        },
+    ])
+    df.to_excel(workbook, index=False, engine="openpyxl")
+    if with_manifest:
+        manifest = pm.build_xlsx_output_manifest(
+            artifact_type="impactsearch_xlsx",
+            producer_engine="impactsearch",
+            engine_version="1.0.0",
+            output_columns=list(df.columns),
+            key_columns=["Primary Ticker", "Resolved/Fetched"],
+            current_run_df=df.copy(),
+            final_df=df,
+            artifact_path=workbook,
+            preexisting_status="none",
+            preexisting_row_count=0,
+        )
+        sidecar = workbook.with_name(workbook.name + pm.SIDECAR_SUFFIX)
+        sidecar.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return workbook
+
+
+def test_3b2b_stackbuilder_fastpath_strict_legacy_rejected(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    _seed_impactsearch_xlsx(tmp_path, "ZZZ", with_manifest=False)
+    # Non-strict: legacy is accepted.
+    df_ns = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=False,
+    )
+    assert isinstance(df_ns, pd.DataFrame)
+    # Strict: legacy is rejected.
+    df_strict = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=True,
+    )
+    assert df_strict is None
+
+
+def test_3b2b_stackbuilder_fastpath_mismatched_always_rejected(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    workbook = _seed_impactsearch_xlsx(tmp_path, "ZZZ", with_manifest=True)
+    # Tamper the workbook bytes after the manifest was written.
+    df_bad = pd.read_excel(workbook, engine="openpyxl")
+    df_bad.loc[0, "Sharpe Ratio"] = 99.99
+    df_bad.to_excel(workbook, index=False, engine="openpyxl")
+    # Mismatch is rejected even under non-strict.
+    df_ns = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=False,
+    )
+    assert df_ns is None
+    df_strict = stackbuilder.try_load_rank_from_impact_xlsx(
+        sec="ZZZ", dirpath=str(tmp_path), max_age_days=45,
+        strict_manifests=True,
+    )
+    assert df_strict is None
+
+
+def test_3b2b_stackbuilder_strict_no_primaries_systemexit(monkeypatch):
+    """When fast-path is rejected under --strict-manifests AND no
+    primaries are provided, phase2_rank_all raises SystemExit."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        stackbuilder, "try_load_rank_from_impact_xlsx",
+        lambda *a, **k: None,
+    )
+    args = SimpleNamespace(
+        secondary="ZZZ",
+        prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>",
+        impact_xlsx_max_age_days=45,
+        strict_manifests=True,
+        no_progress=True,
+        bottom_n=1,
+        signal_lib_dir="<unused>",
+    )
+    primaries_df = pd.DataFrame(columns=["Primary Ticker"])
+    sec_rets = pd.Series(dtype=float)
+    with pytest.raises(SystemExit) as exc_info:
+        stackbuilder.phase2_rank_all(
+            args, primaries_df, sec_rets, outdir=str(PROJECT_DIR / "logs"),
+            secondary="ZZZ", progress_path=None,
+        )
+    assert "--strict-manifests" in str(exc_info.value)
+
+
+def test_3b2b_stackbuilder_strict_primaries_provided_falls_through(
+    tmp_path, monkeypatch
+):
+    """When fast-path is rejected under --strict-manifests but primaries
+    ARE provided, phase2_rank_all does NOT SystemExit; it falls through
+    to the slow path. We monkeypatch _score_primary_both_modes to terminate
+    the slow path quickly with all-None results.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        stackbuilder, "try_load_rank_from_impact_xlsx",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        stackbuilder, "_score_primary_both_modes",
+        lambda *a, **k: (None, None),
+    )
+    args = SimpleNamespace(
+        secondary="ZZZ",
+        prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>",
+        impact_xlsx_max_age_days=45,
+        strict_manifests=True,
+        no_progress=True,
+        bottom_n=0,
+        signal_lib_dir="<unused>",
+        threads="auto",
+    )
+    primaries_df = pd.DataFrame({"Primary Ticker": ["AAA"]})
+    sec_rets = pd.Series([0.01, -0.01, 0.02], name="returns")
+    out = tmp_path / "out"
+    out.mkdir()
+    # Should NOT raise SystemExit; slow-path returns empty results.
+    try:
+        stackbuilder.phase2_rank_all(
+            args, primaries_df, sec_rets, outdir=str(out),
+            secondary="ZZZ", progress_path=None,
+        )
+    except SystemExit as exc:
+        # The only SystemExit allowed here is the empty-results one
+        # downstream; the strict no-primaries SystemExit must NOT fire
+        # because primaries WERE provided.
+        assert "--strict-manifests" not in str(exc)
+
+
+# ===========================================================================
+# Phase 3B-2B: ImpactSearch XLSX manifest (producer)
+# ===========================================================================
+
+
+def _impactsearch_metrics(ticker, **overrides):
+    """Minimal ImpactSearch-shaped metrics dict for export tests."""
+    base = {
+        "Primary Ticker": ticker,
+        "Resolved/Fetched": ticker.lower(),
+        "Library Source": "stable",
+        "Trigger Days": 80,
+        "Wins": 50,
+        "Losses": 30,
+        "Win Ratio (%)": 62.5,
+        "Std Dev (%)": 1.4,
+        "Sharpe Ratio": 1.1,
+        "t-Statistic": 2.2,
+        "p-Value": 0.02,
+        "Significant 90%": "Yes",
+        "Significant 95%": "Yes",
+        "Significant 99%": "No",
+        "Avg Daily Capture (%)": 0.04,
+        "Total Capture (%)": 4.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_3b2b_impactsearch_xlsx_fresh_writes_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "fresh.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY"), _impactsearch_metrics("QQQ")],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    assert sidecar.exists()
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["artifact_type"] == "impactsearch_xlsx"
+    assert manifest["producer_engine"] == "impactsearch"
+    assert manifest["preexisting_manifest_status"] == "none"
+    assert manifest["legacy_row_count"] == 0
+    assert manifest["current_run_row_count"] == 2
+    assert sorted(manifest["current_run_keys"]["preview"]) == ["QQQ", "SPY"]
+    assert manifest["current_run_keys"]["key_columns"] == [
+        "Primary Ticker", "Resolved/Fetched",
+    ]
+    df, vresult = pm.load_verified_xlsx_artifact(output)
+    assert df is not None
+    assert vresult.ok is True
+
+
+def test_3b2b_impactsearch_xlsx_existing_with_retained_row_legacy_one(
+    tmp_path, monkeypatch
+):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "retained.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY"), _impactsearch_metrics("OLD")],
+    )
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY", **{"Sharpe Ratio": 2.5})],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 1
+    assert manifest["current_run_row_count"] == 1
+    assert manifest["current_run_keys"]["preview"] == ["SPY"]
+    assert manifest["preexisting_manifest_status"] == "valid"
+    final_df = pd.read_excel(output, engine="openpyxl")
+    assert sorted(final_df["Primary Ticker"].tolist()) == ["OLD", "SPY"]
+
+
+def test_3b2b_impactsearch_xlsx_full_refresh_legacy_zero(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "refresh.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY"), _impactsearch_metrics("QQQ")],
+    )
+    impactsearch.export_results_to_excel(
+        str(output),
+        [
+            _impactsearch_metrics("SPY", **{"Sharpe Ratio": 2.0}),
+            _impactsearch_metrics("QQQ", **{"Sharpe Ratio": 1.5}),
+        ],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 0
+
+
+def test_3b2b_impactsearch_xlsx_mismatched_preexisting_sidecar(
+    tmp_path, monkeypatch
+):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "mismatched.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output), [_impactsearch_metrics("SPY")]
+    )
+    df_bad = pd.read_excel(output, engine="openpyxl")
+    df_bad.loc[0, "Sharpe Ratio"] = 99.99
+    df_bad.to_excel(output, index=False, engine="openpyxl")
+    impactsearch.export_results_to_excel(
+        str(output), [_impactsearch_metrics("QQQ")]
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["preexisting_manifest_status"] == "mismatched"
+
+
+# ===========================================================================
+# Phase 3B-2B: TrafficFlow strict env mode
+# ===========================================================================
+
+
+def test_3b2b_trafficflow_strict_legacy_no_cache(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    pkl_dir = tmp_path / "cache" / "results"
+    pkl_dir.mkdir(parents=True)
+    monkeypatch.setattr(trafficflow, "SPYMASTER_PKL_DIR", str(pkl_dir))
+    trafficflow._PKL_CACHE.clear()
+
+    p = pkl_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", with_manifest=False)
+
+    # Non-strict: legacy proceeds and IS cached.
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("TRAFFICFLOW_STRICT_MANIFESTS", raising=False)
+    pm.manifest_hash_cache_clear()
+    data_ns = trafficflow.load_spymaster_pkl("AAA")
+    assert data_ns is not None
+    assert "AAA" in trafficflow._PKL_CACHE
+
+    # Strict via TRAFFICFLOW_STRICT_MANIFESTS: legacy returns None and
+    # _PKL_CACHE is NOT populated by this load.
+    trafficflow._PKL_CACHE.clear()
+    monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", "1")
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("AAA") is None
+    assert "AAA" not in trafficflow._PKL_CACHE
+
+    # Strict via PRJCT9_STRICT_MANIFESTS (project-wide) also blocks.
+    trafficflow._PKL_CACHE.clear()
+    monkeypatch.delenv("TRAFFICFLOW_STRICT_MANIFESTS", raising=False)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "yes")
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("AAA") is None
+    assert "AAA" not in trafficflow._PKL_CACHE
+
+
+def test_3b2b_trafficflow_strict_mismatch_no_cache(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    pkl_dir = tmp_path / "cache" / "results"
+    pkl_dir.mkdir(parents=True)
+    monkeypatch.setattr(trafficflow, "SPYMASTER_PKL_DIR", str(pkl_dir))
+    trafficflow._PKL_CACHE.clear()
+
+    p = pkl_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", mutate_after_attach=True)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "true")
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("AAA") is None
+    assert "AAA" not in trafficflow._PKL_CACHE
+
+
+def test_3b2b_trafficflow_strict_env_truthy_parsing(monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("TRAFFICFLOW_STRICT_MANIFESTS", raising=False)
+    assert trafficflow._strict_manifests_enabled() is False
+    for truthy in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", truthy)
+        assert trafficflow._strict_manifests_enabled() is True, truthy
+    for falsy in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", falsy)
+        assert trafficflow._strict_manifests_enabled() is False, falsy
+    # Project-wide truthy overrides a local "0" — strict propagates
+    # downward, never upward.
+    monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", "0")
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "1")
+    assert trafficflow._strict_manifests_enabled() is True
+
+
+# ===========================================================================
+# Phase 3B-2B: Confluence strict env mode
+# ===========================================================================
+
+
+def test_3b2b_confluence_strict_legacy_skips(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    p = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", with_manifest=False)
+
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("CONFLUENCE_STRICT_MANIFESTS", raising=False)
+    # Non-strict: legacy proceeds with rebuilt library.
+    pm.manifest_hash_cache_clear()
+    legacy = confluence_analyzer._load_spymaster_cache_fallback("AAA")
+    assert legacy is not None
+    assert legacy.get("source") == "spymaster_cache"
+
+    # Strict (engine-local) -> skip the fallback, return None.
+    monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", "1")
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("AAA") is None
+
+    # Strict (project-wide) also skips.
+    monkeypatch.delenv("CONFLUENCE_STRICT_MANIFESTS", raising=False)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "true")
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("AAA") is None
+
+
+def test_3b2b_confluence_strict_mismatch_skips(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    p = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", mutate_after_attach=True)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "yes")
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("AAA") is None
+
+
+def test_3b2b_confluence_strict_env_truthy_parsing(monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("CONFLUENCE_STRICT_MANIFESTS", raising=False)
+    assert confluence_analyzer._strict_manifests_enabled() is False
+    for truthy in ("1", "TRUE", "yes", "on"):
+        monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", truthy)
+        assert confluence_analyzer._strict_manifests_enabled() is True, truthy
+    monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", "0")
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "1")
+    assert confluence_analyzer._strict_manifests_enabled() is True
+
+
+# ===========================================================================
+# Phase 3B-2B amendment: type-tagged + boundary-safe canonical encoding
+# ===========================================================================
+
+
+def test_3b2b_canonical_cell_int_vs_str_no_collision():
+    """``1`` and ``"1"`` must produce different canonical encodings AND
+    different workbook hashes. Pre-amendment used repr() for ints and
+    str() for strings; both produced ``"1"``."""
+    assert pm._xlsx_canonical_cell(1) != pm._xlsx_canonical_cell("1")
+    h_int = pm._canonical_workbook_hash(pd.DataFrame([{"x": 1}]))
+    h_str = pm._canonical_workbook_hash(pd.DataFrame([{"x": "1"}]))
+    assert h_int != h_str
+
+
+def test_3b2b_canonical_cell_bool_vs_str_no_collision():
+    """``True`` / ``False`` must NOT collide with ``"True"`` / ``"False"``."""
+    assert pm._xlsx_canonical_cell(True) != pm._xlsx_canonical_cell("True")
+    assert pm._xlsx_canonical_cell(False) != pm._xlsx_canonical_cell("False")
+    h_t = pm._canonical_workbook_hash(pd.DataFrame([{"x": True}]))
+    h_ts = pm._canonical_workbook_hash(pd.DataFrame([{"x": "True"}]))
+    assert h_t != h_ts
+    h_f = pm._canonical_workbook_hash(pd.DataFrame([{"x": False}]))
+    h_fs = pm._canonical_workbook_hash(pd.DataFrame([{"x": "False"}]))
+    assert h_f != h_fs
+
+
+def test_3b2b_canonical_cell_float_vs_str_no_collision():
+    assert pm._xlsx_canonical_cell(1.0) != pm._xlsx_canonical_cell("1.0")
+    h_f = pm._canonical_workbook_hash(pd.DataFrame([{"x": 1.0}]))
+    h_s = pm._canonical_workbook_hash(pd.DataFrame([{"x": "1.0"}]))
+    assert h_f != h_s
+
+
+def test_3b2b_canonical_cell_timestamp_vs_iso_str_no_collision():
+    ts = pd.Timestamp("2026-05-04T00:00:00")
+    iso = "2026-05-04T00:00:00"
+    assert pm._xlsx_canonical_cell(ts) != pm._xlsx_canonical_cell(iso)
+    # Build the workbook directly without going through openpyxl since
+    # writing a Timestamp + reading it back can normalize the dtype; we
+    # want to assert the hash function itself does the right thing.
+    h_ts = pm._canonical_workbook_hash(pd.DataFrame([{"x": ts}]))
+    h_iso = pm._canonical_workbook_hash(pd.DataFrame([{"x": iso}]))
+    assert h_ts != h_iso
+
+
+def test_3b2b_canonical_cell_sentinel_literal_vs_sentinel():
+    """A literal string like ``"none:"`` or ``"int:5"`` must not collide
+    with the corresponding real tagged value."""
+    assert pm._xlsx_canonical_cell("none:") != pm._xlsx_canonical_cell(None)
+    assert pm._xlsx_canonical_cell("nan:") != pm._xlsx_canonical_cell(float("nan"))
+    assert pm._xlsx_canonical_cell("bool:True") != pm._xlsx_canonical_cell(True)
+    assert pm._xlsx_canonical_cell("int:5") != pm._xlsx_canonical_cell(5)
+    assert pm._xlsx_canonical_cell("float:1.0") != pm._xlsx_canonical_cell(1.0)
+    ts = pd.Timestamp("2026-05-04T00:00:00")
+    assert (
+        pm._xlsx_canonical_cell(f"timestamp:{ts.isoformat()}")
+        != pm._xlsx_canonical_cell(ts)
+    )
+    assert pm._xlsx_canonical_cell('str:"abc"') != pm._xlsx_canonical_cell("abc")
+
+
+def test_3b2b_canonical_cell_numpy_scalars_tagged():
+    assert pm._xlsx_canonical_cell(np.int64(1)) != pm._xlsx_canonical_cell("1")
+    assert pm._xlsx_canonical_cell(np.float64(1.0)) != pm._xlsx_canonical_cell("1.0")
+    assert pm._xlsx_canonical_cell(np.bool_(True)) != pm._xlsx_canonical_cell("True")
+    # NumPy scalars must produce the same encoding as their Python counterparts
+    # for true type-equivalence (np.int64(1) and Python int(1) are both ``int``-tagged).
+    assert pm._xlsx_canonical_cell(np.int64(1)) == pm._xlsx_canonical_cell(1)
+    assert pm._xlsx_canonical_cell(np.float64(1.0)) == pm._xlsx_canonical_cell(1.0)
+    assert pm._xlsx_canonical_cell(np.bool_(True)) == pm._xlsx_canonical_cell(True)
+
+
+def test_3b2b_canonical_workbook_hash_cell_boundary_safe():
+    """Cell content containing the legacy ``|`` delimiter (or newlines)
+    must not allow cross-boundary collisions."""
+    df_left = pd.DataFrame([{"A": "x|", "B": "y"}])
+    df_right = pd.DataFrame([{"A": "x", "B": "|y"}])
+    assert (
+        pm._canonical_workbook_hash(df_left)
+        != pm._canonical_workbook_hash(df_right)
+    )
+    # Newline in cell content must not bleed into the row separator.
+    df_nl = pd.DataFrame([{"A": "x\n", "B": "y"}, {"A": "z", "B": "w"}])
+    df_other = pd.DataFrame([{"A": "x", "B": "y"}, {"A": "\nz", "B": "w"}])
+    assert (
+        pm._canonical_workbook_hash(df_nl)
+        != pm._canonical_workbook_hash(df_other)
+    )
+
+
+def test_3b2b_xlsx_upsert_fills_empty_cell_changes_hash():
+    """Filling a previously-empty cell during an upsert must change the
+    workbook hash. This is the partial-upsert empty-cell invariant."""
+    df_empty = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": np.nan}])
+    df_filled = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": 1.5}])
+    assert (
+        pm._canonical_workbook_hash(df_empty)
+        != pm._canonical_workbook_hash(df_filled)
+    )
