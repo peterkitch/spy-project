@@ -77,6 +77,12 @@ MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FIELD = "_manifest"
 VOLATILE_LIBRARY_KEYS: frozenset[str] = frozenset({"_manifest", "build_timestamp"})
 
+# Phase 3B-2A: artifact kind tags. ``signal_library`` is the Phase 3A
+# default and remains the implicit kind when older manifests omit the
+# field. ``output`` covers the new run/result/cache PKL surfaces.
+ARTIFACT_KIND_SIGNAL_LIBRARY = "signal_library"
+ARTIFACT_KIND_OUTPUT = "output"
+
 
 # ---------------------------------------------------------------------------
 # Phase 3B-1: content_hash performance cache
@@ -1076,10 +1082,418 @@ def load_verified_signal_library(
     return data, result
 
 
+# ---------------------------------------------------------------------------
+# Phase 3B-2A: output manifest helper + verified loaders
+# ---------------------------------------------------------------------------
+#
+# Output manifests cover artifacts produced by the engines (StackBuilder
+# run dirs, Spymaster cache PKLs, etc.) where the consumer side is more
+# heterogeneous than for signal libraries. The schema reuses Phase 3A's
+# stable / volatile fields, plus engine and run-context fields. The
+# producer/consumer contract:
+#
+#   - logical content_hash digests artifact content excluding _manifest.
+#     For pickles, this is the same canonical_blob walk as Phase 3A.
+#     For JSON outputs (e.g. run_manifest.json), there is no embedded
+#     manifest so the artifact IS the manifest; in that case content_hash
+#     is the SHA-256 of a canonicalized JSON payload.
+#
+#   - artifact_file_sha256 is SHA-256 of the final on-disk bytes. It is
+#     SIDECAR-ONLY for embedded pickle manifests (otherwise the embedded
+#     manifest would self-reference its own file SHA, which is
+#     mathematically impossible to satisfy). It MAY appear in JSON
+#     manifests when the JSON does not embed itself.
+#
+#   - The two-file (pickle + sidecar) write is not atomic across both
+#     files. The contract therefore tolerates a torn sidecar: embedded
+#     manifest is authoritative; sidecar adds a file-byte check when
+#     present. Strict-mode callers may require sidecar verification;
+#     those failures are reported as a strict-mode mismatch, not a load
+#     crash.
+
+
+def file_sha256(path: Any) -> str:
+    """SHA-256 of file bytes at ``path``. Streams to bound memory use."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _output_content_hash(content_obj: Any) -> Optional[str]:
+    """Compute logical content_hash for an in-memory artifact object.
+
+    Mappings (e.g. dict pickles) reuse the canonical-blob walk. Lists,
+    tuples, scalars, pandas frames are also accepted via the generic
+    ``_canonicalize`` path. Returns None when content_obj is None.
+    """
+    if content_obj is None:
+        return None
+    if isinstance(content_obj, Mapping):
+        return content_hash(content_obj)
+    canonical = _canonicalize(content_obj)
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(blob).hexdigest()
+
+
+def build_output_manifest(
+    *,
+    artifact_type: str,
+    producer_engine: str,
+    engine_version: str,
+    params: Optional[Mapping[str, Any]] = None,
+    input_manifest_hashes: Optional[Sequence[str]] = None,
+    input_secondary_hash: Optional[str] = None,
+    cli_args: Optional[Mapping[str, Any]] = None,
+    ui_args: Optional[Mapping[str, Any]] = None,
+    output_schema: Optional[Mapping[str, Any]] = None,
+    content_obj: Any = None,
+    artifact_kind: str = ARTIFACT_KIND_OUTPUT,
+    repo_root: Optional[Path] = None,
+) -> dict:
+    """Build the core output manifest dict.
+
+    The returned manifest is suitable for:
+      - embedding inside a pickle artifact (writers MUST set
+        ``library_dict[MANIFEST_FIELD]`` to this dict before pickling).
+      - sidecar JSON next to a pickle artifact (writers SHOULD use
+        ``write_output_manifest`` with ``include_file_sha256=True``).
+      - standalone JSON artifact (callers should NOT include a self-hash
+        of the JSON inside itself; if a self-hash is required, omit it
+        from the canonical blob via a documented field name).
+
+    ``content_obj`` is hashed via the same canonical-blob walk as Phase
+    3A signal libraries, with ``_manifest`` excluded for mappings. Pass
+    the artifact object BEFORE any embedded-manifest insertion.
+    """
+    if not artifact_type:
+        raise ValueError("artifact_type is required")
+    if not producer_engine:
+        raise ValueError("producer_engine is required")
+    if not engine_version:
+        raise ValueError("engine_version is required")
+    pkg_versions = _capture_package_versions()
+    git_info = _capture_git_info(repo_root)
+    manifest: dict = {
+        # Stable identity
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "artifact_kind": artifact_kind,
+        "artifact_type": str(artifact_type),
+        "producer_engine": str(producer_engine),
+        "engine_version": str(engine_version),
+        # Run / config inputs
+        "params": _canonicalize(dict(params)) if params else None,
+        "cli_args": _canonicalize(dict(cli_args)) if cli_args else None,
+        "ui_args": _canonicalize(dict(ui_args)) if ui_args else None,
+        "input_manifest_hashes": (
+            sorted(set(str(h) for h in input_manifest_hashes if h))
+            if input_manifest_hashes else []
+        ),
+        "input_secondary_hash": (
+            str(input_secondary_hash) if input_secondary_hash else None
+        ),
+        "output_schema": (
+            _canonicalize(dict(output_schema)) if output_schema else None
+        ),
+        # Runtime / environment
+        "git_commit": git_info["commit"],
+        "git_dirty": git_info["dirty"],
+        "package_versions": pkg_versions,
+        # Volatile provenance
+        "build_timestamp": _utc_now_iso(),
+        "builder_identity": _builder_identity(),
+        "host_platform": platform.platform(),
+    }
+    # Logical content_hash; nullable when no content_obj is available
+    # (e.g. a standalone manifest document where the artifact IS the
+    # manifest and file_sha256 covers the byte-level check separately).
+    manifest["content_hash"] = _output_content_hash(content_obj)
+    return manifest
+
+
+def write_output_manifest(
+    artifact_path: Any,
+    manifest: Mapping[str, Any],
+    *,
+    include_file_sha256: bool = True,
+    sidecar_path: Any = None,
+) -> Path:
+    """Write a sidecar manifest JSON next to ``artifact_path``.
+
+    The sidecar is written atomically via temp-file + ``os.replace``.
+    When ``include_file_sha256`` is True, the on-disk bytes of
+    ``artifact_path`` are hashed and added under ``artifact_file_sha256``
+    in the sidecar (NOT inside the embedded manifest — that would be
+    self-referential).
+
+    Returns the sidecar Path actually written.
+    """
+    artifact_path = Path(artifact_path)
+    if sidecar_path is None:
+        sidecar = _sidecar_path_for(artifact_path)
+    else:
+        sidecar = Path(sidecar_path)
+    payload = dict(manifest)
+    if include_file_sha256 and artifact_path.exists():
+        payload["artifact_file_sha256"] = file_sha256(artifact_path)
+    _write_sidecar(sidecar, payload)
+    return sidecar
+
+
+def _verify_output_manifest(
+    *,
+    manifest: Mapping[str, Any],
+    artifact_obj: Any,
+    artifact_path: Optional[Path],
+    cache_path: Any,
+    strict: bool,
+    requested_params: Optional[Mapping[str, Any]],
+    sidecar_obj: Optional[Mapping[str, Any]],
+) -> VerificationResult:
+    """Shared verification body for output artifacts (pickle + JSON).
+
+    ``artifact_obj`` is the in-memory artifact (dict for pickles, parsed
+    JSON for JSON artifacts). ``artifact_path`` is the file path; needed
+    for the optional ``artifact_file_sha256`` check from the sidecar.
+    ``sidecar_obj`` is the parsed sidecar dict if one exists separately,
+    or None when the manifest already came from the sidecar.
+    """
+    mismatches: list = []
+    warnings_: list = []
+
+    # 1) logical content_hash check (skip if artifact_obj is None)
+    expected = manifest.get("content_hash")
+    if expected is not None and artifact_obj is not None:
+        if cache_path is not None:
+            actual = _cached_content_hash(
+                artifact_obj if isinstance(artifact_obj, Mapping)
+                else {"__non_mapping__": _canonicalize(artifact_obj)},
+                cache_path,
+            )
+            # For non-mappings, _cached_content_hash above used a wrapper
+            # dict; recompute via _output_content_hash if mismatch.
+            if actual != expected and not isinstance(artifact_obj, Mapping):
+                actual = _output_content_hash(artifact_obj)
+        else:
+            actual = _output_content_hash(artifact_obj)
+        if expected != actual:
+            mismatches.append(("content_hash", expected, actual))
+
+    # 2) artifact_file_sha256 (from sidecar only)
+    sidecar_for_file = sidecar_obj if sidecar_obj is not None else manifest
+    file_sha = sidecar_for_file.get("artifact_file_sha256") if sidecar_for_file else None
+    if file_sha and artifact_path is not None:
+        try:
+            current_sha = file_sha256(artifact_path)
+        except OSError as exc:
+            current_sha = None
+            warnings_.append(("file_sha256_unreadable", str(exc)))
+        if current_sha and current_sha != file_sha:
+            mismatches.append(("artifact_file_sha256", file_sha, current_sha))
+
+    # 3) requested_params subset
+    if requested_params is not None:
+        m_params = manifest.get("params") or {}
+        for diff in _params_subset_diff(dict(requested_params), m_params):
+            mismatches.append((f"params.{diff[0]}", diff[1], diff[2]))
+
+    # 4) input_manifest_hashes subset (if caller supplied them)
+    expected_inputs = (
+        requested_params.get("input_manifest_hashes")
+        if requested_params else None
+    )
+    if expected_inputs is not None:
+        m_inputs = set(manifest.get("input_manifest_hashes") or [])
+        missing = [h for h in expected_inputs if h not in m_inputs]
+        if missing:
+            entry = ("input_manifest_hashes", sorted(m_inputs), missing)
+            if strict:
+                mismatches.append(entry)
+            else:
+                warnings_.append(entry)
+
+    # 5) runtime version drift (warn-only unless strict)
+    runtime_versions = _capture_package_versions()
+    m_versions = manifest.get("package_versions") or {}
+    for pkg in _TRACKED_PACKAGES + ("python",):
+        m_ver = m_versions.get(pkg)
+        cur_ver = runtime_versions.get(pkg)
+        if m_ver and cur_ver and m_ver != cur_ver:
+            entry = (f"package_versions.{pkg}", m_ver, cur_ver)
+            if strict:
+                mismatches.append(entry)
+            else:
+                warnings_.append(entry)
+
+    # 6) schema version
+    sv = manifest.get("schema_version")
+    if sv != MANIFEST_SCHEMA_VERSION:
+        warnings_.append(("schema_version", MANIFEST_SCHEMA_VERSION, sv))
+
+    return VerificationResult(
+        ok=not mismatches,
+        legacy=False,
+        mismatches=mismatches,
+        warnings=warnings_,
+    )
+
+
+def load_verified_pickle_artifact(
+    path: Any,
+    *,
+    requested_params: Optional[Mapping[str, Any]] = None,
+    strict: bool = False,
+    expected_type: type = dict,
+    cache: bool = True,
+) -> Tuple[Optional[Any], VerificationResult]:
+    """Load a pickle artifact (output kind) and verify embedded + sidecar.
+
+    Mirrors ``load_verified_signal_library`` but is artifact-kind agnostic;
+    for signal libraries, prefer the signal-specific loader (it carries
+    the ``ARTIFACT_KIND_SIGNAL_LIBRARY`` defaults). Output pickles such as
+    Spymaster cache PKLs and StackBuilder caches use this entry point.
+
+    On a load error the artifact is None and the result has
+    ``mismatches=[("load_error", type, msg)]``. Non-matching expected_type
+    yields ``("type_error", expected, actual)``. Missing manifest yields
+    ``ok=True, legacy=True``.
+    """
+    artifact_path = Path(path)
+    try:
+        with open(artifact_path, "rb") as fh:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", category=DeprecationWarning,
+                )
+                data = pickle_load_compat(fh)
+    except (pickle.UnpicklingError, EOFError) as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+    except ModuleNotFoundError as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+    except OSError as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+
+    if not isinstance(data, expected_type):
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[(
+                "type_error",
+                expected_type.__name__ if hasattr(expected_type, "__name__")
+                else str(expected_type),
+                type(data).__name__,
+            )],
+        )
+
+    embedded = data.get(MANIFEST_FIELD) if isinstance(data, Mapping) else None
+    sidecar = _read_sidecar(_sidecar_path_for(artifact_path))
+    if embedded is None and sidecar is None:
+        return data, VerificationResult(
+            ok=True, legacy=True,
+            warnings=["no_manifest (legacy output artifact)"],
+        )
+    manifest = embedded if embedded is not None else sidecar
+    sidecar_obj = sidecar if (embedded is not None and sidecar is not None) else None
+    if embedded is not None and sidecar is not None:
+        if (embedded.get("content_hash") != sidecar.get("content_hash")
+                or embedded.get("build_timestamp")
+                != sidecar.get("build_timestamp")):
+            LOGGER.warning(
+                "Output manifest sidecar disagrees with embedded manifest "
+                "at %s; preferring embedded.", artifact_path,
+            )
+    result = _verify_output_manifest(
+        manifest=manifest,
+        artifact_obj=data,
+        artifact_path=artifact_path,
+        cache_path=artifact_path if cache else None,
+        strict=strict,
+        requested_params=requested_params,
+        sidecar_obj=sidecar_obj,
+    )
+    return data, result
+
+
+def load_verified_json_artifact(
+    path: Any,
+    *,
+    requested_params: Optional[Mapping[str, Any]] = None,
+    strict: bool = False,
+    expected_type: type = dict,
+) -> Tuple[Optional[Any], VerificationResult]:
+    """Load a JSON artifact and verify it against its sidecar manifest.
+
+    The JSON file itself is the artifact. The sidecar JSON (next to it,
+    same SIDECAR_SUFFIX convention) carries the manifest. JSON artifacts
+    do not embed a manifest because that would create an embed-self
+    cycle; the sidecar is authoritative.
+
+    A standalone JSON document that IS its own manifest (e.g.
+    ``run_manifest.json``) does not need the sidecar pattern; callers
+    can still parse it via ``read_manifest`` directly. This helper is
+    aimed at non-self JSON artifacts.
+    """
+    artifact_path = Path(path)
+    try:
+        with open(artifact_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[("load_error", type(exc).__name__, str(exc))],
+        )
+
+    if not isinstance(data, expected_type):
+        return None, VerificationResult(
+            ok=False, legacy=False,
+            mismatches=[(
+                "type_error",
+                expected_type.__name__ if hasattr(expected_type, "__name__")
+                else str(expected_type),
+                type(data).__name__,
+            )],
+        )
+
+    sidecar = _read_sidecar(_sidecar_path_for(artifact_path))
+    if sidecar is None:
+        return data, VerificationResult(
+            ok=True, legacy=True,
+            warnings=["no_manifest (legacy json artifact)"],
+        )
+    result = _verify_output_manifest(
+        manifest=sidecar,
+        artifact_obj=data,
+        artifact_path=artifact_path,
+        cache_path=None,  # JSON artifacts don't share the pickle hash cache
+        strict=strict,
+        requested_params=requested_params,
+        sidecar_obj=None,
+    )
+    return data, result
+
+
 __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "MANIFEST_FIELD",
     "VOLATILE_LIBRARY_KEYS",
+    "ARTIFACT_KIND_SIGNAL_LIBRARY",
+    "ARTIFACT_KIND_OUTPUT",
     "VerificationResult",
     "build_manifest",
     "attach_manifest",
@@ -1093,4 +1507,10 @@ __all__ = [
     "manifest_hash_cache_info",
     "pickle_load_compat",
     "load_verified_signal_library",
+    # Phase 3B-2A
+    "file_sha256",
+    "build_output_manifest",
+    "write_output_manifest",
+    "load_verified_pickle_artifact",
+    "load_verified_json_artifact",
 ]

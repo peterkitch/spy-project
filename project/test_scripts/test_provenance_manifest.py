@@ -764,6 +764,14 @@ def test_3b1_cache_mtime_change_invalidates(tmp_path, sample_library, sample_clo
 
 
 def test_3b1_cache_atomic_replace_invalidates(tmp_path, sample_library, sample_close):
+    """Atomic ``os.replace`` invalidates the LRU cache via mtime delta.
+
+    Phase 3B-2A tightening: explicit ``os.utime`` controls mtime instead
+    of ``time.sleep(1.05)`` past the FS mtime resolution. The replacement
+    payload is the *same bytes* as the original so size is guaranteed
+    unchanged — the cache miss therefore depends on the mtime key
+    component, not the size key component.
+    """
     pm.attach_manifest(
         sample_library, sidecar_path=None,
         artifact_type="signal_library_daily", ticker="SPY",
@@ -772,29 +780,33 @@ def test_3b1_cache_atomic_replace_invalidates(tmp_path, sample_library, sample_c
     p = tmp_path / "lib.pkl"
     with open(p, "wb") as f:
         pickle.dump(sample_library, f)
+    original_size = p.stat().st_size
+    original_mtime_ns = p.stat().st_mtime_ns
     pm.manifest_hash_cache_clear()
     pm.load_verified_signal_library(p)
-    # Sleep just past the filesystem mtime resolution to force a delta.
-    time.sleep(1.05)
-    # Different payload (mutated copy) so the new content_hash differs.
-    mutated = dict(sample_library)
-    mutated["primary_signals"] = ["Buy"] * len(sample_library["primary_signals"])
-    pm.attach_manifest(
-        mutated, sidecar_path=None,
-        artifact_type="signal_library_daily", ticker="SPY",
-    )
+    # Same bytes -> same size -> only mtime can drive invalidation.
+    payload_bytes = p.read_bytes()
     tmp_replacement = tmp_path / "lib.pkl.tmp"
-    with open(tmp_replacement, "wb") as f:
-        pickle.dump(mutated, f)
+    tmp_replacement.write_bytes(payload_bytes)
     os.replace(tmp_replacement, p)
-    _, result = pm.load_verified_signal_library(p)
-    assert result.ok is True  # mutated lib has its own valid manifest
+    # Bump mtime explicitly past the original; same-size guarantee
+    # ensures the cache key only differs in the mtime component.
+    new_mtime_ns = original_mtime_ns + 2_000_000_000
+    os.utime(p, ns=(new_mtime_ns, new_mtime_ns))
+    assert p.stat().st_size == original_size
+    pm.load_verified_signal_library(p)
     info = pm.manifest_hash_cache_info()
-    assert info["misses"] == 2  # original + replaced
+    assert info["misses"] == 2  # original + post-replace
     assert info["hits"] == 0
 
 
 def test_3b1_cache_inplace_rewrite_invalidates(tmp_path, sample_library, sample_close):
+    """In-place rewrite invalidates the LRU cache via mtime delta.
+
+    Phase 3B-2A tightening: the in-place rewrite writes the same bytes
+    back, then ``os.utime`` bumps mtime explicitly. Size unchanged, so
+    the cache miss is unambiguously driven by the mtime key.
+    """
     pm.attach_manifest(
         sample_library, sidecar_path=None,
         artifact_type="signal_library_daily", ticker="SPY",
@@ -803,18 +815,17 @@ def test_3b1_cache_inplace_rewrite_invalidates(tmp_path, sample_library, sample_
     p = tmp_path / "lib.pkl"
     with open(p, "wb") as f:
         pickle.dump(sample_library, f)
+    original_size = p.stat().st_size
+    original_mtime_ns = p.stat().st_mtime_ns
     pm.manifest_hash_cache_clear()
     pm.load_verified_signal_library(p)
-    time.sleep(1.05)
-    sample_library["primary_signals"] = ["Buy"] * len(
-        sample_library["primary_signals"]
-    )
-    pm.attach_manifest(
-        sample_library, sidecar_path=None,
-        artifact_type="signal_library_daily", ticker="SPY",
-    )
+    # Same bytes again, same size; only mtime drives invalidation.
+    payload_bytes = p.read_bytes()
     with open(p, "wb") as f:
-        pickle.dump(sample_library, f)
+        f.write(payload_bytes)
+    new_mtime_ns = original_mtime_ns + 2_000_000_000
+    os.utime(p, ns=(new_mtime_ns, new_mtime_ns))
+    assert p.stat().st_size == original_size
     pm.load_verified_signal_library(p)
     info = pm.manifest_hash_cache_info()
     assert info["misses"] == 2
@@ -1036,3 +1047,798 @@ def test_3b1_b12_synthetic_bad_raw_load_is_caught(tmp_path):
     assert not _scan_raw_pickle_loads(good), (
         "Expected pickle_load_compat to NOT trip the raw-load scanner"
     )
+
+
+# ===========================================================================
+# Phase 3B-2A: output manifest helper + verified loaders
+# ===========================================================================
+
+
+def _build_sample_output_pickle(tmp_path, *, content):
+    """Producer-side helper: build a manifested pickle artifact + sidecar.
+
+    Returns (path, manifest). Mirrors the producer pattern:
+      1. build core manifest (content_obj = the dict to pickle, sans _manifest)
+      2. embed manifest in dict
+      3. pickle.dump
+      4. compute file_sha256 of the final pickle
+      5. write sidecar with artifact_file_sha256
+    """
+    p = tmp_path / "output.pkl"
+    manifest = pm.build_output_manifest(
+        artifact_type="spymaster_precomputed_results",
+        producer_engine="spymaster",
+        engine_version="1.0.0",
+        params={"MAX_SMA_DAY": 114},
+        content_obj=content,
+    )
+    payload = dict(content)
+    payload["_manifest"] = manifest
+    with open(p, "wb") as f:
+        pickle.dump(payload, f)
+    pm.write_output_manifest(p, manifest, include_file_sha256=True)
+    return p, manifest
+
+
+def test_3b2a_output_manifest_required_fields():
+    m = pm.build_output_manifest(
+        artifact_type="stackbuilder_run",
+        producer_engine="stackbuilder",
+        engine_version="1.0.0",
+        params={"max_combo_size": 3},
+        cli_args={"primary": "SPY"},
+        content_obj={"rows": [1, 2, 3]},
+    )
+    expected = {
+        "schema_version", "artifact_kind", "artifact_type",
+        "producer_engine", "engine_version", "params", "cli_args",
+        "ui_args", "input_manifest_hashes", "input_secondary_hash",
+        "output_schema", "git_commit", "git_dirty", "package_versions",
+        "build_timestamp", "builder_identity", "host_platform",
+        "content_hash",
+    }
+    assert expected <= set(m.keys())
+    assert m["artifact_kind"] == pm.ARTIFACT_KIND_OUTPUT
+    assert m["producer_engine"] == "stackbuilder"
+    assert m["content_hash"] is not None
+
+
+def test_3b2a_file_sha256_sidecar_verification(tmp_path):
+    content = {"rows": [1, 2, 3], "ticker": "SPY"}
+    p, manifest = _build_sample_output_pickle(tmp_path, content=content)
+    sidecar = pm._sidecar_path_for(p)
+    assert sidecar.exists()
+    sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_data["artifact_file_sha256"]
+    assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(p)
+    # The embedded manifest must NOT include the final pickle file SHA.
+    with open(p, "rb") as f:
+        loaded = pickle.load(f)
+    assert "artifact_file_sha256" not in loaded["_manifest"], (
+        "Embedded manifest must not self-reference its own file SHA"
+    )
+
+
+def test_3b2a_embedded_pickle_manifest_verifies(tmp_path):
+    content = {"rows": [1, 2, 3], "ticker": "SPY"}
+    p, manifest = _build_sample_output_pickle(tmp_path, content=content)
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert not result.legacy
+
+
+def test_3b2a_legacy_pickle_loads_ok_legacy(tmp_path):
+    p = tmp_path / "legacy.pkl"
+    with open(p, "wb") as f:
+        pickle.dump({"foo": "bar"}, f)  # no manifest
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data == {"foo": "bar"}
+    assert result.ok is True
+    assert result.legacy is True
+
+
+def test_3b2a_pickle_content_hash_mismatch(tmp_path):
+    content = {"rows": [1, 2, 3]}
+    p, _ = _build_sample_output_pickle(tmp_path, content=content)
+    # Tamper: rewrite the pickle with mutated content but the OLD manifest.
+    with open(p, "rb") as f:
+        loaded = pickle.load(f)
+    loaded["rows"] = [9, 9, 9]
+    with open(p, "wb") as f:
+        pickle.dump(loaded, f)
+    # Refresh the sidecar's artifact_file_sha256 so the file-byte check
+    # passes; we want to isolate the logical content_hash mismatch.
+    sidecar_path = pm._sidecar_path_for(p)
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_data["artifact_file_sha256"] = pm.file_sha256(p)
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    data, result = pm.load_verified_pickle_artifact(p, cache=False)
+    assert result.ok is False
+    fields = [m[0] for m in result.mismatches]
+    assert "content_hash" in fields
+
+
+def test_3b2a_pickle_file_sha256_mismatch(tmp_path):
+    content = {"rows": [1, 2, 3]}
+    p, _ = _build_sample_output_pickle(tmp_path, content=content)
+    sidecar_path = pm._sidecar_path_for(p)
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_data["artifact_file_sha256"] = "0" * 64
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is False
+    fields = [m[0] for m in result.mismatches]
+    assert "artifact_file_sha256" in fields
+
+
+def test_3b2a_json_artifact_verification(tmp_path):
+    """A non-self JSON artifact with a sidecar manifest verifies cleanly."""
+    payload = {"top_buy_pair": [10, 1], "top_short_pair": [1, 10]}
+    p = tmp_path / "summary.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    manifest = pm.build_output_manifest(
+        artifact_type="stackbuilder_summary",
+        producer_engine="stackbuilder",
+        engine_version="1.0.0",
+        content_obj=payload,
+    )
+    pm.write_output_manifest(p, manifest, include_file_sha256=True)
+    data, result = pm.load_verified_json_artifact(p)
+    assert data == payload
+    assert result.ok is True
+    # Tamper: rewrite the JSON file with a different object.
+    p.write_text(json.dumps({"different": True}), encoding="utf-8")
+    data, result = pm.load_verified_json_artifact(p)
+    assert result.ok is False
+    fields = [m[0] for m in result.mismatches]
+    assert "artifact_file_sha256" in fields or "content_hash" in fields
+
+
+def test_3b2a_strict_runtime_mismatch_pickle(tmp_path):
+    content = {"rows": [1, 2, 3]}
+    p, _ = _build_sample_output_pickle(tmp_path, content=content)
+    # Forge a runtime mismatch in the embedded manifest.
+    with open(p, "rb") as f:
+        loaded = pickle.load(f)
+    loaded["_manifest"]["package_versions"]["numpy"] = "0.0.0"
+    with open(p, "wb") as f:
+        pickle.dump(loaded, f)
+    # Refresh sidecar so file_sha256 matches and only runtime drift is seen.
+    sidecar_path = pm._sidecar_path_for(p)
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_data["package_versions"]["numpy"] = "0.0.0"
+    sidecar_data["artifact_file_sha256"] = pm.file_sha256(p)
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    # Refresh embedded content_hash so we isolate the runtime drift.
+    with open(p, "rb") as f:
+        loaded2 = pickle.load(f)
+    embedded_manifest = loaded2["_manifest"]
+    raw_content = {k: v for k, v in loaded2.items() if k != "_manifest"}
+    embedded_manifest["content_hash"] = pm.content_hash(loaded2)
+    loaded2["_manifest"] = embedded_manifest
+    with open(p, "wb") as f:
+        pickle.dump(loaded2, f)
+    sidecar_data["artifact_file_sha256"] = pm.file_sha256(p)
+    sidecar_path.write_text(json.dumps(sidecar_data), encoding="utf-8")
+    # strict=False: warn-only.
+    pm.manifest_hash_cache_clear()
+    data, result = pm.load_verified_pickle_artifact(p, strict=False, cache=False)
+    assert data is not None
+    assert result.ok is True
+    assert any("numpy" in str(w) for w in result.warnings)
+    # strict=True: fail.
+    pm.manifest_hash_cache_clear()
+    data2, result2 = pm.load_verified_pickle_artifact(p, strict=True, cache=False)
+    assert result2.ok is False
+    assert any("numpy" in str(m[0]) for m in result2.mismatches)
+
+
+# ===========================================================================
+# Phase 3B-2A: StackBuilder run_manifest enrichment
+# ===========================================================================
+
+
+def test_3b2a_stackbuilder_input_manifest_collector(tmp_path):
+    """Collector accumulates content_hashes from manifested loads,
+    counts legacy/missing inputs, and resets when finalized."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    stackbuilder._start_input_manifest_collection()
+    # Manifested libs -> content_hash should land in the collector. The
+    # two libs MUST differ so their content_hashes differ; ticker is in
+    # the manifest, not in the canonical content body.
+    dates = pd.bdate_range(start="2024-01-02", periods=10)
+    lib_a = make_signal_library_dict(
+        dates, primary_signals=["Buy"] * len(dates),
+    )
+    pm.attach_manifest(
+        lib_a, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="AAA",
+    )
+    lib_b = make_signal_library_dict(
+        dates, primary_signals=["Short"] * len(dates),
+    )
+    pm.attach_manifest(
+        lib_b, sidecar_path=None,
+        artifact_type="signal_library_daily", ticker="BBB",
+    )
+    legacy = make_signal_library_dict(dates)  # no manifest
+
+    stackbuilder._record_input_lib(lib_a)
+    stackbuilder._record_input_lib(lib_b)
+    stackbuilder._record_input_lib(lib_a)  # duplicate -> set dedupes
+    stackbuilder._record_input_lib(legacy)
+    stackbuilder._record_input_lib(None)
+    snap = stackbuilder._finalize_input_manifest_collection()
+    assert len(snap["input_manifest_hashes"]) == 2  # deduped
+    assert snap["input_legacy_count"] == 1
+    assert snap["input_missing_manifest_count"] == 1
+    # After finalize, recording is a no-op until next start.
+    stackbuilder._record_input_lib(lib_a)
+    snap2 = stackbuilder._finalize_input_manifest_collection()
+    assert snap2["input_manifest_hashes"] == []
+    assert snap2["input_legacy_count"] == 0
+    assert snap2["input_missing_manifest_count"] == 0
+
+
+def test_3b2a_stackbuilder_output_artifact_entry(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    # CSV: row_count and column_schema should be populated.
+    csv_path = tmp_path / "rank_direct.csv"
+    csv_path.write_text(
+        "Primary Ticker,Total Capture (%)\n"
+        "SPY,123.4\n"
+        "QQQ,210.5\n",
+        encoding="utf-8",
+    )
+    entry = stackbuilder._output_artifact_entry(str(tmp_path), "rank_direct")
+    assert entry is not None
+    assert entry["filename"] == "rank_direct.csv"
+    assert entry["format"] == "csv"
+    assert entry["row_count"] == 2
+    assert entry["column_schema"] == [
+        {"name": "Primary Ticker"},
+        {"name": "Total Capture (%)"},
+    ]
+    assert entry["file_sha256"] == pm.file_sha256(csv_path)
+    # Missing artifact -> None.
+    assert stackbuilder._output_artifact_entry(str(tmp_path), "missing") is None
+
+
+def test_3b2a_stackbuilder_build_output_artifacts(tmp_path):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    (tmp_path / "rank_all.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (tmp_path / "rank_direct.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (tmp_path / "cohort.csv").write_text("a\n1\n", encoding="utf-8")
+    (tmp_path / "combo_leaderboard.csv").write_text("a\n1\n", encoding="utf-8")
+    (tmp_path / "summary.json").write_text(json.dumps({"x": 1}), encoding="utf-8")
+    artifacts = stackbuilder._build_output_artifacts(str(tmp_path))
+    names = sorted(a["name"] for a in artifacts)
+    assert names == [
+        "cohort", "combo_leaderboard", "rank_all", "rank_direct", "summary",
+    ]
+    for a in artifacts:
+        assert a["file_sha256"]
+        assert a["produced_at"]
+
+
+def test_3b2a_stackbuilder_run_manifest_preserves_legacy_keys():
+    """A synthetic enrichment over a known-shaped legacy manifest must
+    keep the Phase 3A keys callers depend on (no run_manifest readers
+    exist outside stackbuilder, but downstream tooling may grow over
+    time). This test pins the legacy keys at the producer site.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+
+    legacy_keys = {"secondary", "started_at", "params", "outputs"}
+    enriched_keys = {
+        "schema_version", "artifact_kind", "artifact_type",
+        "producer_engine", "engine_version", "run_id",
+        "git_commit", "git_dirty", "package_versions",
+        "build_timestamp", "builder_identity", "host_platform",
+        "cli_args", "status", "output_artifacts",
+        "input_manifest_hashes", "input_legacy_count",
+        "input_missing_manifest_count", "input_secondary_hash",
+        "finished_at", "elapsed_seconds",
+    }
+    # Source-text grep: ensure both blocks of legacy keys + enriched
+    # keys appear in stackbuilder's run_for_secondary writer.
+    source = (PROJECT_DIR / "stackbuilder.py").read_text(encoding="utf-8")
+    for key in legacy_keys | enriched_keys:
+        assert f"'{key}'" in source or f'"{key}"' in source, (
+            f"Expected stackbuilder.py to set manifest key '{key}'"
+        )
+
+
+# ===========================================================================
+# Phase 3B-2A: Spymaster PKL manifest (producer / consumer)
+# ===========================================================================
+
+
+def _build_synthetic_spymaster_pkl(
+    path,
+    *,
+    ticker: str = "AAA",
+    with_manifest: bool = True,
+    mutate_after_attach: bool = False,
+):
+    """Build a synthetic Spymaster precomputed-results PKL on disk.
+
+    Mirrors the producer pattern in ``spymaster.save_precomputed_results``:
+    embed the manifest, pickle.dump, then write the sidecar with
+    artifact_file_sha256 over final bytes. Used by Spymaster + TrafficFlow
+    + Confluence consumer tests.
+    """
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    payload = {
+        "_ticker": ticker,
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [100.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), float(i + 1))
+                                for i, d in enumerate(dates)},
+        "daily_top_short_pairs": {d: ((113, 114), float(i + 1))
+                                  for i, d in enumerate(dates)},
+        "top_buy_pair": (10, 1),
+        "top_short_pair": (1, 10),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+        "data_fingerprint": "fp-" + ticker,
+    }
+    if with_manifest:
+        manifest = pm.build_output_manifest(
+            artifact_type="spymaster_precomputed_results",
+            producer_engine="spymaster",
+            engine_version="1.0.0",
+            params={"ticker": ticker, "max_sma_day": 114, "price_source": "Close"},
+            content_obj=payload,
+        )
+        payload[pm.MANIFEST_FIELD] = manifest
+    if mutate_after_attach and with_manifest:
+        payload["top_buy_pair"] = (99, 99)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+    if with_manifest:
+        pm.write_output_manifest(
+            path, payload[pm.MANIFEST_FIELD], include_file_sha256=True,
+        )
+    return payload
+
+
+def test_3b2a_spymaster_producer_writes_embedded_and_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    # Redirect cache/results to tmp_path so the producer write is sandboxed.
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    results = {
+        "_ticker": "AAA",
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [100.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), 1.0) for d in dates},
+        "daily_top_short_pairs": {d: ((113, 114), 1.0) for d in dates},
+        "top_buy_pair": (10, 1),
+        "top_short_pair": (1, 10),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+    }
+    spymaster.save_precomputed_results("AAA", results)
+
+    pkl_path = cache_dir / "AAA_precomputed_results.pkl"
+    assert pkl_path.exists()
+    sidecar = pm._sidecar_path_for(pkl_path)
+    assert sidecar.exists()
+    sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(pkl_path)
+    with open(pkl_path, "rb") as f:
+        loaded = pickle.load(f)
+    assert pm.MANIFEST_FIELD in loaded
+    embedded = loaded[pm.MANIFEST_FIELD]
+    assert "artifact_file_sha256" not in embedded, (
+        "Embedded Spymaster manifest must not self-reference its file SHA"
+    )
+    assert embedded["producer_engine"] == "spymaster"
+    assert embedded["artifact_type"] == "spymaster_precomputed_results"
+
+
+def test_3b2a_spymaster_consumer_loads_manifested(tmp_path):
+    p = tmp_path / "AAA_precomputed_results.pkl"
+    payload = _build_synthetic_spymaster_pkl(p, ticker="AAA")
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert not result.legacy
+    assert data["top_buy_pair"] == (10, 1)
+
+
+def test_3b2a_spymaster_legacy_loads_with_warning(tmp_path):
+    p = tmp_path / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", with_manifest=False)
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert result.legacy is True
+
+
+def test_3b2a_spymaster_mismatch_via_internal_consumer(tmp_path, monkeypatch):
+    """Tampered Spymaster PKL must surface as cache miss in
+    ``_quick_last_fingerprint`` (representative internal consumer)."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    p = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", mutate_after_attach=True)
+    pm.manifest_hash_cache_clear()
+    fp = spymaster._quick_last_fingerprint("AAA")
+    assert fp is None  # mismatch -> cache miss
+
+
+def test_3b2a_spymaster_atomic_replace_preserves_embedded(tmp_path):
+    """Two-file write tolerance: even if the sidecar is missing after a
+    torn write, the embedded pickle manifest verifies cleanly."""
+    p = tmp_path / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA")
+    sidecar = pm._sidecar_path_for(p)
+    sidecar.unlink()
+    data, result = pm.load_verified_pickle_artifact(p)
+    assert data is not None
+    assert result.ok is True
+    assert not result.legacy
+
+
+# ===========================================================================
+# Phase 3B-2A: TrafficFlow Spymaster PKL consumer
+# ===========================================================================
+
+
+def test_3b2a_trafficflow_spymaster_consumer_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    pkl_dir = tmp_path / "cache" / "results"
+    pkl_dir.mkdir(parents=True)
+    monkeypatch.setattr(trafficflow, "SPYMASTER_PKL_DIR", str(pkl_dir))
+    # Reset the in-memory cache so each sub-case is independent.
+    trafficflow._PKL_CACHE.clear()
+
+    # Manifested -> loads, populates cache.
+    p_ok = pkl_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p_ok, ticker="AAA")
+    pm.manifest_hash_cache_clear()
+    data = trafficflow.load_spymaster_pkl("AAA")
+    assert data is not None
+    assert "AAA" in trafficflow._PKL_CACHE
+
+    # Tampered -> rejected, NOT cached.
+    p_bad = pkl_dir / "BBB_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_bad, ticker="BBB", mutate_after_attach=True,
+    )
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("BBB") is None
+    assert "BBB" not in trafficflow._PKL_CACHE
+
+    # Legacy (no manifest) -> loads, populates cache.
+    p_legacy = pkl_dir / "CCC_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_legacy, ticker="CCC", with_manifest=False,
+    )
+    legacy = trafficflow.load_spymaster_pkl("CCC")
+    assert legacy is not None
+    assert "CCC" in trafficflow._PKL_CACHE
+
+
+# ===========================================================================
+# Phase 3B-2A: Confluence Spymaster fallback consumer
+# ===========================================================================
+
+
+def test_3b2a_confluence_spymaster_fallback_verifies(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    # _load_spymaster_cache_fallback resolves the path relative to cwd.
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    # Manifested -> returns the rebuilt library structure with signals.
+    p_ok = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p_ok, ticker="AAA")
+    pm.manifest_hash_cache_clear()
+    lib = confluence_analyzer._load_spymaster_cache_fallback("AAA")
+    assert lib is not None
+    assert lib.get("source") == "spymaster_cache"
+    assert lib.get("signals")
+
+    # Tampered -> None.
+    p_bad = cache_dir / "BBB_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_bad, ticker="BBB", mutate_after_attach=True,
+    )
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("BBB") is None
+
+    # Legacy -> proceeds.
+    p_legacy = cache_dir / "CCC_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(
+        p_legacy, ticker="CCC", with_manifest=False,
+    )
+    legacy = confluence_analyzer._load_spymaster_cache_fallback("CCC")
+    assert legacy is not None
+    assert legacy.get("source") == "spymaster_cache"
+
+
+# ===========================================================================
+# Phase 3B-2A amendment: collector isolation across concurrent runs
+# ===========================================================================
+
+
+def test_3b2a_collector_isolation_concurrent_runs():
+    """Two concurrent StackBuilder-style runs must collect disjoint sets of
+    input-manifest hashes; the second run's collector must not overwrite or
+    inherit the first run's state.
+
+    Reproduction strategy: two threads barrier-rendezvous on
+    ``_start_input_manifest_collection`` so both runs are active at the
+    same time, each records a distinct manifested library, then finalizes.
+    Without per-run isolation (the e5f3eb7 module-global pattern), the
+    second start overwrites the first run's collector and the first run's
+    snapshot returns either empty or the wrong (other run's) hashes.
+
+    The test ALSO exercises the ThreadPoolExecutor wrapping invariant: each
+    run hands its recording call off to a worker thread via
+    ``ThreadPoolExecutor.submit``. Worker threads are long-lived and do not
+    inherit a fresh context per task, so the production code must wrap the
+    submission with ``contextvars.copy_context().run`` for the per-run
+    ContextVar to flow into the worker.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+
+    def make_lib(tag: str, idx: int) -> dict:
+        # Distinct content per (tag, idx). The "extra" key forces a unique
+        # canonical-content hash since both tag character and index land in
+        # the canonical body, while ticker only enters the manifest.
+        lib = make_signal_library_dict(
+            dates,
+            extra={"_test_unique_marker": f"{tag}-{idx}"},
+        )
+        pm.attach_manifest(
+            lib, sidecar_path=None,
+            artifact_type="signal_library_daily", ticker=f"{tag}{idx}",
+        )
+        return lib
+
+    libs_a = [make_lib("A", i) for i in range(3)]
+    libs_b = [make_lib("B", i) for i in range(3)]
+    expected_a = sorted({l["_manifest"]["content_hash"] for l in libs_a})
+    expected_b = sorted({l["_manifest"]["content_hash"] for l in libs_b})
+    assert set(expected_a).isdisjoint(expected_b), (
+        "Test fixture is broken: A and B libs share content_hashes"
+    )
+
+    barrier = threading.Barrier(2)
+    snapshots: dict = {}
+    executor = ThreadPoolExecutor(max_workers=4)
+
+    def run(name, libs):
+        token = stackbuilder._start_input_manifest_collection()
+        try:
+            barrier.wait(timeout=5.0)
+            # Hand each record off to the executor via the production
+            # _submit_with_context wrapper that phase2_rank_all uses, so
+            # the test exercises the same context-propagation invariant
+            # the real submit path relies on.
+            futures = [
+                stackbuilder._submit_with_context(
+                    executor, stackbuilder._record_input_lib, lib,
+                )
+                for lib in libs
+            ]
+            for f in futures:
+                f.result(timeout=5.0)
+            snapshots[name] = stackbuilder._finalize_input_manifest_collection(
+                token
+            )
+            token = None
+        finally:
+            if token is not None:
+                try:
+                    stackbuilder._finalize_input_manifest_collection(token)
+                except Exception:
+                    pass
+
+    t_a = threading.Thread(target=run, args=("A", libs_a))
+    t_b = threading.Thread(target=run, args=("B", libs_b))
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=15.0)
+    t_b.join(timeout=15.0)
+    executor.shutdown(wait=True)
+
+    assert "A" in snapshots and "B" in snapshots
+    snap_a = snapshots["A"]
+    snap_b = snapshots["B"]
+    assert sorted(snap_a["input_manifest_hashes"]) == expected_a, (
+        f"Run A collected {snap_a['input_manifest_hashes']}, expected {expected_a}"
+    )
+    assert sorted(snap_b["input_manifest_hashes"]) == expected_b, (
+        f"Run B collected {snap_b['input_manifest_hashes']}, expected {expected_b}"
+    )
+    assert set(snap_a["input_manifest_hashes"]).isdisjoint(
+        snap_b["input_manifest_hashes"]
+    ), "Cross-contamination between concurrent run collectors"
+    # Legacy / missing counters isolated too.
+    assert snap_a["input_legacy_count"] == 0
+    assert snap_b["input_legacy_count"] == 0
+    assert snap_a["input_missing_manifest_count"] == 0
+    assert snap_b["input_missing_manifest_count"] == 0
+
+
+# ===========================================================================
+# Phase 3B-2A amendment: Spymaster save-failure guard
+# ===========================================================================
+
+
+def test_3b2a_spymaster_save_failure_no_orphan_sidecar(tmp_path, monkeypatch):
+    """When pickle replacement fails, no new sidecar manifest must be
+    written.
+
+    Setup:
+      - Pre-populate ``cache/results/AAA_precomputed_results.pkl`` with an
+        OLD pickle and a matching OLD sidecar manifest.
+      - Force both ``os.replace`` and ``shutil.copy2`` inside spymaster
+        to fail for the final pickle replacement.
+      - Sentinel ``_write_output_manifest`` so the test can assert it
+        was never called.
+
+    Assertions:
+      - ``save_precomputed_results`` does not raise.
+      - The on-disk pickle still contains OLD content.
+      - The on-disk sidecar still contains the OLD manifest bytes.
+      - The sentinel write_output_manifest was never invoked.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    # OLD content + OLD manifest pre-populated on disk.
+    pkl_path = cache_dir / "AAA_precomputed_results.pkl"
+    old_payload = _build_synthetic_spymaster_pkl(pkl_path, ticker="AAA")
+    sidecar_path = pm._sidecar_path_for(pkl_path)
+    old_sidecar_bytes = sidecar_path.read_bytes()
+    old_pkl_bytes = pkl_path.read_bytes()
+
+    # Force the final replace path to fail. The retry loop in
+    # save_precomputed_results sleeps between attempts; we monkeypatch
+    # both os.replace and shutil.copy2 to raise PermissionError.
+    def _fail_replace(src, dst, *args, **kwargs):
+        if str(dst).endswith("AAA_precomputed_results.pkl"):
+            raise PermissionError("simulated replace failure")
+        # Allow temp-file cleanup paths and other unrelated calls.
+        return _real_replace(src, dst, *args, **kwargs)
+
+    def _fail_copy2(src, dst, *args, **kwargs):
+        if str(dst).endswith("AAA_precomputed_results.pkl"):
+            raise OSError("simulated copy2 failure")
+        return _real_copy2(src, dst, *args, **kwargs)
+
+    _real_replace = os.replace
+    _real_copy2 = __import__("shutil").copy2
+    monkeypatch.setattr(spymaster.os, "replace", _fail_replace)
+    monkeypatch.setattr(spymaster.shutil, "copy2", _fail_copy2)
+
+    sidecar_call_count = {"n": 0}
+
+    def _sentinel_write_output_manifest(*args, **kwargs):
+        sidecar_call_count["n"] += 1
+        raise AssertionError(
+            "save_ok gate violated: sidecar write attempted after a "
+            "failed pickle replacement"
+        )
+
+    monkeypatch.setattr(
+        spymaster, "_write_output_manifest", _sentinel_write_output_manifest,
+    )
+
+    # NEW content that the failed save would (without the gate) try to
+    # advertise via a fresh sidecar.
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    new_results = {
+        "_ticker": "AAA",
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [200.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), 5.0) for d in dates},
+        "daily_top_short_pairs": {d: ((113, 114), 5.0) for d in dates},
+        "top_buy_pair": (5, 4),
+        "top_short_pair": (4, 5),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+    }
+
+    # Should not raise.
+    spymaster.save_precomputed_results("AAA", new_results)
+
+    # Sidecar write must not have been attempted.
+    assert sidecar_call_count["n"] == 0, (
+        "save_ok gate violated: sidecar write attempted after a failed "
+        "pickle replacement"
+    )
+    # On-disk pickle and sidecar bytes must be unchanged.
+    assert pkl_path.read_bytes() == old_pkl_bytes
+    assert sidecar_path.read_bytes() == old_sidecar_bytes
+
+
+def test_3b2a_spymaster_save_failure_fallback_copy2_succeeds(tmp_path, monkeypatch):
+    """If os.replace fails but shutil.copy2 succeeds, save_ok=True and the
+    sidecar write proceeds (proving the gate is not over-tightened)."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    _real_replace = os.replace
+
+    def _fail_replace(src, dst, *args, **kwargs):
+        if str(dst).endswith("AAA_precomputed_results.pkl"):
+            raise PermissionError("simulated replace failure")
+        return _real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(spymaster.os, "replace", _fail_replace)
+
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    new_results = {
+        "_ticker": "AAA",
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [300.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), 7.0) for d in dates},
+        "daily_top_short_pairs": {d: ((113, 114), 7.0) for d in dates},
+        "top_buy_pair": (3, 2),
+        "top_short_pair": (2, 3),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+    }
+
+    spymaster.save_precomputed_results("AAA", new_results)
+
+    pkl_path = cache_dir / "AAA_precomputed_results.pkl"
+    assert pkl_path.exists()
+    sidecar_path = pm._sidecar_path_for(pkl_path)
+    assert sidecar_path.exists(), (
+        "Sidecar should be written when fallback copy2 succeeds"
+    )
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(pkl_path)

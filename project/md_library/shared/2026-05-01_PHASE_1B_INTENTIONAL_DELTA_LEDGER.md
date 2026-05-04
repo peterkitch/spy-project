@@ -1327,3 +1327,337 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     complete after 3B-1 — Phase 3B-2 covers output manifests and
     the remaining Spymaster / TrafficFlow / Confluence deferred
     surfaces.
+
+
+## Phase 3B-2A: Output Manifest Helper + StackBuilder Run Manifests + Spymaster PKLs
+
+  - Type: ADDITIVE-PROVENANCE (no behavior change to scoring math).
+    Carry-forwards from Phase 3B-1; XLSX upsert manifests, CLI
+    strict-mode, and final Phase 3 close remain Phase 3B-2B scope.
+
+  - Old behavior:
+      - Provenance was signal-library-only (Phase 3A) plus a perf
+        cache and tightened B12 (Phase 3B-1). Output artifacts
+        (StackBuilder run dirs, Spymaster cache PKLs) had no manifest
+        contract; consumers loaded them with raw ``pickle.load`` plus
+        ad-hoc validation. Spymaster cache PKLs in particular were
+        consumed by Spymaster, TrafficFlow, and Confluence with three
+        independent corruption / contamination guards.
+      - StackBuilder ``run_manifest.json`` recorded only the secondary
+        ticker, started/finished timestamps, params subset, and a flat
+        ``outputs`` filename mapping. There was no record of which
+        signal libraries the run consumed, no on-disk file SHAs for
+        the rank/cohort/leaderboard tables, and no schema_version /
+        artifact_kind / engine context to tie it to the broader Phase
+        3 manifest contract.
+      - The Phase 3B-1 perf-cache invalidation tests paid for
+        filesystem mtime resolution by sleeping 1.05 s past the
+        coarse-mtime granularity. ~2 s of test-suite wall-clock that
+        was structural noise.
+
+  - New behavior:
+
+    Output manifest helper / schema (provenance_manifest.py):
+
+      - Constants: ``ARTIFACT_KIND_SIGNAL_LIBRARY = "signal_library"``
+        (Phase 3A default; manifests without ``artifact_kind`` continue
+        to read as signal_library, no Phase 3A regression) and
+        ``ARTIFACT_KIND_OUTPUT = "output"``.
+      - ``file_sha256(path)``: streamed SHA-256 of file bytes; bound
+        memory.
+      - ``build_output_manifest(...)``: produces an output-flavored
+        manifest with stable identity (schema_version, artifact_kind,
+        artifact_type, producer_engine, engine_version), run / config
+        inputs (params, cli_args, ui_args, input_manifest_hashes,
+        input_secondary_hash, output_schema), runtime / environment
+        (git_commit, git_dirty, package_versions), and volatile fields
+        (build_timestamp, builder_identity, host_platform). Logical
+        ``content_hash`` is computed via the Phase 3A canonical-blob
+        walk for mappings; non-mappings go through canonical JSON.
+      - ``write_output_manifest(artifact_path, manifest, *,
+        include_file_sha256=True, sidecar_path=None)``: atomic temp +
+        os.replace sidecar write, with optional ``artifact_file_sha256``
+        stamped over the on-disk bytes. The on-disk SHA lives ONLY in
+        the sidecar — embedding it in a pickle's ``_manifest`` would be
+        self-referential.
+      - ``load_verified_pickle_artifact(path, *, requested_params,
+        strict, expected_type=dict, cache=True)``: mirrors
+        ``load_verified_signal_library`` but routes through the new
+        output-verification path, including the optional sidecar
+        ``artifact_file_sha256`` byte-level check.
+      - ``load_verified_json_artifact(path, *, requested_params,
+        strict, expected_type=dict)``: for non-self JSON outputs whose
+        manifest lives in a sidecar.
+      - Internal ``_verify_output_manifest`` shared body covering:
+          * logical content_hash mismatch -> ok=False
+          * artifact_file_sha256 mismatch (when sidecar has it) -> ok=False
+          * params subset mismatch -> ok=False
+          * input_manifest_hashes subset -> warn (strict=False) /
+            fail (strict=True)
+          * runtime / package version drift -> warn / fail by strict
+          * schema_version drift -> warn
+
+    Hash contract:
+
+      - logical content_hash digests artifact content excluding
+        ``_manifest``. Same canonical walk as Phase 3A. May be embedded.
+      - artifact_file_sha256 digests final on-disk bytes. Sidecar-only
+        for embedded-pickle manifests (Risk 1: self-referential file
+        SHA inside a file is mathematically impossible to satisfy).
+      - JSON artifacts may carry a file SHA in the sidecar.
+        ``run_manifest.json`` does NOT embed its own self-SHA; if a
+        future reader wants tamper-evidence over the JSON itself, it
+        would compute the SHA over a canonical version with the
+        self-hash field excluded.
+
+    Sidecar / embedded drift (Risk 2):
+
+      - Two-file (pickle + sidecar) write is not atomic across both
+        files. The contract tolerates a torn sidecar:
+          * embedded manifest is authoritative for logical verification.
+          * sidecar adds a file-byte check when present.
+          * sidecar/embedded disagreement -> warn, prefer embedded.
+          * strict-mode callers may require sidecar verification;
+            failures surface as a strict mismatch, not a load crash.
+
+    StackBuilder run_manifest enrichment:
+
+      - Existing keys preserved verbatim: ``secondary``, ``started_at``,
+        ``params``, ``finished_at``, ``elapsed_seconds``, ``outputs``.
+        The ``outputs`` mapping retains its existing flat
+        ``name -> filename`` shape unchanged.
+      - New keys (Phase 3B-2A): ``schema_version``, ``artifact_kind``,
+        ``artifact_type``, ``producer_engine``, ``engine_version``,
+        ``run_id``, ``git_commit``, ``git_dirty``, ``package_versions``,
+        ``build_timestamp``, ``builder_identity``, ``host_platform``,
+        ``cli_args`` (stable subset), ``status``,
+        ``output_artifacts`` (per-file entries with filename / format /
+        size / file_sha256 / produced_at; row_count + column_schema for
+        CSV; xlsx / parquet schema deferred to 3B-2B), and
+        ``input_manifest_hashes`` / ``input_legacy_count`` /
+        ``input_missing_manifest_count`` collected via a thread-safe
+        per-run RLock-protected collector hooked into
+        ``load_lib_or_none``. ``input_secondary_hash`` is a placeholder
+        None pending 3B-2B's secondary fingerprinting.
+      - Run-manifest readers grep: only ``stackbuilder.py`` writes
+        ``run_manifest.json``; no external readers exist, so the
+        schema can grow freely as long as existing keys are preserved.
+      - The collector starts at ``run_for_secondary`` entry and
+        finalizes either on success (snapshot embedded in the final
+        manifest) or in the except handler (drops the snapshot so a
+        failed run does not bleed into the next run's manifest).
+
+    Spymaster PKL manifests:
+
+      - Producer: ``spymaster.save_precomputed_results`` now embeds a
+        Phase 3 output manifest in ``results_to_disk`` BEFORE
+        ``pickle.dump``, then writes a sidecar JSON with
+        ``artifact_file_sha256`` over final on-disk bytes after the
+        atomic ``os.replace``. Sidecar write failures log a warning
+        but do not fail the save — the embedded manifest is
+        authoritative for logical verification (Risk 2).
+      - Internal consumers (4) all routed through
+        ``load_verified_pickle_artifact``:
+          * ``_quick_last_fingerprint`` (cache fingerprint probe)
+          * ``load_precomputed_results_from_file`` (with retry; the
+            ``_ticker`` contamination check remains AFTER verified load)
+          * ``load_preprocessed_df`` (DataFrame-only load)
+          * UI disk fallback in the dynamic-strategy callback (~ line
+            8605)
+      - TrafficFlow consumer: ``load_spymaster_pkl`` migrated;
+        ``_PKL_CACHE`` is populated only after a verified-or-legacy
+        accept so a tampered PKL does not poison the in-memory cache.
+      - Confluence consumer: ``_load_spymaster_cache_fallback``
+        migrated; the surrounding signal construction is unchanged.
+
+    B12 allowlist retirements:
+
+      - All 6 deferred entries removed:
+          * ``spymaster.py:3629 / 4036 / 4383 / 8512`` (4 sites)
+          * ``trafficflow.py:1349``
+          * ``signal_library/confluence_analyzer.py:72``
+      - Final 3B-2A allowlist: only ``provenance_manifest.py`` (the
+        central loader internals). Every other production .py file
+        routes through one of ``load_verified_signal_library``,
+        ``load_verified_pickle_artifact``, ``load_verified_json_artifact``,
+        or ``pickle_load_compat``.
+
+    mtime test tightening:
+
+      - ``test_3b1_cache_atomic_replace_invalidates`` and
+        ``test_3b1_cache_inplace_rewrite_invalidates`` now bump
+        mtime explicitly via ``os.utime(..., ns=...)`` past the
+        original mtime_ns instead of sleeping 1.05 s past the
+        filesystem mtime resolution. Both rewrite the file with the
+        same bytes (size unchanged) so the cache miss is unambiguously
+        driven by the mtime key component, not size. Suite runtime
+        drops by ~2 s end-to-end.
+
+  ### Architecture exception: sanctioned Spymaster import
+
+  Old standalone rule (CLAUDE.md):
+    "Spymaster.py is intentionally standalone by design. NO
+     dependencies on other project modules (signal_library,
+     global_ticker_library, onepass, impactsearch). Direct yfinance
+     calls for all data fetching. Isolated caching system. Self-
+     contained calculations for all metrics."
+
+  New narrow exception (Phase 3B-2A):
+    spymaster.py is authorized to import from
+    ``project/provenance_manifest.py`` for the manifest contract only:
+        from provenance_manifest import (
+            build_output_manifest,
+            write_output_manifest,
+            load_verified_pickle_artifact,
+            file_sha256,
+            MANIFEST_FIELD,
+            ARTIFACT_KIND_OUTPUT,
+        )
+    Spymaster's scoring / data-fetch / regression-baseline behavior
+    remains standalone; the import is scoped to producer / consumer
+    manifest IO only.
+
+  Why it is justified:
+    - Spymaster cache PKLs are durable artifacts consumed by
+      Spymaster itself, TrafficFlow, the Confluence Spymaster
+      fallback, and (as of Phase 4) the Cross-Ticker Confluence
+      Dashboard. A single manifest contract across producers and
+      consumers is the Phase 3 single-source-of-truth invariant.
+    - Duplicating ``provenance_manifest.py`` logic inside
+      ``spymaster.py`` would violate that invariant. A separate
+      schema would prevent shared verification across engines and
+      regress the cross-engine provenance work landed in Phase 3A
+      and 3B-1.
+    - The exception is narrow: only the manifest helper, only at the
+      producer write site and the four consumer load sites. No new
+      coupling is introduced into the scoring or data-fetch paths.
+
+  Extraction / injection contingency:
+    If Spymaster is ever split into a separate package, the
+    provenance helper travels with it (vendor in) or gets injected
+    as a dependency through the producer/consumer entry points
+    (callers pass ``build_output_manifest`` / ``write_output_manifest``
+    / ``load_verified_pickle_artifact`` callables in). The exception
+    does not block the standalone extraction; it just makes the
+    helper a build-time dependency rather than a packaging concern.
+
+  - Affected tests/snapshots:
+      - ``project/test_scripts/test_provenance_manifest.py``: +19
+        Phase 3B-2A tests covering helper/schema fields,
+        sidecar/embedded contract, JSON artifact verification,
+        StackBuilder collector + output_artifact_entry +
+        _build_output_artifacts + run_manifest legacy-keys grep,
+        Spymaster producer/consumer/legacy/mismatch/torn-sidecar
+        paths, TrafficFlow valid/legacy/tampered with _PKL_CACHE
+        invariant, Confluence fallback valid/legacy/tampered.
+      - ``project/test_scripts/test_static_regression_guards.py``:
+        B12 allowlist shrunk from 7 entries to 1 (only
+        ``provenance_manifest.py``).
+      - 179 baseline -> 198 with Phase 3B-2A.
+
+  - Phase 3B-2B surface (NOT in 3B-2A scope):
+      - OnePass XLSX upsert manifests
+      - ImpactSearch XLSX upsert manifests
+      - ``load_verified_xlsx_artifact``
+      - StackBuilder XLSX fast-path strict verification
+      - ``--strict-manifests`` CLI plumbing
+      - ``TRAFFICFLOW_STRICT_MANIFESTS`` env-var
+      - final Phase 3 ledger close
+
+  - Out of scope later (unchanged):
+      - ``--backfill-manifests``, ``--rebuild-on-mismatch``,
+        ``--verify-only``
+      - environment.yml / requirements.txt hygiene
+      - B11 ``compute_signals``
+      - QC clone files
+      - OnePass run reports JSON manifests
+
+  - ELI5: every Spymaster cache pickle now carries the same kind of
+    receipt that Phase 3A introduced for signal libraries: an
+    embedded ``_manifest`` plus a JSON sidecar with a file-byte SHA.
+    StackBuilder's ``run_manifest.json`` grew a detailed
+    ``output_artifacts`` list with file SHAs for every rank /
+    cohort / leaderboard / summary file the run produced, plus a
+    record of which signal libraries fed into the run. The static
+    guard that bans raw ``pickle.load`` in production code has
+    tightened from "every consumer except a few specific
+    Phase-3B-2-deferred sites" to "every consumer except the
+    central loader itself" — every signal-library AND output
+    pickle now flows through the central provenance contract.
+  - Status: implemented in Phase 3B-2A (this PR). Phase 3 is NOT
+    complete after 3B-2A — Phase 3B-2B covers XLSX upsert
+    manifests, CLI strict-mode plumbing, and the final Phase 3
+    close.
+
+### Phase 3B-2A amendment (PR #143): collector isolation + save_ok guard
+
+  Codex audit found two blockers in the original PR #143 commits 1-7.
+  Both were fixed in-flight on the same PR.
+
+  **Blocker 1 — collector isolation:**
+    - Old (e5f3eb7 commits 1-7): the StackBuilder input-manifest
+      collector was a single module-level dict guarded by an RLock
+      (``_INPUT_MANIFEST_COLLECTOR``). The lock prevents data-structure
+      races but does NOT isolate concurrent ``run_for_secondary``
+      jobs. The Dash multi-secondary launch path at
+      ``stackbuilder.py:1731`` spawns one ``threading.Thread`` per
+      secondary, so two concurrent jobs would clobber each other's
+      collector and produce wrong (or empty) ``input_manifest_hashes``
+      in the resulting ``run_manifest.json``.
+    - New (amendment): the collector lives in a
+      ``contextvars.ContextVar`` (``_INPUT_COLLECTOR_VAR``). Each
+      ``run_for_secondary`` invocation calls
+      ``_start_input_manifest_collection()`` which constructs a fresh
+      collector ``{"hashes": set(), "legacy": 0, "missing": 0,
+      "lock": RLock()}`` and ``set()``s the ContextVar, returning the
+      token. ``_finalize_input_manifest_collection(token)`` snapshots
+      the run's state and ``reset()``s the ContextVar to its prior
+      value (so nested or sibling runs are unaffected).
+    - ContextVars do NOT automatically propagate from the submitter
+      into long-lived ``ThreadPoolExecutor`` worker threads. The
+      ``phase2_rank_all`` executor was therefore wrapped:
+      ``_submit_with_context(executor, fn, *args, **kwargs)`` captures
+      the caller's Context via ``contextvars.copy_context()`` and runs
+      the worker callable inside it, so the per-run collector
+      ContextVar is visible to ``_record_input_lib`` from inside
+      ``_score_primary_both_modes`` workers.
+    - Regression test:
+      ``test_3b2a_collector_isolation_concurrent_runs``. Two threads
+      barrier-rendezvous on collection start, each records a distinct
+      set of synthetic manifested libraries via the production
+      ``_submit_with_context`` wrapper, then finalizes. The test
+      asserts both snapshots contain only their run's hashes
+      (disjoint sets) and that legacy/missing counters are isolated
+      too. Verified to fail on the e5f3eb7 module-global collector
+      (cross-contamination / empty Run A snapshot) and to pass after
+      the ContextVar + ``_submit_with_context`` migration.
+
+  **Blocker 2 — save_ok sidecar gate:**
+    - Old (e5f3eb7 commits 1-7): ``save_precomputed_results`` would
+      write the new sidecar manifest even when the final pickle
+      replacement failed. That left an orphan sidecar describing
+      content that was never written, or caused legitimate older
+      pickles still on disk to fail verification because their bytes
+      no longer matched the (overwritten) sidecar file_sha256.
+    - New (amendment): a local ``save_ok`` flag is set to True only
+      after the final pickle replacement succeeds (either via
+      ``os.replace`` or the ``shutil.copy2`` fallback). The sidecar
+      write is gated on ``save_ok``; if neither path succeeded, no
+      sidecar action is taken — any existing sidecar on disk is left
+      alone so the older pickle continues to verify.
+    - The ``save_precomputed_results`` public return contract is
+      unchanged.
+    - Regression test:
+      ``test_3b2a_spymaster_save_failure_no_orphan_sidecar``.
+      Pre-populates an OLD pickle + OLD sidecar, monkeypatches
+      ``os.replace`` and ``shutil.copy2`` to fail, calls
+      ``save_precomputed_results`` with NEW content, and asserts:
+        * the call does not raise
+        * the on-disk pickle still contains OLD content
+        * the on-disk sidecar still contains OLD manifest bytes
+        * no new sidecar describing NEW content was written
+      Verified to fail on the un-gated sidecar write (orphan sidecar
+      describing content that was never persisted) and to pass with
+      the ``save_ok`` gate.
+
+  Status: implemented in PR #143 amendment commits 8-9.

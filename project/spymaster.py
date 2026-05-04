@@ -20,6 +20,24 @@ import numpy as np
 import re
 from scipy import stats
 from canonical_scoring import score_captures as _canonical_score_captures
+
+# Phase 3B-2A sanctioned architecture exception:
+# Spymaster remains standalone for scoring/data logic, but imports the
+# central provenance helper so Spymaster cache PKLs share the Phase 3
+# manifest contract with TrafficFlow, Confluence, and the StackBuilder
+# run_manifest. Cross-engine provenance verification is the justification;
+# duplicating provenance_manifest.py logic inside spymaster.py would
+# violate the Phase 3 single-source-of-truth contract. If Spymaster is
+# ever split into a separate package, the provenance helper travels with
+# it or gets injected as a dependency. See ledger Phase 3B-2A entry.
+from provenance_manifest import (
+    build_output_manifest as _build_output_manifest,
+    write_output_manifest as _write_output_manifest,
+    load_verified_pickle_artifact as _load_verified_pickle_artifact,
+    file_sha256 as _file_sha256,
+    MANIFEST_FIELD as _MANIFEST_FIELD,
+    ARTIFACT_KIND_OUTPUT as _ARTIFACT_KIND_OUTPUT,
+)
 import gc
 import threading
 
@@ -3617,20 +3635,25 @@ def _fingerprint_changed(old_fp, new_fp, tol=FINGERPRINT_TOLERANCE):
 
 def _quick_last_fingerprint(ticker):
     """Quickly get just the fingerprint from cached results without loading all data.
-    
+
     Returns fingerprint tuple or None if not found.
+
+    Phase 3B-2A: routes through ``load_verified_pickle_artifact``. Legacy
+    PKLs (no manifest) load with a warning; manifest mismatches surface
+    as None so the caller treats them as cache misses.
     """
     pkl_file = f'cache/results/{ticker}_precomputed_results.pkl'
     if not os.path.exists(pkl_file):
         return None
-    
+
     try:
-        with open(pkl_file, 'rb') as f:
-            data = pickle.load(f)
-        return data.get('data_fingerprint')
+        data, _vresult = _load_verified_pickle_artifact(pkl_file)
     except Exception as e:
         logger.debug(f"Could not read fingerprint from {pkl_file}: {e}")
         return None
+    if data is None or (not _vresult.legacy and not _vresult.ok):
+        return None
+    return data.get('data_fingerprint')
 
 def _log_yahoo_stats_if_needed(now):
     """Log Yahoo API call statistics every 60 seconds in debug mode."""
@@ -4029,34 +4052,57 @@ def get_last_valid_trading_day(df):
     return None
 
 def load_precomputed_results_from_file(pkl_file, ticker=None, max_retries=5, delay=1):
+    """Load a Spymaster precomputed-results PKL with provenance verification.
+
+    Phase 3B-2A: routes through ``load_verified_pickle_artifact``. Legacy
+    PKLs (no embedded manifest) load with a warning and proceed; manifest
+    mismatches return None so the caller treats them as cache misses and
+    triggers a recompute. The contamination check (``_ticker`` field
+    self-validation) remains in place AFTER load.
+    """
     retries = 0
     while retries < max_retries:
         try:
-            with open(pkl_file, 'rb') as f:
-                data = pickle.load(f)
-                # Validate self-check tokens if present
-                if ticker and '_ticker' in data and data['_ticker'] != ticker:
-                    logger.error(f"CONTAMINATION DETECTED!")
-                    logger.error(f"Pickle for {ticker} contains data for {data['_ticker']}")
-                    logger.error(f"Row count: {data.get('_row_count')}")
-                    logger.error(f"Date range: {data.get('_first_date')} to {data.get('_last_date')}")
-                    logger.error(f"Deleting contaminated file: {pkl_file}")
-                    try:
-                        os.remove(pkl_file)
-                    except Exception:
-                        pass
-                    return None
-                return data
+            data, _vresult = _load_verified_pickle_artifact(pkl_file)
         except PermissionError:
             logger.error(f"Permission denied when loading results from {pkl_file}. Retrying...")
             time.sleep(delay)
             retries += 1
-        except FileNotFoundError:
-            logger.warning(f"Results file not found: {pkl_file}")
+            continue
+        if data is None:
+            # Distinguish FileNotFoundError-style misses from manifest
+            # rejections so the existing log shape is preserved.
+            load_err = next(
+                (m for m in _vresult.mismatches if m[0] == "load_error"),
+                None,
+            )
+            if load_err and load_err[1] == "FileNotFoundError":
+                logger.warning(f"Results file not found: {pkl_file}")
+                break
+            logger.error(
+                f"Error loading results from {pkl_file}: "
+                f"{_vresult.mismatches}"
+            )
             break
-        except Exception as e:
-            logger.error(f"Error loading results from {pkl_file}: {str(e)}")
-            break
+        if not _vresult.legacy and not _vresult.ok:
+            logger.warning(
+                f"Provenance manifest mismatch for {pkl_file}: "
+                f"{_vresult.mismatches}. Treating as cache miss."
+            )
+            return None
+        # Validate self-check tokens if present
+        if ticker and '_ticker' in data and data['_ticker'] != ticker:
+            logger.error(f"CONTAMINATION DETECTED!")
+            logger.error(f"Pickle for {ticker} contains data for {data['_ticker']}")
+            logger.error(f"Row count: {data.get('_row_count')}")
+            logger.error(f"Date range: {data.get('_first_date')} to {data.get('_last_date')}")
+            logger.error(f"Deleting contaminated file: {pkl_file}")
+            try:
+                os.remove(pkl_file)
+            except Exception:
+                pass
+            return None
+        return data
     logger.error(f"Failed to load results from {pkl_file} after {max_retries} retries.")
     return None
 
@@ -4375,12 +4421,17 @@ def _lighten_for_runtime(full_results: dict, pkl_path: str) -> dict:
 def load_preprocessed_df(ticker: str, pkl_path: str = None):
     """
     Load just the DataFrame from disk. Avoids touching the RAM cache.
+
+    Phase 3B-2A: routes through ``load_verified_pickle_artifact``. Legacy
+    PKLs load with a warning; manifest mismatches return None so the
+    caller falls back to a recompute path.
     """
     t = normalize_ticker(ticker)
     if not pkl_path:
         pkl_path = f"cache/results/{t}_precomputed_results.pkl"
-    with open(pkl_path, "rb") as f:
-        data = pickle.load(f)
+    data, _vresult = _load_verified_pickle_artifact(pkl_path)
+    if data is None or (not _vresult.legacy and not _vresult.ok):
+        return None
     return data.get("preprocessed_data")
 
 def ensure_df_available(ticker: str, results: dict = None):
@@ -4482,22 +4533,56 @@ def save_precomputed_results(ticker, results):
     
     # Strip transient keys before persisting
     results_to_disk = _persistable_results(results)
-    
+
+    # Phase 3B-2A: build provenance manifest BEFORE pickle.dump so the
+    # logical content_hash is computed over the artifact body (without
+    # _manifest, per the canonical-blob walk). The manifest is then
+    # embedded in the dict; the on-disk file_sha256 is captured AFTER the
+    # final pickle write into the sidecar JSON only -- embedding the
+    # final-bytes SHA inside the same pickle would be self-referential.
+    try:
+        _core_manifest = _build_output_manifest(
+            artifact_type='spymaster_precomputed_results',
+            producer_engine='spymaster',
+            engine_version=str(results_to_disk.get('engine_version', '1.0.0')),
+            params={
+                'ticker': ticker,
+                'max_sma_day': results_to_disk.get('max_sma_day'),
+                'price_source': results_to_disk.get('price_source', 'Close'),
+                'parity_hash': results_to_disk.get('parity_hash'),
+            },
+            content_obj=results_to_disk,
+            artifact_kind=_ARTIFACT_KIND_OUTPUT,
+        )
+        results_to_disk[_MANIFEST_FIELD] = _core_manifest
+    except Exception as _manifest_exc:
+        logger.warning(
+            f"Failed to attach provenance manifest for {ticker}: {_manifest_exc}"
+        )
+
     # Create a temporary file and write data
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl', dir='cache/results') as tf:
         pickle.dump(results_to_disk, tf, protocol=pickle.HIGHEST_PROTOCOL)
         tf.flush()  # Flush Python buffer
         os.fsync(tf.fileno())  # Force OS to write to disk
         temp_name = tf.name
-    
-    # Try atomic replace (better than remove+move)
+
+    # Try atomic replace (better than remove+move).
+    # Phase 3B-2A amendment: track save_ok so the sidecar manifest is
+    # written ONLY when the final pickle is actually in place. Without
+    # this gate a failed os.replace + failed copy2 would still trigger a
+    # sidecar write describing content that was never persisted, leaving
+    # an orphan sidecar (or invalidating the older pickle still on disk
+    # via a stale file_sha256 mismatch).
+    save_ok = False
     max_retries = 3
     retry_delay = 0.5
-    
+
     for attempt in range(max_retries):
         try:
             # Use os.replace for atomic operation
             os.replace(temp_name, final_name)
+            save_ok = True
             break  # Success!
         except (PermissionError, FileExistsError) as e:
             if attempt < max_retries - 1:
@@ -4508,17 +4593,37 @@ def save_precomputed_results(ticker, results):
                 try:
                     shutil.copy2(temp_name, final_name)
                     os.remove(temp_name)
+                    save_ok = True
                 except Exception:
                     # If all else fails, just warn and continue
                     logger.warning(f"Could not save results for {ticker}: {e}")
-                    
+
     # Clean up temp file if it still exists
     if temp_name and os.path.exists(temp_name):
         try:
             os.remove(temp_name)
         except:
             pass
-    
+
+    # Phase 3B-2A: write sidecar manifest JSON with artifact_file_sha256
+    # over the final pickle bytes. This is best-effort; a torn sidecar
+    # write does not fail the save because the embedded manifest in the
+    # pickle itself is authoritative for logical verification (Risk 2).
+    # Phase 3B-2A amendment: gated on save_ok so we never write a sidecar
+    # describing content that was not actually persisted.
+    if save_ok:
+        try:
+            if os.path.exists(final_name) and _MANIFEST_FIELD in results_to_disk:
+                _write_output_manifest(
+                    final_name,
+                    results_to_disk[_MANIFEST_FIELD],
+                    include_file_sha256=True,
+                )
+        except Exception as _sidecar_exc:
+            logger.warning(
+                f"Failed to write provenance sidecar for {ticker}: {_sidecar_exc}"
+            )
+
     # Don't log here - it disrupts progress bar output
     return results
 
@@ -8500,17 +8605,23 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
     # Call with callback parameters to ensure proper logging
     results = load_precomputed_results(ticker, from_callback=True, should_log=should_log)
     
-    # FALLBACK: If RAM cache isn't ready but pickle exists, load from disk
+    # FALLBACK: If RAM cache isn't ready but pickle exists, load from disk.
+    # Phase 3B-2A: route through the central verified loader.
     if results is None:
         if debug_enabled():
             print(f"[AI DEBUG] RAM cache miss for {ticker}, trying disk fallback...")
         pkl_file = f"cache/results/{ticker}_precomputed_results.pkl"
         if os.path.exists(pkl_file):
             try:
-                import pickle
-                with open(pkl_file, "rb") as f:
-                    results = pickle.load(f)
-                if results and 'top_buy_pair' in results and 'top_short_pair' in results:
+                results, _vresult = _load_verified_pickle_artifact(pkl_file)
+                if results is None or (not _vresult.legacy and not _vresult.ok):
+                    if debug_enabled():
+                        print(
+                            f"[AI DEBUG] Disk load rejected for {ticker}: "
+                            f"{_vresult.mismatches}"
+                        )
+                    results = None
+                elif results and 'top_buy_pair' in results and 'top_short_pair' in results:
                     if debug_enabled():
                         print(f"[AI DEBUG] SUCCESS: Loaded from disk for {ticker}")
                 else:

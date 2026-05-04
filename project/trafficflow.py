@@ -40,6 +40,9 @@ from canonical_scoring import (
     combine_consensus_signals as _canonical_consensus,
     score_captures as _canonical_score_captures,
 )
+from provenance_manifest import (
+    load_verified_pickle_artifact as _load_verified_pickle_artifact,
+)
 
 # Optional imports; keep app usable without Dash for headless diagnostics
 try:
@@ -1334,7 +1337,13 @@ def _member_possets_on_secondary(secondary: str,
 
 # ---------- Spymaster PKL loading ----------
 def load_spymaster_pkl(ticker: str) -> Optional[dict]:
-    """Load Spymaster PKL from cache/results directory (with in-memory cache)."""
+    """Load Spymaster PKL from cache/results directory (with in-memory cache).
+
+    Phase 3B-2A: routes through ``load_verified_pickle_artifact``. Legacy
+    PKLs (no manifest) load with a warning and proceed; manifest
+    mismatches return None and bypass the in-memory ``_PKL_CACHE`` so a
+    rebuilt PKL is picked up on the next call.
+    """
     if ticker in _PKL_CACHE:
         return _PKL_CACHE[ticker]
 
@@ -1342,15 +1351,13 @@ def load_spymaster_pkl(ticker: str) -> Optional[dict]:
     if not pkl_path.exists():
         return None
     try:
-        import pickle
-        with open(pkl_path, "rb") as f:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=DeprecationWarning)
-                pkl = pickle.load(f)
-                _PKL_CACHE[ticker] = pkl
-                return pkl
+        pkl, vresult = _load_verified_pickle_artifact(pkl_path)
     except Exception:
         return None
+    if pkl is None or (not vresult.legacy and not vresult.ok):
+        return None
+    _PKL_CACHE[ticker] = pkl
+    return pkl
 
 def _load_signal_library_quick(primary: str) -> Optional[dict]:
     """Quick loader for signal library (alias for load_spymaster_pkl)."""

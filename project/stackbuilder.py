@@ -4,6 +4,7 @@
 # Phases: 1) Preflight  2) Rank All  3) Stack Builder
 
 import os, re, json, math, glob, argparse, time, shutil, threading
+import contextvars
 from types import SimpleNamespace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,7 +29,127 @@ from canonical_scoring import (
 from provenance_manifest import (
     verify_manifest as _verify_manifest,
     load_verified_signal_library as _load_verified_signal_library,
+    build_output_manifest as _build_output_manifest,
+    file_sha256 as _file_sha256,
+    MANIFEST_SCHEMA_VERSION as _MANIFEST_SCHEMA_VERSION,
+    ARTIFACT_KIND_OUTPUT as _ARTIFACT_KIND_OUTPUT,
 )
+
+
+# Phase 3B-2A: per-run collection of input signal-library manifest content
+# hashes so the run_manifest.json can pin which libraries this run consumed.
+#
+# Phase 3B-2A amendment (Codex audit, PR #143): the collector lives in a
+# ContextVar so each ``run_for_secondary`` invocation gets its own
+# isolated collector. Two consecutive Dash-launched runs (each on its own
+# threading.Thread) correctly receive disjoint snapshots.
+#
+# StackBuilder also loads libraries inside ThreadPoolExecutor pools (see
+# phase2_rank_all). ContextVars do NOT automatically propagate from the
+# submitter into long-lived executor worker threads, so executor
+# submissions that may transitively call ``_record_input_lib`` MUST run
+# under ``contextvars.copy_context().run`` so the worker observes the
+# submitter's collector. ``_submit_with_context`` below is the wrapper.
+_INPUT_COLLECTOR_VAR: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("stackbuilder_input_collector", default=None)
+)
+
+
+def _start_input_manifest_collection() -> "contextvars.Token":
+    """Start a fresh per-run collector and return the ContextVar token.
+
+    Callers should pass the returned token to
+    ``_finalize_input_manifest_collection(token)`` so the ContextVar is
+    properly reset to its prior value after the run, including in
+    finally/except paths where the collection might not have completed.
+    """
+    collector = {
+        "hashes": set(),
+        "legacy": 0,
+        "missing": 0,
+        "lock": threading.RLock(),
+    }
+    return _INPUT_COLLECTOR_VAR.set(collector)
+
+
+def _record_input_lib(lib: Optional[dict]) -> None:
+    """Record one signal-library load against the current run's collector.
+
+    Reads the ContextVar; no-ops when no run is active. Mutations are
+    serialized through the per-collector RLock so concurrent
+    ThreadPoolExecutor workers (when wrapped with
+    ``contextvars.copy_context().run``) see consistent state.
+    """
+    coll = _INPUT_COLLECTOR_VAR.get()
+    if coll is None:
+        return
+    with coll["lock"]:
+        if lib is None or not isinstance(lib, dict):
+            coll["missing"] += 1
+            return
+        manifest = lib.get("_manifest")
+        if not isinstance(manifest, dict):
+            coll["legacy"] += 1
+            return
+        ch = manifest.get("content_hash")
+        if isinstance(ch, str) and ch:
+            coll["hashes"].add(ch)
+        else:
+            coll["legacy"] += 1
+
+
+def _finalize_input_manifest_collection(
+    token: "Optional[contextvars.Token]" = None,
+) -> dict:
+    """Return a snapshot of the current run's collector and reset it.
+
+    When ``token`` is provided, ``_INPUT_COLLECTOR_VAR.reset(token)``
+    restores the prior ContextVar value. When no token is supplied, the
+    collector is cleared via ``set(None)`` (legacy callers / defensive
+    cleanup paths). Either way the snapshot reflects only the current
+    run's contributions.
+    """
+    coll = _INPUT_COLLECTOR_VAR.get() or {
+        "hashes": set(), "legacy": 0, "missing": 0,
+    }
+    if "lock" in coll:
+        with coll["lock"]:
+            snapshot = {
+                "input_manifest_hashes": sorted(coll["hashes"]),
+                "input_legacy_count": int(coll["legacy"]),
+                "input_missing_manifest_count": int(coll["missing"]),
+            }
+    else:
+        snapshot = {
+            "input_manifest_hashes": sorted(coll["hashes"]),
+            "input_legacy_count": int(coll["legacy"]),
+            "input_missing_manifest_count": int(coll["missing"]),
+        }
+    if token is not None:
+        try:
+            _INPUT_COLLECTOR_VAR.reset(token)
+        except (ValueError, LookupError):
+            # Token came from a different Context (e.g. captured by
+            # copy_context().run on a worker thread). Fall back to a
+            # plain clear; the worker's local copy will be discarded
+            # when the worker context is released.
+            _INPUT_COLLECTOR_VAR.set(None)
+    else:
+        _INPUT_COLLECTOR_VAR.set(None)
+    return snapshot
+
+
+def _submit_with_context(executor, fn, *args, **kwargs):
+    """Submit ``fn`` to ``executor`` under the caller's current Context.
+
+    ContextVars do not propagate into ThreadPoolExecutor worker threads
+    on their own. This wrapper captures the caller's Context via
+    ``contextvars.copy_context()`` and runs the worker callable inside
+    it, so the per-run collector ContextVar set by ``run_for_secondary``
+    is observable in the worker.
+    """
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
 
 try:
     import yfinance as yf
@@ -137,6 +258,104 @@ def write_json(path: str, obj) -> None:
     ensure_dir(os.path.dirname(path))
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(obj, f, indent=2)
+
+
+# Phase 3B-2A: helpers for run_manifest output_artifact entries.
+def _stable_cli_args_subset(args) -> dict:
+    """Subset of args that materially affects output content.
+
+    Excludes ephemeral / display-only fields (progress paths, --outdir,
+    process IDs) so the same logical run produces the same fingerprint
+    across re-runs from different working directories.
+    """
+    fields = (
+        "alpha", "max_k", "top_n", "bottom_n", "min_trigger_days",
+        "sharpe_eps", "seed_by", "search", "combine_mode",
+        "grace_days",
+    )
+    out: dict = {}
+    for fname in fields:
+        if hasattr(args, fname):
+            v = getattr(args, fname)
+            if v is None:
+                out[fname] = None
+            elif isinstance(v, (int, float, str, bool)):
+                out[fname] = v
+            else:
+                out[fname] = str(v)
+    return out
+
+
+def _output_artifact_entry(
+    outdir: str,
+    name: str,
+    *,
+    candidate_extensions=("xlsx", "csv", "parquet", "json"),
+    content_hasher=None,
+) -> Optional[dict]:
+    """Build one entry for run_manifest.output_artifacts.
+
+    Tries each candidate extension; the first match wins. Returns None
+    when the artifact is absent. ``content_hasher`` is an optional
+    callable that returns a logical content_hash string given the path
+    (e.g. for tabular files we may skip a logical hash and rely on the
+    file_sha256 byte-level integrity).
+    """
+    for ext in candidate_extensions:
+        candidate = os.path.join(outdir, f"{name}.{ext}")
+        if not os.path.exists(candidate):
+            continue
+        entry = {
+            "name": name,
+            "filename": os.path.basename(candidate),
+            "format": ext,
+            "file_sha256": _file_sha256(candidate),
+            "produced_at": datetime.now().isoformat(),
+        }
+        try:
+            entry["size_bytes"] = int(os.path.getsize(candidate))
+        except OSError:
+            entry["size_bytes"] = None
+        # Quick row/column shape probe for tabular outputs without re-
+        # parsing the full file. xlsx/parquet schema probing is left
+        # for the future (Phase 3B-2B); CSV is cheap to count.
+        if ext == "csv":
+            try:
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    header = fh.readline().rstrip("\r\n")
+                    line_count = sum(1 for _ in fh)
+                entry["row_count"] = int(line_count)
+                entry["column_schema"] = [
+                    {"name": col} for col in header.split(",")
+                ]
+            except OSError:
+                pass
+        if content_hasher is not None:
+            try:
+                entry["content_hash"] = content_hasher(candidate)
+            except Exception:
+                pass
+        return entry
+    return None
+
+
+def _build_output_artifacts(outdir: str) -> list:
+    """Scan a finalized StackBuilder run directory for output artifacts."""
+    artifacts: list = []
+    table_names = (
+        "rank_all", "rank_direct", "rank_inverse", "cohort", "combo_leaderboard",
+    )
+    for name in table_names:
+        entry = _output_artifact_entry(outdir, name)
+        if entry is not None:
+            artifacts.append(entry)
+    for name in ("summary", "search_stats"):
+        entry = _output_artifact_entry(
+            outdir, name, candidate_extensions=("json",),
+        )
+        if entry is not None:
+            artifacts.append(entry)
+    return artifacts
 
 def write_table(df: pd.DataFrame, basepath: str) -> None:
     ensure_dir(os.path.dirname(basepath))
@@ -416,10 +635,13 @@ def load_lib_or_none(t: str) -> Optional[dict]:
         try:
             lib = load_signal_library(t)
             if lib:
+                _record_input_lib(lib)
                 return lib
         except Exception:
             pass
-    return fallback_load_signal_library(t)
+    lib = fallback_load_signal_library(t)
+    _record_input_lib(lib)
+    return lib
 
 # ---------- Signal application and metrics ----------
 def apply_signals_to_secondary(primary_signals: List[str], primary_dates: List, sec_returns: pd.Series, *, return_mask: bool = False, grace_days: Optional[int] = None):
@@ -831,8 +1053,14 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     # change sign under metric negation; flipping signals first and
     # rescoring resolves that asymmetry.
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # Phase 3B-2A amendment: wrap each submit with copy_context so the
+        # per-run input-manifest collector ContextVar set by
+        # run_for_secondary flows into the worker thread.
         futures = {
-            ex.submit(_score_primary_both_modes, t, sec_rets, grace_days=grace_days): t
+            _submit_with_context(
+                ex, _score_primary_both_modes, t, sec_rets,
+                grace_days=grace_days,
+            ): t
             for t in primaries_df['Primary Ticker']
         }
 
@@ -1823,8 +2051,17 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                     message='Loading data and validating primaries...', outdir=temp_outdir,
                     secondary=vendor_secondary, started_ts=time.time())
 
+    # Phase 3B-2A amendment: per-run input-manifest collector lives in a
+    # ContextVar so two concurrent runs (Dash launches one threading.Thread
+    # per secondary) get isolated collectors. The token returned by
+    # _start_input_manifest_collection is captured here and passed into
+    # _finalize_input_manifest_collection on success and in the except
+    # path so the ContextVar is properly reset to its prior state.
+    _collector_token = _start_input_manifest_collection()
     try:
+        run_id = f"{vendor_secondary_clean}-{ts}-{os.getpid()}"
         manifest = {
+            # ---- Phase 3A baseline keys (preserved for backwards compat) ----
             'secondary': vendor_secondary,
             'started_at': datetime.now().isoformat(),
             'params': {
@@ -1835,8 +2072,30 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                 'min_trigger_days': getattr(args, 'min_trigger_days', 30),
                 'sharpe_eps': getattr(args, 'sharpe_eps', 0.01),
                 'seed_by': getattr(args, 'seed_by', 'total_capture')
-            }
+            },
+            # ---- Phase 3B-2A enrichment ---------------------------------
+            'schema_version': _MANIFEST_SCHEMA_VERSION,
+            'artifact_kind': _ARTIFACT_KIND_OUTPUT,
+            'artifact_type': 'stackbuilder_run',
+            'producer_engine': 'stackbuilder',
+            'engine_version': '1.0.0',
+            'run_id': run_id,
+            'cli_args': _stable_cli_args_subset(args),
+            'status': 'running',
         }
+        # Capture runtime / git context once at start; the final write
+        # picks up an updated build_timestamp from build_output_manifest.
+        _ctx = _build_output_manifest(
+            artifact_type='stackbuilder_run',
+            producer_engine='stackbuilder',
+            engine_version='1.0.0',
+        )
+        manifest['git_commit'] = _ctx['git_commit']
+        manifest['git_dirty'] = _ctx['git_dirty']
+        manifest['package_versions'] = _ctx['package_versions']
+        manifest['build_timestamp'] = _ctx['build_timestamp']
+        manifest['builder_identity'] = _ctx['builder_identity']
+        manifest['host_platform'] = _ctx['host_platform']
         write_json(os.path.join(temp_outdir, 'run_manifest.json'), manifest)
 
         _write_progress(ppath, status='running', phase='ranking', percent=25.0,
@@ -1947,6 +2206,7 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         manifest['finished_at'] = datetime.now().isoformat()
         manifest['elapsed_seconds'] = round(elapsed_time, 2)
         ext = 'xlsx' if OUTPUT_FORMAT=='xlsx' else ('parquet' if OUTPUT_FORMAT=='parquet' else 'csv')
+        # Preserve the existing flat outputs mapping for backwards compat.
         manifest['outputs'] = {
             'rank_all': f'rank_all.{ext}',
             'rank_direct': f'rank_direct.{ext}',
@@ -1954,6 +2214,17 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
             'cohort': f'cohort.{ext}',
             'leaderboard': f'combo_leaderboard.{ext}'
         }
+        # Phase 3B-2A: detailed output artifact entries with file SHAs
+        # alongside (not replacing) the legacy 'outputs' mapping.
+        manifest['output_artifacts'] = _build_output_artifacts(final_outdir)
+        # Phase 3B-2A: which signal libraries this run consumed. The
+        # collector was active across all load_lib_or_none calls.
+        input_summary = _finalize_input_manifest_collection(_collector_token)
+        _collector_token = None
+        manifest.update(input_summary)
+        manifest['input_secondary_hash'] = None  # populated by 3B-2B once
+                                                 # secondary fingerprinting lands
+        manifest['status'] = 'complete'
         write_json(os.path.join(final_outdir, 'run_manifest.json'), manifest)
         print(f"[COMPLETE] Secondary {vendor_secondary} finished in {elapsed_time:.1f}s")
         print(f"[RESULT] Best stack K={len(final_members)}: Sharpe={summary['best_sharpe']:.3f}, Capture={summary['best_capture']:.2f}%, TD={summary['best_trigger_days']}")
@@ -1965,6 +2236,12 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         if os.path.exists(temp_outdir):
             shutil.rmtree(temp_outdir, ignore_errors=True)
             print(f"[CLEANUP] Removed temp directory: {temp_outdir}")
+        # Phase 3B-2A: drop the per-run input-manifest collector so a
+        # failed run does not bleed into the next run's manifest.
+        # Phase 3B-2A amendment: pass the token so the ContextVar is
+        # restored to its prior state, even on exception paths.
+        if _collector_token is not None:
+            _finalize_input_manifest_collection(_collector_token)
         raise
 
 def parse_args(argv=None):
