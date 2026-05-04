@@ -1842,3 +1842,190 @@ def test_3b2a_spymaster_save_failure_fallback_copy2_succeeds(tmp_path, monkeypat
     )
     sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(pkl_path)
+
+
+# ===========================================================================
+# Phase 3B-2B: XLSX manifest helper + load_verified_xlsx_artifact
+# ===========================================================================
+
+
+def _write_xlsx_with_manifest(
+    path,
+    *,
+    df,
+    artifact_type,
+    producer_engine,
+    output_columns,
+    key_columns,
+    current_run_df=None,
+    preexisting_status="none",
+    preexisting_row_count=0,
+    params=None,
+):
+    """Test helper: write a workbook + sidecar manifest pair."""
+    df.to_excel(path, index=False, engine="openpyxl")
+    if current_run_df is None:
+        current_run_df = df.copy()
+    manifest = pm.build_xlsx_output_manifest(
+        artifact_type=artifact_type,
+        producer_engine=producer_engine,
+        engine_version="1.0.0",
+        output_columns=output_columns,
+        key_columns=key_columns,
+        current_run_df=current_run_df,
+        final_df=df,
+        artifact_path=path,
+        preexisting_status=preexisting_status,
+        preexisting_row_count=preexisting_row_count,
+        params=params or {},
+    )
+    sidecar = path.with_name(path.name + pm.SIDECAR_SUFFIX)
+    sidecar.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def test_3b2b_canonical_workbook_hash_is_deterministic():
+    df = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe": 1.2, "Notes": None},
+        {"Primary Ticker": "QQQ", "Sharpe": 0.8, "Notes": "ok"},
+    ])
+    h1 = pm._canonical_workbook_hash(df)
+    h2 = pm._canonical_workbook_hash(df.copy())
+    assert h1 == h2
+
+
+def test_3b2b_canonical_workbook_hash_distinguishes_nan_none_empty():
+    base = pd.DataFrame([{"A": 1.0, "B": "x"}])
+    df_empty = pd.DataFrame([{"A": 1.0, "B": ""}])
+    df_none = pd.DataFrame([{"A": 1.0, "B": None}])
+    h_base = pm._canonical_workbook_hash(base)
+    h_empty = pm._canonical_workbook_hash(df_empty)
+    h_none = pm._canonical_workbook_hash(df_none)
+    assert h_base != h_empty
+    assert h_base != h_none
+    assert h_empty != h_none
+
+
+def test_3b2b_xlsx_key_strings_priority_and_normalization():
+    df = pd.DataFrame([
+        {"Primary Ticker": "  spy ", "Resolved/Fetched": "spy"},
+        {"Primary Ticker": "", "Resolved/Fetched": "qqq"},
+        {"Primary Ticker": None, "Resolved/Fetched": None},
+        {"Primary Ticker": "AAPL", "Resolved/Fetched": "aapl"},
+    ])
+    keys = pm._xlsx_key_strings(df, ["Primary Ticker", "Resolved/Fetched"])
+    assert keys == ["SPY", "QQQ", "", "AAPL"]
+
+
+def test_3b2b_compute_legacy_row_count():
+    final = pd.DataFrame([
+        {"Primary Ticker": "SPY"},
+        {"Primary Ticker": "QQQ"},
+        {"Primary Ticker": "OLD"},
+    ])
+    legacy = pm._compute_legacy_row_count(
+        final, ["SPY", "QQQ"], ["Primary Ticker"],
+    )
+    assert legacy == 1
+    full = pm._compute_legacy_row_count(
+        final, ["SPY", "QQQ", "OLD"], ["Primary Ticker"],
+    )
+    assert full == 0
+
+
+def test_3b2b_load_verified_xlsx_fresh_happy_path(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe Ratio": 1.2},
+        {"Primary Ticker": "QQQ", "Sharpe Ratio": 0.8},
+    ])
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker", "Sharpe Ratio"],
+        key_columns=["Primary Ticker"],
+    )
+    loaded, result = pm.load_verified_xlsx_artifact(pkl)
+    assert loaded is not None
+    assert result.ok is True
+    assert not result.legacy
+
+
+def test_3b2b_load_verified_xlsx_missing_sidecar_legacy_vs_strict(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([{"Primary Ticker": "SPY"}])
+    df.to_excel(pkl, index=False, engine="openpyxl")
+    loaded, result = pm.load_verified_xlsx_artifact(pkl)
+    assert loaded is not None
+    assert result.ok is True
+    assert result.legacy is True
+    loaded2, result2 = pm.load_verified_xlsx_artifact(pkl, strict=True)
+    assert loaded2 is not None
+    assert result2.ok is False
+    assert result2.legacy is True
+
+
+def test_3b2b_load_verified_xlsx_workbook_content_mismatch(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": 1.2}])
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker", "Sharpe Ratio"],
+        key_columns=["Primary Ticker"],
+    )
+    df_bad = pd.DataFrame([{"Primary Ticker": "SPY", "Sharpe Ratio": 99.9}])
+    df_bad.to_excel(pkl, index=False, engine="openpyxl")
+    loaded, result = pm.load_verified_xlsx_artifact(pkl)
+    fields = [m[0] for m in result.mismatches]
+    assert result.ok is False
+    assert (
+        "full_workbook_content_hash" in fields
+        or "artifact_file_sha256" in fields
+    )
+
+
+def test_3b2b_load_verified_xlsx_legacy_row_count_warn_vs_strict(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    df = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe Ratio": 1.2},
+        {"Primary Ticker": "OLD", "Sharpe Ratio": 0.5},
+    ])
+    current = pd.DataFrame([
+        {"Primary Ticker": "SPY", "Sharpe Ratio": 1.2},
+    ])
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker", "Sharpe Ratio"],
+        key_columns=["Primary Ticker"],
+        current_run_df=current,
+    )
+    _, result = pm.load_verified_xlsx_artifact(pkl)
+    assert result.ok is True
+    assert any("legacy_row_count" in str(w) for w in result.warnings)
+    _, result2 = pm.load_verified_xlsx_artifact(pkl, strict=True)
+    assert result2.ok is False
+    fields = [m[0] for m in result2.mismatches]
+    assert "legacy_row_count" in fields
+
+
+def test_3b2b_inspect_preexisting_xlsx_manifest(tmp_path):
+    pkl = tmp_path / "test.xlsx"
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "none"
+    df = pd.DataFrame([{"Primary Ticker": "SPY"}])
+    df.to_excel(pkl, index=False, engine="openpyxl")
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "none"
+    sidecar = pkl.with_name(pkl.name + pm.SIDECAR_SUFFIX)
+    sidecar.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "legacy"
+    sidecar.unlink()
+    _write_xlsx_with_manifest(
+        pkl, df=df, artifact_type="onepass_xlsx",
+        producer_engine="onepass",
+        output_columns=["Primary Ticker"], key_columns=["Primary Ticker"],
+    )
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "valid"
+    df_bad = pd.DataFrame([{"Primary Ticker": "QQQ"}])
+    df_bad.to_excel(pkl, index=False, engine="openpyxl")
+    assert pm.inspect_preexisting_xlsx_manifest(pkl) == "mismatched"
