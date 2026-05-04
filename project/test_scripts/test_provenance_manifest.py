@@ -2158,3 +2158,129 @@ def test_3b2b_onepass_xlsx_mismatched_preexisting_sidecar(tmp_path, monkeypatch)
     sidecar = pm._sidecar_path_for(output)
     manifest = json.loads(sidecar.read_text(encoding="utf-8"))
     assert manifest["preexisting_manifest_status"] == "mismatched"
+
+
+# ===========================================================================
+# Phase 3B-2B: ImpactSearch XLSX manifest (producer)
+# ===========================================================================
+
+
+def _impactsearch_metrics(ticker, **overrides):
+    """Minimal ImpactSearch-shaped metrics dict for export tests."""
+    base = {
+        "Primary Ticker": ticker,
+        "Resolved/Fetched": ticker.lower(),
+        "Library Source": "stable",
+        "Trigger Days": 80,
+        "Wins": 50,
+        "Losses": 30,
+        "Win Ratio (%)": 62.5,
+        "Std Dev (%)": 1.4,
+        "Sharpe Ratio": 1.1,
+        "t-Statistic": 2.2,
+        "p-Value": 0.02,
+        "Significant 90%": "Yes",
+        "Significant 95%": "Yes",
+        "Significant 99%": "No",
+        "Avg Daily Capture (%)": 0.04,
+        "Total Capture (%)": 4.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_3b2b_impactsearch_xlsx_fresh_writes_sidecar(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "fresh.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY"), _impactsearch_metrics("QQQ")],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    assert sidecar.exists()
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["artifact_type"] == "impactsearch_xlsx"
+    assert manifest["producer_engine"] == "impactsearch"
+    assert manifest["preexisting_manifest_status"] == "none"
+    assert manifest["legacy_row_count"] == 0
+    assert manifest["current_run_row_count"] == 2
+    assert sorted(manifest["current_run_keys"]["preview"]) == ["QQQ", "SPY"]
+    assert manifest["current_run_keys"]["key_columns"] == [
+        "Primary Ticker", "Resolved/Fetched",
+    ]
+    df, vresult = pm.load_verified_xlsx_artifact(output)
+    assert df is not None
+    assert vresult.ok is True
+
+
+def test_3b2b_impactsearch_xlsx_existing_with_retained_row_legacy_one(
+    tmp_path, monkeypatch
+):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "retained.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY"), _impactsearch_metrics("OLD")],
+    )
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY", **{"Sharpe Ratio": 2.5})],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 1
+    assert manifest["current_run_row_count"] == 1
+    assert manifest["current_run_keys"]["preview"] == ["SPY"]
+    assert manifest["preexisting_manifest_status"] == "valid"
+    final_df = pd.read_excel(output, engine="openpyxl")
+    assert sorted(final_df["Primary Ticker"].tolist()) == ["OLD", "SPY"]
+
+
+def test_3b2b_impactsearch_xlsx_full_refresh_legacy_zero(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "refresh.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output),
+        [_impactsearch_metrics("SPY"), _impactsearch_metrics("QQQ")],
+    )
+    impactsearch.export_results_to_excel(
+        str(output),
+        [
+            _impactsearch_metrics("SPY", **{"Sharpe Ratio": 2.0}),
+            _impactsearch_metrics("QQQ", **{"Sharpe Ratio": 1.5}),
+        ],
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["legacy_row_count"] == 0
+
+
+def test_3b2b_impactsearch_xlsx_mismatched_preexisting_sidecar(
+    tmp_path, monkeypatch
+):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import impactsearch
+
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "mismatched.xlsx"
+    impactsearch.export_results_to_excel(
+        str(output), [_impactsearch_metrics("SPY")]
+    )
+    df_bad = pd.read_excel(output, engine="openpyxl")
+    df_bad.loc[0, "Sharpe Ratio"] = 99.99
+    df_bad.to_excel(output, index=False, engine="openpyxl")
+    impactsearch.export_results_to_excel(
+        str(output), [_impactsearch_metrics("QQQ")]
+    )
+    sidecar = pm._sidecar_path_for(output)
+    manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert manifest["preexisting_manifest_status"] == "mismatched"
