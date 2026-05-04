@@ -61,7 +61,9 @@ def test_b8_no_negative_shift_in_signal_paths():
         ("confluence.py", 346),
         # confluence forward_returns dashboard panel: F+k columns are
         # forward-looking by definition; not used to drive any signal.
-        ("confluence.py", 2282),
+        # Line bumped 2282 -> 2293 by the Post Phase 3 dedupe edits in
+        # _build_confluence_strategy_equity and create_master_combined_chart.
+        ("confluence.py", 2293),
     }
 
     failures = []
