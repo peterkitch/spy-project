@@ -2117,6 +2117,12 @@ def _build_confluence_strategy_equity(price_daily: pd.Series, conf_df: pd.DataFr
     Long on Buy-tier, short on Short-tier, flat otherwise.
     Return cumulative 'capture %' (sum of daily pct returns with sign).
     """
+    # Defensive dedupe: partial multi-interval runs can yield duplicated index labels;
+    # pct_change() on a duplicated index emits ValueError or zero-deltas. Keep most-recent.
+    if not price_daily.index.is_unique:
+        price_daily = price_daily[~price_daily.index.duplicated(keep="last")].sort_index()
+    if not conf_df.index.is_unique:
+        conf_df = conf_df[~conf_df.index.duplicated(keep="last")].sort_index()
     rets = price_daily.pct_change().fillna(0.0) * 100.0
     side = conf_df['dir'].map({'Buy': 1, 'Short': -1}).fillna(0).astype(int)
     cap  = rets * side
@@ -2174,8 +2180,13 @@ def create_master_combined_chart(ticker: str, libraries: dict, aligned: pd.DataF
     conf_df = _compute_confluence_history(aligned, min_active=2)
     logger.info("[Master] confluence history %.3fs (rows=%d)", time.perf_counter()-t1, len(conf_df))
 
-    # Strategy equity from confluence
-    eq = _build_confluence_strategy_equity(price.reindex(conf_df.index).fillna(method='ffill'), conf_df)
+    # Strategy equity from confluence — dedupe both indexes before reindex/ffill.
+    # Partial multi-interval runs can yield duplicated rows in price or conf_df,
+    # which makes reindex(conf_df.index) raise ValueError. keep="last" preserves
+    # the most recent observation when duplicates exist (correct for time series).
+    price = price[~price.index.duplicated(keep="last")].sort_index()
+    conf_df = conf_df[~conf_df.index.duplicated(keep="last")].sort_index()
+    eq = _build_confluence_strategy_equity(price.reindex(conf_df.index).ffill(), conf_df)
 
     # Heatmap
     Z, ivs, dates = _signals_heatmap_matrix(libraries, aligned)
@@ -2447,6 +2458,13 @@ def create_confluence_performance_panel(ticker: str, aligned: pd.DataFrame) -> h
     price.index = pd.DatetimeIndex(pd.to_datetime(price.index, utc=True)).tz_convert(None)
 
     conf_df = _compute_confluence_history(aligned, min_active=2)
+
+    # Dedupe before any alignment/pct_change math. Same risk class as the master
+    # chart path: partial multi-interval runs can leave duplicated rows in either
+    # series. keep="last" preserves the most recent observation.
+    price = price[~price.index.duplicated(keep="last")].sort_index()
+    conf_df = conf_df[~conf_df.index.duplicated(keep="last")].sort_index()
+
     today = conf_df.index[-1]
 
     # Expected-performance cohort (match today's TIER; auto-fallback to 'dir' if samples < 40)
