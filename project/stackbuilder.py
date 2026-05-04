@@ -131,9 +131,18 @@ def _finalize_input_manifest_collection(
             _INPUT_COLLECTOR_VAR.reset(token)
         except (ValueError, LookupError):
             # Token came from a different Context (e.g. captured by
-            # copy_context().run on a worker thread). Fall back to a
-            # plain clear; the worker's local copy will be discarded
-            # when the worker context is released.
+            # copy_context().run on a worker thread). Phase 3B-2B:
+            # surface this with a logged warning instead of silently
+            # falling back, so the audit trail records a possible
+            # ContextVar mismanagement signal. Fall back to a plain
+            # clear afterwards; the worker's local copy will be
+            # discarded when the worker context is released.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Cross-context input-manifest collector token reset "
+                "detected; clearing current collector. This may "
+                "indicate ContextVar mismanagement."
+            )
             _INPUT_COLLECTOR_VAR.set(None)
     else:
         _INPUT_COLLECTOR_VAR.set(None)

@@ -1661,3 +1661,196 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
       the ``save_ok`` gate.
 
   Status: implemented in PR #143 amendment commits 8-9.
+
+
+## Phase 3B-2B: XLSX Upsert Manifests + Strict-Mode CLI + Phase 3 Close
+
+  - Type: ADDITIVE-PROVENANCE (no behavior change to scoring math).
+    Closes Phase 3.
+
+  - Old behavior:
+      - OnePass and ImpactSearch result XLSX workbooks had no
+        provenance manifest. A run combined newly-computed rows with
+        previously-persisted rows in the same workbook (upsert by
+        Primary Ticker) without recording which rows came from THIS
+        run vs which were retained from a prior run.
+      - StackBuilder's ``--prefer-impact-xlsx`` fast path would
+        consume any matching ImpactSearch workbook found in the
+        configured directory, regardless of whether the workbook had
+        been mutated, partially upserted, or produced by an
+        incompatible engine version.
+      - TrafficFlow and Confluence Spymaster PKL consumers had a
+        Phase 3B-2A non-strict policy (legacy proceeds, mismatch
+        rejects). There was no env-driven strict mode for users who
+        want every load to verify a manifest.
+      - StackBuilder's per-run input-manifest collector silently fell
+        back to ``set(None)`` when ``ContextVar.reset(token)`` failed
+        across contexts. A future ContextVar mismanagement bug would
+        not have surfaced until the symptom appeared in
+        ``run_manifest.json``.
+
+  - New behavior:
+
+    XLSX manifest helper (``provenance_manifest.py``):
+      - ``load_verified_xlsx_artifact(path, *, requested_params,
+        strict)`` -> ``(DataFrame | None, VerificationResult)``
+      - ``build_xlsx_output_manifest(...)`` -> XLSX-shape manifest
+        builder
+      - ``inspect_preexisting_xlsx_manifest(path)`` -> ``"none"`` /
+        ``"legacy"`` / ``"valid"`` / ``"mismatched"`` classifier (run
+        BEFORE overwriting a workbook so the new manifest can record
+        the prior pair's status)
+      - Internal helpers: ``_canonical_workbook_hash`` (SHA-256 over
+        parsed-DataFrame logical content; preserves row order;
+        distinguishes None / NaN / empty strings; columns serialized
+        in DF order), ``_xlsx_key_strings`` (per-row normalized key
+        with priority across multiple key_columns; matches OnePass
+        and ImpactSearch dedupe semantics), ``_compute_legacy_row_count``
+        (final-workbook rows whose normalized key was NOT touched by
+        THIS run), ``_current_run_input_hash`` (normalized current-
+        run rows AFTER exporter schema normalization — exporter-input
+        provenance, not raw market-data provenance).
+
+    Hash contract (DECISION 2):
+      - ``full_workbook_content_hash`` digests parsed DataFrame
+        logical content. NOT raw XLSX bytes (XLSX is a ZIP container
+        with writer metadata that drifts across openpyxl versions).
+      - ``artifact_file_sha256`` digests raw XLSX bytes; sidecar-only
+        tamper check.
+      - Both fields are required and serve different purposes.
+
+    Sidecar naming (DECISION 3):
+      - ``onepass.xlsx`` -> ``onepass.xlsx.manifest.json``
+      - No hidden sheets, custom XML, or workbook-schema changes.
+        Excel users and downstream tooling see the workbook
+        unchanged.
+
+    legacy_row_count semantics (DECISION 1):
+      - "Rows retained in the FINAL workbook whose key tuple was NOT
+        touched by the current run."
+      - Full refresh over an existing workbook -> 0
+      - Partial upsert that adds/updates only some keys -> non-zero
+      - Strict consumers must not treat a partially verified workbook
+        as fully verified.
+
+    Producer sites:
+      - ``onepass.export_results_to_excel``: classifies preexisting
+        workbook+sidecar via ``inspect_preexisting_xlsx_manifest``
+        BEFORE overwrite, runs the existing concat + dedupe logic
+        unchanged, then writes the sidecar after the workbook is
+        committed. ``key_columns=["Primary Ticker"]``.
+      - ``impactsearch.export_results_to_excel``: same shape;
+        ``key_columns=["Primary Ticker", "Resolved/Fetched"]`` with
+        Primary Ticker priority recorded in
+        ``params.key_priority``.
+      - Both producers: sidecar write failures log a warning but do
+        not fail the export.
+
+    Consumer site (workbook-level accept/reject — DECISION 4):
+      - ``stackbuilder.try_load_rank_from_impact_xlsx`` accepts a
+        kw-only ``strict_manifests`` parameter and runs the freshest
+        matching workbook through ``load_verified_xlsx_artifact``
+        before serving the fast-path. Behavior:
+          * non-strict + missing/legacy manifest -> warn, use fast-path
+          * non-strict + mismatched manifest -> warn, reject (None)
+          * non-strict + legacy_row_count > 0 -> warn, use fast-path
+          * strict + missing/legacy/mismatched -> reject (None)
+          * strict + legacy_row_count > 0 -> reject (None)
+        Hard load errors (corrupt workbook) reject the fast-path
+        uniformly.
+
+    StackBuilder CLI:
+      - ``--strict-manifests`` (default off): "Require verified
+        manifests for manifest-aware fast paths; reject legacy/
+        missing/mismatched ImpactSearch XLSX in strict mode."
+      - ``phase2_rank_all`` hard-fail rule: when fast-path returns
+        None under strict mode and NO primaries were provided,
+        ``SystemExit`` with the prompt-required message ("provide
+        primaries / repair manifest / drop --strict-manifests").
+      - When primaries ARE provided, the fast-path rejection falls
+        through to the slow path so the caller cohort is recomputed
+        (the existing 70K-primary guard is bypassed under this
+        specific shape).
+
+    TrafficFlow strict env:
+      - ``_strict_manifests_enabled()`` returns True when EITHER
+        ``PRJCT9_STRICT_MANIFESTS`` (project-wide) or
+        ``TRAFFICFLOW_STRICT_MANIFESTS`` (engine-local) is truthy
+        ("1", "true", "yes", "on"). Strict propagates DOWNWARD only:
+        a project-wide truthy value is not overridden by a local "0".
+      - Under strict, ``load_spymaster_pkl`` returns None on legacy
+        and mismatch and does NOT populate ``_PKL_CACHE`` so the
+        next call re-checks. No SystemExit; TrafficFlow is
+        UI / long-running.
+
+    Confluence strict env:
+      - Mirrors TrafficFlow with ``CONFLUENCE_STRICT_MANIFESTS``.
+      - Under strict, ``_load_spymaster_cache_fallback`` skips the
+        interval (returns None) on legacy and mismatch. The broader
+        confluence load is unaffected; just this interval's fallback
+        is skipped with a warning.
+
+    Cross-context token reset logging (carry-forward):
+      - ``stackbuilder._finalize_input_manifest_collection`` now logs
+        a warning when ``ContextVar.reset(token)`` fails across
+        contexts before falling back to ``set(None)``. The warning
+        message: "Cross-context input-manifest collector token reset
+        detected; clearing current collector. This may indicate
+        ContextVar mismanagement." Appearance during the test suite
+        would indicate a real issue; verified absent during the
+        Phase 3B-2B test runs.
+
+  - Affected tests/snapshots:
+      - ``project/test_scripts/test_provenance_manifest.py``: +27
+        Phase 3B-2B tests covering XLSX helper determinism, key
+        normalization, legacy_row_count, missing-sidecar legacy vs
+        strict, workbook content mismatch, preexisting status
+        classification, OnePass + ImpactSearch upsert producer
+        coverage (fresh / retained-row / full-refresh / mismatched),
+        StackBuilder strict fast-path (legacy / mismatched / no-
+        primaries SystemExit / primaries-provided fall-through), and
+        TrafficFlow + Confluence strict env truthy parsing + legacy
+        skip + mismatch skip.
+      - 201 baseline -> 228 with Phase 3B-2B.
+
+  - Phase 3 close:
+      The Phase 3 provenance-manifest contract is now complete across
+      all four sub-phases:
+        - 3A:    signal-library manifests + Phase 3A B12
+        - 3B-1:  perf cache + central loader + tightened B12
+        - 3B-2A: output manifests + StackBuilder run manifests +
+                 Spymaster PKLs + sanctioned standalone exception
+        - 3B-2B: XLSX upsert manifests + strict-mode CLI + strict-env
+                 modes + cross-context warning
+      Every signal-library AND output artifact now flows through the
+      central provenance contract. The B12 raw-pickle-load static
+      guard allowlist contains exactly one entry
+      (``provenance_manifest.py``).
+
+  - Deferred (Phase 4+):
+      - B11 ``compute_signals`` delete-or-shift-correct decision.
+      - environment.yml / requirements.txt hygiene.
+      - ``--backfill-manifests``, ``--rebuild-on-mismatch``,
+        ``--verify-only`` CLI surfaces.
+      - ``make_distinct_signal_library_dict`` test helper.
+      - Ticker-in-canonical-content as diagnostic input entries (not
+        as a content_hash replacement).
+      - QC clone Adj Close sites.
+      - OnePass run reports JSON manifests (separate provenance
+        surface from the XLSX exports).
+
+  - ELI5: every artifact PRJCT9 produces — signal libraries,
+    Spymaster cache PKLs, StackBuilder run directories, OnePass
+    XLSX, ImpactSearch XLSX — now carries a tamper-evident
+    receipt. Reading any artifact through the central loader checks
+    the receipt against the artifact bytes and the artifact content
+    before consumers reuse it. Strict mode escalates "no manifest"
+    and "manifest mismatch" from warnings to outright rejection,
+    forcing a rebuild instead of silently consuming a possibly
+    stale or partially-upserted workbook. After this PR, Phase 4
+    (Cross-Ticker Confluence Dashboard) can rely on the manifest
+    contract for cross-engine reproducibility.
+
+  Status: implemented in Phase 3B-2B (this PR). **Phase 3 is
+  COMPLETE.** Phase 4 (Cross-Ticker Confluence Dashboard) is now
+  unblocked.
