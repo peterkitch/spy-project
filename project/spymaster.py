@@ -4567,7 +4567,14 @@ def save_precomputed_results(ticker, results):
         os.fsync(tf.fileno())  # Force OS to write to disk
         temp_name = tf.name
 
-    # Try atomic replace (better than remove+move)
+    # Try atomic replace (better than remove+move).
+    # Phase 3B-2A amendment: track save_ok so the sidecar manifest is
+    # written ONLY when the final pickle is actually in place. Without
+    # this gate a failed os.replace + failed copy2 would still trigger a
+    # sidecar write describing content that was never persisted, leaving
+    # an orphan sidecar (or invalidating the older pickle still on disk
+    # via a stale file_sha256 mismatch).
+    save_ok = False
     max_retries = 3
     retry_delay = 0.5
 
@@ -4575,6 +4582,7 @@ def save_precomputed_results(ticker, results):
         try:
             # Use os.replace for atomic operation
             os.replace(temp_name, final_name)
+            save_ok = True
             break  # Success!
         except (PermissionError, FileExistsError) as e:
             if attempt < max_retries - 1:
@@ -4585,6 +4593,7 @@ def save_precomputed_results(ticker, results):
                 try:
                     shutil.copy2(temp_name, final_name)
                     os.remove(temp_name)
+                    save_ok = True
                 except Exception:
                     # If all else fails, just warn and continue
                     logger.warning(f"Could not save results for {ticker}: {e}")
@@ -4600,17 +4609,20 @@ def save_precomputed_results(ticker, results):
     # over the final pickle bytes. This is best-effort; a torn sidecar
     # write does not fail the save because the embedded manifest in the
     # pickle itself is authoritative for logical verification (Risk 2).
-    try:
-        if os.path.exists(final_name) and _MANIFEST_FIELD in results_to_disk:
-            _write_output_manifest(
-                final_name,
-                results_to_disk[_MANIFEST_FIELD],
-                include_file_sha256=True,
+    # Phase 3B-2A amendment: gated on save_ok so we never write a sidecar
+    # describing content that was not actually persisted.
+    if save_ok:
+        try:
+            if os.path.exists(final_name) and _MANIFEST_FIELD in results_to_disk:
+                _write_output_manifest(
+                    final_name,
+                    results_to_disk[_MANIFEST_FIELD],
+                    include_file_sha256=True,
+                )
+        except Exception as _sidecar_exc:
+            logger.warning(
+                f"Failed to write provenance sidecar for {ticker}: {_sidecar_exc}"
             )
-    except Exception as _sidecar_exc:
-        logger.warning(
-            f"Failed to write provenance sidecar for {ticker}: {_sidecar_exc}"
-        )
 
     # Don't log here - it disrupts progress bar output
     return results

@@ -1697,3 +1697,148 @@ def test_3b2a_collector_isolation_concurrent_runs():
     assert snap_b["input_legacy_count"] == 0
     assert snap_a["input_missing_manifest_count"] == 0
     assert snap_b["input_missing_manifest_count"] == 0
+
+
+# ===========================================================================
+# Phase 3B-2A amendment: Spymaster save-failure guard
+# ===========================================================================
+
+
+def test_3b2a_spymaster_save_failure_no_orphan_sidecar(tmp_path, monkeypatch):
+    """When pickle replacement fails, no new sidecar manifest must be
+    written.
+
+    Setup:
+      - Pre-populate ``cache/results/AAA_precomputed_results.pkl`` with an
+        OLD pickle and a matching OLD sidecar manifest.
+      - Force both ``os.replace`` and ``shutil.copy2`` inside spymaster
+        to fail for the final pickle replacement.
+      - Sentinel ``_write_output_manifest`` so the test can assert it
+        was never called.
+
+    Assertions:
+      - ``save_precomputed_results`` does not raise.
+      - The on-disk pickle still contains OLD content.
+      - The on-disk sidecar still contains the OLD manifest bytes.
+      - The sentinel write_output_manifest was never invoked.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    # OLD content + OLD manifest pre-populated on disk.
+    pkl_path = cache_dir / "AAA_precomputed_results.pkl"
+    old_payload = _build_synthetic_spymaster_pkl(pkl_path, ticker="AAA")
+    sidecar_path = pm._sidecar_path_for(pkl_path)
+    old_sidecar_bytes = sidecar_path.read_bytes()
+    old_pkl_bytes = pkl_path.read_bytes()
+
+    # Force the final replace path to fail. The retry loop in
+    # save_precomputed_results sleeps between attempts; we monkeypatch
+    # both os.replace and shutil.copy2 to raise PermissionError.
+    def _fail_replace(src, dst, *args, **kwargs):
+        if str(dst).endswith("AAA_precomputed_results.pkl"):
+            raise PermissionError("simulated replace failure")
+        # Allow temp-file cleanup paths and other unrelated calls.
+        return _real_replace(src, dst, *args, **kwargs)
+
+    def _fail_copy2(src, dst, *args, **kwargs):
+        if str(dst).endswith("AAA_precomputed_results.pkl"):
+            raise OSError("simulated copy2 failure")
+        return _real_copy2(src, dst, *args, **kwargs)
+
+    _real_replace = os.replace
+    _real_copy2 = __import__("shutil").copy2
+    monkeypatch.setattr(spymaster.os, "replace", _fail_replace)
+    monkeypatch.setattr(spymaster.shutil, "copy2", _fail_copy2)
+
+    sidecar_call_count = {"n": 0}
+
+    def _sentinel_write_output_manifest(*args, **kwargs):
+        sidecar_call_count["n"] += 1
+        raise AssertionError(
+            "save_ok gate violated: sidecar write attempted after a "
+            "failed pickle replacement"
+        )
+
+    monkeypatch.setattr(
+        spymaster, "_write_output_manifest", _sentinel_write_output_manifest,
+    )
+
+    # NEW content that the failed save would (without the gate) try to
+    # advertise via a fresh sidecar.
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    new_results = {
+        "_ticker": "AAA",
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [200.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), 5.0) for d in dates},
+        "daily_top_short_pairs": {d: ((113, 114), 5.0) for d in dates},
+        "top_buy_pair": (5, 4),
+        "top_short_pair": (4, 5),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+    }
+
+    # Should not raise.
+    spymaster.save_precomputed_results("AAA", new_results)
+
+    # Sidecar write must not have been attempted.
+    assert sidecar_call_count["n"] == 0, (
+        "save_ok gate violated: sidecar write attempted after a failed "
+        "pickle replacement"
+    )
+    # On-disk pickle and sidecar bytes must be unchanged.
+    assert pkl_path.read_bytes() == old_pkl_bytes
+    assert sidecar_path.read_bytes() == old_sidecar_bytes
+
+
+def test_3b2a_spymaster_save_failure_fallback_copy2_succeeds(tmp_path, monkeypatch):
+    """If os.replace fails but shutil.copy2 succeeds, save_ok=True and the
+    sidecar write proceeds (proving the gate is not over-tightened)."""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import spymaster
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    _real_replace = os.replace
+
+    def _fail_replace(src, dst, *args, **kwargs):
+        if str(dst).endswith("AAA_precomputed_results.pkl"):
+            raise PermissionError("simulated replace failure")
+        return _real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(spymaster.os, "replace", _fail_replace)
+
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+    new_results = {
+        "_ticker": "AAA",
+        "preprocessed_data": pd.DataFrame(
+            {"Close": [300.0 + i for i in range(len(dates))]}, index=dates,
+        ),
+        "daily_top_buy_pairs": {d: ((114, 113), 7.0) for d in dates},
+        "daily_top_short_pairs": {d: ((113, 114), 7.0) for d in dates},
+        "top_buy_pair": (3, 2),
+        "top_short_pair": (2, 3),
+        "max_sma_day": 114,
+        "engine_version": "1.0.0",
+        "price_source": "Close",
+    }
+
+    spymaster.save_precomputed_results("AAA", new_results)
+
+    pkl_path = cache_dir / "AAA_precomputed_results.pkl"
+    assert pkl_path.exists()
+    sidecar_path = pm._sidecar_path_for(pkl_path)
+    assert sidecar_path.exists(), (
+        "Sidecar should be written when fallback copy2 succeeds"
+    )
+    sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar_data["artifact_file_sha256"] == pm.file_sha256(pkl_path)
