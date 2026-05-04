@@ -4,6 +4,7 @@
 # Phases: 1) Preflight  2) Rank All  3) Stack Builder
 
 import os, re, json, math, glob, argparse, time, shutil, threading
+import contextvars
 from types import SimpleNamespace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -37,32 +38,52 @@ from provenance_manifest import (
 
 # Phase 3B-2A: per-run collection of input signal-library manifest content
 # hashes so the run_manifest.json can pin which libraries this run consumed.
-# StackBuilder loads libraries inside ThreadPoolExecutor; the collector is
-# thread-safe via an RLock and is reset/finalized by run_for_secondary.
-_INPUT_MANIFEST_COLLECTOR_LOCK = threading.RLock()
-_INPUT_MANIFEST_COLLECTOR: Optional[dict] = None
+#
+# Phase 3B-2A amendment (Codex audit, PR #143): the collector lives in a
+# ContextVar so each ``run_for_secondary`` invocation gets its own
+# isolated collector. Two consecutive Dash-launched runs (each on its own
+# threading.Thread) correctly receive disjoint snapshots.
+#
+# StackBuilder also loads libraries inside ThreadPoolExecutor pools (see
+# phase2_rank_all). ContextVars do NOT automatically propagate from the
+# submitter into long-lived executor worker threads, so executor
+# submissions that may transitively call ``_record_input_lib`` MUST run
+# under ``contextvars.copy_context().run`` so the worker observes the
+# submitter's collector. ``_submit_with_context`` below is the wrapper.
+_INPUT_COLLECTOR_VAR: "contextvars.ContextVar[Optional[dict]]" = (
+    contextvars.ContextVar("stackbuilder_input_collector", default=None)
+)
 
 
-def _start_input_manifest_collection() -> None:
-    global _INPUT_MANIFEST_COLLECTOR
-    with _INPUT_MANIFEST_COLLECTOR_LOCK:
-        _INPUT_MANIFEST_COLLECTOR = {
-            "hashes": set(),
-            "legacy": 0,
-            "missing": 0,
-        }
+def _start_input_manifest_collection() -> "contextvars.Token":
+    """Start a fresh per-run collector and return the ContextVar token.
+
+    Callers should pass the returned token to
+    ``_finalize_input_manifest_collection(token)`` so the ContextVar is
+    properly reset to its prior value after the run, including in
+    finally/except paths where the collection might not have completed.
+    """
+    collector = {
+        "hashes": set(),
+        "legacy": 0,
+        "missing": 0,
+        "lock": threading.RLock(),
+    }
+    return _INPUT_COLLECTOR_VAR.set(collector)
 
 
 def _record_input_lib(lib: Optional[dict]) -> None:
-    """Record one signal-library load against the per-run collector.
+    """Record one signal-library load against the current run's collector.
 
-    Call after every successful ``load_lib_or_none`` (or equivalent). Safe
-    to call when the collector is not active — it no-ops.
+    Reads the ContextVar; no-ops when no run is active. Mutations are
+    serialized through the per-collector RLock so concurrent
+    ThreadPoolExecutor workers (when wrapped with
+    ``contextvars.copy_context().run``) see consistent state.
     """
-    with _INPUT_MANIFEST_COLLECTOR_LOCK:
-        coll = _INPUT_MANIFEST_COLLECTOR
-        if coll is None:
-            return
+    coll = _INPUT_COLLECTOR_VAR.get()
+    if coll is None:
+        return
+    with coll["lock"]:
         if lib is None or not isinstance(lib, dict):
             coll["missing"] += 1
             return
@@ -77,20 +98,58 @@ def _record_input_lib(lib: Optional[dict]) -> None:
             coll["legacy"] += 1
 
 
-def _finalize_input_manifest_collection() -> dict:
-    """Return a snapshot of the collector and reset it."""
-    global _INPUT_MANIFEST_COLLECTOR
-    with _INPUT_MANIFEST_COLLECTOR_LOCK:
-        coll = _INPUT_MANIFEST_COLLECTOR or {
-            "hashes": set(), "legacy": 0, "missing": 0,
-        }
+def _finalize_input_manifest_collection(
+    token: "Optional[contextvars.Token]" = None,
+) -> dict:
+    """Return a snapshot of the current run's collector and reset it.
+
+    When ``token`` is provided, ``_INPUT_COLLECTOR_VAR.reset(token)``
+    restores the prior ContextVar value. When no token is supplied, the
+    collector is cleared via ``set(None)`` (legacy callers / defensive
+    cleanup paths). Either way the snapshot reflects only the current
+    run's contributions.
+    """
+    coll = _INPUT_COLLECTOR_VAR.get() or {
+        "hashes": set(), "legacy": 0, "missing": 0,
+    }
+    if "lock" in coll:
+        with coll["lock"]:
+            snapshot = {
+                "input_manifest_hashes": sorted(coll["hashes"]),
+                "input_legacy_count": int(coll["legacy"]),
+                "input_missing_manifest_count": int(coll["missing"]),
+            }
+    else:
         snapshot = {
             "input_manifest_hashes": sorted(coll["hashes"]),
             "input_legacy_count": int(coll["legacy"]),
             "input_missing_manifest_count": int(coll["missing"]),
         }
-        _INPUT_MANIFEST_COLLECTOR = None
-        return snapshot
+    if token is not None:
+        try:
+            _INPUT_COLLECTOR_VAR.reset(token)
+        except (ValueError, LookupError):
+            # Token came from a different Context (e.g. captured by
+            # copy_context().run on a worker thread). Fall back to a
+            # plain clear; the worker's local copy will be discarded
+            # when the worker context is released.
+            _INPUT_COLLECTOR_VAR.set(None)
+    else:
+        _INPUT_COLLECTOR_VAR.set(None)
+    return snapshot
+
+
+def _submit_with_context(executor, fn, *args, **kwargs):
+    """Submit ``fn`` to ``executor`` under the caller's current Context.
+
+    ContextVars do not propagate into ThreadPoolExecutor worker threads
+    on their own. This wrapper captures the caller's Context via
+    ``contextvars.copy_context()`` and runs the worker callable inside
+    it, so the per-run collector ContextVar set by ``run_for_secondary``
+    is observable in the worker.
+    """
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
 
 try:
     import yfinance as yf
@@ -994,8 +1053,14 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     # change sign under metric negation; flipping signals first and
     # rescoring resolves that asymmetry.
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # Phase 3B-2A amendment: wrap each submit with copy_context so the
+        # per-run input-manifest collector ContextVar set by
+        # run_for_secondary flows into the worker thread.
         futures = {
-            ex.submit(_score_primary_both_modes, t, sec_rets, grace_days=grace_days): t
+            _submit_with_context(
+                ex, _score_primary_both_modes, t, sec_rets,
+                grace_days=grace_days,
+            ): t
             for t in primaries_df['Primary Ticker']
         }
 
@@ -1986,11 +2051,14 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                     message='Loading data and validating primaries...', outdir=temp_outdir,
                     secondary=vendor_secondary, started_ts=time.time())
 
+    # Phase 3B-2A amendment: per-run input-manifest collector lives in a
+    # ContextVar so two concurrent runs (Dash launches one threading.Thread
+    # per secondary) get isolated collectors. The token returned by
+    # _start_input_manifest_collection is captured here and passed into
+    # _finalize_input_manifest_collection on success and in the except
+    # path so the ContextVar is properly reset to its prior state.
+    _collector_token = _start_input_manifest_collection()
     try:
-        # Phase 3B-2A: per-run input-manifest collector starts here so every
-        # subsequent load_lib_or_none call records its library's
-        # content_hash. The collector finalizes after the stack run completes.
-        _start_input_manifest_collection()
         run_id = f"{vendor_secondary_clean}-{ts}-{os.getpid()}"
         manifest = {
             # ---- Phase 3A baseline keys (preserved for backwards compat) ----
@@ -2151,7 +2219,8 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         manifest['output_artifacts'] = _build_output_artifacts(final_outdir)
         # Phase 3B-2A: which signal libraries this run consumed. The
         # collector was active across all load_lib_or_none calls.
-        input_summary = _finalize_input_manifest_collection()
+        input_summary = _finalize_input_manifest_collection(_collector_token)
+        _collector_token = None
         manifest.update(input_summary)
         manifest['input_secondary_hash'] = None  # populated by 3B-2B once
                                                  # secondary fingerprinting lands
@@ -2169,7 +2238,10 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
             print(f"[CLEANUP] Removed temp directory: {temp_outdir}")
         # Phase 3B-2A: drop the per-run input-manifest collector so a
         # failed run does not bleed into the next run's manifest.
-        _finalize_input_manifest_collection()
+        # Phase 3B-2A amendment: pass the token so the ContextVar is
+        # restored to its prior state, even on exception paths.
+        if _collector_token is not None:
+            _finalize_input_manifest_collection(_collector_token)
         raise
 
 def parse_args(argv=None):

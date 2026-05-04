@@ -1586,3 +1586,114 @@ def test_3b2a_confluence_spymaster_fallback_verifies(tmp_path, monkeypatch):
     legacy = confluence_analyzer._load_spymaster_cache_fallback("CCC")
     assert legacy is not None
     assert legacy.get("source") == "spymaster_cache"
+
+
+# ===========================================================================
+# Phase 3B-2A amendment: collector isolation across concurrent runs
+# ===========================================================================
+
+
+def test_3b2a_collector_isolation_concurrent_runs():
+    """Two concurrent StackBuilder-style runs must collect disjoint sets of
+    input-manifest hashes; the second run's collector must not overwrite or
+    inherit the first run's state.
+
+    Reproduction strategy: two threads barrier-rendezvous on
+    ``_start_input_manifest_collection`` so both runs are active at the
+    same time, each records a distinct manifested library, then finalizes.
+    Without per-run isolation (the e5f3eb7 module-global pattern), the
+    second start overwrites the first run's collector and the first run's
+    snapshot returns either empty or the wrong (other run's) hashes.
+
+    The test ALSO exercises the ThreadPoolExecutor wrapping invariant: each
+    run hands its recording call off to a worker thread via
+    ``ThreadPoolExecutor.submit``. Worker threads are long-lived and do not
+    inherit a fresh context per task, so the production code must wrap the
+    submission with ``contextvars.copy_context().run`` for the per-run
+    ContextVar to flow into the worker.
+    """
+    sys.path.insert(0, str(PROJECT_DIR))
+    import stackbuilder
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    dates = pd.bdate_range(start="2024-01-02", periods=8)
+
+    def make_lib(tag: str, idx: int) -> dict:
+        # Distinct content per (tag, idx). The "extra" key forces a unique
+        # canonical-content hash since both tag character and index land in
+        # the canonical body, while ticker only enters the manifest.
+        lib = make_signal_library_dict(
+            dates,
+            extra={"_test_unique_marker": f"{tag}-{idx}"},
+        )
+        pm.attach_manifest(
+            lib, sidecar_path=None,
+            artifact_type="signal_library_daily", ticker=f"{tag}{idx}",
+        )
+        return lib
+
+    libs_a = [make_lib("A", i) for i in range(3)]
+    libs_b = [make_lib("B", i) for i in range(3)]
+    expected_a = sorted({l["_manifest"]["content_hash"] for l in libs_a})
+    expected_b = sorted({l["_manifest"]["content_hash"] for l in libs_b})
+    assert set(expected_a).isdisjoint(expected_b), (
+        "Test fixture is broken: A and B libs share content_hashes"
+    )
+
+    barrier = threading.Barrier(2)
+    snapshots: dict = {}
+    executor = ThreadPoolExecutor(max_workers=4)
+
+    def run(name, libs):
+        token = stackbuilder._start_input_manifest_collection()
+        try:
+            barrier.wait(timeout=5.0)
+            # Hand each record off to the executor via the production
+            # _submit_with_context wrapper that phase2_rank_all uses, so
+            # the test exercises the same context-propagation invariant
+            # the real submit path relies on.
+            futures = [
+                stackbuilder._submit_with_context(
+                    executor, stackbuilder._record_input_lib, lib,
+                )
+                for lib in libs
+            ]
+            for f in futures:
+                f.result(timeout=5.0)
+            snapshots[name] = stackbuilder._finalize_input_manifest_collection(
+                token
+            )
+            token = None
+        finally:
+            if token is not None:
+                try:
+                    stackbuilder._finalize_input_manifest_collection(token)
+                except Exception:
+                    pass
+
+    t_a = threading.Thread(target=run, args=("A", libs_a))
+    t_b = threading.Thread(target=run, args=("B", libs_b))
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=15.0)
+    t_b.join(timeout=15.0)
+    executor.shutdown(wait=True)
+
+    assert "A" in snapshots and "B" in snapshots
+    snap_a = snapshots["A"]
+    snap_b = snapshots["B"]
+    assert sorted(snap_a["input_manifest_hashes"]) == expected_a, (
+        f"Run A collected {snap_a['input_manifest_hashes']}, expected {expected_a}"
+    )
+    assert sorted(snap_b["input_manifest_hashes"]) == expected_b, (
+        f"Run B collected {snap_b['input_manifest_hashes']}, expected {expected_b}"
+    )
+    assert set(snap_a["input_manifest_hashes"]).isdisjoint(
+        snap_b["input_manifest_hashes"]
+    ), "Cross-contamination between concurrent run collectors"
+    # Legacy / missing counters isolated too.
+    assert snap_a["input_legacy_count"] == 0
+    assert snap_b["input_legacy_count"] == 0
+    assert snap_a["input_missing_manifest_count"] == 0
+    assert snap_b["input_missing_manifest_count"] == 0

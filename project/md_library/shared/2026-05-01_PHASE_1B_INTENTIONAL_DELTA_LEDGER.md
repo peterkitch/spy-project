@@ -1588,3 +1588,76 @@ landed in PR #133 (branch `phase-1b-2b-backlog`).
     complete after 3B-2A — Phase 3B-2B covers XLSX upsert
     manifests, CLI strict-mode plumbing, and the final Phase 3
     close.
+
+### Phase 3B-2A amendment (PR #143): collector isolation + save_ok guard
+
+  Codex audit found two blockers in the original PR #143 commits 1-7.
+  Both were fixed in-flight on the same PR.
+
+  **Blocker 1 — collector isolation:**
+    - Old (e5f3eb7 commits 1-7): the StackBuilder input-manifest
+      collector was a single module-level dict guarded by an RLock
+      (``_INPUT_MANIFEST_COLLECTOR``). The lock prevents data-structure
+      races but does NOT isolate concurrent ``run_for_secondary``
+      jobs. The Dash multi-secondary launch path at
+      ``stackbuilder.py:1731`` spawns one ``threading.Thread`` per
+      secondary, so two concurrent jobs would clobber each other's
+      collector and produce wrong (or empty) ``input_manifest_hashes``
+      in the resulting ``run_manifest.json``.
+    - New (amendment): the collector lives in a
+      ``contextvars.ContextVar`` (``_INPUT_COLLECTOR_VAR``). Each
+      ``run_for_secondary`` invocation calls
+      ``_start_input_manifest_collection()`` which constructs a fresh
+      collector ``{"hashes": set(), "legacy": 0, "missing": 0,
+      "lock": RLock()}`` and ``set()``s the ContextVar, returning the
+      token. ``_finalize_input_manifest_collection(token)`` snapshots
+      the run's state and ``reset()``s the ContextVar to its prior
+      value (so nested or sibling runs are unaffected).
+    - ContextVars do NOT automatically propagate from the submitter
+      into long-lived ``ThreadPoolExecutor`` worker threads. The
+      ``phase2_rank_all`` executor was therefore wrapped:
+      ``_submit_with_context(executor, fn, *args, **kwargs)`` captures
+      the caller's Context via ``contextvars.copy_context()`` and runs
+      the worker callable inside it, so the per-run collector
+      ContextVar is visible to ``_record_input_lib`` from inside
+      ``_score_primary_both_modes`` workers.
+    - Regression test:
+      ``test_3b2a_collector_isolation_concurrent_runs``. Two threads
+      barrier-rendezvous on collection start, each records a distinct
+      set of synthetic manifested libraries via the production
+      ``_submit_with_context`` wrapper, then finalizes. The test
+      asserts both snapshots contain only their run's hashes
+      (disjoint sets) and that legacy/missing counters are isolated
+      too. Verified to fail on the e5f3eb7 module-global collector
+      (cross-contamination / empty Run A snapshot) and to pass after
+      the ContextVar + ``_submit_with_context`` migration.
+
+  **Blocker 2 — save_ok sidecar gate:**
+    - Old (e5f3eb7 commits 1-7): ``save_precomputed_results`` would
+      write the new sidecar manifest even when the final pickle
+      replacement failed. That left an orphan sidecar describing
+      content that was never written, or caused legitimate older
+      pickles still on disk to fail verification because their bytes
+      no longer matched the (overwritten) sidecar file_sha256.
+    - New (amendment): a local ``save_ok`` flag is set to True only
+      after the final pickle replacement succeeds (either via
+      ``os.replace`` or the ``shutil.copy2`` fallback). The sidecar
+      write is gated on ``save_ok``; if neither path succeeded, no
+      sidecar action is taken — any existing sidecar on disk is left
+      alone so the older pickle continues to verify.
+    - The ``save_precomputed_results`` public return contract is
+      unchanged.
+    - Regression test:
+      ``test_3b2a_spymaster_save_failure_no_orphan_sidecar``.
+      Pre-populates an OLD pickle + OLD sidecar, monkeypatches
+      ``os.replace`` and ``shutil.copy2`` to fail, calls
+      ``save_precomputed_results`` with NEW content, and asserts:
+        * the call does not raise
+        * the on-disk pickle still contains OLD content
+        * the on-disk sidecar still contains OLD manifest bytes
+        * no new sidecar describing NEW content was written
+      Verified to fail on the un-gated sidecar write (orphan sidecar
+      describing content that was never persisted) and to pass with
+      the ``save_ok`` gate.
+
+  Status: implemented in PR #143 amendment commits 8-9.
