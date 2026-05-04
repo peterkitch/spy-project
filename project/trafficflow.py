@@ -1336,12 +1336,34 @@ def _member_possets_on_secondary(secondary: str,
 # This function was not being called anywhere in the code
 
 # ---------- Spymaster PKL loading ----------
+def _strict_manifests_enabled() -> bool:
+    """True iff strict-manifest mode is requested for TrafficFlow.
+
+    Truthy values: "1", "true", "yes", "on" (case-insensitive). Strict is
+    enabled when EITHER ``PRJCT9_STRICT_MANIFESTS`` (project-wide) or
+    ``TRAFFICFLOW_STRICT_MANIFESTS`` (engine-local) is truthy. A local
+    "0" does NOT disable a project-wide truthy value (Phase 3B-2B
+    contract: strict propagates downward, never upward).
+    """
+    truthy = ("1", "true", "yes", "on")
+    for var in ("PRJCT9_STRICT_MANIFESTS", "TRAFFICFLOW_STRICT_MANIFESTS"):
+        val = os.environ.get(var, "")
+        if isinstance(val, str) and val.strip().lower() in truthy:
+            return True
+    return False
+
+
 def load_spymaster_pkl(ticker: str) -> Optional[dict]:
     """Load Spymaster PKL from cache/results directory (with in-memory cache).
 
     Phase 3B-2A: routes through ``load_verified_pickle_artifact``. Legacy
     PKLs (no manifest) load with a warning and proceed; manifest
     mismatches return None and bypass the in-memory ``_PKL_CACHE`` so a
+    rebuilt PKL is picked up on the next call.
+
+    Phase 3B-2B: strict-manifest mode (``PRJCT9_STRICT_MANIFESTS`` or
+    ``TRAFFICFLOW_STRICT_MANIFESTS``) escalates legacy and mismatch
+    paths to a None return that does NOT populate ``_PKL_CACHE``, so a
     rebuilt PKL is picked up on the next call.
     """
     if ticker in _PKL_CACHE:
@@ -1350,11 +1372,15 @@ def load_spymaster_pkl(ticker: str) -> Optional[dict]:
     pkl_path = Path(SPYMASTER_PKL_DIR) / f"{ticker}_precomputed_results.pkl"
     if not pkl_path.exists():
         return None
+    strict = _strict_manifests_enabled()
     try:
-        pkl, vresult = _load_verified_pickle_artifact(pkl_path)
+        pkl, vresult = _load_verified_pickle_artifact(pkl_path, strict=strict)
     except Exception:
         return None
     if pkl is None or (not vresult.legacy and not vresult.ok):
+        return None
+    if strict and vresult.legacy:
+        # Phase 3B-2B: under strict, do not cache or return legacy PKLs.
         return None
     _PKL_CACHE[ticker] = pkl
     return pkl

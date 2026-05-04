@@ -53,6 +53,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _strict_manifests_enabled() -> bool:
+    """True iff strict-manifest mode is requested for Confluence.
+
+    Truthy values: "1", "true", "yes", "on" (case-insensitive). Strict is
+    enabled when EITHER ``PRJCT9_STRICT_MANIFESTS`` (project-wide) or
+    ``CONFLUENCE_STRICT_MANIFESTS`` (engine-local) is truthy. A local
+    "0" does NOT disable a project-wide truthy value (Phase 3B-2B
+    contract: strict propagates downward, never upward).
+    """
+    truthy = ("1", "true", "yes", "on")
+    for var in ("PRJCT9_STRICT_MANIFESTS", "CONFLUENCE_STRICT_MANIFESTS"):
+        val = os.environ.get(var, "")
+        if isinstance(val, str) and val.strip().lower() in truthy:
+            return True
+    return False
+
+
 def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
     """Spymaster ``cache/results/*.pkl`` fallback for the 1d interval.
 
@@ -60,14 +77,23 @@ def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
     PKLs (no manifest) load with the central loader's warning and proceed
     so existing pre-3B-2A caches keep working; manifest mismatches return
     None for that interval so the caller treats the fallback as missing.
+
+    Phase 3B-2B: strict-manifest mode
+    (``PRJCT9_STRICT_MANIFESTS`` or ``CONFLUENCE_STRICT_MANIFESTS``)
+    escalates legacy and mismatch to a skip-this-fallback None return.
+    The broader confluence load is unaffected; just this interval's
+    fallback is skipped with a warning.
     """
     spymaster_path = os.path.join(
         'cache', 'results', f'{ticker}_precomputed_results.pkl'
     )
     if not os.path.exists(spymaster_path):
         return None
+    strict = _strict_manifests_enabled()
     try:
-        spymaster_data, vresult = _load_verified_pickle_artifact(spymaster_path)
+        spymaster_data, vresult = _load_verified_pickle_artifact(
+            spymaster_path, strict=strict,
+        )
     except Exception as e:
         logger.error(f"Failed to load spymaster cache {spymaster_path}: {e}")
         return None
@@ -84,6 +110,12 @@ def _load_spymaster_cache_fallback(ticker: str) -> Optional[dict]:
                 f"{spymaster_path}: {vresult.mismatches}. Treating as "
                 f"missing."
             )
+        return None
+    if strict and vresult.legacy:
+        logger.warning(
+            f"{ticker}: spymaster cache at {spymaster_path} has no "
+            f"provenance manifest; skipping under strict mode."
+        )
         return None
     try:
         # Extract dates from daily_top_buy_pairs keys

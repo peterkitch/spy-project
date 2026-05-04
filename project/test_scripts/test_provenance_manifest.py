@@ -2445,3 +2445,148 @@ def test_3b2b_impactsearch_xlsx_mismatched_preexisting_sidecar(
     sidecar = pm._sidecar_path_for(output)
     manifest = json.loads(sidecar.read_text(encoding="utf-8"))
     assert manifest["preexisting_manifest_status"] == "mismatched"
+
+
+# ===========================================================================
+# Phase 3B-2B: TrafficFlow strict env mode
+# ===========================================================================
+
+
+def test_3b2b_trafficflow_strict_legacy_no_cache(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    pkl_dir = tmp_path / "cache" / "results"
+    pkl_dir.mkdir(parents=True)
+    monkeypatch.setattr(trafficflow, "SPYMASTER_PKL_DIR", str(pkl_dir))
+    trafficflow._PKL_CACHE.clear()
+
+    p = pkl_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", with_manifest=False)
+
+    # Non-strict: legacy proceeds and IS cached.
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("TRAFFICFLOW_STRICT_MANIFESTS", raising=False)
+    pm.manifest_hash_cache_clear()
+    data_ns = trafficflow.load_spymaster_pkl("AAA")
+    assert data_ns is not None
+    assert "AAA" in trafficflow._PKL_CACHE
+
+    # Strict via TRAFFICFLOW_STRICT_MANIFESTS: legacy returns None and
+    # _PKL_CACHE is NOT populated by this load.
+    trafficflow._PKL_CACHE.clear()
+    monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", "1")
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("AAA") is None
+    assert "AAA" not in trafficflow._PKL_CACHE
+
+    # Strict via PRJCT9_STRICT_MANIFESTS (project-wide) also blocks.
+    trafficflow._PKL_CACHE.clear()
+    monkeypatch.delenv("TRAFFICFLOW_STRICT_MANIFESTS", raising=False)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "yes")
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("AAA") is None
+    assert "AAA" not in trafficflow._PKL_CACHE
+
+
+def test_3b2b_trafficflow_strict_mismatch_no_cache(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    pkl_dir = tmp_path / "cache" / "results"
+    pkl_dir.mkdir(parents=True)
+    monkeypatch.setattr(trafficflow, "SPYMASTER_PKL_DIR", str(pkl_dir))
+    trafficflow._PKL_CACHE.clear()
+
+    p = pkl_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", mutate_after_attach=True)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "true")
+    pm.manifest_hash_cache_clear()
+    assert trafficflow.load_spymaster_pkl("AAA") is None
+    assert "AAA" not in trafficflow._PKL_CACHE
+
+
+def test_3b2b_trafficflow_strict_env_truthy_parsing(monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    import trafficflow
+
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("TRAFFICFLOW_STRICT_MANIFESTS", raising=False)
+    assert trafficflow._strict_manifests_enabled() is False
+    for truthy in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", truthy)
+        assert trafficflow._strict_manifests_enabled() is True, truthy
+    for falsy in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", falsy)
+        assert trafficflow._strict_manifests_enabled() is False, falsy
+    # Project-wide truthy overrides a local "0" — strict propagates
+    # downward, never upward.
+    monkeypatch.setenv("TRAFFICFLOW_STRICT_MANIFESTS", "0")
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "1")
+    assert trafficflow._strict_manifests_enabled() is True
+
+
+# ===========================================================================
+# Phase 3B-2B: Confluence strict env mode
+# ===========================================================================
+
+
+def test_3b2b_confluence_strict_legacy_skips(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    p = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", with_manifest=False)
+
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("CONFLUENCE_STRICT_MANIFESTS", raising=False)
+    # Non-strict: legacy proceeds with rebuilt library.
+    pm.manifest_hash_cache_clear()
+    legacy = confluence_analyzer._load_spymaster_cache_fallback("AAA")
+    assert legacy is not None
+    assert legacy.get("source") == "spymaster_cache"
+
+    # Strict (engine-local) -> skip the fallback, return None.
+    monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", "1")
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("AAA") is None
+
+    # Strict (project-wide) also skips.
+    monkeypatch.delenv("CONFLUENCE_STRICT_MANIFESTS", raising=False)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "true")
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("AAA") is None
+
+
+def test_3b2b_confluence_strict_mismatch_skips(tmp_path, monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    cache_dir = tmp_path / "cache" / "results"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    p = cache_dir / "AAA_precomputed_results.pkl"
+    _build_synthetic_spymaster_pkl(p, ticker="AAA", mutate_after_attach=True)
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "yes")
+    pm.manifest_hash_cache_clear()
+    assert confluence_analyzer._load_spymaster_cache_fallback("AAA") is None
+
+
+def test_3b2b_confluence_strict_env_truthy_parsing(monkeypatch):
+    sys.path.insert(0, str(PROJECT_DIR))
+    from signal_library import confluence_analyzer
+
+    monkeypatch.delenv("PRJCT9_STRICT_MANIFESTS", raising=False)
+    monkeypatch.delenv("CONFLUENCE_STRICT_MANIFESTS", raising=False)
+    assert confluence_analyzer._strict_manifests_enabled() is False
+    for truthy in ("1", "TRUE", "yes", "on"):
+        monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", truthy)
+        assert confluence_analyzer._strict_manifests_enabled() is True, truthy
+    monkeypatch.setenv("CONFLUENCE_STRICT_MANIFESTS", "0")
+    monkeypatch.setenv("PRJCT9_STRICT_MANIFESTS", "1")
+    assert confluence_analyzer._strict_manifests_enabled() is True
