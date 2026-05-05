@@ -5424,14 +5424,14 @@ app.layout = dbc.Container(
                                         ])
                                     ], className="mb-3", style={"border": "2px solid #80ff00"}),
                                     
-                                    # Step 3: matrix.py (under development)
+                                    # Step 3: Spymaster Multi-Primary Signal Aggregator
                                     dbc.Card([
                                         dbc.CardBody([
                                             html.H5([
                                                 html.I(className="fas fa-layer-group me-2", style={"color": "#00ff41"}),
-                                                "Step 3: Test Multi-Primary Effects (matrix.py)"
+                                                "Step 3: Test Multi-Primary Effects (Spymaster Multi-Primary)"
                                             ]),
-                                            html.P("(Under development) Combine MULTIPLE Primary tickers to see the effect on one Secondary ticker.")
+                                            html.P("Use the Multi-Primary Signal Aggregator to combine multiple Primary tickers and measure their effect on one Secondary ticker.")
                                         ])
                                     ], className="mb-3", style={"border": "2px solid #80ff00"}),
 
@@ -5487,14 +5487,14 @@ app.layout = dbc.Container(
                                         dbc.AccordionItem([
                                             html.Div([
                                                 html.I(className="fas fa-layer-group me-2", style={"color": "#80ff00"}),
-                                                html.Strong("Phase 3: Multi-Primary (matrix.py, under development)")
+                                                html.Strong("Phase 3: Multi-Primary (Spymaster Multi-Primary Signal Aggregator)")
                                             ]),
                                             html.Ol([
                                                 html.Li("Combine MULTIPLE Primary tickers"),
                                                 html.Li("Measure their impact on one Secondary")
                                             ]),
                                             dbc.Alert("This is a work in progress but already useful for scenario thinking.", color="warning", className="py-2")
-                                        ], title="Phase 3: matrix.py"),
+                                        ], title="Phase 3: Multi-Primary"),
                                         
                                         dbc.AccordionItem([
                                             html.Div([
