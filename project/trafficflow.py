@@ -209,10 +209,6 @@ PARALLEL_SUBSETS_MIN_K = int(os.environ.get("PARALLEL_SUBSETS_MIN_K", "4"))
 TRAFFICFLOW_SUBSET_WORKERS = int(os.environ.get("TRAFFICFLOW_SUBSET_WORKERS", "4"))
 # Preload control
 TRAFFICFLOW_PRELOAD_CACHE = os.environ.get("TRAFFICFLOW_PRELOAD_CACHE", "0").lower() in {"1","true","on","yes"}
-# Matrix path: REMOVED (parity hazard)
-TF_MATRIX_PATH         = False
-TF_MATRIX_MAX_K        = int(os.environ.get("TF_MATRIX_MAX_K", "12"))  # safe up to ~1023 subsets/row
-TF_MATRIX_DTYPE        = "int8"
 TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK = os.environ.get("TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK", "0").lower() in {"1","true","on","yes"}
 
 # ---- Post-intersection fast path (strict parity, no pre-align) ----
@@ -2351,126 +2347,6 @@ def _signal_snapshot_for_members(secondary: str, members: List[str], cap_dt: Opt
         "tomorrow": tomorrow_dt
     }
 
-# ---------- Matrix engine (all subsets in one shot; A.S.O. semantics preserved) ----------
-def _members_signals_df_and_returns(secondary: str, members: List[str],
-                                    *, eval_to_date: Optional[pd.Timestamp]) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Return (signals_df_cap, sec_rets) aligned to the capped secondary grid.
-    Each column of signals_df_cap is 'Buy'/'Short'/'None' for a member.
-
-    WARNING: Uses .reindex().fillna('None') which previously broke parity.
-    This is being tested - if parity breaks, this entire matrix path will be rejected.
-    """
-    # Load prices once
-    sec_df = _PRICE_CACHE.get(_price_cache_key(secondary))
-    if sec_df is None:
-        sec_df = _load_secondary_prices(secondary)
-        _PRICE_CACHE[_price_cache_key(secondary)] = sec_df
-    if sec_df is None or sec_df.empty or PRICE_COLUMN not in sec_df.columns:
-        return pd.DataFrame(), pd.Series(dtype="float64")
-
-    sec_close = _ensure_unique_sorted_1d(sec_df[PRICE_COLUMN])
-    # Cap evaluation window to deterministic date if provided
-    if eval_to_date is not None:
-        cap_day = pd.Timestamp(eval_to_date).normalize()
-        sec_close = sec_close.loc[:cap_day]
-    sec_index_cap = sec_close.index
-
-    # Build per-member signal series aligned to capped grid
-    sig_series_list = []
-    for prim in members:
-        res = load_spymaster_pkl(prim)
-        if not res:
-            continue
-        dates, sigs, next_sig = _extract_signals_from_active_pairs(res, secondary_index=None)
-        if len(dates) == 0:
-            continue
-        sig = pd.Series(list(sigs), index=pd.DatetimeIndex(pd.to_datetime(dates, utc=True)).tz_convert(None).normalize())
-        # PARITY RISK: reindex with fillna - previously broke parity!
-        col = sig.reindex(sec_index_cap).fillna('None').astype(object)
-        # Note: Inversion handling removed from this implementation - may need to add back
-        sig_series_list.append(col)
-
-    if not sig_series_list:
-        return pd.DataFrame(), pd.Series(dtype="float64")
-
-    sig_df_cap = pd.concat(sig_series_list, axis=1)
-    # Same-day returns (signals_with_next semantics; no shift)
-    sec_rets = _pct_returns(sec_close).astype("float64")
-    return sig_df_cap, sec_rets
-
-def _averages_via_matrix(sig_df_cap: pd.DataFrame, sec_rets: pd.Series) -> Dict[str, Any]:
-    """
-    Compute AVERAGES across all non-empty member subsets.
-
-    Per-subset metrics are sourced from canonical_scoring.score_captures
-    (spec §13–§17). The unanimity combiner with None-neutral (Buy only
-    if no Short present; vice versa) is applied per subset before
-    scoring.
-    """
-    if sig_df_cap is None or sig_df_cap.empty or sec_rets is None or sec_rets.empty:
-        return _empty_metrics()
-
-    S = sig_df_cap.replace({'Buy': 1, 'Short': -1}).where(sig_df_cap.isin(['Buy','Short']), 0)
-    S = S.to_numpy(dtype=TF_MATRIX_DTYPE, copy=False)  # [N x K]
-    N, K = S.shape
-    S_count = (1 << K) - 1
-    if S_count <= 0:
-        return _empty_metrics()
-
-    r = sec_rets.to_numpy(dtype="float64")  # [N]
-
-    triggers_l, wins_l, losses_l = [], [], []
-    win_pct_l, std_l, sharpe_l = [], [], []
-    avg_l, total_l, p_l = [], [], []
-
-    for mask in range(1, S_count + 1):
-        cols = [i for i in range(K) if (mask >> i) & 1]
-        Ssub = S[:, cols]
-        pos_cnt = (Ssub == 1).sum(axis=1)
-        neg_cnt = (Ssub == -1).sum(axis=1)
-        combined = np.zeros(N, dtype=TF_MATRIX_DTYPE)
-        combined[(pos_cnt > 0) & (neg_cnt == 0)] = 1
-        combined[(neg_cnt > 0) & (pos_cnt == 0)] = -1
-        cap_subset = combined.astype("float64") * r
-        trig = combined != 0
-
-        captures_s = pd.Series(cap_subset, index=sec_rets.index)
-        trig_s = pd.Series(trig, index=sec_rets.index)
-
-        score = _canonical_score_captures(
-            captures_s, trig_s,
-            risk_free_rate=RISK_FREE_ANNUAL, periods_per_year=252, ddof=1,
-        )
-
-        triggers_l.append(score.trigger_days)
-        wins_l.append(score.wins)
-        losses_l.append(score.losses)
-        win_pct_l.append(score.win_rate)
-        std_l.append(score.std_dev)
-        sharpe_l.append(score.sharpe)
-        avg_l.append(score.avg_daily_capture)
-        total_l.append(score.total_capture)
-        p_l.append(score.p_value if score.p_value is not None else 1.0)
-
-    def _mean_safe(x):
-        x = np.asarray(x, dtype="float64")
-        x[~np.isfinite(x)] = np.nan
-        return float(np.nanmean(x)) if x.size else 0.0
-
-    out = {
-        "Triggers":    int(_mean_safe(triggers_l) + 0.5),
-        "Wins":        int(_mean_safe(wins_l) + 0.5),
-        "Losses":      int(_mean_safe(losses_l) + 0.5),
-        "Win %":       round(_mean_safe(win_pct_l), 2),
-        "Std Dev (%)": round(_mean_safe(std_l), 4),
-        "Sharpe":      round(_mean_safe(sharpe_l), 2),
-        "Avg %":       round(_mean_safe(avg_l), 4),
-        "Total %":     round(_mean_safe(total_l), 4),
-        "p":           round(_mean_safe(p_l), 4),
-    }
-    return out
-
 def _subset_metrics_spymaster_fast(secondary: str,
                                    subset: List[str],
                                    *,
@@ -2790,21 +2666,7 @@ def compute_build_metrics_spymaster_parity(secondary: str, members: List[str], *
 
         return _round_metrics_map(m), info_snapshot
 
-    # --- NEW: Matrix fast path for AVERAGES (K>=2) ---
-    # WARNING: This uses .reindex().fillna() which previously broke parity
-    # Only enabled if TF_MATRIX_PATH=1 and will be rejected if parity tests fail
-    # Matrix path hard-off (kept only as commented reference)
-    if False and TF_MATRIX_PATH and 2 <= len(metrics_members) <= TF_MATRIX_MAX_K:
-        sig_df_cap, sec_rets = _members_signals_df_and_returns(secondary, metrics_members, eval_to_date=eval_to_date)
-        if not sig_df_cap.empty and not sec_rets.empty:
-            out = _averages_via_matrix(sig_df_cap, sec_rets)
-            out = _round_metrics_map(out)
-            # Create info_snapshot for matrix path
-            info_snapshot = _signal_snapshot_for_members(secondary, members, cap_dt=eval_to_date)
-            return out, info_snapshot
-        # fall back if any issue
-
-    # --- Fallback: original per-subset loop (PROVEN PARITY) ---
+    # --- Per-subset loop (PROVEN PARITY) ---
     # Preload PKL signals for all unique members used in METRICS (speeds up K>1 by caching processed signals)
     try:
         for t in set(metrics_members):
@@ -3396,7 +3258,7 @@ def main():
         print(f"\n{'='*70}")
         print(f"  TrafficFlow v1.9 - Signal Aggregation Dashboard")
         print(f"  Port: {PORT} | Secondaries: {len(secs)} | Using raw Close prices")
-        print(f"  Fast Paths: Bitmask={'ON' if TF_BITMASK_FASTPATH else 'OFF'} | Post-Intersect={'ON' if TF_POST_INTERSECT_FASTPATH else 'OFF'} | Matrix=REMOVED")
+        print(f"  Fast Paths: Bitmask={'ON' if TF_BITMASK_FASTPATH else 'OFF'} | Post-Intersect={'ON' if TF_POST_INTERSECT_FASTPATH else 'OFF'}")
         print(f"{'='*70}")
         print(f"\n[PARITY_MODE] A.S.O. strict intersection with PKL-based signals")
         print(f"[METRICS] Signal-agnostic metrics: ON (SpyMaster parity)")
