@@ -5,8 +5,9 @@
 ## PRJCT9 SPRINT OPERATIONAL CONTEXT
 
 This section captures the durable operational shape of the
-Phase 1B / Phase 2 / Phase 3 sprint on this repo. Read this
-before doing any work in `project/`.
+PRJCT9 sprint on this repo (currently Phase 5A in progress;
+Phases 1B through 4B merged). Read this before doing any
+work in `project/`.
 
 ### 1. Pinned Python interpreter (CRITICAL)
 
@@ -153,9 +154,9 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Sprint state (as of 2026-05-03)
+### 6. Sprint state (as of 2026-05-05)
 
-Phase 0 → Phase 2B-2B merged to `main`:
+Phase 0 → Phase 5 Pre-Flight merged to `main`:
 
   - #128 Phase -1 (token sweep)
   - #129 Phase 0 (spec v0.5, env, import smoke)
@@ -173,22 +174,52 @@ Phase 0 → Phase 2B-2B merged to `main`:
   - #137 Phase 2B-2B (grace plumbing refactor +
     rank_inverse structural fix in normal path and xlsx
     fast-path + xlsx loud-fail test pinning)
+  - #140 Phase 3A (signal-library provenance manifests)
+  - #142 Phase 3B-1 (manifest perf cache + central loader +
+    B12 tightening)
+  - #143 Phase 3B-2A (output manifest helper + StackBuilder
+    run manifests + Spymaster PKLs)
+  - #144 Phase 3B-2B (XLSX upsert manifests + strict-mode
+    CLI + Phase 3 close)
+  - #145 Post Phase 3 Sprint Bug Cleanup (Spymaster
+    annualized_return + Confluence dedupe + StackBuilder
+    stale-XLSX message + regression tests)
+  - #146 PRJCT9 North Star + Phase 4 Scoping docs
+  - #147 Phase 4A (cross-ticker multi-timeframe confluence
+    aggregation engine)
+  - #148 Phase 4B (cross-ticker confluence operator Dash)
+  - #149 Phase 5 Pre-Flight (validation, cleanups,
+    controlled compute + Path 2 backend, pre-launch
+    hardening)
 
-**Next: Phase 3 — Provenance Manifests.** End-to-end
-provenance: every produced artifact (rank tables, combo
-leaderboard, signal libraries, metric exports) gets a
-manifest pinning the input SHA, engine version, spec
-section coverage, and run parameters. Phase 3 is unblocked
-now that the golden test suite (139 tests) is closed.
+**Currently in progress: Phase 5A — sprint-state hygiene +
+cleanup ledger.** Doc/config-only triage step that
+classifies every Phase 5B-bound cleanup item by deletion /
+deprecation / rename / behavior-change / cross-app-
+reconciliation. The locked classification lives in
+`project/md_library/shared/2026-05-05_PHASE_5A_CLEANUP_LEDGER.md`.
 
-**Phase 4: Cross-Ticker Confluence Dashboard.** UI that
-visualizes confluence across multiple tickers
-simultaneously. Depends on Phase 3 manifests for
-reproducibility.
+**Phase 5B: Targeted cleanup PRs.** Runs from 5A
+classification. Multiple small PRs allowed; preflight
+required when a PR deletes behavior, changes CLI surface,
+touches env files, or changes cross-app semantics.
 
-**Phase 5: Honest Validation Report.**
+**Phase 5C: Honest validation program.** Two-step (5C-1
+methodology doc PR, 5C-2 validation engine + report PR).
+Methodology must be locked before implementation begins.
 
-**Phase 6: PRJCT9.com.**
+**Phase 5D: Controlled compute + Path 2 backend.** Local-
+first orchestration; Path 2 on-demand backend; emits
+Phase 4A-compatible run directories.
+
+**Phase 5G: Pre-launch data licensing gate.** Doc/process
+work; runs in parallel; gates Phase 6 launch scoping.
+
+**Phase 6: PRJCT9.com.** Public research website that
+consumes Phase 4A / Phase 5 manifest-stamped outputs.
+
+See `project/md_library/shared/2026-05-05_PHASE_5_PRE_FLIGHT.md`
+for the locked Phase 5 scope and sub-phase rules.
 
 Confirm current state with `git log -10 --oneline main`;
 this section may lag reality if PRs land without an update.
@@ -200,13 +231,16 @@ on the named gate phase, surface them so they can be
 scheduled or explicitly re-deferred.
 
   - **B11 `compute_signals` delete-or-shift-correct
-    (deferred to Phase 3):** the function in spymaster has
-    a dead-code static guard
+    (deferred through Phase 3 / Phase 4; classified for
+    Phase 5B in
+    `2026-05-05_PHASE_5A_CLEANUP_LEDGER.md` Item 6):** the
+    function in spymaster has a dead-code static guard
     (`test_b11_spymaster_compute_signals_uncalled` in
     `project/test_scripts/test_lookahead_guards.py`) but
     the function body has a shift-correctness question.
     Either delete the function or fix the shift and change
-    the guard from "uncalled" to "shift-correct."
+    the guard from "uncalled" to "shift-correct." Phase 5B
+    preflight picks one before code change begins.
   - **QC clone Adj Close sites:** at
     `project/QC/Clone of Project 9/main.py:103, 918, 1509`.
     QC clone is a frozen historical snapshot, intentionally
