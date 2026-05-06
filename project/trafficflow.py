@@ -198,6 +198,41 @@ TF_ROLLOVER_VERBOSE = os.environ.get("TF_ROLLOVER_VERBOSE", "1").lower() in {"1"
 # Always drop "today UTC" bar for crypto/FX if UTC-yesterday is missing (Yahoo quirk)
 TF_CRYPTO_STRICT_MISSING_DAY = os.environ.get("TF_CRYPTO_STRICT_MISSING_DAY", "1").lower() in {"1", "true", "on", "yes"}
 
+# ============================================================================
+# Phase 5B Item 8: TrafficFlow refresh-callback diagnostic surface
+# ============================================================================
+#
+# Local minimal fix (intentionally NOT the broad rejection_out
+# refactor used in OnePass / ImpactSearch). The callback collects a
+# small list of [TRAFFICFLOW:<reason>] formatted strings during
+# refresh and appends a bounded summary to the existing status text.
+# Each reason code is a module-level constant so future audits can
+# grep for the deprecation set in one place.
+
+REFRESH_EXCEPTION = "refresh_exception"
+REFRESH_SYMBOL_FAILED = "refresh_symbol_failed"
+REFRESH_NO_DATA = "refresh_no_data"
+REFRESH_UNAVAILABLE = "refresh_unavailable"
+PRICE_LOAD_FAILED = "price_load_failed"
+
+# Bound for the appended status segment (refresh_issues count).
+_REFRESH_ISSUES_DISPLAY_LIMIT = 10
+
+
+def _format_trafficflow_issue(reason, *, ticker_or_context, message, action):
+    """Format a TrafficFlow refresh issue as a single ASCII line.
+
+    Schema mirrors the OnePass/ImpactSearch ``[ENGINE:reason] ...``
+    convention but is intentionally local — TrafficFlow does NOT
+    import OnePass/ImpactSearch helpers; the cross-app consistency is
+    only at the operator-string level.
+    """
+    return (
+        f"[TRAFFICFLOW:{reason}] {ticker_or_context}: {message}. "
+        f"Action: {action}."
+    )
+
+
 # Cache refresh controls (for refresh_secondary_caches)
 PRICE_CACHE_TTL_DAYS   = int(os.environ.get("PRICE_CACHE_TTL_DAYS", "1"))   # refresh if last date < today-1
 PRICE_BACKFILL_DAYS    = int(os.environ.get("PRICE_BACKFILL_DAYS", "10"))   # overlap window to close gaps
@@ -1119,16 +1154,42 @@ def _load_secondary_prices(secondary: str,
     return fresh
 
 
-def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
+def refresh_secondary_caches(symbols, force=False):
     """
     Refresh disk caches **with full-history enforcement**.
     If existing cache is truncated, replace it. Otherwise do a small tail merge.
+
+    Phase 5B Item 8: returns a list of formatted [TRAFFICFLOW:<reason>]
+    issue strings (failures only — None-filtered from worker results).
+    Successful per-symbol outcomes (`up-to-date`, `merged`, `replaced`,
+    `kept existing`) are NOT returned; workers return None on success
+    so the issue list stays focused on operator-actionable failures.
+    Empty list means the refresh batch completed without surfaced
+    failures.
     """
     uniq = sorted({_price_cache_key(s) for s in symbols})
-    if not uniq or yf is None:
-        return
+    if not uniq:
+        return []
+    if yf is None:
+        return [
+            _format_trafficflow_issue(
+                REFRESH_UNAVAILABLE,
+                ticker_or_context="<all>",
+                message=(
+                    "yfinance is unavailable in the current "
+                    "interpreter; refresh skipped."
+                ),
+                action=(
+                    "Install or restore yfinance, then retry refresh."
+                ),
+            )
+        ]
 
-    def _one(sym: str) -> str:
+    def _one(sym):
+        """Worker contract: return None on success; return a formatted
+        [TRAFFICFLOW:refresh_no_data] / [TRAFFICFLOW:refresh_symbol_failed]
+        issue string on failure. Workers must NEVER mutate a shared
+        issue-collection list."""
         try:
             p = _choose_price_cache_path(sym)
 
@@ -1136,10 +1197,18 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
             if force:
                 fresh = _fetch_secondary_from_yf(sym)
                 if fresh.empty:
-                    return f"{sym}: no data"
+                    return _format_trafficflow_issue(
+                        REFRESH_NO_DATA,
+                        ticker_or_context=sym,
+                        message="yfinance returned no data on forced refresh",
+                        action=(
+                            "Confirm the ticker is valid; retry later "
+                            "or check yfinance connectivity."
+                        ),
+                    )
                 _write_cache_file(p, fresh)
                 _PRICE_CACHE[sym] = fresh.copy()
-                return f"{sym}: replaced (full)"
+                return None  # success: replaced (full)
 
             # Else: read existing and do a light tail update
             existing = _read_cache_file(p)
@@ -1152,14 +1221,25 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
             if _is_truncated_history(sym, existing):
                 fresh = _fetch_secondary_from_yf(sym)
                 if fresh.empty:
-                    return f"{sym}: no data"
+                    return _format_trafficflow_issue(
+                        REFRESH_NO_DATA,
+                        ticker_or_context=sym,
+                        message=(
+                            "yfinance returned no data while replacing "
+                            "truncated history"
+                        ),
+                        action=(
+                            "Confirm the ticker is valid; retry later "
+                            "or check yfinance connectivity."
+                        ),
+                    )
                 # Never shrink guard: if the new fetch is materially shorter, keep existing.
                 if len(fresh) + max(25, int(0.05 * len(existing))) < len(existing):
                     _PRICE_CACHE[sym] = existing.copy()
-                    return f"{sym}: kept existing (fresh shorter: {len(fresh)} < {len(existing)})"
+                    return None  # success: kept existing
                 _write_cache_file(p, fresh)
                 _PRICE_CACHE[sym] = fresh.copy()
-                return f"{sym}: replaced (full)"
+                return None  # success: replaced (full)
 
             # Light tail update
             start = (existing.index.max() - pd.Timedelta(days=PRICE_BACKFILL_DAYS)).strftime("%Y-%m-%d")
@@ -1170,19 +1250,29 @@ def refresh_secondary_caches(symbols: List[str], force: bool = False) -> None:
             # Short-circuit if nothing new (avoid unnecessary cache writes)
             if inc.empty or inc.index.max() <= existing.index.max():
                 _PRICE_CACHE[sym] = existing.copy()  # keep exact object shape
-                return f"{sym}: up-to-date"
+                return None  # success: up-to-date
 
             merged = pd.concat([existing, inc]).sort_index()
             merged = merged[~merged.index.duplicated(keep="last")]
             _write_cache_file(p, merged)
             _PRICE_CACHE[sym] = merged.copy()
-            return f"{sym}: merged -> {merged.index.max().date()}"
+            return None  # success: merged
         except Exception as e:
-            return f"{sym}: update failed ({e})"
+            return _format_trafficflow_issue(
+                REFRESH_SYMBOL_FAILED,
+                ticker_or_context=sym,
+                message=f"update failed ({type(e).__name__}: {e})",
+                action=(
+                    "Inspect logs for the specific worker exception; "
+                    "retry or remove the symbol from the universe."
+                ),
+            )
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=max(1, PRICE_REFRESH_THREADS)) as ex:
-        msgs = list(ex.map(_one, uniq))
+        worker_results = list(ex.map(_one, uniq))
+    # Filter None successes; aggregate failures into the returned list.
+    return [r for r in worker_results if r]
 
 # ---------- Spymaster-parity asof helper ----------
 def _asof(series: pd.Series, ts, default=np.nan):
@@ -3080,6 +3170,12 @@ def make_app():
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+            # Phase 5B Item 8: collect refresh-stage failures so the
+            # operator sees specific [TRAFFICFLOW:<reason>] lines
+            # instead of silent absences. Aggregation happens on this
+            # main thread; workers never mutate this list.
+            refresh_issues = []
+
             # Show resolved debug flags once per refresh
             secs = list_secondaries()  # Fresh list each refresh
 
@@ -3096,10 +3192,27 @@ def make_app():
             try:
                 first_load = int(_n or 0) == 0
                 if (not first_load) or TF_AUTO_PRICE_REFRESH_ON_FIRST_LOAD:
-                    refresh_secondary_caches(secs, force=TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK)
+                    _refresh_results = refresh_secondary_caches(
+                        secs, force=TF_FORCE_FULL_PRICE_REFRESH_ON_CLICK,
+                    )
+                    if _refresh_results:
+                        refresh_issues.extend(_refresh_results)
                 # else: skip price refresh on first load
             except Exception as _e:
-                pass  # Price refresh error handled silently
+                # Phase 5B Item 8: surface the previously-silent
+                # refresh exception. Refresh failure must NOT cause a
+                # hard failure -- operator should still see cached/row
+                # data below, just with the diagnostic appended to the
+                # status line.
+                refresh_issues.append(_format_trafficflow_issue(
+                    REFRESH_EXCEPTION,
+                    ticker_or_context="<refresh_secondary_caches>",
+                    message=f"{type(_e).__name__}: {_e}",
+                    action=(
+                        "Inspect logs for the underlying error; cached "
+                        "rows still available below."
+                    ),
+                ))
 
             k = int(kval or 1)
 
@@ -3110,8 +3223,19 @@ def make_app():
                     price_df = _load_secondary_prices(sec)
                     atype = _infer_quote_type(sec)  # EQUITY | INDEX | CRYPTOCURRENCY | CURRENCY | FUTURE
                     universe_prices[sec] = {"prices": price_df, "asset": atype}
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    # Phase 5B Item 8: surface the previously-silent
+                    # per-secondary price-load failure. The loop
+                    # continues so other secondaries still load.
+                    refresh_issues.append(_format_trafficflow_issue(
+                        PRICE_LOAD_FAILED,
+                        ticker_or_context=sec,
+                        message=f"{type(_exc).__name__}: {_exc}",
+                        action=(
+                            "Inspect cache file at the expected path; "
+                            "remove the symbol or rebuild the cache."
+                        ),
+                    ))
             cap_global, cap_by_sec = compute_run_cutoff(universe_prices)
 
             # Create run_fence dict for explicit cap propagation (no global var races)
@@ -3194,6 +3318,20 @@ def make_app():
                     issue_parts.append(f"{error_msg.replace('under output/stackbuilder/[TICKER]', 'for ' + ticker_list)}")
 
                 msg += f"  | Issues: {len(problems)} - " + "; ".join(issue_parts)
+
+            # Phase 5B Item 8: append a bounded "Refresh issues: N - ..."
+            # segment when refresh-stage failures were collected. Empty
+            # list = no segment appended (no "Refresh issues: 0" noise).
+            if refresh_issues:
+                _shown = refresh_issues[:_REFRESH_ISSUES_DISPLAY_LIMIT]
+                msg += (
+                    f"  | Refresh issues: {len(refresh_issues)} - "
+                    + "; ".join(_shown)
+                )
+                if len(refresh_issues) > len(_shown):
+                    msg += (
+                        f" (+{len(refresh_issues) - len(_shown)} more)"
+                    )
 
             # Format missing/stale PKLs message with reason counts
             if missing_map:
