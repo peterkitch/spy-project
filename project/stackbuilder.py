@@ -3,7 +3,7 @@
 # Lean fastpath: uses existing Signal Library only; no network; optional minimal Dash UI.
 # Phases: 1) Preflight  2) Rank All  3) Stack Builder
 
-import os, re, json, math, glob, argparse, time, shutil, threading
+import os, re, sys, json, math, glob, argparse, time, shutil, threading
 import contextvars
 from types import SimpleNamespace
 from datetime import datetime, timedelta
@@ -2379,7 +2379,57 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
             _finalize_input_manifest_collection(_collector_token)
         raise
 
+# Phase 5B Item 1: vestigial CLI deprecations. Each entry is
+# (flag_name, message). Flags remain parseable with their existing
+# defaults; the warning fires only when the flag is explicitly
+# supplied on the command line. Module-level so future audits can
+# grep for the deprecation set in one place.
+_DEPRECATED_CLI_FLAGS = (
+    (
+        "--alpha",
+        "[STACKBUILDER:DEPRECATED] --alpha: accepted for one release "
+        "cycle but no longer changes StackBuilder scoring or selection; "
+        "it is recorded as legacy metadata only and will be removed in "
+        "a future cleanup.",
+    ),
+    (
+        "--min-marginal-capture",
+        "[STACKBUILDER:DEPRECATED] --min-marginal-capture: has no "
+        "effect in the current StackBuilder search path; no replacement. "
+        "Will be removed in a future cleanup.",
+    ),
+    (
+        "--fail-on-missing-cache",
+        "[STACKBUILDER:DEPRECATED] --fail-on-missing-cache: has no "
+        "effect; use --prefer-impact-xlsx / --strict-manifests for "
+        "current fast-path behavior where applicable. Will be removed "
+        "in a future cleanup.",
+    ),
+)
+
+
+def _emit_deprecated_cli_warnings(argv):
+    """Emit a stderr warning for each explicitly-supplied deprecated
+    CLI flag. Detection scans raw argv (parsed defaults can't tell
+    "user passed default" from "user supplied flag explicitly"); the
+    ``--flag=value`` form is supported alongside ``--flag value``.
+
+    ``argv=None`` is the real command-line invocation path (argparse
+    falls back to ``sys.argv[1:]``); this helper mirrors that fallback
+    so warnings work both in tests and at the actual CLI. Each
+    deprecated flag emits its warning at most once per parse.
+    """
+    raw = sys.argv[1:] if argv is None else list(argv)
+    for flag, message in _DEPRECATED_CLI_FLAGS:
+        prefix = flag + "="
+        for tok in raw:
+            if tok == flag or tok.startswith(prefix):
+                print(message, file=sys.stderr)
+                break
+
+
 def parse_args(argv=None):
+    _emit_deprecated_cli_warnings(argv)
     p = argparse.ArgumentParser(description="PRJCT9 StackBuilder (Signal Library only)")
     p.add_argument('--secondary', help='Secondary ticker')
     p.add_argument('--secondaries', help='Comma-separated list of secondaries', default=None)
