@@ -6,7 +6,10 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import logging
-from canonical_scoring import score_captures as _canonical_score_captures
+from canonical_scoring import (
+    score_captures as _canonical_score_captures,
+    combine_consensus_signals as _canonical_consensus,
+)
 from provenance_manifest import (
     verify_manifest as _verify_manifest,
     load_verified_signal_library as _load_verified_signal_library,
@@ -116,6 +119,17 @@ PROCESS_WORKER_EXCEPTION = "worker_exception"
 # Reason codes -- EXPORT stage
 EXPORT_XLSX_MANIFEST_FAILED = "xlsx_manifest_failed"
 
+# Reason codes -- MULTI-PRIMARY stage (Phase 5B-MP-2c, locked
+# multi_primary_contract_v1; see md_library/shared/2026-05-06_PHASE_5B_MP_CANONICAL_CONTRACT.md).
+# Reused via _build_rejection / _format_rejection so cross-app prefix
+# stays at [IMPACTSEARCH:...] without a parallel formatter.
+IMPACT_MP_INPUT_INVALID = "multi_primary_input_invalid"
+IMPACT_MP_PARTIAL_COVERAGE = "multi_primary_partial_coverage"
+IMPACT_MP_UNAVAILABLE = "multi_primary_unavailable"
+IMPACT_MP_NO_OVERLAP = "multi_primary_no_overlap"
+IMPACT_MP_NO_TRIGGERS = "multi_primary_no_triggers"
+IMPACT_MP_AGGREGATION_FAILED = "multi_primary_aggregation_failed"
+
 # Heuristic indicators for yfinance rate-limit detection.
 _RATE_LIMIT_INDICATORS = (
     "rate limit",
@@ -220,6 +234,187 @@ def _append_capped_error(tracker, msg):
     overflow = len(bucket) - _PROGRESS_TRACKER_MAX_RECENT_ERRORS
     if overflow > 0:
         del bucket[:overflow]
+
+
+# ---- Phase 5B-MP-2c: canonical multi-primary contract surface ----
+# Wraps canonical_scoring.combine_consensus_signals into the locked
+# multi_primary_contract_v1 shape (status + issues + formatted_issues)
+# without changing batch-mode behavior or introducing parallel
+# rejection_out infrastructure. _build_rejection / _format_rejection
+# are reused so issues carry the [IMPACTSEARCH:...] prefix shape.
+def _impactsearch_multi_primary_contract_result(
+    sig_df,
+    *,
+    requested_members,
+    contributed_members,
+    missing_members=None,
+    context="multi-primary",
+):
+    """Compute multi_primary_contract_v1 status + issues + aggregate_signal.
+
+    Returns:
+        {
+            "aggregate_signal": pd.Series,
+            "status": str,
+            "issues": list[dict],
+            "formatted_issues": list[str],
+        }
+
+    Status precedence (locked §6 + ImpactSearch hybrid policy §10):
+      1. invalid_input  - empty / duplicate requested members
+      2. unavailable    - requested non-empty, contributed empty
+      3. no_overlap     - sig_df has zero rows
+      4. (compute aggregate via _canonical_consensus)
+      5. partial        - some requested missing
+      6. no_triggers    - aggregate has no Buy/Short
+      7. valid          - no issues
+
+    `partial` wins over `no_triggers` when both apply; the no_triggers
+    issue is also appended so operators see both reasons.
+    """
+    if missing_members is None:
+        contributed_set = set(contributed_members or [])
+        missing_members = [m for m in (requested_members or []) if m not in contributed_set]
+
+    issues = []
+    formatted_issues = []
+
+    def _emit(reason, ticker, message, action):
+        rec = _build_rejection(
+            "process", reason,
+            ticker=ticker, message=message, action=action,
+        )
+        issues.append(rec)
+        formatted_issues.append(_format_rejection(rec))
+
+    # Precedence 1: invalid_input (empty or duplicate requested members).
+    if not requested_members:
+        _emit(
+            IMPACT_MP_INPUT_INVALID, context,
+            "no requested primary tickers",
+            "enter at least one primary ticker before re-running",
+        )
+        return {
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "invalid_input",
+            "issues": issues,
+            "formatted_issues": formatted_issues,
+        }
+    # Alias-aware duplicate detection: use resolve_symbol(...)[0] as the
+    # collision key so BRK.B and BRK-B (or any other alias pair that
+    # resolves to the same vendor symbol) trip invalid_input. Operator-
+    # visible alias forms are preserved in the issue message.
+    seen_keys = {}
+    duplicate_alias_a = None
+    duplicate_alias_b = None
+    duplicate_vendor_key = None
+    for m in requested_members:
+        try:
+            vendor_key = resolve_symbol(m)[0] or m
+        except Exception:
+            vendor_key = m
+        if vendor_key in seen_keys:
+            duplicate_alias_a = seen_keys[vendor_key]
+            duplicate_alias_b = m
+            duplicate_vendor_key = vendor_key
+            break
+        seen_keys[vendor_key] = m
+    if duplicate_vendor_key is not None:
+        if duplicate_alias_a == duplicate_alias_b:
+            dup_msg = f"duplicate active primary ticker {duplicate_alias_a}"
+        else:
+            dup_msg = (
+                f"duplicate active primary aliases "
+                f"{duplicate_alias_a} and {duplicate_alias_b} "
+                f"resolve to {duplicate_vendor_key}"
+            )
+        _emit(
+            IMPACT_MP_INPUT_INVALID, context,
+            dup_msg,
+            "remove the duplicate before re-running",
+        )
+        return {
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "invalid_input",
+            "issues": issues,
+            "formatted_issues": formatted_issues,
+        }
+
+    # Precedence 2: unavailable (no contributed members).
+    if not contributed_members:
+        for m in (missing_members or list(requested_members)):
+            _emit(
+                IMPACT_MP_UNAVAILABLE, m or context,
+                "primary signal library or fetch unavailable",
+                "rebuild or refresh the primary library before re-running",
+            )
+        if not issues:
+            _emit(
+                IMPACT_MP_UNAVAILABLE, context,
+                "no contributed primaries available",
+                "ensure at least one primary library/data source is loaded",
+            )
+        return {
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "unavailable",
+            "issues": issues,
+            "formatted_issues": formatted_issues,
+        }
+
+    # Precedence 3: no_overlap (sig_df has zero rows).
+    if sig_df is None or len(sig_df.index) == 0:
+        _emit(
+            IMPACT_MP_NO_OVERLAP, context,
+            "no overlapping evaluation grid across primaries",
+            "select primaries whose data ranges overlap",
+        )
+        return {
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "no_overlap",
+            "issues": issues,
+            "formatted_issues": formatted_issues,
+        }
+
+    # Aggregate via canonical helper (no consensus reimplementation).
+    aggregate = _canonical_consensus(
+        [sig_df[c] for c in sig_df.columns]
+    )
+
+    # Precedence 4: partial (missing requested primaries).
+    is_partial = bool(missing_members)
+    if is_partial:
+        for m in missing_members:
+            _emit(
+                IMPACT_MP_PARTIAL_COVERAGE, m,
+                "primary signal library missing or empty; excluded from consensus",
+                "rebuild the primary library to restore full-coverage consensus",
+            )
+
+    # Precedence 5: no_triggers (aggregate is all None).
+    has_buy = bool((aggregate == "Buy").any())
+    has_short = bool((aggregate == "Short").any())
+    has_triggers = has_buy or has_short
+    if not has_triggers:
+        _emit(
+            IMPACT_MP_NO_TRIGGERS, context,
+            "aggregate produced no Buy/Short signals",
+            "review primary inputs or expand the evaluation window",
+        )
+
+    if is_partial:
+        status = "partial"
+    elif not has_triggers:
+        status = "no_triggers"
+    else:
+        status = "valid"
+
+    return {
+        "aggregate_signal": aggregate,
+        "status": status,
+        "issues": issues,
+        "formatted_issues": formatted_issues,
+    }
+# ---- end Phase 5B-MP-2c canonical contract surface ----
 
 
 # ---------- Max-period capability registry ----------
@@ -2475,13 +2670,21 @@ def _pick_best_library(requested_sym, fetched_sym, df):
         
     return chosen_lib, chosen_sym, chosen_acc
 
-def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=None, *, rejection_out=None):
-    """Process a single primary ticker with optional frozen analysis clock (single-download path).
+def _impactsearch_primary_signal_series_for_secondary(
+    prim_ticker, sec_df, sma_cache=None, analysis_clock=None,
+    *, rejection_out=None,
+):
+    """Phase 5B-MP-2c: produce a secondary-calendar-aligned signal series
+    for one primary, plus the metadata that batch-mode metrics rows
+    receive. Returns ``(aligned_series, meta_dict)`` on success;
+    ``(None, rejection_dict_or_empty)`` on failure.
 
-    Phase 5B Item 9: optional ``rejection_out`` dict captures structured
-    failure reason on a None return. Reasons surfaced here include the
-    forwarded fetch/coerce reasons plus ``insufficient_data`` and
-    ``no_metrics``.
+    All fetch / coerce / library-acceptance / signal-derivation /
+    grace-window-alignment behavior is preserved byte-identical to the
+    prior pre-metrics block of process_single_ticker. process_single_ticker
+    is now a thin wrapper that calls this helper and then runs
+    calculate_metrics_from_signals; aggregate-mode worker reuses this
+    helper to build the per-primary signal columns of sig_df.
     """
     requested_ticker = prim_ticker  # Keep original for transparency
     vendor_symbol, _ = resolve_symbol(prim_ticker)
@@ -2505,50 +2708,12 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             else:
                 aligned_signals = sig_series.reindex(sec_df.index).fillna('None')
 
-            # Convert to lists for compatibility with existing metrics function
-            primary_signals = aligned_signals.values.tolist()
-            primary_dates = aligned_signals.index.tolist()
-
-            # Calculate metrics using existing function
-            metrics = calculate_metrics_from_signals(
-                primary_signals,
-                primary_dates,
-                sec_df,
-                persist_skip_bars=PERSIST_SKIP_BARS
-            )
-
-            # Add ticker info
-            if metrics:
-                metrics['Primary Ticker'] = prim_ticker
-                metrics['Requested Ticker'] = requested_ticker
-                metrics['Data Source'] = 'FASTPATH'
-            else:
-                # Phase 5B Item 9 amendment: FASTPATH metrics returned
-                # None — surface PROCESS_NO_METRICS so the diagnostic
-                # contract holds on this branch too. The FASTPATH
-                # decision itself was correct (library was fresh and
-                # compatible); we just had no qualifying signal/trigger
-                # days against the secondary's calendar.
-                _populate_rejection(
-                    rejection_out, "process", PROCESS_NO_METRICS,
-                    ticker=prim_ticker,
-                    message=(
-                        f"FASTPATH calculate_metrics_from_signals "
-                        f"returned no metrics for {prim_ticker} "
-                        f"(no qualifying signal/trigger days against "
-                        f"the secondary's calendar)."
-                    ),
-                    action=(
-                        "Confirm the primary's signal library has "
-                        "trigger days overlapping the secondary's "
-                        "calendar; otherwise drop the primary or "
-                        "extend the secondary's date range."
-                    ),
-                )
-
-            # Account for fast-path usage
             FASTPATH_STATS['fastpath_used'] += 1
-            return metrics
+            return aligned_signals, {
+                'Primary Ticker': prim_ticker,
+                'Requested Ticker': requested_ticker,
+                'Data Source': 'FASTPATH',
+            }
         else:
             # Log at INFO level for better visibility
             logger.info(f"[FASTPATH:FALLBACK] {prim_ticker}: {fp_reason}")
@@ -2593,7 +2758,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                     action="Confirm the ticker is valid; retry later.",
                     retryable=True,
                 )
-        return None
+        return None, dict(rejection_out) if isinstance(rejection_out, dict) else {}
 
     # Coerce to the price basis (no second download)
     coerce_rejection = {}
@@ -2620,8 +2785,8 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                         "Inspect upstream fetch and dedupe behavior."
                     ),
                 )
-        return None
-    
+        return None, dict(rejection_out) if isinstance(rejection_out, dict) else {}
+
     # Apply session guard with the resolved type
     ttype = detect_ticker_type(fetched_symbol)
     if not is_session_complete(df, ttype, reference_now=analysis_clock, ticker=fetched_symbol):
@@ -2655,7 +2820,7 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
             ),
             details={"num_days": int(num_days)},
         )
-        return None
+        return None, dict(rejection_out) if isinstance(rejection_out, dict) else {}
     
     # Debug: Verify unique data per ticker
     logger.info(f"Ticker {prim_ticker}: {num_days} days, Close[0]={close_values[0]:.2f}, Close[-1]={close_values[-1]:.2f}")
@@ -2940,37 +3105,93 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         aligned = sig_series.reindex(sec_df.index)
     aligned = aligned.fillna('None').astype(str).str.strip()
 
+    # Phase 5B-MP-2c: helper returns the aligned series + slow-path
+    # metadata. Metrics computation now happens in the thin
+    # process_single_ticker wrapper below.
+    return aligned, {
+        'Primary Ticker': requested_ticker,  # What user asked for
+        'Resolved/Fetched': fetched_symbol,   # What Yahoo returned
+        'Library Source': library_ticker,     # Which library was used
+        'Data Source': 'SLOW_PATH',
+    }
+
+
+def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=None, *, rejection_out=None):
+    """Process a single primary ticker with optional frozen analysis clock (single-download path).
+
+    Phase 5B Item 9: optional ``rejection_out`` dict captures structured
+    failure reason on a None return. Reasons surfaced here include the
+    forwarded fetch/coerce reasons plus ``insufficient_data`` and
+    ``no_metrics``.
+
+    Phase 5B-MP-2c: signal-production logic lives in
+    ``_impactsearch_primary_signal_series_for_secondary``; this function
+    is the metrics wrapper. Public output for batch mode is byte-identical
+    for the same inputs (FASTPATH and SLOW PATH metadata keys, ordering,
+    and PROCESS_NO_METRICS rejection text are preserved).
+    """
+    aligned, meta_or_rejection = _impactsearch_primary_signal_series_for_secondary(
+        prim_ticker, sec_df,
+        sma_cache=sma_cache,
+        analysis_clock=analysis_clock,
+        rejection_out=rejection_out,
+    )
+    if aligned is None:
+        return None
+
     # Compute metrics against the SECONDARY ticker's returns (ImpactSearch semantics)
     result = calculate_metrics_from_signals(
         aligned.values.tolist(),
         aligned.index.tolist(),
         sec_df,
-        persist_skip_bars=PERSIST_SKIP_BARS
+        persist_skip_bars=PERSIST_SKIP_BARS,
     )
-    
+
+    is_fastpath = bool(meta_or_rejection.get('Data Source') == 'FASTPATH')
     if result is not None:
-        # Track all ticker names for transparency
-        result['Primary Ticker'] = requested_ticker  # What user asked for
-        result['Resolved/Fetched'] = fetched_symbol   # What Yahoo returned
-        result['Library Source'] = library_ticker      # Which library was used
-        result['Data Source'] = 'SLOW_PATH'           # Mark as slow-path result
-    else:
-        # calculate_metrics_from_signals returned None — no usable
-        # metrics for this primary against the secondary.
+        # Merge signal-production metadata (preserves prior key order:
+        # metrics keys first, then Primary Ticker / Resolved/Fetched /
+        # Library Source / Data Source from the helper).
+        result.update(meta_or_rejection)
+        return result
+
+    # calculate_metrics_from_signals returned None — surface
+    # PROCESS_NO_METRICS with path-specific message text matching prior
+    # process_single_ticker behavior.
+    if is_fastpath:
+        ticker_for_msg = meta_or_rejection.get('Primary Ticker') or prim_ticker
         _populate_rejection(
             rejection_out, "process", PROCESS_NO_METRICS,
-            ticker=prim_ticker,
+            ticker=ticker_for_msg,
+            message=(
+                f"FASTPATH calculate_metrics_from_signals "
+                f"returned no metrics for {ticker_for_msg} "
+                f"(no qualifying signal/trigger days against "
+                f"the secondary's calendar)."
+            ),
+            action=(
+                "Confirm the primary's signal library has "
+                "trigger days overlapping the secondary's "
+                "calendar; otherwise drop the primary or "
+                "extend the secondary's date range."
+            ),
+        )
+    else:
+        ticker_for_msg = meta_or_rejection.get('Resolved/Fetched') or prim_ticker
+        _populate_rejection(
+            rejection_out, "process", PROCESS_NO_METRICS,
+            ticker=ticker_for_msg,
             message=(
                 f"calculate_metrics_from_signals returned no metrics "
-                f"for {prim_ticker} (no qualifying signal/trigger days)."
+                f"for {ticker_for_msg} (no qualifying signal/trigger days)."
             ),
             action=(
                 "Confirm the primary's signal library has trigger days "
                 "overlapping the secondary's calendar."
             ),
         )
+    return None
 
-    return result
 
 def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing=False, mark_complete=True, *, rejection_out=None):
     """Process primary tickers with progress tracking and optional multiprocessing.
@@ -3341,6 +3562,334 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
 
     return metrics_list
 
+
+def process_primary_tickers_aggregate_mode(
+    secondary_ticker, primary_tickers, *,
+    use_multiprocessing=False, mark_complete=True, rejection_out=None,
+):
+    """Phase 5B-MP-2c canonical aggregate-mode worker for ImpactSearch.
+
+    Implements the locked multi_primary_contract_v1 hybrid policy
+    (§10): one canonical aggregate row per secondary built from N
+    contributed primaries via _canonical_consensus, with status +
+    formatted [IMPACTSEARCH:...] issues. Returns:
+
+        {
+            "row": dict | None,
+            "aggregate_signal": pd.Series,
+            "status": str,
+            "issues": list[dict],
+            "formatted_issues": list[str],
+        }
+
+    Aggregate mode is UI/in-memory only. This function NEVER calls
+    export_results_to_excel, ReportGenerator.generate_pdf_report, or
+    AnalysisTemplates.save_template. The raw aggregate_signal is
+    returned for tests/internal use; only ``row`` is meant to be
+    surfaced via progress_tracker. Duplicate detection happens BEFORE
+    deduplicate_tickers(...); deduplicate_tickers itself is unchanged.
+    """
+    global progress_tracker
+
+    # 1. Strip blanks/whitespace, preserve operator-visible alias forms,
+    # detect alias-aware duplicates BEFORE deduplicate_tickers. The
+    # duplicate-detection key is the vendor symbol returned by
+    # resolve_symbol so that BRK.B and BRK-B (or any future alias pair
+    # that resolves to the same vendor symbol) are flagged as a
+    # duplicate. All aggregate-mode primaries are [D] direct and unmuted
+    # in this PR.
+    raw_inputs = list(primary_tickers or [])
+    requested_members = []
+    for t in raw_inputs:
+        if t is None:
+            continue
+        t_str = str(t).strip().upper()
+        if not t_str:
+            continue
+        requested_members.append(t_str)
+
+    duplicate_alias_a = None  # operator-visible form already seen
+    duplicate_alias_b = None  # operator-visible form that collided
+    duplicate_vendor_key = None
+    if requested_members:
+        seen_keys = {}
+        for t in requested_members:
+            try:
+                vendor_key = resolve_symbol(t)[0] or t
+            except Exception:
+                vendor_key = t
+            if vendor_key in seen_keys:
+                duplicate_alias_a = seen_keys[vendor_key]
+                duplicate_alias_b = t
+                duplicate_vendor_key = vendor_key
+                break
+            seen_keys[vendor_key] = t
+
+    sec_label = str(secondary_ticker or "").strip().upper() or "?"
+
+    if not requested_members or duplicate_vendor_key is not None:
+        if duplicate_vendor_key is not None:
+            if duplicate_alias_a == duplicate_alias_b:
+                # Same operator-visible form repeated.
+                issue_msg = (
+                    f"duplicate active primary ticker {duplicate_alias_a}"
+                )
+            else:
+                issue_msg = (
+                    f"duplicate active primary aliases "
+                    f"{duplicate_alias_a} and {duplicate_alias_b} "
+                    f"resolve to {duplicate_vendor_key}"
+                )
+            issue_action = "remove the duplicate before re-running"
+        else:
+            issue_msg = "no active primary tickers"
+            issue_action = (
+                "enter at least one non-empty primary ticker before re-running"
+            )
+        rec = _build_rejection(
+            "process", IMPACT_MP_INPUT_INVALID,
+            ticker="aggregate",
+            message=issue_msg,
+            action=issue_action,
+        )
+        formatted = _format_rejection(rec)
+        _record_recent_error(formatted)
+        if isinstance(rejection_out, dict):
+            rejection_out.clear()
+            rejection_out.update(rec)
+        members_label = (
+            ",".join(requested_members) if requested_members else ""
+        )
+        row = {
+            "Primary Ticker": f"AGGREGATE({members_label})",
+            "Secondary Ticker": sec_label,
+            "Result Mode": "canonical_multi_primary_aggregate",
+            "Aggregate Members": "",
+            "Status": "invalid_input",
+            "Issues": formatted,
+        }
+        if mark_complete:
+            try:
+                progress_tracker['status'] = 'complete'
+            except Exception:
+                pass
+        return {
+            "row": row,
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "invalid_input",
+            "issues": [rec],
+            "formatted_issues": [formatted],
+        }
+
+    # 2. Resolve and fetch the secondary (mirrors process_primary_tickers
+    # semantics) so the aggregate's evaluation grid matches batch mode.
+    import pytz
+    analysis_clock = datetime.now(pytz.timezone('America/New_York'))
+    logger.info(
+        f"[AGGREGATE] Analysis clock frozen at: "
+        f"{analysis_clock.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    )
+
+    vendor_symbol_sec, _ = resolve_symbol(secondary_ticker)
+    secondary_ticker_resolved = vendor_symbol_sec
+
+    sec_fetch_rejection = {}
+    sec_raw, sec_resolved = fetch_data_raw(
+        secondary_ticker_resolved, reference_now=analysis_clock,
+        rejection_out=sec_fetch_rejection,
+    )
+    if sec_raw is None or (hasattr(sec_raw, 'empty') and sec_raw.empty):
+        rec = sec_fetch_rejection or _build_rejection(
+            "fetch", FETCH_NO_DATA, ticker=secondary_ticker_resolved,
+            message=(
+                f"Secondary {secondary_ticker_resolved} returned no data."
+            ),
+            action="Confirm the secondary ticker is valid.",
+            retryable=True,
+        )
+        formatted = _format_rejection(rec)
+        _record_recent_error(formatted)
+        if isinstance(rejection_out, dict):
+            rejection_out.clear()
+            rejection_out.update(rec)
+        row = {
+            "Primary Ticker": f"AGGREGATE({','.join(requested_members)})",
+            "Secondary Ticker": secondary_ticker_resolved,
+            "Result Mode": "canonical_multi_primary_aggregate",
+            "Aggregate Members": "",
+            "Status": "unavailable",
+            "Issues": formatted,
+        }
+        if mark_complete:
+            try:
+                progress_tracker['status'] = 'complete'
+            except Exception:
+                pass
+        return {
+            "row": row,
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "unavailable",
+            "issues": [rec],
+            "formatted_issues": [formatted],
+        }
+
+    sec_coerce_rejection = {}
+    sec_df = _coerce_to_close_frame(
+        sec_raw, preferred='Close',
+        rejection_out=sec_coerce_rejection, ticker=secondary_ticker_resolved,
+    )
+    sec_df = sec_df[~sec_df.index.duplicated(keep='last')].sort_index()
+    if sec_df.empty:
+        rec = sec_coerce_rejection or _build_rejection(
+            "coerce", COERCE_EMPTY_INPUT, ticker=secondary_ticker_resolved,
+            message=(
+                f"Coerced frame is empty for secondary "
+                f"{secondary_ticker_resolved}."
+            ),
+            action="Inspect upstream secondary fetch and dedupe behavior.",
+        )
+        formatted = _format_rejection(rec)
+        _record_recent_error(formatted)
+        if isinstance(rejection_out, dict):
+            rejection_out.clear()
+            rejection_out.update(rec)
+        row = {
+            "Primary Ticker": f"AGGREGATE({','.join(requested_members)})",
+            "Secondary Ticker": secondary_ticker_resolved,
+            "Result Mode": "canonical_multi_primary_aggregate",
+            "Aggregate Members": "",
+            "Status": "unavailable",
+            "Issues": formatted,
+        }
+        if mark_complete:
+            try:
+                progress_tracker['status'] = 'complete'
+            except Exception:
+                pass
+        return {
+            "row": row,
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "unavailable",
+            "issues": [rec],
+            "formatted_issues": [formatted],
+        }
+
+    sec_type = detect_ticker_type(sec_resolved)
+    if not is_session_complete(sec_df, sec_type, reference_now=analysis_clock, ticker=sec_resolved):
+        sec_df = sec_df.iloc[:-1]
+    sec_df = apply_strict_parity(sec_df)
+
+    # 3. Per-primary signal series via the shared production helper.
+    contributed_members = []
+    missing_members = []
+    aligned_map = {}
+    sma_cache = {}
+    for prim in requested_members:
+        per_rejection = {}
+        aligned, meta_or_rej = _impactsearch_primary_signal_series_for_secondary(
+            prim, sec_df,
+            sma_cache=sma_cache,
+            analysis_clock=analysis_clock,
+            rejection_out=per_rejection,
+        )
+        if aligned is None:
+            missing_members.append(prim)
+            if per_rejection:
+                _record_recent_error(_format_rejection(per_rejection))
+            continue
+        contributed_members.append(prim)
+        aligned_map[prim] = aligned
+
+    # 4. Build sig_df from contributed members only. Missing primaries
+    # are NEVER added as all-None series; they remain absent and the
+    # contract surfaces them as partial-coverage.
+    if contributed_members:
+        sig_df = pd.DataFrame(aligned_map)
+    else:
+        sig_df = pd.DataFrame()
+
+    # 5. Compute the locked contract status + aggregate via the local
+    # contract helper (which delegates to _canonical_consensus).
+    contract = _impactsearch_multi_primary_contract_result(
+        sig_df,
+        requested_members=requested_members,
+        contributed_members=contributed_members,
+        missing_members=missing_members,
+        context="multi-primary",
+    )
+    aggregate_signal = contract["aggregate_signal"]
+    status = contract["status"]
+    issues = list(contract["issues"])
+    formatted_issues = list(contract["formatted_issues"])
+
+    # 6. Compute metrics from the aggregate signal when defined.
+    metrics = None
+    if not aggregate_signal.empty:
+        try:
+            metrics = calculate_metrics_from_signals(
+                aggregate_signal.values.tolist(),
+                aggregate_signal.index.tolist(),
+                sec_df,
+                persist_skip_bars=PERSIST_SKIP_BARS,
+            )
+        except Exception as e:
+            agg_rec = _build_rejection(
+                "process", IMPACT_MP_AGGREGATION_FAILED,
+                ticker="aggregate",
+                message=(
+                    f"aggregate metric computation raised "
+                    f"{type(e).__name__}: {e}"
+                ),
+                action="inspect logs",
+                details={"exception_type": type(e).__name__},
+            )
+            issues.append(agg_rec)
+            formatted_issues.append(_format_rejection(agg_rec))
+            metrics = None
+
+    # 7. Surface diagnostics on recent_errors and the caller dict.
+    for f in formatted_issues:
+        _record_recent_error(f)
+    if isinstance(rejection_out, dict) and issues:
+        rejection_out.clear()
+        rejection_out.update(issues[0])
+
+    # 8. Build the single aggregate row. NEVER includes the raw
+    # aggregate_signal series; that stays in the helper return for
+    # tests/internal use only.
+    members_label = (
+        ",".join(contributed_members)
+        if contributed_members else ",".join(requested_members)
+    )
+    primary_label = f"AGGREGATE({members_label})"
+    row = {
+        "Primary Ticker": primary_label,
+        "Secondary Ticker": secondary_ticker_resolved,
+        "Result Mode": "canonical_multi_primary_aggregate",
+        "Aggregate Members": ", ".join(contributed_members),
+        "Status": status,
+        "Issues": " | ".join(formatted_issues),
+    }
+    if metrics:
+        for k, v in metrics.items():
+            if k not in row:
+                row[k] = v
+
+    if mark_complete:
+        try:
+            progress_tracker['status'] = 'complete'
+        except Exception:
+            pass
+
+    return {
+        "row": row,
+        "aggregate_signal": aggregate_signal,
+        "status": status,
+        "issues": issues,
+        "formatted_issues": formatted_issues,
+    }
+
+
 # Create Dash app
 # --- UI: price-basis banner (raw Close only, spec v0.5 §3) ---
 _BASIS_TEXT = 'Close'
@@ -3364,7 +3913,7 @@ app.layout = dbc.Container([
         dbc.Col([
             html.H1("Impact Analysis Tool", 
                    style={'color': '#00ff41', 'textShadow': '0 0 10px rgba(0, 255, 65, 0.5)'}),
-            html.P("Analyze the impact of primary tickers on secondary ticker performance using SMA-based signals",
+            html.P("Analyze batch primary effects or opt into canonical multi-primary consensus against secondary ticker performance.",
                   style={'color': '#aaa'}),
             html.Div(
                 [
@@ -3390,7 +3939,7 @@ app.layout = dbc.Container([
                     dbc.Row([
                         dbc.Col([
                             html.Label("Primary Tickers", style={'color': '#00ff41'}),
-                            html.P("Enter comma-separated tickers (e.g., AAPL, MSFT, GOOGL)", 
+                            html.P("Enter comma-separated tickers. Batch mode evaluates each primary independently; canonical aggregate mode combines non-None unanimous primary signals under Algorithm Spec 18.",
                                   style={'fontSize': '0.8rem', 'color': '#888'}),
                             dbc.Textarea(
                                 id='primary-tickers-input',
@@ -3399,6 +3948,28 @@ app.layout = dbc.Container([
                                       'border': '1px solid #00ff41', 'color': '#fff'},
                                 className='mb-3'
                             ),
+                            # Phase 5B-MP-2c: hybrid multi-primary mode
+                            # control. Default is batch (preserves existing
+                            # behavior); aggregate is opt-in only and
+                            # routes through process_primary_tickers_aggregate_mode.
+                            html.Div([
+                                html.Label(
+                                    "Primary mode",
+                                    style={'color': '#00ff41', 'fontSize': '0.8rem',
+                                           'marginRight': '8px'},
+                                ),
+                                dbc.RadioItems(
+                                    id='multi-primary-mode',
+                                    options=[
+                                        {"label": "Batch evaluation across primaries", "value": "batch"},
+                                        {"label": "Canonical multi-primary aggregate", "value": "aggregate"},
+                                    ],
+                                    value="batch",
+                                    inline=True,
+                                    labelStyle={'color': '#aaa', 'marginRight': '12px'},
+                                    inputStyle={'marginRight': '4px'},
+                                ),
+                            ], className='mb-3'),
                             # Preset ticker lists - consistent styling
                             dbc.ButtonGroup([
                                 dbc.Button("Tech Giants", id='preset-tech', color='primary', size='sm', outline=True),
@@ -3737,9 +4308,10 @@ def handle_presets(tech_clicks, sp10_clicks, crypto_clicks, clear_clicks, mega_c
     [Input('process-button', 'n_clicks')],
     [State('primary-tickers-input', 'value'),
      State('secondary-ticker-input', 'value'),
-     State('analysis-options', 'value')]
+     State('analysis-options', 'value'),
+     State('multi-primary-mode', 'value')]
 )
-def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis_options):
+def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis_options, multi_primary_mode):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     
@@ -3762,6 +4334,12 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
     generate_pdf = 'pdf' in analysis_options
     save_template = 'save_template' in analysis_options
     show_metrics = 'show_metrics' in analysis_options
+
+    # Phase 5B-MP-2c: hybrid mode switch. Default is batch (locked
+    # multi_primary_contract_v1 §10 hybrid policy preserves existing
+    # behavior); operator opts into canonical aggregate mode via the
+    # multi-primary-mode RadioItems control.
+    mode = multi_primary_mode or "batch"
 
     # Reset progress tracker (multi-secondary batch state)
     global progress_tracker
@@ -3798,6 +4376,24 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
                 # Check if output file exists BEFORE processing (to determine new vs updated)
                 out_path = f"output/impactsearch/{sec}_analysis.xlsx"
                 file_existed_before_processing = os.path.exists(out_path)
+
+                # Phase 5B-MP-2c: aggregate mode is UI/in-memory only.
+                # Skip XLSX/PDF/template options regardless of whether
+                # they were checked in the analysis-options panel.
+                if mode == "aggregate":
+                    agg_result = process_primary_tickers_aggregate_mode(
+                        sec, primary_tickers,
+                        use_multiprocessing=use_multiprocessing,
+                        mark_complete=False,
+                    )
+                    if agg_result and agg_result.get("row"):
+                        with progress_lock:
+                            progress_tracker['results'].append(agg_result["row"])
+                            progress_tracker['results_timestamp'] = time.time()
+                    else:
+                        with progress_lock:
+                            progress_tracker['tickers_not_found'].append(sec)
+                    continue
 
                 # Run WITHOUT closing the progress loop between secondaries
                 results = process_primary_tickers(sec, primary_tickers, use_multiprocessing, mark_complete=False)
