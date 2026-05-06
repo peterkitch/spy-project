@@ -66,6 +66,162 @@ RESULTS_FLUSH_COUNT = int(os.environ.get("IMPACT_RESULTS_FLUSH_COUNT", "2500"))
 LIGHT_SUMMARY = os.environ.get("IMPACT_LIGHT_SUMMARY", "1").lower() in ("1", "true", "on", "yes")
 os.makedirs(LOGS_ROOT, exist_ok=True)
 
+# ==============================================================================
+# Phase 5B Item 9: structured rejection diagnostics
+# ==============================================================================
+#
+# Local duplication of the OnePass Item 7 helpers with the prefix
+# ``[IMPACTSEARCH:...]`` instead of ``[ONEPASS:...]``. Shared extraction
+# into a common module is intentionally deferred to a future cleanup PR
+# (Codex Option C); each engine carries its own copy so the cross-app
+# reconciliation is achieved at the operator-string level (matching
+# reason codes) rather than at the import-graph level.
+#
+# Schema:
+#   - stage:    "load" | "fetch" | "coerce" | "process" | "export"
+#   - reason:   stable string code (constants below)
+#   - ticker:   the ticker / context being processed (best-effort)
+#   - message:  one-sentence operator-facing explanation
+#   - action:   one-sentence remediation guidance
+#   - retryable: bool
+#   - path:     optional filesystem path
+#   - details:  optional dict of extras
+
+# Reason codes -- LOAD stage (mirror OnePass literal strings where the
+# failure mode is identical so the cross-app taxonomy stays consistent).
+LOAD_MISSING_LIBRARY = "missing_library"
+LOAD_CORRUPT_LIBRARY = "corrupt_library"
+LOAD_INVALID_LIBRARY_FORMAT = "invalid_library_format"
+LOAD_MANIFEST_FAILED = "manifest_failed"
+LOAD_VERSION_MISMATCH = "version_mismatch"
+LOAD_EXCEPTION = "load_exception"
+
+# Reason codes -- FETCH stage
+FETCH_INVALID_TICKER = "invalid_ticker"
+FETCH_UNSUPPORTED_PERIOD = "unsupported_period"
+FETCH_NO_DATA = "no_data"
+FETCH_RATE_LIMITED = "rate_limited"
+FETCH_YFINANCE_EXCEPTION = "yfinance_exception"
+
+# Reason codes -- COERCE stage
+COERCE_EMPTY_INPUT = "empty_input"
+COERCE_AMBIGUOUS_PRICE_COLUMNS = "ambiguous_price_columns"
+COERCE_MISSING_CLOSE_COLUMN = "missing_close_column"
+
+# Reason codes -- PROCESS stage
+PROCESS_INSUFFICIENT_DATA = "insufficient_data"
+PROCESS_NO_METRICS = "no_metrics"
+PROCESS_WORKER_EXCEPTION = "worker_exception"
+
+# Reason codes -- EXPORT stage
+EXPORT_XLSX_MANIFEST_FAILED = "xlsx_manifest_failed"
+
+# Heuristic indicators for yfinance rate-limit detection.
+_RATE_LIMIT_INDICATORS = (
+    "rate limit",
+    "rate-limit",
+    "rate_limit",
+    "429",
+    "too many requests",
+)
+
+
+def _build_rejection(stage, reason, *, ticker=None, message="",
+                     action="", retryable=False, path=None, details=None):
+    """Build a structured rejection record. Schema-stable for tests."""
+    rec = {
+        "stage": str(stage),
+        "reason": str(reason),
+        "ticker": ticker,
+        "message": str(message),
+        "action": str(action),
+        "retryable": bool(retryable),
+    }
+    if path is not None:
+        rec["path"] = str(path)
+    if details is not None:
+        rec["details"] = details
+    return rec
+
+
+def _format_rejection(rec):
+    """Render a rejection record as a single operator-facing line."""
+    if not isinstance(rec, dict) or not rec:
+        return ""
+    return (
+        f"[IMPACTSEARCH:{rec.get('reason', 'unknown')}] "
+        f"{rec.get('ticker') or '?'}: "
+        f"{rec.get('message') or 'no message'}. "
+        f"Action: {rec.get('action') or 'none'}."
+    )
+
+
+def _populate_rejection(rejection_out, stage, reason, **kwargs):
+    """If ``rejection_out`` is a dict, fill it with a rejection record.
+
+    No-op when None. Returns the formatted string so callers can route
+    it directly into log records or progress trackers.
+    """
+    rec = _build_rejection(stage, reason, **kwargs)
+    if isinstance(rejection_out, dict):
+        rejection_out.clear()
+        rejection_out.update(rec)
+    return _format_rejection(rec)
+
+
+def _classify_yfinance_exception(exc):
+    """Heuristic: classify a yfinance exception as ``rate_limited``
+    (retryable) or ``yfinance_exception`` (non-retryable) by scanning
+    the message text for known rate-limit indicators. Conservative —
+    matches only well-known phrases.
+    """
+    text = (str(exc) or "").lower()
+    if any(needle in text for needle in _RATE_LIMIT_INDICATORS):
+        return FETCH_RATE_LIMITED, True
+    return FETCH_YFINANCE_EXCEPTION, False
+
+
+# Maximum number of recent error strings retained on the progress
+# tracker for operator display. Older entries are dropped.
+_PROGRESS_TRACKER_MAX_RECENT_ERRORS = 25
+
+
+def _record_recent_error(msg):
+    """Append a formatted error string to ``progress_tracker['recent_errors']``
+    under the lock, capped at ``_PROGRESS_TRACKER_MAX_RECENT_ERRORS``.
+    No-op if the global ``progress_tracker`` or ``progress_lock`` are
+    not yet initialised.
+    """
+    if not msg:
+        return
+    try:
+        tracker = globals().get("progress_tracker")
+        lock = globals().get("progress_lock")
+        if tracker is None:
+            return
+        if lock is not None:
+            with lock:
+                _append_capped_error(tracker, msg)
+        else:
+            _append_capped_error(tracker, msg)
+    except Exception:
+        # Diagnostic-surface helpers must never themselves raise.
+        pass
+
+
+def _append_capped_error(tracker, msg):
+    if not isinstance(tracker, dict):
+        return
+    bucket = tracker.get("recent_errors")
+    if not isinstance(bucket, list):
+        bucket = []
+        tracker["recent_errors"] = bucket
+    bucket.append(str(msg))
+    overflow = len(bucket) - _PROGRESS_TRACKER_MAX_RECENT_ERRORS
+    if overflow > 0:
+        del bucket[:overflow]
+
+
 # ---------- Max-period capability registry ----------
 PERIOD_CAPABILITY_CACHE_PATH = os.path.join(CACHE_ROOT, 'period_capabilities.json')
 PERIOD_RECHECK_DAYS = 30  # 30-day hold period as requested
@@ -349,7 +505,11 @@ progress_tracker = {
     'results': [],
     'status': 'idle',
     'show_metrics': False,
-    'excel_path': None
+    'excel_path': None,
+    # Phase 5B Item 9: bounded list of formatted [IMPACTSEARCH:*]
+    # error strings so the operator UI can show specific failure
+    # reasons instead of an opaque count or silent absence.
+    'recent_errors': []
 }
 
 def safe_divide(numerator, denominator, default=0):
@@ -1143,18 +1303,24 @@ def _lib_path_for(ticker):
     filename = f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"
     return os.path.join(stable_dir, filename)
 
-def load_signal_library(ticker):
+def load_signal_library(ticker, *, rejection_out=None):
     """
     Load Signal Library for a ticker from onepass.py's saved signals.
     Returns the signal data if found, None otherwise.
     Tries both new (dot) and old (dash) naming conventions for backward compatibility.
+
+    Phase 5B Item 9: optional ``rejection_out`` dict captures the
+    structured failure reason on a None return. Mirrors the OnePass
+    Item 7 contract; reason codes are identical for matching failure
+    modes (manifest_failed, corrupt_library, etc.) so cross-app
+    operators see consistent diagnostics.
     """
     try:
         # Try both new naming (with dots) and old naming (with dashes)
         candidates = [ticker]
         if '.' in ticker:
             candidates.append(ticker.replace('.', '-'))  # Old naming convention
-        
+
         for candidate in candidates:
             filepath = _lib_path_for(candidate)
 
@@ -1187,6 +1353,20 @@ def load_signal_library(ticker):
                             logger.error(
                                 f"Failed to quarantine corrupt library: {exc}"
                             )
+                        _populate_rejection(
+                            rejection_out, "load", LOAD_CORRUPT_LIBRARY,
+                            ticker=ticker, path=filepath,
+                            message=(
+                                f"Signal library at {filepath} is corrupt "
+                                f"({load_err[1]}); quarantined to .corrupt."
+                            ),
+                            action=(
+                                "Rebuild via OnePass for this ticker."
+                            ),
+                            retryable=True,
+                            details={"load_error": load_err[1],
+                                     "load_message": load_err[2]},
+                        )
                         continue
                     if any(m[0] == "type_error" for m in _vresult.mismatches):
                         type_err = next(
@@ -1197,10 +1377,32 @@ def load_signal_library(ticker):
                             f"Invalid signal library format for {ticker}: "
                             f"expected {type_err[1]}, got {type_err[2]}"
                         )
+                        _populate_rejection(
+                            rejection_out, "load", LOAD_INVALID_LIBRARY_FORMAT,
+                            ticker=ticker, path=filepath,
+                            message=(
+                                f"Library at {filepath} has wrong type "
+                                f"(expected {type_err[1]}, got {type_err[2]})."
+                            ),
+                            action=(
+                                "Quarantine or delete the file and rebuild."
+                            ),
+                            details={"expected": type_err[1],
+                                     "actual": type_err[2]},
+                        )
                         continue
                     logger.error(
                         f"Failed to load Signal Library for {ticker}: "
                         f"{_vresult.mismatches}"
+                    )
+                    _populate_rejection(
+                        rejection_out, "load", LOAD_EXCEPTION,
+                        ticker=ticker, path=filepath,
+                        message=(
+                            f"Verified loader rejected library at {filepath}."
+                        ),
+                        action="Inspect logs and rebuild if recoverable.",
+                        details={"mismatches": list(_vresult.mismatches)},
                     )
                     continue
 
@@ -1214,6 +1416,18 @@ def load_signal_library(ticker):
                         f"{ticker}: provenance manifest mismatch at "
                         f"{filepath}: {_vresult.mismatches}. Treating as "
                         f"missing library."
+                    )
+                    _populate_rejection(
+                        rejection_out, "load", LOAD_MANIFEST_FAILED,
+                        ticker=ticker, path=filepath,
+                        message=(
+                            f"Provenance manifest mismatch at {filepath}."
+                        ),
+                        action=(
+                            "Rebuild the library so the new content_hash "
+                            "matches the manifest."
+                        ),
+                        details={"mismatches": list(_vresult.mismatches)},
                     )
                     return None
 
@@ -1233,17 +1447,61 @@ def load_signal_library(ticker):
                     if 'primary_signals' in signal_data:
                         logger.info(f"  Enhanced V2 format detected with {len(signal_data['primary_signals'])} signals")
 
+                    # Phase 5B Item 9 amendment (mirrors Item 7): clear
+                    # any stale rejection from a prior candidate
+                    # iteration so a successful fallback load doesn't
+                    # leave a "rejected" diagnostic behind.
+                    if isinstance(rejection_out, dict):
+                        rejection_out.clear()
                     return signal_data
                 else:
                     logger.warning(f"Signal Library rejected for {ticker} due to version/config mismatch")
+                    _populate_rejection(
+                        rejection_out, "load", LOAD_VERSION_MISMATCH,
+                        ticker=ticker, path=filepath,
+                        message=(
+                            f"Library at {filepath} is incompatible: "
+                            f"engine_version={stored_version!r} "
+                            f"vs expected {ENGINE_VERSION!r}, "
+                            f"max_sma_day={stored_max_sma!r} "
+                            f"vs expected {MAX_SMA_DAY!r}."
+                        ),
+                        action="Rebuild under the current engine version.",
+                        details={
+                            "library_engine_version": stored_version,
+                            "library_max_sma_day": stored_max_sma,
+                            "expected_engine_version": ENGINE_VERSION,
+                            "expected_max_sma_day": MAX_SMA_DAY,
+                        },
+                    )
                     return None
-        
-        # No library found in any location
+
+        # No library found in any location.
+        # Preserve any per-candidate rejection from the loop (corrupt /
+        # invalid format / load_exception) rather than overwriting with
+        # a generic missing_library at fallthrough.
         logger.debug(f"No Signal Library found for {ticker}")
+        if not (isinstance(rejection_out, dict) and rejection_out):
+            _populate_rejection(
+                rejection_out, "load", LOAD_MISSING_LIBRARY,
+                ticker=ticker,
+                message=f"No Signal Library on disk for {ticker}.",
+                action=(
+                    "Run OnePass to build the library; this is normal "
+                    "on first run."
+                ),
+            )
         return None
-            
+
     except Exception as e:
         logger.error(f"Error loading Signal Library for {ticker}: {e}")
+        _populate_rejection(
+            rejection_out, "load", LOAD_EXCEPTION,
+            ticker=ticker,
+            message=f"Unhandled exception loading library: {type(e).__name__}: {e}",
+            action="Inspect logs and rebuild if recoverable.",
+            details={"exception_type": type(e).__name__},
+        )
         return None
 
 def is_session_complete(*args, **kwargs):
@@ -1273,24 +1531,51 @@ def _extract_resolved_symbol(df_raw, requested):
             resolved = list(set(lvl0))[0].upper()
     return resolved
 
-def fetch_data_raw(ticker, max_retries=3, reference_now=None):
+def fetch_data_raw(ticker, max_retries=3, reference_now=None, *, rejection_out=None):
     """
     Single yfinance download in group_by='ticker' so the resolved symbol is present.
     Returns (df_raw, resolved_symbol); caller is responsible for coercion and session-guard.
     Note: `reference_now` is reserved for future use (kept for API symmetry).
+
+    Phase 5B Item 9: optional ``rejection_out`` dict captures structured
+    failure reason on the (empty-df, ticker) sentinel return —
+    ``invalid_ticker`` / ``unsupported_period`` / ``no_data`` /
+    ``rate_limited`` / ``yfinance_exception``.
     """
-    if not ticker or not ticker.strip():
+    if not ticker or not str(ticker).strip():
+        _populate_rejection(
+            rejection_out, "fetch", FETCH_INVALID_TICKER,
+            ticker=ticker,
+            message="ticker symbol is blank or empty",
+            action="provide a non-empty ticker symbol",
+            retryable=False,
+        )
         return pd.DataFrame(), ticker
     vendor_symbol, _ = resolve_symbol(ticker)
     ticker = vendor_symbol  # Use resolved symbol for all operations
-    
+
     # Fast-skip if we've recently confirmed 'max' is unsupported (unless override)
     if PERIOD_REGISTRY.get_status(ticker) == 'no_max' and not PERIOD_FORCE_RECHECK:
         last = PERIOD_REGISTRY.get_last_checked(ticker)
         logger.info(f"Skipping {ticker}: 'max' period unsupported (cached as of {last}). "
                     f"Recheck after {PERIOD_REGISTRY.recheck_days}d or set IMPACTSEARCH_FORCE_RECHECK_MAX=1.")
+        _populate_rejection(
+            rejection_out, "fetch", FETCH_UNSUPPORTED_PERIOD,
+            ticker=ticker,
+            message=(
+                f"yfinance 'max' period unsupported for {ticker} "
+                f"(cached as of {last})."
+            ),
+            action=(
+                f"Wait {PERIOD_REGISTRY.recheck_days}d for the cache to "
+                f"recheck, or set IMPACTSEARCH_FORCE_RECHECK_MAX=1."
+            ),
+            retryable=False,
+            details={"last_checked": str(last)},
+        )
         return pd.DataFrame(), ticker
-    
+
+    last_exception = None
     for attempt in range(max_retries):
         try:
             logger.info(f"Fetching data for {ticker} (attempt {attempt+1}/{max_retries})...")
@@ -1303,17 +1588,30 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
                         auto_adjust=False, timeout=10, threads=False, group_by='ticker'
                     )
                 noisy = (_buf_out.getvalue().strip() or _buf_err.getvalue().strip())
-                
+
                 # Check for InvalidPeriod error specifically
                 if noisy and ("YFInvalidPeriodError" in noisy or "Period 'max' is invalid" in noisy or "period 'max' is invalid" in noisy.lower()):
                     logger.warning(noisy)
                     PERIOD_REGISTRY.set_status(ticker, supports=False, reason='YFInvalidPeriodError')
                     logger.info(f"Detected unsupported 'max' for {ticker}. Marked in cache for {PERIOD_REGISTRY.recheck_days}d.")
+                    _populate_rejection(
+                        rejection_out, "fetch", FETCH_UNSUPPORTED_PERIOD,
+                        ticker=ticker,
+                        message=(
+                            f"yfinance refused 'max' period for {ticker} "
+                            f"(YFInvalidPeriodError detected this run)."
+                        ),
+                        action=(
+                            f"Cached for {PERIOD_REGISTRY.recheck_days}d; "
+                            f"force a recheck via IMPACTSEARCH_FORCE_RECHECK_MAX=1."
+                        ),
+                        retryable=False,
+                    )
                     return pd.DataFrame(), ticker
                 elif noisy:
                     # Surface other warnings as normal
                     logger.warning(noisy)
-                    
+
             if df_raw.empty:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
@@ -1322,6 +1620,20 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
                     continue
                 else:
                     logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
+                    _populate_rejection(
+                        rejection_out, "fetch", FETCH_NO_DATA,
+                        ticker=ticker,
+                        message=(
+                            f"yfinance returned empty data for {ticker} "
+                            f"after {max_retries} attempts."
+                        ),
+                        action=(
+                            "Confirm the ticker is valid on Yahoo "
+                            "Finance; retry later if the symbol is "
+                            "known good."
+                        ),
+                        retryable=True,
+                    )
                     return pd.DataFrame(), ticker
             # Success! Mark as supporting 'max' period
             df_raw.index = pd.to_datetime(df_raw.index).tz_localize(None)
@@ -1332,27 +1644,78 @@ def fetch_data_raw(ticker, max_retries=3, reference_now=None):
             PERIOD_REGISTRY.set_status(ticker, supports=True, reason='successful_fetch')
             return df_raw, resolved
         except Exception as e:
+            last_exception = e
             logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
             if attempt == max_retries - 1:
                 logger.error(f"All retries exhausted for {ticker}: {e}")
+                reason, retryable = _classify_yfinance_exception(e)
+                _populate_rejection(
+                    rejection_out, "fetch", reason,
+                    ticker=ticker,
+                    message=(
+                        f"yfinance fetch failed for {ticker} after "
+                        f"{max_retries} attempts: "
+                        f"{type(e).__name__}: {e}"
+                    ),
+                    action=(
+                        "Wait and retry once rate limits clear."
+                        if reason == FETCH_RATE_LIMITED else
+                        "Inspect logs; verify yfinance/network "
+                        "connectivity."
+                    ),
+                    retryable=retryable,
+                    details={"exception_type": type(e).__name__},
+                )
                 return pd.DataFrame(), ticker
             wait_time = 2 ** attempt
             if attempt < max_retries - 1:
                 logger.info(f"Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
+    # Defensive fallthrough: classify last_exception or no_data.
+    if last_exception is not None:
+        reason, retryable = _classify_yfinance_exception(last_exception)
+        _populate_rejection(
+            rejection_out, "fetch", reason,
+            ticker=ticker,
+            message=(
+                f"yfinance fetch failed for {ticker}: "
+                f"{type(last_exception).__name__}: {last_exception}"
+            ),
+            action="Inspect logs and retry.",
+            retryable=retryable,
+        )
+    else:
+        _populate_rejection(
+            rejection_out, "fetch", FETCH_NO_DATA,
+            ticker=ticker,
+            message=f"yfinance fetch returned empty for {ticker}.",
+            action="Confirm the ticker exists; retry later.",
+            retryable=True,
+        )
     return pd.DataFrame(), ticker
 
-def _coerce_to_close_frame(df, preferred=None):
+def _coerce_to_close_frame(df, preferred=None, *, rejection_out=None, ticker=None):
     """
     Helper function to handle various column structures from yfinance.
     Ensures we always get a clean DataFrame with a single 'Close' column.
 
     Args:
         df: DataFrame from yfinance
-        preferred: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
+        preferred: ignored. Always raw 'Close' (spec v0.5 Section 3, ledger Entry 1).
+
+    Phase 5B Item 9: optional ``rejection_out`` + ``ticker`` populate a
+    structured failure reason on the empty-DataFrame sentinel return —
+    ``empty_input`` / ``ambiguous_price_columns`` /
+    ``missing_close_column``.
     """
     preferred = 'Close'
     if df is None or df.empty:
+        _populate_rejection(
+            rejection_out, "coerce", COERCE_EMPTY_INPUT,
+            ticker=ticker,
+            message="Input DataFrame is None or empty before coercion.",
+            action="Inspect upstream fetch; coercion needs at least one row.",
+        )
         return pd.DataFrame()
 
     # Handle MultiIndex columns (yfinance sometimes returns MI)
@@ -1378,6 +1741,20 @@ def _coerce_to_close_frame(df, preferred=None):
         # If multiple tickers present, fail loud to avoid accidental cross-ticker selection
         if (preferred in lvl0 and len(u1) > 1) or (preferred in lvl1 and len(u0) > 1):
             logger.error("MultiIndex contains multiple tickers; refusing ambiguous selection")
+            _populate_rejection(
+                rejection_out, "coerce", COERCE_AMBIGUOUS_PRICE_COLUMNS,
+                ticker=ticker,
+                message=(
+                    "yfinance returned a MultiIndex containing multiple "
+                    "tickers; refusing ambiguous price-column selection."
+                ),
+                action=(
+                    "Fetch one ticker at a time so the resulting frame "
+                    "has a single Close column."
+                ),
+                details={"level0_unique": sorted(set(lvl0)),
+                         "level1_unique": sorted(set(lvl1))},
+            )
             return pd.DataFrame()
 
     # Handle flat columns - exact match only (no substring scans)
@@ -1388,25 +1765,49 @@ def _coerce_to_close_frame(df, preferred=None):
 
     # STRICT: Do not cross-basis fallback
     logger.error("No exact price column found matching preferred basis; returning empty")
+    _populate_rejection(
+        rejection_out, "coerce", COERCE_MISSING_CLOSE_COLUMN,
+        ticker=ticker,
+        message=(
+            "Input frame has no 'Close' column matching the canonical "
+            "price basis."
+        ),
+        action=(
+            "Confirm the upstream fetch returned a Close column; check "
+            "yfinance API contract for this ticker."
+        ),
+        details={"available_columns": [str(c) for c in df.columns]},
+    )
     return pd.DataFrame()
 
-def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, reference_now=None, price_source=None):
+def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, reference_now=None, price_source=None, *, rejection_out=None):
     """
     Fetch data with optional caching support
-    
+
     Args:
         ticker: The ticker symbol to fetch
         use_cache: Whether to use cached data if available
         max_retries: Number of retry attempts
         return_symbol: If True, return tuple (df, resolved_ticker)
         reference_now: Optional fixed timestamp for consistent session checks
-        price_source: ignored. Always raw 'Close' (spec v0.5 §3, ledger Entry 1).
+        price_source: ignored. Always raw 'Close' (spec v0.5 Section 3, ledger Entry 1).
 
     Returns:
         DataFrame or tuple (DataFrame, resolved_ticker) if return_symbol=True
+
+    Phase 5B Item 9: optional ``rejection_out`` dict captures structured
+    failure reason on every empty-frame sentinel return (mirrors
+    fetch_data_raw plus internal coerce paths).
     """
     price_source = 'Close'
-    if not ticker or not ticker.strip():
+    if not ticker or not str(ticker).strip():
+        _populate_rejection(
+            rejection_out, "fetch", FETCH_INVALID_TICKER,
+            ticker=ticker,
+            message="ticker symbol is blank or empty",
+            action="provide a non-empty ticker symbol",
+            retryable=False,
+        )
         if return_symbol:
             return pd.DataFrame(), ticker
         return pd.DataFrame()
@@ -1416,13 +1817,27 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
     if original and original.strip().upper() != vendor_symbol:
         logger.info(f"Resolved ticker: {original.strip()} -> {vendor_symbol}")
     ticker = vendor_symbol  # Use vendor symbol for all operations
-    
+
     # Fast-skip if we've recently confirmed 'max' is unsupported (unless override)
     if PERIOD_REGISTRY.get_status(ticker) == 'no_max' and not PERIOD_FORCE_RECHECK:
         last = PERIOD_REGISTRY.get_last_checked(ticker)
         msg = (f"Skipping {ticker}: 'max' period unsupported (cached as of {last}). "
                f"Recheck after {PERIOD_REGISTRY.recheck_days}d or set IMPACTSEARCH_FORCE_RECHECK_MAX=1.")
         logger.info(msg)
+        _populate_rejection(
+            rejection_out, "fetch", FETCH_UNSUPPORTED_PERIOD,
+            ticker=ticker,
+            message=(
+                f"yfinance 'max' period unsupported for {ticker} "
+                f"(cached as of {last})."
+            ),
+            action=(
+                f"Wait {PERIOD_REGISTRY.recheck_days}d for the cache to "
+                f"recheck, or set IMPACTSEARCH_FORCE_RECHECK_MAX=1."
+            ),
+            retryable=False,
+            details={"last_checked": str(last)},
+        )
         if return_symbol:
             return pd.DataFrame(), ticker
         return pd.DataFrame()
@@ -1456,12 +1871,24 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
                     logger.warning(noisy)
                     PERIOD_REGISTRY.set_status(ticker, supports=False, reason='YFInvalidPeriodError')
                     logger.info(f"Detected unsupported 'max' for {ticker}. Marked in cache for {PERIOD_REGISTRY.recheck_days}d.")
+                    _populate_rejection(
+                        rejection_out, "fetch", FETCH_UNSUPPORTED_PERIOD,
+                        ticker=ticker,
+                        message=(
+                            f"yfinance refused 'max' period for {ticker}."
+                        ),
+                        action=(
+                            f"Cached for {PERIOD_REGISTRY.recheck_days}d; "
+                            f"force a recheck via IMPACTSEARCH_FORCE_RECHECK_MAX=1."
+                        ),
+                        retryable=False,
+                    )
                     if return_symbol:
                         return pd.DataFrame(), ticker
                     return pd.DataFrame()
                 elif noisy:
                     logger.warning(noisy)
-                    
+
             if df.empty:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
@@ -1470,6 +1897,18 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
                     continue
                 else:
                     logger.warning(f"No data returned for {ticker} after {max_retries} attempts.")
+                    _populate_rejection(
+                        rejection_out, "fetch", FETCH_NO_DATA,
+                        ticker=ticker,
+                        message=(
+                            f"yfinance returned empty data for {ticker} "
+                            f"after {max_retries} attempts."
+                        ),
+                        action=(
+                            "Confirm the ticker is valid; retry later."
+                        ),
+                        retryable=True,
+                    )
                     if return_symbol:
                         return pd.DataFrame(), ticker
                     return pd.DataFrame()
@@ -1504,17 +1943,58 @@ def fetch_data(ticker, use_cache=True, max_retries=3, return_symbol=False, refer
                 time.sleep(wait_time)
             else:
                 logger.error(f"All retries exhausted for {ticker}: {e}")
+                reason, retryable = _classify_yfinance_exception(e)
+                _populate_rejection(
+                    rejection_out, "fetch", reason,
+                    ticker=ticker,
+                    message=(
+                        f"yfinance fetch failed for {ticker} after "
+                        f"{max_retries} attempts: "
+                        f"{type(e).__name__}: {e}"
+                    ),
+                    action=(
+                        "Wait and retry once rate limits clear."
+                        if reason == FETCH_RATE_LIMITED else
+                        "Inspect logs; verify yfinance/network connectivity."
+                    ),
+                    retryable=retryable,
+                    details={"exception_type": type(e).__name__},
+                )
                 if return_symbol:
                     return pd.DataFrame(), ticker
                 return pd.DataFrame()
-    
+
     try:
         # Use the helper function to handle all column structures with price_source preference
-        df = _coerce_to_close_frame(df, preferred=price_source)
+        coerce_rejection = {}
+        df = _coerce_to_close_frame(
+            df, preferred=price_source,
+            rejection_out=coerce_rejection, ticker=ticker,
+        )
         # De-dup & sort to avoid rare vendor duplicate rows
         df = df[~df.index.duplicated(keep='last')].sort_index()
         if df.empty:
             logger.error(f"No exact price column found for basis={price_source} on {ticker}, aborting.")
+            # Forward the coerce diagnostic up to the caller's
+            # rejection_out (or synthesize one if coerce didn't supply
+            # one — e.g. dedupe collapsed a thin frame to empty).
+            if isinstance(rejection_out, dict):
+                if coerce_rejection:
+                    rejection_out.clear()
+                    rejection_out.update(coerce_rejection)
+                else:
+                    _populate_rejection(
+                        rejection_out, "coerce", COERCE_EMPTY_INPUT,
+                        ticker=ticker,
+                        message=(
+                            f"No {price_source} data after dedupe/sort "
+                            f"for {ticker}."
+                        ),
+                        action=(
+                            "Inspect raw fetch result; the frame "
+                            "collapsed to empty after duplicate removal."
+                        ),
+                    )
             if return_symbol:
                 return pd.DataFrame(), ticker
             return pd.DataFrame()
@@ -1789,7 +2269,12 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
     }
 
 
-def export_results_to_excel(output_filename, metrics_list):
+def export_results_to_excel(output_filename, metrics_list, *, rejection_out=None):
+    """Phase 5B Item 9: optional ``rejection_out`` dict captures
+    structured failure reason ONLY on sidecar manifest write failure.
+    Workbook write behavior is unchanged; XLSX/sidecar schemas
+    unchanged; the warning-only fallback is preserved.
+    """
     # Ensure output directory exists
     output_dir = os.path.dirname(output_filename)
     if output_dir:
@@ -1940,6 +2425,22 @@ def export_results_to_excel(output_filename, metrics_list):
             f"Failed to write ImpactSearch XLSX provenance sidecar: "
             f"{_xlsx_manifest_exc}"
         )
+        _populate_rejection(
+            rejection_out, "export", EXPORT_XLSX_MANIFEST_FAILED,
+            ticker=None,
+            path=output_filename,
+            message=(
+                f"XLSX provenance sidecar write failed for "
+                f"{output_filename}: {type(_xlsx_manifest_exc).__name__}: "
+                f"{_xlsx_manifest_exc}"
+            ),
+            action=(
+                "Workbook itself was written; rerun export to retry the "
+                "sidecar manifest, or inspect logs for the underlying "
+                "error."
+            ),
+            details={"exception_type": type(_xlsx_manifest_exc).__name__},
+        )
 
 def process_single_ticker_wrapper(args):
     """Wrapper for multiprocessing compatibility"""
@@ -1974,8 +2475,14 @@ def _pick_best_library(requested_sym, fetched_sym, df):
         
     return chosen_lib, chosen_sym, chosen_acc
 
-def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=None):
-    """Process a single primary ticker with optional frozen analysis clock (single-download path)"""
+def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=None, *, rejection_out=None):
+    """Process a single primary ticker with optional frozen analysis clock (single-download path).
+
+    Phase 5B Item 9: optional ``rejection_out`` dict captures structured
+    failure reason on a None return. Reasons surfaced here include the
+    forwarded fetch/coerce reasons plus ``insufficient_data`` and
+    ``no_metrics``.
+    """
     requested_ticker = prim_ticker  # Keep original for transparency
     vendor_symbol, _ = resolve_symbol(prim_ticker)
     prim_ticker = vendor_symbol
@@ -2015,6 +2522,29 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
                 metrics['Primary Ticker'] = prim_ticker
                 metrics['Requested Ticker'] = requested_ticker
                 metrics['Data Source'] = 'FASTPATH'
+            else:
+                # Phase 5B Item 9 amendment: FASTPATH metrics returned
+                # None — surface PROCESS_NO_METRICS so the diagnostic
+                # contract holds on this branch too. The FASTPATH
+                # decision itself was correct (library was fresh and
+                # compatible); we just had no qualifying signal/trigger
+                # days against the secondary's calendar.
+                _populate_rejection(
+                    rejection_out, "process", PROCESS_NO_METRICS,
+                    ticker=prim_ticker,
+                    message=(
+                        f"FASTPATH calculate_metrics_from_signals "
+                        f"returned no metrics for {prim_ticker} "
+                        f"(no qualifying signal/trigger days against "
+                        f"the secondary's calendar)."
+                    ),
+                    action=(
+                        "Confirm the primary's signal library has "
+                        "trigger days overlapping the secondary's "
+                        "calendar; otherwise drop the primary or "
+                        "extend the secondary's date range."
+                    ),
+                )
 
             # Account for fast-path usage
             FASTPATH_STATS['fastpath_used'] += 1
@@ -2041,18 +2571,55 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         )
     
     # Single download: get raw frame & resolved symbol once
-    df_raw, fetched_symbol = fetch_data_raw(prim_ticker, reference_now=analysis_clock)
+    fetch_rejection = {}
+    df_raw, fetched_symbol = fetch_data_raw(
+        prim_ticker, reference_now=analysis_clock,
+        rejection_out=fetch_rejection,
+    )
     # FIX: Add None check before accessing df_raw attributes
     if df_raw is None or df_raw.empty:
         logger.warning(f"No data for primary ticker {prim_ticker}, skipping.")
+        if isinstance(rejection_out, dict):
+            if fetch_rejection:
+                rejection_out.clear()
+                rejection_out.update(fetch_rejection)
+            else:
+                _populate_rejection(
+                    rejection_out, "fetch", FETCH_NO_DATA,
+                    ticker=prim_ticker,
+                    message=(
+                        f"No data for primary ticker {prim_ticker}."
+                    ),
+                    action="Confirm the ticker is valid; retry later.",
+                    retryable=True,
+                )
         return None
-    
+
     # Coerce to the price basis (no second download)
-    df = _coerce_to_close_frame(df_raw, preferred=price_source)
+    coerce_rejection = {}
+    df = _coerce_to_close_frame(
+        df_raw, preferred=price_source,
+        rejection_out=coerce_rejection, ticker=prim_ticker,
+    )
     # De-dup & sort to avoid rare vendor duplicate rows
     df = df[~df.index.duplicated(keep='last')].sort_index()
     if df.empty:
         logger.warning(f"No {price_source} series for {prim_ticker}, skipping.")
+        if isinstance(rejection_out, dict):
+            if coerce_rejection:
+                rejection_out.clear()
+                rejection_out.update(coerce_rejection)
+            else:
+                _populate_rejection(
+                    rejection_out, "coerce", COERCE_EMPTY_INPUT,
+                    ticker=prim_ticker,
+                    message=(
+                        f"Coerced frame is empty for {prim_ticker}."
+                    ),
+                    action=(
+                        "Inspect upstream fetch and dedupe behavior."
+                    ),
+                )
         return None
     
     # Apply session guard with the resolved type
@@ -2076,6 +2643,18 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
     num_days = len(df)
     if num_days < 2:
         logger.warning(f"Insufficient days of data for {prim_ticker}, skipping.")
+        _populate_rejection(
+            rejection_out, "process", PROCESS_INSUFFICIENT_DATA,
+            ticker=prim_ticker,
+            message=(
+                f"Insufficient bars for {prim_ticker} "
+                f"({num_days}; need >= 2)."
+            ),
+            action=(
+                "Wait for more data or extend the fetch range."
+            ),
+            details={"num_days": int(num_days)},
+        )
         return None
     
     # Debug: Verify unique data per ticker
@@ -2375,11 +2954,53 @@ def process_single_ticker(prim_ticker, sec_df, sma_cache=None, analysis_clock=No
         result['Resolved/Fetched'] = fetched_symbol   # What Yahoo returned
         result['Library Source'] = library_ticker      # Which library was used
         result['Data Source'] = 'SLOW_PATH'           # Mark as slow-path result
-    
+    else:
+        # calculate_metrics_from_signals returned None — no usable
+        # metrics for this primary against the secondary.
+        _populate_rejection(
+            rejection_out, "process", PROCESS_NO_METRICS,
+            ticker=prim_ticker,
+            message=(
+                f"calculate_metrics_from_signals returned no metrics "
+                f"for {prim_ticker} (no qualifying signal/trigger days)."
+            ),
+            action=(
+                "Confirm the primary's signal library has trigger days "
+                "overlapping the secondary's calendar."
+            ),
+        )
+
     return result
 
-def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing=False, mark_complete=True):
-    """Process primary tickers with progress tracking and optional multiprocessing"""
+def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessing=False, mark_complete=True, *, rejection_out=None):
+    """Process primary tickers with progress tracking and optional multiprocessing.
+
+    Phase 5B Item 9 amendment: optional ``rejection_out`` dict
+    captures a representative structured rejection on terminal
+    failure paths that return ``[]``. The per-future / per-iteration
+    diagnostic surface (recent_errors via ``_record_recent_error``)
+    is unchanged; this kwarg adds a caller-facing diagnostic for
+    direct callers (e.g. tests, future Phase 5D backend) that don't
+    inspect ``progress_tracker['recent_errors']``.
+
+    Population rules:
+      * Empty primary_tickers input AFTER dedupe / period filter:
+        DOES NOT populate rejection_out (no failure occurred —
+        nothing to report).
+      * Secondary fetch / coerce terminal failure: forward the
+        secondary's structured rejection.
+      * After processing one or more primaries: if ``metrics_list``
+        is empty, populate from the FIRST per-primary rejection
+        captured in this invocation (sequential or threaded path),
+        OR synthesize ``PROCESS_NO_METRICS`` if no per-primary
+        rejection was captured.
+
+    The local ``first_primary_rejection`` variable is the single
+    in-invocation source of truth for the per-primary fallback —
+    we deliberately do NOT read ``progress_tracker['recent_errors']``
+    because that list is shared across batched secondaries and
+    would conflate diagnostics from prior calls.
+    """
     global progress_tracker
     
     # Freeze the analysis clock for consistent session checks across all tickers
@@ -2408,21 +3029,77 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     
     vendor_symbol_sec, _ = resolve_symbol(secondary_ticker)
     secondary_ticker = vendor_symbol_sec
-    # Single download for the secondary too
-    sec_raw, sec_resolved = fetch_data_raw(secondary_ticker, reference_now=analysis_clock)
+    # Single download for the secondary too. The secondary fetch /
+    # coerce rejections are recorded on the progress tracker's
+    # recent_errors list (Phase 5B Item 9) so operators can see why a
+    # whole secondary returned [] rather than only seeing per-primary
+    # failures.
+    sec_fetch_rejection = {}
+    sec_raw, sec_resolved = fetch_data_raw(
+        secondary_ticker, reference_now=analysis_clock,
+        rejection_out=sec_fetch_rejection,
+    )
     if sec_raw.empty:
         logger.error(f"No data for secondary ticker {secondary_ticker}, cannot proceed.")
+        if sec_fetch_rejection:
+            _record_recent_error(_format_rejection(sec_fetch_rejection))
+        else:
+            _record_recent_error(
+                f"[IMPACTSEARCH:{FETCH_NO_DATA}] {secondary_ticker}: "
+                f"secondary has no data. Action: confirm the symbol."
+            )
+        # Forward the secondary fetch rejection up to the direct
+        # caller's diagnostic dict.
+        if isinstance(rejection_out, dict):
+            if sec_fetch_rejection:
+                rejection_out.clear()
+                rejection_out.update(sec_fetch_rejection)
+            else:
+                _populate_rejection(
+                    rejection_out, "fetch", FETCH_NO_DATA,
+                    ticker=secondary_ticker,
+                    message=(
+                        f"Secondary {secondary_ticker} returned no data."
+                    ),
+                    action="Confirm the secondary ticker is valid.",
+                    retryable=True,
+                )
         return []
     if sec_resolved != secondary_ticker:
         logger.info(f"Secondary ticker resolved {secondary_ticker} -> {sec_resolved}")
-    
-    # Coerce secondary once. Raw Close only (spec v0.5 §3).
+
+    # Coerce secondary once. Raw Close only (spec v0.5 Section 3).
     price_source = 'Close'
-    sec_df = _coerce_to_close_frame(sec_raw, preferred=price_source)
+    sec_coerce_rejection = {}
+    sec_df = _coerce_to_close_frame(
+        sec_raw, preferred=price_source,
+        rejection_out=sec_coerce_rejection, ticker=secondary_ticker,
+    )
     # De-dup & sort to avoid rare vendor duplicate rows
     sec_df = sec_df[~sec_df.index.duplicated(keep='last')].sort_index()
     if sec_df.empty:
         logger.error(f"No {price_source} series for secondary {sec_resolved}, cannot proceed.")
+        if sec_coerce_rejection:
+            _record_recent_error(_format_rejection(sec_coerce_rejection))
+        # Forward the secondary coerce rejection up to the direct
+        # caller's diagnostic dict.
+        if isinstance(rejection_out, dict):
+            if sec_coerce_rejection:
+                rejection_out.clear()
+                rejection_out.update(sec_coerce_rejection)
+            else:
+                _populate_rejection(
+                    rejection_out, "coerce", COERCE_EMPTY_INPUT,
+                    ticker=secondary_ticker,
+                    message=(
+                        f"Coerced frame is empty for secondary "
+                        f"{sec_resolved}."
+                    ),
+                    action=(
+                        "Inspect upstream secondary fetch and dedupe "
+                        "behavior."
+                    ),
+                )
         return []
     
     # Session guard for secondary too
@@ -2437,6 +3114,15 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
 
     metrics_list = []
     sma_cache = {}  # Cache for SMA calculations
+    # Phase 5B Item 9 amendment: in-invocation source of truth for the
+    # caller-visible rejection_out fallback. The first per-primary
+    # structured rejection captured (sequential or threaded) wins; if
+    # nothing captures, the post-loop block synthesizes
+    # PROCESS_NO_METRICS. Deliberately NOT read from
+    # progress_tracker['recent_errors'] -- that list is shared across
+    # batched secondaries and would conflate diagnostics.
+    first_primary_rejection: dict = {}
+    primaries_attempted = 0
 
     logger.info(f"Starting analysis for Secondary Ticker: {secondary_ticker}")
     
@@ -2448,11 +3134,11 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     if use_multiprocessing and len(primary_tickers) > 3:
         # Use multiprocessing for large batches
         logger.info("Using multiprocessing for faster analysis...")
-        
+
         # Pass sec_df by reference (read-only in workers, no need to copy)
         # Include the frozen analysis_clock for consistent session checks
         process_args = [(ticker, sec_df, None, analysis_clock) for ticker in primary_tickers]
-        
+
         # Use ThreadPoolExecutor (ProcessPoolExecutor has pickle issues with DataFrames)
         # Allow override via IMPACT_MAX_WORKERS; otherwise default to min(CPU-1, 8)
         _mw_env = os.environ.get("IMPACT_MAX_WORKERS")
@@ -2465,9 +3151,19 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
                 logger.warning(f"Invalid IMPACT_MAX_WORKERS value, using default: {max_workers}")
         else:
             max_workers = max(1, min(multiprocessing.cpu_count() - 1, 8))
-        
+
         # Helper function for bounded submission
         from itertools import islice
+
+        # Phase 5B Item 9: per-future rejection wrapper. Each worker
+        # gets its OWN fresh dict so concurrent threads cannot race
+        # against a shared mutable rejection_out. Returns the standard
+        # process_single_ticker result alongside the per-call dict so
+        # the main thread can aggregate diagnostics safely.
+        def _process_with_rejection(args):
+            rej = {}
+            res = process_single_ticker(*args, rejection_out=rej)
+            return res, rej
 
         def bounded_submit(executor, args_iter, inflight_limit):
             """Submit tasks in bounded batches to prevent memory pressure from 70K futures."""
@@ -2475,7 +3171,7 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
 
             # Prime the pool with initial batch
             for args in islice(args_iter, inflight_limit):
-                fut = executor.submit(process_single_ticker, *args)
+                fut = executor.submit(_process_with_rejection, args)
                 inflight[fut] = args[0]  # Store ticker
 
             # Process completions and maintain queue
@@ -2487,7 +3183,7 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
                     # Submit next task if available
                     try:
                         args = next(args_iter)
-                        new_fut = executor.submit(process_single_ticker, *args)
+                        new_fut = executor.submit(_process_with_rejection, args)
                         inflight[new_fut] = args[0]
                     except StopIteration:
                         pass  # No more tasks to submit
@@ -2503,7 +3199,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
 
             for future, ticker in bounded_submit(executor, args_iter, inflight_limit):
                 try:
-                    result = future.result()  # No timeout
+                    result, per_future_rejection = future.result()  # No timeout
+                    primaries_attempted += 1
                     if result:
                         result['Secondary Ticker'] = secondary_ticker
                         metrics_list.append(result)
@@ -2511,8 +3208,32 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
                         if len(metrics_list) % RESULTS_SNAPSHOT_EVERY == 0:
                             progress_tracker['results'] = metrics_list.copy()
                             progress_tracker['results_timestamp'] = time.time()
+                    elif per_future_rejection:
+                        # Per-primary failure with structured reason —
+                        # surface to the operator-visible recent_errors
+                        # list. Aggregation happens here on the main
+                        # thread, NOT inside the worker.
+                        _record_recent_error(_format_rejection(per_future_rejection))
+                        if not first_primary_rejection:
+                            first_primary_rejection = dict(per_future_rejection)
                 except Exception as e:
                     logger.error(f"Error processing {ticker}: {e}")
+                    primaries_attempted += 1
+                    _record_recent_error(
+                        f"[IMPACTSEARCH:{PROCESS_WORKER_EXCEPTION}] {ticker}: "
+                        f"worker raised {type(e).__name__}: {e}. "
+                        f"Action: inspect logs."
+                    )
+                    if not first_primary_rejection:
+                        first_primary_rejection = _build_rejection(
+                            "process", PROCESS_WORKER_EXCEPTION,
+                            ticker=ticker,
+                            message=(
+                                f"worker raised {type(e).__name__}: {e}"
+                            ),
+                            action="inspect logs",
+                            details={"exception_type": type(e).__name__},
+                        )
                 finally:
                     completed_count += 1
                     progress_tracker['current_index'] = completed_count  # Not -1
@@ -2528,8 +3249,15 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
             with progress_lock:
                 # Show SECONDARY · PRIMARY
                 progress_tracker['current_ticker'] = f"{secondary_ticker} · {prim_ticker}"
-            
-            result = process_single_ticker(prim_ticker, sec_df, sma_cache, analysis_clock)
+
+            # Phase 5B Item 9: per-call fresh rejection_out dict so the
+            # diagnostic surface mirrors the threaded path exactly.
+            seq_rejection = {}
+            result = process_single_ticker(
+                prim_ticker, sec_df, sma_cache, analysis_clock,
+                rejection_out=seq_rejection,
+            )
+            primaries_attempted += 1
             if result:
                 result['Secondary Ticker'] = secondary_ticker
                 metrics_list.append(result)
@@ -2537,6 +3265,10 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
                 if len(metrics_list) % RESULTS_SNAPSHOT_EVERY == 0:
                     progress_tracker['results'] = metrics_list.copy()
                     progress_tracker['results_timestamp'] = time.time()
+            elif seq_rejection:
+                _record_recent_error(_format_rejection(seq_rejection))
+                if not first_primary_rejection:
+                    first_primary_rejection = dict(seq_rejection)
 
             progress_tracker['current_index'] = idx + 1  # Mark as completed
 
@@ -2577,6 +3309,35 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
             log_fastpath_stats(FASTPATH_STATS)
     except Exception:
         pass
+
+    # Phase 5B Item 9 amendment: caller-visible rejection_out
+    # population for the "processed primaries but produced no metrics"
+    # case. We populate ONLY when:
+    #   - the caller actually requested diagnostics (rejection_out is a dict)
+    #   - we attempted at least one primary (empty input list does NOT
+    #     populate rejection_out)
+    #   - metrics_list is empty (otherwise success — leave dict alone)
+    if (isinstance(rejection_out, dict)
+            and primaries_attempted > 0
+            and not metrics_list):
+        if first_primary_rejection:
+            rejection_out.clear()
+            rejection_out.update(first_primary_rejection)
+        else:
+            _populate_rejection(
+                rejection_out, "process", PROCESS_NO_METRICS,
+                ticker=secondary_ticker,
+                message=(
+                    f"Processed {primaries_attempted} primary "
+                    f"ticker(s) against secondary {secondary_ticker} "
+                    f"but produced no metrics."
+                ),
+                action=(
+                    "Confirm primaries have signal libraries with "
+                    "trigger days overlapping the secondary's "
+                    "calendar."
+                ),
+            )
 
     return metrics_list
 
@@ -3018,7 +3779,11 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
         'tickers_not_found': [],    # Track tickers that failed to download
         'secondary_total': len(secondary_tickers),
         'secondary_index': 0,
-        'current_secondary': None
+        'current_secondary': None,
+        # Phase 5B Item 9: bounded list of [IMPACTSEARCH:*] error
+        # strings; populated by per-primary worker failures and
+        # secondary fetch/coerce failures.
+        'recent_errors': []
     }
     
     # Start processing in a separate thread (sequential over secondary tickers)
@@ -3135,12 +3900,30 @@ def update_progress(n_intervals, processing_state):
     if secondary_total > 1:
         secondary_info = f"Secondary {secondary_index} of {secondary_total} | "
 
+    # Phase 5B Item 9: surface the most recent [IMPACTSEARCH:*] error
+    # inline with the in-progress status so operators see specific
+    # failure reasons live (matches Item 7 OnePass treatment).
+    _recent_errors_snapshot = list(
+        progress_tracker.get('recent_errors') or [],
+    )
+    _live_error_children = []
+    if _recent_errors_snapshot:
+        _live_error_children.append(
+            html.P(
+                f"Last error: {_recent_errors_snapshot[-1]}",
+                style={'color': '#f87171', 'fontSize': '12px',
+                       'fontFamily': 'monospace',
+                       'marginTop': '4px', 'marginBottom': '0'},
+            )
+        )
+
     progress_display = html.Div([
         html.H5(f"Processing: {progress_tracker['current_ticker']}", style={'color': '#00ff41'}),
         html.P(f"{secondary_info}Primary {progress_tracker['current_index'] + 1} of {progress_tracker['total_tickers']} | {time_str}",
               style={'color': '#aaa'}),
         dbc.Progress(value=progress_pct, striped=True, animated=True,
-                    style={'height': '30px'}, color='success')
+                    style={'height': '30px'}, color='success'),
+        *_live_error_children,
     ])
     
     # Create summary cards if we have results and metrics are enabled
@@ -3243,6 +4026,38 @@ def update_progress(n_intervals, processing_state):
                     html.P(ticker,
                           style={'color': '#ff6b6b', 'marginLeft': '20px', 'marginTop': '0px', 'marginBottom': '0px'})
                 )
+
+        # Phase 5B Item 9: render the most recent N formatted
+        # [IMPACTSEARCH:*] failure reasons. Bounded to the last 10 even
+        # though the tracker itself caps at 25.
+        completion_recent_errors = list(
+            progress_tracker.get('recent_errors') or [],
+        )
+        if completion_recent_errors:
+            completion_message.append(
+                html.H6(
+                    "Recent Errors",
+                    style={'color': '#f87171',
+                           'marginTop': '15px',
+                           'marginBottom': '5px'},
+                )
+            )
+            completion_message.append(
+                html.Ul(
+                    [
+                        html.Li(
+                            err,
+                            style={'color': '#f87171',
+                                   'fontSize': '12px',
+                                   'fontFamily': 'monospace'},
+                        )
+                        for err in completion_recent_errors[-10:]
+                    ],
+                    style={'paddingLeft': '20px',
+                           'marginBottom': '0',
+                           'marginLeft': '20px'},
+                )
+            )
 
         completion_message.append(
             dbc.Progress(value=100, striped=False, style={'height': '30px', 'marginTop': '20px'}, color='success')
