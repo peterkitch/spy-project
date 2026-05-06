@@ -19,7 +19,10 @@ import time
 import numpy as np
 import re
 from scipy import stats
-from canonical_scoring import score_captures as _canonical_score_captures
+from canonical_scoring import (
+    score_captures as _canonical_score_captures,
+    combine_consensus_signals as _canonical_consensus,
+)
 
 # Phase 3B-2A sanctioned architecture exception:
 # Spymaster remains standalone for scoring/data logic, but imports the
@@ -3096,6 +3099,120 @@ def _multi_primary_placeholder(msg="Preparing data…"):
     )
     return fig
 
+# ---- Phase 5B-MP-2a: canonical multi-primary contract surface ----
+# Reason-code constants and Spymaster-local helpers that wrap
+# canonical_scoring.combine_consensus_signals into the
+# multi_primary_contract_v1 shape (status + issues) without
+# introducing broad rejection_out infrastructure or new Dash layout
+# components. See md_library/shared/2026-05-06_PHASE_5B_MP_CANONICAL_CONTRACT.md.
+SPYMASTER_MP_INPUT_INVALID = "multi_primary_input_invalid"
+SPYMASTER_MP_UNAVAILABLE = "multi_primary_unavailable"
+SPYMASTER_MP_NO_OVERLAP = "multi_primary_no_overlap"
+SPYMASTER_MP_NO_TRIGGERS = "multi_primary_no_triggers"
+
+
+def _format_spymaster_mp_issue(reason, *, ticker_or_context, message, action):
+    return (
+        f"[SPYMASTER:{reason}] {ticker_or_context}: {message}. "
+        f"Action: {action}."
+    )
+
+
+def _spymaster_multi_primary_input_result(tickers, mute_flags=None, *, context="multi-primary"):
+    raw = list(tickers or [])
+    if mute_flags is None:
+        mute_flags = [False] * len(raw)
+    active = []
+    for ticker, mute in zip(raw, mute_flags):
+        if mute:
+            continue
+        ticker_text = str(ticker).strip() if ticker is not None else ""
+        if not ticker_text:
+            continue
+        active.append(normalize_ticker(ticker_text))
+    if not active:
+        return {
+            "active_tickers": [],
+            "status": "invalid_input",
+            "issues": [_format_spymaster_mp_issue(
+                SPYMASTER_MP_INPUT_INVALID,
+                ticker_or_context=context,
+                message="no active primary tickers remain after applying mute settings",
+                action="enter at least one un-muted primary ticker",
+            )],
+        }
+    seen = set()
+    duplicate = None
+    for t in active:
+        if t in seen:
+            duplicate = t
+            break
+        seen.add(t)
+    if duplicate is not None:
+        return {
+            "active_tickers": active,
+            "status": "invalid_input",
+            "issues": [_format_spymaster_mp_issue(
+                SPYMASTER_MP_INPUT_INVALID,
+                ticker_or_context=context,
+                message=f"duplicate active primary ticker {duplicate}",
+                action="remove the duplicate before re-running",
+            )],
+        }
+    return {
+        "active_tickers": active,
+        "status": "valid",
+        "issues": [],
+    }
+
+
+def _spymaster_multi_primary_contract_result(signals_df, *, context="multi-primary"):
+    if signals_df is None or len(signals_df.columns) == 0:
+        return {
+            "aggregate_signal": pd.Series(dtype=object),
+            "status": "invalid_input",
+            "issues": [_format_spymaster_mp_issue(
+                SPYMASTER_MP_INPUT_INVALID,
+                ticker_or_context=context,
+                message="multi-primary signals frame has no active primary columns",
+                action="provide at least one active primary signal series",
+            )],
+        }
+    if len(signals_df.index) == 0:
+        return {
+            "aggregate_signal": pd.Series(dtype=object),
+            "status": "no_overlap",
+            "issues": [_format_spymaster_mp_issue(
+                SPYMASTER_MP_NO_OVERLAP,
+                ticker_or_context=context,
+                message="no overlapping evaluation grid across primaries",
+                action="select primaries whose data ranges overlap",
+            )],
+        }
+    aggregate = _canonical_consensus(
+        [signals_df[c] for c in signals_df.columns]
+    )
+    has_buy = bool((aggregate == "Buy").any())
+    has_short = bool((aggregate == "Short").any())
+    if not (has_buy or has_short):
+        return {
+            "aggregate_signal": aggregate,
+            "status": "no_triggers",
+            "issues": [_format_spymaster_mp_issue(
+                SPYMASTER_MP_NO_TRIGGERS,
+                ticker_or_context=context,
+                message="aggregate produced no Buy/Short signals",
+                action="review primary direction tags or expand the evaluation window",
+            )],
+        }
+    return {
+        "aggregate_signal": aggregate,
+        "status": "valid",
+        "issues": [],
+    }
+# ---- end Phase 5B-MP-2a canonical multi-primary surface ----
+
+
 def _queue_missing_primaries(primary_tickers):
     """
     Enqueue any primaries that are not 'complete' so optimization can proceed.
@@ -5406,7 +5523,7 @@ app.layout = dbc.Container(
                                                 html.I(className="fas fa-layer-group me-2", style={"color": "#00ff41"}),
                                                 "Step 3: Test Multi-Primary Effects (Spymaster Multi-Primary)"
                                             ]),
-                                            html.P("Use the Multi-Primary Signal Aggregator to combine multiple Primary tickers and measure their effect on one Secondary ticker.")
+                                            html.P("Use the Multi-Primary Signal Aggregator to combine non-None unanimous Primary signals and measure their effect on one Secondary ticker.")
                                         ])
                                     ], className="mb-3", style={"border": "2px solid #80ff00"}),
 
@@ -5465,7 +5582,7 @@ app.layout = dbc.Container(
                                                 html.Strong("Phase 3: Multi-Primary (Spymaster Multi-Primary Signal Aggregator)")
                                             ]),
                                             html.Ol([
-                                                html.Li("Combine MULTIPLE Primary tickers"),
+                                                html.Li("Combine non-None unanimous Primary signals"),
                                                 html.Li("Measure their impact on one Secondary")
                                             ]),
                                             dbc.Alert("This is a work in progress but already useful for scenario thinking.", color="warning", className="py-2")
@@ -6531,7 +6648,7 @@ app.layout = dbc.Container(
         # New Section: Multi-Primary Signal Aggregator
         html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
         html.H2('Multi-Primary Signal Aggregator', className='text-center mt-5'),
-        html.P('Combine signals from multiple primary tickers to create an aggregated trading strategy for a single-ticker (signal follower)', 
+        html.P('Combine non-None unanimous signals from multiple primary tickers and measure the consensus effect on a single signal follower.',
                className='text-center text-muted mb-4', style={'fontSize': '14px'}),
         dbc.Row([
             dbc.Col([
@@ -6539,7 +6656,7 @@ app.layout = dbc.Container(
                     dbc.CardHeader([
                         html.Div([
                             html.I(className="fas fa-layer-group me-2"),
-                            'Aggregate Signals from Multiple Primary Tickers'
+                            'Consensus Signals from Multiple Primary Tickers'
                         ], style={"display": "flex", "alignItems": "center"}),
                         html.Button(children='Hide', id='toggle-multi-primary-button', className='btn btn-sm btn-secondary ml-auto')
                     ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "color": "#80ff00"}),
@@ -11400,16 +11517,22 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     if not secondary_tickers_input:
         return no_update, no_update, no_update, 'Please enter at least one secondary ticker.'
 
-    # Filter out empty or muted primary tickers
-    primary_tickers_filtered = []
-    invert_signals_filtered = []
-    for ticker, invert, mute in zip(primary_tickers, invert_signals, mute_signals):
-        if ticker and not mute:
-            primary_tickers_filtered.append(ticker.strip().upper())
-            invert_signals_filtered.append(invert)
+    # Phase 5B-MP-2a: canonical multi_primary_contract_v1 input validation.
+    # Surfaces invalid_input (no active primary / duplicates) as a
+    # [SPYMASTER:multi_primary_input_invalid] diagnostic on the existing
+    # multi-secondary-feedback channel without altering the callback signature.
+    input_result = _spymaster_multi_primary_input_result(
+        primary_tickers, mute_flags=mute_signals, context="multi-primary",
+    )
+    if input_result["status"] == "invalid_input":
+        issue = input_result["issues"][0]
+        return _multi_primary_placeholder(issue), [], [], issue
 
-    if not primary_tickers_filtered:
-        return no_update, no_update, no_update, 'Please enter at least one primary ticker.'
+    primary_tickers_filtered = input_result["active_tickers"]
+    invert_signals_filtered = [
+        invert for ticker, invert, mute in zip(primary_tickers, invert_signals, mute_signals)
+        if ticker and not mute
+    ]
 
     # Parse secondary tickers
     secondary_tickers = [ticker.strip().upper() for ticker in secondary_tickers_input.split(',') if ticker.strip()]
@@ -11457,14 +11580,24 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
                     logger.warning(f"Disk fallback failed for {ticker}: {e}")
                     results = None
             if not results:
-                msg = f'Processing Data for primary ticker {ticker}. Please wait.'
+                msg = _format_spymaster_mp_issue(
+                    SPYMASTER_MP_UNAVAILABLE,
+                    ticker_or_context=ticker,
+                    message="processing data for primary ticker; no cached results yet",
+                    action="wait for the background processor to populate the cache",
+                )
                 placeholder_fig = _multi_primary_placeholder(msg)
                 return placeholder_fig, [], [], msg
         signals = results.get('active_pairs')
         # Load DataFrame on-demand to get dates
         df = ensure_df_available(ticker, results)
         if df is None or df.empty:
-            msg = f'Could not load data for {ticker}'
+            msg = _format_spymaster_mp_issue(
+                SPYMASTER_MP_UNAVAILABLE,
+                ticker_or_context=ticker,
+                message="could not load primary ticker data frame",
+                action="verify the ticker exists in cache or rebuild the library",
+            )
             placeholder_fig = _multi_primary_placeholder(msg)
             return placeholder_fig, [], [], msg
         dates = df.index
@@ -11499,33 +11632,27 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
     common_dates = sorted(common_dates)
 
     if not common_dates:
-        msg = 'No overlapping dates among primary tickers.'
+        msg = _format_spymaster_mp_issue(
+            SPYMASTER_MP_NO_OVERLAP,
+            ticker_or_context="multi-primary",
+            message="no overlapping evaluation grid across primaries",
+            action="select primaries whose data ranges overlap",
+        )
         placeholder_fig = _multi_primary_placeholder(msg)
         return placeholder_fig, [], [], msg
 
     # Combine signals into a DataFrame
     signals_df = pd.DataFrame({f'primary_{i}': sig.loc[common_dates] for i, sig in enumerate(primary_signals_list)})
 
-    # Function to determine combined signal
-    def get_combined_signal(row):
-        # Validate input and handle None values
-        if row is None or len(row) == 0:
-            return 'None'
-            
-        # List of signals excluding 'None'
-        active_signals = [s for s in row if s is not None and s != 'None']
-
-        if not active_signals:
-            return 'None'
-
-        # Check if all active signals are the same
-        if all(s == active_signals[0] for s in active_signals):
-            return active_signals[0]
-        else:
-            return 'None'  # Signals are mixed and cancel out
-
-    # Apply the combination function
-    combined_signals = signals_df.apply(get_combined_signal, axis=1)
+    # Phase 5B-MP-2a: route §18 consensus through the canonical helper via
+    # _spymaster_multi_primary_contract_result; the hand-rolled per-bar
+    # block has been removed. Contract-status diagnostics surface on the
+    # existing multi-secondary-feedback output (see contract_issue below).
+    contract = _spymaster_multi_primary_contract_result(
+        signals_df, context="multi-primary",
+    )
+    combined_signals = contract["aggregate_signal"]
+    contract_issue = contract["issues"][0] if contract["issues"] else ""
 
     # Initialize figure
     fig = go.Figure()
@@ -11611,7 +11738,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         ))
 
     if not metrics_data:
-        msg = 'No valid data for secondary tickers.'
+        msg = contract_issue or 'No valid data for secondary tickers.'
         placeholder_fig = _multi_primary_placeholder(msg)
         return placeholder_fig, [], [], msg
 
@@ -11647,7 +11774,7 @@ def update_multi_primary_outputs(primary_tickers, invert_signals, mute_signals, 
         )
     )
 
-    return fig, metrics_data, columns, ''
+    return fig, metrics_data, columns, contract_issue
 
 # Global variables for processing queue, worker thread, and all tickers
 ticker_queue = []
@@ -11969,7 +12096,32 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
         
         if VERBOSE_DEBUG:
             logger.info(f"OPTIMIZE_SIGNALS called: triggered_id={triggered_id}, n_clicks={n_clicks}, primary={primary_tickers_input}, secondary={secondary_ticker_input}")
-        
+
+        # Phase 5B-MP-2a: detect duplicate active primary tickers BEFORE
+        # sanitize_ticker_input silently dedupes them. Mirrors the canonical
+        # multi_primary_contract_v1 invalid_input contract.
+        if primary_tickers_input:
+            raw_primary_parts = [
+                p.strip().upper()
+                for p in str(primary_tickers_input).split(',')
+                if p.strip()
+            ]
+            seen_dup = set()
+            duplicate_primary = None
+            for t in raw_primary_parts:
+                if t in seen_dup:
+                    duplicate_primary = t
+                    break
+                seen_dup.add(t)
+            if duplicate_primary is not None:
+                dup_msg = _format_spymaster_mp_issue(
+                    SPYMASTER_MP_INPUT_INVALID,
+                    ticker_or_context="optimization",
+                    message=f"duplicate active primary ticker {duplicate_primary}",
+                    action="remove the duplicate before re-running",
+                )
+                return [], empty_columns, dup_msg, False
+
         # Sanitize inputs server-side
         primary_tickers_sanitized = sanitize_ticker_input(primary_tickers_input or "", max_tickers=20)
         secondary_ticker_list = sanitize_ticker_input(secondary_ticker_input or "", max_tickers=1)
@@ -12386,6 +12538,11 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
 
         # Prepare for results
         results_list = []
+        # Phase 5B-MP-2a: track the most-recent canonical contract issue so the
+        # no-valid-combinations message can surface a specific reason code
+        # (no_overlap / no_triggers / invalid_input) instead of the generic
+        # 'No valid combinations found.' string.
+        last_contract_issue = ""
 
         # Process each combination with a single progress bar
         from tqdm import tqdm
@@ -12436,27 +12593,15 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                     
                     combined_signals_df[ticker] = signals
 
-                # Combine signals using vectorization without deprecated 'applymap' method
-                signal_mapping = {'Buy': 1, 'Short': -1, 'None': 0}
-
-                # Apply mapping using 'apply' and 'map' to avoid FutureWarning
-                signal_values = combined_signals_df.apply(lambda col: col.map(signal_mapping)).values.astype(int)
-
-                sum_signals = np.sum(signal_values, axis=1)
-                signal_counts = np.count_nonzero(signal_values != 0, axis=1)
-
-                # Determine combined signals
-                combined_signals_array = np.where(
-                    signal_counts == 0, 'None',
-                    np.where(
-                        sum_signals == signal_counts, 'Buy',
-                        np.where(
-                            sum_signals == -signal_counts, 'Short',
-                            'None'
-                        )
-                    )
+                # Phase 5B-MP-2a: route §18 consensus through the canonical
+                # helper via _spymaster_multi_primary_contract_result; the
+                # hand-rolled vectorized block has been removed.
+                contract = _spymaster_multi_primary_contract_result(
+                    combined_signals_df, context="optimization",
                 )
-                combined_signals = pd.Series(combined_signals_array, index=combined_signals_df.index)
+                combined_signals = contract["aggregate_signal"]
+                if contract["issues"]:
+                    last_contract_issue = contract["issues"][0]
 
                 # No need to shift signals since we included the next day's signal
                 signals = combined_signals.fillna('None')
@@ -12522,7 +12667,8 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                 optimization_in_progress = False
                 if optimization_lock.locked():
                     optimization_lock.release()
-            return [], empty_columns, 'No valid combinations found.', True  # Add the fourth output
+            no_valid_msg = last_contract_issue or 'No valid combinations found.'
+            return [], empty_columns, no_valid_msg, True  # Add the fourth output
 
         # Sort by Sharpe
         results_list.sort(key=lambda x: x['Sharpe'], reverse=True)
