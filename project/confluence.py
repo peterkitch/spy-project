@@ -319,6 +319,132 @@ def _mp_combine_unanimity_vectorized(sig_df: pd.DataFrame) -> pd.Series:
         return pd.Series([], dtype=object)
     return _canonical_consensus([sig_df[c] for c in sig_df.columns])
 
+# ---- Phase 5B-MP-2b: canonical multi-primary contract diagnostic surface ----
+# Reason-code constants and a Confluence-local wrapper that route
+# multi_primary_contract_v1 status (valid / partial / unavailable /
+# no_overlap / no_triggers) through existing _mp_eval_interval result
+# rows without changing the consensus rule. _mp_combine_unanimity_vectorized
+# above remains the canonical-helper delegate (Phase 1A baseline-pinned)
+# and is byte-identical to main. See md_library/shared/2026-05-06_PHASE_5B_MP_CANONICAL_CONTRACT.md.
+CONFLUENCE_MP_PARTIAL_COVERAGE = "multi_primary_partial_coverage"
+CONFLUENCE_MP_UNAVAILABLE = "multi_primary_unavailable"
+CONFLUENCE_MP_NO_OVERLAP = "multi_primary_no_overlap"
+CONFLUENCE_MP_NO_TRIGGERS = "multi_primary_no_triggers"
+CONFLUENCE_MP_INPUT_INVALID = "multi_primary_input_invalid"
+
+
+def _format_confluence_mp_issue(reason, *, ticker_or_context, message, action):
+    return (
+        f"[CONFLUENCE:{reason}] {ticker_or_context}: {message}. "
+        f"Action: {action}."
+    )
+
+
+def _mp_multi_primary_contract_result(
+    sig_df,
+    *,
+    requested_members,
+    contributed_members,
+    missing_members=None,
+    context="multi-primary",
+):
+    """Wrap _mp_combine_unanimity_vectorized into multi_primary_contract_v1.
+
+    Aggregate computation is delegated to the byte-identical canonical
+    helper. This wrapper only adds status + issues classification per
+    locked §6 failure semantics: missing primaries surface as `partial`
+    (NOT silent exclusion); no contributed members surface as
+    `unavailable`; no overlapping evaluation grid surfaces as
+    `no_overlap`; all-None aggregate surfaces as `no_triggers` unless
+    `partial` precedence applies.
+
+    Missing primaries are NEVER added as all-None series; they remain
+    excluded from sig_df. The contract surfaces their absence; it does
+    not silently fold them into consensus.
+    """
+    if missing_members is None:
+        contributed_set = set(contributed_members or [])
+        missing_members = [m for m in (requested_members or []) if m not in contributed_set]
+
+    issues = []
+
+    # Precedence 1: no contributed members at all -> unavailable.
+    if not contributed_members:
+        for m in (missing_members or list(requested_members or [])):
+            issues.append(_format_confluence_mp_issue(
+                CONFLUENCE_MP_UNAVAILABLE,
+                ticker_or_context=m or context,
+                message="primary signal library unavailable for this interval",
+                action="rebuild or refresh the primary library before re-running",
+            ))
+        if not issues:
+            issues.append(_format_confluence_mp_issue(
+                CONFLUENCE_MP_UNAVAILABLE,
+                ticker_or_context=context,
+                message="no contributed primaries available",
+                action="ensure at least one primary library is loaded",
+            ))
+        return {
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "unavailable",
+            "issues": issues,
+        }
+
+    # Precedence 2: no rows in the aligned signals frame -> no_overlap.
+    if sig_df is None or len(sig_df.index) == 0:
+        issues.append(_format_confluence_mp_issue(
+            CONFLUENCE_MP_NO_OVERLAP,
+            ticker_or_context=context,
+            message="no overlapping evaluation grid across primaries",
+            action="select primaries whose data ranges overlap",
+        ))
+        return {
+            "aggregate_signal": pd.Series([], dtype=object),
+            "status": "no_overlap",
+            "issues": issues,
+        }
+
+    # Aggregate via the canonical helper (byte-identical to main).
+    aggregate = _mp_combine_unanimity_vectorized(sig_df)
+
+    # Precedence 3: missing requested primaries -> partial coverage.
+    is_partial = bool(missing_members)
+    if is_partial:
+        for m in missing_members:
+            issues.append(_format_confluence_mp_issue(
+                CONFLUENCE_MP_PARTIAL_COVERAGE,
+                ticker_or_context=m,
+                message="primary signal library missing or empty; excluded from consensus",
+                action="rebuild the primary library to restore full-coverage consensus",
+            ))
+
+    # Precedence 4: aggregate has no Buy/Short triggers.
+    has_buy = bool((aggregate == "Buy").any())
+    has_short = bool((aggregate == "Short").any())
+    has_triggers = has_buy or has_short
+    if not has_triggers:
+        issues.append(_format_confluence_mp_issue(
+            CONFLUENCE_MP_NO_TRIGGERS,
+            ticker_or_context=context,
+            message="aggregate produced no Buy/Short signals",
+            action="review primary direction tags or expand the evaluation window",
+        ))
+
+    if is_partial:
+        status = "partial"
+    elif not has_triggers:
+        status = "no_triggers"
+    else:
+        status = "valid"
+
+    return {
+        "aggregate_signal": aggregate,
+        "status": status,
+        "issues": issues,
+    }
+# ---- end Phase 5B-MP-2b canonical multi-primary contract surface ----
+
+
 def _mp_safe_daily_pct_change(close: pd.Series) -> pd.Series:
     prev = close.shift(1)
     ok = prev.notna() & np.isfinite(prev.values) & (prev.values > 0)
@@ -403,6 +529,11 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
     if not act:
         return {'Interval': interval, 'Members': '', 'Status': 'NO_ACTIVE_PRIMARIES'}
 
+    # Phase 5B-MP-2b: track requested vs contributed members so the
+    # canonical contract wrapper can classify partial / unavailable /
+    # no_overlap / no_triggers without silently dropping primaries.
+    requested_members = [t for t, _ in act]
+
     # ---------- 1) Load secondary prices (interval-aware) ----------
     # Daily path stays as-is to preserve the validated parity
     if interval == '1d':
@@ -438,6 +569,11 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         raw   = lib.get('primary_signals', lib.get('signals', []))
         sigs  = pd.Series([_mp_decode_sig(x) for x in raw], index=dates, dtype=object)
         sigs  = sigs[~sigs.index.duplicated(keep='last')].sort_index()
+        # Phase 5B-MP-2b: empty signal series after dedup is treated as
+        # missing, mirroring the locked contract semantics. Missing
+        # primaries are NOT added as all-None series.
+        if sigs.empty:
+            continue
         if inv:
             arr = sigs.to_numpy(object)
             arr = np.where(arr == 'Buy', 'Short', np.where(arr == 'Short', 'Buy', arr))
@@ -447,8 +583,24 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         series_map[t] = sigs
         invert_map[t] = inv
 
+    contributed_members = list(series_map.keys())
+    contributed_set = set(contributed_members)
+    missing_members = [t for t in requested_members if t not in contributed_set]
+
     if not series_map:
-        return {'Interval': interval, 'Members': ', '.join([t for t, _ in act]), 'Status': 'NO_PRIMARY_DATA'}
+        contract = _mp_multi_primary_contract_result(
+            None,
+            requested_members=requested_members,
+            contributed_members=[],
+            missing_members=requested_members,
+            context=f"multi-primary[{interval}]",
+        )
+        status_text = contract['issues'][0] if contract['issues'] else 'NO_PRIMARY_DATA'
+        return {
+            'Interval': interval,
+            'Members': ', '.join(requested_members),
+            'Status': status_text,
+        }
 
     # Build Members column with asterisks for inverted tickers
     members = ', '.join([f"{t}*" if invert_map.get(t, False) else t for t in series_map.keys()])
@@ -463,11 +615,27 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         # Step 1: Intersect primaries (only dates where ALL primaries have signals)
         common_dates = sorted(set.intersection(*[set(s.index) for s in prim_series]))
         if not common_dates:
-            return {'Interval': interval, 'Members': members, 'Status': 'NO_COMMON_DATES'}
+            contract = _mp_multi_primary_contract_result(
+                pd.DataFrame(index=[]),
+                requested_members=requested_members,
+                contributed_members=contributed_members,
+                missing_members=missing_members,
+                context=f"multi-primary[{interval}]",
+            )
+            status_text = contract['issues'][0] if contract['issues'] else 'NO_COMMON_DATES'
+            return {'Interval': interval, 'Members': members, 'Status': status_text}
 
-        # Step 2: Combine signals on primary-intersection dates only
+        # Step 2: Combine signals on primary-intersection dates only via
+        # the canonical contract wrapper (Phase 5B-MP-2b).
         sig_df = pd.DataFrame({t: series_map[t].reindex(common_dates) for t in series_map}, index=common_dates)
-        combined = _mp_combine_unanimity_vectorized(sig_df).astype(str)
+        contract = _mp_multi_primary_contract_result(
+            sig_df,
+            requested_members=requested_members,
+            contributed_members=contributed_members,
+            missing_members=missing_members,
+            context=f"multi-primary[{interval}]",
+        )
+        combined = contract['aggregate_signal'].astype(str)
 
         # Step 3: Intersect with secondary
         common_dates_sec = pd.Index(common_dates).intersection(sec_close.index)
@@ -494,7 +662,10 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
 
         trig_mask = signals_u.isin(['Buy', 'Short'])
         metrics = _mp_metrics(cap, trig_mask, BARS_PER_YEAR['1d'])
-        return {'Interval': interval, 'Members': members, **(metrics or {'Status': 'NO_TRIGGERS'})}
+        status_text = contract['issues'][0] if contract['issues'] else ''
+        if metrics:
+            return {'Interval': interval, 'Members': members, **metrics, 'Status': status_text}
+        return {'Interval': interval, 'Members': members, 'Status': status_text or 'NO_TRIGGERS'}
 
     else:
         # NON‑DAILY path: native interval calendar, strict intersection, NO daily ffill
@@ -503,13 +674,29 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
         for s in series_map.values():
             common &= set(s.index)
         if not common:
-            return {'Interval': interval, 'Members': members, 'Status': 'NO_COMMON_DATES'}
+            contract = _mp_multi_primary_contract_result(
+                pd.DataFrame(index=[]),
+                requested_members=requested_members,
+                contributed_members=contributed_members,
+                missing_members=missing_members,
+                context=f"multi-primary[{interval}]",
+            )
+            status_text = contract['issues'][0] if contract['issues'] else 'NO_COMMON_DATES'
+            return {'Interval': interval, 'Members': members, 'Status': status_text}
 
         dates = pd.DatetimeIndex(sorted(common))
 
-        # Build grid on the interval bar dates and combine
-        sig_df   = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
-        combined = _mp_combine_unanimity_vectorized(sig_df)
+        # Build grid on the interval bar dates and combine via the
+        # canonical contract wrapper (Phase 5B-MP-2b).
+        sig_df = pd.DataFrame({t: series_map[t].reindex(dates) for t in series_map}, index=dates)
+        contract = _mp_multi_primary_contract_result(
+            sig_df,
+            requested_members=requested_members,
+            contributed_members=contributed_members,
+            missing_members=missing_members,
+            context=f"multi-primary[{interval}]",
+        )
+        combined = contract['aggregate_signal']
 
         # Use same-bar returns on the interval grid (parity with daily path)
         # Signal at bar N uses previous bar's info to trade bar N's return
@@ -531,8 +718,11 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
             logger.info(f"[1mo] return sanity: nonzero={nz} / {len(rets_grid)}")
 
         trig_mask = combined.isin(['Buy', 'Short'])
-        metrics   = _mp_metrics(cap, trig_mask, BARS_PER_YEAR.get(interval, 252))
-        return {'Interval': interval, 'Members': members, **(metrics or {'Status': 'NO_TRIGGERS'})}
+        metrics = _mp_metrics(cap, trig_mask, BARS_PER_YEAR.get(interval, 252))
+        status_text = contract['issues'][0] if contract['issues'] else ''
+        if metrics:
+            return {'Interval': interval, 'Members': members, **metrics, 'Status': status_text}
+        return {'Interval': interval, 'Members': members, 'Status': status_text or 'NO_TRIGGERS'}
 
 def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flags=None, mute_flags=None) -> pd.Series:
     """
@@ -1056,6 +1246,11 @@ def _create_primary_row(index: int):
 multi_primary_section = dbc.Container([
     html.Div(id="multi-primary-section", style={"position": "relative", "top": "-80px"}),
     html.H2('Multi-Primary Signal Aggregator', className='text-center', style={'color': '#80ff00'}),
+    html.P(
+        "Combines non-None unanimous primary signals; missing active primaries are surfaced as partial coverage.",
+        className='text-center',
+        style={'color': '#888', 'fontSize': '13px', 'marginBottom': '12px'},
+    ),
 
     # Full-width form layout
     dbc.Row([
@@ -2027,21 +2222,62 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
     )
 
     # Bridge payload for Apply-to-Analyze
+    # Phase 5B-MP-2b: collect any partial-coverage / unavailable contract
+    # issues from row Status fields so apply_mp_to_analyze can surface
+    # them on the applied-mode banner without a new persistent schema.
+    partial_coverage_issues = []
+    for r in rows:
+        s = r.get('Status', '') or ''
+        if isinstance(s, str) and s.startswith('[CONFLUENCE:multi_primary_partial_coverage]'):
+            partial_coverage_issues.append(s)
+
     mp_ctx = {
         'secondary': secondary,
         'primaries': primaries,
         'invert_flags': invert_flags,
         'mute_flags': mute_flags,
-        'intervals': intervals
+        'intervals': intervals,
+        'partial_coverage_issues': partial_coverage_issues,
     }
 
-    return (html.Div([
+    # Phase 5B-MP-2b: optional dynamic warning block above the table when
+    # any interval row hit a [CONFLUENCE:...] contract status. Renders
+    # only when needed; uses no new static layout ID.
+    contract_status_rows = [
+        (r.get('Interval', ''), r.get('Status', ''))
+        for r in rows
+        if isinstance(r.get('Status', ''), str) and r.get('Status', '').startswith('[CONFLUENCE:')
+    ]
+    children = [
         html.H4(f"Multi-Primary Results: {', '.join(primaries)} → {secondary}",
                 style={'color': '#80ff00', 'textAlign': 'center', 'marginBottom': '12px'}),
         html.P("Signals and returns are computed on each interval's native calendar; 1d uses daily ffill parity.",
                style={'color': '#888', 'textAlign': 'center', 'fontSize': '14px', 'marginBottom': '12px'}),
-        table
-    ]), mp_ctx)
+    ]
+    if contract_status_rows:
+        warning_lines = [
+            f"{interval}: {status}" for interval, status in contract_status_rows
+        ]
+        children.append(
+            dbc.Alert(
+                [
+                    html.Div(
+                        "Multi-primary contract status (partial coverage / unavailable / "
+                        "no_overlap / no_triggers):",
+                        style={'fontWeight': 'bold', 'marginBottom': '4px'},
+                    ),
+                    html.Ul(
+                        [html.Li(line) for line in warning_lines],
+                        style={'margin': '0', 'paddingLeft': '20px'},
+                    ),
+                ],
+                color='warning',
+                style={'marginBottom': '12px'},
+            )
+        )
+    children.append(table)
+
+    return (html.Div(children), mp_ctx)
 
 
 # ========= New: Confluence history, performance, and master panel =========
@@ -2663,8 +2899,18 @@ def apply_mp_to_analyze(n_clicks, mp_ctx):
                        style={'color': '#ff4444', 'textAlign': 'center', 'fontSize': '18px'})
             ])
 
-        # Create informative banner
+        # Create informative banner. Phase 5B-MP-2b: append a concise
+        # partial-coverage note when the prior multi-primary run carried
+        # partial-coverage issues so the applied-mode banner reflects
+        # the contract status instead of silently presenting partial
+        # results as full-coverage results.
+        partial_issues = mp_ctx.get('partial_coverage_issues') or []
         banner = f"Multi-Primary Applied Mode: Combined unanimity signals from [{', '.join(primaries)}] applied to {secondary}"
+        if partial_issues:
+            banner += (
+                f" | Partial coverage on {len(partial_issues)} interval row(s); see prior "
+                "multi-primary results panel for [CONFLUENCE:...] tags."
+            )
 
         # Render confluence view with virtual libraries
         t_render = time.time()

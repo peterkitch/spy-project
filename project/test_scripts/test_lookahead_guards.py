@@ -58,12 +58,16 @@ def test_b8_no_negative_shift_in_signal_paths():
     allowlisted_lines = {
         # confluence._mp_forward_return_on_grid: forward return helper
         # used by display logic only, not signal construction.
-        ("confluence.py", 346),
+        # Line bumped 346 -> 472 by the Phase 5B-MP-2b insertion of the
+        # canonical multi-primary contract wrapper above this helper.
+        ("confluence.py", 472),
         # confluence forward_returns dashboard panel: F+k columns are
         # forward-looking by definition; not used to drive any signal.
         # Line bumped 2282 -> 2293 by the Post Phase 3 dedupe edits in
         # _build_confluence_strategy_equity and create_master_combined_chart.
-        ("confluence.py", 2293),
+        # Line bumped 2293 -> 2529 by the Phase 5B-MP-2b multi-primary
+        # contract diagnostic surface in run_multi_primary_analysis.
+        ("confluence.py", 2529),
     }
 
     failures = []
