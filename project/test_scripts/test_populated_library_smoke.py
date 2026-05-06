@@ -184,6 +184,18 @@ def test_d2_impactsearch_load_signal_library_populated(monkeypatch, _populated_l
     assert isinstance(loaded, dict)
     assert loaded.get("price_source") == "Close"
 
+    # Phase 5B Item 9: passing rejection_out on a successful
+    # ImpactSearch load must leave the dict empty (happy-path mirrors
+    # OnePass Item 7).
+    rejection_ok: dict = {}
+    loaded2 = isr.load_signal_library(
+        _populated_lib_dir["ticker"], rejection_out=rejection_ok,
+    )
+    assert isinstance(loaded2, dict)
+    assert rejection_ok == {}, (
+        f"expected empty rejection on success, got {rejection_ok!r}"
+    )
+
 
 def test_d2_impact_fastpath_load_quick_populated(monkeypatch, tmp_path):
     """impact_fastpath._load_signal_library_quick should find and

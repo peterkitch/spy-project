@@ -522,6 +522,19 @@ def test_f12_impactsearch_consumer_verifies(tmp_path, monkeypatch):
     _write_lib_for_consumer(library_dir, "BBB", mutate_after_attach=True)
     assert impactsearch.load_signal_library("BBB") is None
 
+    # Phase 5B Item 9: when the diagnostic kwarg is supplied, the same
+    # mismatched-manifest call must populate rejection_out with reason
+    # == "manifest_failed" (matches the OnePass Item 7 contract; the
+    # cross-app reason taxonomy is by design literal-string-equal
+    # for identical failure modes).
+    bbb_rejection: dict = {}
+    assert impactsearch.load_signal_library(
+        "BBB", rejection_out=bbb_rejection,
+    ) is None
+    assert bbb_rejection.get("reason") == "manifest_failed"
+    assert bbb_rejection.get("stage") == "load"
+    assert bbb_rejection.get("ticker") == "BBB"
+
     _write_lib_for_consumer(library_dir, "CCC", with_manifest=False)
     legacy = impactsearch.load_signal_library("CCC")
     assert legacy is not None
