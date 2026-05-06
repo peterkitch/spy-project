@@ -1,3 +1,8 @@
+# requirements.txt is the pip-only mirror of project/environment.yml shared runtime/test pins.
+# Shared packages MUST match environment.yml exactly (conda = maps to pip ==).
+# Conda-only platform/runtime packages stay in environment.yml only.
+# Any one-file-only package must be explicitly documented in the static guard allowlist.
+
 # Core dependencies for SPY Project
 # Python 3.12+ required
 
@@ -7,24 +12,25 @@ dash-bootstrap-components==1.6.0
 dash-core-components==2.0.0
 dash-html-components==2.0.0
 dash-table==5.0.0
-flask==3.0.2
+flask==2.3.3
 flask-caching==2.1.0
-werkzeug==3.0.1
+werkzeug==2.3.7
 
 # Data analysis and scientific computing
-numpy==2.2.6
-pandas==2.3.2
+numpy==1.26.4
+pandas==2.2.1
 scipy==1.13.1
 
 # Data visualization
-plotly==5.20.0
+plotly==5.24.1
 
 # Financial data
 yfinance==0.2.63
 yahoo-fin==0.8.9.1
+pandas-market-calendars==5.1.1
 
 # Web requests and scraping
-requests==2.31.0
+requests==2.32.5
 requests-cache==1.2.1
 beautifulsoup4==4.12.3
 lxml==5.1.0
@@ -38,7 +44,6 @@ nest-asyncio==1.6.0
 
 # Data formats
 openpyxl==3.1.5
-xlsxwriter==3.1.0
 joblib==1.4.2
 
 # Utilities
@@ -91,14 +96,12 @@ cattrs==25.1.1
 typing-extensions==4.14.0
 retrying==1.3.4
 tenacity==8.2.3
-more-itertools==10.2.0
-toolz==0.12.1
-cytoolz==0.12.3
 itsdangerous==2.1.2
-MarkupSafe==2.1.5
-Jinja2==3.1.4
+markupsafe==3.0.2
+jinja2==3.1.6
 blinker==1.7.0
 psutil==6.0.0
+reportlab==4.4.3
 
 # Dependencies typically auto-installed
 six==1.16.0

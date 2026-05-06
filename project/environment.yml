@@ -4,26 +4,26 @@ channels:
   - defaults
 dependencies:
   # Core Python - pinned versions
-  - python=3.12
+  - python=3.12.2
   - pip=25.2
   - setuptools=80.9.0
   - wheel=0.45.1
-  
+
   # Essential libraries (conda will select platform-appropriate versions)
   - openssl  # TLS/SSL support
   - ca-certificates  # Certificate bundle
   - libffi  # Foreign function interface
   - tk  # GUI support for any tkinter usage
   - sqlite>=3.41  # Database support
-  
-  # Scientific computing
-  - numpy=2.2.6
-  - pandas=2.3.2
+
+  # Scientific computing (pinned to verified spyproject2 audit runtime)
+  - numpy=1.26.4
+  - pandas=2.2.1
   - scipy=1.13.1
-  
+
   # Visualization and web
-  - plotly=5.20.0
-  
+  - plotly=5.24.1
+
   # Use pip for packages not available in conda or with specific versions needed
   - pip:
       # Web framework and dashboard
@@ -32,30 +32,30 @@ dependencies:
       - dash-core-components==2.0.0
       - dash-html-components==2.0.0
       - dash-table==5.0.0
-      - flask==3.0.2
+      - flask==2.3.3
       - flask-caching==2.1.0
-      - werkzeug==3.0.1
-      
+      - werkzeug==2.3.7
+
       # Data fetching and processing
       - yfinance==0.2.63
       - yahoo-fin==0.8.9.1
-      - requests==2.31.0
+      - pandas-market-calendars==5.1.1
+      - requests==2.32.5
       - requests-cache==1.2.1
       - beautifulsoup4==4.12.3
       - lxml==5.1.0
       - html5lib==1.1
       - feedparser==6.0.11
-      
+
       # Async and concurrent processing
       - multitasking==0.0.11
       - multiprocess==0.70.17
       - nest-asyncio==1.6.0
-      
+
       # Data formats and serialization
       - openpyxl==3.1.5
-      - xlsxwriter==3.1.0
       - joblib==1.4.2
-      
+
       # Utilities
       - tqdm==4.66.2
       - python-dateutil==2.9.0.post0
@@ -66,7 +66,7 @@ dependencies:
       - attrs==25.3.0
       - cattrs==25.1.1
       - typing-extensions==4.14.0
-      
+
       # Web scraping and parsing
       - cssselect==1.2.0
       - pyquery==2.0.1
@@ -75,7 +75,7 @@ dependencies:
       - w3lib==2.2.1
       - fake-useragent==1.5.1
       - pyee==11.1.1
-      
+
       # HTTP and networking
       - urllib3==1.26.20
       - certifi==2024.2.2
@@ -83,7 +83,7 @@ dependencies:
       - idna==3.6
       - curl-cffi==0.11.3
       - websockets==15.0.1
-      
+
       # Caching and storage
       - diskcache==5.6.3
       - cachelib==0.9.0
@@ -91,49 +91,46 @@ dependencies:
       - platformdirs==4.3.6
       - appdirs==1.4.4
       - peewee==3.17.1
-      
+
       # Serialization and data structures
       - frozendict==2.4.0
       - msgpack==1.1.0
       - lz4==4.3.3
       - dill==0.3.9
       - protobuf==6.31.1
-      
+
       # Security and crypto
       - cffi==1.17.1
       - pycparser==2.22
-      
+
       # Selenium and web automation
       - selenium==4.35.0
       - webdriver-manager==4.0.2
-      
+
       # Other utilities
       - retrying==1.3.4
       - tenacity==8.2.3
       - six==1.16.0
       - soupsieve==2.5
-      - webencodings==0.5.1
       - packaging==24.0
       - importlib-metadata==7.1.0
       - zipp==3.18.1
       - blinker==1.7.0
       - itsdangerous==2.1.2
-      - jinja2==3.1.3
-      - markupsafe==2.1.5
-      - url-normalize==2.2.1
-      - et-xmlfile==2.0.0
-      - reportlab==4.0.4
-      
+      - jinja2==3.1.6
+      - markupsafe==3.0.2
+      - reportlab==4.4.3
+
       # System monitoring
       - psutil==6.0.0
 
       # Testing
       - pytest==8.3.5
-      
+
       # Platform-specific (optional, installed only if on Windows)
       # These will be skipped on Mac/Linux
       - pywin32-ctypes==0.2.2 ; sys_platform == 'win32'
-      
+
       # Build tools (if needed for distribution)
       - pyinstaller==6.5.0
       - pyinstaller-hooks-contrib==2024.3
@@ -141,7 +138,15 @@ dependencies:
       - altgraph==0.17.4
 
 # Platform notes:
-# - This environment file is cross-platform compatible (Windows, Mac, Linux)
-# - conda-forge channel is prioritized for better cross-platform packages
-# - Platform-specific packages use conditional markers (sys_platform)
-# - All version pins use >= to allow flexibility while ensuring minimum requirements
+# - This environment file is cross-platform compatible (Windows, Mac, Linux).
+# - conda-forge channel is prioritized for better cross-platform packages.
+# - Platform-specific packages use conditional markers (sys_platform).
+# - Shared runtime/test pins are strict (`==` for pip entries, `=X.Y.Z` for
+#   conda entries) to preserve audit reproducibility against the
+#   spyproject2 baseline (Python 3.12.2 / NumPy 1.26.4 MKL / pandas 2.2.1 /
+#   SciPy 1.13.1 / pytest 8.3.5).
+# - Loose constraints (`>=`) are reserved for OS / system-library bottoms
+#   (e.g., sqlite>=3.41) only.
+# - Shared runtime/test packages MUST stay in lockstep with
+#   project/requirements.txt; the static guard at
+#   project/test_scripts/test_env_dependency_specs.py pins this contract.
