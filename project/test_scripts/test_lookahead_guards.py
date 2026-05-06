@@ -1,7 +1,7 @@
 """
 Phase 2B-1: lookahead static guards.
 
-Spec §7: a day-T signal must depend only on data through day T-1.
+Spec Section 7: a day-T signal must depend only on data through day T-1.
 Same-day SMA values, same-day returns shifted by negative
 amounts, and unshifted SMA comparisons applied to the day's own
 return are all forms of lookahead.
@@ -10,7 +10,7 @@ These guards scan production code for known lookahead patterns.
 Each guard is documented with its rule, allowlist, and the
 ledger entry it seals against regression.
 
-Failure messages cite spec §7 and the affected file:line.
+Failure messages cite spec Section 7 and the affected file:line.
 
 Out of scope (best-effort coverage notes):
   A4 (unshifted SMA-comparison-on-same-day-return) is hard to
@@ -89,9 +89,9 @@ def test_b8_no_negative_shift_in_signal_paths():
             f"[B8-negative-shift] {len(failures)} hit(s):\n{body}\n\n"
             "Expected: production signal-construction code must not use "
             ".shift(-N). Day-T signals must depend only on data through "
-            "day T-1 (spec §7). Forward-return display helpers are "
+            "day T-1 (spec Section 7). Forward-return display helpers are "
             "allowlisted explicitly.\n"
-            "Ledger: spec §7 lookahead contract.\n"
+            "Ledger: spec Section 7 lookahead contract.\n"
         )
 
 
@@ -137,7 +137,7 @@ def test_b9_no_negative_shift_on_price_series():
         pytest.fail(
             f"[B9-negative-price-shift] {len(failures)} hit(s):\n{body}\n\n"
             "Expected: price series must not be shifted with a negative N "
-            "in production signal-construction code (spec §7).\n"
+            "in production signal-construction code (spec Section 7).\n"
         )
 
 
@@ -200,41 +200,51 @@ def test_b10_no_unshifted_sma_matrix_in_signal_paths():
             "Expected: signal-construction code reads sma_matrix at the "
             "previous index (idx - 1, t - 1), not the current index. "
             "Day-T signals must depend only on data through day T-1 "
-            "(spec §7).\n"
+            "(spec Section 7).\n"
         )
 
 
 # ---------------------------------------------------------------------------
-# B11: spymaster.compute_signals must remain uncalled (dead code).
+# B11: spymaster.compute_signals must remain DELETED (Phase 5B Item 6).
 # ---------------------------------------------------------------------------
 
 
-def test_b11_spymaster_compute_signals_uncalled():
-    """spymaster.compute_signals applies same-day SMA comparison
-    directly to same-day returns, which is lookahead by spec §7.
-    Codex audit confirmed it has zero call sites on origin/main
-    eb5f1a7. This guard pins it as dead code: any future call
-    site reintroduces a known lookahead bug.
+def test_b11_spymaster_compute_signals_removed():
+    """spymaster.compute_signals applied same-day SMA comparison
+    directly to same-day returns, which is lookahead by spec Section 7.
+    Phase 5B Item 6 (PR after #153) deleted the function outright per
+    the locked 5A cleanup ledger Item 6 (`delete` classification).
 
-    If/when 2B-2 or Phase 3 fixes the function (shift the signal
-    by 1 before applying), the static guard's rule should change
-    from "uncalled" to "shift-corrected" — update the rule then,
-    not now.
+    This guard pins the post-deletion state in two parts:
+      1. The `def compute_signals(` definition is absent from
+         spymaster.py.
+      2. No production .py file calls `compute_signals(` (whether as
+         a bare name or as `spymaster.compute_signals(`), preventing
+         a future PR from reintroducing the known-lookahead surface
+         under any name.
+
+    If a future PR reintroduces a shift-corrected `compute_signals`,
+    amend the 5A ledger Item 6 first (with date and rationale) and
+    then update this guard to assert shift-correctness instead of
+    removal.
     """
     spymaster_path = PROJECT_DIR / "spymaster.py"
     spymaster_text = spymaster_path.read_text(encoding="utf-8")
 
-    # Confirm the function still exists (sanity check; otherwise
-    # this guard becomes vacuous).
-    if "def compute_signals(" not in spymaster_text:
-        pytest.skip(
-            "spymaster.compute_signals has been removed; this guard is "
-            "no longer needed. Delete the test or convert to a "
-            "regression seal against re-introduction."
-        )
+    # Part 1: the function definition must remain absent.
+    assert "def compute_signals(" not in spymaster_text, (
+        "[B11-compute_signals-removed] `def compute_signals(` "
+        "reappeared in spymaster.py. Phase 5B Item 6 deleted this "
+        "function as a known-lookahead surface (same-day SMA "
+        "comparison applied to same-day returns; spec Section 7). If you "
+        "intend to reintroduce a shift-corrected version, amend "
+        "2026-05-05_PHASE_5A_CLEANUP_LEDGER.md Item 6 first with "
+        "date and rationale, then update this guard."
+    )
 
-    # Search every production .py file for a CALL site
-    # `compute_signals(` (anything besides the def line).
+    # Part 2: no production file may call compute_signals(
+    # (bare-name or spymaster.compute_signals attribute access).
+    # This catches reintroduction under any name.
     call_pattern = re.compile(r"\bcompute_signals\s*\(")
     def_pattern = re.compile(r"^\s*def\s+compute_signals\s*\(")
 
@@ -257,11 +267,14 @@ def test_b11_spymaster_compute_signals_uncalled():
     if callers:
         body = "\n".join(f"{r}:{ln}: {ln_.rstrip()}" for r, ln, ln_ in callers)
         pytest.fail(
-            f"[B11-compute_signals-uncalled] {len(callers)} call site(s):\n"
+            f"[B11-compute_signals-removed] {len(callers)} call "
+            f"site(s) reintroduced:\n"
             f"{body}\n\n"
-            "Expected: spymaster.compute_signals has zero call sites. "
-            "It applies same-day SMA comparisons to same-day returns, "
-            "which is lookahead by spec §7. If you intend to call it, "
-            "first shift the signal by +1 day; then update this guard "
-            "to assert shift-correctness instead of uncalled-ness.\n"
+            "Expected: zero production call sites for "
+            "compute_signals(. The function was deleted in Phase 5B "
+            "Item 6 because applying same-day SMA comparisons to "
+            "same-day returns is lookahead (spec Section 7). If you intend "
+            "to call a shift-corrected replacement, amend the 5A "
+            "cleanup ledger Item 6 first, then update this guard to "
+            "assert shift-correctness instead of removal.\n"
         )

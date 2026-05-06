@@ -4331,31 +4331,6 @@ def get_data(ticker, MAX_SMA_DAY):
     # Pass should_log=True to ensure Statistical Significance and Forecast are logged
     results = load_precomputed_results(ticker, skip_staleness_check=True, should_log=True)
     return results
-    
-def compute_signals(df, sma1, sma2):
-    # Align the indexes of sma1 and sma2
-    sma1, sma2 = sma1.align(sma2)
-
-    # Calculate signals where the signal remains True as long as sma1 is greater than sma2
-    signals = sma1 > sma2
-
-    # Check if the 'Close' column exists in the DataFrame
-    if 'Close' not in df.columns:
-        raise KeyError("The 'Close' column is missing in the DataFrame.")
-
-    # Calculate daily returns
-    daily_returns = df['Close'].pct_change()
-
-    # Calculate captures by applying the signal directly to the daily returns
-    buy_returns = daily_returns.copy()
-    buy_returns[~signals] = 0
-    buy_capture = buy_returns.cumsum()
-
-    short_returns = -daily_returns.copy()
-    short_returns[signals] = 0
-    short_capture = short_returns.cumsum()
-
-    return {'buy_capture': buy_capture, 'short_capture': short_capture}
 
 def write_status(ticker, status):
     """
