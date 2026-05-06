@@ -158,6 +158,18 @@ def test_d2_onepass_load_signal_library_populated(monkeypatch, _populated_lib_di
     assert loaded.get("price_source") == "Close"
     assert loaded.get("max_sma_day") == 114
 
+    # Phase 5B Item 7: passing rejection_out on a successful load must
+    # leave the dict empty -- no rejection is recorded for happy-path
+    # loads.
+    rejection_ok: dict = {}
+    loaded2 = op.load_signal_library(
+        _populated_lib_dir["ticker"], rejection_out=rejection_ok,
+    )
+    assert isinstance(loaded2, dict)
+    assert rejection_ok == {}, (
+        f"expected empty rejection on success, got {rejection_ok!r}"
+    )
+
 
 def test_d2_impactsearch_load_signal_library_populated(monkeypatch, _populated_lib_dir):
     isr = _get_module("impactsearch")
@@ -336,6 +348,20 @@ def test_d2_onepass_process_tickers_existing_signals_path(monkeypatch, tmp_path)
         # compute). The success criterion is purely "no exception".
         assert metrics == [] or metrics is None or isinstance(metrics, list), (
             f"unexpected metrics shape: {type(metrics).__name__}"
+        )
+
+        # Phase 5B Item 7: the no-data short-circuit must surface a
+        # structured error string in the run report -- not a silent
+        # skip. The format is the formatted ONEPASS rejection string
+        # produced by _format_rejection().
+        rpt = op.RUN_REPORT.to_dict()
+        outcomes = rpt.get("outcomes", [])
+        matching = [o for o in outcomes if o.get("ticker") == "AAA"]
+        assert matching, "expected outcome for AAA in run report"
+        err = matching[0].get("error") or ""
+        assert err and "[ONEPASS:" in err, (
+            f"expected ONEPASS-tagged error string in run report, "
+            f"got {err!r}"
         )
     finally:
         op.SIGNAL_LIBRARY_DIR = pre_signal_dir

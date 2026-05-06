@@ -480,6 +480,18 @@ def test_f11_onepass_consumer_verifies(tmp_path, monkeypatch):
     )
     assert onepass.load_signal_library("BBB") is None
 
+    # Phase 5B Item 7: when the diagnostic kwarg is supplied, the same
+    # mismatched-manifest call must populate rejection_out with reason
+    # == "manifest_failed". Adds to the existing F11 contract without
+    # changing return-type behavior.
+    bbb_rejection: dict = {}
+    assert onepass.load_signal_library(
+        "BBB", rejection_out=bbb_rejection,
+    ) is None
+    assert bbb_rejection.get("reason") == "manifest_failed"
+    assert bbb_rejection.get("stage") == "load"
+    assert bbb_rejection.get("ticker") == "BBB"
+
     # Legacy library (no manifest) -> load still works (warning).
     _write_lib_for_consumer(
         library_dir, "CCC",
