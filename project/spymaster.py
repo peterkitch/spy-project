@@ -23,6 +23,24 @@ from canonical_scoring import (
     score_captures as _canonical_score_captures,
     combine_consensus_signals as _canonical_consensus,
 )
+from validation_engine import (
+    SelectionAdapter,
+    FoldContext,
+    StrategyCandidate,
+    StrategyFoldResult,
+    BaselineFoldMetrics,
+    validate_strategy_set,
+    generate_run_id,
+    slice_to_cutoff,
+    slice_between,
+    DEFAULT_INITIAL_TRAIN_DAYS,
+    DEFAULT_TEST_WINDOW_DAYS,
+    DEFAULT_STEP_DAYS,
+    DEFAULT_ALPHA,
+    DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+    DEFAULT_N_PERMUTATIONS,
+    DEFAULT_N_BOOTSTRAP_SAMPLES,
+)
 
 # Phase 3B-2A sanctioned architecture exception:
 # Spymaster remains standalone for scoring/data logic, but imports the
@@ -12101,11 +12119,20 @@ class SpymasterOptimizationResult:
     the original callback's diagnostic-message tracking for the
     no-valid-combinations branch. ``total_combinations`` is the
     pre-evaluation product over the per-ticker state options.
+
+    Phase 5C-2d: ``validation_summary`` is an optional compact UI-side
+    summary attached after the in-memory walk-forward validation pass
+    runs. Default ``None`` preserves prep-PR behavior (no validation
+    line in the formatter message). Spymaster optimization is
+    interactive tier per locked 5C-1 §13.1; no JSON sidecar exists,
+    so ``validation_artifact_path`` / ``validation_artifact_hash``
+    inside the summary are always ``None``.
     """
 
     records: list
     last_contract_issue: str
     total_combinations: int
+    validation_summary: Optional[Mapping[str, Any]] = None
 
 
 def _align_spymaster_active_pairs_to_dates(
@@ -12560,11 +12587,19 @@ def format_spymaster_optimization_table(
                 continue
 
     rows = [averages] + sortable_data
-    success_message = html.Div(
+    base_text = (
         'Optimization complete. Click any ticker combination cell to '
-        'auto-populate in Multi-Primary Signal Aggregator.',
-        style={'color': '#80ff00'},
+        'auto-populate in Multi-Primary Signal Aggregator.'
     )
+    validation_summary = getattr(result, "validation_summary", None)
+    if validation_summary is None:
+        success_message = html.Div(base_text, style={'color': '#80ff00'})
+    else:
+        children = [base_text]
+        for line in _spymaster_validation_completion_lines(validation_summary):
+            children.append(html.Br())
+            children.append(line)
+        success_message = html.Div(children, style={'color': '#80ff00'})
     return rows, columns, success_message
 
 
@@ -12696,6 +12731,560 @@ def fetch_secondary_window_with_cutoff(
         return df
     cutoff_ts = pd.Timestamp(data_available_through)
     return df.loc[df.index <= cutoff_ts]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2d: Spymaster optimization validation (interactive tier)
+# ---------------------------------------------------------------------------
+
+
+def _spymaster_mean_finite(values):
+    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+    if not finite:
+        return None
+    return float(np.mean(finite))
+
+
+def _spymaster_validation_ui_summary(
+    contract: Mapping[str, Any],
+) -> dict:
+    """Return operator-facing in-memory validation summary for Spymaster.
+
+    Interactive tier summary only. No sidecar exists, so
+    ``validation_artifact_path`` and ``validation_artifact_hash`` are
+    ``None``. Modeled on the ImpactSearch UI summary pattern (PR #170).
+    """
+    agg = contract.get("baseline_aggregate") or {}
+    strategies = contract.get("strategies") or []
+    sharpe_deltas = []
+    return_deltas = []
+    for s in strategies:
+        d = s.get("aggregate_baseline_delta") or {}
+        if d.get("mean_sharpe_delta") is not None:
+            sharpe_deltas.append(d["mean_sharpe_delta"])
+        if d.get("mean_return_delta") is not None:
+            return_deltas.append(d["mean_return_delta"])
+    return {
+        "validation_contract_version": contract.get("validation_contract_version"),
+        "validation_status": contract.get("validation_status"),
+        "run_id": contract.get("run_id"),
+        "app_surface": contract.get("app_surface"),
+        "n_strategies_tested": contract.get("n_strategies_tested"),
+        "n_strategies_reported": contract.get("n_strategies_reported"),
+        "n_strategies_survived_empirical": contract.get(
+            "n_strategies_survived_empirical",
+        ),
+        "multiple_comparisons_control_method": contract.get(
+            "multiple_comparisons_control_method",
+        ),
+        "multiple_comparisons_control_alpha": contract.get(
+            "multiple_comparisons_control_alpha",
+        ),
+        "walk_forward_n_folds": contract.get("walk_forward_n_folds"),
+        "mean_baseline_sharpe": agg.get("mean_baseline_sharpe"),
+        "mean_sharpe_delta": _spymaster_mean_finite(sharpe_deltas),
+        "mean_return_delta": _spymaster_mean_finite(return_deltas),
+        "validation_artifact_path": None,
+        "validation_artifact_hash": None,
+        "issues": list(contract.get("issues") or []),
+    }
+
+
+def _spymaster_validation_completion_lines(
+    validation_summary: Optional[Mapping[str, Any]],
+):
+    """Return operator-visible validation lines for Spymaster optimization.
+
+    ``None`` returns ``[]`` so prep-PR message rendering stays
+    unchanged for the no-validation path.
+    """
+    if validation_summary is None:
+        return []
+    out = []
+    status = validation_summary.get("validation_status")
+    if status == "failed":
+        issues = validation_summary.get("issues") or []
+        first_issue = str(issues[0]) if issues else "unknown failure"
+        out.append(f"Validation: FAILED - {first_issue}.")
+        return out
+    n_tested = validation_summary.get("n_strategies_tested")
+    n_reported = validation_summary.get("n_strategies_reported")
+    n_survived_emp = validation_summary.get("n_strategies_survived_empirical")
+    alpha = validation_summary.get("multiple_comparisons_control_alpha")
+    delta = validation_summary.get("mean_sharpe_delta")
+    if delta is None:
+        delta_text = "n/a"
+    else:
+        try:
+            delta_f = float(delta)
+            if not np.isfinite(delta_f):
+                delta_text = "n/a"
+            else:
+                delta_text = f"{delta_f:.2f}"
+        except (TypeError, ValueError):
+            delta_text = "n/a"
+    out.append(
+        f"Validation: {n_reported} of {n_tested} survived BH at "
+        f"alpha={alpha} ({n_survived_emp} empirically validated). "
+        f"Mean Sharpe delta vs baseline: {delta_text}."
+    )
+    return out
+
+
+def _spymaster_capture_series_from_state(
+    *,
+    state_by_ticker: Mapping[str, Mapping[str, Any]],
+    primary_signal_data: Mapping[str, SpymasterPrimarySignalData],
+    secondary_data: pd.DataFrame,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+):
+    """Reconstruct daily_capture / trigger_mask / signal_state /
+    permutation_return_pool over a fold's evaluation window using the
+    Spymaster optimization scoring semantics.
+
+    Uses ``_spymaster_multi_primary_contract_result`` for consensus,
+    ``_price_series`` for raw Close, and the prep-core's
+    ``pct_change().fillna(0.0) * 100.0`` percent-point convention.
+    No ``shift(-1)`` (forward-looking returns are forbidden in the
+    scoring path; locked 5C-1 §6 baseline applies the same rule).
+    """
+    sec_window = slice_between(secondary_data, test_start, test_end)
+    if sec_window is None or sec_window.empty:
+        empty_idx = pd.DatetimeIndex([])
+        return (
+            pd.Series([], index=empty_idx, dtype=float),
+            pd.Series([], index=empty_idx, dtype=bool),
+            pd.Series([], index=empty_idx, dtype=object),
+            pd.Series([], index=empty_idx, dtype=float),
+        )
+
+    unmuted = [
+        t for t, st in state_by_ticker.items()
+        if not (st or {}).get("mute")
+    ]
+    if not unmuted:
+        empty_idx = sec_window.index
+        return (
+            pd.Series(0.0, index=empty_idx, dtype=float),
+            pd.Series(False, index=empty_idx, dtype=bool),
+            pd.Series('None', index=empty_idx, dtype=object),
+            pd.Series(0.0, index=empty_idx, dtype=float),
+        )
+
+    common_dates = set(sec_window.index)
+    for t in unmuted:
+        psig = primary_signal_data.get(t)
+        if psig is None:
+            return (
+                pd.Series([], dtype=float),
+                pd.Series([], dtype=bool),
+                pd.Series([], dtype=object),
+                pd.Series([], dtype=float),
+            )
+        common_dates = common_dates.intersection(set(psig.signals_with_next.index))
+    common_dates = sorted(common_dates)
+    if not common_dates:
+        empty_idx = pd.DatetimeIndex([])
+        return (
+            pd.Series([], index=empty_idx, dtype=float),
+            pd.Series([], index=empty_idx, dtype=bool),
+            pd.Series([], index=empty_idx, dtype=object),
+            pd.Series([], index=empty_idx, dtype=float),
+        )
+
+    combined_signals_df = pd.DataFrame(index=common_dates)
+    for t in unmuted:
+        st = state_by_ticker.get(t) or {}
+        sig_series = primary_signal_data[t].signals_with_next.loc[common_dates]
+        if st.get("invert_signals"):
+            sig_series = sig_series.replace({'Buy': 'Short', 'Short': 'Buy'})
+        combined_signals_df[t] = sig_series
+
+    contract = _spymaster_multi_primary_contract_result(
+        combined_signals_df, context="optimization_validation",
+    )
+    combined_signals = contract["aggregate_signal"]
+    signals = combined_signals.fillna('None').astype(str)
+
+    prices = _price_series(sec_window, index=signals.index)
+    daily_returns = prices.astype('float64').pct_change().fillna(0.0) * 100.0
+    if isinstance(daily_returns, pd.DataFrame):
+        daily_returns = daily_returns.iloc[:, 0]
+
+    signals = signals.loc[daily_returns.index]
+    ret = daily_returns.to_numpy()
+    buy_mask = signals.eq('Buy').to_numpy()
+    short_mask = signals.eq('Short').to_numpy()
+    cap = np.zeros_like(ret, dtype='float64')
+    cap[buy_mask] = ret[buy_mask]
+    cap[short_mask] = -ret[short_mask]
+    daily_capture = pd.Series(cap, index=daily_returns.index)
+    trigger_mask = pd.Series(
+        (buy_mask | short_mask).astype(bool), index=daily_returns.index,
+    )
+    signal_state = signals.copy()
+    return_pool = daily_returns.copy()
+    return daily_capture, trigger_mask, signal_state, return_pool
+
+
+def _spymaster_baseline_for_fold(
+    secondary_data: pd.DataFrame,
+    context: FoldContext,
+) -> BaselineFoldMetrics:
+    """Same-ticker buy-and-hold baseline (locked 5C-1 §6) over the
+    fold's test window using Spymaster scoring units (raw Close,
+    pct_change percent points, ddof=1, RFR=5.0).
+    """
+    test_window = slice_between(
+        secondary_data, context.test_start, context.test_end,
+    )
+    if test_window is None or test_window.empty:
+        formatted = (
+            f"[SPYMASTER:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: empty secondary window. "
+            f"Action: extend secondary history."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=0,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+            issues=(formatted,),
+        )
+    prices = _price_series(test_window, index=test_window.index)
+    daily_returns = prices.astype('float64').pct_change().fillna(0.0) * 100.0
+    n_obs = int(len(daily_returns))
+    if n_obs == 0:
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=0,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+        )
+    all_true = pd.Series([True] * n_obs, index=daily_returns.index)
+    try:
+        score = _canonical_score_captures(
+            daily_returns, all_true,
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
+    except Exception as exc:
+        formatted = (
+            f"[SPYMASTER:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: baseline scoring raised "
+            f"{type(exc).__name__}: {exc}. "
+            f"Action: inspect canonical scoring."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=n_obs,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+            issues=(formatted,),
+        )
+
+    def _safe(x):
+        if x is None:
+            return None
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(f):
+            return None
+        return f
+
+    return BaselineFoldMetrics(
+        fold_index=context.fold_index,
+        n_observations=n_obs,
+        baseline_sharpe=_safe(getattr(score, "sharpe", None)),
+        baseline_total_return=_safe(getattr(score, "total_capture", None)),
+        baseline_mean_return=_safe(getattr(score, "avg_daily_capture", None)),
+        baseline_std=_safe(getattr(score, "std_dev", None)),
+    )
+
+
+def _empty_spymaster_strategy_fold_result(
+    fold_index: int,
+    candidate: StrategyCandidate,
+    reason: str,
+) -> StrategyFoldResult:
+    formatted = (
+        f"[SPYMASTER:validation_unavailable] {candidate.strategy_id}: "
+        f"{reason}. Action: inspect adapter logs or extend history."
+    )
+    return StrategyFoldResult(
+        fold_index=fold_index,
+        strategy_id=candidate.strategy_id,
+        strategy_label=candidate.strategy_label,
+        daily_capture=pd.Series([], dtype=float),
+        trigger_mask=pd.Series([], dtype=bool),
+        issues=(formatted,),
+        metadata={"reason": reason},
+    )
+
+
+class SpymasterOptimizationValidationAdapter:
+    """SelectionAdapter for Spymaster optimization walk-forward validation.
+
+    ``select_for_fold`` refits the invert/mute combination search using
+    only data ``<= context.selection_cutoff``.
+
+    ``evaluate_candidate`` scores the selected combination on the
+    fold's test window using signal data available through
+    ``context.evaluation_cutoff``.
+
+    Each ``StrategyCandidate`` is one scored optimization record
+    returned by ``compute_spymaster_optimization``, not the formatter
+    AVERAGES row.
+    """
+
+    def __init__(
+        self,
+        secondary_ticker: str,
+        primary_tickers: Sequence[str],
+        primary_results_by_ticker: Mapping[str, Mapping[str, Any]],
+        primary_dfs_by_ticker: Mapping[str, pd.DataFrame],
+        secondary_data: pd.DataFrame,
+    ) -> None:
+        self.secondary_ticker = str(secondary_ticker or "").strip().upper()
+        self.primary_tickers = [
+            str(t or "").strip().upper()
+            for t in (primary_tickers or [])
+            if str(t or "").strip()
+        ]
+        self.primary_results_by_ticker = {
+            str(k or "").strip().upper(): v
+            for k, v in (primary_results_by_ticker or {}).items()
+        }
+        self.primary_dfs_by_ticker = {
+            str(k or "").strip().upper(): v
+            for k, v in (primary_dfs_by_ticker or {}).items()
+        }
+        self.secondary_data = secondary_data
+
+    def select_for_fold(self, context: FoldContext):
+        sec_train = slice_to_cutoff(self.secondary_data, context.selection_cutoff)
+        if sec_train is None or sec_train.empty:
+            return []
+
+        psig_map: dict = {}
+        missing_or_failed: list = []
+        for t in self.primary_tickers:
+            results = self.primary_results_by_ticker.get(t)
+            df = self.primary_dfs_by_ticker.get(t)
+            if results is None or df is None or df.empty:
+                missing_or_failed.append(t)
+                continue
+            try:
+                psig = build_spymaster_primary_signal_data(
+                    ticker=t,
+                    results=results,
+                    df=df,
+                    secondary_data=sec_train,
+                    data_available_through=context.selection_cutoff,
+                )
+            except Exception as exc:
+                missing_or_failed.append(f"{t} ({type(exc).__name__})")
+                continue
+            psig_map[t] = psig
+
+        if missing_or_failed:
+            raise ValueError(
+                f"SpymasterOptimizationValidationAdapter.select_for_fold: "
+                f"unable to resolve primary signal data for: "
+                f"{', '.join(missing_or_failed)}"
+            )
+
+        opt_result = compute_spymaster_optimization(
+            primary_tickers=self.primary_tickers,
+            secondary_ticker=self.secondary_ticker,
+            secondary_data=sec_train,
+            primary_signal_data=psig_map,
+            progress_callback=None,
+        )
+
+        candidates: list = []
+        for rank_one_based, rec in enumerate(opt_result.records, start=1):
+            sid = rec.get("strategy_id") or ""
+            label = str(rec.get("Combination") or sid)
+            in_sample_metrics = {
+                "Sharpe": rec.get("Sharpe"),
+                "Total %": rec.get("Total %"),
+                "Win %": rec.get("Win %"),
+                "Triggers": rec.get("Triggers"),
+                "Avg Cap %": rec.get("Avg Cap %"),
+            }
+            candidates.append(StrategyCandidate(
+                strategy_id=sid,
+                strategy_label=label,
+                app_payload={
+                    "state_by_ticker": dict(rec.get("state_by_ticker") or {}),
+                    "unmuted_tickers": list(rec.get("unmuted_tickers") or []),
+                    "in_sample_metrics": in_sample_metrics,
+                    "fold_train_rank": int(rank_one_based),
+                    "secondary_ticker": self.secondary_ticker,
+                    "primary_tickers": list(self.primary_tickers),
+                },
+            ))
+        return candidates
+
+    def evaluate_candidate(
+        self,
+        candidate: StrategyCandidate,
+        context: FoldContext,
+    ) -> StrategyFoldResult:
+        payload = candidate.app_payload or {}
+        state_by_ticker = dict(payload.get("state_by_ticker") or {})
+        if not state_by_ticker:
+            return _empty_spymaster_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="candidate has no state_by_ticker payload",
+            )
+
+        # Build per-primary signal data for the EVALUATION cutoff so
+        # the test-window signal series is fully available without
+        # leaking past the fold boundary.
+        sec_eval = slice_to_cutoff(
+            self.secondary_data, context.evaluation_cutoff,
+        )
+        if sec_eval is None or sec_eval.empty:
+            return _empty_spymaster_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="secondary frame empty under evaluation cutoff",
+            )
+
+        psig_eval: dict = {}
+        for t in self.primary_tickers:
+            st = state_by_ticker.get(t) or {}
+            if st.get("mute"):
+                # Muted tickers don't contribute; still track to honor
+                # state_by_ticker keys but we don't need a psig for them.
+                continue
+            results = self.primary_results_by_ticker.get(t)
+            df = self.primary_dfs_by_ticker.get(t)
+            if results is None or df is None or df.empty:
+                return _empty_spymaster_strategy_fold_result(
+                    context.fold_index, candidate,
+                    reason=f"missing primary data for {t} at evaluation cutoff",
+                )
+            try:
+                psig = build_spymaster_primary_signal_data(
+                    ticker=t,
+                    results=results,
+                    df=df,
+                    secondary_data=sec_eval,
+                    data_available_through=context.evaluation_cutoff,
+                )
+            except Exception as exc:
+                return _empty_spymaster_strategy_fold_result(
+                    context.fold_index, candidate,
+                    reason=(
+                        f"build_spymaster_primary_signal_data raised for "
+                        f"{t}: {type(exc).__name__}: {exc}"
+                    ),
+                )
+            psig_eval[t] = psig
+
+        daily_capture, trigger_mask, signal_state, return_pool = (
+            _spymaster_capture_series_from_state(
+                state_by_ticker=state_by_ticker,
+                primary_signal_data=psig_eval,
+                secondary_data=sec_eval,
+                test_start=context.test_start,
+                test_end=context.test_end,
+            )
+        )
+        if daily_capture.empty or not bool(trigger_mask.any()):
+            return _empty_spymaster_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="no triggers in evaluation window",
+            )
+        return StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=daily_capture.astype('float64'),
+            trigger_mask=trigger_mask,
+            metadata={
+                "signal_state": signal_state,
+                "permutation_return_pool": return_pool,
+                "state_by_ticker": dict(state_by_ticker),
+                "unmuted_tickers": list(payload.get("unmuted_tickers") or []),
+                "secondary_ticker": self.secondary_ticker,
+            },
+            issues=(),
+        )
+
+    def baseline_for_fold(self, context: FoldContext) -> BaselineFoldMetrics:
+        if self.secondary_data is None or self.secondary_data.empty:
+            formatted = (
+                f"[SPYMASTER:validation_baseline_unavailable] "
+                f"fold-{context.fold_index}: secondary frame unavailable. "
+                f"Action: confirm secondary ticker is valid."
+            )
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index, n_observations=0,
+                baseline_sharpe=None, baseline_total_return=None,
+                baseline_mean_return=None, baseline_std=None,
+                issues=(formatted,),
+            )
+        return _spymaster_baseline_for_fold(self.secondary_data, context)
+
+
+def _run_spymaster_optimization_validation(
+    *,
+    secondary_ticker: str,
+    primary_tickers: Sequence[str],
+    primary_results_by_ticker: Mapping[str, Mapping[str, Any]],
+    primary_dfs_by_ticker: Mapping[str, pd.DataFrame],
+    secondary_data: pd.DataFrame,
+    run_id: Optional[str] = None,
+    n_permutations: int = DEFAULT_N_PERMUTATIONS,
+    n_bootstrap_samples: int = DEFAULT_N_BOOTSTRAP_SAMPLES,
+    rng_seed: Optional[int] = None,
+):
+    """Run in-memory walk-forward validation for Spymaster optimization.
+
+    Interactive tier per locked 5C-1 §13.1: NO sidecar, NO manifest
+    persistence. Returns a compact UI summary dict, or ``None`` when
+    validation raises (failure is non-fatal in the interactive path
+    and surfaces only via the absence of a validation line in the
+    completion message).
+    """
+    rid = run_id or generate_run_id("spymaster", "optimization_interactive")
+    try:
+        adapter = SpymasterOptimizationValidationAdapter(
+            secondary_ticker=secondary_ticker,
+            primary_tickers=primary_tickers,
+            primary_results_by_ticker=primary_results_by_ticker,
+            primary_dfs_by_ticker=primary_dfs_by_ticker,
+            secondary_data=secondary_data,
+        )
+        history_index = (
+            secondary_data.index
+            if secondary_data is not None and not secondary_data.empty
+            else pd.DatetimeIndex([])
+        )
+        contract = validate_strategy_set(
+            adapter, history_index,
+            run_id=rid,
+            producer_engine="spymaster",
+            app_surface="optimization_interactive",
+            alpha=DEFAULT_ALPHA,
+            initial_train_days=DEFAULT_INITIAL_TRAIN_DAYS,
+            test_window_days=DEFAULT_TEST_WINDOW_DAYS,
+            step_days=DEFAULT_STEP_DAYS,
+            n_permutations=int(n_permutations),
+            n_bootstrap_samples=int(n_bootstrap_samples),
+            borderline_tolerance_multiplier=DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+            rng_seed=rng_seed,
+        )
+        return _spymaster_validation_ui_summary(contract)
+    except Exception as exc:
+        logger.warning(
+            "[5C-2d] Spymaster optimization validation raised; "
+            "returning None: %s: %s",
+            type(exc).__name__, exc,
+        )
+        return None
 
 
 @app.callback(
@@ -12958,9 +13547,15 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
         # The callback retains ownership of data loading
         # (``load_precomputed_results`` + ``ensure_df_available``) so
         # the missing-ticker / queue path stays in the orchestrator.
+        # Phase 5C-2d: also retain the loaded ``results`` and ``df``
+        # per ticker so the validation adapter can rerun cutoff-aware
+        # signal resolution without re-fetching during the in-memory
+        # walk-forward pass.
         primary_signal_data = {}
         date_indexes = {}
         missing_tickers = []
+        primary_results_by_ticker = {}
+        primary_dfs_by_ticker = {}
 
         for ticker in primary_tickers:
             logger.info(f"Loading precomputed results for {ticker}...")
@@ -13011,6 +13606,8 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
 
             primary_signal_data[ticker] = psig
             date_indexes[ticker] = set(psig.signals_with_next.index)
+            primary_results_by_ticker[ticker] = results
+            primary_dfs_by_ticker[ticker] = df
         
         # Check if we have any missing tickers that need processing
         if missing_tickers:
@@ -13087,6 +13684,25 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
                     optimization_lock.release()
             no_valid_msg = result.last_contract_issue or 'No valid combinations found.'
             return [], empty_columns, no_valid_msg, True
+
+        # Phase 5C-2d: interactive in-memory validation. Runs only on
+        # the fresh-compute path (the cache/sort polling branches above
+        # return cached rows without re-validating). On failure the
+        # helper returns None and the formatter behaves as in the
+        # prep PR (no validation line appended).
+        validation_summary = _run_spymaster_optimization_validation(
+            secondary_ticker=secondary_ticker,
+            primary_tickers=primary_tickers,
+            primary_results_by_ticker=primary_results_by_ticker,
+            primary_dfs_by_ticker=primary_dfs_by_ticker,
+            secondary_data=secondary_data,
+        )
+        result = SpymasterOptimizationResult(
+            records=result.records,
+            last_contract_issue=result.last_contract_issue,
+            total_combinations=result.total_combinations,
+            validation_summary=validation_summary,
+        )
 
         try:
             current_sort = getattr(ctx.inputs, 'optimization-results-table.sort_by', None)
