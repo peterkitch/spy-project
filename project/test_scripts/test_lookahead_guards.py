@@ -68,6 +68,11 @@ def test_b8_no_negative_shift_in_signal_paths():
         # Line bumped 2293 -> 2529 by the Phase 5B-MP-2b multi-primary
         # contract diagnostic surface in run_multi_primary_analysis.
         ("confluence.py", 2529),
+        # validation_engine.outcome_returns_at_horizon: forward-return
+        # outcome measurement per locked 5C-1 Section 5. It is not used
+        # for signal selection. Bump this line number only if the helper
+        # moves.
+        ("validation_engine.py", 283),
     }
 
     failures = []
