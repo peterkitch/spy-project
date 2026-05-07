@@ -1139,6 +1139,19 @@ def _output_content_hash(content_obj: Any) -> Optional[str]:
     return hashlib.sha256(blob).hexdigest()
 
 
+_VALIDATION_SUMMARY_REQUIRED_KEYS: Tuple[str, ...] = (
+    "validation_contract_version",
+    "validation_status",
+    "n_strategies_tested",
+    "n_strategies_reported",
+    "multiple_comparisons_control_method",
+    "multiple_comparisons_control_alpha",
+    "walk_forward_n_folds",
+    "validation_artifact_path",
+    "validation_artifact_hash",
+)
+
+
 def build_output_manifest(
     *,
     artifact_type: str,
@@ -1153,6 +1166,7 @@ def build_output_manifest(
     content_obj: Any = None,
     artifact_kind: str = ARTIFACT_KIND_OUTPUT,
     repo_root: Optional[Path] = None,
+    validation_summary: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Build the core output manifest dict.
 
@@ -1211,6 +1225,18 @@ def build_output_manifest(
     # (e.g. a standalone manifest document where the artifact IS the
     # manifest and file_sha256 covers the byte-level check separately).
     manifest["content_hash"] = _output_content_hash(content_obj)
+    # Phase 5C-2a-ii: optional validation summary (locked 5C-1 §12).
+    # When None, the manifest is byte-identical to the pre-5C-2a-ii
+    # output (modulo unavoidable volatile fields like build_timestamp).
+    # When provided, the locked nine summary keys are required; missing
+    # keys raise ValueError naming the offending key.
+    if validation_summary is not None:
+        for key in _VALIDATION_SUMMARY_REQUIRED_KEYS:
+            if key not in validation_summary:
+                raise ValueError(
+                    f"validation_summary missing required key: {key!r}"
+                )
+            manifest[key] = validation_summary[key]
     return manifest
 
 

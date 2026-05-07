@@ -364,6 +364,8 @@ def test_validate_strategy_set_in_sample_only_when_history_short():
         run_id="test-run-short",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
     assert contract["validation_status"] == ve.IN_SAMPLE_ONLY
     assert contract["walk_forward_n_folds"] is None
@@ -391,6 +393,8 @@ def test_validate_strategy_set_basic_parametric_path():
         run_id="test-run-basic",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
     assert contract["validation_status"] == ve.VALID
     assert contract["walk_forward_n_folds"] == 5
@@ -432,6 +436,8 @@ def test_validate_strategy_set_no_leak_walk_forward():
         run_id="test-run-no-leak",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
     assert len(adapter.select_contexts) == 5
     assert len(adapter.evaluate_contexts) == 5
@@ -463,6 +469,8 @@ def test_validate_strategy_set_partial_folds_when_one_fails():
         run_id="test-run-partial",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
     assert contract["validation_status"] == ve.PARTIAL
     assert contract["walk_forward_n_folds"] == 5
@@ -508,6 +516,8 @@ def test_validate_strategy_set_failed_when_canonical_scoring_raises(monkeypatch)
         run_id="test-run-failed-canonical",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
 
     assert contract["validation_status"] == ve.FAILED, (
@@ -594,6 +604,8 @@ def test_validate_strategy_set_failed_when_adapter_evaluate_raises():
         run_id="test-run-failed-adapter",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
 
     assert contract["validation_status"] == ve.FAILED, (
@@ -635,6 +647,8 @@ def test_validate_strategy_set_failed_status_wins_over_partial(monkeypatch):
         run_id="test-run-failed-wins",
         producer_engine="test_engine",
         app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
     )
 
     assert contract["validation_status"] == ve.FAILED, (
@@ -710,3 +724,478 @@ def test_canonical_scoring_byte_identical():
     assert math.isclose(
         score_a.total_capture, score_b.total_capture, rel_tol=1e-12,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2a-ii: empirical layer + persistence helpers
+# ---------------------------------------------------------------------------
+
+
+def _trigger_capture_series(values, n_total=50):
+    """Build a daily_capture / trigger_mask Series pair. ``values`` is
+    placed at the front of a length-``n_total`` Series; the rest are
+    zero non-trigger days.
+    """
+    idx = pd.RangeIndex(n_total)
+    cap = pd.Series([0.0] * n_total, index=idx, dtype=float)
+    mask = pd.Series([False] * n_total, index=idx)
+    for i, v in enumerate(values):
+        cap.iloc[i] = float(v)
+        mask.iloc[i] = True
+    return cap, mask
+
+
+def test_permutation_p_value_basic():
+    """Strong observed signal vs zero-centred pool: empirical p
+    should be small (< 0.10). The observed captures must have non-
+    zero variance so canonical scoring returns a finite, large
+    Sharpe; constant captures would produce Sharpe == 0 and the
+    test would not exercise the strong-signal path.
+    """
+    rng = np.random.default_rng(42)
+    # 20 strongly-positive observed captures with non-zero variance.
+    cycle = [0.8, 1.0, 1.2, 0.9, 1.1]
+    obs_values = (cycle * 4)[:20]
+    cap, mask = _trigger_capture_series(obs_values, n_total=200)
+    # Pool: zero-centred, mild values. Drawing 20 from this pool
+    # rarely produces a Sharpe approaching the observed.
+    pool = pd.Series(np.concatenate([
+        np.linspace(-0.05, 0.05, 800),
+        np.linspace(-0.1, 0.1, 200),
+    ]))
+    p = ve._permutation_p_value(
+        cap, mask, n_permutations=1000, rng=rng,
+        permutation_capture_pool=pool,
+    )
+    assert p is not None
+    assert p < 0.10, f"expected p < 0.10 for strong signal; got {p!r}"
+
+
+def test_permutation_p_value_random_strategy():
+    """Observed captures drawn from same distribution as the pool: the
+    empirical p should NOT be small.
+    """
+    rng = np.random.default_rng(2026)
+    pool_arr = rng.standard_normal(1000)
+    obs_idx = rng.choice(len(pool_arr), size=20, replace=False)
+    cap, mask = _trigger_capture_series(pool_arr[obs_idx].tolist(), n_total=200)
+    pool = pd.Series(pool_arr)
+    rng2 = np.random.default_rng(2027)
+    p = ve._permutation_p_value(
+        cap, mask, n_permutations=1000, rng=rng2,
+        permutation_capture_pool=pool,
+    )
+    assert p is not None
+    assert p > 0.10, (
+        "expected p > 0.10 for representative-of-pool signal; got "
+        + repr(p)
+    )
+
+
+def test_permutation_p_value_zero_triggers():
+    rng = np.random.default_rng(7)
+    cap, mask = _trigger_capture_series([], n_total=50)
+    pool = pd.Series(np.linspace(-1.0, 1.0, 100))
+    p = ve._permutation_p_value(
+        cap, mask, n_permutations=1000, rng=rng,
+        permutation_capture_pool=pool,
+    )
+    assert p is None
+
+
+def test_permutation_p_value_direction_preserves_buy_short_counts(monkeypatch):
+    """In direction-preserving mode, captures fed to canonical scoring
+    must contain exactly ``n_buy`` positive-direction samples and
+    ``n_short`` negative-direction samples per permutation. Trigger-
+    count fallback would mix them indistinguishably, so we instrument
+    _score_capture_arrays to assert the per-permutation sign profile.
+    """
+    rng = np.random.default_rng(11)
+    # Observed: 10 Buy + 10 Short triggers in a 50-row evaluation
+    # grid.
+    cap_vals = [1.0] * 10 + [-1.0] * 10
+    cap, mask = _trigger_capture_series(cap_vals, n_total=50)
+
+    sig_state = pd.Series(
+        ["Buy"] * 10 + ["Short"] * 10 + ["None"] * 30,
+        index=cap.index,
+    )
+    return_pool = pd.Series(
+        np.linspace(0.1, 5.0, 200, dtype=float),
+    )
+
+    seen_capture_arrays = []
+    real_score = ve._score_capture_arrays
+
+    def _spy(captures):
+        # Capture only the permutation-time scoring calls (length
+        # equal to n_buy + n_short = 20).
+        arr = np.asarray(captures, dtype=float)
+        if arr.size == 20:
+            seen_capture_arrays.append(arr.copy())
+        return real_score(captures)
+
+    monkeypatch.setattr(ve, "_score_capture_arrays", _spy)
+
+    p = ve._permutation_p_value(
+        cap, mask, n_permutations=50, rng=rng,
+        signal_state=sig_state,
+        permutation_return_pool=return_pool,
+    )
+    assert p is not None
+    assert seen_capture_arrays, (
+        "expected at least one permutation to invoke _score_capture_arrays"
+    )
+    for arr in seen_capture_arrays:
+        # Every direction-preserving permutation MUST produce
+        # exactly 10 strictly-positive (Buy) + 10 strictly-negative
+        # (Short) values, given the all-positive return pool.
+        positives = int(np.sum(arr > 0))
+        negatives = int(np.sum(arr < 0))
+        assert positives == 10 and negatives == 10, (
+            "Direction-preserving sign profile broken: "
+            + repr({"+": positives, "-": negatives, "arr": arr.tolist()})
+        )
+
+
+def test_bootstrap_sharpe_ci_basic():
+    rng = np.random.default_rng(3)
+    cap, mask = _trigger_capture_series(
+        [0.5, 0.6, 0.4, 0.5, 0.55, 0.45, 0.6, 0.5, 0.5, 0.55] * 4,
+        n_total=80,
+    )
+    observed = ve._score_capture_arrays(cap[mask].to_numpy())
+    assert observed is not None
+    lo, hi = ve._bootstrap_sharpe_ci(
+        cap, mask, n_bootstrap_samples=1000, ci_level=0.95, rng=rng,
+    )
+    assert lo is not None and hi is not None
+    assert lo <= observed <= hi, (
+        f"observed Sharpe {observed!r} outside CI [{lo!r}, {hi!r}]"
+    )
+
+
+def test_bootstrap_sharpe_ci_zero_triggers():
+    rng = np.random.default_rng(5)
+    cap, mask = _trigger_capture_series([], n_total=50)
+    lo, hi = ve._bootstrap_sharpe_ci(
+        cap, mask, n_bootstrap_samples=1000, ci_level=0.95, rng=rng,
+    )
+    assert lo is None and hi is None
+
+
+def test_run_empirical_layer_basic():
+    cap1, mask1 = _trigger_capture_series([1.0] * 15, n_total=60)
+    cap2, mask2 = _trigger_capture_series([0.8] * 15, n_total=60)
+    cap3, mask3 = _trigger_capture_series([1.2] * 15, n_total=60)
+    pool = pd.Series(np.concatenate([np.zeros(80), np.linspace(-0.1, 0.1, 20)]))
+    survivors = [
+        {
+            "strategy_id": "s1",
+            "daily_capture": cap1,
+            "trigger_mask": mask1,
+            "metadata": {"permutation_capture_pool": pool},
+        },
+        {
+            "strategy_id": "s2",
+            "daily_capture": cap2,
+            "trigger_mask": mask2,
+            "metadata": {"permutation_capture_pool": pool},
+        },
+        {
+            "strategy_id": "s3",
+            "daily_capture": cap3,
+            "trigger_mask": mask3,
+            "metadata": {"permutation_capture_pool": pool},
+        },
+    ]
+    res = ve._run_empirical_layer(
+        survivors,
+        n_permutations=200,
+        n_bootstrap_samples=200,
+        bootstrap_ci_level=0.95,
+        rng_seed=2026,
+        alpha=0.05,
+        producer_engine="test_engine",
+        run_id="test-run",
+    )
+    assert set(res.keys()) == {"s1", "s2", "s3"}
+    for sid in ("s1", "s2", "s3"):
+        assert res[sid]["empirical_validation_status"] == "validated"
+        assert "empirical_p_value" in res[sid]
+        assert res[sid].get("issue") is None
+
+
+def test_run_empirical_layer_handles_strategy_exception(monkeypatch):
+    cap1, mask1 = _trigger_capture_series([1.0] * 10, n_total=40)
+    cap2, mask2 = _trigger_capture_series([0.8] * 10, n_total=40)
+    pool = pd.Series(np.linspace(-0.5, 0.5, 100))
+
+    real_perm = ve._permutation_p_value
+
+    def _selective_boom(*args, **kwargs):
+        # Find which strategy is being permuted by inspecting the
+        # capture series identity.
+        cap = args[0] if args else kwargs.get("daily_capture")
+        if cap is cap2:
+            raise RuntimeError("simulated S2 permutation failure")
+        return real_perm(*args, **kwargs)
+
+    monkeypatch.setattr(ve, "_permutation_p_value", _selective_boom)
+
+    survivors = [
+        {"strategy_id": "S1", "daily_capture": cap1, "trigger_mask": mask1,
+         "metadata": {"permutation_capture_pool": pool}},
+        {"strategy_id": "S2", "daily_capture": cap2, "trigger_mask": mask2,
+         "metadata": {"permutation_capture_pool": pool}},
+    ]
+    res = ve._run_empirical_layer(
+        survivors,
+        n_permutations=100,
+        n_bootstrap_samples=100,
+        bootstrap_ci_level=0.95,
+        rng_seed=2026,
+        alpha=0.05,
+        producer_engine="test_engine",
+        run_id="run-x",
+    )
+    assert res["S1"]["empirical_validation_status"] == "validated"
+    assert res["S2"]["empirical_validation_status"] == "empirical_failed"
+    assert res["S2"]["issue"] is not None
+    assert ve.VALIDATION_EMPIRICAL_FAILED in res["S2"]["issue"]
+
+
+class _PoolSupplyingAdapter:
+    """Mock adapter that supplies a permutation_capture_pool in
+    metadata so the empirical layer can run for selected strategies.
+    """
+
+    def __init__(self, history, n_strategies=5, n_triggers_per_fold=20,
+                 capture_value=0.4, pool_size=400):
+        self._history = history
+        self._n = n_strategies
+        self._n_trig = n_triggers_per_fold
+        self._cap_v = capture_value
+        rng = np.random.default_rng(123)
+        self._pool = pd.Series(rng.standard_normal(pool_size) * 0.05)
+
+    def select_for_fold(self, context):
+        return [
+            ve.StrategyCandidate(strategy_id=f"s{i}", strategy_label=f"S{i}")
+            for i in range(self._n)
+        ]
+
+    def evaluate_candidate(self, candidate, context):
+        cap, mask = _captures_in_window(
+            self._history, context.test_start, context.test_end,
+            self._n_trig, self._cap_v,
+        )
+        return ve.StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=cap,
+            trigger_mask=mask,
+            metadata={"permutation_capture_pool": self._pool},
+        )
+
+    def baseline_for_fold(self, context):
+        cap, mask = _captures_in_window(
+            self._history, context.test_start, context.test_end, 0, 0.0,
+        )
+        return ve.StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id="baseline",
+            strategy_label="Baseline",
+            daily_capture=cap,
+            trigger_mask=mask,
+        )
+
+
+def test_validate_strategy_set_empirical_layer_wires_correctly(monkeypatch):
+    history = _bdate_index(2520)
+    adapter = _PoolSupplyingAdapter(history, n_strategies=5)
+
+    # Spike q-values: s0/s1 below alpha, s2 borderline, s3/s4 above 2*alpha.
+    fixed_q = [0.01, 0.02, 0.07, 0.20, 0.40]
+    monkeypatch.setattr(ve, "bh_adjust", lambda ps: list(fixed_q[: len(ps)]))
+
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="test-run-empirical-wire",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        alpha=0.05,
+        n_permutations=100,
+        n_bootstrap_samples=100,
+        rng_seed=42,
+    )
+
+    by_id = {s["strategy_id"]: s for s in contract["strategies"]}
+    # In subset (q <= alpha or q <= 2*alpha = 0.10): s0, s1, s2.
+    for sid in ("s0", "s1", "s2"):
+        assert by_id[sid]["empirical_validation_status"] == "validated", (
+            f"{sid} should be validated; got "
+            + str(by_id[sid]["empirical_validation_status"])
+        )
+        assert by_id[sid]["empirical_p_value"] is not None
+        assert by_id[sid]["bootstrap_sharpe_ci_lower"] is not None
+        assert by_id[sid]["bootstrap_sharpe_ci_upper"] is not None
+    # Out of subset: s3 (q=0.20), s4 (q=0.40) > 2*alpha=0.10.
+    for sid in ("s3", "s4"):
+        assert by_id[sid]["empirical_validation_status"] == "empirical_not_run"
+        assert by_id[sid]["empirical_p_value"] is None
+
+
+def test_validate_strategy_set_borderline_strategies_get_empirical(monkeypatch):
+    history = _bdate_index(2520)
+    adapter = _PoolSupplyingAdapter(history, n_strategies=3)
+
+    # q-values: s0 well below alpha, s1 in borderline band, s2 above
+    # 2*alpha.
+    fixed_q = [0.01, 0.09, 0.30]
+    monkeypatch.setattr(ve, "bh_adjust", lambda ps: list(fixed_q[: len(ps)]))
+
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="test-run-borderline",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        alpha=0.05,
+        n_permutations=50,
+        n_bootstrap_samples=50,
+        rng_seed=99,
+    )
+    by_id = {s["strategy_id"]: s for s in contract["strategies"]}
+    assert by_id["s0"]["empirical_validation_status"] == "validated"
+    assert by_id["s1"]["empirical_validation_status"] == "validated"
+    assert by_id["s2"]["empirical_validation_status"] == "empirical_not_run"
+
+
+def test_validate_strategy_set_n_strategies_survived_empirical_count(monkeypatch):
+    history = _bdate_index(2520)
+    adapter = _PoolSupplyingAdapter(history, n_strategies=4)
+
+    fixed_q = [0.01, 0.02, 0.04, 0.09]
+    monkeypatch.setattr(ve, "bh_adjust", lambda ps: list(fixed_q[: len(ps)]))
+
+    # Force deterministic empirical p-values:
+    # s0 -> 0.001 (BH survivor + empirical pass)
+    # s1 -> 0.06 (BH survivor but empirical fail at alpha=0.05)
+    # s2 -> 0.04 (BH survivor + empirical pass)
+    # s3 -> 0.08 (borderline, NOT a BH survivor — does not count)
+    p_lookup = {"s0": 0.001, "s1": 0.06, "s2": 0.04, "s3": 0.08}
+    real_run = ve._run_empirical_layer
+
+    def _fake_run(survivors, **kw):
+        out = {}
+        for entry in survivors:
+            sid = entry["strategy_id"]
+            out[sid] = {
+                "empirical_p_value": p_lookup.get(sid),
+                "bootstrap_sharpe_ci_lower": -1.0,
+                "bootstrap_sharpe_ci_upper": 1.0,
+                "empirical_validation_status": "validated",
+                "passed_empirical_alpha": (p_lookup.get(sid, 1.0) <= kw.get("alpha", 0.05)),
+                "issue": None,
+            }
+        return out
+
+    monkeypatch.setattr(ve, "_run_empirical_layer", _fake_run)
+
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="test-run-survived",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        alpha=0.05,
+        n_permutations=10,
+        n_bootstrap_samples=10,
+        rng_seed=1,
+    )
+    # n_strategies_survived_empirical counts BH-survivors (q<=0.05)
+    # whose empirical_p_value <= 0.05. That's s0 (0.001) and s2 (0.04).
+    # s1 has p=0.06 > alpha; s3 has q=0.09 > alpha (not a BH survivor).
+    assert contract["n_strategies_survived_empirical"] == 2, (
+        "expected 2 BH-survivor strategies passing empirical alpha; got "
+        + str(contract["n_strategies_survived_empirical"])
+    )
+
+
+def test_validate_strategy_set_empirical_failure_promotes_to_partial_not_failed(monkeypatch):
+    history = _bdate_index(2520)
+
+    # Adapter with NO permutation pool metadata (forces
+    # empirical_failed for the BH-survivor subset).
+    class NoPoolAdapter:
+        def select_for_fold(self, context):
+            return [
+                ve.StrategyCandidate(strategy_id="s0", strategy_label="S0"),
+            ]
+
+        def evaluate_candidate(self, candidate, context):
+            cap, mask = _captures_in_window(
+                history, context.test_start, context.test_end, 15, 0.4,
+            )
+            return ve.StrategyFoldResult(
+                fold_index=context.fold_index,
+                strategy_id=candidate.strategy_id,
+                strategy_label=candidate.strategy_label,
+                daily_capture=cap,
+                trigger_mask=mask,
+            )
+
+        def baseline_for_fold(self, context):
+            cap, mask = _captures_in_window(
+                history, context.test_start, context.test_end, 0, 0.0,
+            )
+            return ve.StrategyFoldResult(
+                fold_index=context.fold_index, strategy_id="b",
+                strategy_label="B", daily_capture=cap, trigger_mask=mask,
+            )
+
+    monkeypatch.setattr(ve, "bh_adjust", lambda ps: [0.01] * len(ps))
+
+    contract = ve.validate_strategy_set(
+        NoPoolAdapter(), history,
+        run_id="test-run-empirical-fail",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        alpha=0.05,
+        n_permutations=50,
+        n_bootstrap_samples=50,
+        rng_seed=7,
+    )
+    assert contract["validation_status"] == ve.PARTIAL, (
+        "strategy-level empirical failure must promote to PARTIAL not "
+        f"FAILED; got {contract['validation_status']!r}"
+    )
+    s0 = contract["strategies"][0]
+    assert s0["empirical_validation_status"] == "empirical_failed"
+    # Parametric / BH / Bonferroni must be preserved.
+    assert s0["parametric_p_value"] is not None
+    assert s0["bh_q_value"] is not None
+    assert s0["bonferroni_p_value"] is not None
+    assert any(
+        ve.VALIDATION_EMPIRICAL_FAILED in iss for iss in contract["issues"]
+    )
+
+
+def test_validate_strategy_set_empirical_disabled_when_zero_counts():
+    history = _bdate_index(2520)
+    adapter = _PoolSupplyingAdapter(history, n_strategies=3)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="test-run-zero-empirical",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    # 5C-2a-i compatibility: every strategy stays empirical_not_run.
+    for s in contract["strategies"]:
+        assert s["empirical_validation_status"] == "empirical_not_run"
+        assert s["empirical_p_value"] is None
+        assert s["bootstrap_sharpe_ci_lower"] is None
+        assert s["bootstrap_sharpe_ci_upper"] is None
+    assert contract["n_strategies_survived_empirical"] == 0
