@@ -5,10 +5,13 @@
 
 import os, re, sys, json, math, glob, argparse, time, shutil, threading
 import contextvars
+import copy
+import logging
+import tempfile
 from types import SimpleNamespace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Union
+from typing import List, Tuple, Optional, Dict, Any, Union, Mapping, Sequence, Callable
 from itertools import combinations, product
 import numpy as np
 import pandas as pd
@@ -35,6 +38,31 @@ from provenance_manifest import (
     MANIFEST_SCHEMA_VERSION as _MANIFEST_SCHEMA_VERSION,
     ARTIFACT_KIND_OUTPUT as _ARTIFACT_KIND_OUTPUT,
 )
+from validation_engine import (
+    FoldContext,
+    StrategyCandidate,
+    StrategyFoldResult,
+    BaselineFoldMetrics,
+    validate_strategy_set,
+    write_validation_sidecar,
+    compute_validation_artifact_hash,
+    extract_manifest_summary,
+    generate_run_id,
+    slice_to_cutoff,
+    slice_between,
+    DEFAULT_INITIAL_TRAIN_DAYS,
+    DEFAULT_TEST_WINDOW_DAYS,
+    DEFAULT_STEP_DAYS,
+    DEFAULT_ALPHA,
+    DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+    DEFAULT_OUTCOME_WINDOWS,
+    VALIDATION_CONTRACT_VERSION,
+    VALIDATION_METHODOLOGY_VERSION,
+    VALIDATION_OUTPUT_BASE_DIR,
+)
+
+
+_validation_logger = logging.getLogger("stackbuilder.validation")
 
 
 # Phase 3B-2A: per-run collection of input signal-library manifest content
@@ -898,7 +926,11 @@ def _flip_signals(signals):
     return out
 
 
-def _load_primary_signals(primary: str) -> Tuple[str, Optional[List[str]], Optional[List]]:
+def _load_primary_signals(
+    primary: str,
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+) -> Tuple[str, Optional[List[str]], Optional[List]]:
     """Phase 2B-2B: load + decode a primary's signal library once.
 
     Returns ``(vendor, sigs, dates)`` where ``sigs`` is a list of
@@ -907,6 +939,11 @@ def _load_primary_signals(primary: str) -> Tuple[str, Optional[List[str]], Optio
     if no library is available or the library is missing required
     fields. Centralizing this load lets ``phase2_rank_all`` score
     both modes from the same payload without duplicating IO.
+
+    Phase 5C-2c: ``data_available_through`` (optional) restricts the
+    returned ``(sigs, dates)`` to ``date <= data_available_through``.
+    Default ``None`` preserves byte-identical behavior so production
+    runs are unaffected; validation folds pass an explicit cutoff.
     """
     vendor, _ = resolve_symbol(primary)
     lib = load_lib_or_none(vendor)
@@ -919,7 +956,22 @@ def _load_primary_signals(primary: str) -> Tuple[str, Optional[List[str]], Optio
     if isinstance(sigs[0], (int, np.integer)):
         dec = {1: 'Buy', -1: 'Short', 0: 'None'}
         sigs = [dec.get(int(x), 'None') for x in sigs]
-    return vendor, list(sigs), list(dates)
+    sigs_list = list(sigs)
+    dates_list = list(dates)
+    if data_available_through is not None:
+        cutoff_ts = pd.Timestamp(data_available_through)
+        try:
+            date_idx = pd.to_datetime(dates_list)
+        except Exception:
+            return vendor, sigs_list, dates_list
+        if getattr(date_idx, "tz", None) is not None:
+            date_idx = date_idx.tz_localize(None)
+        keep = (date_idx <= cutoff_ts)
+        if not bool(np.any(keep)):
+            return vendor, [], []
+        sigs_list = [s for s, k in zip(sigs_list, keep) if k]
+        dates_list = [d for d, k in zip(dates_list, keep) if k]
+    return vendor, sigs_list, dates_list
 
 
 def _score_primary_from_signals(
@@ -959,7 +1011,14 @@ def _score_primary_from_signals(
     return m
 
 
-def _score_primary(primary: str, sec_rets: pd.Series, *, mode: str = 'D', grace_days: Optional[int] = None) -> Optional[Dict]:
+def _score_primary(
+    primary: str,
+    sec_rets: pd.Series,
+    *,
+    mode: str = 'D',
+    grace_days: Optional[int] = None,
+    data_available_through: Optional[pd.Timestamp] = None,
+) -> Optional[Dict]:
     """Phase 2B-2B: load + score a single primary in either direct or
     inverse mode. ``mode='D'`` (default) preserves prior behavior.
     ``mode='I'`` flips signals Buy<->Short before scoring so the
@@ -969,10 +1028,16 @@ def _score_primary(primary: str, sec_rets: pd.Series, *, mode: str = 'D', grace_
     Callers that need both modes for the same primary should prefer
     ``_load_primary_signals`` + two ``_score_primary_from_signals``
     calls to avoid duplicate IO.
+
+    Phase 5C-2c: ``data_available_through`` (optional) filters the
+    library to ``date <= cutoff`` before scoring. Default ``None``
+    preserves byte-identical behavior.
     """
     if mode not in ('D', 'I'):
         raise ValueError(f"_score_primary: mode must be 'D' or 'I', got {mode!r}")
-    vendor, sigs, dates = _load_primary_signals(primary)
+    vendor, sigs, dates = _load_primary_signals(
+        primary, data_available_through=data_available_through,
+    )
     if sigs is None:
         if mode == 'D':
             print(f"[WARN] No signal library found for {vendor}")
@@ -987,6 +1052,7 @@ def _score_primary_both_modes(
     sec_rets: pd.Series,
     *,
     grace_days: Optional[int] = None,
+    data_available_through: Optional[pd.Timestamp] = None,
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
     """Phase 2B-2B: load a primary once and score it in both modes.
 
@@ -994,8 +1060,13 @@ def _score_primary_both_modes(
     Used by ``phase2_rank_all`` so a single library load services
     both ``rank_direct`` (direct) and ``rank_inverse`` (real
     inverse-mode) construction.
+
+    Phase 5C-2c: ``data_available_through`` (optional) filters the
+    library to ``date <= cutoff`` before scoring.
     """
-    vendor, sigs, dates = _load_primary_signals(primary)
+    vendor, sigs, dates = _load_primary_signals(
+        primary, data_available_through=data_available_through,
+    )
     if sigs is None:
         print(f"[WARN] No signal library found for {vendor}")
         return None, None
@@ -1007,17 +1078,25 @@ def _score_primary_both_modes(
     )
     return direct, inverse
 
-def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None, *, grace_days: Optional[int] = None):
+def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None, *, grace_days: Optional[int] = None, data_available_through: Optional[pd.Timestamp] = None):
     """Phase 2: Rank all primaries against secondary with progress tracking.
 
     Phase 2B-2B: ``grace_days`` is now an explicit kwarg threaded
     through to ``_score_primary`` and from there to
     ``apply_signals_to_secondary``. ``None`` falls back to
     ``DEFAULT_GRACE_DAYS``.
+
+    Phase 5C-2c: ``data_available_through`` (optional, default
+    ``None``) filters every primary's signal library to
+    ``date <= cutoff`` before scoring. The ImpactSearch XLSX
+    fast-path is skipped under a non-None cutoff (validation MUST
+    recompute from cutoff-filtered libraries; full-history XLSX
+    metrics would leak future information into fold selection).
+    Default ``None`` preserves byte-identical production behavior.
     """
     # Fast-path: use ImpactSearch .xlsx if requested and available
     strict_manifests = bool(getattr(args, "strict_manifests", False))
-    if getattr(args, "prefer_impact_xlsx", False):
+    if getattr(args, "prefer_impact_xlsx", False) and data_available_through is None:
         sec = (secondary or getattr(args, "secondary", "") or "").upper()
         # Capture structured rejection info so a stale-rejection produces an
         # accurate error below instead of a misleading "No ImpactSearch Excel
@@ -1195,6 +1274,7 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
             _submit_with_context(
                 ex, _score_primary_both_modes, t, sec_rets,
                 grace_days=grace_days,
+                data_available_through=data_available_through,
             ): t
             for t in primaries_df['Primary Ticker']
         }
@@ -1307,13 +1387,19 @@ def _combined_metrics(member_caps: List[pd.Series]) -> Tuple[pd.Series, Optional
     return combined, m
 
 # NEW: signal-level helpers with strict-calendar mask (spymaster-parity)
-def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex, *, grace_days: Optional[int] = None) -> Tuple[pd.Series, pd.Series]:
+def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeIndex, *, grace_days: Optional[int] = None, data_available_through: Optional[pd.Timestamp] = None) -> Tuple[pd.Series, pd.Series]:
     """Return (signals_aligned_to_sec_index, present_mask_before_fill).
 
     Phase 2B-2B: ``grace_days`` is now an explicit kwarg. ``None``
     falls back to ``DEFAULT_GRACE_DAYS``; explicit ints (including 0)
     are honored verbatim. Calendar policy stays unified with Phase 2's
     ``apply_signals_to_secondary`` (Entry 5).
+
+    Phase 5C-2c: ``data_available_through`` (optional) filters the
+    raw signal library to ``date <= cutoff`` BEFORE alignment, so
+    validation folds never observe signals dated after the
+    selection / evaluation cutoff. Default ``None`` preserves
+    byte-identical production behavior.
     """
     vendor, _ = resolve_symbol(primary)
     try:
@@ -1333,6 +1419,11 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
         if len(sigs) > 0 and isinstance(sigs[0], (int, np.integer)):
             sigs = [{1:'Buy', -1:'Short', 0:'None'}.get(int(x), 'None') for x in sigs]
         raw = pd.Series(list(sigs), index=pd.to_datetime(dates))
+        if getattr(raw.index, "tz", None) is not None:
+            raw.index = raw.index.tz_localize(None)
+        if data_available_through is not None:
+            cutoff_ts = pd.Timestamp(data_available_through)
+            raw = raw.loc[raw.index <= cutoff_ts]
     except Exception as e:
         print(f"[ERROR] Failed to load signals for {vendor}: {e}")
         raise RuntimeError(f"Ticker {vendor} signal library error: {e}") from e
@@ -1393,7 +1484,7 @@ def _combined_metrics_signals(member_signals: List[Union[pd.Series, Tuple[pd.Ser
     m = metrics_from_captures(combined_caps, trigger_mask=trigger_mask)
     return combined_caps, m
 
-def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None, *, grace_days: Optional[int] = None) -> Tuple[pd.DataFrame, List]:
+def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFrame, sec_rets: pd.Series, outdir: str, progress_cb=None, *, grace_days: Optional[int] = None, data_available_through: Optional[pd.Timestamp] = None, validation_collector: Optional[Callable[[dict], None]] = None) -> Tuple[pd.DataFrame, List]:
     """Beam+exhaustive search over top/bottom cohort with both modes.
     progress_cb: optional callback for reporting progress
     Returns: (leaderboard_df, final_members_list)
@@ -1401,7 +1492,70 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     Phase 2B-2B: ``grace_days`` is now an explicit kwarg threaded
     through to ``_signals_aligned_and_mask`` for every (ticker, mode)
     in the cohort. ``None`` falls back to ``DEFAULT_GRACE_DAYS``.
+
+    Phase 5C-2c: ``data_available_through`` (optional) filters every
+    signal library to ``date <= cutoff`` before alignment so the
+    fold's ``selection_cutoff`` is honored. ``validation_collector``
+    (optional callable) receives one record per uniquely-canonical
+    stack definition that was successfully scored, including
+    candidates later rejected by min-trigger or monotonic-improvement
+    gates. Both default to ``None`` and preserve byte-identical
+    production behavior. Leaderboard, pruning, search_stats, and
+    output files are unchanged when ``validation_collector is None``.
     """
+    # Phase 5C-2c: per-fold canonical de-dup + emission counter for the
+    # optional validation collector. State is local to this call so
+    # production runs (collector=None) pay zero overhead and concurrent
+    # validation folds never share state.
+    _collector_seen: set = set()
+    _collector_state = {"rank": 0}
+
+    def _emit_validation_record(
+        path,
+        k_value,
+        search_source,
+        in_sample_metrics,
+        rejected_reason,
+    ):
+        if validation_collector is None:
+            return
+        if in_sample_metrics is None:
+            return
+        try:
+            canon = tuple(
+                sorted(
+                    (str(t), str(m))
+                    for (t, m, _sig) in path
+                )
+            )
+        except Exception:
+            return
+        if canon in _collector_seen:
+            return
+        _collector_seen.add(canon)
+        _collector_state["rank"] += 1
+        try:
+            metrics_view = {
+                kk: vv for kk, vv in in_sample_metrics.items()
+                if not kk.startswith("_")
+            }
+        except Exception:
+            metrics_view = {}
+        record = {
+            "members": canon,
+            "k": int(k_value),
+            "fold_train_rank": int(_collector_state["rank"]),
+            "search_source": str(search_source),
+            "in_sample_metrics": metrics_view,
+            "in_sample_rejected_reason": rejected_reason,
+        }
+        try:
+            validation_collector(record)
+        except Exception:
+            # Collector exceptions must NEVER taint the production
+            # leaderboard; swallow and continue.
+            pass
+
     topN, botN = int(args.top_n), int(args.bottom_n)
     min_td = int(getattr(args, 'min_trigger_days', 30))
     eps = float(getattr(args, 'sharpe_eps', 1e-6))
@@ -1445,7 +1599,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     for _, r in cohort.iterrows():
         t, m = r['Primary Ticker'], r['Mode']
         if (t, m) not in sig_cache:
-            sig_cache[(t, m)] = _signals_aligned_and_mask(t, m, sec_rets.index, grace_days=grace_days)
+            sig_cache[(t, m)] = _signals_aligned_and_mask(t, m, sec_rets.index, grace_days=grace_days, data_available_through=data_available_through)
     def sigs_for(t, m): return sig_cache.get((t, m), (pd.Series('None', index=sec_rets.index),
                                                         pd.Series(False, index=sec_rets.index)))
 
@@ -1455,12 +1609,21 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
         t, m = r['Primary Ticker'], r['Mode']
         sig_pair = sigs_for(t, m)
         _, met = _combined_metrics_signals([sig_pair], sec_rets)
-        if met and int(met['Trigger Days']) >= min_td:
-            # add raw fields for stable sorting
-            met['Sharpe_raw'] = float(met['Sharpe Ratio'])
-            met['Total_raw']  = float(met['Total Capture (%)'])
-            met['p_raw']      = (float(met['p-Value']) if met['p-Value'] != 'N/A' else None)
+        if not met:
+            continue
+        # add raw fields for stable sorting
+        met['Sharpe_raw'] = float(met['Sharpe Ratio'])
+        met['Total_raw']  = float(met['Total Capture (%)'])
+        met['p_raw']      = (float(met['p-Value']) if met['p-Value'] != 'N/A' else None)
+        if int(met['Trigger Days']) >= min_td:
             singles.append(((t, m, sig_pair), met))
+            _emit_validation_record(
+                [(t, m, sig_pair)], 1, "single", met, None,
+            )
+        else:
+            _emit_validation_record(
+                [(t, m, sig_pair)], 1, "single", met, "trigger_days",
+            )
     if not singles:
         raise SystemExit("[FATAL] No single candidate passed the min Trigger Days gate.")
 
@@ -1567,6 +1730,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                     search_stats['rejection_reasons']['trigger_days'] += 1
                     if VERBOSE:
                         print(f"  [REJECT] {[t for t in tickers]}: Trigger Days {mm['Trigger Days']} < {min_td}")
+                    _emit_validation_record(path, K, "exhaustive", mm, "trigger_days")
                     continue
                 # Enforce monotone improvement based on optimize_by metric (unless allow_decreasing is enabled)
                 if not allow_decreasing:
@@ -1579,6 +1743,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                             search_stats['rejection_reasons']['sharpe_improvement'] += 1  # reuse counter
                             if VERBOSE:
                                 print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f}% <= {prev_metric:.4f}% + {eps}")
+                            _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
                             continue
                     else:  # optimize_by == 'sharpe'
                         prev_metric = leaderboard[-1]['Sharpe Ratio']
@@ -1589,7 +1754,9 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                             search_stats['rejection_reasons']['sharpe_improvement'] += 1
                             if VERBOSE:
                                 print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f} <= {prev_metric:.4f} + {eps}")
+                            _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
                             continue
+                _emit_validation_record(path, K, "exhaustive", mm, None)
                 # Set key for comparison (always needed, regardless of allow_decreasing)
                 if optimize_by == 'total_capture':
                     key = (mm['Total_raw'], mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0))
@@ -1645,6 +1812,7 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                     if int(m2['Trigger Days']) < min_td:
                         search_stats['combinations_rejected'] += 1
                         search_stats['rejection_reasons']['trigger_days'] += 1
+                        _emit_validation_record(new_path, K, "beam", m2, "trigger_days")
                         continue
                     # Enforce monotone improvement (unless allow_decreasing is enabled)
                     if not allow_decreasing:
@@ -1652,7 +1820,9 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                         if cur_metric <= prev_metric + eps:
                             search_stats['combinations_rejected'] += 1
                             search_stats['rejection_reasons']['sharpe_improvement'] += 1
+                            _emit_validation_record(new_path, K, "beam", m2, "sharpe_improvement")
                             continue
+                    _emit_validation_record(new_path, K, "beam", m2, None)
                     key = (m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'],
                            - (m2['p_raw'] if m2['p_raw'] is not None else 1.0))
                     sig = (tuple(sorted([x[0] for x in new_path])), tuple([x[1] for x in new_path]))
@@ -2266,6 +2436,41 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                         message='Finalizing results and generating output files...',
                         outdir=temp_outdir, secondary=vendor_secondary)
 
+        # Phase 5C-2c amendment: durable validation MUST run before
+        # the durable run is published (locked 5C-1 §3 fail-closed
+        # contract). If even the failed-artifact write raises, we
+        # propagate so the outer exception handler removes
+        # temp_outdir; a complete StackBuilder run directory is
+        # NEVER produced without locked validation summary keys.
+        if (
+            primaries_df is not None
+            and not primaries_df.empty
+            and "Primary Ticker" in primaries_df.columns
+        ):
+            validation_universe = primaries_df["Primary Ticker"].astype(str).tolist()
+        elif rank_all is not None and not rank_all.empty and "Primary Ticker" in rank_all.columns:
+            validation_universe = rank_all["Primary Ticker"].astype(str).tolist()
+        else:
+            validation_universe = []
+
+        validation_run_id = generate_run_id("stackbuilder", "run_directory")
+        # Intentionally NO try/except around this call. Normal
+        # validation failures are absorbed inside the helper (it
+        # writes a status='failed' artifact and returns a complete
+        # manifest summary); only a fallback-write failure can
+        # propagate, and that MUST abort the run so no manifest
+        # without locked validation keys is ever published.
+        _vcontract, validation_summary, _vsidecar = (
+            _prepare_stackbuilder_durable_validation(
+                args=args,
+                secondary_ticker=vendor_secondary,
+                primary_universe=validation_universe,
+                run_id=validation_run_id,
+                grace_days=effective_grace,
+            )
+        )
+        _validate_stackbuilder_validation_summary(validation_summary)
+
         # Construct final directory name based on stack members
         if final_members:
             # Keep the mode indicators [D] or [I] in the name
@@ -2359,11 +2564,25 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         manifest.update(input_summary)
         manifest['input_secondary_hash'] = None  # populated by 3B-2B once
                                                  # secondary fingerprinting lands
+
+        # Phase 5C-2c: inject the locked 10 validation summary keys
+        # into the manifest. ``validation_summary`` was produced
+        # BEFORE the run was published (see the validation block
+        # above phase3->finalize), and was already validated against
+        # _LOCKED_VALIDATION_SUMMARY_KEYS. Re-validate here as a
+        # belt-and-suspenders gate so a complete manifest can NEVER
+        # be written without the locked keys.
+        _validate_stackbuilder_validation_summary(validation_summary)
+        for _vk in _LOCKED_VALIDATION_SUMMARY_KEYS:
+            manifest[_vk] = validation_summary[_vk]
+
         manifest['status'] = 'complete'
         write_json(os.path.join(final_outdir, 'run_manifest.json'), manifest)
         print(f"[COMPLETE] Secondary {vendor_secondary} finished in {elapsed_time:.1f}s")
         print(f"[RESULT] Best stack K={len(final_members)}: Sharpe={summary['best_sharpe']:.3f}, Capture={summary['best_capture']:.2f}%, TD={summary['best_trigger_days']}")
         print(f"[OUTPUT] Results saved to: {final_outdir}")
+        for _vline in _stackbuilder_validation_completion_lines(validation_summary):
+            print(f"[VALIDATION] {_vline}")
         return final_outdir
 
     except Exception as e:
@@ -2378,6 +2597,667 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         if _collector_token is not None:
             _finalize_input_manifest_collection(_collector_token)
         raise
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2c: validation integration
+# ---------------------------------------------------------------------------
+
+
+_LOCKED_VALIDATION_SUMMARY_KEYS = (
+    "validation_contract_version",
+    "validation_status",
+    "n_strategies_tested",
+    "n_strategies_reported",
+    "multiple_comparisons_control_method",
+    "multiple_comparisons_control_alpha",
+    "walk_forward_n_folds",
+    "mean_baseline_sharpe",
+    "validation_artifact_path",
+    "validation_artifact_hash",
+)
+
+
+def _validate_stackbuilder_validation_summary(
+    validation_summary: Mapping[str, Any],
+) -> None:
+    """Raise ValueError naming the missing key when the locked 5C
+    validation manifest summary is incomplete. Used at the
+    run_manifest write gate so durable runs fail before producing a
+    manifest without locked validation fields.
+    """
+    for key in _LOCKED_VALIDATION_SUMMARY_KEYS:
+        if key not in validation_summary:
+            raise ValueError(
+                f"validation_summary missing required key: {key!r}"
+            )
+
+
+def _stackbuilder_load_secondary_with_cutoff(
+    secondary_ticker: str,
+    cutoff: Optional[pd.Timestamp] = None,
+):
+    """Load the secondary price frame and optionally slice to cutoff.
+
+    Default ``cutoff=None`` preserves existing loader behavior.
+    """
+    df = load_secondary_prices(secondary_ticker)
+    if df is None or df.empty:
+        return df
+    if cutoff is None:
+        return df
+    return slice_to_cutoff(df, cutoff)
+
+
+def _stackbuilder_safe_float(x):
+    if x is None:
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(f):
+        return None
+    return f
+
+
+def _stackbuilder_canonical_strategy_id(
+    members: Sequence[Tuple[str, str]],
+    secondary_ticker: str,
+) -> str:
+    """Stable canonical strategy id for a stack: deterministic
+    member-mode ordering, uppercase, then ``__{SECONDARY}``.
+    """
+    canon = sorted((str(t).upper(), str(m).upper()) for (t, m) in members)
+    label = ",".join(f"{t}[{m}]" for (t, m) in canon)
+    sec = str(secondary_ticker or "").strip().upper()
+    return f"STACKBUILDER({label})__{sec}"
+
+
+def _build_failed_validation_contract(
+    *,
+    run_id: str,
+    producer_engine: str,
+    app_surface: str,
+    secondary_ticker: str,
+    primary_universe: Sequence[str],
+    failure_reason: str,
+    exception_repr: str,
+) -> dict:
+    """Construct a minimal ``validation_contract_v1`` artifact with
+    ``validation_status='failed'``. Used when durable StackBuilder
+    validation raises before a normal contract can be completed; the
+    failed contract MUST still satisfy the locked
+    ``write_validation_sidecar`` schema check.
+    """
+    formatted = (
+        f"[STACKBUILDER:validation_failed] run {run_id}: "
+        f"{failure_reason} ({exception_repr})"
+    )
+    return {
+        "validation_contract_version": VALIDATION_CONTRACT_VERSION,
+        "validation_methodology_version": VALIDATION_METHODOLOGY_VERSION,
+        "validation_status": "failed",
+        "run_id": run_id,
+        "producer_engine": producer_engine,
+        "app_surface": app_surface,
+        "evaluation_time": datetime.now(timezone.utc).isoformat(),
+        "data_available_through": None,
+        "in_sample_window_start": None,
+        "in_sample_window_end": None,
+        "oos_window_start": None,
+        "oos_window_end": None,
+        "walk_forward_n_folds": None,
+        "outcome_windows": list(DEFAULT_OUTCOME_WINDOWS),
+        "baseline_method": "same_ticker_buy_and_hold",
+        "n_strategies_tested": 0,
+        "n_strategies_reported": 0,
+        "n_strategies_survived_empirical": 0,
+        "multiple_comparisons_control_method": "benjamini_hochberg",
+        "multiple_comparisons_control_alpha": float(DEFAULT_ALPHA),
+        "multiple_comparisons_supplementary": "bonferroni",
+        "n_permutations": 0,
+        "n_bootstrap_samples": 0,
+        "borderline_tolerance_multiplier": float(
+            DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+        ),
+        "baseline_per_fold": [],
+        "baseline_aggregate": {
+            "n_folds_with_baseline": 0,
+            "mean_baseline_sharpe": None,
+            "mean_baseline_return": None,
+            "total_baseline_observations": 0,
+        },
+        "survivorship_summary": {
+            "total_tested": 0,
+            "total_reported_bh": 0,
+            "total_empirical_validated": 0,
+            "total_empirical_not_run": 0,
+            "did_not_survive_bh": 0,
+            "did_not_survive_empirical": 0,
+            "did_not_survive_no_triggers": 0,
+            "did_not_survive_insufficient_history": 0,
+        },
+        "issues": [formatted],
+        "strategies": [],
+    }
+
+
+def _empty_stackbuilder_strategy_fold_result(
+    fold_index: int,
+    candidate: StrategyCandidate,
+    reason: str,
+) -> StrategyFoldResult:
+    """Return an empty StrategyFoldResult tagged with a formatted
+    [STACKBUILDER:validation_unavailable] issue.
+    """
+    formatted = (
+        f"[STACKBUILDER:validation_unavailable] {candidate.strategy_id}: "
+        f"{reason}. Action: inspect adapter logs or extend history."
+    )
+    return StrategyFoldResult(
+        fold_index=fold_index,
+        strategy_id=candidate.strategy_id,
+        strategy_label=candidate.strategy_label,
+        daily_capture=pd.Series([], dtype=FLOAT_DTYPE),
+        trigger_mask=pd.Series([], dtype=bool),
+        issues=(formatted,),
+        metadata={"reason": reason},
+    )
+
+
+class StackBuilderValidationAdapter:
+    """Phase 5C-2c SelectionAdapter for StackBuilder per-app validation.
+
+    Walks the same phase2 / phase3 search space the production
+    pipeline runs, but with cutoff-filtered signal libraries and
+    secondary returns so each fold's selection only sees data
+    ``<= context.selection_cutoff``. Evaluation reuses
+    ``_signals_aligned_and_mask`` + ``_combine_signals`` +
+    ``_captures_from_signals`` over the test window so candidate
+    semantics match production. Baseline is same-ticker buy-and-hold
+    on the secondary over the test window per locked 5C-1 §6.
+    """
+
+    def __init__(
+        self,
+        *,
+        args,
+        secondary_ticker: str,
+        primary_universe: Sequence[str],
+        scratch_dir,
+        grace_days: Optional[int] = None,
+    ) -> None:
+        self.args = args
+        self.secondary_ticker = str(secondary_ticker or "").strip().upper()
+        self.primary_universe = [
+            str(t or "").strip().upper()
+            for t in (primary_universe or [])
+            if str(t or "").strip()
+        ]
+        self.scratch_dir = Path(scratch_dir)
+        self.grace_days = grace_days
+        self._sec_df_cache = None
+
+    def _secondary_frame(self):
+        if self._sec_df_cache is None:
+            self._sec_df_cache = _stackbuilder_load_secondary_with_cutoff(
+                self.secondary_ticker, cutoff=None,
+            )
+        return self._sec_df_cache
+
+    def history_index(self) -> pd.DatetimeIndex:
+        df = self._secondary_frame()
+        if df is None or df.empty:
+            return pd.DatetimeIndex([])
+        return df.index
+
+    def select_for_fold(self, context: FoldContext):
+        sec_df = self._secondary_frame()
+        if sec_df is None or sec_df.empty:
+            return []
+        train_sec_df = slice_to_cutoff(sec_df, context.selection_cutoff)
+        if train_sec_df is None or train_sec_df.empty:
+            return []
+        train_sec_rets = pct_returns(train_sec_df["Close"])
+        primaries_df = pd.DataFrame(
+            {"Primary Ticker": list(self.primary_universe)}
+        )
+
+        scratch = self.scratch_dir / f"fold_{context.fold_index}"
+        scratch.mkdir(parents=True, exist_ok=True)
+
+        # Force XLSX fastpath OFF for validation: locked 5C contract
+        # forbids using full-history XLSX metrics inside fold
+        # selection. ``data_available_through`` is the secondary
+        # defense (skips the fastpath even if some caller leaves
+        # prefer_impact_xlsx=True).
+        args2 = copy.copy(self.args)
+        try:
+            args2.prefer_impact_xlsx = False
+            args2.no_progress = True
+        except Exception:
+            pass
+
+        try:
+            rank_all, rank_direct, rank_inverse = phase2_rank_all(
+                args2, primaries_df, train_sec_rets, str(scratch),
+                secondary=self.secondary_ticker,
+                progress_path=None,
+                grace_days=self.grace_days,
+                data_available_through=context.selection_cutoff,
+            )
+        except SystemExit:
+            return []
+        except Exception:
+            return []
+
+        collected: List[dict] = []
+
+        def _phase3_collector(record: dict) -> None:
+            collected.append(record)
+
+        args3 = copy.copy(self.args)
+        try:
+            args3.no_progress = True
+        except Exception:
+            pass
+
+        try:
+            phase3_build_stacks(
+                args3, rank_direct, rank_inverse, train_sec_rets,
+                str(scratch),
+                progress_cb=None,
+                grace_days=self.grace_days,
+                data_available_through=context.selection_cutoff,
+                validation_collector=_phase3_collector,
+            )
+        except SystemExit:
+            # phase3 raises SystemExit when no single passed the
+            # min Trigger Days gate; that's not a validation
+            # failure, just an empty fold.
+            pass
+        except Exception:
+            pass
+
+        candidates: List[StrategyCandidate] = []
+        seen_canon: set = set()
+        for rec in collected:
+            members_tuple = rec.get("members") or ()
+            try:
+                canon = tuple(sorted(
+                    (str(t).upper(), str(m).upper())
+                    for (t, m) in members_tuple
+                ))
+            except Exception:
+                continue
+            if not canon:
+                continue
+            if canon in seen_canon:
+                continue
+            seen_canon.add(canon)
+            sid = _stackbuilder_canonical_strategy_id(
+                canon, self.secondary_ticker,
+            )
+            candidates.append(StrategyCandidate(
+                strategy_id=sid,
+                strategy_label=sid,
+                app_payload={
+                    "members": list(canon),
+                    "secondary_ticker": self.secondary_ticker,
+                    "k": int(rec.get("k") or len(canon)),
+                    "search_source": str(rec.get("search_source") or ""),
+                    "in_sample_metrics": dict(
+                        rec.get("in_sample_metrics") or {}
+                    ),
+                    "in_sample_rejected_reason": rec.get(
+                        "in_sample_rejected_reason"
+                    ),
+                },
+            ))
+        return candidates
+
+    def evaluate_candidate(
+        self,
+        candidate: StrategyCandidate,
+        context: FoldContext,
+    ) -> StrategyFoldResult:
+        sec_df = self._secondary_frame()
+        if sec_df is None or sec_df.empty:
+            return _empty_stackbuilder_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="secondary frame unavailable for fold",
+            )
+        eval_sec_df = slice_to_cutoff(sec_df, context.evaluation_cutoff)
+        if eval_sec_df is None or eval_sec_df.empty:
+            return _empty_stackbuilder_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="secondary frame empty under evaluation cutoff",
+            )
+        test_window = slice_between(
+            eval_sec_df, context.test_start, context.test_end,
+        )
+        if test_window is None or test_window.empty:
+            return _empty_stackbuilder_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="empty secondary frame over test window",
+            )
+        test_index = test_window.index
+        test_sec_rets = pct_returns(test_window["Close"])
+
+        members = list((candidate.app_payload or {}).get("members") or [])
+        if not members:
+            return _empty_stackbuilder_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="candidate has no members",
+            )
+
+        member_signals: List[Tuple[pd.Series, pd.Series]] = []
+        for entry in members:
+            try:
+                t, m = entry[0], entry[1]
+            except Exception:
+                continue
+            try:
+                sig, present = _signals_aligned_and_mask(
+                    str(t), str(m), test_index,
+                    grace_days=self.grace_days,
+                    data_available_through=context.evaluation_cutoff,
+                )
+            except Exception as exc:
+                return _empty_stackbuilder_strategy_fold_result(
+                    context.fold_index, candidate,
+                    reason=(
+                        f"_signals_aligned_and_mask raised "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            member_signals.append((sig, present))
+
+        if not member_signals:
+            return _empty_stackbuilder_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="no member produced an aligned signal series",
+            )
+
+        signal_list = [s for (s, _p) in member_signals]
+        comb_sig = _combine_signals(signal_list)
+        present_all = member_signals[0][1].copy()
+        for (_s, p) in member_signals[1:]:
+            present_all &= p
+        comb_sig = comb_sig.where(present_all, 'None')
+        daily_capture = _captures_from_signals(comb_sig, test_sec_rets)
+        trigger_mask = comb_sig.isin(['Buy', 'Short']).astype(bool)
+
+        if daily_capture.empty or not bool(trigger_mask.any()):
+            return _empty_stackbuilder_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="no triggers in evaluation window",
+            )
+
+        return StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=daily_capture.astype(FLOAT_DTYPE),
+            trigger_mask=trigger_mask,
+            metadata={
+                "signal_state": comb_sig,
+                "permutation_return_pool": test_sec_rets,
+                "members": list(members),
+                "secondary_ticker": self.secondary_ticker,
+            },
+            issues=(),
+        )
+
+    def baseline_for_fold(self, context: FoldContext) -> BaselineFoldMetrics:
+        sec_df = self._secondary_frame()
+        if sec_df is None or sec_df.empty:
+            formatted = (
+                f"[STACKBUILDER:validation_baseline_unavailable] "
+                f"fold-{context.fold_index}: secondary frame unavailable. "
+                f"Action: confirm secondary ticker is valid."
+            )
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index, n_observations=0,
+                baseline_sharpe=None, baseline_total_return=None,
+                baseline_mean_return=None, baseline_std=None,
+                issues=(formatted,),
+            )
+        test_window = slice_between(
+            sec_df, context.test_start, context.test_end,
+        )
+        if test_window is None or test_window.empty:
+            formatted = (
+                f"[STACKBUILDER:validation_baseline_unavailable] "
+                f"fold-{context.fold_index}: empty secondary frame over "
+                f"baseline test window. "
+                f"Action: extend the secondary history or relax fold cutoffs."
+            )
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index, n_observations=0,
+                baseline_sharpe=None, baseline_total_return=None,
+                baseline_mean_return=None, baseline_std=None,
+                issues=(formatted,),
+            )
+        prices = test_window["Close"].astype(float)
+        daily_returns = prices.pct_change().fillna(0.0) * 100.0
+        n_obs = int(len(daily_returns))
+        if n_obs == 0:
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index, n_observations=0,
+                baseline_sharpe=None, baseline_total_return=None,
+                baseline_mean_return=None, baseline_std=None,
+            )
+        all_true = pd.Series([True] * n_obs, index=daily_returns.index)
+        try:
+            score = _canonical_score_captures(
+                daily_returns, all_true,
+                risk_free_rate=RISK_FREE_ANNUAL,
+                periods_per_year=252,
+                ddof=1,
+            )
+        except Exception as exc:
+            formatted = (
+                f"[STACKBUILDER:validation_baseline_unavailable] "
+                f"fold-{context.fold_index}: baseline scoring raised "
+                f"{type(exc).__name__}: {exc}. "
+                f"Action: inspect canonical scoring."
+            )
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index, n_observations=n_obs,
+                baseline_sharpe=None, baseline_total_return=None,
+                baseline_mean_return=None, baseline_std=None,
+                issues=(formatted,),
+            )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index,
+            n_observations=n_obs,
+            baseline_sharpe=_stackbuilder_safe_float(
+                getattr(score, "sharpe", None),
+            ),
+            baseline_total_return=_stackbuilder_safe_float(
+                getattr(score, "total_capture", None),
+            ),
+            baseline_mean_return=_stackbuilder_safe_float(
+                getattr(score, "avg_daily_capture", None),
+            ),
+            baseline_std=_stackbuilder_safe_float(
+                getattr(score, "std_dev", None),
+            ),
+        )
+
+
+def _prepare_stackbuilder_durable_validation(
+    *,
+    args,
+    secondary_ticker: str,
+    primary_universe: Sequence[str],
+    run_id: str,
+    grace_days: Optional[int] = None,
+):
+    """Phase 5C-2c fail-closed durable validation prepare.
+
+    Returns ``(contract, validation_summary, sidecar_path)``.
+
+    Normal path: drive ``validate_strategy_set`` with the
+    StackBuilder adapter, persist ``validation.json`` (success path
+    write uses ``allow_overwrite=False`` per locked 5C-1 §12), and
+    re-validate the manifest summary against
+    ``_LOCKED_VALIDATION_SUMMARY_KEYS``.
+
+    Failure path: build a status='failed' contract via
+    ``_build_failed_validation_contract``, persist via
+    ``write_validation_sidecar(... allow_overwrite=True)`` so a
+    post-sidecar failure (matching the 5C-2b second-amendment
+    pattern) replaces the partial sidecar with the canonical failed
+    contract. The ``allow_overwrite=True`` is bounded to this run's
+    own run_id directory.
+
+    If even the failed-artifact write raises, propagate so the
+    caller can decide whether to abort the run_manifest write.
+    """
+    n_perm = int(getattr(args, "validation_n_permutations", 10000) or 10000)
+    n_boot = int(
+        getattr(args, "validation_n_bootstrap_samples", 10000) or 10000
+    )
+    rng_seed = getattr(args, "validation_rng_seed", None)
+    init_train = int(
+        getattr(args, "validation_initial_train_days", DEFAULT_INITIAL_TRAIN_DAYS)
+        or DEFAULT_INITIAL_TRAIN_DAYS
+    )
+    test_window = int(
+        getattr(args, "validation_test_window_days", DEFAULT_TEST_WINDOW_DAYS)
+        or DEFAULT_TEST_WINDOW_DAYS
+    )
+    step = int(
+        getattr(args, "validation_step_days", DEFAULT_STEP_DAYS)
+        or DEFAULT_STEP_DAYS
+    )
+
+    output_dir = Path(VALIDATION_OUTPUT_BASE_DIR) / run_id
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f"sb_validation_{run_id}_",
+        ) as scratch_str:
+            adapter = StackBuilderValidationAdapter(
+                args=args,
+                secondary_ticker=secondary_ticker,
+                primary_universe=primary_universe,
+                scratch_dir=scratch_str,
+                grace_days=grace_days,
+            )
+            history_index = adapter.history_index()
+            contract = validate_strategy_set(
+                adapter, history_index,
+                run_id=run_id,
+                producer_engine="stackbuilder",
+                app_surface="run_directory",
+                alpha=DEFAULT_ALPHA,
+                initial_train_days=init_train,
+                test_window_days=test_window,
+                step_days=step,
+                n_permutations=n_perm,
+                n_bootstrap_samples=n_boot,
+                borderline_tolerance_multiplier=(
+                    DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER
+                ),
+                rng_seed=rng_seed,
+            )
+        sidecar_path = write_validation_sidecar(
+            contract, output_dir, allow_overwrite=False,
+        )
+        artifact_hash = compute_validation_artifact_hash(sidecar_path)
+        validation_summary = extract_manifest_summary(
+            contract,
+            validation_artifact_path=str(sidecar_path),
+            validation_artifact_hash=artifact_hash,
+        )
+        _validate_stackbuilder_validation_summary(validation_summary)
+        return contract, validation_summary, sidecar_path
+    except Exception as primary_exc:
+        failure_reason = (
+            "StackBuilder durable validation failed during normal run"
+        )
+        exception_repr = (
+            f"{type(primary_exc).__name__}: {primary_exc}"
+        )
+        _validation_logger.warning(
+            "[5C-2c] durable validation falling back to failed artifact "
+            "for %s: %s", secondary_ticker, exception_repr,
+        )
+        failed_contract = _build_failed_validation_contract(
+            run_id=run_id,
+            producer_engine="stackbuilder",
+            app_surface="run_directory",
+            secondary_ticker=secondary_ticker,
+            primary_universe=list(primary_universe or []),
+            failure_reason=failure_reason,
+            exception_repr=exception_repr,
+        )
+        failed_sidecar_path = write_validation_sidecar(
+            failed_contract, output_dir, allow_overwrite=True,
+        )
+        artifact_hash = compute_validation_artifact_hash(failed_sidecar_path)
+        failed_summary = extract_manifest_summary(
+            failed_contract,
+            validation_artifact_path=str(failed_sidecar_path),
+            validation_artifact_hash=artifact_hash,
+        )
+        _validate_stackbuilder_validation_summary(failed_summary)
+        return failed_contract, failed_summary, failed_sidecar_path
+
+
+def _stackbuilder_validation_completion_lines(
+    validation_summary: Optional[Mapping[str, Any]],
+) -> List[str]:
+    """Phase 5C-2c: operator-visible validation completion lines.
+
+    Returns ``[]`` when no validation summary is present so existing
+    completion prints stay unchanged for non-validation paths.
+    """
+    out: List[str] = []
+    if not isinstance(validation_summary, Mapping):
+        return out
+    status = validation_summary.get("validation_status")
+    artifact_path = (
+        validation_summary.get("validation_artifact_path") or "n/a"
+    )
+    if status == "failed":
+        issues = validation_summary.get("issues") or []
+        if not issues:
+            # Fall back to a generic message; the contract issues
+            # may live only in the sidecar JSON, not in the summary.
+            first_issue = "see sidecar for details"
+        else:
+            first_issue = str(issues[0])
+        out.append(
+            f"Validation: FAILED - {first_issue}. "
+            f"Sidecar: {artifact_path}"
+        )
+        return out
+    n_tested = validation_summary.get("n_strategies_tested")
+    n_reported = validation_summary.get("n_strategies_reported")
+    alpha = validation_summary.get("multiple_comparisons_control_alpha")
+    mean_baseline = validation_summary.get("mean_baseline_sharpe")
+    if mean_baseline is None:
+        baseline_text = "n/a"
+    else:
+        try:
+            mb = float(mean_baseline)
+            if not np.isfinite(mb):
+                baseline_text = "n/a"
+            else:
+                baseline_text = f"{mb:.2f}"
+        except (TypeError, ValueError):
+            baseline_text = "n/a"
+    out.append(
+        f"Validation: {n_reported} of {n_tested} survived BH at "
+        f"alpha={alpha}. Mean baseline Sharpe: {baseline_text}. "
+        f"Sidecar: {artifact_path}"
+    )
+    return out
+
 
 # Phase 5B Item 1: vestigial CLI deprecations. Each entry is
 # (flag_name, message). Flags remain parseable with their existing
