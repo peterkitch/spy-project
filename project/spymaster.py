@@ -64,6 +64,8 @@ from bs4 import BeautifulSoup
 import uuid
 import ast
 from datetime import datetime, timedelta, date
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 # --- Lightweight central job pool for background work (precompute, refresh) ---
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
@@ -12069,6 +12071,633 @@ def _gate_batch_interval(is_open, data):
         logger.debug(f"Batch interval gate fallback: {e}")
         return True
 
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2d prep: pure Spymaster optimization core + cutoff-aware loaders
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpymasterPrimarySignalData:
+    """Resolved primary signal data for the Spymaster optimization core.
+
+    ``signals_with_next`` is the per-date Buy/Short/None series including
+    the next-day signal appended at the next available secondary date,
+    matching the existing optimize_signals callback semantics.
+    """
+
+    ticker: str
+    signals_with_next: pd.Series
+    next_signal: str
+
+
+@dataclass(frozen=True)
+class SpymasterOptimizationResult:
+    """Result of pure Spymaster optimization computation.
+
+    ``records`` carries the visible DataTable fields PLUS helper fields
+    (``state_by_ticker``, ``unmuted_tickers``, ``strategy_id``) that the
+    formatter strips before rendering. ``last_contract_issue`` mirrors
+    the original callback's diagnostic-message tracking for the
+    no-valid-combinations branch. ``total_combinations`` is the
+    pre-evaluation product over the per-ticker state options.
+    """
+
+    records: list
+    last_contract_issue: str
+    total_combinations: int
+
+
+def _align_spymaster_active_pairs_to_dates(
+    active_pairs: Sequence[Any],
+    dates: pd.DatetimeIndex,
+) -> pd.Series:
+    """Align active_pairs to a date index using the historical
+    Spymaster rule. Returns a pd.Series indexed by either ``dates``
+    (when ``len(active_pairs) == len(dates)``) or ``dates[1:]`` (when
+    ``len(active_pairs) == len(dates) - 1`` -- the historical PKL shape
+    where the first preprocessed_data row has no derived signal).
+
+    Raises ``ValueError`` when neither rule applies. Callers with
+    ticker context should re-raise with the historical
+    ``"Length mismatch between active_pairs and dates for ticker X. Cannot proceed."``
+    message.
+    """
+    n_ap = len(active_pairs)
+    n_d = len(dates)
+    if n_ap == n_d:
+        return pd.Series(list(active_pairs), index=dates)
+    if n_ap == n_d - 1:
+        return pd.Series(list(active_pairs), index=dates[1:])
+    raise ValueError(
+        f"Length mismatch between active_pairs and dates: "
+        f"len(active_pairs)={n_ap}, len(dates)={n_d}"
+    )
+
+
+def _spymaster_strategy_id(state_by_ticker: Mapping[str, Mapping[str, Any]],
+                           secondary_ticker: str) -> str:
+    """Stable canonical strategy id for one optimization combination.
+
+    Members are sorted alphabetically; muted tickers are excluded; mode
+    is ``B`` (buy/normal) or ``I`` (inverted). Empty unmuted set yields
+    ``SPYMASTER()__{SECONDARY}``.
+    """
+    sec = str(secondary_ticker or "").strip().upper()
+    parts = []
+    for t in sorted(state_by_ticker.keys()):
+        st = state_by_ticker.get(t) or {}
+        if st.get("mute"):
+            continue
+        mode = "I" if st.get("invert_signals") else "B"
+        parts.append(f"{str(t).upper()}[{mode}]")
+    return f"SPYMASTER({','.join(parts)})__{sec}"
+
+
+def build_spymaster_primary_signal_data(
+    *,
+    ticker: str,
+    results: Mapping[str, Any],
+    df: pd.DataFrame,
+    secondary_data: pd.DataFrame,
+    data_available_through: Optional[pd.Timestamp] = None,
+) -> SpymasterPrimarySignalData:
+    """Resolve a primary's signal series + next-signal at the cutoff.
+
+    Default ``data_available_through=None`` preserves the existing
+    callback behavior (operate on the full df / secondary index). Under
+    a non-None cutoff the helper slices df + secondary to
+    ``date <= cutoff`` BEFORE deriving last_date / next_date so the
+    output never carries a future-dated row.
+
+    Raises ``ValueError`` for malformed inputs (length mismatch,
+    missing daily_top_*, invalid pair structure, missing SMA columns).
+    Callers are responsible for converting failures to user-facing
+    messages.
+    """
+    if results is None or 'active_pairs' not in results:
+        raise ValueError(
+            f"build_spymaster_primary_signal_data: results missing "
+            f"'active_pairs' for {ticker}"
+        )
+    if df is None or df.empty:
+        raise ValueError(
+            f"build_spymaster_primary_signal_data: empty df for {ticker}"
+        )
+
+    # Phase 5C-2d prep amendment: align active_pairs to the ORIGINAL
+    # df.index FIRST, then apply the cutoff filter to the aligned
+    # signal series. This preserves the historical len(df)-1 shape
+    # alignment (active_pairs -> df.index[1:]) under any cutoff.
+    try:
+        signals_series = _align_spymaster_active_pairs_to_dates(
+            results['active_pairs'], df.index,
+        )
+    except ValueError:
+        raise ValueError(
+            f"Length mismatch between active_pairs and dates for "
+            f"ticker {ticker}. Cannot proceed."
+        )
+
+    if data_available_through is not None:
+        cutoff_ts = pd.Timestamp(data_available_through)
+        signals_series = signals_series.loc[signals_series.index <= cutoff_ts]
+        df = df.loc[df.index <= cutoff_ts]
+        if df.empty:
+            raise ValueError(
+                f"build_spymaster_primary_signal_data: df empty under "
+                f"cutoff for {ticker}"
+            )
+        secondary_data = secondary_data.loc[secondary_data.index <= cutoff_ts]
+
+    if 'daily_top_buy_pairs' not in results or 'daily_top_short_pairs' not in results:
+        raise ValueError(
+            f"build_spymaster_primary_signal_data: missing daily_top_* "
+            f"keys for {ticker}"
+        )
+
+    last_date = df.index[-1]
+    buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
+    short_pair_data = results['daily_top_short_pairs'].get(last_date)
+    if not buy_pair_data or not short_pair_data:
+        raise ValueError(
+            f"build_spymaster_primary_signal_data: incomplete "
+            f"daily_top_* entries at last_date for {ticker}"
+        )
+    if not isinstance(buy_pair_data[0], tuple) or not isinstance(short_pair_data[0], tuple):
+        raise ValueError("Invalid pair data structure")
+
+    buy_pair = buy_pair_data[0]
+    short_pair = short_pair_data[0]
+    buy_capture = buy_pair_data[1]
+    short_capture = short_pair_data[1]
+
+    required_smas = [
+        f'SMA_{buy_pair[0]}', f'SMA_{buy_pair[1]}',
+        f'SMA_{short_pair[0]}', f'SMA_{short_pair[1]}',
+    ]
+    if not all(sma in df.columns for sma in required_smas):
+        raise ValueError("Missing required SMA columns")
+
+    sma_buy_0 = _asof(df[f'SMA_{buy_pair[0]}'], last_date, default=None)
+    sma_buy_1 = _asof(df[f'SMA_{buy_pair[1]}'], last_date, default=None)
+    sma_short_0 = _asof(df[f'SMA_{short_pair[0]}'], last_date, default=None)
+    sma_short_1 = _asof(df[f'SMA_{short_pair[1]}'], last_date, default=None)
+
+    buy_signal = (
+        sma_buy_0 is not None and sma_buy_1 is not None and sma_buy_0 > sma_buy_1
+    )
+    short_signal = (
+        sma_short_0 is not None
+        and sma_short_1 is not None
+        and sma_short_0 < sma_short_1
+    )
+
+    if buy_signal and short_signal:
+        next_signal = "Buy" if buy_capture > short_capture else "Short"
+    elif buy_signal:
+        next_signal = "Buy"
+    elif short_signal:
+        next_signal = "Short"
+    else:
+        next_signal = "None"
+
+    processed_signals = signals_series.astype(str).apply(
+        lambda x: 'Buy' if x.strip().startswith('Buy') else
+                  'Short' if x.strip().startswith('Short') else 'None'
+    )
+
+    next_date_index = secondary_data.index[secondary_data.index > last_date]
+    if not next_date_index.empty:
+        next_date = next_date_index[0]
+        if data_available_through is None or next_date <= pd.Timestamp(data_available_through):
+            processed_signals = pd.concat(
+                [processed_signals, pd.Series([next_signal], index=[next_date])]
+            )
+
+    return SpymasterPrimarySignalData(
+        ticker=str(ticker).upper(),
+        signals_with_next=processed_signals,
+        next_signal=next_signal,
+    )
+
+
+def compute_spymaster_optimization(
+    *,
+    primary_tickers: Sequence[str],
+    secondary_ticker: str,
+    secondary_data: pd.DataFrame,
+    primary_signal_data: Mapping[str, SpymasterPrimarySignalData],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> SpymasterOptimizationResult:
+    """Pure-function Spymaster optimization core.
+
+    Generates per-ticker state combinations (invert / mute) via
+    ``itertools.product`` in primary_tickers insertion order, scores
+    each combination via the canonical scoring path
+    (``_spymaster_multi_primary_contract_result`` + ``_price_series``
+    + ``_canonical_score_captures``), and returns the records list,
+    the most recent canonical contract issue, and total combinations.
+
+    progress_callback(current, total) is the only allowed callback into
+    UI plumbing; the function MUST NOT touch optimization_lock,
+    optimization_in_progress, optimization_results_cache,
+    optimization_progress, pending_optimization, or any cache global.
+    """
+    primary_tickers_list = list(primary_tickers)
+    # Phase 5C-2d prep amendment: explicit-inputs contract. Reject any
+    # requested primary_ticker that lacks a SpymasterPrimarySignalData
+    # entry rather than silently shrinking the optimization set. The
+    # callback's outer except surfaces this as a user-facing error
+    # message; the upcoming validation adapter will treat it as a
+    # contract violation.
+    missing_psig = [t for t in primary_tickers_list if t not in primary_signal_data]
+    if missing_psig:
+        raise ValueError(
+            f"missing primary_signal_data for: {', '.join(missing_psig)}"
+        )
+
+    date_indexes = {
+        t: set(primary_signal_data[t].signals_with_next.index)
+        for t in primary_tickers_list
+    }
+
+    ticker_states = {}
+    for t in primary_tickers_list:
+        sig = primary_signal_data[t].next_signal
+        if 'Buy' in sig:
+            ticker_states[t] = [(False, False), (False, True)]
+        elif 'Short' in sig:
+            ticker_states[t] = [(True, False), (False, True)]
+        else:
+            ticker_states[t] = [(False, True)]
+
+    ticker_state_lists = list(ticker_states.values())
+    from functools import reduce as _reduce
+    import operator as _operator
+    total_combinations = _reduce(
+        _operator.mul, [len(s) for s in ticker_state_lists], 1
+    )
+
+    combinations_iter = product(*ticker_state_lists)
+    combination_labels = []
+    valid_combinations = []
+    for states in combinations_iter:
+        label_parts = []
+        state_dict = {}
+        for ticker, (invert_signals, mute) in zip(ticker_states.keys(), states):
+            if mute:
+                state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
+                continue
+            if invert_signals:
+                label_parts.append(f"<span style='color:red'>{ticker}</span>")
+            else:
+                label_parts.append(f"<span style='color:#80ff00'>{ticker}</span>")
+            state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
+        label = ', '.join(label_parts)
+        combination_labels.append(label)
+        valid_combinations.append(state_dict)
+
+    records = []
+    last_contract_issue = ""
+    total_emit = len(valid_combinations)
+
+    for idx, state_dict in enumerate(valid_combinations):
+        if progress_callback is not None:
+            try:
+                progress_callback(idx, total_emit)
+            except Exception:
+                pass
+
+        unmuted_tickers = [
+            t for t in primary_tickers_list
+            if t in state_dict and not state_dict[t]['mute']
+        ]
+        if not unmuted_tickers:
+            continue
+
+        common_dates = set(secondary_data.index)
+        for t in unmuted_tickers:
+            common_dates = common_dates.intersection(date_indexes.get(t, set()))
+        common_dates = sorted(common_dates)
+        if not common_dates:
+            continue
+
+        combined_signals_df = pd.DataFrame(index=common_dates)
+        for t in unmuted_tickers:
+            invert_signals = state_dict[t]['invert_signals']
+            sig_series = primary_signal_data[t].signals_with_next.loc[common_dates]
+            if invert_signals:
+                sig_series = sig_series.replace({'Buy': 'Short', 'Short': 'Buy'})
+            combined_signals_df[t] = sig_series
+
+        contract = _spymaster_multi_primary_contract_result(
+            combined_signals_df, context="optimization",
+        )
+        combined_signals = contract["aggregate_signal"]
+        if contract["issues"]:
+            last_contract_issue = contract["issues"][0]
+
+        signals = combined_signals.fillna('None')
+        prices = _price_series(secondary_data, index=signals.index)
+        daily_returns = prices.astype('float64').pct_change().fillna(0.0)
+        if isinstance(daily_returns, pd.DataFrame):
+            daily_returns = daily_returns.iloc[:, 0]
+        signals = signals.loc[daily_returns.index]
+        ret = daily_returns.to_numpy()
+        buy_mask = signals.eq('Buy').to_numpy()
+        short_mask = signals.eq('Short').to_numpy()
+        cap = np.zeros_like(ret, dtype='float64')
+        cap[buy_mask] = ret[buy_mask] * 100.0
+        cap[short_mask] = -ret[short_mask] * 100.0
+        daily_captures = pd.Series(cap, index=daily_returns.index)
+        trigger_mask = buy_mask | short_mask
+        if int(trigger_mask.sum()) == 0:
+            continue
+
+        _score = _canonical_score_captures(
+            daily_captures,
+            pd.Series(trigger_mask, index=daily_returns.index),
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
+
+        record = {
+            'id': idx,
+            'Combination': combination_labels[idx],
+            'Triggers': _score.trigger_days,
+            'Wins': _score.wins,
+            'Losses': _score.losses,
+            'Win %': round(_score.win_rate, 2),
+            'StdDev %': round(_score.std_dev, 4),
+            'Sharpe': round(_score.sharpe, 2),
+            't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
+            'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
+            'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
+            'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
+            'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
+            'Avg Cap %': round(_score.avg_daily_capture, 4),
+            'Total %': round(_score.total_capture, 4),
+            'state_by_ticker': dict(state_dict),
+            'unmuted_tickers': list(unmuted_tickers),
+            'strategy_id': _spymaster_strategy_id(state_dict, secondary_ticker),
+        }
+        records.append(record)
+
+    if progress_callback is not None and total_emit > 0:
+        try:
+            progress_callback(total_emit, total_emit)
+        except Exception:
+            pass
+
+    records.sort(key=lambda x: x['Sharpe'], reverse=True)
+
+    return SpymasterOptimizationResult(
+        records=records,
+        last_contract_issue=last_contract_issue,
+        total_combinations=int(total_combinations),
+    )
+
+
+_SPYMASTER_OPTIMIZATION_VISIBLE_COLUMNS = [
+    {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
+    {'name': 'Triggers', 'id': 'Triggers', 'type': 'numeric'},
+    {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
+    {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
+    {'name': 'Win %', 'id': 'Win %', 'type': 'numeric'},
+    {'name': 'StdDev %', 'id': 'StdDev %', 'type': 'numeric'},
+    {'name': 'Sharpe', 'id': 'Sharpe', 'type': 'numeric'},
+    {'name': 't', 'id': 't'},
+    {'name': 'p', 'id': 'p'},
+    {'name': 'Sig 90%', 'id': 'Sig 90%'},
+    {'name': 'Sig 95%', 'id': 'Sig 95%'},
+    {'name': 'Sig 99%', 'id': 'Sig 99%'},
+    {'name': 'Avg Cap %', 'id': 'Avg Cap %', 'type': 'numeric'},
+    {'name': 'Total %', 'id': 'Total %', 'type': 'numeric'},
+]
+
+_SPYMASTER_OPTIMIZATION_HELPER_FIELDS = (
+    "state_by_ticker", "unmuted_tickers", "strategy_id",
+)
+
+_SPYMASTER_OPTIMIZATION_NUMERIC_SORT_COLS = (
+    'Triggers', 'Wins', 'Losses', 'Win %', 'StdDev %',
+    'Sharpe', 'Avg Cap %', 'Total %',
+)
+
+
+def format_spymaster_optimization_table(
+    result: SpymasterOptimizationResult,
+    *,
+    sort_by: Optional[Sequence[Mapping[str, Any]]] = None,
+):
+    """Format pure-core result for DataTable consumption.
+
+    Returns ``(rows, columns, message)`` matching the historical
+    callback's contract. Strips helper fields
+    (``state_by_ticker``, ``unmuted_tickers``, ``strategy_id``) from
+    visible rows. ``id`` is preserved.
+    """
+    columns = [dict(c) for c in _SPYMASTER_OPTIMIZATION_VISIBLE_COLUMNS]
+
+    if not result.records:
+        return [], columns, 'No valid combinations found.'
+
+    visible_rows = []
+    for r in result.records:
+        visible = {k: v for k, v in r.items()
+                   if k not in _SPYMASTER_OPTIMIZATION_HELPER_FIELDS}
+        visible_rows.append(visible)
+
+    n = len(visible_rows)
+    averages = {
+        'Combination': 'AVERAGES',
+        'Triggers': round(sum(r['Triggers'] for r in visible_rows) / n),
+        'Wins': round(sum(r['Wins'] for r in visible_rows) / n),
+        'Losses': round(sum(r['Losses'] for r in visible_rows) / n),
+        'Win %': round(sum(r['Win %'] for r in visible_rows) / n, 2),
+        'StdDev %': round(sum(r['StdDev %'] for r in visible_rows) / n, 4),
+        'Sharpe': round(sum(r['Sharpe'] for r in visible_rows) / n, 2),
+        't': round(
+            sum(float(r['t']) if r['t'] != 'N/A' else 0 for r in visible_rows)
+            / sum(1 for r in visible_rows if r['t'] != 'N/A'), 4,
+        ) if any(r['t'] != 'N/A' for r in visible_rows) else 'N/A',
+        'p': round(
+            sum(float(r['p']) if r['p'] != 'N/A' else 0 for r in visible_rows)
+            / sum(1 for r in visible_rows if r['p'] != 'N/A'), 4,
+        ) if any(r['p'] != 'N/A' for r in visible_rows) else 'N/A',
+        'Sig 90%': f"{round(sum(1 for r in visible_rows if r['Sig 90%'] == 'Yes') / n * 100, 1)}% of combos",
+        'Sig 95%': f"{round(sum(1 for r in visible_rows if r['Sig 95%'] == 'Yes') / n * 100, 1)}% of combos",
+        'Sig 99%': f"{round(sum(1 for r in visible_rows if r['Sig 99%'] == 'Yes') / n * 100, 1)}% of combos",
+        'Avg Cap %': round(sum(r['Avg Cap %'] for r in visible_rows) / n, 4),
+        'Total %': round(sum(r['Total %'] for r in visible_rows) / n, 4),
+    }
+
+    sortable_data = sorted(visible_rows, key=lambda x: x['Sharpe'], reverse=True)
+    if sort_by:
+        for sort_spec in sort_by:
+            col_id = sort_spec.get('column_id')
+            if col_id is None:
+                continue
+            is_ascending = sort_spec.get('direction') == 'asc'
+            try:
+                if col_id in _SPYMASTER_OPTIMIZATION_NUMERIC_SORT_COLS:
+                    sortable_data = sorted(
+                        sortable_data,
+                        key=lambda x: (
+                            float(str(x[col_id]).replace('N/A', '-inf'))
+                            if x[col_id] != 'N/A' else float('-inf')
+                        ),
+                        reverse=not is_ascending,
+                    )
+                else:
+                    sortable_data = sorted(
+                        sortable_data,
+                        key=lambda x: str(x[col_id]),
+                        reverse=not is_ascending,
+                    )
+            except Exception as e:
+                logger.error(f"Sorting error for column {col_id}: {str(e)}")
+                continue
+
+    rows = [averages] + sortable_data
+    success_message = html.Div(
+        'Optimization complete. Click any ticker combination cell to '
+        'auto-populate in Multi-Primary Signal Aggregator.',
+        style={'color': '#80ff00'},
+    )
+    return rows, columns, success_message
+
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2d prep: cutoff-aware loader wrappers (default None = no-op)
+# ---------------------------------------------------------------------------
+
+
+def _slice_spymaster_results_to_cutoff(
+    results: Mapping[str, Any],
+    *,
+    data_available_through: Optional[pd.Timestamp],
+):
+    """Return a cutoff-filtered shallow copy of loaded Spymaster PKL
+    contents.
+
+    ``data_available_through=None`` returns ``dict(results)`` untouched
+    (no field-type conversion). Under a non-None cutoff:
+      * preprocessed_data: rows with ``index <= cutoff`` only.
+      * active_pairs: aligned to the original df-derived dates per the
+        existing length-mismatch rule, then filtered to dates
+        ``<= cutoff``, returned in positional order as a list.
+      * daily_top_buy_pairs / daily_top_short_pairs: keep only date
+        keys ``<= cutoff``.
+      * Other fields pass through unchanged.
+    """
+    if results is None:
+        return None
+    if data_available_through is None:
+        return dict(results)
+
+    cutoff_ts = pd.Timestamp(data_available_through)
+    out = dict(results)
+
+    pre = out.get('preprocessed_data')
+    if isinstance(pre, pd.DataFrame) and not pre.empty:
+        out['preprocessed_data'] = pre.loc[pre.index <= cutoff_ts]
+
+    # Phase 5C-2d prep amendment: align active_pairs to the ORIGINAL
+    # df.index using the shared alignment helper, then filter the
+    # aligned signal series by cutoff. Returns positional list. If
+    # the lengths don't match either historical rule, we pass the raw
+    # active_pairs through unchanged (defensive against malformed
+    # legacy PKLs).
+    active_pairs = out.get('active_pairs')
+    if active_pairs is not None and isinstance(pre, pd.DataFrame):
+        try:
+            aligned_series = _align_spymaster_active_pairs_to_dates(
+                active_pairs, pre.index,
+            )
+        except ValueError:
+            out['active_pairs'] = list(active_pairs)
+        else:
+            sliced_series = aligned_series.loc[aligned_series.index <= cutoff_ts]
+            out['active_pairs'] = list(sliced_series.values)
+
+    for key in ('daily_top_buy_pairs', 'daily_top_short_pairs'):
+        d = out.get(key)
+        if isinstance(d, dict):
+            out[key] = {
+                k: v for k, v in d.items()
+                if pd.Timestamp(k) <= cutoff_ts
+            }
+
+    return out
+
+
+def load_precomputed_results_with_cutoff(
+    ticker: str,
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+    skip_staleness_check: bool = True,
+    bypass_loading_check: bool = True,
+) -> Optional[dict]:
+    """Load via existing ``load_precomputed_results``, then slice to cutoff.
+
+    Default ``data_available_through=None`` returns the same dict the
+    underlying loader returned (modulo the ``dict(results)`` shallow
+    copy from the slicer's no-op path).
+    """
+    results = load_precomputed_results(
+        ticker,
+        skip_staleness_check=skip_staleness_check,
+        bypass_loading_check=bypass_loading_check,
+    )
+    if results is None:
+        return None
+    return _slice_spymaster_results_to_cutoff(
+        results, data_available_through=data_available_through,
+    )
+
+
+def ensure_df_available_with_cutoff(
+    ticker: str,
+    results: Optional[Mapping[str, Any]] = None,
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+) -> Optional[pd.DataFrame]:
+    """Ensure ticker DataFrame is available, then slice to cutoff.
+
+    Default ``data_available_through=None`` preserves
+    ``ensure_df_available`` behavior.
+    """
+    df = ensure_df_available(ticker, results)
+    if df is None or df.empty:
+        return df
+    if data_available_through is None:
+        return df
+    cutoff_ts = pd.Timestamp(data_available_through)
+    return df.loc[df.index <= cutoff_ts]
+
+
+def fetch_secondary_window_with_cutoff(
+    ticker: str,
+    start,
+    end,
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+) -> Optional[pd.DataFrame]:
+    """Fetch secondary window, then slice to cutoff.
+
+    Default ``data_available_through=None`` preserves
+    ``fetch_secondary_window`` behavior.
+    """
+    df = fetch_secondary_window(ticker, start, end)
+    if df is None or df.empty:
+        return df
+    if data_available_through is None:
+        return df
+    cutoff_ts = pd.Timestamp(data_available_through)
+    return df.loc[df.index <= cutoff_ts]
+
+
 @app.callback(
     [Output('optimization-results-table', 'data'),
      Output('optimization-results-table', 'columns'),
@@ -12324,130 +12953,64 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
             return [], empty_columns, f'No data found for secondary ticker {secondary_ticker}.', False
 
         # Fetch data for each primary ticker
-        primary_signals = {}
+        # Phase 5C-2d prep: per-ticker resolution delegates to the
+        # extracted ``build_spymaster_primary_signal_data`` pure helper.
+        # The callback retains ownership of data loading
+        # (``load_precomputed_results`` + ``ensure_df_available``) so
+        # the missing-ticker / queue path stays in the orchestrator.
+        primary_signal_data = {}
         date_indexes = {}
         missing_tickers = []
-        
+
         for ticker in primary_tickers:
             logger.info(f"Loading precomputed results for {ticker}...")
-            # Use skip_staleness_check=True to ensure we get results even if not in RAM cache
             results = load_precomputed_results(ticker, skip_staleness_check=True, bypass_loading_check=True)
             if not results or 'active_pairs' not in results:
                 logger.info(f"No complete results found for {ticker}")
                 missing_tickers.append(ticker)
-                continue  # Don't return early, collect all missing tickers
+                continue
             logger.info(f"Successfully loaded results for {ticker}")
 
-            active_pairs = results['active_pairs']
-            # Load DataFrame on-demand to get dates
             df = ensure_df_available(ticker, results)
             if df is None or df.empty:
                 logger.warning(f"Could not load DataFrame for {ticker}")
                 continue
-            dates = df.index
 
-            # Handle length mismatch
-            if len(active_pairs) != len(dates):
-                if len(active_pairs) == len(dates) - 1:
-                    dates = dates[1:]
-                else:
-                    return [], empty_columns, f'Length mismatch between active_pairs and dates for ticker {ticker}. Cannot proceed.', False
-
-            # Create signals series
-            signals_series = pd.Series(active_pairs, index=dates)
-            
-            # Process for next day's signals
-            if 'daily_top_buy_pairs' in results and 'daily_top_short_pairs' in results:
-                # Load DataFrame on-demand to get last date
-                df = ensure_df_available(ticker, results)
-                if df is None or df.empty:
-                    logger.warning(f"Could not load DataFrame for {ticker}")
-                    continue
-                last_date = df.index[-1]
-                buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
-                short_pair_data = results['daily_top_short_pairs'].get(last_date)
-                
-                if buy_pair_data and short_pair_data:
-                    try:
-                        # Validate pair data structure
-                        if not isinstance(buy_pair_data[0], tuple) or not isinstance(short_pair_data[0], tuple):
-                            raise ValueError("Invalid pair data structure")
-                                
-                        # Calculate next day's signal
-                        buy_pair = buy_pair_data[0]
-                        short_pair = short_pair_data[0]
-                        buy_capture = buy_pair_data[1]
-                        short_capture = short_pair_data[1]
-                            
-                        # Validate SMA columns exist
-                        required_smas = [
-                            f'SMA_{buy_pair[0]}', f'SMA_{buy_pair[1]}',
-                            f'SMA_{short_pair[0]}', f'SMA_{short_pair[1]}'
-                        ]
-                        if not all(sma in df.columns for sma in required_smas):
-                            raise ValueError("Missing required SMA columns")
-                            
-                        # Use tolerant lookups for last_date
-                        sma_buy_0 = _asof(df[f'SMA_{buy_pair[0]}'], last_date, default=None)
-                        sma_buy_1 = _asof(df[f'SMA_{buy_pair[1]}'], last_date, default=None)
-                        sma_short_0 = _asof(df[f'SMA_{short_pair[0]}'], last_date, default=None)
-                        sma_short_1 = _asof(df[f'SMA_{short_pair[1]}'], last_date, default=None)
-                        
-                        # Check if we have valid values
-                        if sma_buy_0 is not None and sma_buy_1 is not None:
-                            buy_signal = sma_buy_0 > sma_buy_1
-                        else:
-                            buy_signal = False
-                            
-                        if sma_short_0 is not None and sma_short_1 is not None:
-                            short_signal = sma_short_0 < sma_short_1
-                        else:
-                            short_signal = False
-                            
-                        # Determine next signal
-                        if buy_signal and short_signal:
-                            next_signal = f"Buy" if buy_capture > short_capture else f"Short"
-                        elif buy_signal:
-                            next_signal = f"Buy"
-                        elif short_signal:
-                            next_signal = f"Short"
-                        else:
-                            next_signal = "None"
-                            
-                        # Store current signals for performance calculation
-                        processed_signals = signals_series.astype(str).apply(
-                            lambda x: 'Buy' if x.strip().startswith('Buy') else
-                                    'Short' if x.strip().startswith('Short') else 'None'
-                        )
-                        
-                        # Append next_signal to processed_signals
-                        next_date = secondary_data.index[secondary_data.index > last_date]
-                        if not next_date.empty:
-                            next_date = next_date[0]
-                            processed_signals = pd.concat([processed_signals, pd.Series([next_signal], index=[next_date])])
-                        else:
-                            # No future date available, cannot append next_signal
-                            pass
-             
-                        # Only log signals during initial processing, not during sorts or interval updates
-                        if ctx.triggered_id not in ['optimization-results-table.sort_by', 'optimization-update-interval']:
-                            logger.info(f"Ticker {ticker} - Next signal: {next_signal}")
-                            
-                        primary_signals[ticker] = {
-                            'signals_with_next': processed_signals,
-                            'next_signal': next_signal
-                        }
-                        date_indexes[ticker] = set(processed_signals.index)
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing signals for {ticker}: {str(e)}")
-                        return [], empty_columns, f'Error processing signals for {ticker}.', False
-                else:
-                    missing_tickers.append(ticker)
-                    logger.warning(f"Incomplete data for ticker {ticker}")
-            else:
+            if 'daily_top_buy_pairs' not in results or 'daily_top_short_pairs' not in results:
                 missing_tickers.append(ticker)
                 logger.warning(f"Missing data in results for ticker {ticker}")
+                continue
+
+            last_date = df.index[-1]
+            buy_pair_data = results['daily_top_buy_pairs'].get(last_date)
+            short_pair_data = results['daily_top_short_pairs'].get(last_date)
+            if not buy_pair_data or not short_pair_data:
+                missing_tickers.append(ticker)
+                logger.warning(f"Incomplete data for ticker {ticker}")
+                continue
+
+            try:
+                psig = build_spymaster_primary_signal_data(
+                    ticker=ticker,
+                    results=results,
+                    df=df,
+                    secondary_data=secondary_data,
+                )
+            except ValueError as ve:
+                msg = str(ve)
+                if msg.startswith("Length mismatch between active_pairs"):
+                    return [], empty_columns, msg, False
+                logger.error(f"Error processing signals for {ticker}: {msg}")
+                return [], empty_columns, f'Error processing signals for {ticker}.', False
+            except Exception as e:
+                logger.error(f"Error processing signals for {ticker}: {str(e)}")
+                return [], empty_columns, f'Error processing signals for {ticker}.', False
+
+            if ctx.triggered_id not in ['optimization-results-table.sort_by', 'optimization-update-interval']:
+                logger.info(f"Ticker {ticker} - Next signal: {psig.next_signal}")
+
+            primary_signal_data[ticker] = psig
+            date_indexes[ticker] = set(psig.signals_with_next.index)
         
         # Check if we have any missing tickers that need processing
         if missing_tickers:
@@ -12479,279 +13042,62 @@ def optimize_signals(n_clicks, n_intervals, sort_by, primary_tickers_input, seco
             logger.info(f"OPTIMIZATION STARTED - Lock acquired, processing {len(primary_tickers)} primaries with {secondary_ticker}")
         # (No explicit return in this region; the function-level 'finally' below will always release the lock.)
 
-        # Generate possible states for each ticker based on next day's signals
-        ticker_states = {}
-        for ticker in primary_tickers:
-            signal = primary_signals[ticker]['next_signal']
-            logger.debug(f"Using next day signal for {ticker}: {signal}")
-            
-            # Determine possible states based on next signal
-            if 'Buy' in signal:
-                ticker_states[ticker] = [(False, False), (False, True)]  # (invert_signals, mute)
-            elif 'Short' in signal:
-                ticker_states[ticker] = [(True, False), (False, True)]  # (invert_signals, mute)
-            else:
-                ticker_states[ticker] = [(False, True)]  # Only mute option for 'None' signals
+        # Phase 5C-2d prep: combination generation + scoring is delegated
+        # to the pure ``compute_spymaster_optimization`` core. A local
+        # tqdm progress bar restores the historical ``Combos metrics``
+        # console output via the (current, total) progress callback;
+        # the module-level ``optimization_progress`` global is left
+        # untouched (the original callback's inline assignment never
+        # reached the global because of missing ``global`` declaration,
+        # and the polling-UI contract for that global is owned by a
+        # future PR).
+        _opt_pbar_holder = [None]
 
-        # Generate combinations as an iterator
-        ticker_state_lists = list(ticker_states.values())
-        combinations = product(*ticker_state_lists)  # Do not convert to list to save memory
-        combination_labels = []
-        valid_combinations = []
-
-        for states in combinations:
-            label_parts = []
-            state_dict = {}
-            
-            for ticker, (invert_signals, mute) in zip(ticker_states.keys(), states):
-                if mute:
-                    state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
-                    continue  # Skip muted tickers in label
-                
-                # Get next day's signal for display
-                next_signal = primary_signals[ticker]['next_signal']
-                if invert_signals:
-                    # Invert the signal for display
-                    if 'Buy' in next_signal:
-                        display_signal = 'Short'
-                    elif 'Short' in next_signal:
-                        display_signal = 'Buy'
-                    else:
-                        display_signal = next_signal
-                    label_parts.append(f"<span style='color:red'>{ticker}</span>")
-                else:
-                    display_signal = next_signal
-                    label_parts.append(f"<span style='color:#80ff00'>{ticker}</span>")
-                
-                state_dict[ticker] = {'invert_signals': invert_signals, 'mute': mute}
-            
-            label = ', '.join(label_parts)
-            combination_labels.append(label)
-            valid_combinations.append(state_dict)
-
-        # Calculate total number of combinations
-        from functools import reduce
-        import operator
-
-        total_combinations = reduce(operator.mul, [len(states) for states in ticker_state_lists], 1)
-        logger.info(f"Total combinations to process: {total_combinations}")
-
-        # Prepare for results
-        results_list = []
-        # Phase 5B-MP-2a: track the most-recent canonical contract issue so the
-        # no-valid-combinations message can surface a specific reason code
-        # (no_overlap / no_triggers / invalid_input) instead of the generic
-        # 'No valid combinations found.' string.
-        last_contract_issue = ""
-
-        # Process each combination with a single progress bar
-        from tqdm import tqdm
-
-        logger.info(f"Total combinations to process: {len(valid_combinations)}")
-        with tqdm_compact(total=len(valid_combinations), desc="Combos metrics") as pbar:
-            for idx, state_dict in enumerate(valid_combinations):
-                # Update progress with timestamp
-                optimization_progress = {
-                    'status': 'processing',
-                    'current': idx,
-                    'total': len(valid_combinations),
-                    'ts': time.time()
-                }
-                
-                # Get unmuted tickers
-                unmuted_tickers = [ticker for ticker in primary_tickers 
-                                if ticker in state_dict and not state_dict[ticker]['mute']]
-
-                if not unmuted_tickers:
-                    pbar.update(1)
-                    continue  # Skip if all tickers are muted
-
-                # Find common dates
-                common_dates = set(secondary_data.index)
-                for ticker in unmuted_tickers:
-                    common_dates = common_dates.intersection(date_indexes[ticker])
-                common_dates = sorted(common_dates)
-
-                if not common_dates:
-                    pbar.update(1)
-                    continue  # Skip if no overlapping dates
-
-                # Build combined signals DataFrame for performance calculation
-                combined_signals_df = pd.DataFrame(index=common_dates)
-                for ticker in unmuted_tickers:
-                    state = state_dict[ticker]
-                    invert_signals = state['invert_signals']
-                    
-                    # Use signals_with_next for performance calculation
-                    signals_with_next = primary_signals[ticker]['signals_with_next'].loc[common_dates]
-                    
-                    # Apply inversion if needed
-                    if invert_signals:
-                        signals = signals_with_next.replace({'Buy': 'Short', 'Short': 'Buy'})
-                    else:
-                        signals = signals_with_next
-                    
-                    combined_signals_df[ticker] = signals
-
-                # Phase 5B-MP-2a: route §18 consensus through the canonical
-                # helper via _spymaster_multi_primary_contract_result; the
-                # hand-rolled vectorized block has been removed.
-                contract = _spymaster_multi_primary_contract_result(
-                    combined_signals_df, context="optimization",
+        def _opt_progress_callback(current, total):
+            if _opt_pbar_holder[0] is None:
+                _opt_pbar_holder[0] = tqdm_compact(
+                    total=total, desc="Combos metrics",
                 )
-                combined_signals = contract["aggregate_signal"]
-                if contract["issues"]:
-                    last_contract_issue = contract["issues"][0]
+            pb = _opt_pbar_holder[0]
+            delta = int(current) - pb.n
+            if delta > 0:
+                pb.update(delta)
 
-                # No need to shift signals since we included the next day's signal
-                signals = combined_signals.fillna('None')
+        try:
+            result = compute_spymaster_optimization(
+                primary_tickers=primary_tickers,
+                secondary_ticker=secondary_ticker,
+                secondary_data=secondary_data,
+                primary_signal_data=primary_signal_data,
+                progress_callback=_opt_progress_callback,
+            )
+        finally:
+            if _opt_pbar_holder[0] is not None:
+                try:
+                    _opt_pbar_holder[0].close()
+                except Exception:
+                    pass
 
-                # Align signals and prices
-                prices = _price_series(secondary_data, index=signals.index)
-                
-                # Compute daily returns (1-D Series) and aligned signals
-                daily_returns = prices.astype('float64').pct_change().fillna(0.0)
-                if isinstance(daily_returns, pd.DataFrame):
-                    daily_returns = daily_returns.iloc[:, 0]
+        logger.info(f"Total combinations to process: {result.total_combinations}")
 
-                signals = signals.loc[daily_returns.index]
-
-                # Robust vectorized capture
-                ret = daily_returns.to_numpy()
-                buy_mask = signals.eq('Buy').to_numpy()
-                short_mask = signals.eq('Short').to_numpy()
-
-                cap = np.zeros_like(ret, dtype='float64')
-                cap[buy_mask] = ret[buy_mask] * 100.0
-                cap[short_mask] = -ret[short_mask] * 100.0
-
-                daily_captures = pd.Series(cap, index=daily_returns.index)
-
-                # Calculate metrics
-                trigger_mask = buy_mask | short_mask
-                if int(trigger_mask.sum()) == 0:
-                    pbar.update(1)
-                    continue  # Skip combinations with no triggers
-
-                # Spec §13–§17: route through canonical_scoring.
-                _score = _canonical_score_captures(
-                    daily_captures,
-                    pd.Series(trigger_mask, index=daily_returns.index),
-                    risk_free_rate=5.0, periods_per_year=252, ddof=1,
-                )
-
-                # Store results
-                results_list.append({
-                    'id': idx,  # Add a unique identifier
-                    'Combination': combination_labels[idx],
-                    'Triggers': _score.trigger_days,
-                    'Wins': _score.wins,
-                    'Losses': _score.losses,
-                    'Win %': round(_score.win_rate, 2),
-                    'StdDev %': round(_score.std_dev, 4),
-                    'Sharpe': round(_score.sharpe, 2),
-                    't': round(_score.t_statistic, 4) if _score.t_statistic is not None else 'N/A',
-                    'p': round(_score.p_value, 4) if _score.p_value is not None else 'N/A',
-                    'Sig 90%': 'Yes' if _score.p_value is not None and _score.p_value < 0.10 else 'No',
-                    'Sig 95%': 'Yes' if _score.p_value is not None and _score.p_value < 0.05 else 'No',
-                    'Sig 99%': 'Yes' if _score.p_value is not None and _score.p_value < 0.01 else 'No',
-                    'Avg Cap %': round(_score.avg_daily_capture, 4),
-                    'Total %': round(_score.total_capture, 4)
-                })
-
-                # Update progress bar
-                pbar.update(1)
-
-        if not results_list:
+        if not result.records:
             if optimization_in_progress:
                 optimization_in_progress = False
                 if optimization_lock.locked():
                     optimization_lock.release()
-            no_valid_msg = last_contract_issue or 'No valid combinations found.'
-            return [], empty_columns, no_valid_msg, True  # Add the fourth output
-
-        # Sort by Sharpe
-        results_list.sort(key=lambda x: x['Sharpe'], reverse=True)
-
-        # Define columns for the DataTable
-        columns = [
-            {'name': 'Combination', 'id': 'Combination', 'presentation': 'markdown'},
-            {'name': 'Triggers', 'id': 'Triggers', 'type': 'numeric'},
-            {'name': 'Wins', 'id': 'Wins', 'type': 'numeric'},
-            {'name': 'Losses', 'id': 'Losses', 'type': 'numeric'},
-            {'name': 'Win %', 'id': 'Win %', 'type': 'numeric'},
-            {'name': 'StdDev %', 'id': 'StdDev %', 'type': 'numeric'},
-            {'name': 'Sharpe', 'id': 'Sharpe', 'type': 'numeric'},
-            {'name': 't', 'id': 't'},
-            {'name': 'p', 'id': 'p'},
-            {'name': 'Sig 90%', 'id': 'Sig 90%'},
-            {'name': 'Sig 95%', 'id': 'Sig 95%'},
-            {'name': 'Sig 99%', 'id': 'Sig 99%'},
-            {'name': 'Avg Cap %', 'id': 'Avg Cap %', 'type': 'numeric'},
-            {'name': 'Total %', 'id': 'Total %', 'type': 'numeric'}
-        ]
+            no_valid_msg = result.last_contract_issue or 'No valid combinations found.'
+            return [], empty_columns, no_valid_msg, True
 
         try:
-            # Calculate averages for numeric columns
-            if results_list:
-                averages = {
-                    'Combination': 'AVERAGES',
-                    'Triggers': round(sum(r['Triggers'] for r in results_list) / len(results_list)),
-                    'Wins': round(sum(r['Wins'] for r in results_list) / len(results_list)),
-                    'Losses': round(sum(r['Losses'] for r in results_list) / len(results_list)),
-                    'Win %': round(sum(r['Win %'] for r in results_list) / len(results_list), 2),
-                    'StdDev %': round(sum(r['StdDev %'] for r in results_list) / len(results_list), 4),
-                    'Sharpe': round(sum(r['Sharpe'] for r in results_list) / len(results_list), 2),
-                    't': round(sum(float(r['t']) if r['t'] != 'N/A' else 0 for r in results_list) / 
-                                      sum(1 for r in results_list if r['t'] != 'N/A'), 4) if any(r['t'] != 'N/A' for r in results_list) else 'N/A',
-                    'p': round(sum(float(r['p']) if r['p'] != 'N/A' else 0 for r in results_list) / 
-                                   sum(1 for r in results_list if r['p'] != 'N/A'), 4) if any(r['p'] != 'N/A' for r in results_list) else 'N/A',
-                    'Sig 90%': f"{round(sum(1 for r in results_list if r['Sig 90%'] == 'Yes') / len(results_list) * 100, 1)}% of combos",
-                    'Sig 95%': f"{round(sum(1 for r in results_list if r['Sig 95%'] == 'Yes') / len(results_list) * 100, 1)}% of combos",
-                    'Sig 99%': f"{round(sum(1 for r in results_list if r['Sig 99%'] == 'Yes') / len(results_list) * 100, 1)}% of combos",
-                    'Avg Cap %': round(sum(r['Avg Cap %'] for r in results_list) / len(results_list), 4),
-                    'Total %': round(sum(r['Total %'] for r in results_list) / len(results_list), 4)
-                }        
-            # Handle sorting and fixed averages row
+            current_sort = getattr(ctx.inputs, 'optimization-results-table.sort_by', None)
+            rows, columns, success_message = format_spymaster_optimization_table(
+                result, sort_by=current_sort,
+            )
             cache_key = f"{primary_tickers_input}_{secondary_ticker_input}"
-            if results_list:
-                # Store current sort state with the cache
-                current_sort = getattr(ctx.inputs, 'optimization-results-table.sort_by', None)
-                sortable_data = sorted(results_list, key=lambda x: x['Sharpe'], reverse=True)
-                
-                # Apply current sort if exists
-                if current_sort:
-                    for sort_spec in current_sort:
-                        col_id = sort_spec['column_id']
-                        is_ascending = sort_spec['direction'] == 'asc'
-                        try:
-                            if col_id in ['Triggers', 'Wins', 'Losses', 'Win %', 
-                                        'StdDev %', 'Sharpe', 'Avg Cap %', 
-                                        'Total %']:
-                                sortable_data = sorted(
-                                    sortable_data,
-                                    key=lambda x: (float(str(x[col_id]).replace('N/A', '-inf'))
-                                                 if x[col_id] != 'N/A' else float('-inf')),
-                                    reverse=not is_ascending
-                                )
-                            else:
-                                sortable_data = sorted(
-                                    sortable_data,
-                                    key=lambda x: str(x[col_id]),
-                                    reverse=not is_ascending
-                                )
-                        except Exception as e:
-                            logger.error(f"Sorting error for column {col_id}: {str(e)}")
-                            continue
-                
-                fixed_results = [averages] + sortable_data
-                success_message = html.Div('Optimization complete. Click any ticker combination cell to auto-populate in Multi-Primary Signal Aggregator.', 
-                                          style={'color': '#80ff00'})
-                optimization_results_cache[cache_key] = (fixed_results, columns, success_message, current_sort)
-                _enforce_cache_limits()
-            else:
-                optimization_results_cache[cache_key] = ([], columns, 'No valid combinations found.', None)
-                _enforce_cache_limits()
+            optimization_results_cache[cache_key] = (
+                rows, columns, success_message, current_sort,
+            )
+            _enforce_cache_limits()
             return optimization_results_cache[cache_key][:3] + (True,)
 
         finally:
