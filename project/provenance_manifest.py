@@ -1147,6 +1147,8 @@ _VALIDATION_SUMMARY_REQUIRED_KEYS: Tuple[str, ...] = (
     "multiple_comparisons_control_method",
     "multiple_comparisons_control_alpha",
     "walk_forward_n_folds",
+    # Phase 5C-2a-iii: baseline summary (locked 5C-1 §6 + §12 amendment).
+    "mean_baseline_sharpe",
     "validation_artifact_path",
     "validation_artifact_hash",
 )
