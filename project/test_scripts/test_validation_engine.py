@@ -1199,3 +1199,344 @@ def test_validate_strategy_set_empirical_disabled_when_zero_counts():
         assert s["bootstrap_sharpe_ci_lower"] is None
         assert s["bootstrap_sharpe_ci_upper"] is None
     assert contract["n_strategies_survived_empirical"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2a-iii: baseline persistence
+# ---------------------------------------------------------------------------
+
+
+class _BaselineMetricsAdapter:
+    """Adapter that returns ``BaselineFoldMetrics`` directly per fold,
+    with deterministic baseline metrics keyed by fold index. Strategy
+    captures use the existing _captures_in_window helper for known
+    Sharpe behavior.
+    """
+
+    def __init__(
+        self,
+        history,
+        baseline_per_fold_by_index,
+        n_strategies=2,
+        n_triggers_per_fold=15,
+        capture_value=0.4,
+    ):
+        self._history = history
+        self._baselines = baseline_per_fold_by_index
+        self._n = n_strategies
+        self._n_trig = n_triggers_per_fold
+        self._cap_v = capture_value
+
+    def select_for_fold(self, context):
+        return [
+            ve.StrategyCandidate(strategy_id=f"s{i}", strategy_label=f"S{i}")
+            for i in range(self._n)
+        ]
+
+    def evaluate_candidate(self, candidate, context):
+        cap, mask = _captures_in_window(
+            self._history, context.test_start, context.test_end,
+            self._n_trig, self._cap_v,
+        )
+        return ve.StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=cap,
+            trigger_mask=mask,
+        )
+
+    def baseline_for_fold(self, context):
+        return self._baselines[context.fold_index]
+
+
+class _RaisingBaselineAdapter:
+    """Adapter whose baseline_for_fold raises for the configured set
+    of fold indices and returns BaselineFoldMetrics otherwise.
+    """
+
+    def __init__(self, history, raise_at_folds, n_strategies=1):
+        self._history = history
+        self._raise_at = set(raise_at_folds)
+        self._n = n_strategies
+
+    def select_for_fold(self, context):
+        return [
+            ve.StrategyCandidate(strategy_id=f"s{i}", strategy_label=f"S{i}")
+            for i in range(self._n)
+        ]
+
+    def evaluate_candidate(self, candidate, context):
+        cap, mask = _captures_in_window(
+            self._history, context.test_start, context.test_end, 10, 0.3,
+        )
+        return ve.StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=cap,
+            trigger_mask=mask,
+        )
+
+    def baseline_for_fold(self, context):
+        if context.fold_index in self._raise_at:
+            raise RuntimeError(
+                f"simulated baseline failure for fold {context.fold_index}"
+            )
+        return ve.BaselineFoldMetrics(
+            fold_index=context.fold_index,
+            n_observations=252,
+            baseline_sharpe=0.6,
+            baseline_total_return=5.0,
+            baseline_mean_return=0.02,
+            baseline_std=0.9,
+        )
+
+
+def test_baseline_fold_metrics_dataclass():
+    bm = ve.BaselineFoldMetrics(
+        fold_index=2,
+        n_observations=252,
+        baseline_sharpe=0.55,
+        baseline_total_return=4.2,
+        baseline_mean_return=0.0167,
+        baseline_std=1.1,
+        issues=("[ENGINE:warn] sample issue",),
+    )
+    assert bm.fold_index == 2
+    assert bm.n_observations == 252
+    assert bm.baseline_sharpe == 0.55
+    assert bm.baseline_total_return == 4.2
+    assert bm.baseline_mean_return == 0.0167
+    assert bm.baseline_std == 1.1
+    assert bm.issues == ("[ENGINE:warn] sample issue",)
+    # frozen=True immutability — direct attribute mutation must raise.
+    raised = False
+    try:
+        bm.baseline_sharpe = 0.0  # type: ignore[misc]
+    except Exception:
+        raised = True
+    assert raised, "BaselineFoldMetrics(frozen=True) must reject mutation"
+
+
+def test_validate_strategy_set_persists_baseline_per_fold():
+    history = _bdate_index(2520)
+    # 5 folds expected for 2520 / 1260 / 252 / 252.
+    baselines = {
+        i: ve.BaselineFoldMetrics(
+            fold_index=i,
+            n_observations=252,
+            baseline_sharpe=0.5 + 0.1 * i,
+            baseline_total_return=5.0 + i,
+            baseline_mean_return=0.02 + 0.001 * i,
+            baseline_std=0.9 + 0.05 * i,
+        )
+        for i in range(5)
+    }
+    adapter = _BaselineMetricsAdapter(history, baselines, n_strategies=1)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-persist",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    bf = contract["baseline_per_fold"]
+    assert isinstance(bf, list)
+    assert len(bf) == 5
+    for i, entry in enumerate(bf):
+        assert entry["fold_index"] == i
+        assert entry["n_observations"] == 252
+        assert math.isclose(entry["baseline_sharpe"], 0.5 + 0.1 * i, rel_tol=1e-9)
+        assert math.isclose(entry["baseline_total_return"], 5.0 + i, rel_tol=1e-9)
+        assert entry["issues"] == []
+
+
+def test_validate_strategy_set_adapts_strategy_fold_result_baseline():
+    history = _bdate_index(2520)
+    # Use the existing _RecordingAdapter — it returns
+    # StrategyFoldResult from baseline_for_fold; the engine must adapt.
+    adapter = _RecordingAdapter(
+        history, n_strategies=1, n_triggers_per_fold=10, capture_value=0.0,
+    )
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-adapt",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    bf = contract["baseline_per_fold"]
+    assert len(bf) == 5
+    for entry in bf:
+        # _RecordingAdapter's baseline returns a zero-capture series
+        # over the whole evaluation window; n_observations must reflect
+        # that length, not zero.
+        assert entry["n_observations"] > 0
+        # Sharpe / total_return may be None (zero-variance captures)
+        # but the schema must include those keys.
+        assert set(entry.keys()) >= {
+            "fold_index", "n_observations",
+            "baseline_sharpe", "baseline_total_return",
+            "baseline_mean_return", "baseline_std", "issues",
+        }
+
+
+def test_validate_strategy_set_baseline_aggregate_summary():
+    history = _bdate_index(2520)
+    baselines = {
+        0: ve.BaselineFoldMetrics(0, 252, 0.5, 4.0, 0.0159, 1.0),
+        1: ve.BaselineFoldMetrics(1, 252, 0.7, 6.0, 0.0238, 1.2),
+        2: ve.BaselineFoldMetrics(2, 252, 0.3, 2.0, 0.0079, 0.8),
+        3: ve.BaselineFoldMetrics(3, 252, 0.6, 5.0, 0.0198, 1.1),
+        4: ve.BaselineFoldMetrics(4, 252, 0.9, 8.0, 0.0317, 1.3),
+    }
+    adapter = _BaselineMetricsAdapter(history, baselines, n_strategies=1)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-agg",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    agg = contract["baseline_aggregate"]
+    assert agg["n_folds_with_baseline"] == 5
+    assert agg["total_baseline_observations"] == 5 * 252
+    expected_mean_sharpe = (0.5 + 0.7 + 0.3 + 0.6 + 0.9) / 5
+    expected_mean_return = (4.0 + 6.0 + 2.0 + 5.0 + 8.0) / 5
+    assert math.isclose(
+        agg["mean_baseline_sharpe"], expected_mean_sharpe, rel_tol=1e-9,
+    )
+    assert math.isclose(
+        agg["mean_baseline_return"], expected_mean_return, rel_tol=1e-9,
+    )
+
+
+def test_validate_strategy_set_per_strategy_baseline_delta():
+    history = _bdate_index(2520)
+    # Constant baseline metrics so deltas reflect strategy-side
+    # variation only.
+    baselines = {
+        i: ve.BaselineFoldMetrics(
+            fold_index=i,
+            n_observations=252,
+            baseline_sharpe=0.5,
+            baseline_total_return=2.0,
+            baseline_mean_return=0.008,
+            baseline_std=1.0,
+        )
+        for i in range(5)
+    }
+    adapter = _BaselineMetricsAdapter(history, baselines, n_strategies=1)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-delta",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    s0 = contract["strategies"][0]
+    assert "per_fold_baseline_delta" in s0
+    assert "aggregate_baseline_delta" in s0
+    assert len(s0["per_fold_baseline_delta"]) == len(s0["per_fold_metrics"])
+    for fm, dm in zip(s0["per_fold_metrics"], s0["per_fold_baseline_delta"]):
+        assert dm["fold_index"] == fm["fold_index"]
+        if fm["sharpe"] is not None:
+            assert math.isclose(
+                dm["sharpe_delta"], fm["sharpe"] - 0.5, rel_tol=1e-9,
+            )
+        if fm["total_capture"] is not None:
+            assert math.isclose(
+                dm["return_delta"], fm["total_capture"] - 2.0, rel_tol=1e-9,
+            )
+    finite_sharpe_d = [
+        d["sharpe_delta"] for d in s0["per_fold_baseline_delta"]
+        if d["sharpe_delta"] is not None
+    ]
+    if finite_sharpe_d:
+        expected_mean = sum(finite_sharpe_d) / len(finite_sharpe_d)
+        assert math.isclose(
+            s0["aggregate_baseline_delta"]["mean_sharpe_delta"],
+            expected_mean, rel_tol=1e-9,
+        )
+
+
+def test_validate_strategy_set_baseline_failure_promotes_to_partial():
+    history = _bdate_index(2520)
+    adapter = _RaisingBaselineAdapter(history, raise_at_folds={2})
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-fail-one",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    assert contract["validation_status"] == ve.PARTIAL
+    assert any(
+        ve.VALIDATION_BASELINE_UNAVAILABLE in iss for iss in contract["issues"]
+    )
+    by_fold = {b["fold_index"]: b for b in contract["baseline_per_fold"]}
+    failed = by_fold[2]
+    assert failed["n_observations"] == 0
+    assert failed["baseline_sharpe"] is None
+    assert failed["baseline_total_return"] is None
+    assert failed["baseline_mean_return"] is None
+    assert failed["baseline_std"] is None
+    assert failed["issues"], "expected failure issue on the failed-fold entry"
+    # Other folds populated normally.
+    for fi in (0, 1, 3, 4):
+        ok = by_fold[fi]
+        assert ok["n_observations"] == 252
+        assert ok["baseline_sharpe"] == 0.6
+
+
+def test_validate_strategy_set_all_baselines_fail():
+    history = _bdate_index(2520)
+    adapter = _RaisingBaselineAdapter(history, raise_at_folds={0, 1, 2, 3, 4})
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-fail-all",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    assert contract["validation_status"] == ve.PARTIAL
+    agg = contract["baseline_aggregate"]
+    assert agg["n_folds_with_baseline"] == 0
+    assert agg["mean_baseline_sharpe"] is None
+    assert agg["mean_baseline_return"] is None
+    assert agg["total_baseline_observations"] == 0
+    failure_issues = [
+        iss for iss in contract["issues"]
+        if ve.VALIDATION_BASELINE_UNAVAILABLE in iss
+    ]
+    assert len(failure_issues) >= 5, (
+        "expected one validation_baseline_unavailable per failed fold; got "
+        + str(len(failure_issues))
+    )
+
+
+def test_validate_strategy_set_baseline_in_sample_only():
+    history = _bdate_index(1008)  # too short for default walk-forward
+    adapter = _RecordingAdapter(history, n_strategies=1)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="bf-in-sample",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    assert contract["validation_status"] == ve.IN_SAMPLE_ONLY
+    assert contract["baseline_per_fold"] == []
+    agg = contract["baseline_aggregate"]
+    assert agg["n_folds_with_baseline"] == 0
+    assert agg["mean_baseline_sharpe"] is None
+    assert agg["mean_baseline_return"] is None
+    assert agg["total_baseline_observations"] == 0

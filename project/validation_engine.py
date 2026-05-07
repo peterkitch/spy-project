@@ -161,6 +161,26 @@ class StrategyFoldResult:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class BaselineFoldMetrics:
+    """Phase 5C-2a-iii: baseline observation summary for one fold.
+
+    ``n_observations`` is the number of evaluation-window bars used by
+    the adapter's same-ticker buy-and-hold baseline (per locked 5C-1
+    Section 6), NOT trigger days. ``issues`` carries any
+    ``[<ENGINE>:validation_baseline_unavailable]`` / similar reason
+    strings emitted while the baseline was constructed.
+    """
+
+    fold_index: int
+    n_observations: int
+    baseline_sharpe: Optional[float]
+    baseline_total_return: Optional[float]
+    baseline_mean_return: Optional[float]
+    baseline_std: Optional[float]
+    issues: Tuple[str, ...] = ()
+
+
 # ---------------------------------------------------------------------------
 # 6. Adapter Protocol
 # ---------------------------------------------------------------------------
@@ -184,7 +204,7 @@ class SelectionAdapter(Protocol):
         self, candidate: StrategyCandidate, context: FoldContext,
     ) -> StrategyFoldResult: ...
 
-    def baseline_for_fold(self, context: FoldContext) -> StrategyFoldResult: ...
+    def baseline_for_fold(self, context: FoldContext) -> "BaselineFoldMetrics": ...
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +426,9 @@ _REQUIRED_CONTRACT_KEYS = (
     "survivorship_summary",
     "issues",
     "strategies",
+    # Phase 5C-2a-iii baseline persistence (locked 5C-1 §6).
+    "baseline_per_fold",
+    "baseline_aggregate",
 )
 
 
@@ -426,6 +449,18 @@ def validate_validation_contract_v1(contract: Mapping[str, Any]) -> None:
     assert status in _VALID_STATUSES, (
         f"validation_status must be one of {sorted(_VALID_STATUSES)}; "
         f"got {status!r}"
+    )
+    # Phase 5C-2a-iii: structural shape checks for the new baseline
+    # persistence fields. baseline_per_fold stays list-only; baseline
+    # _aggregate accepts any Mapping so subclasses (and JSON-roundtrip
+    # dicts) are all valid (locked 5C-2a-iii sidecar I/O alignment).
+    assert isinstance(contract["baseline_per_fold"], list), (
+        "baseline_per_fold must be a list; got "
+        + type(contract["baseline_per_fold"]).__name__
+    )
+    assert isinstance(contract["baseline_aggregate"], Mapping), (
+        "baseline_aggregate must be a Mapping; got "
+        + type(contract["baseline_aggregate"]).__name__
     )
 
 
@@ -455,6 +490,90 @@ def _iso_date(ts) -> Optional[str]:
     if ts is None:
         return None
     return pd.Timestamp(ts).date().isoformat()
+
+
+def _coerce_baseline_fold_metrics(
+    baseline_result,
+    context: "FoldContext",
+    *,
+    producer_engine: str,
+    run_id: str,
+) -> "BaselineFoldMetrics":
+    """Phase 5C-2a-iii: adapt either a ``BaselineFoldMetrics`` or a
+    ``StrategyFoldResult`` returned by ``adapter.baseline_for_fold``
+    into the canonical ``BaselineFoldMetrics`` shape.
+
+    For the compatibility path (``StrategyFoldResult`` input), the
+    daily-capture series is scored with an all-True trigger mask over
+    the evaluation window so the resulting Sharpe / total / mean /
+    std reflect same-ticker buy-and-hold-style observation set
+    (locked 5C-1 §6 baseline contract).
+
+    Raises ``TypeError`` for inputs that are neither shape; the
+    orchestrator catches that as ``validation_baseline_unavailable``.
+    """
+    if isinstance(baseline_result, BaselineFoldMetrics):
+        return baseline_result
+    if isinstance(baseline_result, StrategyFoldResult):
+        cap = pd.Series(baseline_result.daily_capture).astype(float)
+        n_obs = int(len(cap))
+        if n_obs == 0:
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index,
+                n_observations=0,
+                baseline_sharpe=None,
+                baseline_total_return=None,
+                baseline_mean_return=None,
+                baseline_std=None,
+                issues=tuple(baseline_result.issues or ()),
+            )
+        all_true_mask = pd.Series(
+            [True] * n_obs, index=cap.index,
+        )
+        try:
+            score = _canonical_score_captures(
+                cap, all_true_mask,
+                risk_free_rate=5.0,
+                periods_per_year=252,
+                ddof=1,
+            )
+        except Exception as exc:
+            raise TypeError(
+                f"baseline scoring failed during coercion: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index,
+            n_observations=n_obs,
+            baseline_sharpe=_safe_float(getattr(score, "sharpe", None)),
+            baseline_total_return=_safe_float(
+                getattr(score, "total_capture", None),
+            ),
+            baseline_mean_return=_safe_float(
+                getattr(score, "avg_daily_capture", None),
+            ),
+            baseline_std=_safe_float(getattr(score, "std_dev", None)),
+            issues=tuple(baseline_result.issues or ()),
+        )
+    raise TypeError(
+        "adapter.baseline_for_fold must return BaselineFoldMetrics or "
+        f"StrategyFoldResult; got {type(baseline_result).__name__}"
+    )
+
+
+def _baseline_metrics_to_dict(bm: "BaselineFoldMetrics") -> dict:
+    """Serialize a BaselineFoldMetrics to its on-the-wire dict form
+    for ``contract['baseline_per_fold']``.
+    """
+    return {
+        "fold_index": int(bm.fold_index),
+        "n_observations": int(bm.n_observations),
+        "baseline_sharpe": bm.baseline_sharpe,
+        "baseline_total_return": bm.baseline_total_return,
+        "baseline_mean_return": bm.baseline_mean_return,
+        "baseline_std": bm.baseline_std,
+        "issues": list(bm.issues or ()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +981,15 @@ def validate_strategy_set(
         },
         "issues": [],
         "strategies": [],
+        # Phase 5C-2a-iii defaults — empty for in_sample_only / no-fold
+        # returns; populated below when folds run.
+        "baseline_per_fold": [],
+        "baseline_aggregate": {
+            "n_folds_with_baseline": 0,
+            "mean_baseline_sharpe": None,
+            "mean_baseline_return": None,
+            "total_baseline_observations": 0,
+        },
     }
 
     if not folds:
@@ -899,6 +1027,12 @@ def validate_strategy_set(
     # Aggregation buckets.
     per_strategy_results: dict = {}  # strategy_id -> list of (StrategyFoldResult, FoldContext)
     strategy_labels: dict = {}
+    # Phase 5C-2a-iii: persist baseline observations per fold so the
+    # locked 5C-1 §6 contract (strategy metrics MUST be reported
+    # alongside same-fold baseline metrics) holds in the returned
+    # validation_contract_v1 artifact.
+    baseline_per_fold: List[BaselineFoldMetrics] = []
+    baseline_lookup: Dict[int, BaselineFoldMetrics] = {}
 
     for fold in folds:
         try:
@@ -914,6 +1048,40 @@ def validate_strategy_set(
             status = _promote_status(status, PARTIAL)
             continue
 
+        # Phase 5C-2a-iii: call baseline_for_fold once per fold whose
+        # select_for_fold returned successfully, even when the
+        # candidate list is empty. The baseline is part of the
+        # contract regardless of selection outcome.
+        try:
+            raw_baseline = adapter.baseline_for_fold(fold)
+            baseline_metrics = _coerce_baseline_fold_metrics(
+                raw_baseline, fold,
+                producer_engine=producer_engine, run_id=run_id,
+            )
+            baseline_per_fold.append(baseline_metrics)
+            baseline_lookup[fold.fold_index] = baseline_metrics
+        except Exception as exc:
+            baseline_failures += 1
+            formatted = _format_issue(
+                producer_engine, VALIDATION_BASELINE_UNAVAILABLE, run_id,
+                f"fold {fold.fold_index}: baseline_for_fold raised "
+                f"{type(exc).__name__}: {exc}",
+                "verify baseline data availability for this fold",
+            )
+            issues.append(formatted)
+            failure_metrics = BaselineFoldMetrics(
+                fold_index=fold.fold_index,
+                n_observations=0,
+                baseline_sharpe=None,
+                baseline_total_return=None,
+                baseline_mean_return=None,
+                baseline_std=None,
+                issues=(formatted,),
+            )
+            baseline_per_fold.append(failure_metrics)
+            baseline_lookup[fold.fold_index] = failure_metrics
+            status = _promote_status(status, PARTIAL)
+
         if not candidates:
             fold_failures += 1
             issues.append(_format_issue(
@@ -923,18 +1091,6 @@ def validate_strategy_set(
             ))
             status = _promote_status(status, PARTIAL)
             continue
-
-        try:
-            adapter.baseline_for_fold(fold)
-        except Exception as exc:
-            baseline_failures += 1
-            issues.append(_format_issue(
-                producer_engine, VALIDATION_BASELINE_UNAVAILABLE, run_id,
-                f"fold {fold.fold_index}: baseline_for_fold raised "
-                f"{type(exc).__name__}: {exc}",
-                "verify baseline data availability for this fold",
-            ))
-            status = _promote_status(status, PARTIAL)
 
         for candidate in candidates:
             strategy_labels[candidate.strategy_id] = candidate.strategy_label
@@ -1209,12 +1365,96 @@ def validate_strategy_set(
                 "verify adapter selection and evaluation paths",
             ))
 
+    # Phase 5C-2a-iii: build baseline_aggregate + per-strategy
+    # baseline-delta fields. baseline_lookup is indexed by fold_index;
+    # entries with n_observations == 0 represent failed folds (their
+    # metrics fields are None and they don't contribute to means).
+    finite_baseline_sharpes = [
+        bm.baseline_sharpe for bm in baseline_per_fold
+        if bm.baseline_sharpe is not None
+    ]
+    finite_baseline_returns = [
+        bm.baseline_total_return for bm in baseline_per_fold
+        if bm.baseline_total_return is not None
+    ]
+    n_folds_with_baseline = sum(
+        1 for bm in baseline_per_fold if bm.n_observations > 0
+    )
+    total_baseline_observations = sum(
+        int(bm.n_observations) for bm in baseline_per_fold
+    )
+    baseline_aggregate = {
+        "n_folds_with_baseline": int(n_folds_with_baseline),
+        "mean_baseline_sharpe": (
+            float(np.mean(finite_baseline_sharpes))
+            if finite_baseline_sharpes else None
+        ),
+        "mean_baseline_return": (
+            float(np.mean(finite_baseline_returns))
+            if finite_baseline_returns else None
+        ),
+        "total_baseline_observations": int(total_baseline_observations),
+    }
+
+    # Per-strategy baseline-delta fields (locked 5C-1 §6).
+    for strat in strategies:
+        per_fold_delta_entries: List[dict] = []
+        for fm in strat.get("per_fold_metrics", []):
+            fi = fm.get("fold_index")
+            bm = baseline_lookup.get(fi) if fi is not None else None
+            sharpe_d: Optional[float] = None
+            return_d: Optional[float] = None
+            if bm is not None:
+                strat_sharpe = fm.get("sharpe")
+                if (
+                    strat_sharpe is not None
+                    and bm.baseline_sharpe is not None
+                ):
+                    sharpe_d = float(strat_sharpe) - float(bm.baseline_sharpe)
+                strat_return = fm.get("total_capture")
+                if (
+                    strat_return is not None
+                    and bm.baseline_total_return is not None
+                ):
+                    return_d = (
+                        float(strat_return)
+                        - float(bm.baseline_total_return)
+                    )
+            per_fold_delta_entries.append({
+                "fold_index": int(fi) if fi is not None else None,
+                "sharpe_delta": sharpe_d,
+                "return_delta": return_d,
+            })
+        finite_sharpe_deltas = [
+            d["sharpe_delta"] for d in per_fold_delta_entries
+            if d["sharpe_delta"] is not None
+        ]
+        finite_return_deltas = [
+            d["return_delta"] for d in per_fold_delta_entries
+            if d["return_delta"] is not None
+        ]
+        strat["per_fold_baseline_delta"] = per_fold_delta_entries
+        strat["aggregate_baseline_delta"] = {
+            "mean_sharpe_delta": (
+                float(np.mean(finite_sharpe_deltas))
+                if finite_sharpe_deltas else None
+            ),
+            "mean_return_delta": (
+                float(np.mean(finite_return_deltas))
+                if finite_return_deltas else None
+            ),
+        }
+
     base_contract["validation_status"] = status
     base_contract["n_strategies_tested"] = n_tested
     base_contract["n_strategies_reported"] = n_reported
     base_contract["n_strategies_survived_empirical"] = int(n_strategies_survived_empirical)
     base_contract["issues"] = issues
     base_contract["strategies"] = strategies
+    base_contract["baseline_per_fold"] = [
+        _baseline_metrics_to_dict(bm) for bm in baseline_per_fold
+    ]
+    base_contract["baseline_aggregate"] = baseline_aggregate
     base_contract["survivorship_summary"] = {
         "total_tested": n_tested,
         "total_reported_bh": n_reported,
@@ -1256,6 +1496,9 @@ _MANIFEST_SUMMARY_KEYS: Tuple[str, ...] = (
     "multiple_comparisons_control_method",
     "multiple_comparisons_control_alpha",
     "walk_forward_n_folds",
+    # Phase 5C-2a-iii: baseline summary (locked 5C-1 §6 + §12 amendment).
+    # Source: contract["baseline_aggregate"]["mean_baseline_sharpe"].
+    "mean_baseline_sharpe",
 )
 
 
@@ -1264,24 +1507,27 @@ def _validate_validation_contract_for_io(
 ) -> None:
     """Validate ``validation_contract_v1`` shape for persistence.
 
-    Wraps the in-process ``validate_validation_contract_v1`` assertion
-    helper so the I/O layer raises ``ValueError`` (not
-    ``AssertionError``) on schema gaps. Required keys and the locked
-    status enum are checked.
+    Phase 5C-2a-iii alignment fix: this wrapper now delegates to the
+    in-memory ``validate_validation_contract_v1`` helper and translates
+    any validation exception into ``ValueError`` so the sidecar I/O
+    path keeps its existing ``ValueError`` contract while staying in
+    sync with every shape check enforced in-memory (including the
+    baseline_per_fold / baseline_aggregate structural checks added in
+    Phase 5C-2a-iii). Future shape checks added to
+    ``validate_validation_contract_v1`` propagate to the I/O path
+    automatically.
     """
     if not isinstance(artifact, Mapping):
         raise ValueError("validation contract must be a Mapping")
-    missing = [k for k in _REQUIRED_CONTRACT_KEYS if k not in artifact]
-    if missing:
-        raise ValueError(
-            f"validation_contract_v1 missing required keys: {missing}"
-        )
-    status = artifact["validation_status"]
-    if status not in _VALID_STATUSES:
-        raise ValueError(
-            f"validation_status must be one of "
-            f"{sorted(_VALID_STATUSES)}; got {status!r}"
-        )
+    try:
+        validate_validation_contract_v1(artifact)
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        # Preserve the original message but normalize the exception
+        # type to ValueError for the I/O layer's stable contract.
+        message = str(exc)
+        if not message:
+            message = type(exc).__name__
+        raise ValueError(message) from exc
 
 
 def write_validation_sidecar(
@@ -1348,7 +1594,8 @@ def extract_manifest_summary(
     validation_artifact_path: str,
     validation_artifact_hash: str,
 ) -> dict:
-    """Return the locked 5C-1 §12 manifest summary subset.
+    """Return the locked 5C-1 §12 manifest summary subset (amended in
+    Phase 5C-2a-iii to include ``mean_baseline_sharpe``).
 
     Output keys, in this exact order:
         validation_contract_version,
@@ -1358,13 +1605,30 @@ def extract_manifest_summary(
         multiple_comparisons_control_method,
         multiple_comparisons_control_alpha,
         walk_forward_n_folds,
+        mean_baseline_sharpe,
         validation_artifact_path,
         validation_artifact_hash.
 
     Missing contract fields raise ``KeyError``; no silent defaults.
+    ``mean_baseline_sharpe`` is read from
+    ``contract["baseline_aggregate"]["mean_baseline_sharpe"]``.
     """
     summary: Dict[str, Any] = {}
     for key in _MANIFEST_SUMMARY_KEYS:
+        if key == "mean_baseline_sharpe":
+            if "baseline_aggregate" not in contract:
+                raise KeyError(
+                    "validation contract missing required summary key: "
+                    "'baseline_aggregate' (Phase 5C-2a-iii)"
+                )
+            agg = contract["baseline_aggregate"]
+            if not isinstance(agg, Mapping) or "mean_baseline_sharpe" not in agg:
+                raise KeyError(
+                    "validation contract baseline_aggregate missing "
+                    "'mean_baseline_sharpe'"
+                )
+            summary["mean_baseline_sharpe"] = agg["mean_baseline_sharpe"]
+            continue
         if key not in contract:
             raise KeyError(
                 f"validation contract missing required summary key: {key!r}"

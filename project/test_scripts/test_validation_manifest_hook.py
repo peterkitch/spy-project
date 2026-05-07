@@ -77,6 +77,24 @@ def _minimal_contract():
             "did_not_survive_insufficient_history": 0,
         },
         "issues": [],
+        # Phase 5C-2a-iii contract amendment.
+        "baseline_per_fold": [
+            {
+                "fold_index": 0,
+                "n_observations": 252,
+                "baseline_sharpe": 0.7,
+                "baseline_total_return": 8.2,
+                "baseline_mean_return": 0.033,
+                "baseline_std": 1.1,
+                "issues": [],
+            },
+        ],
+        "baseline_aggregate": {
+            "n_folds_with_baseline": 1,
+            "mean_baseline_sharpe": 0.7,
+            "mean_baseline_return": 8.2,
+            "total_baseline_observations": 252,
+        },
         "strategies": [
             {
                 "strategy_id": "s0",
@@ -111,19 +129,24 @@ def test_write_validation_sidecar_basic(tmp_path):
     assert parsed["validation_status"] == "valid"
     assert parsed["run_id"] == "run-x"
     # Pretty JSON: indent=2 produces newlines between top-level entries.
-    # sort_keys=True puts alphabetical order: 'app_surface' precedes
-    # 'baseline_method' precedes 'borderline_tolerance_multiplier'.
+    # sort_keys=True puts alphabetical order; after the Phase 5C-2a-iii
+    # baseline_per_fold + baseline_aggregate additions:
+    # 'app_surface' precedes 'baseline_aggregate' precedes
+    # 'baseline_method' precedes 'baseline_per_fold' precedes
+    # 'borderline_tolerance_multiplier'.
     lines = raw.splitlines()
     top_order = [
         line.split('"')[1]
         for line in lines
         if line.startswith('  "')
     ]
-    # Just verify the first three sorted top-level keys to pin the
+    # Verify the first five sorted top-level keys to pin the
     # sort_keys=True contract without over-asserting the full layout.
-    assert top_order[0] == "app_surface", top_order[:5]
-    assert top_order[1] == "baseline_method", top_order[:5]
-    assert top_order[2] == "borderline_tolerance_multiplier", top_order[:5]
+    assert top_order[0] == "app_surface", top_order[:6]
+    assert top_order[1] == "baseline_aggregate", top_order[:6]
+    assert top_order[2] == "baseline_method", top_order[:6]
+    assert top_order[3] == "baseline_per_fold", top_order[:6]
+    assert top_order[4] == "borderline_tolerance_multiplier", top_order[:6]
 
 
 def test_write_validation_sidecar_atomic_rename(tmp_path, monkeypatch):
@@ -161,6 +184,41 @@ def test_write_validation_sidecar_validates_contract_schema(tmp_path):
         ve.write_validation_sidecar(contract, out_dir)
     assert "validation_status" in str(exc_info.value)
     # No file written.
+    assert not (out_dir / "validation.json").exists()
+
+
+def test_write_validation_sidecar_rejects_wrong_shape_baseline_per_fold(tmp_path):
+    """Phase 5C-2a-iii sidecar I/O alignment fix: baseline_per_fold
+    must be a list. A non-list value MUST raise ValueError with the
+    field name in the message and MUST NOT write validation.json.
+    """
+    contract = _minimal_contract()
+    contract["baseline_per_fold"] = {"bad": "shape"}  # dict, not list
+    out_dir = tmp_path / "run-bad-baseline-per-fold"
+    with pytest.raises(ValueError) as exc_info:
+        ve.write_validation_sidecar(contract, out_dir)
+    assert "baseline_per_fold" in str(exc_info.value), (
+        "ValueError message must name baseline_per_fold; got "
+        + repr(str(exc_info.value))
+    )
+    assert not (out_dir / "validation.json").exists()
+
+
+def test_write_validation_sidecar_rejects_wrong_shape_baseline_aggregate(tmp_path):
+    """Phase 5C-2a-iii sidecar I/O alignment fix: baseline_aggregate
+    must be a Mapping. A non-Mapping value (e.g., list) MUST raise
+    ValueError with the field name in the message and MUST NOT write
+    validation.json.
+    """
+    contract = _minimal_contract()
+    contract["baseline_aggregate"] = ["bad", "shape"]  # list, not Mapping
+    out_dir = tmp_path / "run-bad-baseline-aggregate"
+    with pytest.raises(ValueError) as exc_info:
+        ve.write_validation_sidecar(contract, out_dir)
+    assert "baseline_aggregate" in str(exc_info.value), (
+        "ValueError message must name baseline_aggregate; got "
+        + repr(str(exc_info.value))
+    )
     assert not (out_dir / "validation.json").exists()
 
 
@@ -213,6 +271,9 @@ def test_extract_manifest_summary_includes_locked_keys():
         "multiple_comparisons_control_method",
         "multiple_comparisons_control_alpha",
         "walk_forward_n_folds",
+        # Phase 5C-2a-iii: mean_baseline_sharpe sourced from
+        # contract["baseline_aggregate"]["mean_baseline_sharpe"].
+        "mean_baseline_sharpe",
         "validation_artifact_path",
         "validation_artifact_hash",
     ]
@@ -270,6 +331,9 @@ def _summary_payload():
         "multiple_comparisons_control_method": "benjamini_hochberg",
         "multiple_comparisons_control_alpha": 0.05,
         "walk_forward_n_folds": 5,
+        # Phase 5C-2a-iii: mean_baseline_sharpe is now part of the
+        # locked manifest summary key set.
+        "mean_baseline_sharpe": 0.7,
         "validation_artifact_path": "project/output/validation/run-x/validation.json",
         "validation_artifact_hash": "deadbeef" * 8,
     }
@@ -343,3 +407,65 @@ def test_generate_run_id_format():
     assert rid_a != rid_b, (
         "two consecutive run_ids must differ (uuid suffix)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2a-iii: mean_baseline_sharpe in manifest summary
+# ---------------------------------------------------------------------------
+
+
+def test_extract_manifest_summary_includes_mean_baseline_sharpe():
+    contract = _minimal_contract()
+    # Override baseline_aggregate.mean_baseline_sharpe to a known
+    # non-default value so we can assert it propagated.
+    contract["baseline_aggregate"] = {
+        "n_folds_with_baseline": 5,
+        "mean_baseline_sharpe": 0.42,
+        "mean_baseline_return": 4.5,
+        "total_baseline_observations": 1260,
+    }
+    summary = ve.extract_manifest_summary(
+        contract,
+        validation_artifact_path="project/output/validation/run-x/validation.json",
+        validation_artifact_hash="cafef00d",
+    )
+    assert "mean_baseline_sharpe" in summary
+    assert summary["mean_baseline_sharpe"] == 0.42
+    # Order-correctness pin: mean_baseline_sharpe sits between
+    # walk_forward_n_folds and validation_artifact_path in the locked
+    # 10-key emission order.
+    keys = list(summary.keys())
+    idx = keys.index("mean_baseline_sharpe")
+    assert keys[idx - 1] == "walk_forward_n_folds"
+    assert keys[idx + 1] == "validation_artifact_path"
+
+
+def test_build_output_manifest_includes_mean_baseline_sharpe(monkeypatch):
+    _stable_manifest_helpers(monkeypatch)
+    summary = _summary_payload()
+    summary["mean_baseline_sharpe"] = 0.55
+    manifest = pm.build_output_manifest(
+        artifact_type="rankings",
+        producer_engine="test_engine",
+        engine_version="0.0.1",
+        validation_summary=summary,
+    )
+    assert "mean_baseline_sharpe" in manifest, (
+        "build_output_manifest must include mean_baseline_sharpe when "
+        "validation_summary supplies it"
+    )
+    assert manifest["mean_baseline_sharpe"] == 0.55
+
+
+def test_build_output_manifest_validation_summary_missing_mean_baseline_sharpe(monkeypatch):
+    _stable_manifest_helpers(monkeypatch)
+    summary = _summary_payload()
+    summary.pop("mean_baseline_sharpe")
+    with pytest.raises(ValueError) as exc_info:
+        pm.build_output_manifest(
+            artifact_type="rankings",
+            producer_engine="test_engine",
+            engine_version="0.0.1",
+            validation_summary=summary,
+        )
+    assert "mean_baseline_sharpe" in str(exc_info.value)
