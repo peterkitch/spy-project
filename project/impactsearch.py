@@ -18,6 +18,30 @@ from provenance_manifest import (
     inspect_preexisting_xlsx_manifest as _inspect_preexisting_xlsx_manifest,
     SIDECAR_SUFFIX as _SIDECAR_SUFFIX,
 )
+# Phase 5C-2b: validation engine integration (locked 5C-1 + 5C-2a-i/ii/iii).
+from validation_engine import (
+    FoldContext,
+    StrategyCandidate,
+    StrategyFoldResult,
+    BaselineFoldMetrics,
+    validate_strategy_set,
+    write_validation_sidecar,
+    compute_validation_artifact_hash,
+    extract_manifest_summary,
+    generate_run_id,
+    slice_to_cutoff,
+    slice_between,
+    DEFAULT_ALPHA,
+    DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+    DEFAULT_INITIAL_TRAIN_DAYS,
+    DEFAULT_TEST_WINDOW_DAYS,
+    DEFAULT_STEP_DAYS,
+    DEFAULT_OUTCOME_WINDOWS,
+    VALIDATION_OUTPUT_BASE_DIR,
+    VALIDATION_CONTRACT_VERSION,
+    VALIDATION_METHODOLOGY_VERSION,
+)
+from typing import Any, Mapping, Optional, Sequence
 import random
 import warnings
 
@@ -41,7 +65,7 @@ import yfinance as yf
 from tqdm import tqdm
 import pickle
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 import threading
@@ -2464,12 +2488,29 @@ def _metrics_from_ccc(ccc_series, active_pairs=None):
     }
 
 
-def export_results_to_excel(output_filename, metrics_list, *, rejection_out=None):
+def export_results_to_excel(
+    output_filename, metrics_list, *, rejection_out=None,
+    validation_summary: Optional[Mapping[str, Any]] = None,
+    per_strategy_validation: Optional[Mapping[str, Mapping[str, Any]]] = None,
+):
     """Phase 5B Item 9: optional ``rejection_out`` dict captures
     structured failure reason ONLY on sidecar manifest write failure.
     Workbook write behavior is unchanged; XLSX/sidecar schemas
     unchanged; the warning-only fallback is preserved.
+
+    Phase 5C-2b: optional ``validation_summary`` and
+    ``per_strategy_validation`` enable durable validation-artifact
+    columns appended to the workbook AFTER existing columns, plus
+    validation-summary key copy into the XLSX provenance manifest.
+    Both default to None for byte-identical pre-5C-2b behavior.
     """
+    # Phase 5C-2b amendment: locked validation manifest summary must
+    # be schema-valid BEFORE we write the workbook. This prevents a
+    # workbook landing on disk while the locked validation contract
+    # silently lacks required keys (durable-tier fail-closed gate).
+    if validation_summary is not None:
+        _validate_impactsearch_validation_summary(validation_summary)
+
     # Ensure output directory exists
     output_dir = os.path.dirname(output_filename)
     if output_dir:
@@ -2515,6 +2556,56 @@ def export_results_to_excel(output_filename, metrics_list, *, rejection_out=None
             d['t-Statistic'] = 'N/A'
         return d
 
+    # Phase 5C-2b: append-only validation columns. Column order MUST
+    # come AFTER existing columns; this list is consulted only when
+    # validation_summary is provided (locked durable-tier contract).
+    _VALIDATION_COLUMNS: list = [
+        "Validation Status",
+        "BH q-Value",
+        "Bonferroni p-Value",
+        "Empirical p-Value",
+        "Bootstrap Sharpe CI Lower",
+        "Bootstrap Sharpe CI Upper",
+        "Empirical Validation Status",
+        "N Strategies Tested",
+        "N Strategies Reported",
+        "Mean Baseline Sharpe",
+        "Mean Baseline Return",
+        "Mean Sharpe Delta vs Baseline",
+        "Mean Return Delta vs Baseline",
+    ]
+    _validation_active = (
+        validation_summary is not None or per_strategy_validation is not None
+    )
+
+    def _row_validation_payload(row_dict):
+        if not _validation_active:
+            return {}
+        primary = str(row_dict.get("Primary Ticker", "") or "").strip().upper()
+        secondary = str(row_dict.get("Secondary Ticker", "") or "").strip().upper()
+        if not primary or not secondary:
+            return {}
+        sid = _impactsearch_strategy_id(primary, secondary)
+        if isinstance(per_strategy_validation, Mapping):
+            payload = per_strategy_validation.get(sid)
+            if payload:
+                return {
+                    "Validation Status": payload.get("validation_status"),
+                    "BH q-Value": payload.get("bh_q_value"),
+                    "Bonferroni p-Value": payload.get("bonferroni_p_value"),
+                    "Empirical p-Value": payload.get("empirical_p_value"),
+                    "Bootstrap Sharpe CI Lower": payload.get("bootstrap_sharpe_ci_lower"),
+                    "Bootstrap Sharpe CI Upper": payload.get("bootstrap_sharpe_ci_upper"),
+                    "Empirical Validation Status": payload.get("empirical_validation_status"),
+                    "N Strategies Tested": payload.get("n_strategies_tested"),
+                    "N Strategies Reported": payload.get("n_strategies_reported"),
+                    "Mean Baseline Sharpe": payload.get("mean_baseline_sharpe"),
+                    "Mean Baseline Return": payload.get("mean_baseline_return"),
+                    "Mean Sharpe Delta vs Baseline": payload.get("mean_sharpe_delta"),
+                    "Mean Return Delta vs Baseline": payload.get("mean_return_delta"),
+                }
+        return {}
+
     normalized_rows = []
     for m in metrics_list:
         m = _normalize_keys(m)
@@ -2525,6 +2616,12 @@ def export_results_to_excel(output_filename, metrics_list, *, rejection_out=None
         for key, value in m.items():
             if key not in desired_order:
                 row[key] = value
+        # Phase 5C-2b: populate validation columns (append-only).
+        if _validation_active:
+            payload = _row_validation_payload(m)
+            for col in _VALIDATION_COLUMNS:
+                if col not in row:
+                    row[col] = payload.get(col, None)
         normalized_rows.append(row)
     
     # Phase 3B-2B: classify any preexisting workbook+sidecar BEFORE the
@@ -2612,10 +2709,31 @@ def export_results_to_excel(output_filename, metrics_list, *, rejection_out=None
                 "key_priority": "Primary Ticker > Resolved/Fetched",
             },
         )
+        # Phase 5C-2b: inject locked validation-summary keys into the
+        # XLSX manifest dict AFTER _build_xlsx_output_manifest returns.
+        # build_xlsx_output_manifest itself is unchanged (locked
+        # constraint); injection happens at this call site only.
+        if validation_summary is not None:
+            for key in _LOCKED_VALIDATION_SUMMARY_KEYS:
+                if key not in validation_summary:
+                    raise ValueError(
+                        f"validation_summary missing required key: {key!r}"
+                    )
+                manifest[key] = validation_summary[key]
         sidecar_path = output_filename + _SIDECAR_SUFFIX
         with open(sidecar_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, sort_keys=True, indent=2)
     except Exception as _xlsx_manifest_exc:
+        # Phase 5C-2b amendment: when validation_summary is provided,
+        # any manifest construction / validation-injection / sidecar
+        # write failure MUST propagate. Durable tier requires the
+        # validation manifest fields; silently logging-and-swallowing
+        # would let a workbook land without locked validation
+        # participation. For the legacy non-validation path
+        # (validation_summary is None), keep the existing
+        # warning-and-rejection_out behavior unchanged.
+        if validation_summary is not None:
+            raise
         logger.warning(
             f"Failed to write ImpactSearch XLSX provenance sidecar: "
             f"{_xlsx_manifest_exc}"
@@ -2672,7 +2790,7 @@ def _pick_best_library(requested_sym, fetched_sym, df):
 
 def _impactsearch_primary_signal_series_for_secondary(
     prim_ticker, sec_df, sma_cache=None, analysis_clock=None,
-    *, rejection_out=None,
+    *, rejection_out=None, data_available_through=None,
 ):
     """Phase 5B-MP-2c: produce a secondary-calendar-aligned signal series
     for one primary, plus the metadata that batch-mode metrics rows
@@ -2685,10 +2803,37 @@ def _impactsearch_primary_signal_series_for_secondary(
     is now a thin wrapper that calls this helper and then runs
     calculate_metrics_from_signals; aggregate-mode worker reuses this
     helper to build the per-primary signal columns of sig_df.
+
+    Phase 5C-2b: optional ``data_available_through`` enforces a fold
+    evaluation cutoff. When provided, sec_df is sliced to rows
+    ``<= data_available_through`` before any signal work; the FASTPATH
+    sig_series is also sliced; the SLOW PATH primary df is sliced
+    after fetch/coerce/dedupe/session-guard/parity. None preserves
+    pre-5C-2b behavior byte-identical.
     """
     requested_ticker = prim_ticker  # Keep original for transparency
     vendor_symbol, _ = resolve_symbol(prim_ticker)
     prim_ticker = vendor_symbol
+
+    # Phase 5C-2b: enforce fold evaluation cutoff on sec_df at function
+    # entry so all downstream FASTPATH / SLOW PATH alignment respects
+    # the cutoff. None preserves existing behavior.
+    if data_available_through is not None:
+        try:
+            sec_df = slice_to_cutoff(sec_df, data_available_through).copy()
+        except Exception:
+            sec_df = sec_df.copy()
+        if sec_df is None or sec_df.empty:
+            _populate_rejection(
+                rejection_out, "process", PROCESS_INSUFFICIENT_DATA,
+                ticker=prim_ticker,
+                message=(
+                    f"Secondary frame is empty at cutoff "
+                    f"{data_available_through!s} for {prim_ticker}."
+                ),
+                action="extend the secondary history or relax the fold cutoff.",
+            )
+            return None, dict(rejection_out) if isinstance(rejection_out, dict) else {}
 
     # FAST-PATH: Skip Yahoo Finance call if library is fresh and compatible
     global FASTPATH_STATS
@@ -2698,6 +2843,14 @@ def _impactsearch_primary_signal_series_for_secondary(
         sig_series, fp_reason = get_primary_signals_fast(prim_ticker, sec_df.index)
         if sig_series is not None:
             logger.info(f"Processing {prim_ticker}... [FASTPATH: {fp_reason}]")
+
+            # Phase 5C-2b: enforce cutoff on FASTPATH sig_series before
+            # grace-window alignment so no future signals leak.
+            if data_available_through is not None:
+                try:
+                    sig_series = slice_to_cutoff(sig_series, data_available_through)
+                except Exception:
+                    pass
 
             # Align signals to secondary's index with carry-forward inside grace window
             grace_days = int(os.environ.get('IMPACT_CALENDAR_GRACE_DAYS', '10') or 10)
@@ -2792,10 +2945,32 @@ def _impactsearch_primary_signal_series_for_secondary(
     if not is_session_complete(df, ttype, reference_now=analysis_clock, ticker=fetched_symbol):
         df = df.iloc[:-1]
         logger.debug(f"Dropped incomplete session for {fetched_symbol}. Days now: {len(df)}")
-    
+
     # Apply strict parity transformations if enabled
     df = apply_strict_parity(df)
-    
+
+    # Phase 5C-2b: enforce fold evaluation cutoff on the primary df
+    # AFTER fetch/coerce/dedupe/session-guard/parity so library
+    # acceptance and SMA derivation operate on the in-fold horizon
+    # only. Global max-period loader behavior is unchanged.
+    if data_available_through is not None:
+        try:
+            df = slice_to_cutoff(df, data_available_through)
+        except Exception:
+            pass
+        if df is None or df.empty or len(df) < 2:
+            _populate_rejection(
+                rejection_out, "process", PROCESS_INSUFFICIENT_DATA,
+                ticker=prim_ticker,
+                message=(
+                    f"Primary frame for {prim_ticker} has fewer than 2 "
+                    f"bars at cutoff {data_available_through!s}."
+                ),
+                action="extend the primary history or relax the fold cutoff.",
+                details={"num_days": int(len(df) if df is not None else 0)},
+            )
+            return None, dict(rejection_out) if isinstance(rejection_out, dict) else {}
+
     # Decide which library (requested vs resolved) fits best
     signal_data, library_ticker, preselected_acc = _pick_best_library(prim_ticker, fetched_symbol, df)
     
@@ -3566,6 +3741,8 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
 def process_primary_tickers_aggregate_mode(
     secondary_ticker, primary_tickers, *,
     use_multiprocessing=False, mark_complete=True, rejection_out=None,
+    run_validation: bool = False,
+    validation_options: Optional[Mapping[str, Any]] = None,
 ):
     """Phase 5B-MP-2c canonical aggregate-mode worker for ImpactSearch.
 
@@ -3881,13 +4058,52 @@ def process_primary_tickers_aggregate_mode(
         except Exception:
             pass
 
-    return {
+    result = {
         "row": row,
         "aggregate_signal": aggregate_signal,
         "status": status,
         "issues": issues,
         "formatted_issues": formatted_issues,
     }
+
+    # Phase 5C-2b: optional in-memory aggregate validation. Default
+    # run_validation=False preserves existing direct-call behavior and
+    # 5B-MP-2c tests byte-identically. When enabled (interactive UI
+    # tier), run validation in-memory only — never write sidecar,
+    # never call export_results_to_excel / ReportGenerator /
+    # AnalysisTemplates.
+    if run_validation:
+        try:
+            agg_contract, agg_ui_summary, agg_per_strategy = (
+                _run_impactsearch_aggregate_validation_in_memory(
+                    secondary_ticker_resolved,
+                    requested_members,
+                    options=validation_options,
+                )
+            )
+            result["validation_contract"] = agg_contract
+            result["validation_summary"] = agg_ui_summary
+            result["per_strategy_validation"] = agg_per_strategy
+            # Surface a few key validation columns into the aggregate
+            # row so operators see them in the UI table (no XLSX
+            # export in aggregate mode per locked §10).
+            for sid, payload in (agg_per_strategy or {}).items():
+                row["Validation Status"] = payload.get("validation_status")
+                row["BH q-Value"] = payload.get("bh_q_value")
+                row["Empirical p-Value"] = payload.get("empirical_p_value")
+                row["Mean Baseline Sharpe"] = payload.get("mean_baseline_sharpe")
+                row["Mean Sharpe Delta vs Baseline"] = payload.get("mean_sharpe_delta")
+                break
+        except Exception as exc:
+            logger.warning(
+                "[5C-2b] aggregate-mode validation skipped: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            result["validation_contract"] = None
+            result["validation_summary"] = None
+            result["per_strategy_validation"] = None
+
+    return result
 
 
 # Create Dash app
@@ -4361,7 +4577,12 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
         # Phase 5B Item 9: bounded list of [IMPACTSEARCH:*] error
         # strings; populated by per-primary worker failures and
         # secondary fetch/coerce failures.
-        'recent_errors': []
+        'recent_errors': [],
+        # Phase 5C-2b: validation tier surfacing (locked 5C-1 §3
+        # threshold contract: durable / interactive / exploratory).
+        'validation_tier': None,
+        'validation_summaries': [],
+        'validation_artifact_paths': [],
     }
     
     # Start processing in a separate thread (sequential over secondary tickers)
@@ -4381,15 +4602,25 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
                 # Skip XLSX/PDF/template options regardless of whether
                 # they were checked in the analysis-options panel.
                 if mode == "aggregate":
+                    # Phase 5C-2b: interactive tier — run validation
+                    # in memory; never write sidecar in this mode.
+                    with progress_lock:
+                        progress_tracker['validation_tier'] = 'interactive'
                     agg_result = process_primary_tickers_aggregate_mode(
                         sec, primary_tickers,
                         use_multiprocessing=use_multiprocessing,
                         mark_complete=False,
+                        run_validation=True,
                     )
                     if agg_result and agg_result.get("row"):
                         with progress_lock:
                             progress_tracker['results'].append(agg_result["row"])
                             progress_tracker['results_timestamp'] = time.time()
+                            agg_summary = agg_result.get("validation_summary")
+                            if agg_summary:
+                                progress_tracker['validation_summaries'].append(
+                                    agg_summary,
+                                )
                     else:
                         with progress_lock:
                             progress_tracker['tickers_not_found'].append(sec)
@@ -4406,10 +4637,71 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
                     continue
 
                 if results and export_excel:
+                    # Phase 5C-2b: batch + export = durable tier.
+                    # Validation MUST run and persist validation.json
+                    # before/alongside the XLSX export — fail-closed
+                    # via _prepare_impactsearch_durable_validation_for_export.
+                    with progress_lock:
+                        progress_tracker['validation_tier'] = (
+                            _determine_impactsearch_validation_tier(
+                                mode=mode, analysis_options=analysis_options,
+                            )
+                        )
                     def export_excel_async(_sec=sec, _res=results, _existed=file_existed_before_processing):
                         try:
+                            try:
+                                _contract, validation_summary, per_strategy_validation, sidecar_path = (
+                                    _prepare_impactsearch_durable_validation_for_export(
+                                        _sec, primary_tickers,
+                                    )
+                                )
+                            except Exception as prepare_exc:
+                                # Even the failed-artifact write raised.
+                                # Locked durable contract: do NOT export
+                                # an XLSX without a validation artifact.
+                                logger.error(
+                                    "[5C-2b] durable validation could not "
+                                    "produce a validation artifact for "
+                                    f"{_sec}; aborting XLSX export. "
+                                    f"{type(prepare_exc).__name__}: "
+                                    f"{prepare_exc}"
+                                )
+                                _record_recent_error(
+                                    "[IMPACTSEARCH:validation_failed] "
+                                    f"{_sec}: durable validation artifact "
+                                    f"could not be written "
+                                    f"({type(prepare_exc).__name__}: "
+                                    f"{prepare_exc}). XLSX export "
+                                    "aborted."
+                                )
+                                return
+                            with progress_lock:
+                                progress_tracker['validation_artifact_paths'].append(
+                                    str(sidecar_path),
+                                )
+                                progress_tracker['validation_summaries'].append(
+                                    _impactsearch_validation_ui_summary(
+                                        _contract, validation_summary,
+                                    ),
+                                )
+                            if (validation_summary or {}).get(
+                                "validation_status",
+                            ) == "failed":
+                                _record_recent_error(
+                                    "[IMPACTSEARCH:validation_failed] "
+                                    f"{_sec}: durable validation status="
+                                    "failed; XLSX exported with failed "
+                                    "validation artifact."
+                                )
                             out = f"output/impactsearch/{_sec}_analysis.xlsx"
-                            export_results_to_excel(out, _res)
+                            # Locked: export_results_to_excel is NEVER
+                            # called with validation_summary=None for
+                            # the durable tier.
+                            export_results_to_excel(
+                                out, _res,
+                                validation_summary=validation_summary,
+                                per_strategy_validation=per_strategy_validation,
+                            )
                             with progress_lock:
                                 progress_tracker['excel_path'] = out
                                 if _existed:
@@ -4422,6 +4714,16 @@ def start_processing(n_clicks, primary_tickers_input, secondary_ticker, analysis
                         except Exception as e:
                             logger.error(f"Excel export failed: {e}")
                     threading.Thread(target=export_excel_async, daemon=True).start()
+                elif results and not export_excel:
+                    # Phase 5C-2b: batch without export = exploratory.
+                    # No validation run; UI must surface the
+                    # not-validated label.
+                    with progress_lock:
+                        progress_tracker['validation_tier'] = (
+                            _determine_impactsearch_validation_tier(
+                                mode=mode, analysis_options=analysis_options,
+                            )
+                        )
                 if results and generate_pdf:
                     df = pd.DataFrame(results)
                     ReportGenerator.generate_pdf_report(df, sec)
@@ -4654,6 +4956,39 @@ def update_progress(n_intervals, processing_state):
                            'marginLeft': '20px'},
                 )
             )
+
+        # Phase 5C-2b: surface validation lines in the completion
+        # message. Reads progress_tracker fields populated by the
+        # durable / interactive / exploratory tier branches and
+        # delegates formatting to the pure helper.
+        validation_summaries = (
+            progress_tracker.get('validation_summaries') or []
+        )
+        validation_tier = progress_tracker.get('validation_tier')
+        validation_lines = _impactsearch_validation_completion_lines(
+            validation_summaries, validation_tier,
+        )
+        if validation_lines:
+            completion_message.append(
+                html.H6(
+                    "Validation",
+                    style={'color': '#00ff41',
+                           'marginTop': '15px',
+                           'marginBottom': '5px'},
+                )
+            )
+            for line in validation_lines:
+                completion_message.append(
+                    html.P(
+                        line,
+                        style={'color': '#ccc',
+                               'fontSize': '12px',
+                               'fontFamily': 'monospace',
+                               'marginLeft': '20px',
+                               'marginTop': '0px',
+                               'marginBottom': '0px'},
+                    )
+                )
 
         completion_message.append(
             dbc.Progress(value=100, striped=False, style={'height': '30px', 'marginTop': '20px'}, color='success')
@@ -5157,6 +5492,918 @@ app.index_string = '''
     </body>
 </html>
 '''
+
+# =============================================================================
+# Phase 5C-2b: validation integration
+# =============================================================================
+#
+# Per-app validation adapters and run helpers wiring impactsearch into the
+# shared validation_engine. Tier-based execution (durable batch XLSX,
+# interactive aggregate UI, exploratory unsaved batch) is enforced by the
+# start_processing callback below, not by this section. This section only
+# provides the building blocks.
+
+
+# Phase 5C-2b amendment: locked validation manifest summary key list.
+# Used by both the workbook-side schema gate (export_results_to_excel)
+# and the durable-tier prepare helper to enforce the locked 5C-1 §12
+# manifest contract uniformly.
+_LOCKED_VALIDATION_SUMMARY_KEYS = (
+    "validation_contract_version",
+    "validation_status",
+    "n_strategies_tested",
+    "n_strategies_reported",
+    "multiple_comparisons_control_method",
+    "multiple_comparisons_control_alpha",
+    "walk_forward_n_folds",
+    "mean_baseline_sharpe",
+    "validation_artifact_path",
+    "validation_artifact_hash",
+)
+
+
+def _validate_impactsearch_validation_summary(
+    validation_summary: Mapping[str, Any],
+) -> None:
+    """Raise ValueError if the locked 5C validation manifest summary
+    is incomplete. Used at the workbook-write gate so durable runs
+    fail before producing an XLSX without locked validation fields.
+    """
+    for key in _LOCKED_VALIDATION_SUMMARY_KEYS:
+        if key not in validation_summary:
+            raise ValueError(
+                f"validation_summary missing required key: {key!r}"
+            )
+
+
+def _determine_impactsearch_validation_tier(
+    *,
+    mode: str,
+    analysis_options: Sequence[str],
+) -> str:
+    """Phase 5C-2b production tier helper. Used by start_processing
+    AND by the tier-logic regression test. Locked 5C-1 §3:
+
+      * mode == "aggregate"                            -> "interactive"
+      * mode == "batch" + "export_excel" in options    -> "durable"
+      * mode == "batch" + "export_excel" NOT in options -> "exploratory"
+    """
+    options = set(analysis_options or [])
+    if mode == "aggregate":
+        return "interactive"
+    if "export_excel" in options:
+        return "durable"
+    return "exploratory"
+
+
+def _build_failed_validation_contract(
+    *,
+    run_id: str,
+    producer_engine: str,
+    app_surface: str,
+    secondary_ticker: str,
+    primary_tickers: Sequence[str],
+    failure_reason: str,
+    exception_repr: str,
+) -> dict:
+    """Construct a minimal ``validation_contract_v1`` artifact with
+    ``validation_status='failed'``. Used when durable ImpactSearch
+    validation raises before a normal contract can be completed; the
+    failed contract MUST still satisfy the locked
+    ``write_validation_sidecar`` schema check.
+    """
+    formatted = (
+        f"[IMPACTSEARCH:validation_failed] run {run_id}: "
+        f"{failure_reason} ({exception_repr})"
+    )
+    return {
+        "validation_contract_version": VALIDATION_CONTRACT_VERSION,
+        "validation_methodology_version": VALIDATION_METHODOLOGY_VERSION,
+        "validation_status": "failed",
+        "run_id": run_id,
+        "producer_engine": producer_engine,
+        "app_surface": app_surface,
+        "evaluation_time": datetime.now(timezone.utc).isoformat(),
+        "data_available_through": None,
+        "in_sample_window_start": None,
+        "in_sample_window_end": None,
+        "oos_window_start": None,
+        "oos_window_end": None,
+        "walk_forward_n_folds": None,
+        "outcome_windows": list(DEFAULT_OUTCOME_WINDOWS),
+        "baseline_method": "same_ticker_buy_and_hold",
+        "n_strategies_tested": 0,
+        "n_strategies_reported": 0,
+        "n_strategies_survived_empirical": 0,
+        "multiple_comparisons_control_method": "benjamini_hochberg",
+        "multiple_comparisons_control_alpha": float(DEFAULT_ALPHA),
+        "multiple_comparisons_supplementary": "bonferroni",
+        "n_permutations": 0,
+        "n_bootstrap_samples": 0,
+        "borderline_tolerance_multiplier": float(
+            DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+        ),
+        "baseline_per_fold": [],
+        "baseline_aggregate": {
+            "n_folds_with_baseline": 0,
+            "mean_baseline_sharpe": None,
+            "mean_baseline_return": None,
+            "total_baseline_observations": 0,
+        },
+        "survivorship_summary": {
+            "total_tested": 0,
+            "total_reported_bh": 0,
+            "total_empirical_validated": 0,
+            "total_empirical_not_run": 0,
+            "did_not_survive_bh": 0,
+            "did_not_survive_empirical": 0,
+            "did_not_survive_no_triggers": 0,
+            "did_not_survive_insufficient_history": 0,
+        },
+        "issues": [formatted],
+        "strategies": [],
+    }
+
+
+def _impactsearch_strategy_id(primary_ticker: str, secondary_ticker: str) -> str:
+    """Stable per-app strategy id used by adapters AND XLSX row mapping.
+    Shape: ``{PRIMARY}__{SECONDARY}`` (uppercase, stripped).
+    """
+    p = str(primary_ticker or "").strip().upper()
+    s = str(secondary_ticker or "").strip().upper()
+    return f"{p}__{s}"
+
+
+def _load_secondary_frame_for_validation(
+    secondary_ticker: str,
+    *,
+    analysis_clock=None,
+):
+    """Wrap fetch_data_raw + _coerce_to_close_frame + dedupe/sort +
+    session guard + apply_strict_parity into a single helper. Returns
+    a DataFrame with a DatetimeIndex and raw ``Close``, or None when
+    data is unavailable.
+    """
+    rejection: dict = {}
+    try:
+        df_raw, fetched_symbol = fetch_data_raw(
+            secondary_ticker, reference_now=analysis_clock,
+            rejection_out=rejection,
+        )
+    except Exception:
+        return None
+    if df_raw is None or df_raw.empty:
+        return None
+    coerce_rej: dict = {}
+    df = _coerce_to_close_frame(
+        df_raw, preferred="Close",
+        rejection_out=coerce_rej, ticker=secondary_ticker,
+    )
+    if df is None or df.empty:
+        return None
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    if df.empty:
+        return None
+    try:
+        ttype = detect_ticker_type(fetched_symbol)
+        if not is_session_complete(
+            df, ttype, reference_now=analysis_clock, ticker=fetched_symbol,
+        ):
+            df = df.iloc[:-1]
+    except Exception:
+        pass
+    try:
+        df = apply_strict_parity(df)
+    except Exception:
+        pass
+    return df
+
+
+def _impactsearch_capture_series_from_signals(
+    signals,
+    sec_df,
+    context: FoldContext,
+):
+    """Build daily_capture / trigger_mask / signal_state /
+    permutation_return_pool over the fold's evaluation window.
+
+    Mirrors calculate_metrics_from_signals semantics:
+      * raw Close only (NO Adj Close);
+      * pct_change().fillna(0.0) * 100.0 secondary daily returns
+        (NO shift(-1) — forward-looking returns are forbidden in the
+        scoring path);
+      * Buy capture = +ret pp; Short capture = -ret pp; None = 0.0;
+      * trigger_mask = Buy or Short.
+
+    Returns ``(daily_capture, trigger_mask, signal_state,
+    permutation_return_pool)`` as four pd.Series indexed by the fold
+    evaluation window.
+    """
+    sec_window = slice_between(sec_df, context.test_start, context.test_end)
+    if sec_window is None or sec_window.empty:
+        empty_idx = pd.DatetimeIndex([])
+        return (
+            pd.Series([], index=empty_idx, dtype=float),
+            pd.Series([], index=empty_idx, dtype=bool),
+            pd.Series([], index=empty_idx, dtype=object),
+            pd.Series([], index=empty_idx, dtype=float),
+        )
+    eval_idx = sec_window.index
+    aligned = pd.Series(signals).reindex(eval_idx).fillna("None").astype(str).str.strip()
+    prices = sec_window["Close"].astype(float)
+    daily_returns = prices.pct_change().fillna(0.0) * 100.0  # percent points
+    buy_mask = aligned.eq("Buy")
+    short_mask = aligned.eq("Short")
+    trigger_mask = pd.Series(
+        (buy_mask | short_mask).to_numpy(bool), index=eval_idx,
+    )
+    daily_capture = pd.Series(0.0, index=eval_idx, dtype=float)
+    daily_capture.loc[buy_mask] = daily_returns.loc[buy_mask]
+    daily_capture.loc[short_mask] = -daily_returns.loc[short_mask]
+    signal_state = aligned.copy()
+    permutation_return_pool = daily_returns.copy()
+    return daily_capture, trigger_mask, signal_state, permutation_return_pool
+
+
+def _empty_strategy_fold_result(
+    fold_index: int,
+    candidate: StrategyCandidate,
+    reason: str,
+) -> StrategyFoldResult:
+    """Return an empty StrategyFoldResult tagged with a formatted
+    [IMPACTSEARCH:validation_unavailable] issue. Used when the signal
+    helper or capture pipeline returns no usable data for a fold.
+    """
+    formatted = (
+        f"[IMPACTSEARCH:validation_unavailable] {candidate.strategy_id}: "
+        f"{reason}. Action: inspect adapter logs or extend history."
+    )
+    return StrategyFoldResult(
+        fold_index=fold_index,
+        strategy_id=candidate.strategy_id,
+        strategy_label=candidate.strategy_label,
+        daily_capture=pd.Series([], dtype=float),
+        trigger_mask=pd.Series([], dtype=bool),
+        issues=(formatted,),
+        metadata={"reason": reason},
+    )
+
+
+def _impactsearch_baseline_for_fold(
+    sec_df,
+    context: FoldContext,
+) -> BaselineFoldMetrics:
+    """Same-ticker buy-and-hold baseline (locked 5C-1 §6) over the
+    fold's evaluation window. Uses raw Close pct_change percent points
+    scored against an all-True mask via canonical scoring.
+    """
+    sec_window = slice_between(sec_df, context.test_start, context.test_end)
+    if sec_window is None or sec_window.empty:
+        formatted = (
+            f"[IMPACTSEARCH:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: "
+            f"baseline frame is empty over evaluation window. "
+            f"Action: extend the secondary history or relax fold cutoffs."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index,
+            n_observations=0,
+            baseline_sharpe=None,
+            baseline_total_return=None,
+            baseline_mean_return=None,
+            baseline_std=None,
+            issues=(formatted,),
+        )
+    prices = sec_window["Close"].astype(float)
+    daily_returns = prices.pct_change().fillna(0.0) * 100.0
+    n_obs = int(len(daily_returns))
+    if n_obs == 0:
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=0,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+        )
+    all_true_mask = pd.Series([True] * n_obs, index=daily_returns.index)
+    try:
+        score = _canonical_score_captures(
+            daily_returns, all_true_mask,
+            risk_free_rate=5.0, periods_per_year=252, ddof=1,
+        )
+    except Exception as exc:
+        formatted = (
+            f"[IMPACTSEARCH:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: baseline scoring raised "
+            f"{type(exc).__name__}: {exc}. Action: inspect canonical scoring."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=n_obs,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+            issues=(formatted,),
+        )
+
+    def _safe(x):
+        if x is None:
+            return None
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(f):
+            return None
+        return f
+
+    return BaselineFoldMetrics(
+        fold_index=context.fold_index,
+        n_observations=n_obs,
+        baseline_sharpe=_safe(getattr(score, "sharpe", None)),
+        baseline_total_return=_safe(getattr(score, "total_capture", None)),
+        baseline_mean_return=_safe(getattr(score, "avg_daily_capture", None)),
+        baseline_std=_safe(getattr(score, "std_dev", None)),
+    )
+
+
+def _mean_finite(values):
+    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+    if not finite:
+        return None
+    return float(np.mean(finite))
+
+
+def _impactsearch_validation_ui_summary(
+    contract: Mapping[str, Any],
+    manifest_summary: Optional[Mapping[str, Any]] = None,
+) -> dict:
+    """Compact UI / progress_tracker summary derived from a
+    ``validation_contract_v1`` artifact. Does NOT include per-strategy
+    detail or raw aggregate signal series; those stay in the JSON
+    sidecar / contract proper.
+    """
+    agg = contract.get("baseline_aggregate") or {}
+    strategies = contract.get("strategies") or []
+    sharpe_deltas = []
+    return_deltas = []
+    for s in strategies:
+        d = s.get("aggregate_baseline_delta") or {}
+        if d.get("mean_sharpe_delta") is not None:
+            sharpe_deltas.append(d["mean_sharpe_delta"])
+        if d.get("mean_return_delta") is not None:
+            return_deltas.append(d["mean_return_delta"])
+    summary = {
+        "validation_contract_version": contract.get("validation_contract_version"),
+        "validation_status": contract.get("validation_status"),
+        "run_id": contract.get("run_id"),
+        "app_surface": contract.get("app_surface"),
+        "n_strategies_tested": contract.get("n_strategies_tested"),
+        "n_strategies_reported": contract.get("n_strategies_reported"),
+        "n_strategies_survived_empirical": contract.get("n_strategies_survived_empirical"),
+        "multiple_comparisons_control_alpha": contract.get("multiple_comparisons_control_alpha"),
+        "mean_baseline_sharpe": agg.get("mean_baseline_sharpe"),
+        "mean_sharpe_delta": _mean_finite(sharpe_deltas),
+        "mean_return_delta": _mean_finite(return_deltas),
+        # Phase 5C-2b amendment: completion rendering needs issues
+        # text for failed runs.
+        "issues": list(contract.get("issues") or []),
+    }
+    if manifest_summary is not None:
+        summary["validation_artifact_path"] = manifest_summary.get(
+            "validation_artifact_path",
+        )
+        summary["validation_artifact_hash"] = manifest_summary.get(
+            "validation_artifact_hash",
+        )
+    return summary
+
+
+def _impactsearch_validation_completion_lines(
+    validation_summaries: Sequence[Mapping[str, Any]],
+    validation_tier: Optional[str],
+) -> list:
+    """Phase 5C-2b amendment: operator-visible validation completion
+    lines for the Dash callback completion message.
+
+    Returns ``[]`` when there is no validation data and the tier is
+    not 'exploratory' (so existing completion rendering stays
+    unchanged for non-validation paths).
+    """
+    out = []
+    for summary in (validation_summaries or []):
+        if not isinstance(summary, Mapping):
+            continue
+        status = summary.get("validation_status")
+        artifact_path = summary.get("validation_artifact_path") or "n/a"
+        if status == "failed":
+            issues = summary.get("issues") or []
+            if issues:
+                first_issue = str(issues[0])
+            else:
+                first_issue = "unknown failure"
+            out.append(
+                f"Validation: FAILED - {first_issue}. "
+                f"Sidecar: {artifact_path}"
+            )
+            continue
+        n_tested = summary.get("n_strategies_tested")
+        n_reported = summary.get("n_strategies_reported")
+        n_survived_emp = summary.get("n_strategies_survived_empirical")
+        alpha = summary.get("multiple_comparisons_control_alpha")
+        delta = summary.get("mean_sharpe_delta")
+        if delta is None:
+            delta_text = "n/a"
+        else:
+            try:
+                delta_f = float(delta)
+                if not np.isfinite(delta_f):
+                    delta_text = "n/a"
+                else:
+                    delta_text = f"{delta_f:.2f}"
+            except (TypeError, ValueError):
+                delta_text = "n/a"
+        out.append(
+            f"Validation: {n_reported} of {n_tested} survived BH at "
+            f"alpha={alpha} ({n_survived_emp} empirically validated). "
+            f"Mean Sharpe delta vs baseline: {delta_text}."
+        )
+    if validation_tier == "exploratory":
+        out.append(
+            "Exploratory - not validated (enable Export Excel to run "
+            "honest validation)."
+        )
+    return out
+
+
+def _impactsearch_per_strategy_validation_map(
+    contract: Mapping[str, Any],
+) -> dict:
+    """Per-strategy validation map keyed by strategy_id. Used by
+    export_results_to_excel to populate appended validation columns
+    and by the aggregate-mode UI surface.
+    """
+    out: dict = {}
+    agg = contract.get("baseline_aggregate") or {}
+    n_tested = contract.get("n_strategies_tested")
+    n_reported = contract.get("n_strategies_reported")
+    mean_baseline_sharpe = agg.get("mean_baseline_sharpe")
+    mean_baseline_return = agg.get("mean_baseline_return")
+    for s in (contract.get("strategies") or []):
+        sid = s.get("strategy_id")
+        if not sid:
+            continue
+        d = s.get("aggregate_baseline_delta") or {}
+        # Strategy-level "validation_status" is the run-level status
+        # by default (the contract doesn't keep a per-strategy status
+        # field separate from the empirical_validation_status).
+        out[sid] = {
+            "validation_status": contract.get("validation_status"),
+            "bh_q_value": s.get("bh_q_value"),
+            "bonferroni_p_value": s.get("bonferroni_p_value"),
+            "empirical_p_value": s.get("empirical_p_value"),
+            "bootstrap_sharpe_ci_lower": s.get("bootstrap_sharpe_ci_lower"),
+            "bootstrap_sharpe_ci_upper": s.get("bootstrap_sharpe_ci_upper"),
+            "empirical_validation_status": s.get("empirical_validation_status"),
+            "n_strategies_tested": n_tested,
+            "n_strategies_reported": n_reported,
+            "mean_baseline_sharpe": mean_baseline_sharpe,
+            "mean_baseline_return": mean_baseline_return,
+            "mean_sharpe_delta": d.get("mean_sharpe_delta"),
+            "mean_return_delta": d.get("mean_return_delta"),
+        }
+    return out
+
+
+class _ImpactSearchValidationAdapterBase:
+    """Shared state and helpers for batch and aggregate adapters.
+    Caches the full secondary frame load once per adapter instance so
+    repeated fold evaluations don't re-fetch.
+    """
+
+    def __init__(
+        self,
+        secondary_ticker: str,
+        primary_tickers: Sequence[str],
+        options: Optional[Mapping[str, Any]] = None,
+        *,
+        sma_cache: Optional[dict] = None,
+        analysis_clock=None,
+    ) -> None:
+        self.secondary_ticker = str(secondary_ticker or "").strip().upper()
+        self.primary_tickers = [
+            str(t or "").strip().upper()
+            for t in (primary_tickers or [])
+            if str(t or "").strip()
+        ]
+        self.options = dict(options or {})
+        self.sma_cache = sma_cache if sma_cache is not None else {}
+        self.analysis_clock = analysis_clock
+        self._sec_df_cache = None
+
+    def _secondary_frame(self):
+        if self._sec_df_cache is None:
+            self._sec_df_cache = _load_secondary_frame_for_validation(
+                self.secondary_ticker, analysis_clock=self.analysis_clock,
+            )
+        return self._sec_df_cache
+
+    def history_index(self):
+        sec = self._secondary_frame()
+        if sec is None or sec.empty:
+            return pd.DatetimeIndex([])
+        return sec.index
+
+    def baseline_for_fold(self, context: FoldContext) -> BaselineFoldMetrics:
+        sec = self._secondary_frame()
+        if sec is None:
+            formatted = (
+                f"[IMPACTSEARCH:validation_baseline_unavailable] "
+                f"fold-{context.fold_index}: secondary frame unavailable. "
+                f"Action: confirm secondary ticker is valid."
+            )
+            return BaselineFoldMetrics(
+                fold_index=context.fold_index, n_observations=0,
+                baseline_sharpe=None, baseline_total_return=None,
+                baseline_mean_return=None, baseline_std=None,
+                issues=(formatted,),
+            )
+        return _impactsearch_baseline_for_fold(sec, context)
+
+
+class ImpactSearchBatchValidationAdapter(_ImpactSearchValidationAdapterBase):
+    """SelectionAdapter that maps each primary -> secondary pair to one
+    StrategyCandidate. Used by the durable batch XLSX validation path.
+    """
+
+    def select_for_fold(self, context: FoldContext):
+        return [
+            StrategyCandidate(
+                strategy_id=_impactsearch_strategy_id(p, self.secondary_ticker),
+                strategy_label=f"{p} -> {self.secondary_ticker}",
+                app_payload={
+                    "primary_ticker": p,
+                    "secondary_ticker": self.secondary_ticker,
+                },
+            )
+            for p in self.primary_tickers
+        ]
+
+    def evaluate_candidate(
+        self,
+        candidate: StrategyCandidate,
+        context: FoldContext,
+    ) -> StrategyFoldResult:
+        sec = self._secondary_frame()
+        if sec is None or sec.empty:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="secondary frame unavailable for fold",
+            )
+        primary = (candidate.app_payload or {}).get(
+            "primary_ticker", candidate.strategy_id.split("__", 1)[0],
+        )
+        try:
+            aligned, meta_or_rej = (
+                _impactsearch_primary_signal_series_for_secondary(
+                    primary, sec,
+                    sma_cache=self.sma_cache,
+                    analysis_clock=self.analysis_clock,
+                    data_available_through=context.evaluation_cutoff,
+                )
+            )
+        except Exception as exc:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason=f"signal helper raised {type(exc).__name__}: {exc}",
+            )
+        if aligned is None:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="signal helper returned no signal series",
+            )
+        cap, mask, signal_state, return_pool = (
+            _impactsearch_capture_series_from_signals(aligned, sec, context)
+        )
+        if cap.empty or not mask.any():
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="no triggers in evaluation window",
+            )
+        return StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=cap,
+            trigger_mask=mask,
+            metadata={
+                "signal_state": signal_state,
+                "permutation_return_pool": return_pool,
+                "primary_ticker": primary,
+                "secondary_ticker": self.secondary_ticker,
+            },
+        )
+
+
+class ImpactSearchAggregateValidationAdapter(_ImpactSearchValidationAdapterBase):
+    """SelectionAdapter that aggregates N primary signals into a single
+    canonical multi-primary aggregate (locked 5B-MP-2c §10) and
+    validates the aggregate as one strategy. Used by the interactive
+    aggregate-mode in-memory validation path.
+    """
+
+    def select_for_fold(self, context: FoldContext):
+        members_label = ",".join(self.primary_tickers)
+        sid = (
+            f"AGGREGATE({members_label})__{self.secondary_ticker}"
+        )
+        return [
+            StrategyCandidate(
+                strategy_id=sid,
+                strategy_label=(
+                    f"AGGREGATE({members_label}) -> {self.secondary_ticker}"
+                ),
+                app_payload={
+                    "primary_tickers": list(self.primary_tickers),
+                    "secondary_ticker": self.secondary_ticker,
+                },
+            ),
+        ]
+
+    def evaluate_candidate(
+        self,
+        candidate: StrategyCandidate,
+        context: FoldContext,
+    ) -> StrategyFoldResult:
+        sec = self._secondary_frame()
+        if sec is None or sec.empty:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="secondary frame unavailable for fold",
+            )
+        primaries = list((candidate.app_payload or {}).get(
+            "primary_tickers", self.primary_tickers,
+        ))
+        contributed = []
+        aligned_map: dict = {}
+        for primary in primaries:
+            try:
+                aligned, _meta = (
+                    _impactsearch_primary_signal_series_for_secondary(
+                        primary, sec,
+                        sma_cache=self.sma_cache,
+                        analysis_clock=self.analysis_clock,
+                        data_available_through=context.evaluation_cutoff,
+                    )
+                )
+            except Exception:
+                continue
+            if aligned is None:
+                continue
+            contributed.append(primary)
+            aligned_map[primary] = aligned
+        if not contributed:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="no primary contributed to aggregate over fold window",
+            )
+        sig_df = pd.DataFrame(aligned_map)
+        try:
+            contract = _impactsearch_multi_primary_contract_result(
+                sig_df,
+                requested_members=primaries,
+                contributed_members=contributed,
+                missing_members=[
+                    p for p in primaries if p not in contributed
+                ],
+                context=f"aggregate[{self.secondary_ticker}]",
+            )
+        except Exception as exc:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason=f"aggregate consensus raised {type(exc).__name__}: {exc}",
+            )
+        aggregate_signal = contract.get("aggregate_signal")
+        if aggregate_signal is None or aggregate_signal.empty:
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="aggregate consensus produced empty signal series",
+            )
+        cap, mask, signal_state, return_pool = (
+            _impactsearch_capture_series_from_signals(
+                aggregate_signal, sec, context,
+            )
+        )
+        if cap.empty or not mask.any():
+            return _empty_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="aggregate has no triggers in evaluation window",
+            )
+        return StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=cap,
+            trigger_mask=mask,
+            metadata={
+                "signal_state": signal_state,
+                "permutation_return_pool": return_pool,
+                "primary_tickers": list(primaries),
+                "contributed_members": list(contributed),
+                "secondary_ticker": self.secondary_ticker,
+                "aggregate_status": contract.get("status"),
+            },
+        )
+
+
+def _run_impactsearch_batch_validation_for_export(
+    secondary_ticker: str,
+    primary_tickers: Sequence[str],
+    *,
+    run_id: Optional[str] = None,
+    n_permutations: int = 10000,
+    n_bootstrap_samples: int = 10000,
+    rng_seed: Optional[int] = None,
+    analysis_clock=None,
+):
+    """Phase 5C-2b durable batch XLSX validation entry point.
+    Instantiates the batch adapter, drives validate_strategy_set,
+    persists validation.json, computes the SHA-256, builds the
+    manifest summary, and returns
+    ``(contract, manifest_summary, per_strategy_validation, sidecar_path)``.
+    """
+    adapter = ImpactSearchBatchValidationAdapter(
+        secondary_ticker, primary_tickers, analysis_clock=analysis_clock,
+    )
+    history_index = adapter.history_index()
+    rid = run_id or generate_run_id("impactsearch", "batch_xlsx")
+    contract = validate_strategy_set(
+        adapter, history_index,
+        run_id=rid,
+        producer_engine="impactsearch",
+        app_surface="batch_xlsx",
+        alpha=DEFAULT_ALPHA,
+        initial_train_days=DEFAULT_INITIAL_TRAIN_DAYS,
+        test_window_days=DEFAULT_TEST_WINDOW_DAYS,
+        step_days=DEFAULT_STEP_DAYS,
+        n_permutations=int(n_permutations),
+        n_bootstrap_samples=int(n_bootstrap_samples),
+        borderline_tolerance_multiplier=DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+        rng_seed=rng_seed,
+    )
+    output_dir = Path(VALIDATION_OUTPUT_BASE_DIR) / rid
+    sidecar_path = write_validation_sidecar(
+        contract, output_dir, allow_overwrite=False,
+    )
+    artifact_hash = compute_validation_artifact_hash(sidecar_path)
+    manifest_summary = extract_manifest_summary(
+        contract,
+        validation_artifact_path=str(sidecar_path),
+        validation_artifact_hash=artifact_hash,
+    )
+    per_strategy = _impactsearch_per_strategy_validation_map(contract)
+    return contract, manifest_summary, per_strategy, sidecar_path
+
+
+def _prepare_impactsearch_durable_validation_for_export(
+    secondary_ticker: str,
+    primary_tickers: Sequence[str],
+    *,
+    run_id: Optional[str] = None,
+    n_permutations: int = 10000,
+    n_bootstrap_samples: int = 10000,
+    rng_seed: Optional[int] = None,
+    analysis_clock=None,
+):
+    """Phase 5C-2b amendment: fail-closed durable validation prepare.
+
+    Returns ``(contract, validation_summary, per_strategy_validation,
+    sidecar_path)``.
+
+    Normal path: delegate to ``_run_impactsearch_batch_validation_for_export``,
+    then re-validate the manifest summary against
+    ``_LOCKED_VALIDATION_SUMMARY_KEYS``. If either step raises, fall
+    back to the failed-artifact path so the durable XLSX export NEVER
+    proceeds without a validation artifact (locked 5C-1 §3).
+
+    Failure path: build a status='failed' contract via
+    ``_build_failed_validation_contract``, persist it through
+    ``write_validation_sidecar`` (re-using the deterministic ``rid`` so
+    overwrite refusal stays an error), hash it via
+    ``compute_validation_artifact_hash``, extract the manifest summary
+    via ``extract_manifest_summary``, validate the failed summary
+    against ``_LOCKED_VALIDATION_SUMMARY_KEYS``, and return an empty
+    ``per_strategy_validation`` map.
+
+    If writing the failed artifact itself raises, re-raise. The
+    durable XLSX export must not proceed without a validation
+    artifact.
+    """
+    rid = run_id or generate_run_id("impactsearch", "batch_xlsx")
+    try:
+        contract, validation_summary, per_strategy, sidecar_path = (
+            _run_impactsearch_batch_validation_for_export(
+                secondary_ticker,
+                primary_tickers,
+                run_id=rid,
+                n_permutations=n_permutations,
+                n_bootstrap_samples=n_bootstrap_samples,
+                rng_seed=rng_seed,
+                analysis_clock=analysis_clock,
+            )
+        )
+        _validate_impactsearch_validation_summary(validation_summary)
+        return contract, validation_summary, per_strategy, sidecar_path
+    except Exception as primary_exc:
+        failure_reason = (
+            "ImpactSearch durable batch validation failed during normal run"
+        )
+        exception_repr = f"{type(primary_exc).__name__}: {primary_exc}"
+        logger.warning(
+            "[5C-2b] durable validation falling back to failed artifact "
+            f"for {secondary_ticker}: {exception_repr}"
+        )
+        failed_contract = _build_failed_validation_contract(
+            run_id=rid,
+            producer_engine="impactsearch",
+            app_surface="batch_xlsx",
+            secondary_ticker=secondary_ticker,
+            primary_tickers=list(primary_tickers or []),
+            failure_reason=failure_reason,
+            exception_repr=exception_repr,
+        )
+        # Writing the failed artifact MUST succeed; if even this
+        # raises, propagate so the caller aborts the XLSX export.
+        # allow_overwrite=True only on the FALLBACK path: if the
+        # normal run wrote a sidecar before raising
+        # (post-sidecar failure edge), the canonical failed
+        # contract replaces the partial / malformed-for-summary
+        # sidecar in this run_id directory. Success path keeps
+        # allow_overwrite=False so locked 5C-1 §12 collision
+        # detection stays intact.
+        output_dir = Path(VALIDATION_OUTPUT_BASE_DIR) / rid
+        failed_sidecar_path = write_validation_sidecar(
+            failed_contract, output_dir, allow_overwrite=True,
+        )
+        artifact_hash = compute_validation_artifact_hash(failed_sidecar_path)
+        failed_summary = extract_manifest_summary(
+            failed_contract,
+            validation_artifact_path=str(failed_sidecar_path),
+            validation_artifact_hash=artifact_hash,
+        )
+        _validate_impactsearch_validation_summary(failed_summary)
+        return failed_contract, failed_summary, {}, failed_sidecar_path
+
+
+def _run_impactsearch_aggregate_validation_in_memory(
+    secondary_ticker: str,
+    primary_tickers: Sequence[str],
+    *,
+    options: Optional[Mapping[str, Any]] = None,
+    run_id: Optional[str] = None,
+    n_permutations: Optional[int] = None,
+    n_bootstrap_samples: Optional[int] = None,
+    rng_seed: Optional[int] = None,
+    analysis_clock=None,
+):
+    """Phase 5C-2b interactive aggregate-mode validation entry point.
+    Instantiates the aggregate adapter, drives validate_strategy_set
+    with app_surface='aggregate_interactive', and returns
+    ``(contract, ui_summary, per_strategy_validation)``. NEVER writes
+    a sidecar.
+    """
+    options = dict(options or {})
+    if n_permutations is None:
+        n_permutations = int(options.get("n_permutations", 10000))
+    if n_bootstrap_samples is None:
+        n_bootstrap_samples = int(options.get("n_bootstrap_samples", 10000))
+    if rng_seed is None:
+        rng_seed = options.get("rng_seed")
+    adapter = ImpactSearchAggregateValidationAdapter(
+        secondary_ticker, primary_tickers, options=options,
+        analysis_clock=analysis_clock,
+    )
+    history_index = adapter.history_index()
+    rid = run_id or generate_run_id("impactsearch", "aggregate_interactive")
+    contract = validate_strategy_set(
+        adapter, history_index,
+        run_id=rid,
+        producer_engine="impactsearch",
+        app_surface="aggregate_interactive",
+        alpha=DEFAULT_ALPHA,
+        initial_train_days=DEFAULT_INITIAL_TRAIN_DAYS,
+        test_window_days=DEFAULT_TEST_WINDOW_DAYS,
+        step_days=DEFAULT_STEP_DAYS,
+        n_permutations=int(n_permutations),
+        n_bootstrap_samples=int(n_bootstrap_samples),
+        borderline_tolerance_multiplier=DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+        rng_seed=rng_seed,
+    )
+    ui_summary = _impactsearch_validation_ui_summary(contract)
+    per_strategy = _impactsearch_per_strategy_validation_map(contract)
+    return contract, ui_summary, per_strategy
+
+
+# =============================================================================
+# End Phase 5C-2b validation integration section
+# =============================================================================
+
 
 if __name__ == "__main__":
     # Optional: log parity status once at boot (no-op if fallback)
