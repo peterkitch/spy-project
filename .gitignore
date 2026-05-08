@@ -1,5 +1,7 @@
 *.pkl
 *.json
+# Phase 5D-1 onboarding: example controlled compute job specs are committed reference material.
+!project/examples/controlled_compute/*.json
 *.npz
 
 debug.log

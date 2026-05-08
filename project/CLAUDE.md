@@ -5,8 +5,9 @@
 ## PRJCT9 SPRINT OPERATIONAL CONTEXT
 
 This section captures the durable operational shape of the
-PRJCT9 sprint on this repo (currently Phase 5A in progress;
-Phases 1B through 4B merged). Read this before doing any
+PRJCT9 sprint on this repo (currently post-Phase 5D-1
+onboarding; Phase 5C validation is closed and Phase 5D
+controlled compute is in progress). Read this before doing any
 work in `project/`.
 
 ### 1. Pinned Python interpreter (CRITICAL)
@@ -154,9 +155,9 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Sprint state (as of 2026-05-05)
+### 6. Sprint state (as of 2026-05-08)
 
-Phase 0 → Phase 5 Pre-Flight merged to `main`:
+Phase 0 -> Phase 5D-1 onboarding merged to `main`:
 
   - #128 Phase -1 (token sweep)
   - #129 Phase 0 (spec v0.5, env, import smoke)
@@ -191,35 +192,36 @@ Phase 0 → Phase 5 Pre-Flight merged to `main`:
   - #149 Phase 5 Pre-Flight (validation, cleanups,
     controlled compute + Path 2 backend, pre-launch
     hardening)
+  - #166 Phase 5C validation methodology lock
+  - #167-#169 Phase 5C-2a validation engine foundation,
+    empirical layer, sidecars, manifest hook, baseline persistence
+  - #170 Phase 5C-2b ImpactSearch validation integration
+  - #171 Phase 5C-2c StackBuilder validation integration
+  - #172 Phase 5C-2d Spymaster prep extraction
+  - #173 Phase 5C-2d Spymaster validation integration
+  - #174 Phase 5C-2e Confluence validation integration
+  - #175 Phase 5C-3 honest validation report ledger
+  - #176 Phase 5D-1 local controlled compute orchestrator
+  - #177 Phase 5D-1 operational onboarding
 
-**Currently in progress: Phase 5A — sprint-state hygiene +
-cleanup ledger.** Doc/config-only triage step that
-classifies every Phase 5B-bound cleanup item by deletion /
-deprecation / rename / behavior-change / cross-app-
-reconciliation. The locked classification lives in
-`project/md_library/shared/2026-05-05_PHASE_5A_CLEANUP_LEDGER.md`.
+**Phase 5C: Honest validation framework - CLOSED.**
+The locked methodology lives at
+`project/md_library/shared/2026-05-06_PHASE_5C_VALIDATION_METHODOLOGY.md`.
+All four PRJCT9 apps are wired through validation_contract_v1
+where their tier supports it, and `honest_validation_ledger.py`
+aggregates durable validation sidecars.
 
-**Phase 5B: Targeted cleanup PRs.** Runs from 5A
-classification. Multiple small PRs allowed; preflight
-required when a PR deletes behavior, changes CLI surface,
-touches env files, or changes cross-app semantics.
+**Phase 5D: Controlled compute - IN PROGRESS.**
+5D-1 local orchestration and onboarding are merged. 5D-2
+distributed cluster and 5D-3 cloud burst are not started and need
+fresh scoping plus Peter input before implementation.
 
-**Phase 5C: Honest validation program.** Two-step (5C-1
-methodology doc PR, 5C-2 validation engine + report PR).
-Methodology must be locked before implementation begins.
+**Phase 5G: Data licensing pre-launch gate - NOT STARTED.**
+Runs in parallel with later 5D work and gates Phase 6 launch
+scoping.
 
-**Phase 5D: Controlled compute + Path 2 backend.** Local-
-first orchestration; Path 2 on-demand backend; emits
-Phase 4A-compatible run directories.
-
-**Phase 5G: Pre-launch data licensing gate.** Doc/process
-work; runs in parallel; gates Phase 6 launch scoping.
-
-**Phase 6: PRJCT9.com.** Public research website that
-consumes Phase 4A / Phase 5 manifest-stamped outputs.
-
-See `project/md_library/shared/2026-05-05_PHASE_5_PRE_FLIGHT.md`
-for the locked Phase 5 scope and sub-phase rules.
+**Phase 6: PRJCT9.com - NOT STARTED.**
+Public-facing UX / website. Gated by 5G.
 
 Confirm current state with `git log -10 --oneline main`;
 this section may lag reality if PRs land without an update.
@@ -301,6 +303,7 @@ This is a quantitative trading analysis web application built with Python and Da
 ## Development Environment
 
 **Operating System**: Windows (platform: win32) — Linux/macOS clones should also work; the Windows-specific notes below only apply on win32.
+**Local audit hardware**: Intel Core i7-13700F (16C/24T), 192GB DDR5 RAM, RTX 2080 Ti + RTX 4060 Ti GPUs.
 **Recommended Shell**: PowerShell 7+ (`pwsh`). CMD and Git Bash are supported but PowerShell is the canonical contributor shell. Older Git Bash workarounds are preserved as historical notes in `md_library/shared/2025-11-13_CONDA_ACTIVATION_IN_BASH_TOOL_SOLUTION.md` and `md_library/shared/2025-10-22_CLAUDE_TESTING_WINDOWS_PATH_SOLUTION.md`.
 **Python Environments**:
   - **spyproject2** (Primary) - Has Intel MKL, NumPy 1.26.4, optimized BLAS
@@ -309,12 +312,12 @@ This is a quantitative trading analysis web application built with Python and Da
 **Python environment setup**: create from `project/environment.yml` using Conda, Mamba, or Micromamba (`conda env create -f project/environment.yml`). Activate with `conda activate spyproject2`. Do not assume any particular Conda install location; the activate command works once your shell has Conda initialized. A pip-only path is available via `project/requirements.txt`.
 
 ### CRITICAL DATE AWARENESS ISSUE
-**IMPORTANT**: The system often shows incorrect dates. When creating MD files with date prefixes:
-- **ALWAYS verify the actual current date** using `date` command or checking system clock
-- **As of this writing**: The actual date is September 16, 2025 (NOT January or August 2025)
-- **Common date confusion**: System may think it's January or August 2025 when it's actually September
-- **Before creating any dated file**: Double-check the current date to avoid mislabeled files
-- **Existing mislabeled files**: Many MD files are incorrectly dated as "2025-01-*" or "2025-08-*" when they were actually created in September 2025
+
+**IMPORTANT**: The system may show incorrect dates. When creating MD files with date prefixes:
+
+- **ALWAYS verify the actual current date** using `date` command before naming any dated file.
+- **Format**: `YYYY-MM-DD_ACTION_DESCRIPTION_IN_CAPS.md`.
+- **Do not rely on memory or training data for the current date.**
 
 ### Windows shell notes:
 - Environment variables (PowerShell): `$env:VAR = "value"; command` (or `;` between statements)
@@ -436,9 +439,33 @@ pyinstaller spymaster.spec
 4. If discrepancies found → Debug the new script (not spymaster)
 
 ### Core Structure
-- **spymaster.py** (4,971 lines): Main Dash web application serving the trading analysis dashboard (STANDALONE - Regression Testing Baseline)
-- **impactsearch.py**: Statistical relationship analysis between different tickers (Integrated with signal_library)
-- **onepass.py**: Single-pass analysis module for quick computations (Integrated with signal_library)
+
+Per-app surfaces:
+
+- **spymaster.py**: Main Dash dashboard (STANDALONE - regression baseline; black background, #80ff00 green accent "PRJCT9 branding")
+- **impactsearch.py**: Cross-asset pattern discovery; primary-secondary signal correlation; durable XLSX export tier per locked 5C-1 methodology
+- **onepass.py**: Signal generation and ticker library construction
+- **stackbuilder.py**: Multi-primary stack construction with full-refit walk-forward validation; durable-only tier per locked 5C-1 methodology
+- **confluence.py**: Multi-primary confluence engine; interactive-tier validation per locked 5C-1 methodology
+- **trafficflow.py**: Cross-asset traffic flow analysis (contains the disabled matrix.py code path)
+- **tickerdash.py**: Per-ticker dashboard with single-job model
+- **run.py**: Ticker universe construction
+
+Validation infrastructure (Phase 5C track):
+
+- **validation_engine.py**: Canonical validation contract foundation; walk-forward fold generation; BH + Bonferroni multiple comparisons; empirical permutation/bootstrap layer; sidecar emission via write_validation_sidecar
+- **canonical_scoring.py**: Locked scoring contract (score_captures, combine_consensus_signals)
+- **provenance_manifest.py**: Output manifest schema with optional validation_summary participation
+- **honest_validation_ledger.py**: Cross-app validation_contract_v1 sidecar aggregation; produces validation_ledger_v1 markdown + JSON
+
+Compute infrastructure (Phase 5D track):
+
+- **controlled_compute.py**: Local subprocess + ProcessPoolExecutor orchestrator; budget controls; sidecar verification (exact-path or discovery modes); compute_manifest_v1
+
+Cross-cutting:
+
+- **shared_*.py / signal_library/**: Shared utilities consumed by per-app modules
+- **md_library/shared/**: Locked methodology + scoping docs; reference these directly when source-of-truth is needed
 
 ### Data Flow
 1. **Market Data**: Fetched via yfinance API into pandas DataFrames
@@ -475,237 +502,74 @@ pyinstaller spymaster.spec
 - **Output**: Excel files for detailed analysis exports
 - **Logs**: `debug.log`, `analysis.log` for troubleshooting
 
-## Recent Updates (Session: 2025-01-23)
+## Sprint State (as of 2026-05-08)
 
-### Secondary Ticker Signal Following Analysis Fixes
+The PRJCT9 sprint reached Phase 5D-1 onboarding closure on this date. Snapshot below for fast context recovery on session start.
 
-#### Issues Fixed:
-1. **Missing Last Day Data**: Secondary analysis was missing the most recent trading day
-   - Root cause: yfinance's `end` parameter is exclusive
-   - Fix: Added `pd.Timedelta(days=1)` to make end date inclusive (line 2714-2715)
+### Three-voice workflow doctrine (non-negotiable)
 
-2. **Mismatched Cumulative Captures**: Primary and secondary showed different results for same ticker
-   - Root cause: Secondary used 'Close' while primary used 'Adj Close' prices
-   - Fix: Modified price column selection to prioritize 'Adj Close' (lines 8511-8535)
+PRJCT9 work flows through three agents:
 
-#### Testing Results:
-All tickers now show perfect matching between primary and secondary analyses:
-- SPY: Primary = 192.80%, Secondary = 192.80% ✅
-- QQQ: Primary = 213.52%, Secondary = 213.52% ✅
-- ^GSPC: Primary = 665.57%, Secondary = 665.57% ✅
-- MSFT: Primary = 216.92%, Secondary = 216.92% ✅
-- AAPL: Primary = 688.01%, Secondary = 688.01% ✅
+- **Web Claude (Claude Desktop)**: co-foreman; drafts implementation prompts for Claude Code, drafts audit prompts for Codex, evaluates responses, iterates.
+- **Claude Code (this agent)**: implementer; full repo access; reads CLAUDE.md automatically.
+- **Codex via Emdash**: independent auditor; read-only against the repo; references AGENTS.md.
 
-## Recent Updates (Session: 2025-01-08)
+Peter is courier between agents. All git/bash work flows through Claude Code. Squash-merge with branch preservation (NEVER `--delete-branch`). Single-command bash invocations; no GPG prefix workaround. Doc/scoping PRs may skip Codex draft-review and go directly to Claude Code.
 
-### Phase 2 Enhancements Completed
+### Phase 5 track (in progress)
 
-#### 1. Position Configuration Dictionary
-- Added `POSITION_CONFIGS` dictionary to centralize styling
-- Consistent icons, colors, and symbols across all position types
-- Simplified maintenance and updates to position display
+**Phase 5C - validation framework - CLOSED:**
 
-#### 2. Risk Metrics Integration
-- Added `calculate_risk_metrics()` method to PerformanceMetrics class
-- Shows expected return, max potential loss/gain, risk/reward ratio
-- Based on 60-day historical data percentiles (5th/95th)
-- Integrated into position status cards
+- 5C-1 (#166): validation_methodology_v1 LOCKED in md_library/shared/2026-05-06_PHASE_5C_VALIDATION_METHODOLOGY.md (walk-forward 5y/1y/1y; BH primary + Bonferroni supplementary; hybrid empirical layer; honest-scope 11 discipline).
+- 5C-2 (#167-#174): per-app validation integration across all four apps (ImpactSearch, StackBuilder, Spymaster, Confluence). Cross-app contract parity via validate_validation_contract_v1.
+- 5C-3 (#175): honest_validation_ledger.py cross-app sidecar aggregation; produces validation_ledger_v1 (markdown + JSON).
 
-#### 3. Signal Strength Visualization
-- Calculates percentage divergence between SMAs
-- Visual progress bar showing signal strength (0-100%)
-- Color-coded: green (>5%), yellow (2-5%), red (<2%)
-- Added to action required card
+**Phase 5D - controlled compute - partial:**
 
-#### 4. Position Performance Tracking
-- Session-based position history storage with `dcc.Store`
-- Tracks entry/exit prices, holding days, and P&L
-- Automatic P&L calculation for closed positions
-- Maintains rolling 30-position history
+- 5D-1 orchestrator (#176): controlled_compute.py with subprocess + ProcessPoolExecutor; budget controls; exact-path sidecar verification; compute_manifest_v1.
+- 5D-1 onboarding (#177): sidecar discovery mode for apps that generate validation run_ids internally (e.g., StackBuilder); StackBuilder example spec at project/examples/controlled_compute/stackbuilder_onboarding_job_spec.json; operator runbook at md_library/shared/2026-05-08_PHASE_5D_1_OPERATIONAL_ONBOARDING.md.
+- 5D-2 distributed cluster: NOT STARTED (LAN multi-machine coordination; needs scoping + Peter input on architecture).
+- 5D-3 cloud burst: NOT STARTED (cloud workers + cost monitoring; needs scoping + Peter input).
 
-#### 5. Position History Table
-- New `create_position_history_table()` method
-- Shows last 10 positions with entry/exit prices
-- Color-coded P&L display
-- Integrated into Performance Overview section
+**Phase 5G - data licensing pre-launch gate:** NOT STARTED. Parallel sub-phase that gates Phase 6. Research/legal scope; yfinance ToS review + alternative data source survey.
 
-## Recent Updates (Session: 2025-01-07)
+### Future phases
 
-### Major Improvements Completed
+- **Phase 6**: public-facing UX / website. Gated by 5G.
+- **Phase 7+**: volunteer compute, BYO-data ingestion, full Wikipedia/crowdsourcing layer per North Star vision (md_library/shared/2026-05-04_PRJCT9_NORTH_STAR.md).
 
-#### 1. Time-Weighted Performance Rating System
-- Implemented annualized return calculations for fair comparison across time periods
-- Applied to both AI-Optimized and Manual SMA sections
-- Grades now based on annualized performance rather than absolute returns
+### Test baseline
 
-#### 2. Individual Leader Metrics
-- Added Sharpe Ratio and Max Drawdown calculations for Buy Leader and Short Leader
-- Fixed pandas Series vs numpy array handling issues
-- Metrics now display in Strategy Comparison table
+566 tests passing on main HEAD da7244e. Zero failures, zero new skips. 60 unchanged pre-existing pandas fragmentation warnings in test_lookahead_poison.py:49 (carried since Phase 5B-MP).
 
-#### 3. Complete UI Overhaul of Dynamic Master Trading Strategy Section
-- **Restructured into 3 clear sections:**
-  - Position Status & Required Action (what to do NOW)
-  - Performance Overview (consolidated metrics)
-  - Signal Change Thresholds (clear price levels)
-- **New Visual Components:**
-  - `create_position_status_card()` - Current position display
-  - `create_action_required_card()` - Prominent action needed
-  - `create_price_threshold_visual()` - Clear threshold ladder
-  - `create_position_timeline()` - Visual position progression
-- **Eliminated redundancies:** Removed 6 duplicate sections
+### Locked methodology references
 
-#### 4. Critical Fixes
-- Fixed "Hold" → "Cash" terminology for None positions
-- Fixed signal strength calculations (no fast/slow SMA assumptions)
-- Fixed position return calculation (actual P&L from entry)
-- Enhanced confidence calculation (multi-factor weighting)
-- Robust price threshold parsing with error handling
-- Added position transition warnings
+Source-of-truth docs in md_library/shared/:
 
-#### 5. Trading Mechanics Clarification
-- All trades execute at market CLOSE (4:00 PM ET)
-- Positions held from close to close (minimum)
-- Clear date/time stamps on all recommendations
+- `2026-05-04_PRJCT9_NORTH_STAR.md` - Phase 7+ vision
+- `2026-05-04_PHASE_4_SCOPING.md` - Phase 4 controlled compute commitment
+- `2026-05-05_PHASE_5_PRE_FLIGHT.md`
+- `2026-05-06_PHASE_5C_PRE_FLIGHT.md`
+- `2026-05-06_PHASE_5C_VALIDATION_METHODOLOGY.md` - locked validation contract + methodology
+- `2026-05-08_PHASE_5D_1_OPERATIONAL_ONBOARDING.md` - controlled compute operator runbook
 
-## Recent Updates (Session: 2025-01-12)
+Reference these directly when source-of-truth is needed; do not paraphrase locked content from memory.
 
-### Current Uncommitted Enhancements (Ready to Commit)
+### Carry-forward technical debt (tracked but not blocking)
 
-#### Signal Flip Probability Calculator ✅ (Accelerated from Phase 4)
-- **`calculate_signal_flip_probability()`**: New method calculating likelihood of signal changes
-- Uses 10-day (70% weight) and 30-day (30% weight) volatility analysis
-- 5-level risk assessment: Very Low (<20%), Low (20-40%), Medium (40-60%), High (60-80%), Very High (>80%)
-- Proximity-based threshold distance calculations
-- Integrated into action_required_card with color-coded warnings
-- Clear messaging about signal stability and flip risks
+- B11 compute_signals cleanup (deferred)
+- environment.yml/requirements.txt hygiene (deferred)
+- Deferred UI/operational issues from Post Phase 3 Codex audit (OnePass error UX, TrafficFlow refresh callback, ImpactSearch error taxonomy, StackBuilder progress JSON, TickerDash global single-job model)
+- ImpactSearch capture-metric integrity audit (parked; affects Core Club / direction-flip integrity / geography tiers / cross-asset signals findings until resolved)
+- ProcessPoolExecutor parallelism for empirical layer inside validation_engine itself (deferred per Codex 5C-2a preflight)
 
-#### Enhanced Visual Effects System ✅
-- **5-tier signal strength system**: EXTREME/STRONG/MODERATE/WEAK/VERY WEAK
-- Dynamic glow effects (up to 25px for EXTREME signals)
-- Pulse animations for signals ≥60% strength
-- Enhanced emoji indicators (🔥🔥🔥 for EXTREME)
-- Variable border widths (1-3px) based on signal strength
-- Gradient backgrounds and animated progress bars
+### Key principles to preserve across phases
 
-#### Risk/Reward Matrix Redesign ✅
-- Quality ratings with emoji indicators (🎯 Excellent, ✅ Good, ⚠️ Fair, ⛔ Poor)
-- Visual progress bars (0-100 scale) for risk and reward
-- Dynamic glow effects based on positioning quality
-- New `_get_risk_reward_interpretation()` helper method
-- Clear English summaries for investment context
-
-#### Performance Optimizations ✅
-- Added `from_callback` and `should_log` parameters to control logging
-- Fixed 3-second interval update console spam issue
-- Improved callback context detection using dash.callback_context
-- Better chart loading state management
-
-## Recent Updates (Session: 2025-01-08)
-
-### Phase 2 Completed ✅
-
-#### Infrastructure & Architecture
-- **Added POSITION_CONFIGS dictionary** for centralized position styling
-- **Implemented session storage** for ticker-specific position history tracking
-- **Fixed callback architecture** (20→21 outputs) to support position history store
-
-#### Critical Bug Fixes
-- **Fixed position timing logic**: Positions now correctly enter at dates[i-1]
-- **Fixed complex number crashes**: Added comprehensive validation for NaN/infinite values
-- **Fixed position history persistence**: Ticker-specific storage prevents data mixing
-- **Removed duplicate position update logic**: Eliminated conflicting code sections
-
-#### New Features & Methods
-- **`calculate_risk_metrics()`**: Calculates expected return, max loss/gain, risk/reward ratio
-- **`create_position_history_table()`**: Comprehensive trade history with performance metrics
-- **Enhanced signal strength calculation**: Percentage divergence between SMAs (0-100 scale)
-
-#### Visual Enhancements
-- **Signal Strength Meters**:
-  - Emoji indicators (🔥 Strong, ⚡ Moderate, ⚠️ Weak, ❄️ Very Weak)
-  - Animated progress bars with color coding
-  - Glowing effects for strong signals
-- **Risk/Reward Display**:
-  - Visual quality ratings (🎯 Excellent, ✅ Good, ⚠️ Fair, ⛔ Poor)
-  - Color-coded risk/reward bar visualization
-  - Detailed metrics with emoji icons
-- **Position Performance Summary**:
-  - Current streak tracking (e.g., "🔥 3 wins in a row")
-  - Best/worst trade display
-  - Average hold time
-  - Position-specific success rates (Buy vs Short)
-
-## Phase 3 TESTING & VALIDATION (Session: 2025-01-12)
-
-### Implementation Complete - In Testing Phase ✅
-
-All Phase 3 components have been implemented and are undergoing validation:
-
-1. **Market Close Countdown Timer** ⏰ ✅
-   - ✅ Basic structure created with `create_market_countdown_timer()`
-   - ✅ Countdown interval component added
-   - ✅ Callback `update_countdown_timer()` implemented
-   - 🧪 Testing real-time updates with market hours
-   - 🧪 Validating weekend/holiday handling
-   - 🧪 Verifying display updates in UI
-
-2. **Position Sizing Calculator** 📊 ✅
-   - ✅ Basic calculator function `create_position_sizing_calculator()`
-   - ✅ UI inputs for account value, risk %, stop-loss %
-   - 🧪 Testing interactive updates
-   - 🧪 Validating calculations with real ticker prices
-   - 🧪 Kelly Criterion calculation validation
-   - 🧪 Position sizing callback testing
-
-3. **Interactive Price Threshold Slider** 🎯 ✅
-   - ✅ Fixed AttributeError with list/dict handling
-   - ✅ Basic slider component created
-   - 🧪 Testing interactive functionality
-   - 🧪 Validating distance calculations
-   - 🧪 Refining slider marks and styling
-   - 🧪 Testing callback for slider updates
-
-### Active Testing Checklist:
-- [x] Components created and integrated
-- [ ] Live ticker data validation
-- [ ] Market hours countdown verification
-- [ ] Position sizing accuracy check
-- [ ] Threshold slider responsiveness
-- [ ] Cross-browser compatibility
-- [ ] Error handling verification
-- [ ] Performance under load
-
-### Bug Fixes Applied:
-- Fixed `create_interactive_threshold_slider()` to handle list format from threshold_data
-- Added proper parsing for price ranges in various formats ("$X - $Y", "above $X", "below $X")
-- Resolved layout issues in Risk Management Tools section
-- Fixed position history date/price display
-
-## Phase 4 - Future Enhancements (Optional)
-
-### Potential Future Features (Not Currently Planned)
-
-These items are noted for potential future development but are not essential components:
-
-#### Data & Analytics Enhancements
-- Confidence intervals around predictions
-- Monte Carlo simulation results  
-- Backtesting parameter sensitivity analysis
-- Alternative risk metrics (VaR, CVaR)
-- Correlation matrix between positions
-
-#### Real-Time Features
-- Live price updates during market hours
-- WebSocket integration for streaming data
-- Multi-ticker portfolio optimization
-
-#### Advanced Visualizations
-- Enhanced interactive price threshold slider with what-if scenarios
-- 3D volatility surface plots
-- Heatmap correlation matrices
-
-Note: Machine learning integration, advanced analytics, and institutional features have been deprioritized as they are not essential for the core trading strategy functionality.
+- **matrix.py does not exist as a file.** The concept survives only as a disabled code path in trafficflow.py.
+- **.bat files** are local shortcuts, gitignored by design.
+- **QC clone is parked indefinitely.** Exclude from all current phase work.
+- **Scoping docs follow decisions, not precede them.** Drafting a scoping doc before underlying decisions are Codex-reviewed creates rework cycles.
+- **Per-app preflight justified ONLY when parent scoping defers questions to it.** Default flow: scoping doc -> Web Claude drafts implementation prompt -> Codex sign-off -> Claude Code implements.
 
 ## Known Issues to Address
 - Position return calculation needs actual entry price tracking
