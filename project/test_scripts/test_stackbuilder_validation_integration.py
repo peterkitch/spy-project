@@ -155,12 +155,22 @@ def _baseline_args(**overrides):
     return SimpleNamespace(**base)
 
 
-def _phase2_outputs(args, primaries, sec_df):
-    """Drive phase2 against synthetic libs and return rank tuple."""
+def _phase2_outputs(args, primaries, sec_df, tmp_path):
+    """Drive phase2 against synthetic libs and return rank tuple.
+
+    ``tmp_path`` is REQUIRED. The previous default of
+    ``str(Path(os.getcwd()))`` leaked ``rank_all.xlsx`` /
+    ``rank_direct.xlsx`` / ``rank_inverse.xlsx`` into pytest's cwd
+    (the repo root when launched from there, ``project/`` when
+    launched from inside it). Pass each test's ``tmp_path`` so
+    ``stackbuilder.write_table`` writes inside that scratch area.
+    """
+    out_phase2 = Path(tmp_path) / "phase2"
+    out_phase2.mkdir(parents=True, exist_ok=True)
     sec_rets = stackbuilder.pct_returns(sec_df["Close"])
     primaries_df = pd.DataFrame({"Primary Ticker": list(primaries)})
     return stackbuilder.phase2_rank_all(
-        args, primaries_df, sec_rets, str(Path(os.getcwd())),
+        args, primaries_df, sec_rets, str(out_phase2),
         secondary="ZZZ",
         progress_path=None,
         grace_days=args.grace_days,
@@ -183,7 +193,7 @@ def test_phase3_validation_collector_no_op_when_none(tmp_path, monkeypatch):
     )
     args = _baseline_args(top_n=2, bottom_n=0, max_k=2)
     rank_all, rank_direct, rank_inverse = _phase2_outputs(
-        args, ["AAA", "BBB"], sec_df,
+        args, ["AAA", "BBB"], sec_df, tmp_path,
     )
 
     sec_rets = stackbuilder.pct_returns(sec_df["Close"])
@@ -221,7 +231,7 @@ def test_phase3_validation_collector_invoked_for_unique_tested_stacks(
         min_trigger_days=1, allow_decreasing=True,
     )
     rank_all, rank_direct, rank_inverse = _phase2_outputs(
-        args, ["AAA", "BBB"], sec_df,
+        args, ["AAA", "BBB"], sec_df, tmp_path,
     )
     sec_rets = stackbuilder.pct_returns(sec_df["Close"])
 
