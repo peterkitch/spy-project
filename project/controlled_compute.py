@@ -193,6 +193,67 @@ def validate_compute_job_spec(spec: Mapping[str, Any]) -> None:
                 f"({job_id!r}) timeout_seconds={timeout} exceeds "
                 f"budget.max_wall_seconds_per_job={max_wall}"
             )
+        # Phase 5D-1 onboarding: sidecar verification has two
+        # mutually-exclusive modes - exact-path
+        # ``expected_validation_sidecar`` (the original 5D-1
+        # contract) and post-run discovery via
+        # ``validation_sidecar_search_root`` (this onboarding
+        # amendment). Apps that generate the validation run_id
+        # internally - e.g. StackBuilder via
+        # ``generate_run_id("stackbuilder", "run_directory")`` - use
+        # the discovery path because the operator cannot know the
+        # produced sidecar path up front.
+        expected_sidecar = job.get("expected_validation_sidecar")
+        search_root = job.get("validation_sidecar_search_root")
+        sidecar_glob = job.get("validation_sidecar_glob")
+        sidecar_required = job.get("validation_sidecar_required")
+        if expected_sidecar is not None and not isinstance(expected_sidecar, str):
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): expected_validation_sidecar must be a "
+                f"string when set"
+            )
+        if search_root is not None and not isinstance(search_root, str):
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): validation_sidecar_search_root must be "
+                f"a string when set"
+            )
+        if sidecar_glob is not None and not isinstance(sidecar_glob, str):
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): validation_sidecar_glob must be a "
+                f"string when set"
+            )
+        if sidecar_required is not None and not isinstance(sidecar_required, bool):
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): validation_sidecar_required must be a "
+                f"bool when set"
+            )
+        if expected_sidecar is not None and search_root is not None:
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): expected_validation_sidecar and "
+                f"validation_sidecar_search_root are mutually exclusive"
+            )
+        if (
+            sidecar_required is True
+            and expected_sidecar is None
+            and search_root is None
+        ):
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): validation_sidecar_required=true but "
+                f"neither expected_validation_sidecar nor "
+                f"validation_sidecar_search_root was provided"
+            )
+        if sidecar_glob is not None and search_root is None:
+            raise ValueError(
+                f"[CONTROLLED_COMPUTE:spec_invalid] jobs[{idx}] "
+                f"({job_id!r}): validation_sidecar_glob requires "
+                f"validation_sidecar_search_root"
+            )
 
 
 def load_compute_job_spec(path) -> dict:
@@ -244,6 +305,43 @@ def _bound_max_workers(requested: int, n_jobs: int) -> int:
     return max(1, min(int(requested), int(n_jobs), int(cpu)))
 
 
+def _resolve_sidecar_glob(job: Mapping[str, Any]) -> Optional[str]:
+    """Return the effective discovery glob for manifest/runtime use.
+
+    If ``validation_sidecar_search_root`` is absent, return ``None``
+    so the manifest faithfully records "no discovery configured".
+    If ``validation_sidecar_search_root`` is present, return the
+    explicit ``validation_sidecar_glob`` when supplied, otherwise the
+    documented default ``"**/validation.json"``. This keeps the
+    manifest audit-complete: the recorded glob always equals the
+    pattern the worker actually uses.
+    """
+    if not job.get("validation_sidecar_search_root"):
+        return None
+    explicit = job.get("validation_sidecar_glob")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    return "**/validation.json"
+
+
+def _resolve_sidecar_required(job: Mapping[str, Any]) -> bool:
+    """Resolve the effective ``validation_sidecar_required`` value.
+
+    Explicit ``validation_sidecar_required`` wins. Otherwise required
+    defaults to True when either ``expected_validation_sidecar`` or
+    ``validation_sidecar_search_root`` is supplied (preserving the
+    original 5D-1 contract that exact-path sidecars are required).
+    Otherwise required defaults to False (no sidecar coupling at all).
+    """
+    explicit = job.get("validation_sidecar_required")
+    if isinstance(explicit, bool):
+        return explicit
+    return bool(
+        job.get("expected_validation_sidecar")
+        or job.get("validation_sidecar_search_root")
+    )
+
+
 def _planned_result(job: Mapping[str, Any], job_index: int) -> dict:
     return {
         "job_id": job.get("job_id") or f"job-{job_index:04d}",
@@ -267,7 +365,127 @@ def _planned_result(job: Mapping[str, Any], job_index: int) -> dict:
         "validation_sidecar_sha256": None,
         "validation_run_id": None,
         "validation_status": None,
+        # Phase 5D-1 onboarding: discovery audit fields. Echo the
+        # EFFECTIVE discovery configuration into the manifest so an
+        # operator can reconstruct the search semantics from the
+        # manifest alone -- including jobs that rely on the documented
+        # default glob ``"**/validation.json"``.
+        "validation_sidecar_search_root": job.get("validation_sidecar_search_root"),
+        "validation_sidecar_glob": _resolve_sidecar_glob(job),
+        "validation_sidecar_required": _resolve_sidecar_required(job),
+        "validation_sidecar_discovery_candidates": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# Sidecar discovery (Phase 5D-1 onboarding)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_validation_sidecars(root, pattern: str) -> dict:
+    """Snapshot matching sidecars under ``root`` before the subprocess.
+
+    Missing root is allowed and treated as an empty snapshot. Returns
+    ``{resolved_path_str: mtime_ns}``; downstream discovery only uses
+    the keys to detect new paths, but the mtime is preserved for
+    debugging / future use.
+    """
+    p = Path(root)
+    if not p.exists() or not p.is_dir():
+        return {}
+    out: dict = {}
+    try:
+        matches = list(p.glob(pattern))
+    except (OSError, ValueError):
+        return out
+    for m in matches:
+        try:
+            key = str(m.resolve())
+            out[key] = int(m.stat().st_mtime_ns)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _discover_new_validation_sidecars(root, pattern: str, before: Mapping[str, int]) -> list:
+    """Return sorted candidate sidecars present after the subprocess
+    that were NOT present in the ``before`` snapshot. Missing root is
+    treated as no candidates.
+    """
+    p = Path(root)
+    if not p.exists() or not p.is_dir():
+        return []
+    seen_before = set(before.keys())
+    out = []
+    try:
+        matches = list(p.glob(pattern))
+    except (OSError, ValueError):
+        return out
+    for m in matches:
+        try:
+            key = str(m.resolve())
+        except (OSError, ValueError):
+            continue
+        if key in seen_before:
+            continue
+        out.append(m)
+    return sorted(out, key=lambda x: str(x))
+
+
+def _validate_and_hash_validation_sidecar(sidecar_path: Path, result: dict) -> bool:
+    """Load + structurally validate + hash the sidecar at
+    ``sidecar_path`` and populate validation fields on ``result``.
+
+    Returns True on success. On failure appends a
+    ``[CONTROLLED_COMPUTE:validation_sidecar_invalid]`` issue and
+    returns False (caller decides whether to set status=failed).
+    """
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as fh:
+            contract = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        result["issues"].append(
+            f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
+            f"{result['job_id']}: failed to read sidecar "
+            f"{sidecar_path}: {type(exc).__name__}: {exc}"
+        )
+        return False
+    if not isinstance(contract, dict):
+        result["issues"].append(
+            f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
+            f"{result['job_id']}: sidecar {sidecar_path} did not "
+            f"parse to a dict; got {type(contract).__name__}"
+        )
+        return False
+    try:
+        validate_validation_contract_v1(contract)
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        result["issues"].append(
+            f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
+            f"{result['job_id']}: sidecar {sidecar_path} failed "
+            f"contract shape check: {type(exc).__name__}: {exc}"
+        )
+        return False
+    try:
+        sha = compute_validation_artifact_hash(sidecar_path)
+    except Exception as exc:
+        result["issues"].append(
+            f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
+            f"{result['job_id']}: failed to hash sidecar "
+            f"{sidecar_path}: {type(exc).__name__}: {exc}"
+        )
+        return False
+    result["validation_sidecar_sha256"] = sha
+    result["validation_run_id"] = contract.get("run_id")
+    result["validation_status"] = contract.get("validation_status")
+    # Carry through producer_engine / app_surface from the contract
+    # when not pre-supplied on the job (so the manifest matches the
+    # actual on-disk validation envelope).
+    if not result.get("producer_engine"):
+        result["producer_engine"] = contract.get("producer_engine")
+    if not result.get("app_surface"):
+        result["app_surface"] = contract.get("app_surface")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +498,10 @@ def _run_compute_job_worker(job: Mapping[str, Any]) -> dict:
 
     Suitable for ``ProcessPoolExecutor`` (pickle-safe). Captures
     stdout/stderr tails, wall time, and timeout state, then optionally
-    validates the produced ``validation.json`` sidecar.
+    validates the produced ``validation.json`` sidecar via either the
+    exact-path contract (``expected_validation_sidecar``) or the
+    Phase 5D-1 onboarding discovery contract
+    (``validation_sidecar_search_root``).
     """
     job_index = int(job.get("_job_index", 0))
     result = _planned_result(job, job_index)
@@ -293,6 +514,21 @@ def _run_compute_job_worker(job: Mapping[str, Any]) -> dict:
             "non-empty list of strings"
         )
         return result
+
+    expected = job.get("expected_validation_sidecar")
+    search_root = job.get("validation_sidecar_search_root")
+    # ``_resolve_sidecar_glob`` returns None when no search_root is
+    # configured; fall back to the documented default for the worker
+    # so the runtime branch never sees None when search_root is set.
+    sidecar_glob = _resolve_sidecar_glob(job) or "**/validation.json"
+    sidecar_required = _resolve_sidecar_required(job)
+
+    # Snapshot existing sidecars BEFORE the subprocess runs so the
+    # post-run discovery can isolate exactly the new candidates.
+    pre_snapshot = (
+        _snapshot_validation_sidecars(Path(search_root), sidecar_glob)
+        if search_root else None
+    )
 
     cwd = job.get("cwd")
     timeout_seconds = job.get("_effective_timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
@@ -341,62 +577,55 @@ def _run_compute_job_worker(job: Mapping[str, Any]) -> dict:
         )
         return result
 
-    # Command succeeded; verify expected validation sidecar if any.
-    expected = job.get("expected_validation_sidecar")
+    # Command succeeded; verify validation sidecar in whichever mode
+    # the spec selected. (validate_compute_job_spec already enforced
+    # mutual exclusion of exact / discovery.)
     if expected:
         sidecar_path = Path(expected)
         result["validation_sidecar_path"] = str(sidecar_path)
         if not sidecar_path.exists():
+            if sidecar_required:
+                result["issues"].append(
+                    f"[CONTROLLED_COMPUTE:validation_sidecar_missing] "
+                    f"{result['job_id']}: expected sidecar at "
+                    f"{sidecar_path}"
+                )
+                return result
+        else:
+            if not _validate_and_hash_validation_sidecar(sidecar_path, result):
+                return result
+    elif search_root:
+        candidates = _discover_new_validation_sidecars(
+            Path(search_root), sidecar_glob, pre_snapshot or {},
+        )
+        result["validation_sidecar_discovery_candidates"] = [
+            str(p) for p in candidates
+        ]
+        if len(candidates) == 0:
+            if sidecar_required:
+                result["issues"].append(
+                    f"[CONTROLLED_COMPUTE:validation_sidecar_missing] "
+                    f"{result['job_id']}: no new validation.json found "
+                    f"under {search_root!r} matching {sidecar_glob!r} "
+                    f"after command success"
+                )
+                return result
+        elif len(candidates) > 1:
+            # Ambiguous discovery is always fatal regardless of
+            # ``sidecar_required`` - we cannot honestly attribute one
+            # validation envelope to this job.
             result["issues"].append(
-                f"[CONTROLLED_COMPUTE:validation_sidecar_missing] "
-                f"{result['job_id']}: expected sidecar at {sidecar_path}"
+                f"[CONTROLLED_COMPUTE:validation_sidecar_ambiguous] "
+                f"{result['job_id']}: {len(candidates)} new sidecars "
+                f"found under {search_root!r} after command success: "
+                f"{[str(p) for p in candidates]}"
             )
             return result
-        try:
-            with open(sidecar_path, "r", encoding="utf-8") as fh:
-                contract = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            result["issues"].append(
-                f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
-                f"{result['job_id']}: failed to read sidecar "
-                f"{sidecar_path}: {type(exc).__name__}: {exc}"
-            )
-            return result
-        if not isinstance(contract, dict):
-            result["issues"].append(
-                f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
-                f"{result['job_id']}: sidecar {sidecar_path} did not "
-                f"parse to a dict; got {type(contract).__name__}"
-            )
-            return result
-        try:
-            validate_validation_contract_v1(contract)
-        except (AssertionError, KeyError, TypeError, ValueError) as exc:
-            result["issues"].append(
-                f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
-                f"{result['job_id']}: sidecar {sidecar_path} failed "
-                f"contract shape check: {type(exc).__name__}: {exc}"
-            )
-            return result
-        try:
-            sha = compute_validation_artifact_hash(sidecar_path)
-        except Exception as exc:
-            result["issues"].append(
-                f"[CONTROLLED_COMPUTE:validation_sidecar_invalid] "
-                f"{result['job_id']}: failed to hash sidecar "
-                f"{sidecar_path}: {type(exc).__name__}: {exc}"
-            )
-            return result
-        result["validation_sidecar_sha256"] = sha
-        result["validation_run_id"] = contract.get("run_id")
-        result["validation_status"] = contract.get("validation_status")
-        # Carry through producer_engine / app_surface from the contract
-        # when not pre-supplied on the job (so the manifest matches the
-        # actual on-disk validation envelope).
-        if not result.get("producer_engine"):
-            result["producer_engine"] = contract.get("producer_engine")
-        if not result.get("app_surface"):
-            result["app_surface"] = contract.get("app_surface")
+        else:
+            sidecar_path = candidates[0]
+            result["validation_sidecar_path"] = str(sidecar_path)
+            if not _validate_and_hash_validation_sidecar(sidecar_path, result):
+                return result
 
     result["status"] = "succeeded"
     return result
@@ -475,6 +704,13 @@ def build_compute_run_manifest(
             "validation_sidecar_sha256": r.get("validation_sidecar_sha256"),
             "validation_run_id": r.get("validation_run_id"),
             "validation_status": r.get("validation_status"),
+            # Phase 5D-1 onboarding discovery audit fields.
+            "validation_sidecar_search_root": r.get("validation_sidecar_search_root"),
+            "validation_sidecar_glob": r.get("validation_sidecar_glob"),
+            "validation_sidecar_required": r.get("validation_sidecar_required"),
+            "validation_sidecar_discovery_candidates": list(
+                r.get("validation_sidecar_discovery_candidates") or []
+            ),
         })
     return {
         "compute_contract_version": COMPUTE_CONTRACT_VERSION,
