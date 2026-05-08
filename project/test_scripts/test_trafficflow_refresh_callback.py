@@ -80,11 +80,24 @@ def _empty_list(*args, **kwargs):
     return []
 
 
-def _make_minimal_helpers(monkeypatch, *, secs=("AAA",)):
+def _make_minimal_helpers(monkeypatch, tmp_path, *, secs=("AAA",)):
     """Replace every helper ``_refresh`` calls with a deterministic
     stub so tests stay hermetic. Returns the resolved ``app`` after
     ``make_app()`` registers the callback against the patched globals.
+
+    ``tmp_path`` is REQUIRED. The default ``trafficflow.PRICE_CACHE_DIR``
+    is the relative path ``"price_cache/daily"`` (read from env at
+    import time). Real code paths reached by the refresh callback
+    (notably ``_load_secondary_prices`` + ``_write_cache_file``) write
+    to that relative directory under the active cwd, polluting the
+    repo when pytest runs from there. Pinning the module attribute to
+    a per-test ``tmp_path`` keeps any incidental disk write inside
+    pytest's scratch area.
     """
+    cache_dir = Path(tmp_path) / "price_cache" / "daily"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(trafficflow, "PRICE_CACHE_DIR", str(cache_dir))
+
     monkeypatch.setattr(trafficflow, "list_secondaries", lambda: list(secs))
     monkeypatch.setattr(trafficflow, "_clear_runtime", _no_op)
     monkeypatch.setattr(trafficflow, "preload_pkl_cache", _no_op)
@@ -131,7 +144,7 @@ def _make_minimal_helpers(monkeypatch, *, secs=("AAA",)):
 
 
 def test_refresh_callback_surfaces_refresh_secondary_caches_exception(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     def _boom_refresh(symbols, force=False):
         raise RuntimeError("simulated yfinance outage")
@@ -139,7 +152,7 @@ def test_refresh_callback_surfaces_refresh_secondary_caches_exception(
     monkeypatch.setattr(
         trafficflow, "refresh_secondary_caches", _boom_refresh,
     )
-    app = _make_minimal_helpers(monkeypatch, secs=("AAA",))
+    app = _make_minimal_helpers(monkeypatch, tmp_path, secs=("AAA",))
     cb = _get_refresh_callback(app)
     rows, status_children, last_update, missing_msg, missing_style = cb(1, 1)
     status_str = str(status_children)
@@ -162,7 +175,7 @@ def test_refresh_callback_surfaces_refresh_secondary_caches_exception(
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_callback_surfaces_price_load_failure(monkeypatch):
+def test_refresh_callback_surfaces_price_load_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(
         trafficflow, "refresh_secondary_caches",
         lambda symbols, force=False: [],  # no refresh issues
@@ -177,7 +190,7 @@ def test_refresh_callback_surfaces_price_load_failure(monkeypatch):
     monkeypatch.setattr(
         trafficflow, "_infer_quote_type", lambda sec: "EQUITY",
     )
-    app = _make_minimal_helpers(monkeypatch, secs=("BBB", "CCC"))
+    app = _make_minimal_helpers(monkeypatch, tmp_path, secs=("BBB", "CCC"))
     cb = _get_refresh_callback(app)
     _, status_children, *_ = cb(1, 1)
     status_str = str(status_children)
