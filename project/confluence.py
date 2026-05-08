@@ -10,7 +10,7 @@ import os
 import logging
 import glob
 import re
-from typing import Optional, Tuple, Dict
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 from pathlib import Path
 from datetime import datetime
 
@@ -515,7 +515,7 @@ def _mp_metrics(captures: pd.Series, trig_mask: pd.Series, bars_per_year: int) -
         'Total %': round(score.total_capture, 4),
     }
 
-def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_flags=None):
+def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_flags=None, *, data_available_through: Optional[pd.Timestamp] = None):
     """
     Interval-aware multi-primary evaluator with SpyMaster parity:
       • 1d: signals aligned to the DAILY calendar (ffill), daily returns
@@ -536,10 +536,7 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
 
     # ---------- 1) Load secondary prices (interval-aware) ----------
     # Daily path stays as-is to preserve the validated parity
-    if interval == '1d':
-        sec_df = _cached_fetch_interval_data(secondary, '1d')
-    else:
-        sec_df = _cached_fetch_interval_data(secondary, interval)
+    sec_df = _confluence_fetch_interval_data_with_cutoff(secondary, interval, data_available_through=data_available_through)
 
     if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
         return {'Interval': interval, 'Members': '', 'Status': f'NO_SECONDARY_DATA:{secondary}'}
@@ -562,7 +559,7 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
     series_map = {}
     invert_map = {}  # Track which tickers are inverted
     for t, inv in act:
-        lib = _cached_load_signal_library_interval(t, interval)
+        lib = _confluence_load_signal_library_interval_with_cutoff(t, interval, data_available_through=data_available_through)
         if not lib:
             continue
         dates = _mp_to_naive_days(lib.get('dates', []))
@@ -724,7 +721,7 @@ def _mp_eval_interval(primaries, secondary, interval, invert_flags=None, mute_fl
             return {'Interval': interval, 'Members': members, **metrics, 'Status': status_text}
         return {'Interval': interval, 'Members': members, 'Status': status_text or 'NO_TRIGGERS'}
 
-def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flags=None, mute_flags=None) -> pd.Series:
+def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flags=None, mute_flags=None, *, data_available_through: Optional[pd.Timestamp] = None) -> pd.Series:
     """
     Build the *signal series* (Buy/Short/None) for the secondary by combining the primaries
     with unanimity rules, matching _mp_eval_interval's calendars.
@@ -736,7 +733,7 @@ def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flag
 
     # Load secondary prices
     logger.info(f"[Combined Signals] Fetching secondary {secondary} prices...")
-    sec_df = _cached_fetch_interval_data(secondary, '1d' if interval == '1d' else interval)
+    sec_df = _confluence_fetch_interval_data_with_cutoff(secondary, interval, data_available_through=data_available_through)
     if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
         logger.warning(f"[Combined Signals] Secondary {secondary} has no data, returning empty")
         return pd.Series(dtype=object)
@@ -757,7 +754,7 @@ def _mp_build_combined_signal_series(primaries, secondary, interval, invert_flag
         if not t or m:
             continue
         logger.info(f"[Combined Signals] Loading primary {idx+1}/{len(primaries)}: {t}")
-        lib = _cached_load_signal_library_interval(t.strip().upper(), interval)
+        lib = _confluence_load_signal_library_interval_with_cutoff(t.strip().upper(), interval, data_available_through=data_available_through)
         if not lib:
             logger.warning(f"[Combined Signals] No library found for {t}")
             continue
@@ -2231,6 +2228,7 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
         if isinstance(s, str) and s.startswith('[CONFLUENCE:multi_primary_partial_coverage]'):
             partial_coverage_issues.append(s)
 
+    validation_summary = _run_confluence_multi_primary_validation(secondary_ticker=secondary, primary_tickers=primaries, invert_flags=invert_flags, mute_flags=mute_flags, selected_intervals=intervals)  # Phase 5C-2e interactive-tier validation
     mp_ctx = {
         'secondary': secondary,
         'primaries': primaries,
@@ -2238,6 +2236,7 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
         'mute_flags': mute_flags,
         'intervals': intervals,
         'partial_coverage_issues': partial_coverage_issues,
+        'validation_summary': validation_summary,
     }
 
     # Phase 5B-MP-2b: optional dynamic warning block above the table when
@@ -2276,7 +2275,8 @@ def run_multi_primary_analysis(n_clicks, secondary, primaries_vals, invert_vals,
             )
         )
     children.append(table)
-
+    if (vlines := _confluence_validation_completion_lines(validation_summary)):
+        children.append(html.Div([html.Div(line, style={'marginTop': '4px'}) for line in vlines], style={'color': '#80ff00', 'textAlign': 'center', 'marginTop': '12px', 'fontSize': '14px'}))
     return (html.Div(children), mp_ctx)
 
 
@@ -2529,9 +2529,903 @@ def _forward_returns(price: pd.Series, horizons=(5, 20, 60)) -> pd.DataFrame:
         out[f'F+{k}'] = (price.shift(-k) / price - 1.0) * 100.0
     return pd.DataFrame(out, index=price.index)
 
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2e: validation_engine imports + cutoff-aware loader wrappers.
+# Placed below _mp_forward_return_on_grid to preserve the locked B8
+# allowlist line for that helper's intentional .shift(-1).
+# ---------------------------------------------------------------------------
+
+
+from validation_engine import (
+    SelectionAdapter,
+    FoldContext,
+    StrategyCandidate,
+    StrategyFoldResult,
+    BaselineFoldMetrics,
+    validate_strategy_set,
+    generate_run_id,
+    slice_to_cutoff,
+    slice_between,
+    DEFAULT_INITIAL_TRAIN_DAYS,
+    DEFAULT_TEST_WINDOW_DAYS,
+    DEFAULT_STEP_DAYS,
+    DEFAULT_ALPHA,
+    DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+    DEFAULT_N_PERMUTATIONS,
+    DEFAULT_N_BOOTSTRAP_SAMPLES,
+)
+
+
+def _confluence_fetch_interval_data_with_cutoff(
+    ticker: str,
+    interval: str,
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+):
+    """Fetch interval-specific price data and slice to cutoff if provided.
+
+    Default ``data_available_through=None`` preserves existing
+    ``_cached_fetch_interval_data`` behavior byte-identical for
+    production callers. Under a non-None cutoff the helper normalizes
+    + sorts + dedupes the returned frame's index defensively (avoids
+    timezone-compare errors), then keeps rows ``index <= cutoff``.
+    """
+    df = _cached_fetch_interval_data(ticker, '1d' if interval == '1d' else interval)
+    if df is None or df.empty:
+        return df
+    if data_available_through is None:
+        return df
+    out = df.copy()
+    try:
+        idx = pd.to_datetime(out.index, utc=True, errors='coerce')
+        idx = pd.DatetimeIndex(idx.tz_convert(None).normalize())
+        out.index = idx
+    except Exception:
+        out.index = pd.DatetimeIndex(pd.to_datetime(out.index, errors='coerce'))
+    out = out[~out.index.duplicated(keep='last')].sort_index()
+    cutoff_ts = pd.Timestamp(data_available_through)
+    if getattr(cutoff_ts, "tz", None) is not None:
+        cutoff_ts = cutoff_ts.tz_convert(None) if cutoff_ts.tzinfo else cutoff_ts
+    cutoff_ts = pd.Timestamp(cutoff_ts).normalize()
+    return out.loc[out.index <= cutoff_ts]
+
+
+def _confluence_slice_library_to_cutoff(
+    lib: Optional[Mapping[str, Any]],
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+):
+    """Slice a loaded signal library to cutoff.
+
+    Default ``data_available_through=None`` returns ``dict(lib)``
+    untouched (no field-type conversion). Under a non-None cutoff:
+      * ``dates`` is filtered to entries ``<= cutoff``.
+      * ``signals``, ``primary_signals``, ``signal_entry_dates`` are
+        filtered consistently using the same boolean mask (positional).
+      * Other fields pass through unchanged.
+
+    If field lengths are malformed (don't all match ``dates``) the
+    helper preserves the malformed field unchanged rather than
+    silently realigning future rows into the past.
+    """
+    if lib is None:
+        return None
+    if data_available_through is None:
+        return dict(lib)
+    cutoff_ts = pd.Timestamp(data_available_through)
+    out = dict(lib)
+    raw_dates = out.get('dates')
+    if raw_dates is None:
+        return out
+    try:
+        dates_idx = _mp_to_naive_days(raw_dates)
+    except Exception:
+        return out
+    if len(dates_idx) == 0:
+        return out
+    keep_mask = (dates_idx <= cutoff_ts)
+    if not bool(np.any(keep_mask)):
+        out['dates'] = []
+        for key in ('signals', 'primary_signals', 'signal_entry_dates'):
+            if key in out:
+                out[key] = [] if isinstance(out[key], list) else (
+                    pd.Series([], dtype=object)
+                    if isinstance(out[key], pd.Series) else out[key]
+                )
+        return out
+    keep_arr = np.asarray(keep_mask)
+    n = int(len(keep_arr))
+
+    def _filter_seq(seq):
+        if seq is None:
+            return seq
+        if isinstance(seq, pd.Series):
+            if len(seq) != n:
+                return seq
+            return seq.iloc[keep_arr]
+        try:
+            seq_list = list(seq)
+        except Exception:
+            return seq
+        if len(seq_list) != n:
+            return seq
+        return [v for v, k in zip(seq_list, keep_arr) if k]
+
+    if isinstance(raw_dates, pd.DatetimeIndex):
+        out['dates'] = raw_dates[keep_arr]
+    elif isinstance(raw_dates, pd.Series):
+        out['dates'] = raw_dates.iloc[keep_arr] if len(raw_dates) == n else raw_dates
+    else:
+        try:
+            raw_list = list(raw_dates)
+            if len(raw_list) == n:
+                out['dates'] = [d for d, k in zip(raw_list, keep_arr) if k]
+        except Exception:
+            pass
+    for key in ('signals', 'primary_signals', 'signal_entry_dates'):
+        if key in out:
+            out[key] = _filter_seq(out[key])
+    return out
+
+
+def _confluence_load_signal_library_interval_with_cutoff(
+    ticker: str,
+    interval: str,
+    *,
+    data_available_through: Optional[pd.Timestamp] = None,
+):
+    """Load interval signal library and slice to cutoff if provided.
+
+    Default ``data_available_through=None`` preserves existing
+    ``_cached_load_signal_library_interval`` behavior byte-identical.
+    """
+    lib = _cached_load_signal_library_interval(ticker, interval)
+    if lib is None:
+        return None
+    if data_available_through is None:
+        return lib
+    return _confluence_slice_library_to_cutoff(
+        lib, data_available_through=data_available_through,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5C-2e: Confluence multi-primary validation (interactive tier)
+# ---------------------------------------------------------------------------
+
+
+def _confluence_mean_finite(values):
+    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+    if not finite:
+        return None
+    return float(np.mean(finite))
+
+
+def _confluence_strategy_id(
+    secondary_ticker: str,
+    interval: str,
+    primary_tickers: Sequence[str],
+    invert_flags: Sequence[bool],
+    mute_flags: Sequence[bool],
+) -> str:
+    """Stable canonical strategy id for one Confluence interval candidate."""
+    sec = str(secondary_ticker or "").strip().upper()
+    parts = []
+    for t, inv, m in zip(primary_tickers or [], invert_flags or [], mute_flags or []):
+        tt = str(t or "").strip().upper()
+        if not tt:
+            continue
+        if m:
+            mode = "M"
+        elif inv:
+            mode = "I"
+        else:
+            mode = "B"
+        parts.append(f"{tt}:{mode}")
+    members = ",".join(parts)
+    return f"CONFLUENCE({sec}|{interval}|{members})"
+
+
+def _confluence_members_label(
+    primary_tickers: Sequence[str],
+    invert_flags: Sequence[bool],
+    mute_flags: Sequence[bool],
+) -> str:
+    """Render member labels using the same `*` for inverted convention
+    as the existing _mp_eval_interval `Members` column. Muted tickers
+    are excluded from the label."""
+    out = []
+    for t, inv, m in zip(primary_tickers or [], invert_flags or [], mute_flags or []):
+        tt = str(t or "").strip().upper()
+        if not tt or m:
+            continue
+        out.append(f"{tt}*" if inv else tt)
+    return ", ".join(out)
+
+
+def _confluence_capture_series_for_interval(
+    *,
+    primaries: Sequence[str],
+    secondary: str,
+    interval: str,
+    invert_flags: Optional[Sequence[bool]] = None,
+    mute_flags: Optional[Sequence[bool]] = None,
+    data_available_through: Optional[pd.Timestamp] = None,
+    test_start: Optional[pd.Timestamp] = None,
+    test_end: Optional[pd.Timestamp] = None,
+):
+    """Reconstruct daily_capture / trigger_mask / signal_state /
+    return_pool / contract_info for a single Confluence interval.
+
+    Reuses the existing daily / non-daily calendar rules from
+    ``_mp_eval_interval``: ``_canonical_consensus`` for combination,
+    raw Close, ``pct_change().fillna(0.0) * 100.0`` percent points,
+    no ``shift(-1)``, daily-path primary intersection then secondary
+    intersection, non-daily strict intersection. Capture units are
+    percent points; ``trigger_mask`` is a bool series.
+
+    When ``test_start`` / ``test_end`` are provided, returned Series
+    are restricted to ``test_start <= index <= test_end``.
+    """
+    primaries = list(primaries or [])
+    invert_flags = list(invert_flags or [False] * len(primaries))
+    mute_flags = list(mute_flags or [False] * len(primaries))
+
+    empty_idx = pd.DatetimeIndex([])
+    empty_capture = pd.Series([], index=empty_idx, dtype=float)
+    empty_mask = pd.Series([], index=empty_idx, dtype=bool)
+    empty_state = pd.Series([], index=empty_idx, dtype=object)
+    empty_return = pd.Series([], index=empty_idx, dtype=float)
+
+    act = [
+        (str(t or "").strip().upper(), bool(inv))
+        for t, inv, m in zip(primaries, invert_flags, mute_flags)
+        if t and not m
+    ]
+    requested_members = [t for t, _ in act]
+    if not act:
+        return (
+            empty_capture, empty_mask, empty_state, empty_return,
+            {"status": "unavailable",
+             "issues": [],
+             "requested_members": requested_members,
+             "contributed_members": [],
+             "missing_members": requested_members},
+        )
+
+    if data_available_through is None:
+        sec_df = _cached_fetch_interval_data(
+            secondary, '1d' if interval == '1d' else interval,
+        )
+    else:
+        sec_df = _confluence_fetch_interval_data_with_cutoff(
+            secondary, interval, data_available_through=data_available_through,
+        )
+    if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
+        return (
+            empty_capture, empty_mask, empty_state, empty_return,
+            {"status": "unavailable",
+             "issues": [],
+             "requested_members": requested_members,
+             "contributed_members": [],
+             "missing_members": requested_members},
+        )
+    if isinstance(sec_df.columns, pd.MultiIndex):
+        sec_df.columns = sec_df.columns.get_level_values(0)
+    sec_df = sec_df.sort_index()
+    sec_idx = _mp_to_naive_days(sec_df.index)
+    close_data = sec_df['Close']
+    if isinstance(close_data, pd.DataFrame):
+        close_data = close_data.iloc[:, 0]
+    sec_close = pd.Series(
+        pd.to_numeric(close_data.values, errors='coerce'),
+        index=sec_idx, dtype='float64',
+    )
+
+    series_map = {}
+    invert_map = {}
+    for t, inv in act:
+        if data_available_through is None:
+            lib = _cached_load_signal_library_interval(t, interval)
+        else:
+            lib = _confluence_load_signal_library_interval_with_cutoff(
+                t, interval, data_available_through=data_available_through,
+            )
+        if not lib:
+            continue
+        dates = _mp_to_naive_days(lib.get('dates', []))
+        raw = lib.get('primary_signals', lib.get('signals', []))
+        sigs = pd.Series(
+            [_mp_decode_sig(x) for x in raw], index=dates, dtype=object,
+        )
+        sigs = sigs[~sigs.index.duplicated(keep='last')].sort_index()
+        if sigs.empty:
+            continue
+        if inv:
+            arr = sigs.to_numpy(object)
+            arr = np.where(
+                arr == 'Buy', 'Short',
+                np.where(arr == 'Short', 'Buy', arr),
+            )
+            sigs = pd.Series(arr, index=sigs.index, dtype=object)
+        series_map[t] = sigs
+        invert_map[t] = inv
+
+    contributed_members = list(series_map.keys())
+    contributed_set = set(contributed_members)
+    missing_members = [t for t in requested_members if t not in contributed_set]
+
+    contract_info_base = {
+        "requested_members": requested_members,
+        "contributed_members": contributed_members,
+        "missing_members": missing_members,
+    }
+
+    if not series_map:
+        return (
+            empty_capture, empty_mask, empty_state, empty_return,
+            {**contract_info_base, "status": "unavailable", "issues": []},
+        )
+
+    if interval == '1d':
+        prim_series = list(series_map.values())
+        common_dates = sorted(set.intersection(*[set(s.index) for s in prim_series]))
+        if not common_dates:
+            contract = _mp_multi_primary_contract_result(
+                pd.DataFrame(index=[]),
+                requested_members=requested_members,
+                contributed_members=contributed_members,
+                missing_members=missing_members,
+                context=f"multi-primary[{interval}]",
+            )
+            return (
+                empty_capture, empty_mask, empty_state, empty_return,
+                {**contract_info_base, "status": contract["status"],
+                 "issues": list(contract["issues"])},
+            )
+        sig_df = pd.DataFrame(
+            {t: series_map[t].reindex(common_dates) for t in series_map},
+            index=common_dates,
+        )
+        contract = _mp_multi_primary_contract_result(
+            sig_df,
+            requested_members=requested_members,
+            contributed_members=contributed_members,
+            missing_members=missing_members,
+            context=f"multi-primary[{interval}]",
+        )
+        combined = contract['aggregate_signal'].astype(str)
+        common_dates_sec = pd.Index(common_dates).intersection(sec_close.index)
+        if len(common_dates_sec) < 2:
+            return (
+                empty_capture, empty_mask, empty_state, empty_return,
+                {**contract_info_base, "status": contract["status"],
+                 "issues": list(contract["issues"])},
+            )
+        signals_f = combined.loc[common_dates_sec]
+        prices_f = sec_close.loc[common_dates_sec]
+        common_ix = signals_f.index.union(prices_f.index)
+        signals_u = signals_f.reindex(common_ix).fillna('None')
+        prices_u = prices_f.reindex(common_ix).ffill()
+        rets = prices_u.astype('float64').pct_change().fillna(0.0) * 100.0
+        buy_mask = signals_u.eq('Buy').to_numpy(bool)
+        short_mask = signals_u.eq('Short').to_numpy(bool)
+        cap = pd.Series(0.0, index=rets.index, dtype=float)
+        cap.iloc[buy_mask] = rets.iloc[buy_mask]
+        cap.iloc[short_mask] = -rets.iloc[short_mask]
+        trig_mask = signals_u.isin(['Buy', 'Short']).astype(bool)
+        signal_state = signals_u.astype(object)
+        return_pool = rets
+        daily_capture = cap
+    else:
+        common = set(sec_close.index)
+        for s in series_map.values():
+            common &= set(s.index)
+        if not common:
+            contract = _mp_multi_primary_contract_result(
+                pd.DataFrame(index=[]),
+                requested_members=requested_members,
+                contributed_members=contributed_members,
+                missing_members=missing_members,
+                context=f"multi-primary[{interval}]",
+            )
+            return (
+                empty_capture, empty_mask, empty_state, empty_return,
+                {**contract_info_base, "status": contract["status"],
+                 "issues": list(contract["issues"])},
+            )
+        dates = pd.DatetimeIndex(sorted(common))
+        sig_df = pd.DataFrame(
+            {t: series_map[t].reindex(dates) for t in series_map}, index=dates,
+        )
+        contract = _mp_multi_primary_contract_result(
+            sig_df,
+            requested_members=requested_members,
+            contributed_members=contributed_members,
+            missing_members=missing_members,
+            context=f"multi-primary[{interval}]",
+        )
+        combined = contract['aggregate_signal']
+        rets_grid = _mp_safe_pct_change(sec_close).reindex(dates).fillna(0.0)
+        cap = pd.Series(0.0, index=dates, dtype=float)
+        buy_days = combined.index[combined.eq('Buy')]
+        short_days = combined.index[combined.eq('Short')]
+        if len(buy_days):
+            cap.loc[buy_days] = rets_grid.loc[buy_days]
+        if len(short_days):
+            cap.loc[short_days] = -rets_grid.loc[short_days]
+        trig_mask = combined.isin(['Buy', 'Short']).astype(bool)
+        signal_state = combined.astype(object)
+        return_pool = rets_grid
+        daily_capture = cap
+
+    if test_start is not None and test_end is not None:
+        ts = pd.Timestamp(test_start)
+        te = pd.Timestamp(test_end)
+        sel = (daily_capture.index >= ts) & (daily_capture.index <= te)
+        daily_capture = daily_capture.loc[sel]
+        trig_mask = trig_mask.reindex(daily_capture.index, fill_value=False).astype(bool)
+        signal_state = signal_state.reindex(daily_capture.index).fillna('None').astype(object)
+        return_pool = return_pool.reindex(daily_capture.index).fillna(0.0)
+
+    contract_info = {
+        **contract_info_base,
+        "status": contract["status"],
+        "issues": list(contract["issues"]),
+    }
+    return daily_capture, trig_mask, signal_state, return_pool, contract_info
+
+
+def _empty_confluence_strategy_fold_result(
+    fold_index: int,
+    candidate: StrategyCandidate,
+    reason: str,
+) -> StrategyFoldResult:
+    formatted = (
+        f"[CONFLUENCE:validation_unavailable] {candidate.strategy_id}: "
+        f"{reason}. Action: inspect adapter logs or extend history."
+    )
+    return StrategyFoldResult(
+        fold_index=fold_index,
+        strategy_id=candidate.strategy_id,
+        strategy_label=candidate.strategy_label,
+        daily_capture=pd.Series([], dtype=float),
+        trigger_mask=pd.Series([], dtype=bool),
+        issues=(formatted,),
+        metadata={"reason": reason},
+    )
+
+
+def _confluence_baseline_for_fold_daily(
+    secondary_ticker: str,
+    context: FoldContext,
+) -> BaselineFoldMetrics:
+    """Daily same-ticker buy-and-hold baseline using Confluence's
+    percent-point convention. ``no shift(-1)``."""
+    sec_df = _confluence_fetch_interval_data_with_cutoff(
+        secondary_ticker, "1d",
+        data_available_through=context.evaluation_cutoff,
+    )
+    if sec_df is None or sec_df.empty or 'Close' not in sec_df.columns:
+        formatted = (
+            f"[CONFLUENCE:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: secondary daily frame unavailable. "
+            f"Action: confirm secondary ticker has daily history."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=0,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+            issues=(formatted,),
+        )
+    if isinstance(sec_df.columns, pd.MultiIndex):
+        sec_df.columns = sec_df.columns.get_level_values(0)
+    sec_df = sec_df.sort_index()
+    idx = _mp_to_naive_days(sec_df.index)
+    close_data = sec_df['Close']
+    if isinstance(close_data, pd.DataFrame):
+        close_data = close_data.iloc[:, 0]
+    close = pd.Series(
+        pd.to_numeric(close_data.values, errors='coerce'),
+        index=idx, dtype='float64',
+    )
+    rets = close.pct_change().fillna(0.0) * 100.0
+    ts = pd.Timestamp(context.test_start)
+    te = pd.Timestamp(context.test_end)
+    rets = rets.loc[(rets.index >= ts) & (rets.index <= te)]
+    n_obs = int(len(rets))
+    if n_obs == 0:
+        formatted = (
+            f"[CONFLUENCE:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: empty test window. "
+            f"Action: extend secondary history."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=0,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+            issues=(formatted,),
+        )
+    all_true = pd.Series([True] * n_obs, index=rets.index)
+    try:
+        score = _canonical_score_captures(
+            rets, all_true,
+            risk_free_rate=RISK_FREE_ANNUAL,
+            periods_per_year=BARS_PER_YEAR['1d'],
+            ddof=1,
+        )
+    except Exception as exc:
+        formatted = (
+            f"[CONFLUENCE:validation_baseline_unavailable] "
+            f"fold-{context.fold_index}: baseline scoring raised "
+            f"{type(exc).__name__}: {exc}."
+        )
+        return BaselineFoldMetrics(
+            fold_index=context.fold_index, n_observations=n_obs,
+            baseline_sharpe=None, baseline_total_return=None,
+            baseline_mean_return=None, baseline_std=None,
+            issues=(formatted,),
+        )
+
+    def _safe(x):
+        if x is None:
+            return None
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(f):
+            return None
+        return f
+
+    return BaselineFoldMetrics(
+        fold_index=context.fold_index,
+        n_observations=n_obs,
+        baseline_sharpe=_safe(getattr(score, "sharpe", None)),
+        baseline_total_return=_safe(getattr(score, "total_capture", None)),
+        baseline_mean_return=_safe(getattr(score, "avg_daily_capture", None)),
+        baseline_std=_safe(getattr(score, "std_dev", None)),
+    )
+
+
+class ConfluenceMultiPrimaryValidationAdapter:
+    """SelectionAdapter for Confluence interactive multi-primary validation.
+
+    Confluence multi-primary is deterministic, not a search. Refit
+    means rebuilding the same selected interval candidates with data
+    ``<= context.selection_cutoff``. Each selected interval is one
+    StrategyCandidate.
+    """
+
+    def __init__(
+        self,
+        secondary_ticker: str,
+        primary_tickers: Sequence[str],
+        invert_flags: Sequence[bool],
+        mute_flags: Sequence[bool],
+        selected_intervals: Sequence[str],
+    ) -> None:
+        self.secondary_ticker = str(secondary_ticker or "").strip().upper()
+        self.primary_tickers = [
+            str(t or "").strip().upper()
+            for t in (primary_tickers or [])
+            if str(t or "").strip()
+        ]
+        self.invert_flags = [bool(x) for x in (invert_flags or [])]
+        self.mute_flags = [bool(x) for x in (mute_flags or [])]
+        # Pad/truncate flag arrays to primary length defensively.
+        n = len(self.primary_tickers)
+        self.invert_flags = (self.invert_flags + [False] * n)[:n]
+        self.mute_flags = (self.mute_flags + [False] * n)[:n]
+        self.selected_intervals = [
+            str(iv or "").strip()
+            for iv in (selected_intervals or [])
+            if str(iv or "").strip()
+        ]
+
+    def history_index(self) -> pd.DatetimeIndex:
+        sec_df = _confluence_fetch_interval_data_with_cutoff(
+            self.secondary_ticker, "1d", data_available_through=None,
+        )
+        if sec_df is None or sec_df.empty:
+            return pd.DatetimeIndex([])
+        try:
+            idx = _mp_to_naive_days(sec_df.index)
+        except Exception:
+            idx = pd.DatetimeIndex(pd.to_datetime(sec_df.index, errors='coerce'))
+        return pd.DatetimeIndex(idx).unique().sort_values()
+
+    def _state_by_ticker(self) -> Mapping[str, Mapping[str, Any]]:
+        out = {}
+        for t, inv, m in zip(
+            self.primary_tickers, self.invert_flags, self.mute_flags,
+        ):
+            out[t] = {"invert_signals": bool(inv), "mute": bool(m)}
+        return out
+
+    def _unmuted_tickers(self) -> list:
+        return [
+            t for t, m in zip(self.primary_tickers, self.mute_flags) if not m
+        ]
+
+    def select_for_fold(self, context: FoldContext):
+        sel_cut = context.selection_cutoff
+        candidates = []
+        for interval in self.selected_intervals:
+            try:
+                row = _mp_eval_interval(
+                    primaries=self.primary_tickers,
+                    secondary=self.secondary_ticker,
+                    interval=interval,
+                    invert_flags=self.invert_flags,
+                    mute_flags=self.mute_flags,
+                    data_available_through=sel_cut,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"ConfluenceMultiPrimaryValidationAdapter.select_for_fold: "
+                    f"_mp_eval_interval raised for interval={interval}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            status = str(row.get('Status', '') or '')
+            if status.startswith('NO_SECONDARY_DATA') or status.startswith('NO_PRIMARY_DATA'):
+                raise ValueError(
+                    f"ConfluenceMultiPrimaryValidationAdapter.select_for_fold: "
+                    f"interval {interval}: {status}"
+                )
+            if status.startswith('[CONFLUENCE:multi_primary_unavailable]'):
+                raise ValueError(
+                    f"ConfluenceMultiPrimaryValidationAdapter.select_for_fold: "
+                    f"interval {interval}: {status}"
+                )
+            if status.startswith('[CONFLUENCE:multi_primary_partial_coverage]'):
+                # Phase 5C-2e amendment: partial coverage means one or
+                # more requested primaries failed to contribute; the
+                # remaining primaries would silently be validated as a
+                # reduced-set strategy. Fail loud so validation_engine
+                # records a partial-fold issue naming the failing
+                # primary instead of green-lighting a different
+                # strategy than the user requested.
+                raise ValueError(
+                    f"ConfluenceMultiPrimaryValidationAdapter.select_for_fold: "
+                    f"interval {interval}: {status}"
+                )
+            members_label = _confluence_members_label(
+                self.primary_tickers, self.invert_flags, self.mute_flags,
+            )
+            sid = _confluence_strategy_id(
+                self.secondary_ticker, interval,
+                self.primary_tickers, self.invert_flags, self.mute_flags,
+            )
+            label = (
+                f"{interval}: {members_label} -> {self.secondary_ticker}"
+                if members_label else
+                f"{interval}: -> {self.secondary_ticker}"
+            )
+            in_sample_metrics = {
+                k: row.get(k) for k in (
+                    "Triggers", "Wins", "Losses", "Win %", "StdDev %",
+                    "Sharpe", "Avg Cap %", "Total %",
+                )
+                if k in row
+            }
+            candidates.append(StrategyCandidate(
+                strategy_id=sid,
+                strategy_label=label,
+                app_payload={
+                    "secondary_ticker": self.secondary_ticker,
+                    "primary_tickers": list(self.primary_tickers),
+                    "invert_flags": list(self.invert_flags),
+                    "mute_flags": list(self.mute_flags),
+                    "interval": interval,
+                    "members_label": members_label,
+                    "bars_per_year": int(BARS_PER_YEAR.get(interval, 252)),
+                    "requested_members": list(self.primary_tickers),
+                    "in_sample_metrics": in_sample_metrics,
+                    "contract_status": status,
+                    "contract_issues": [status] if status else [],
+                },
+            ))
+        return candidates
+
+    def evaluate_candidate(
+        self,
+        candidate: StrategyCandidate,
+        context: FoldContext,
+    ) -> StrategyFoldResult:
+        payload = candidate.app_payload or {}
+        interval = str(payload.get("interval") or "1d")
+        try:
+            daily_capture, trigger_mask, signal_state, return_pool, contract_info = (
+                _confluence_capture_series_for_interval(
+                    primaries=self.primary_tickers,
+                    secondary=self.secondary_ticker,
+                    interval=interval,
+                    invert_flags=self.invert_flags,
+                    mute_flags=self.mute_flags,
+                    data_available_through=context.evaluation_cutoff,
+                    test_start=context.test_start,
+                    test_end=context.test_end,
+                )
+            )
+        except Exception as exc:
+            return _empty_confluence_strategy_fold_result(
+                context.fold_index, candidate,
+                reason=(
+                    f"_confluence_capture_series_for_interval raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        if daily_capture.empty or not bool(trigger_mask.any()):
+            return _empty_confluence_strategy_fold_result(
+                context.fold_index, candidate,
+                reason="no triggers in evaluation window",
+            )
+        return StrategyFoldResult(
+            fold_index=context.fold_index,
+            strategy_id=candidate.strategy_id,
+            strategy_label=candidate.strategy_label,
+            daily_capture=daily_capture.astype('float64'),
+            trigger_mask=trigger_mask.astype(bool),
+            metadata={
+                "signal_state": signal_state,
+                "permutation_return_pool": return_pool,
+                "interval": interval,
+                "state_by_ticker": self._state_by_ticker(),
+                "unmuted_tickers": self._unmuted_tickers(),
+                "secondary_ticker": self.secondary_ticker,
+                "contract_status": contract_info.get("status"),
+                "contract_issues": list(contract_info.get("issues") or []),
+            },
+            issues=(),
+        )
+
+    def baseline_for_fold(self, context: FoldContext) -> BaselineFoldMetrics:
+        return _confluence_baseline_for_fold_daily(
+            self.secondary_ticker, context,
+        )
+
+
+def _confluence_validation_ui_summary(
+    contract: Mapping[str, Any],
+) -> dict:
+    """Return operator-facing in-memory validation summary for Confluence.
+
+    Interactive tier summary only. No sidecar exists, so
+    ``validation_artifact_path`` and ``validation_artifact_hash`` are
+    ``None``. Modeled on the ImpactSearch / Spymaster UI summary
+    pattern (PR #170 / PR #173).
+    """
+    agg = contract.get("baseline_aggregate") or {}
+    strategies = contract.get("strategies") or []
+    sharpe_deltas = []
+    return_deltas = []
+    for s in strategies:
+        d = s.get("aggregate_baseline_delta") or {}
+        if d.get("mean_sharpe_delta") is not None:
+            sharpe_deltas.append(d["mean_sharpe_delta"])
+        if d.get("mean_return_delta") is not None:
+            return_deltas.append(d["mean_return_delta"])
+    return {
+        "validation_contract_version": contract.get("validation_contract_version"),
+        "validation_status": contract.get("validation_status"),
+        "run_id": contract.get("run_id"),
+        "app_surface": contract.get("app_surface"),
+        "n_strategies_tested": contract.get("n_strategies_tested"),
+        "n_strategies_reported": contract.get("n_strategies_reported"),
+        "n_strategies_survived_empirical": contract.get(
+            "n_strategies_survived_empirical",
+        ),
+        "multiple_comparisons_control_method": contract.get(
+            "multiple_comparisons_control_method",
+        ),
+        "multiple_comparisons_control_alpha": contract.get(
+            "multiple_comparisons_control_alpha",
+        ),
+        "walk_forward_n_folds": contract.get("walk_forward_n_folds"),
+        "mean_baseline_sharpe": agg.get("mean_baseline_sharpe"),
+        "mean_sharpe_delta": _confluence_mean_finite(sharpe_deltas),
+        "mean_return_delta": _confluence_mean_finite(return_deltas),
+        "validation_artifact_path": None,
+        "validation_artifact_hash": None,
+        "issues": list(contract.get("issues") or []),
+    }
+
+
+def _confluence_validation_completion_lines(
+    validation_summary: Optional[Mapping[str, Any]],
+):
+    """Operator-visible validation lines for Confluence multi-primary."""
+    if validation_summary is None:
+        return []
+    out = []
+    status = validation_summary.get("validation_status")
+    if status == "failed":
+        issues = validation_summary.get("issues") or []
+        first_issue = str(issues[0]) if issues else "unknown failure"
+        out.append(f"Validation: FAILED - {first_issue}.")
+        return out
+    n_tested = validation_summary.get("n_strategies_tested")
+    n_reported = validation_summary.get("n_strategies_reported")
+    n_survived_emp = validation_summary.get("n_strategies_survived_empirical")
+    alpha = validation_summary.get("multiple_comparisons_control_alpha")
+    delta = validation_summary.get("mean_sharpe_delta")
+    if delta is None:
+        delta_text = "n/a"
+    else:
+        try:
+            delta_f = float(delta)
+            if not np.isfinite(delta_f):
+                delta_text = "n/a"
+            else:
+                delta_text = f"{delta_f:.2f}"
+        except (TypeError, ValueError):
+            delta_text = "n/a"
+    out.append(
+        f"Validation: {n_reported} of {n_tested} survived BH at "
+        f"alpha={alpha} ({n_survived_emp} empirically validated). "
+        f"Mean Sharpe delta vs baseline: {delta_text}."
+    )
+    return out
+
+
+def _run_confluence_multi_primary_validation(
+    *,
+    secondary_ticker: str,
+    primary_tickers: Sequence[str],
+    invert_flags: Sequence[bool],
+    mute_flags: Sequence[bool],
+    selected_intervals: Sequence[str],
+    run_id: Optional[str] = None,
+    n_permutations: int = DEFAULT_N_PERMUTATIONS,
+    n_bootstrap_samples: int = DEFAULT_N_BOOTSTRAP_SAMPLES,
+    rng_seed: Optional[int] = None,
+):
+    """Run in-memory walk-forward validation for Confluence multi-primary.
+
+    Interactive tier per locked 5C-1 §13.1: NO sidecar, NO manifest
+    persistence. Returns a compact UI summary dict, or ``None`` when
+    validation raises (failure is non-fatal in the interactive path).
+    """
+    rid = run_id or generate_run_id("confluence", "multi_primary_interactive")
+    try:
+        adapter = ConfluenceMultiPrimaryValidationAdapter(
+            secondary_ticker=secondary_ticker,
+            primary_tickers=primary_tickers,
+            invert_flags=invert_flags,
+            mute_flags=mute_flags,
+            selected_intervals=selected_intervals,
+        )
+        history_index = adapter.history_index()
+        contract = validate_strategy_set(
+            adapter, history_index,
+            run_id=rid,
+            producer_engine="confluence",
+            app_surface="multi_primary_interactive",
+            alpha=DEFAULT_ALPHA,
+            initial_train_days=DEFAULT_INITIAL_TRAIN_DAYS,
+            test_window_days=DEFAULT_TEST_WINDOW_DAYS,
+            step_days=DEFAULT_STEP_DAYS,
+            n_permutations=int(n_permutations),
+            n_bootstrap_samples=int(n_bootstrap_samples),
+            borderline_tolerance_multiplier=DEFAULT_BORDERLINE_TOLERANCE_MULTIPLIER,
+            rng_seed=rng_seed,
+        )
+        return _confluence_validation_ui_summary(contract)
+    except Exception as exc:
+        logger.warning(
+            "[5C-2e] Confluence multi-primary validation raised; "
+            "returning None: %s: %s",
+            type(exc).__name__, exc,
+        )
+        return None
+
+
 def _expected_stats_from_state(price: pd.Series, conf_df: pd.DataFrame, today: pd.Timestamp,
                                state_key: str = 'tier', horizons=(5,20,60),
-                               min_samples: int = 40, fallback: str = 'dir') -> dict:
+                               min_samples: int = 40, fallback: str = 'dir',
+                               *, data_available_through: Optional[pd.Timestamp] = None) -> dict:
     """
     Build forward-return cohort using all past dates with the SAME state as today.
     If sample size < min_samples, fallback to broader cohort (e.g., 'dir').
@@ -2544,6 +3438,13 @@ def _expected_stats_from_state(price: pd.Series, conf_df: pd.DataFrame, today: p
         horizons: Forward return horizons in bars
         min_samples: Minimum samples before fallback
         fallback: Fallback key if samples too few ('dir' or 'align_bucket')
+        data_available_through: Phase 5C-2e cutoff guard. Default
+            ``None`` preserves existing behavior. Under a non-None
+            cutoff, ``price`` and ``conf_df`` are sliced to rows
+            ``<= cutoff`` before forward-return / cohort construction.
+            ``today`` is clamped to the latest available date
+            ``<= cutoff`` (and to the latest available date
+            ``<= today`` when ``today`` is not exactly in the index).
 
     Returns:
         Dict with effective_key, state_value, by_horizon stats, cohorts, sample_size
@@ -2557,6 +3458,47 @@ def _expected_stats_from_state(price: pd.Series, conf_df: pd.DataFrame, today: p
     # Prepare optional bucket if needed later
     conf_df = conf_df.copy()
     conf_df['align_bucket'] = conf_df['alignment_pct'].apply(_align_bucket)
+
+    # Phase 5C-2e cutoff guard. Slice price + conf_df to rows
+    # `index <= cutoff` BEFORE _forward_returns is called so future
+    # post-cutoff bars cannot leak into cohorts. Adjust ``today`` to
+    # the latest available date <= cutoff.
+    def _empty_stats():
+        empty_cols = pd.Index([f'F+{k}' for k in horizons])
+        return {
+            'effective_key': state_key,
+            'state_value': None,
+            'by_horizon': {c: {'N': 0, 'Win%': 0.0, 'Mean': 0.0, 'Median': 0.0,
+                               'P05': 0.0, 'P25': 0.0, 'P75': 0.0, 'P95': 0.0}
+                           for c in empty_cols},
+            'cohorts': {c: pd.Series(dtype=float) for c in empty_cols},
+            'sample_size': 0,
+        }
+
+    if data_available_through is not None:
+        cutoff_ts = pd.Timestamp(data_available_through)
+        if getattr(cutoff_ts, "tz", None) is not None:
+            try:
+                cutoff_ts = cutoff_ts.tz_convert(None)
+            except Exception:
+                cutoff_ts = cutoff_ts.tz_localize(None)
+        try:
+            price = price.loc[price.index <= cutoff_ts]
+        except Exception:
+            pass
+        try:
+            conf_df = conf_df.loc[conf_df.index <= cutoff_ts]
+        except Exception:
+            pass
+        if today > cutoff_ts:
+            today = cutoff_ts
+    if conf_df is None or conf_df.empty:
+        return _empty_stats()
+    if today not in conf_df.index:
+        prior = conf_df.index[conf_df.index <= today]
+        if len(prior) == 0:
+            return _empty_stats()
+        today = prior.max()
 
     chosen_key = state_key
     state_today = conf_df.loc[today, chosen_key]
