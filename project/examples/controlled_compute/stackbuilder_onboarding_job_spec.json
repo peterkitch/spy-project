@@ -1,0 +1,46 @@
+{
+  "compute_contract_version": "controlled_compute_v1",
+  "run_id": "controlled-compute-stackbuilder-onboarding",
+  "description": "Phase 5D-1 onboarding: StackBuilder durable validation through controlled_compute. StackBuilder generates validation_run_id internally; controlled_compute discovers the new validation.json under project/output/validation/ after command success.",
+  "execution_mode": "serial",
+  "max_workers": 1,
+  "budget": {
+    "max_jobs": 1,
+    "max_wall_seconds_per_job": 3600,
+    "fail_fast": true
+  },
+  "jobs": [
+    {
+      "job_id": "stackbuilder-spy-smoke",
+      "command": [
+        "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe",
+        "project/stackbuilder.py",
+        "--secondary", "SPY",
+        "--primaries", "AAPL,MSFT,NVDA,QQQ,IWM",
+        "--top-n", "3",
+        "--bottom-n", "3",
+        "--max-k", "2",
+        "--search", "beam",
+        "--beam-width", "4",
+        "--exhaustive-k", "2",
+        "--min-trigger-days", "10",
+        "--jobs", "1",
+        "--no-progress",
+        "--output-format", "csv",
+        "--outdir", "project/output/stackbuilder_controlled_compute_onboarding"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 3600,
+      "producer_engine": "stackbuilder",
+      "app_surface": "run_directory",
+      "validation_sidecar_search_root": "project/output/validation",
+      "validation_sidecar_glob": "**/validation.json",
+      "validation_sidecar_required": true,
+      "metadata": {
+        "phase": "5D-1",
+        "onboarding": true,
+        "sidecar_coordination": "StackBuilder generates validation run_id internally via generate_run_id('stackbuilder', 'run_directory'); controlled_compute discovers the new validation.json by snapshotting project/output/validation before the run and matching exactly one new validation.json after the run."
+      }
+    }
+  ]
+}
