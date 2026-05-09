@@ -810,6 +810,58 @@ def _selected_pattern_cumulative_capture(
     return out.reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------------
+# Phase 6B-1: canonical research_day_v1 artifact integration
+# ---------------------------------------------------------------------------
+
+
+def _read_research_day_artifact_for_pair(
+    signal_source: str,
+    target: str,
+):
+    """Return the saved canonical day-by-day artifact for the
+    (signal source, target) pair, or None when none exists / the
+    file is missing or corrupt. Wraps
+    ``research_artifacts.read_research_day_artifact`` so callers
+    don't have to import the artifact module directly."""
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None
+    path = ra.artifact_path_for_impactsearch(target, signal_source)
+    if path is None:
+        return None
+    return ra.read_research_day_artifact(path)
+
+
+def _build_research_day_artifact_for_pair(
+    signal_source: str,
+    target: str,
+    summary_overrides: Optional[Mapping[str, Any]] = None,
+) -> Optional[Path]:
+    """Build + persist a canonical research_day_v1 artifact for the
+    (signal source, target) pair from local saved data. Returns the
+    on-disk path on success, or None when the source PKLs are
+    missing / corrupt. Strictly local; no network."""
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None
+    artifact = ra.build_impactsearch_day_artifact_from_local(
+        target, signal_source,
+        summary_overrides=summary_overrides,
+    )
+    if artifact is None:
+        return None
+    path = ra.artifact_path_for_impactsearch(target, signal_source)
+    if path is None:
+        return None
+    try:
+        return ra.write_research_day_artifact(artifact, path)
+    except Exception:
+        return None
+
+
 # Confluence stack: per-timeframe stable library suffixes. Mirrors
 # the order used by ``_timeframe_coverage_for_ticker``.
 _CONFLUENCE_TIMEFRAMES: list[tuple[str, str]] = [
@@ -2320,6 +2372,84 @@ def build_app() -> Any:
             )
         return log[-200:]
 
+    @app.callback(
+        Output("log-store", "data", allow_duplicate=True),
+        Input("btn-build-chart-data", "n_clicks"),
+        State("selected-row-store", "data"),
+        State("results-store", "data"),
+        State("meta-store", "data"),
+        State("log-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _build_chart_data_action(
+        _clicks, selected_row, results_data, meta, log,
+    ):
+        """Phase 6B-1 single-row artifact generator. Builds and saves
+        exactly one ``research_day_v1`` artifact for the currently
+        selected pattern. Bounded, offline, error-trapped, never
+        triggers a 36k-row batch."""
+        log = list(log or [])
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        row = selected_row or _auto_select_best_row(
+            results_data, meta or {},
+        )
+        if not isinstance(row, dict):
+            log.append(
+                f"[{ts}] build chart data: nothing selected; "
+                "load a saved ticker study first."
+            )
+            return log[-200:]
+        signal_source = row.get("Primary Ticker") or row.get("primary_ticker")
+        target = (
+            row.get("Secondary Ticker") or row.get("secondary_ticker")
+            or (meta or {}).get("target") or DEFAULT_TARGET
+        )
+        if not signal_source or not target:
+            log.append(
+                f"[{ts}] build chart data: missing signal source or "
+                "ticker on the selected row."
+            )
+            return log[-200:]
+        signal_source = str(signal_source).strip().upper()
+        target = str(target).strip().upper()
+        overrides = {
+            "total_capture_pct": row.get("Total Capture (%)"),
+            "avg_daily_capture_pct": row.get("Avg Daily Capture (%)"),
+            "sharpe_ratio": row.get("Sharpe"),
+            "trigger_days": row.get("Trigger Days"),
+            "wins": row.get("Wins"),
+            "losses": row.get("Losses"),
+            "p_value": row.get("P-Value"),
+            "significant_95": (
+                str(row.get("Significant 95%") or "").strip().upper()
+                == "YES"
+            ),
+        }
+        try:
+            path = _build_research_day_artifact_for_pair(
+                signal_source, target,
+                summary_overrides=overrides,
+            )
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build chart data failed for "
+                f"{signal_source} on {target}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return log[-200:]
+        if path is None:
+            log.append(
+                f"[{ts}] build chart data: saved local data missing "
+                f"for {signal_source} on {target}."
+            )
+            return log[-200:]
+        log.append(
+            f"[{ts}] saved chart data for {signal_source} on "
+            f"{target}. Re-open the saved ticker study to refresh "
+            "the chart."
+        )
+        return log[-200:]
+
     # Clientside scroll-into-view callbacks for the three left-rail
     # navigate buttons. They run in the browser (no server hop) and
     # take the user directly to the target detail section. The
@@ -3178,6 +3308,22 @@ def build_app() -> Any:
             # key-values card and the reconciliation line follow.
             _render_cumulative_capture_chart(row, meta),
             _render_cumulative_capture_reconcile(row, meta),
+            # Phase 6B-1: explicit one-row generator. Materializes a
+            # canonical research_day_v1 artifact for the currently
+            # selected (signal source, target) pair. Bounded, local,
+            # offline. Clicks log Activity messages; the live chart
+            # picks up the new artifact on next render.
+            html.Button(
+                "Build chart data for this pattern",
+                id="btn-build-chart-data",
+                n_clicks=0,
+                style={**btn_style,
+                       "marginTop": "6px",
+                       "marginBottom": "0",
+                       "width": "100%",
+                       "boxSizing": "border-box",
+                       "fontSize": "11px"},
+            ),
             # The id="selected-pattern-body" is the target of the
             # _render_selected_pattern_only callback, which updates
             # only this subsection on row click.
@@ -3218,13 +3364,31 @@ def build_app() -> Any:
             row_total = None
         if not signal_source or not target:
             return html.Div(style={"display": "none"})
-        df = _selected_pattern_cumulative_capture(signal_source, target)
-        if df is None or df.empty:
-            return html.Div(style={"display": "none"})
-        try:
-            chart_final = float(df["cum_capture"].iloc[-1])
-        except Exception:
-            return html.Div(style={"display": "none"})
+        chart_final = None
+        artifact_present = False
+        # Phase 6B-1: prefer the saved artifact's rebuilt cumulative
+        # for parity. Fall back to the live reconstruction.
+        artifact = _read_research_day_artifact_for_pair(
+            signal_source, target,
+        )
+        if artifact is not None and artifact.daily:
+            artifact_present = True
+            try:
+                chart_final = float(
+                    artifact.daily[-1].get("cumulative_capture_pct")
+                )
+            except Exception:
+                chart_final = None
+        if chart_final is None:
+            df = _selected_pattern_cumulative_capture(
+                signal_source, target,
+            )
+            if df is None or df.empty:
+                return html.Div(style={"display": "none"})
+            try:
+                chart_final = float(df["cum_capture"].iloc[-1])
+            except Exception:
+                return html.Div(style={"display": "none"})
         line = (
             f"Final cumulative capture: {chart_final:.2f}%   "
             + (
@@ -3237,6 +3401,12 @@ def build_app() -> Any:
             row_total is not None
             and abs(chart_final - row_total) > 1.0
         ):
+            # When the chart came from the saved artifact and still
+            # disagrees with the saved row's Total Capture (%), the
+            # mismatch is real (different metric grids). When the
+            # chart came from the reconstruction fallback, the
+            # mismatch is more likely a saved-date-window issue. The
+            # message stays neutral.
             children.append(html.Span(
                 "  Chart and table use different saved date windows.",
                 style={"color": PRJCT9_MUTED,
@@ -4321,13 +4491,18 @@ def build_app() -> Any:
     def _render_cumulative_capture_chart(selected_row, meta):
         """Primary chart for the Selected Pattern panel: real
         cumulative capture over time for the (signal source, target)
-        pair, reconstructed from saved local data. Daily capture
-        follows ImpactSearch's mapping (Buy = +pct_change*100, Short
-        = -pct_change*100, None = 0); cumulative capture is the
-        running sum in percentage points.
+        pair.
 
-        Returns an honest fallback panel when the saved daily signal
-        history for the chosen signal source isn't available."""
+        Source preference:
+          1. Saved Phase 6B-1 day-by-day artifact at
+             ``output/research_artifacts/impactsearch/<TARGET>/<SRC>.research_day.json``.
+             Engine-canonical: same daily path used to compute the
+             saved Total Capture (%).
+          2. Reconstructed fallback via
+             ``_selected_pattern_cumulative_capture`` (separate
+             stable signal library + Spymaster cache).
+
+        Honest fallback panel when neither source resolves."""
         signal_source = None
         target = None
         if isinstance(selected_row, dict):
@@ -4370,26 +4545,61 @@ def build_app() -> Any:
 
         if not signal_source or not target:
             return empty_msg
-        df = _selected_pattern_cumulative_capture(signal_source, target)
-        if df is None or df.empty:
-            return empty_msg
+
+        dates: list = []
+        signals: list = []
+        cum: list = []
+        daily: list = []
+        chart_source = "rebuilt"
+        # Phase 6B-1: prefer the saved canonical artifact when present.
+        artifact = _read_research_day_artifact_for_pair(
+            signal_source, target,
+        )
+        if artifact is not None and artifact.daily:
+            chart_source = "artifact"
+            for row in artifact.daily:
+                dates.append(row.get("date"))
+                signals.append(row.get("signal"))
+                cum.append(row.get("cumulative_capture_pct"))
+                daily.append(row.get("daily_capture_pct"))
+        else:
+            df = _selected_pattern_cumulative_capture(
+                signal_source, target,
+            )
+            if df is None or df.empty:
+                return empty_msg
+            dates = list(df["date"])
+            signals = list(df["signal"])
+            cum = list(df["cum_capture"])
+            daily = list(df["daily_capture"])
+
         try:
             import plotly.graph_objects as go
         except Exception:
             return empty_msg
 
-        hover_text = [
-            f"{pd.Timestamp(d).strftime('%Y-%m-%d')}<br>"
-            f"Signal: {s}<br>"
-            f"Daily Capture: {dc:.4f}%<br>"
-            f"Cumulative Capture: {cc:.4f}%"
-            for d, s, dc, cc in zip(
-                df["date"], df["signal"],
-                df["daily_capture"], df["cum_capture"],
+        hover_text = []
+        for d, s, dc, cc in zip(dates, signals, daily, cum):
+            try:
+                ds = pd.Timestamp(d).strftime("%Y-%m-%d")
+            except Exception:
+                ds = str(d)
+            try:
+                dc_f = float(dc)
+            except Exception:
+                dc_f = 0.0
+            try:
+                cc_f = float(cc)
+            except Exception:
+                cc_f = 0.0
+            hover_text.append(
+                f"{ds}<br>"
+                f"Signal: {s}<br>"
+                f"Daily Capture: {dc_f:.4f}%<br>"
+                f"Cumulative Capture: {cc_f:.4f}%"
             )
-        ]
         fig = go.Figure(go.Scatter(
-            x=df["date"], y=df["cum_capture"],
+            x=list(dates), y=list(cum),
             mode="lines",
             line={"color": PRJCT9_GREEN, "width": 1.4},
             hovertext=hover_text,
@@ -4421,6 +4631,27 @@ def build_app() -> Any:
                    "border": f"1px solid {PRJCT9_BORDER}",
                    "padding": "6px 8px"},
             children=[
+                # Plain-language source line: "Chart data: exact saved
+                # path" when the saved Phase 6B-1 artifact rendered;
+                # "Chart data: rebuilt from local signal files" when
+                # the reconstruction fallback rendered. Read by the
+                # reconcile line below the chart for parity surfacing.
+                html.Div(
+                    (
+                        "Chart data: exact saved path"
+                        if chart_source == "artifact"
+                        else "Chart data: rebuilt from local signal files"
+                    ),
+                    id="cumulative-capture-source",
+                    style={"color": (
+                            PRJCT9_GREEN if chart_source == "artifact"
+                            else PRJCT9_MUTED
+                          ),
+                          "fontSize": "10px",
+                          "letterSpacing": "1px",
+                          "textTransform": "uppercase",
+                          "marginBottom": "4px"},
+                ),
                 dcc.Graph(figure=fig, config={"displayModeBar": False}),
             ],
         )
