@@ -999,6 +999,99 @@ def _spymaster_cache_dir() -> Path:
     return Path(__file__).resolve().parent / "cache" / "results"
 
 
+def _read_confluence_artifact_for_target(target: str):
+    """Phase 6B-3: read the saved confluence day-by-day artifact for
+    ``target`` when present. Returns None for missing / corrupt
+    files."""
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None
+    path = ra.artifact_path_for_confluence(target)
+    if path is None:
+        return None
+    return ra.read_research_day_artifact(path)
+
+
+def _build_confluence_artifact_for_target(
+    target: str,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Phase 6B-3: materialize a confluence day-by-day artifact for
+    the studied ticker.
+
+    Returns ``(path, None)`` on success or ``(None, reason_code)``
+    when a step in the pipeline cannot resolve. ``reason_code`` is
+    one of:
+
+      - ``"no_libraries"``       : no saved confluence libraries for
+                                   the target (no per-timeframe PKL
+                                   and no Spymaster fallback cache).
+      - ``"target_cache_missing"`` : target Spymaster cache PKL absent
+                                     (needed for the daily Close
+                                     series).
+      - ``"build_failed"``       : the confluence engine ran but
+                                   produced no aligned grid.
+      - ``"write_failed"``       : artifact built but write failed.
+      - ``"engine_unavailable"`` : ``research_artifacts`` import
+                                   failed.
+
+    Strictly local; no network. Never imports
+    ``confluence.py`` / ``trafficflow.py``.
+    """
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None, "engine_unavailable"
+    if not target or not isinstance(target, str):
+        return None, "no_libraries"
+    safe = target.strip().upper()
+    if not safe:
+        return None, "no_libraries"
+
+    cache_base = _spymaster_cache_dir()
+    sig_dir = _signal_library_dir()
+
+    # Resolve target cache path and signal-library form INDEPENDENTLY.
+    # Real local files often retain the original ticker form (e.g.,
+    # ``^GSPC_precomputed_results.pkl``); the filename-safe form
+    # (``_GSPC``) is the artifact-output form. The two file kinds
+    # may live under different ticker forms (mixed-form fixtures),
+    # so the preflight resolves each side independently.
+    target_pkl, _cache_form = ra._resolve_local_target_cache_path(
+        target, cache_base,
+    )
+    if target_pkl is None:
+        return None, "target_cache_missing"
+
+    library_form = ra._resolve_local_signal_library_form(
+        target, sig_dir, ra.CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+    # The analyzer's 1d Spymaster-cache fallback can satisfy "any
+    # library" when no stable PKL exists, using the resolved cache
+    # file. So having a cache without libraries does NOT trigger
+    # no_libraries; only the all-empty case does.
+    if library_form is None and target_pkl is None:
+        return None, "no_libraries"
+
+    try:
+        artifact = ra.build_confluence_day_artifact_from_local(
+            target,
+            sig_lib_dir=sig_dir,
+            cache_dir=cache_base,
+        )
+    except Exception:
+        return None, "build_failed"
+    if artifact is None:
+        return None, "build_failed"
+    path = ra.artifact_path_for_confluence(target)
+    if path is None:
+        return None, "write_failed"
+    try:
+        return ra.write_research_day_artifact(artifact, path), None
+    except Exception:
+        return None, "write_failed"
+
+
 # Confluence stack: per-timeframe stable library suffixes. Mirrors
 # the order used by ``_timeframe_coverage_for_ticker``.
 _CONFLUENCE_TIMEFRAMES: list[tuple[str, str]] = [
@@ -2653,6 +2746,69 @@ def build_app() -> Any:
         )
         return log[-200:]
 
+    @app.callback(
+        Output("log-store", "data", allow_duplicate=True),
+        Input("btn-build-confluence-chart-data", "n_clicks"),
+        State("meta-store", "data"),
+        State("log-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _build_confluence_chart_data_action(_clicks, meta, log):
+        """Phase 6B-3 single-target confluence artifact generator.
+        Builds and saves exactly one ``research_day_v1`` artifact for
+        the studied ticker. Bounded, offline, error-trapped; never
+        triggers a universe scan."""
+        log = list(log or [])
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        target = (meta or {}).get("target") or DEFAULT_TARGET
+        target = str(target).strip().upper()
+        try:
+            path, reason = _build_confluence_artifact_for_target(target)
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build confluence chart data failed for "
+                f"{target}: {type(exc).__name__}: {exc}"
+            )
+            return log[-200:]
+        if path is None:
+            if reason == "no_libraries":
+                msg = (
+                    f"build confluence chart data: no saved "
+                    f"confluence libraries for {target}."
+                )
+            elif reason == "target_cache_missing":
+                msg = (
+                    f"build confluence chart data: {target} price "
+                    "cache missing on this computer."
+                )
+            elif reason == "build_failed":
+                msg = (
+                    f"build confluence chart data: confluence build "
+                    f"failed for {target}."
+                )
+            elif reason == "write_failed":
+                msg = (
+                    f"build confluence chart data: artifact built "
+                    f"for {target} but the file could not be saved."
+                )
+            elif reason == "engine_unavailable":
+                msg = (
+                    "build confluence chart data: research artifact "
+                    "engine unavailable; restart the launcher."
+                )
+            else:
+                msg = (
+                    f"build confluence chart data: unknown failure "
+                    f"for {target}."
+                )
+            log.append(f"[{ts}] {msg}")
+            return log[-200:]
+        log.append(
+            f"[{ts}] saved confluence chart data for {target}. "
+            "Re-open the saved ticker study to refresh the chart."
+        )
+        return log[-200:]
+
     # Clientside scroll-into-view callbacks for the three left-rail
     # navigate buttons. They run in the browser (no server hop) and
     # take the user directly to the target detail section. The
@@ -3966,7 +4122,15 @@ def build_app() -> Any:
     def _render_stack_cumulative_chart(artifact):
         """Render the saved stack day-by-day artifact's cumulative
         capture as a single Plotly line. Sourced exclusively from the
-        saved artifact - never reconstructs."""
+        saved artifact - never reconstructs.
+
+        Surfaces a small reconciliation block: rebuilt final cumulative
+        capture (from the daily rows) vs the saved leaderboard
+        ``Total Capture (%)`` (when present in the artifact summary).
+        Differences greater than 1 percentage point flag the saved
+        date window mismatch plainly so the user does not assume the
+        chart number must equal the leaderboard number.
+        """
         try:
             import plotly.graph_objects as go
         except Exception:
@@ -4013,6 +4177,63 @@ def build_app() -> Any:
                 "font": {"color": PRJCT9_GREEN, "size": 12},
             },
         )
+
+        # Reconciliation block: show the rebuilt final cumulative
+        # capture from the saved daily rows alongside the saved
+        # leaderboard's Total Capture (%) when one is recorded in the
+        # artifact summary. Material mismatches (> 1 percentage point)
+        # surface a plain note so the user does not chase the
+        # discrepancy as a bug.
+        summary = artifact.summary or {}
+        final_cum = (
+            float(cum[-1]) if cum and cum[-1] is not None else None
+        )
+        saved_total_raw = summary.get("total_capture_pct")
+        try:
+            saved_total = (
+                float(saved_total_raw)
+                if saved_total_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            saved_total = None
+        rec_lines: list = []
+        if final_cum is not None:
+            rec_lines.append(
+                f"Final Cumulative Capture (%): {final_cum:.2f}"
+            )
+        if saved_total is not None:
+            rec_lines.append(
+                f"Saved Total Capture (%): {saved_total:.2f}"
+            )
+        mismatch_note = None
+        if (
+            final_cum is not None and saved_total is not None
+            and abs(final_cum - saved_total) > 1.0
+        ):
+            mismatch_note = (
+                "Chart and leaderboard use different saved date windows."
+            )
+        recon_block_children: list = []
+        if rec_lines:
+            recon_block_children.append(html.Div(
+                " | ".join(rec_lines),
+                id="stack-reconciliation-line",
+                style={"color": PRJCT9_TEXT,
+                       "fontSize": "11px",
+                       "letterSpacing": "0",
+                       "marginTop": "4px",
+                       "marginBottom": "2px"},
+            ))
+        if mismatch_note:
+            recon_block_children.append(html.Div(
+                mismatch_note,
+                id="stack-reconciliation-mismatch",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "10px",
+                       "fontStyle": "italic",
+                       "marginBottom": "4px"},
+            ))
+
         return html.Div(
             id="stack-cumulative-capture-chart",
             style={"marginTop": "10px",
@@ -4028,6 +4249,7 @@ def build_app() -> Any:
                            "textTransform": "uppercase",
                            "marginBottom": "4px"},
                 ),
+                *recon_block_children,
                 dcc.Graph(figure=fig, config={"displayModeBar": False}),
             ],
         )
@@ -4067,6 +4289,44 @@ def build_app() -> Any:
         snap = _real_confluence_snapshot_for_target(
             target, sig_lib_dir=sig_dir,
         )
+        # Phase 6B-3 artifact + build-button block. Threaded through
+        # ALL render branches (success, engine-unavailable, no-libs)
+        # so the user can always see whether saved confluence chart
+        # data exists and can always reach the build button.
+        def _append_confluence_artifact_block(_target=target):
+            confluence_artifact = _read_confluence_artifact_for_target(
+                _target,
+            )
+            if (
+                confluence_artifact is not None
+                and confluence_artifact.daily
+            ):
+                body.append(_render_confluence_cumulative_chart(
+                    confluence_artifact,
+                ))
+                body.append(_render_confluence_tier_distribution(
+                    confluence_artifact,
+                ))
+            else:
+                body.append(html.Div(
+                    "Confluence chart data has not been built yet.",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "11px",
+                           "lineHeight": "1.5",
+                           "marginTop": "8px"},
+                ))
+            body.append(html.Button(
+                "Build confluence chart data",
+                id="btn-build-confluence-chart-data",
+                n_clicks=0,
+                style={**btn_style,
+                       "marginTop": "8px",
+                       "marginBottom": "0",
+                       "width": "100%",
+                       "boxSizing": "border-box",
+                       "fontSize": "11px"},
+            ))
+
         # Engine import / load failure - fall back to the simple
         # last-signal helper so the user still sees Buy / Short / None
         # rather than a blank section. Engine snapshot tier is the
@@ -4084,6 +4344,7 @@ def build_app() -> Any:
                            "color": PRJCT9_MUTED,
                            "lineHeight": "1.5"},
                 ))
+                _append_confluence_artifact_block()
                 return _section_wrapper(
                     "time-windows-detail",
                     "TIME WINDOWS DETAIL",
@@ -4143,6 +4404,7 @@ def build_app() -> Any:
                     "fontSize": "10px",
                 },
             ))
+            _append_confluence_artifact_block()
             return _section_wrapper(
                 "time-windows-detail",
                 "TIME WINDOWS DETAIL",
@@ -4257,11 +4519,174 @@ def build_app() -> Any:
                  "color": PRJCT9_MUTED, "fontStyle": "italic"},
             ],
         ))
+
+        # Phase 6B-3: confluence day-by-day artifact preference. When a
+        # saved research_day_v1 confluence artifact exists for the
+        # studied ticker, render the real Confluence Capture Over Time
+        # chart + tier distribution. Otherwise show an honest deferred
+        # note plus a one-row "Build confluence chart data" button.
+        _append_confluence_artifact_block()
+
         return _section_wrapper(
             "time-windows-detail",
             "TIME WINDOWS DETAIL",
             "Buy / Short / None status across timeframes",
             body,
+        )
+
+    def _render_confluence_cumulative_chart(artifact):
+        """Render the saved confluence day-by-day artifact's
+        cumulative capture as a Plotly line. Sourced exclusively from
+        the saved artifact - never reconstructs."""
+        try:
+            import plotly.graph_objects as go
+        except Exception:
+            return html.Div(
+                "Plotly unavailable; cannot draw confluence chart.",
+                style={"color": PRJCT9_MUTED, "fontSize": "11px"},
+            )
+        daily = artifact.daily or []
+        dates = [r.get("date") for r in daily]
+        cum = [r.get("cumulative_capture_pct") or 0.0 for r in daily]
+        signals = [r.get("confluence_signal") for r in daily]
+        tiers = [r.get("confluence_tier") for r in daily]
+        daily_caps = [r.get("daily_capture_pct") or 0.0 for r in daily]
+        tf_snaps = [r.get("timeframe_signals") or {} for r in daily]
+        hover = []
+        for d, t, sig, tf, dc, cc in zip(
+            dates, tiers, signals, tf_snaps, daily_caps, cum,
+        ):
+            tf_text = " / ".join(
+                f"{k}: {v}" for k, v in tf.items()
+            )
+            hover.append(
+                f"{d}<br>"
+                f"Tier: {t}<br>"
+                f"Confluence: {sig}<br>"
+                f"Timeframes: {tf_text}<br>"
+                f"Daily Capture: {dc:.4f}%<br>"
+                f"Cumulative Capture: {cc:.4f}%"
+            )
+        fig = go.Figure(go.Scatter(
+            x=dates, y=cum, mode="lines",
+            line={"color": PRJCT9_GREEN, "width": 1.4},
+            hovertext=hover, hoverinfo="text",
+        ))
+        fig.add_hline(
+            y=0.0, line_color=PRJCT9_BORDER, line_width=1,
+        )
+        fig.update_layout(
+            paper_bgcolor=PRJCT9_BLACK,
+            plot_bgcolor=PRJCT9_BLACK,
+            font={"color": PRJCT9_TEXT, "family": "Consolas, monospace"},
+            xaxis={"gridcolor": PRJCT9_BORDER, "title": "Date"},
+            yaxis={"gridcolor": PRJCT9_BORDER,
+                   "title": "Cumulative Capture (%)"},
+            margin={"l": 56, "r": 12, "t": 28, "b": 36},
+            height=220,
+            title={
+                "text": "Confluence Capture Over Time",
+                "font": {"color": PRJCT9_GREEN, "size": 12},
+            },
+        )
+        summary = artifact.summary or {}
+        final_cum = (
+            float(cum[-1]) if cum and cum[-1] is not None else None
+        )
+        rec_lines: list = []
+        if final_cum is not None:
+            rec_lines.append(
+                f"Final Cumulative Capture (%): {final_cum:.2f}"
+            )
+        trig = summary.get("rebuilt_trigger_days")
+        if trig is not None:
+            rec_lines.append(f"Signal days: {int(trig)}")
+        return html.Div(
+            id="confluence-cumulative-capture-chart",
+            style={"marginTop": "10px",
+                   "border": f"1px solid {PRJCT9_BORDER}",
+                   "padding": "6px 8px"},
+            children=[
+                html.Div(
+                    "Chart data: exact saved confluence path",
+                    id="confluence-chart-source",
+                    style={"color": PRJCT9_GREEN,
+                           "fontSize": "10px",
+                           "letterSpacing": "1px",
+                           "textTransform": "uppercase",
+                           "marginBottom": "4px"},
+                ),
+                html.Div(
+                    " | ".join(rec_lines),
+                    id="confluence-reconciliation-line",
+                    style={"color": PRJCT9_TEXT,
+                           "fontSize": "11px",
+                           "marginTop": "2px",
+                           "marginBottom": "4px"},
+                ) if rec_lines else html.Div(),
+                dcc.Graph(figure=fig, config={"displayModeBar": False}),
+            ],
+        )
+
+    def _render_confluence_tier_distribution(artifact):
+        """Render a compact 7-tier count summary for the saved
+        confluence artifact. One row per tier, plain count."""
+        summary = artifact.summary or {}
+        tier_counts = summary.get("tier_counts") or {}
+        order = [
+            ("Strong Buy", "strong_buy"),
+            ("Buy", "buy"),
+            ("Weak Buy", "weak_buy"),
+            ("Neutral", "neutral"),
+            ("Weak Short", "weak_short"),
+            ("Short", "short"),
+            ("Strong Short", "strong_short"),
+        ]
+        rows = []
+        for label, key in order:
+            cnt = tier_counts.get(key)
+            try:
+                cnt_str = str(int(cnt)) if cnt is not None else "0"
+            except (TypeError, ValueError):
+                cnt_str = "0"
+            rows.append({"Tier": label, "Days": cnt_str})
+        return html.Div(
+            id="confluence-tier-distribution",
+            style={"marginTop": "8px"},
+            children=[
+                html.Div(
+                    "TIER DISTRIBUTION",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "letterSpacing": "1px",
+                           "marginBottom": "4px"},
+                ),
+                dash_table.DataTable(
+                    columns=[
+                        {"name": "Tier", "id": "Tier"},
+                        {"name": "Days", "id": "Days"},
+                    ],
+                    data=rows,
+                    style_table={"overflowX": "auto"},
+                    style_cell={
+                        "backgroundColor": PRJCT9_BLACK,
+                        "color": PRJCT9_TEXT,
+                        "fontFamily": "Consolas, 'Courier New', monospace",
+                        "fontSize": "11px",
+                        "padding": "4px 8px",
+                        "border": f"1px solid {PRJCT9_BORDER}",
+                        "textAlign": "left",
+                    },
+                    style_header={
+                        "backgroundColor": PRJCT9_DIM,
+                        "color": PRJCT9_GREEN,
+                        "fontWeight": "bold",
+                        "border": f"1px solid {PRJCT9_GREEN}",
+                        "letterSpacing": "1px",
+                        "fontSize": "10px",
+                    },
+                ),
+            ],
         )
 
     def _render_signal_rules_section():

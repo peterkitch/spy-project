@@ -1187,13 +1187,904 @@ def test_catalogue_index_empty_when_dir_missing(tmp_path: Path):
     assert idx["entries"] == []
 
 
-@pytest.mark.skip(reason="Phase 6B-3 scope (Confluence day-by-day)")
-def test_phase_6b3_confluence_artifact_placeholder():
-    raise NotImplementedError(
-        "Phase 6B-3 will add per-day 7-tier confluence path "
-        "artifacts via build_confluence_day_artifact "
-        "(engine='confluence')."
+# ---------------------------------------------------------------------------
+# Phase 6B-3: Confluence day-by-day artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_path_for_confluence(tmp_path: Path):
+    """Confluence artifacts live under
+    ``output/research_artifacts/confluence/<TARGET>/`` with a default
+    filename of ``<TARGET>.research_day.json``. ``run_id`` lets
+    multiple runs coexist."""
+    p = ra.artifact_path_for_confluence("SPY", base_dir=tmp_path)
+    assert p is not None
+    assert p == (
+        tmp_path / "confluence" / "SPY" / "SPY.research_day.json"
     )
+    p_run = ra.artifact_path_for_confluence(
+        "SPY", run_id="2026-05-09", base_dir=tmp_path,
+    )
+    assert p_run is not None
+    assert p_run.name == "SPY__2026-05-09.research_day.json"
+    # Caret normalizes.
+    p_gspc = ra.artifact_path_for_confluence("^GSPC", base_dir=tmp_path)
+    assert p_gspc is not None
+    assert p_gspc.parts[-2] == "_GSPC"
+    # Empty target returns None.
+    assert ra.artifact_path_for_confluence(
+        "", base_dir=tmp_path,
+    ) is None
+
+
+def test_confluence_tier_to_signal_mapping():
+    """Strong Buy / Buy / Weak Buy -> Buy. Strong Short / Short /
+    Weak Short -> Short. Neutral / Unknown / missing -> None."""
+    assert ra.confluence_tier_to_signal("Strong Buy") == "Buy"
+    assert ra.confluence_tier_to_signal("Buy") == "Buy"
+    assert ra.confluence_tier_to_signal("Weak Buy") == "Buy"
+    assert ra.confluence_tier_to_signal("Strong Short") == "Short"
+    assert ra.confluence_tier_to_signal("Short") == "Short"
+    assert ra.confluence_tier_to_signal("Weak Short") == "Short"
+    assert ra.confluence_tier_to_signal("Neutral") == "None"
+    assert ra.confluence_tier_to_signal("Unknown") == "None"
+    assert ra.confluence_tier_to_signal(None) == "None"
+    assert ra.confluence_tier_to_signal("") == "None"
+    # Case-insensitive head match.
+    assert ra.confluence_tier_to_signal("strong buy") == "Buy"
+    assert ra.confluence_tier_to_signal("STRONG SHORT") == "Short"
+
+
+def test_build_confluence_artifact_capture_and_t1_skip():
+    """Buy tier day -> +pct_change*100, Short tier day -> -pct_change
+    *100, Neutral -> 0; cumulative is running sum; T-1 skip drops the
+    trailing bar by default."""
+    idx = pd.bdate_range("2024-01-02", periods=5)
+    closes = [100.0, 110.0, 121.0, 108.9, 115.0]
+    tiers = ["Strong Buy", "Buy", "Neutral", "Strong Short", "Buy"]
+    snaps = [
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "Buy", "1y": "Buy"},
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "None", "1y": "None"},
+        {"1d": "Buy", "1wk": "Short", "1mo": "None",
+         "3mo": "None", "1y": "None"},
+        {"1d": "Short", "1wk": "Short", "1mo": "Short",
+         "3mo": "Short", "1y": "Short"},
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Short",
+         "3mo": "None", "1y": "Buy"},
+    ]
+    # No-skip variant, full 5 rows.
+    art_no_skip = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx, target_close=closes,
+        confluence_tiers=tiers, timeframe_signals=snaps,
+        persist_skip_bars=0,
+    )
+    daily = art_no_skip.daily
+    assert len(daily) == 5
+    assert daily[0]["confluence_signal"] == "Buy"
+    assert daily[1]["confluence_signal"] == "Buy"
+    assert daily[2]["confluence_signal"] == "None"
+    assert daily[3]["confluence_signal"] == "Short"
+    # Day 0 capture = 0 (first row, pct_change is 0).
+    # Day 1 capture = +10 (Buy, +10%).
+    # Day 2 capture = 0 (Neutral).
+    # Day 3 capture = +10 (Short, -10% return -> -1*-10=+10).
+    # Day 4 capture = +5.6 (Buy, +5.6%).
+    expected = [0.0, 10.0, 0.0, 10.0]
+    actual = [round(r["daily_capture_pct"], 6) for r in daily[:4]]
+    assert actual == expected
+    # T-1 default: trailing bar dropped.
+    art_default = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx, target_close=closes,
+        confluence_tiers=tiers, timeframe_signals=snaps,
+    )
+    assert art_default.persist_skip_bars == 1
+    assert len(art_default.daily) == 4
+
+
+def test_build_confluence_artifact_tier_counts_and_summary():
+    """Summary's ``tier_counts`` mirror the daily rows after the T-1
+    skip; ``rebuilt_total_capture_pct`` matches the daily sum."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx,
+        target_close=[100.0, 110.0, 99.0, 99.0],
+        confluence_tiers=[
+            "Strong Buy", "Buy", "Strong Short", "Neutral",
+        ],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "None", "1y": "None"},
+            {"1d": "Short", "1wk": "Short", "1mo": "Short",
+             "3mo": "Short", "1y": "Short"},
+            {"1d": "Buy", "1wk": "Short", "1mo": "Short",
+             "3mo": "Buy", "1y": "None"},
+        ],
+        persist_skip_bars=0,
+    )
+    counts = art.summary["tier_counts"]
+    assert counts["strong_buy"] == 1
+    assert counts["buy"] == 1
+    assert counts["strong_short"] == 1
+    assert counts["neutral"] == 1
+    assert counts["weak_buy"] == 0
+    assert counts["weak_short"] == 0
+    assert counts["short"] == 0
+    # Trigger days = Buy or Short tiers only -> 3 (Strong Buy, Buy,
+    # Strong Short). Neutral does not trigger.
+    assert art.summary["rebuilt_trigger_days"] == 3
+    # Day 0 (Buy, 0% ret) -> 0; Day 1 (Buy, +10%) -> +10;
+    # Day 2 (Short, -10%) -> +10. Sum = +20.
+    assert (
+        round(art.summary["rebuilt_total_capture_pct"], 6) == 20.0
+    )
+
+
+def test_build_confluence_artifact_unknown_tier_falls_to_neutral():
+    """Unknown / garbled tier strings normalize to Neutral with
+    confluence_signal=None and daily_capture=0."""
+    idx = pd.bdate_range("2024-01-02", periods=2)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx,
+        target_close=[100.0, 110.0],
+        confluence_tiers=["wat", None],
+        timeframe_signals=[
+            {"1d": "garbage", "1wk": "Buy", "1mo": "Short",
+             "3mo": "None", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+        ],
+        persist_skip_bars=0,
+    )
+    assert art.daily[0]["confluence_tier"] == "Neutral"
+    assert art.daily[0]["confluence_signal"] == "None"
+    assert art.daily[1]["confluence_tier"] == "Neutral"
+    # "garbage" timeframe value coerces to "missing".
+    assert art.daily[0]["timeframe_signals"]["1d"] == "missing"
+    # Phase 6B-3 amendment: active_count = Buy + Short ONLY (mirrors
+    # the production analyzer's active-frame semantics). The day-0
+    # snapshot is {1d: missing, 1wk: Buy, 1mo: Short, 3mo: None,
+    # 1y: Buy}, giving buy=2 + short=1 = 3 active. None is reported
+    # via none_count (= 1) and excluded from active_count.
+    # available_count (= 4) covers Buy + Short + None (loaded
+    # frames) but excludes "missing".
+    assert art.daily[0]["buy_count"] == 2
+    assert art.daily[0]["short_count"] == 1
+    assert art.daily[0]["none_count"] == 1
+    assert art.daily[0]["active_count"] == 3
+    assert art.daily[0]["available_count"] == 4
+
+
+def test_build_confluence_artifact_ascending_alignment_pct():
+    """When ``alignment_pcts`` is supplied (e.g., from the engine
+    directly), the artifact preserves it row-for-row instead of
+    recomputing from the snapshot."""
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx,
+        target_close=[100.0, 110.0, 99.0],
+        confluence_tiers=["Strong Buy", "Buy", "Strong Short"],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Short", "1wk": "Short", "1mo": "Short",
+             "3mo": "Short", "1y": "Short"},
+        ],
+        alignment_pcts=[100.0, 80.0, 100.0],
+        persist_skip_bars=0,
+    )
+    assert art.daily[0]["alignment_pct"] == pytest.approx(100.0)
+    assert art.daily[1]["alignment_pct"] == pytest.approx(80.0)
+    assert art.daily[2]["alignment_pct"] == pytest.approx(100.0)
+
+
+def test_confluence_artifact_write_read_roundtrip(tmp_path: Path):
+    """write_research_day_artifact + read_research_day_artifact
+    preserve the confluence-only fields (timeframes, min_active,
+    timeframe_signals, alignment_pct, tier_counts)."""
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=idx, target_close=[100.0, 110.0, 99.0],
+        confluence_tiers=["Strong Buy", "Buy", "Strong Short"],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "None", "1y": "None"},
+            {"1d": "Short", "1wk": "Short", "1mo": "Short",
+             "3mo": "Short", "1y": "Short"},
+        ],
+        persist_skip_bars=0,
+    )
+    path = ra.artifact_path_for_confluence("SPY", base_dir=tmp_path)
+    written = ra.write_research_day_artifact(art, path)
+    assert written.exists()
+    rehydrated = ra.read_research_day_artifact(written)
+    assert rehydrated is not None
+    assert rehydrated.engine == "confluence"
+    assert rehydrated.target_ticker == "SPY"
+    assert rehydrated.timeframes == [
+        "1d", "1wk", "1mo", "3mo", "1y",
+    ]
+    assert rehydrated.min_active == 2
+    assert "tier_counts" in (rehydrated.summary or {})
+    # Daily row roundtrip preserves the confluence-only fields.
+    first = rehydrated.daily[0]
+    assert first["confluence_tier"] == "Strong Buy"
+    assert first["confluence_signal"] == "Buy"
+    assert first["timeframe_signals"]["1d"] == "Buy"
+    assert "alignment_pct" in first
+
+
+def test_confluence_artifact_summarize():
+    """summarize_research_day_artifact returns the standard summary
+    shape for confluence artifacts."""
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx,
+        target_close=[100.0, 105.0, 110.0],
+        confluence_tiers=["Strong Buy", "Buy", "Buy"],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "None"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "None"},
+        ],
+        persist_skip_bars=0,
+    )
+    s = ra.summarize_research_day_artifact(art)
+    assert s["engine"] == "confluence"
+    assert s["rows"] == 3
+    assert s["first_date"] is not None
+    assert s["last_date"] is not None
+
+
+def test_build_confluence_artifact_from_local_returns_none_when_no_target_cache(
+    tmp_path: Path,
+):
+    """No target cache PKL on disk -> None, never raise."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "signal_library_stable"
+    sig.mkdir()
+    assert ra.build_confluence_day_artifact_from_local(
+        "ZZZNONE",
+        sig_lib_dir=sig, cache_dir=cache,
+    ) is None
+
+
+def test_build_confluence_artifact_from_local_returns_none_when_no_libraries(
+    tmp_path: Path,
+):
+    """Target cache present but no signal libraries on disk and no
+    Spymaster-fallback library -> None."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "signal_library_stable"
+    sig.mkdir()
+    # Lay down only a Close-bearing target cache; no signal libs.
+    import pickle as _pkl
+    idx = pd.date_range("2024-01-02", periods=3, freq="D")
+    target_df = pd.DataFrame({"Close": [100.0, 110.0, 99.0]}, index=idx)
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {},
+            "daily_top_short_pairs": {},
+        }, fh)
+    # Without the daily_top_*_pairs filled the analyzer's spymaster
+    # fallback projects an empty signal series, which the analyzer
+    # rejects. Builder must return None instead of raising.
+    out = ra.build_confluence_day_artifact_from_local(
+        "AAA", sig_lib_dir=sig, cache_dir=cache,
+    )
+    assert out is None
+
+
+def test_catalogue_index_includes_confluence(tmp_path: Path):
+    """The catalogue index counts confluence artifacts under
+    ``output/research_artifacts/confluence/<TARGET>/`` alongside
+    impactsearch + stackbuilder entries."""
+    base = tmp_path / "research_artifacts"
+    art_imp = ra.build_impactsearch_day_artifact(
+        target_ticker="SPY", signal_source="HRNNF",
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        signals=["Buy", "Buy", "None"],
+        target_close=[100.0, 105.0, 102.0],
+        persist_skip_bars=0,
+    )
+    ra.write_research_day_artifact(
+        art_imp, ra.artifact_path_for_impactsearch(
+            "SPY", "HRNNF", base_dir=base,
+        ),
+    )
+    art_stk = ra.build_stackbuilder_day_artifact(
+        target_ticker="SPY", run_id="seed_run", K=2,
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 105.0, 102.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "None"],
+            "BBB": ["Buy", "Buy", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    ra.write_research_day_artifact(
+        art_stk, ra.artifact_path_for_stackbuilder(
+            "SPY", "seed_run", K=2, base_dir=base,
+        ),
+    )
+    art_conf = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 105.0, 102.0],
+        confluence_tiers=["Strong Buy", "Buy", "Neutral"],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "None", "1y": "None"},
+            {"1d": "Buy", "1wk": "Short", "1mo": "None",
+             "3mo": "None", "1y": "None"},
+        ],
+        persist_skip_bars=0,
+    )
+    ra.write_research_day_artifact(
+        art_conf, ra.artifact_path_for_confluence("SPY", base_dir=base),
+    )
+
+    found = ra.discover_research_artifacts(base)
+    assert len(found) == 3
+    idx = ra.build_research_catalogue_index(base)
+    assert idx["counts"]["impactsearch"] == 1
+    assert idx["counts"]["stackbuilder"] == 1
+    assert idx["counts"]["confluence"] == 1
+    engines = sorted(e["engine"] for e in idx["entries"])
+    assert engines == ["confluence", "impactsearch", "stackbuilder"]
+
+
+def test_research_artifacts_still_clean_imports_after_phase_6b3():
+    """Phase 6B-3 hardening: even after adding the confluence
+    artifact builder, ``research_artifacts`` must NOT pull
+    confluence.py / dash / spymaster / trafficflow / impactsearch /
+    the confluence_analyzer into ``sys.modules`` at import time.
+    The analyzer is loaded lazily inside
+    ``build_confluence_day_artifact_from_local``; everything else
+    stays out of the import graph."""
+    import subprocess
+    code = (
+        "import sys; "
+        "sys.path.insert(0, r'" + str(PROJECT_DIR) + "'); "
+        "import research_artifacts as ra; "
+        "loaded = list(sys.modules); "
+        "banned = ["
+        "    'impactsearch', 'spymaster', 'trafficflow', "
+        "    'confluence', 'cross_ticker_confluence', 'dash', "
+        "    'signal_library.confluence_analyzer', "
+        "]; "
+        "leaks = [m for m in banned if m in loaded]; "
+        "print('LEAKS=' + ','.join(leaks))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0
+    out = proc.stdout.strip().splitlines()[-1]
+    leaked = (
+        out[len("LEAKS="):].split(",") if out != "LEAKS=" else []
+    )
+    leaked = [m for m in leaked if m]
+    assert not leaked, (
+        f"importing research_artifacts after Phase 6B-3 leaked "
+        f"heavy modules: {leaked!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-3 amendment: caret/index ticker file resolution
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_path_for_confluence_caret_normalizes_to_safe(
+    tmp_path: Path,
+):
+    """Output paths stay filename-safe (``^GSPC`` -> ``_GSPC``)
+    even though the input-side reads now also try the real form."""
+    p = ra.artifact_path_for_confluence("^GSPC", base_dir=tmp_path)
+    assert p is not None
+    assert p == (
+        tmp_path / "confluence" / "_GSPC" / "_GSPC.research_day.json"
+    )
+
+
+def test_confluence_ticker_form_candidates_orders_real_first():
+    """Real ticker form first, filename-safe second, de-duped."""
+    forms = ra._confluence_ticker_form_candidates("^GSPC")
+    assert forms == ["^GSPC", "_GSPC"]
+    # Plain ticker collapses to a single form.
+    assert ra._confluence_ticker_form_candidates("SPY") == ["SPY"]
+    # Whitespace + casing normalized.
+    assert ra._confluence_ticker_form_candidates(" spy ") == ["SPY"]
+
+
+def test_resolve_local_ticker_form_prefers_existing_caret_file(
+    tmp_path: Path,
+):
+    """When the caret-form file exists on disk, the resolver returns
+    the caret form so the analyzer call uses the real filename."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    (cache / "^GSPC_precomputed_results.pkl").write_bytes(b"")
+    form = ra._resolve_local_ticker_form(
+        "^GSPC", sig, cache, ra.CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+    assert form == "^GSPC"
+
+    # If only the filename-safe form is present, the resolver picks
+    # it up via the second-pass candidate.
+    cache2 = tmp_path / "cache_results_safe"
+    cache2.mkdir()
+    sig2 = tmp_path / "sig_safe"
+    sig2.mkdir()
+    (cache2 / "_GSPC_precomputed_results.pkl").write_bytes(b"")
+    form2 = ra._resolve_local_ticker_form(
+        "^GSPC", sig2, cache2, ra.CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+    assert form2 == "_GSPC"
+
+    # Neither form on disk -> None.
+    cache3 = tmp_path / "no_files_cache"
+    cache3.mkdir()
+    sig3 = tmp_path / "no_files_sig"
+    sig3.mkdir()
+    assert ra._resolve_local_ticker_form(
+        "^GSPC", sig3, cache3, ra.CONFLUENCE_TIMEFRAMES_DEFAULT,
+    ) is None
+
+
+def test_build_confluence_from_local_caret_ticker_resolves(
+    tmp_path: Path,
+):
+    """build_confluence_day_artifact_from_local must succeed against
+    a caret-named local fixture (^GSPC_precomputed_results.pkl +
+    ^GSPC_stable_v1_0_0.pkl) and not fall through to None just
+    because the filename-safe form is absent."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    idx = pd.date_range("2024-01-02", periods=4, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {
+                d: ((1, 2), 1.0) for d in idx
+            },
+            "daily_top_short_pairs": {
+                d: ((2, 1), 0.0) for d in idx
+            },
+        }, fh)
+    # Real-form daily stable lib so the analyzer's primary path
+    # (load_signal_library_interval) matches without falling back
+    # to the spymaster cache. ``_local_load_verified_signal_library``
+    # tolerates the absence of a manifest under the analyzer's
+    # legacy-PKL warning path.
+    with (sig / "^GSPC_stable_v1_0_0.pkl").open("wb") as fh:
+        _pkl.dump({
+            "primary_signals": ["Buy", "Buy", "Short", "Short"],
+            "dates": list(idx),
+        }, fh)
+
+    art = ra.build_confluence_day_artifact_from_local(
+        "^GSPC", cache_dir=cache, sig_lib_dir=sig,
+        persist_skip_bars=0,
+    )
+    assert art is not None, (
+        "caret-form fixture must produce a valid confluence artifact "
+        "via the real-ticker-form-first resolver"
+    )
+    assert art.engine == "confluence"
+    # The ARTIFACT records the upper-cased original ticker.
+    assert art.target_ticker == "^GSPC"
+    assert len(art.daily) > 0
+
+
+def test_build_confluence_from_local_filename_safe_ticker_still_resolves(
+    tmp_path: Path,
+):
+    """The fallback (filename-safe form) must still resolve when
+    only the safe-form files exist on disk."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    idx = pd.date_range("2024-01-02", periods=3, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "_GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {
+                d: ((1, 2), 1.0) for d in idx
+            },
+            "daily_top_short_pairs": {
+                d: ((2, 1), 0.0) for d in idx
+            },
+        }, fh)
+    with (sig / "_GSPC_stable_v1_0_0.pkl").open("wb") as fh:
+        _pkl.dump({
+            "primary_signals": ["Buy", "Buy", "Short"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_confluence_day_artifact_from_local(
+        "^GSPC", cache_dir=cache, sig_lib_dir=sig,
+        persist_skip_bars=0,
+    )
+    assert art is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-3 amendment: active_count semantics
+# ---------------------------------------------------------------------------
+
+
+def test_active_count_excludes_none_and_missing():
+    """Snapshot ``{1d: Buy, 1wk: None, 1mo: Short, 3mo: missing,
+    1y: missing}`` must produce buy_count=1, short_count=1,
+    none_count=1, active_count=2 (Buy + Short ONLY), and
+    alignment_pct=50.0 with min_active=2.
+
+    Active denominator excludes None and missing. Mirrors the
+    production confluence_analyzer.calculate_confluence rule.
+    """
+    idx = pd.bdate_range("2024-01-02", periods=1)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=idx, target_close=[100.0],
+        confluence_tiers=["Neutral"],
+        timeframe_signals=[{
+            "1d": "Buy", "1wk": "None", "1mo": "Short",
+            "3mo": "missing", "1y": "missing",
+        }],
+        min_active=2,
+        persist_skip_bars=0,
+    )
+    daily = art.daily[0]
+    assert daily["buy_count"] == 1
+    assert daily["short_count"] == 1
+    assert daily["none_count"] == 1
+    # active_count = Buy + Short only.
+    assert daily["active_count"] == 2
+    # available_count = Buy + Short + None (non-missing total).
+    assert daily["available_count"] == 3
+    # alignment_pct over the active denominator: max(1, 1) / 2 = 50.
+    assert daily["alignment_pct"] == pytest.approx(50.0)
+
+
+def test_alignment_pct_zero_when_below_min_active():
+    """When the active count (Buy + Short) is below min_active, the
+    alignment_pct must report 0.0 to match the production
+    analyzer's 'min-active gate' guard against overstating
+    confidence."""
+    idx = pd.bdate_range("2024-01-02", periods=1)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=idx, target_close=[100.0],
+        confluence_tiers=["Buy"],
+        timeframe_signals=[{
+            "1d": "Buy", "1wk": "None", "1mo": "None",
+            "3mo": "missing", "1y": "missing",
+        }],
+        min_active=2,
+        persist_skip_bars=0,
+    )
+    # Single active frame (Buy), below min_active=2 -> 0.0.
+    assert art.daily[0]["active_count"] == 1
+    assert art.daily[0]["alignment_pct"] == pytest.approx(0.0)
+
+
+def test_active_count_zero_when_all_none_or_missing():
+    """A row with no Buy and no Short reports active_count=0; None
+    is NOT counted as active."""
+    idx = pd.bdate_range("2024-01-02", periods=1)
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=idx, target_close=[100.0],
+        confluence_tiers=["Neutral"],
+        timeframe_signals=[{
+            "1d": "None", "1wk": "None", "1mo": "None",
+            "3mo": "missing", "1y": "missing",
+        }],
+        persist_skip_bars=0,
+    )
+    daily = art.daily[0]
+    assert daily["active_count"] == 0
+    assert daily["none_count"] == 3
+    assert daily["available_count"] == 3
+    assert daily["alignment_pct"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-3 amendment 2: linear-time builder + split resolvers
+# ---------------------------------------------------------------------------
+
+
+def test_compute_confluence_tier_pure_helper_matches_analyzer_rules():
+    """The pure tier helper must mirror
+    ``signal_library.confluence_analyzer.calculate_confluence``
+    decision rules exactly (without the alignment_since walk)."""
+    f = ra._compute_confluence_tier_from_counts
+    # Strong Buy / Strong Short
+    assert f(5, 0, 0, 2) == "Strong Buy"
+    assert f(0, 5, 0, 2) == "Strong Short"
+    # All active frames are Buy when None doesn't count
+    assert f(4, 0, 1, 2) == "Strong Buy"
+    # Mixed Buy + Short -> Neutral when neither cleanly dominates
+    assert f(1, 1, 1, 2) == "Neutral"
+    # Below min_active -> Neutral via the gate
+    assert f(1, 0, 2, 2) == "Neutral"
+    assert f(0, 0, 5, 2) == "Neutral"
+    # Buy gate: buy_pct >= 0.75 AND short == 0 -> Buy
+    assert f(3, 0, 1, 2) == "Strong Buy"  # buy(3)==active(3): Strong Buy
+    assert f(3, 0, 0, 2) == "Strong Buy"
+    # Buy: 4 Buy + 0 Short + 1 None -> active=4, buy=4 -> Strong Buy
+    # Synthesize a 'Buy' (not Strong) case: 6 Buy + 0 Short + 0 None
+    # is Strong Buy (all active). Need >=0.75 Buy with mixed:
+    # 7 Buy + 1 None + 0 Short and not all-active means must include
+    # short or none. Try 3 Buy + 0 Short + 1 None -> active=3, all
+    # Buy -> Strong Buy. The non-strong Buy tier requires buy<active,
+    # which means short>0, but the 'Buy' rule also requires short==0.
+    # That's the analyzer's intent: 'Buy' is only reachable when
+    # short == 0 yet buy < active (impossible). So 'Buy' is
+    # effectively unreachable through this code path -- matches the
+    # analyzer.
+    # Weak Buy: buy_pct >= 0.50 AND short_pct < 0.25
+    assert f(2, 0, 2, 2) == "Strong Buy"  # active=2, buy=2 -> Strong
+    # 3 Buy + 1 Short + 0 None -> active=4, buy_pct=0.75,
+    # short_pct=0.25; the gate requires short_pct<0.25 (strict);
+    # 0.25 fails -> Neutral. Analyzer behaves the same.
+    assert f(3, 1, 0, 2) == "Neutral"
+    # 3 Buy + 0 Short + 3 None -> active=3, all Buy -> Strong Buy.
+    assert f(3, 0, 3, 2) == "Strong Buy"
+    # 4 Buy + 0 Short + 4 None -> Strong Buy (all active).
+    assert f(4, 0, 4, 2) == "Strong Buy"
+    # 2 Buy + 1 Short + 1 None -> active=3, buy_pct=0.667,
+    # short_pct=0.333; Weak Buy gate fails (short_pct not <0.25);
+    # Weak Short gate fails (short_pct not >=0.5). -> Neutral.
+    assert f(2, 1, 1, 2) == "Neutral"
+    # Weak Short: 0 Buy + 2 Short + 2 None -> active=2, all Short
+    # -> Strong Short.
+    assert f(0, 2, 2, 2) == "Strong Short"
+    # Strong Short with mixed None
+    assert f(0, 3, 0, 2) == "Strong Short"
+    # Min-active gate when both active counts are zero.
+    assert f(0, 0, 0, 2) == "Neutral"
+
+
+def test_build_confluence_from_local_does_not_call_calculate_confluence_per_date(
+    tmp_path: Path, monkeypatch,
+):
+    """Phase 6B-3 amendment 2: the linear-time builder must NOT
+    call the analyzer's ``calculate_confluence`` per date. We prove
+    this by monkeypatching ``calculate_confluence`` to raise; if the
+    builder still produces a valid artifact, it isn't using the
+    O(N^2) analyzer path."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    idx = pd.date_range("2024-01-02", periods=10, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0 + i for i in range(10)]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {
+                d: ((1, 2), 1.0) for d in idx
+            },
+            "daily_top_short_pairs": {
+                d: ((2, 1), 0.0) for d in idx
+            },
+        }, fh)
+    with (sig / "AAA_stable_v1_0_0.pkl").open("wb") as fh:
+        _pkl.dump({
+            "primary_signals": ["Buy"] * 10,
+            "dates": list(idx),
+        }, fh)
+    # Explode if the builder ever delegates a per-date tier
+    # computation to the analyzer.
+    import signal_library.confluence_analyzer as _ca
+
+    def _boom(*_a, **_kw):
+        raise AssertionError(
+            "build_confluence_day_artifact_from_local must not call "
+            "signal_library.confluence_analyzer.calculate_confluence "
+            "per date (O(N^2) alignment_since walk). Use the pure "
+            "helper _compute_confluence_tier_from_counts instead."
+        )
+
+    monkeypatch.setattr(_ca, "calculate_confluence", _boom)
+
+    art = ra.build_confluence_day_artifact_from_local(
+        "AAA", cache_dir=cache, sig_lib_dir=sig,
+        persist_skip_bars=0,
+    )
+    assert art is not None
+    assert art.engine == "confluence"
+    assert len(art.daily) > 0
+    # Every day's tier resolves to one of the seven canonical labels.
+    tiers = {r["confluence_tier"] for r in art.daily}
+    assert tiers <= {
+        "Strong Buy", "Buy", "Weak Buy", "Neutral",
+        "Weak Short", "Short", "Strong Short",
+    }
+
+
+def test_resolve_local_target_cache_path_real_first(tmp_path: Path):
+    """The cache resolver tries the real ticker form first."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    (cache / "^GSPC_precomputed_results.pkl").write_bytes(b"")
+    p, form = ra._resolve_local_target_cache_path("^GSPC", cache)
+    assert form == "^GSPC"
+    assert p is not None
+    assert p.name == "^GSPC_precomputed_results.pkl"
+
+
+def test_resolve_local_target_cache_path_filename_safe_fallback(
+    tmp_path: Path,
+):
+    """When only the filename-safe form has a cache file, the
+    resolver falls back to it."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    (cache / "_GSPC_precomputed_results.pkl").write_bytes(b"")
+    p, form = ra._resolve_local_target_cache_path("^GSPC", cache)
+    assert form == "_GSPC"
+    assert p is not None
+    assert p.name == "_GSPC_precomputed_results.pkl"
+
+
+def test_resolve_local_signal_library_form_real_first(tmp_path: Path):
+    """The library resolver prefers the real ticker form."""
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    (sig / "^GSPC_stable_v1_0_0.pkl").write_bytes(b"")
+    form = ra._resolve_local_signal_library_form(
+        "^GSPC", sig, ra.CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+    assert form == "^GSPC"
+
+
+def test_resolve_local_signal_library_form_filename_safe_fallback(
+    tmp_path: Path,
+):
+    """Library resolver falls back to filename-safe when only that
+    form has a library file."""
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    (sig / "_GSPC_stable_v1_0_0_1wk.pkl").write_bytes(b"")
+    form = ra._resolve_local_signal_library_form(
+        "^GSPC", sig, ra.CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+    assert form == "_GSPC"
+
+
+def test_build_confluence_from_local_mixed_form_caret_lib_safe_cache(
+    tmp_path: Path,
+):
+    """Mixed-form fixture: library saved under the caret form
+    (^GSPC) and target cache saved under the filename-safe form
+    (_GSPC). The builder must succeed by resolving each side
+    independently."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    idx = pd.date_range("2024-01-02", periods=4, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    # Filename-safe target cache.
+    with (cache / "_GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {
+                d: ((1, 2), 1.0) for d in idx
+            },
+            "daily_top_short_pairs": {
+                d: ((2, 1), 0.0) for d in idx
+            },
+        }, fh)
+    # Caret-form daily stable library.
+    with (sig / "^GSPC_stable_v1_0_0.pkl").open("wb") as fh:
+        _pkl.dump({
+            "primary_signals": ["Buy", "Buy", "Short", "Short"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_confluence_day_artifact_from_local(
+        "^GSPC", cache_dir=cache, sig_lib_dir=sig,
+        persist_skip_bars=0,
+    )
+    assert art is not None, (
+        "mixed-form fixture (caret library + safe cache) must "
+        "still build via the split resolvers"
+    )
+    assert art.engine == "confluence"
+    assert art.target_ticker == "^GSPC"
+
+
+def test_build_confluence_from_local_mixed_form_safe_lib_caret_cache(
+    tmp_path: Path,
+):
+    """Reverse mixed-form fixture: library saved under the
+    filename-safe form (_GSPC) and target cache saved under the
+    caret form (^GSPC). The builder must still succeed."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    idx = pd.date_range("2024-01-02", periods=4, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    # Caret-form target cache.
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {
+                d: ((1, 2), 1.0) for d in idx
+            },
+            "daily_top_short_pairs": {
+                d: ((2, 1), 0.0) for d in idx
+            },
+        }, fh)
+    # Filename-safe daily stable library.
+    with (sig / "_GSPC_stable_v1_0_0.pkl").open("wb") as fh:
+        _pkl.dump({
+            "primary_signals": ["Buy", "Buy", "Short", "Short"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_confluence_day_artifact_from_local(
+        "^GSPC", cache_dir=cache, sig_lib_dir=sig,
+        persist_skip_bars=0,
+    )
+    assert art is not None, (
+        "reverse mixed-form fixture (safe library + caret cache) "
+        "must still build via the split resolvers"
+    )
+    # Output path stays filename-safe regardless of input form.
+    out_path = ra.artifact_path_for_confluence(
+        "^GSPC", base_dir=tmp_path,
+    )
+    assert out_path is not None
+    assert out_path.parts[-2] == "_GSPC"
 
 
 @pytest.mark.skip(reason="Phase 6B-4 scope (Traffic Flow pressure)")
