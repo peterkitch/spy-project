@@ -862,6 +862,143 @@ def _build_research_day_artifact_for_pair(
         return None
 
 
+def _read_stack_artifact_for_run(
+    target: str,
+    run_id: str,
+    K: int,
+):
+    """Phase 6B-2: read the saved stack day-by-day artifact for
+    (target, run_id, K) when present. Returns None for missing /
+    corrupt files."""
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None
+    path = ra.artifact_path_for_stackbuilder(target, run_id, K)
+    if path is None:
+        return None
+    return ra.read_research_day_artifact(path)
+
+
+def _build_stack_artifact_for_top_run(
+    target: str,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Phase 6B-2: materialize a stack day-by-day artifact for the
+    top (highest-K-or-first) leaderboard row of the studied ticker's
+    most recent saved StackBuilder run.
+
+    Returns ``(path, None)`` on success or ``(None, reason_code)``
+    when a step in the pipeline cannot resolve. ``reason_code`` is
+    one of the short tags below so the Activity log can render a
+    differentiated message:
+
+      - ``"no_run"``: no saved StackBuilder run for this ticker
+      - ``"target_cache_missing"``: target Spymaster cache PKL absent
+      - ``"no_member_caches"``: no readable member cache PKLs
+      - ``"write_failed"``: artifact built but write to disk failed
+      - ``"engine_unavailable"``: research_artifacts import failed
+
+    Strictly local; no network. Never imports spymaster / trafficflow.
+    """
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None, "engine_unavailable"
+    if not target or not isinstance(target, str):
+        return None, "no_run"
+    safe = target.strip().upper()
+    runs = _discover_stack_runs(_stack_output_dir())
+    target_runs = [r for r in runs if r["ticker"].upper() == safe]
+    if not target_runs:
+        return None, "no_run"
+    run = target_runs[0]
+    run_id = run.get("run_dir") or run.get("run_name")
+    if not run_id:
+        return None, "no_run"
+    lb = _load_stack_leaderboard(run["run_path"])
+    if lb is None or lb.empty:
+        return None, "no_run"
+    if "Members" not in lb.columns or "K" not in lb.columns:
+        return None, "no_run"
+    members_str = str(lb["Members"].iloc[0])
+    try:
+        K = int(pd.to_numeric(lb["K"], errors="coerce").iloc[0])
+    except Exception:
+        return None, "no_run"
+
+    # Differentiate the next two failure modes (target cache vs
+    # no readable member caches) by probing them ahead of the build.
+    cache_base = _spymaster_cache_dir()
+    safe_target_file = (
+        cache_base
+        / f"{ra._normalize_ticker_for_filename(target)}_precomputed_results.pkl"
+    )
+    if not safe_target_file.exists():
+        return None, "target_cache_missing"
+    parsed_members = ra.parse_stack_members_with_protocol(members_str)
+    any_member_readable = False
+    for ticker, _proto in parsed_members:
+        m_file = (
+            cache_base
+            / f"{ra._normalize_ticker_for_filename(ticker)}_precomputed_results.pkl"
+        )
+        if m_file.exists() and m_file.is_file():
+            any_member_readable = True
+            break
+    if not any_member_readable:
+        return None, "no_member_caches"
+
+    overrides = {
+        "total_capture_pct": (
+            lb["Total Capture (%)"].iloc[0]
+            if "Total Capture (%)" in lb.columns else None
+        ),
+        "sharpe_ratio": (
+            lb["Sharpe Ratio"].iloc[0]
+            if "Sharpe Ratio" in lb.columns else None
+        ),
+        "trigger_days": (
+            lb["Trigger Days"].iloc[0]
+            if "Trigger Days" in lb.columns else None
+        ),
+        "p_value": (
+            lb["p-Value"].iloc[0]
+            if "p-Value" in lb.columns else None
+        ),
+        "significant_95": (
+            (
+                str(lb["Significant 95%"].iloc[0]).strip().upper()
+                == "YES"
+            )
+            if "Significant 95%" in lb.columns else None
+        ),
+    }
+    artifact = ra.build_stackbuilder_day_artifact_from_local(
+        target, run_id, members_str=members_str, K=K,
+        summary_overrides=overrides,
+    )
+    if artifact is None:
+        # The pre-flight checks already separated target_cache_missing
+        # / no_member_caches paths, so this branch covers the
+        # remaining "all members unreadable despite a cache file"
+        # case (corrupt PKL etc.).
+        return None, "no_member_caches"
+    path = ra.artifact_path_for_stackbuilder(target, run_id, K)
+    if path is None:
+        return None, "write_failed"
+    try:
+        return ra.write_research_day_artifact(artifact, path), None
+    except Exception:
+        return None, "write_failed"
+
+
+def _spymaster_cache_dir() -> Path:
+    """Resolve the standalone Spymaster cache directory the artifact
+    builders read. Uses a project-relative path so it works under any
+    launcher cwd."""
+    return Path(__file__).resolve().parent / "cache" / "results"
+
+
 # Confluence stack: per-timeframe stable library suffixes. Mirrors
 # the order used by ``_timeframe_coverage_for_ticker``.
 _CONFLUENCE_TIMEFRAMES: list[tuple[str, str]] = [
@@ -2450,6 +2587,72 @@ def build_app() -> Any:
         )
         return log[-200:]
 
+    @app.callback(
+        Output("log-store", "data", allow_duplicate=True),
+        Input("btn-build-stack-chart-data", "n_clicks"),
+        State("meta-store", "data"),
+        State("log-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _build_stack_chart_data_action(_clicks, meta, log):
+        """Phase 6B-2 single-row stack artifact generator. Builds and
+        saves exactly one ``research_day_v1`` artifact for the top
+        leaderboard row of the studied ticker's most recent saved
+        StackBuilder run. Bounded, offline, error-trapped."""
+        log = list(log or [])
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        target = (meta or {}).get("target") or DEFAULT_TARGET
+        target = str(target).strip().upper()
+        try:
+            path, reason = _build_stack_artifact_for_top_run(target)
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build stack chart data failed for {target}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return log[-200:]
+        if path is None:
+            # Differentiated user-facing copy. Each branch maps to a
+            # specific failure mode so the user knows what saved
+            # local data is missing.
+            if reason == "no_run":
+                msg = (
+                    f"build stack chart data: no saved combined-"
+                    f"signal run found for {target}."
+                )
+            elif reason == "target_cache_missing":
+                msg = (
+                    f"build stack chart data: {target} price cache "
+                    "missing on this computer."
+                )
+            elif reason == "no_member_caches":
+                msg = (
+                    f"build stack chart data: stack member caches "
+                    f"are missing for {target}."
+                )
+            elif reason == "write_failed":
+                msg = (
+                    f"build stack chart data: artifact built for "
+                    f"{target} but the file could not be saved."
+                )
+            elif reason == "engine_unavailable":
+                msg = (
+                    "build stack chart data: research artifact "
+                    "engine unavailable; restart the launcher."
+                )
+            else:
+                msg = (
+                    f"build stack chart data: unknown failure for "
+                    f"{target}."
+                )
+            log.append(f"[{ts}] {msg}")
+            return log[-200:]
+        log.append(
+            f"[{ts}] saved stack chart data for {target}. Re-open "
+            "the saved ticker study to refresh the chart."
+        )
+        return log[-200:]
+
     # Clientside scroll-into-view callbacks for the three left-rail
     # navigate buttons. They run in the browser (no server hop) and
     # take the user directly to the target detail section. The
@@ -3083,10 +3286,27 @@ def build_app() -> Any:
         else:
             activity_line = "Nothing yet."
 
+        # Phase 6B-2: count of saved chartable research artifacts
+        # discovered under output/research_artifacts/. Filesystem-only;
+        # no engine import.
+        try:
+            import research_artifacts as _ra
+            artifacts = _ra.discover_research_artifacts()
+            n_chartable = len(artifacts)
+        except Exception:
+            n_chartable = 0
+        if n_chartable == 0:
+            chartable_line = "none built yet."
+        elif n_chartable == 1:
+            chartable_line = "1 saved chart artifact."
+        else:
+            chartable_line = f"{n_chartable} saved chart artifacts."
+
         cells = [
             ("Combined signals", stack_line),
             ("Time windows", tw_line),
             ("Signal rules", rules_line),
+            ("Chartable artifacts", chartable_line),
             ("Latest activity", activity_line),
         ]
 
@@ -3685,14 +3905,55 @@ def build_app() -> Any:
             except Exception:
                 pass
 
-        body.append(html.Div(
-            "Saved stack leaderboard does not include day-by-day "
-            "stack history, so cumulative stack capture is not "
-            "available yet.",
-            style={"color": PRJCT9_MUTED,
-                   "fontSize": "10px",
-                   "lineHeight": "1.5",
-                   "marginTop": "8px"},
+        # Phase 6B-2: stack day-by-day artifact preference. When a
+        # saved research_day_v1 stack artifact exists for the top
+        # leaderboard row of the studied-ticker run, render the real
+        # cumulative stack capture chart with an "exact saved stack
+        # path" source line. Otherwise show an honest deferred note
+        # plus a bounded one-row "Build stack chart data" button.
+        run_id_for_target = first_run.get("run_dir") or first_run.get(
+            "run_name",
+        )
+        top_K: Optional[int] = None
+        if lb is not None and not lb.empty and "K" in lb.columns:
+            try:
+                top_K = int(
+                    pd.to_numeric(lb["K"], errors="coerce").iloc[0]
+                )
+            except Exception:
+                top_K = None
+        stack_artifact = None
+        if (
+            run_id_for_target
+            and top_K is not None
+            and my_runs
+        ):
+            stack_artifact = _read_stack_artifact_for_run(
+                target, run_id_for_target, top_K,
+            )
+        if stack_artifact is not None and stack_artifact.daily:
+            body.append(_render_stack_cumulative_chart(stack_artifact))
+        else:
+            body.append(html.Div(
+                "Stack chart data has not been built yet.",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5",
+                       "marginTop": "8px"},
+            ))
+        # One-row build button. Only enabled for stacks belonging to
+        # the studied ticker (otherwise the user would build artifacts
+        # against unrelated runs).
+        body.append(html.Button(
+            "Build stack chart data",
+            id="btn-build-stack-chart-data",
+            n_clicks=0,
+            style={**btn_style,
+                   "marginTop": "8px",
+                   "marginBottom": "0",
+                   "width": "100%",
+                   "boxSizing": "border-box",
+                   "fontSize": "11px"},
         ))
 
         return _section_wrapper(
@@ -3700,6 +3961,75 @@ def build_app() -> Any:
             "COMBINED SIGNALS DETAIL",
             "stacks of agreeing signals",
             body,
+        )
+
+    def _render_stack_cumulative_chart(artifact):
+        """Render the saved stack day-by-day artifact's cumulative
+        capture as a single Plotly line. Sourced exclusively from the
+        saved artifact - never reconstructs."""
+        try:
+            import plotly.graph_objects as go
+        except Exception:
+            return html.Div(
+                "Plotly unavailable; cannot draw stack chart.",
+                style={"color": PRJCT9_MUTED, "fontSize": "11px"},
+            )
+        daily = artifact.daily or []
+        dates = [r.get("date") for r in daily]
+        cum = [r.get("cumulative_capture_pct") or 0.0 for r in daily]
+        signals = [r.get("combined_signal") for r in daily]
+        daily_caps = [r.get("daily_capture_pct") or 0.0 for r in daily]
+        hover = [
+            f"{d}<br>"
+            f"Combined: {s}<br>"
+            f"Daily Capture: {dc:.4f}%<br>"
+            f"Cumulative Capture: {cc:.4f}%"
+            for d, s, dc, cc in zip(dates, signals, daily_caps, cum)
+        ]
+        fig = go.Figure(go.Scatter(
+            x=dates, y=cum, mode="lines",
+            line={"color": PRJCT9_GREEN, "width": 1.4},
+            hovertext=hover, hoverinfo="text",
+        ))
+        fig.add_hline(
+            y=0.0, line_color=PRJCT9_BORDER, line_width=1,
+        )
+        member_label = ", ".join(artifact.members or [])[:80]
+        fig.update_layout(
+            paper_bgcolor=PRJCT9_BLACK,
+            plot_bgcolor=PRJCT9_BLACK,
+            font={"color": PRJCT9_TEXT, "family": "Consolas, monospace"},
+            xaxis={"gridcolor": PRJCT9_BORDER, "title": "Date"},
+            yaxis={"gridcolor": PRJCT9_BORDER,
+                   "title": "Cumulative Capture (%)"},
+            margin={"l": 56, "r": 12, "t": 28, "b": 36},
+            height=220,
+            title={
+                "text": (
+                    f"Stack Cumulative Capture - "
+                    f"K={artifact.K} on {artifact.target_ticker}"
+                    + (f" ({member_label})" if member_label else "")
+                ),
+                "font": {"color": PRJCT9_GREEN, "size": 12},
+            },
+        )
+        return html.Div(
+            id="stack-cumulative-capture-chart",
+            style={"marginTop": "10px",
+                   "border": f"1px solid {PRJCT9_BORDER}",
+                   "padding": "6px 8px"},
+            children=[
+                html.Div(
+                    "Chart data: exact saved stack path",
+                    id="stack-chart-source",
+                    style={"color": PRJCT9_GREEN,
+                           "fontSize": "10px",
+                           "letterSpacing": "1px",
+                           "textTransform": "uppercase",
+                           "marginBottom": "4px"},
+                ),
+                dcc.Graph(figure=fig, config={"displayModeBar": False}),
+            ],
         )
 
     def _render_time_windows_section(meta):

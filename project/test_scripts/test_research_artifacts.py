@@ -414,6 +414,278 @@ def test_preview_build_chart_data_button_present_in_layout():
     assert 'id="btn-build-chart-data"' in src
 
 
+def test_preview_build_stack_chart_data_button_present_in_layout():
+    """Phase 6B-2 lock: Combined Signals Detail must render the
+    'Build stack chart data' button + its callback id."""
+    pytest.importorskip("dash")
+    src = (
+        PROJECT_DIR / "phase6_research_preview.py"
+    ).read_text(encoding="utf-8")
+    assert "Build stack chart data" in src
+    assert 'id="btn-build-stack-chart-data"' in src
+    # Honest fallback copy when no stack artifact exists yet.
+    assert "Stack chart data has not been built yet." in src
+    # Phase 6B-1's "exact saved path" wording stays for ImpactSearch;
+    # the stack section uses the analogous "exact saved stack path".
+    assert "Chart data: exact saved stack path" in src
+
+
+def test_preview_combined_signals_uses_stack_artifact_when_present(
+    tmp_path, monkeypatch,
+):
+    """When a saved stack day-by-day artifact exists for the studied
+    ticker's top stack, Combined Signals Detail must render the
+    real stack cumulative-capture chart with the
+    'Chart data: exact saved stack path' source line."""
+    pytest.importorskip("dash")
+    sys.path.insert(0, str(PROJECT_DIR))
+    import phase6_research_preview as preview
+
+    # Synthesize a stack artifact + override the preview's reader to
+    # serve it without touching the live project's output dir.
+    art = ra.build_stackbuilder_day_artifact(
+        target_ticker="SPY", run_id="seed_run", K=2,
+        dates=pd.bdate_range("2024-01-02", periods=4),
+        target_close=[100.0, 105.0, 110.0, 100.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy", "Short"],
+            "BBB": ["Buy", "Buy", "Buy", "Short"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    monkeypatch.setattr(
+        preview, "_read_stack_artifact_for_run",
+        lambda target, run_id, K: art,
+    )
+
+    app = preview.build_app()
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 25.0, "Avg Daily Capture (%)": 0.25,
+        "Sharpe": 1.5, "Trigger Days": 100,
+        "P-Value": 0.01, "Significant 95%": "YES",
+    }]
+    meta = {"target": "SPY", "loaded_path": "mock.xlsx",
+            "stack_runs_for_target": 1,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    log = []
+    entry = app.callback_map["dashboard-main.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(sample, meta, log, None)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = json.dumps(_to_jsonlike(component), default=str)
+    assert "stack-cumulative-capture-chart" in text
+    assert "Chart data: exact saved stack path" in text
+    # Engine-truth labels still intact in the broader dashboard.
+    assert "Risk score" not in text
+    assert "Risk-adjusted score" not in text
+
+
+def test_preview_combined_signals_falls_back_when_no_stack_artifact(
+    monkeypatch,
+):
+    """When no stack artifact exists, the section must show the
+    honest 'Stack chart data has not been built yet.' copy and NOT
+    a stack-cumulative-capture chart."""
+    pytest.importorskip("dash")
+    sys.path.insert(0, str(PROJECT_DIR))
+    import phase6_research_preview as preview
+
+    monkeypatch.setattr(
+        preview, "_read_stack_artifact_for_run",
+        lambda *_a, **_kw: None,
+    )
+
+    app = preview.build_app()
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 25.0, "Avg Daily Capture (%)": 0.25,
+        "Sharpe": 1.5, "Trigger Days": 100,
+        "P-Value": 0.01, "Significant 95%": "YES",
+    }]
+    meta = {"target": "SPY", "loaded_path": "mock.xlsx",
+            "stack_runs_for_target": 1,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    log = []
+    entry = app.callback_map["dashboard-main.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(sample, meta, log, None)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = json.dumps(_to_jsonlike(component), default=str)
+    # Honest fallback copy present.
+    assert "Stack chart data has not been built yet." in text
+    # No stack chart container rendered.
+    assert "stack-cumulative-capture-chart" not in text
+    # Build button still present so the user can materialize the
+    # artifact.
+    assert "Build stack chart data" in text
+
+
+def test_preview_build_stack_chart_data_logs_missing_when_no_run(
+    monkeypatch,
+):
+    """The stack-build callback must log a plain Activity message
+    when the saved StackBuilder run / member caches are missing."""
+    pytest.importorskip("dash")
+    sys.path.insert(0, str(PROJECT_DIR))
+    import phase6_research_preview as preview
+
+    # Phase 6B-2 amendment: _build_stack_artifact_for_top_run now
+    # returns ``(path, reason)`` so the Activity log can render
+    # differentiated copy. Stub returns ``(None, "no_run")``.
+    monkeypatch.setattr(
+        preview, "_build_stack_artifact_for_top_run",
+        lambda target: (None, "no_run"),
+    )
+    app = preview.build_app()
+    cbmap = app.callback_map
+    # Find the stack-build callback registered against log-store.
+    target_key = None
+    for key in cbmap:
+        s = str(key)
+        if "log-store" in s and "btn-build-stack-chart-data" in s:
+            target_key = key
+            break
+    if target_key is None:
+        # Dash registers btn-build-stack-chart-data as Input on the
+        # callback whose Output is log-store.data; locate via inputs.
+        for key, entry in cbmap.items():
+            if "log-store" not in str(key):
+                continue
+            inputs = entry.get("inputs") or []
+            input_ids = [
+                inp.component_id if hasattr(inp, "component_id")
+                else inp.get("id") if isinstance(inp, dict) else None
+                for inp in inputs
+            ]
+            if "btn-build-stack-chart-data" in input_ids:
+                target_key = key
+                break
+    assert target_key is not None, (
+        "expected a callback bound to btn-build-stack-chart-data"
+    )
+
+
+def test_build_stack_returns_reason_codes_for_each_failure_mode(
+    monkeypatch, tmp_path,
+):
+    """``_build_stack_artifact_for_top_run`` must return the new
+    ``(path, reason)`` tuple. Each reason code maps to a distinct
+    user-facing Activity message: ``no_run`` /
+    ``target_cache_missing`` / ``no_member_caches`` / ``write_failed``
+    / ``engine_unavailable``."""
+    pytest.importorskip("dash")
+    sys.path.insert(0, str(PROJECT_DIR))
+    import phase6_research_preview as preview
+
+    # 1) no_run: no saved StackBuilder run for the target.
+    monkeypatch.setattr(
+        preview, "_discover_stack_runs", lambda *_a, **_kw: [],
+    )
+    out, reason = preview._build_stack_artifact_for_top_run("ZZZNONE")
+    assert out is None
+    assert reason == "no_run"
+
+
+def test_build_stack_chart_action_logs_differentiated_copy(
+    monkeypatch,
+):
+    """The stack-build callback's Activity message must differ per
+    reason code so the user knows which saved-data piece is
+    missing."""
+    pytest.importorskip("dash")
+    sys.path.insert(0, str(PROJECT_DIR))
+    import phase6_research_preview as preview
+
+    app = preview.build_app()
+    # Find the stack-build callback's wrapped function.
+    cbmap = app.callback_map
+    inner = None
+    for key, entry in cbmap.items():
+        if "log-store" not in str(key):
+            continue
+        inputs = entry.get("inputs") or []
+        input_ids = [
+            inp.component_id if hasattr(inp, "component_id")
+            else inp.get("id") if isinstance(inp, dict) else None
+            for inp in inputs
+        ]
+        if "btn-build-stack-chart-data" in input_ids:
+            cb = entry.get("callback")
+            inner = getattr(cb, "__wrapped__", cb)
+            break
+    assert inner is not None
+
+    cases = [
+        ("no_run", "no saved combined-signal run found"),
+        ("target_cache_missing", "price cache"),
+        ("no_member_caches", "stack member caches"),
+        ("write_failed", "could not be saved"),
+        ("engine_unavailable", "engine unavailable"),
+    ]
+    for reason, expected_substring in cases:
+        monkeypatch.setattr(
+            preview, "_build_stack_artifact_for_top_run",
+            lambda target, _r=reason: (None, _r),
+        )
+        log = inner(1, {"target": "SPY"}, [])
+        assert log, "expected at least one Activity log line"
+        last = str(log[-1])
+        assert expected_substring in last, (
+            f"reason {reason!r} should produce a message containing "
+            f"{expected_substring!r}; got {last!r}"
+        )
+
+
+def test_research_artifacts_still_clean_imports_after_amend():
+    """Phase 6B-2 amendment lock: even after adding the real-cache
+    extractor, ``research_artifacts`` must NOT pull spymaster /
+    trafficflow / impactsearch / dash / confluence at import time."""
+    import subprocess
+    code = (
+        "import sys; "
+        "sys.path.insert(0, r'" + str(PROJECT_DIR) + "'); "
+        "import research_artifacts as ra; "
+        "loaded = list(sys.modules); "
+        "banned = ["
+        "    'impactsearch', 'spymaster', 'trafficflow', "
+        "    'confluence', 'cross_ticker_confluence', 'dash', "
+        "    'signal_library.confluence_analyzer', "
+        "]; "
+        "leaks = [m for m in banned if m in loaded]; "
+        "print('LEAKS=' + ','.join(leaks))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0
+    out = proc.stdout.strip().splitlines()[-1]
+    leaked = (
+        out[len("LEAKS="):].split(",") if out != "LEAKS=" else []
+    )
+    leaked = [m for m in leaked if m]
+    assert not leaked, (
+        f"importing research_artifacts after Phase 6B-2 amendment "
+        f"leaked heavy modules: {leaked!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Network discipline
 # ---------------------------------------------------------------------------
@@ -448,12 +720,471 @@ def test_artifact_module_does_not_invoke_network(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="Phase 6B-2 scope (StackBuilder day-by-day)")
-def test_phase_6b2_stack_artifact_placeholder():
-    raise NotImplementedError(
-        "Phase 6B-2 will add stack day-by-day capture artifacts via "
-        "build_stackbuilder_day_artifact (engine='stackbuilder')."
+# ---------------------------------------------------------------------------
+# Phase 6B-2: import discipline + stack day-by-day artifacts +
+# catalogue index.
+# ---------------------------------------------------------------------------
+
+
+def test_research_artifacts_import_does_not_pull_heavy_modules():
+    """``research_artifacts`` must import cleanly without dragging
+    in Dash, Spymaster, TrafficFlow, ImpactSearch, or the confluence
+    analyzer. Importing those at artifact-helper level has bitten the
+    Dash cockpit in the past (ImportedInsideCallbackError). Run the
+    import in a fresh Python subprocess so the test is not polluted
+    by the parent process's already-imported modules."""
+    import subprocess
+    code = (
+        "import sys; "
+        "sys.path.insert(0, r'" + str(PROJECT_DIR) + "'); "
+        "import research_artifacts as ra; "
+        "loaded = list(sys.modules); "
+        "banned = ["
+        "    'impactsearch', 'spymaster', 'trafficflow', "
+        "    'confluence', 'cross_ticker_confluence', 'dash', "
+        "    'dash.dependencies', 'dash_html_components', "
+        "    'dash_core_components', 'plotly', "
+        "    'signal_library.confluence_analyzer', "
+        "]; "
+        "leaks = [m for m in banned if m in loaded]; "
+        "print('LEAKS=' + ','.join(leaks))"
     )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"subprocess import failed: stderr={proc.stderr!r}"
+    )
+    out = proc.stdout.strip().splitlines()[-1]
+    assert out.startswith("LEAKS="), (
+        f"unexpected subprocess stdout: {proc.stdout!r}"
+    )
+    leaked = out[len("LEAKS="):].split(",") if out != "LEAKS=" else []
+    leaked = [m for m in leaked if m]
+    assert not leaked, (
+        f"importing research_artifacts leaked heavy modules into "
+        f"sys.modules: {leaked!r}"
+    )
+
+
+def test_default_persist_skip_bars_is_constant():
+    """Phase 6B-2 hardening: DEFAULT_PERSIST_SKIP_BARS replaces the
+    lazy ``_resolve_default_skip()`` helper. Pin the constant so a
+    future refactor can't silently re-introduce a runtime
+    impactsearch import."""
+    assert ra.DEFAULT_PERSIST_SKIP_BARS == 1
+    # The legacy helper must be gone.
+    assert not hasattr(ra, "_resolve_default_skip")
+
+
+def test_artifact_path_for_stackbuilder(tmp_path: Path):
+    p = ra.artifact_path_for_stackbuilder(
+        "SPY", "seedTC__AAA-D_BBB-I", K=3, base_dir=tmp_path,
+    )
+    assert p is not None
+    assert p == (
+        tmp_path / "stackbuilder" / "SPY"
+        / "seedTC__AAA-D_BBB-I__K3.research_day.json"
+    )
+    # Caret/dot tickers normalize.
+    p2 = ra.artifact_path_for_stackbuilder(
+        "^GSPC", "run", K=2, base_dir=tmp_path,
+    )
+    assert p2 is not None
+    assert p2.parts[-2] == "_GSPC"
+    # Missing target / run_id / K return None.
+    assert ra.artifact_path_for_stackbuilder(
+        "", "run", K=1, base_dir=tmp_path,
+    ) is None
+    assert ra.artifact_path_for_stackbuilder(
+        "SPY", "", K=1, base_dir=tmp_path,
+    ) is None
+
+
+def test_parse_stack_members_with_protocol():
+    """Members parser must mirror trafficflow's protocol semantics
+    without importing trafficflow at runtime."""
+    parsed = ra.parse_stack_members_with_protocol(
+        "AAPL[D], MSFT[I], NVDA",
+    )
+    assert parsed == [("AAPL", "D"), ("MSFT", "I"), ("NVDA", None)]
+    # Bracketed list form
+    assert ra.parse_stack_members_with_protocol(
+        "[AAA, BBB]",
+    ) == [("AAA", None), ("BBB", None)]
+    # Whitespace + casing tolerated; trafficflow extra-suffix tolerated.
+    assert ra.parse_stack_members_with_protocol(
+        " psa[I] , jnyax[I] ",
+    ) == [("PSA", "I"), ("JNYAX", "I")]
+    # Empty input
+    assert ra.parse_stack_members_with_protocol(None) == []
+    assert ra.parse_stack_members_with_protocol("") == []
+
+
+def test_combine_member_signals_rules():
+    """PRJCT9 / Spymaster combine rule semantics."""
+    assert ra.combine_member_signals(
+        {"a": "Buy", "b": "Buy"}, K=1,
+    ) == "Buy"
+    assert ra.combine_member_signals(
+        {"a": "Short", "b": "Short"}, K=1,
+    ) == "Short"
+    assert ra.combine_member_signals(
+        {"a": "Buy", "b": "Short"}, K=1,
+    ) == "None"
+    assert ra.combine_member_signals(
+        {"a": "Buy", "b": "Buy", "c": "None"}, K=3,
+    ) == "None"
+    assert ra.combine_member_signals(
+        {"a": "Buy", "b": "Buy", "c": "None"}, K=2,
+    ) == "Buy"
+    assert ra.combine_member_signals(
+        {"a": "None", "b": "None"}, K=1,
+    ) == "None"
+
+
+def test_inverse_protocol_flips_signal_in_stack_artifact():
+    """Inverse member protocol flips the raw signal before agreement
+    counting. Inverse + Buy -> Short, Inverse + Short -> Buy."""
+    idx = pd.bdate_range("2024-01-02", periods=2)
+    art = ra.build_stackbuilder_day_artifact(
+        target_ticker="TGT", run_id="run", K=2,
+        dates=idx, target_close=[100.0, 110.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy"],
+            "BBB": ["Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "I"},
+        persist_skip_bars=0,
+    )
+    assert art.daily[1]["combined_signal"] == "None"
+    assert art.daily[1]["member_signals"]["AAA"] == "Buy"
+    assert art.daily[1]["member_signals"]["BBB"] == "Short"
+
+
+def test_stack_artifact_capture_and_t1_skip():
+    """Stack artifact: Buy combined day -> +ret*100, Short combined
+    day -> -ret*100, None -> 0; cumulative is running sum; T-1 skip
+    drops the trailing bar by default."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    art_no_skip = ra.build_stackbuilder_day_artifact(
+        target_ticker="TGT", run_id="run", K=2,
+        dates=idx, target_close=[100.0, 110.0, 121.0, 108.9],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy", "None"],
+            "BBB": ["Buy", "Buy", "Short", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    daily = art_no_skip.daily
+    assert daily[0]["combined_signal"] == "Buy"
+    assert daily[1]["combined_signal"] == "Buy"
+    assert daily[2]["combined_signal"] == "None"
+    assert daily[3]["combined_signal"] == "None"
+    expected = [0.0, 10.0, 0.0, 0.0]
+    actual = [round(r["daily_capture_pct"], 6) for r in daily]
+    assert actual == expected
+    art_default = ra.build_stackbuilder_day_artifact(
+        target_ticker="TGT", run_id="run", K=2,
+        dates=idx, target_close=[100.0, 110.0, 121.0, 108.9],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy", "None"],
+            "BBB": ["Buy", "Buy", "Short", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    assert art_default.persist_skip_bars == 1
+    assert len(art_default.daily) == 3
+
+
+def test_stack_artifact_write_read_roundtrip(tmp_path: Path):
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    art = ra.build_stackbuilder_day_artifact(
+        target_ticker="TGT", run_id="run42", K=2,
+        dates=idx, target_close=[100.0, 110.0, 99.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "None"],
+            "BBB": ["Buy", "Buy", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "I"},
+        persist_skip_bars=0,
+    )
+    path = ra.artifact_path_for_stackbuilder(
+        "TGT", "run42", K=2, base_dir=tmp_path,
+    )
+    written = ra.write_research_day_artifact(art, path)
+    assert written.exists()
+    rehydrated = ra.read_research_day_artifact(written)
+    assert rehydrated is not None
+    assert rehydrated.engine == "stackbuilder"
+    assert rehydrated.K == 2
+    assert rehydrated.members == ["AAA", "BBB"]
+    assert rehydrated.protocol_per_member == {"AAA": "D", "BBB": "I"}
+
+
+def test_extract_member_signals_from_active_pairs_cache_shape():
+    """Real Spymaster caches don't carry ``primary_signals`` / ``dates``
+    arrays - they carry ``preprocessed_data`` (DataFrame indexed by
+    date) + ``active_pairs`` (list of strings like ``"Buy 3,2"``).
+    The extractor must align ``active_pairs`` to the index using the
+    documented Spymaster rule: equal-length -> full index, off-by-one
+    -> ``index[1:]``."""
+    idx = pd.date_range("2024-01-02", periods=5, freq="D")
+    pre = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9, 115.0]}, index=idx,
+    )
+    # Off-by-one shape (real Spymaster historical PKL): len(active_pairs)
+    # = len(index) - 1 -> aligns to index[1:].
+    cache_off_by_one = {
+        "preprocessed_data": pre,
+        "active_pairs": [
+            "Buy 3,2", "Short 1,2", "None", "Buy 5,4",
+        ],
+    }
+    df = ra._extract_member_signals_from_spymaster_cache(
+        cache_off_by_one,
+    )
+    assert df is not None
+    assert list(df["signal"]) == ["Buy", "Short", "None", "Buy"]
+    assert list(df["date"]) == list(idx[1:])
+
+    # Full-length shape: len(active_pairs) == len(index).
+    cache_full = {
+        "preprocessed_data": pre,
+        "active_pairs": [
+            "None", "Buy 3,2", "Short 1,2", "None", "Buy 5,4",
+        ],
+    }
+    df_full = ra._extract_member_signals_from_spymaster_cache(
+        cache_full,
+    )
+    assert df_full is not None
+    assert list(df_full["signal"]) == [
+        "None", "Buy", "Short", "None", "Buy",
+    ]
+    assert list(df_full["date"]) == list(idx)
+
+    # Mismatched length: returns None instead of guessing.
+    cache_bad = {
+        "preprocessed_data": pre,
+        "active_pairs": ["Buy 3,2", "Short 1,2"],
+    }
+    assert ra._extract_member_signals_from_spymaster_cache(
+        cache_bad,
+    ) is None
+    # No preprocessed_data + no primary_signals -> None.
+    assert ra._extract_member_signals_from_spymaster_cache(
+        {"foo": "bar"},
+    ) is None
+
+
+def test_normalize_active_pair_to_signal_buckets():
+    """``active_pairs`` strings starting with ``Buy``/``Short``
+    map to those signals; everything else (``None``, empty,
+    unknown) -> ``None``."""
+    assert ra._normalize_active_pair_to_signal("Buy 3,2") == "Buy"
+    assert ra._normalize_active_pair_to_signal("Short 14,2") == "Short"
+    assert ra._normalize_active_pair_to_signal("None") == "None"
+    assert ra._normalize_active_pair_to_signal("") == "None"
+    assert ra._normalize_active_pair_to_signal(None) == "None"
+    assert ra._normalize_active_pair_to_signal("garbage") == "None"
+    # Case-insensitive head match.
+    assert ra._normalize_active_pair_to_signal("buy 1,2") == "Buy"
+    assert ra._normalize_active_pair_to_signal("SHORT 5,3") == "Short"
+
+
+def test_stack_artifact_from_local_uses_real_active_pairs_shape(
+    tmp_path: Path,
+):
+    """End-to-end: a fixture with real Spymaster cache shape
+    (preprocessed_data + active_pairs, no primary_signals / dates)
+    must produce a valid stack artifact whose member_signals reflect
+    the post-protocol view and whose combined_signal + cumulative
+    capture compose correctly."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.date_range("2024-01-02", periods=5, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9, 115.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "TGT_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+
+    # Real-shape member cache: preprocessed_data + active_pairs only.
+    member_pre = pd.DataFrame(
+        {"Close": [10.0, 11.0, 12.1, 10.89, 11.5]}, index=idx,
+    )
+    member_pre.index.name = "Date"
+    member_cache = {
+        "preprocessed_data": member_pre,
+        # Off-by-one: len(active_pairs) = 4, index = 5.
+        "active_pairs": [
+            "Buy 3,2", "Buy 3,2", "Short 1,2", "None",
+        ],
+    }
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump(member_cache, fh)
+
+    art = ra.build_stackbuilder_day_artifact_from_local(
+        "TGT", "run-real",
+        members_str="AAA[D]", K=1,
+        cache_dir=cache,
+        persist_skip_bars=0,
+    )
+    assert art is not None, (
+        "real-shape (active_pairs only) member cache must produce a "
+        "stack artifact via the Spymaster-cache extractor"
+    )
+    assert art.engine == "stackbuilder"
+    assert art.K == 1
+    assert art.members == ["AAA"]
+    assert art.protocol_per_member == {"AAA": "D"}
+    # 5 dates in target index; member signals align to index[1:],
+    # so date 0 has no member signal and is recorded as "missing"
+    # (excluded from agreement, combined -> None).
+    daily = art.daily
+    assert len(daily) == 5
+    assert daily[0]["member_signals"] == {"AAA": "missing"}
+    assert daily[0]["combined_signal"] == "None"
+    # Day 1: AAA=Buy[D] -> combined Buy. Return = +10% -> +10.
+    assert daily[1]["member_signals"] == {"AAA": "Buy"}
+    assert daily[1]["combined_signal"] == "Buy"
+    assert round(daily[1]["daily_capture_pct"], 6) == 10.0
+    # Day 2: AAA=Buy[D] -> combined Buy. Return +10% -> +10.
+    assert daily[2]["member_signals"] == {"AAA": "Buy"}
+    assert daily[2]["combined_signal"] == "Buy"
+    # Day 3: AAA=Short[D] -> combined Short. Return -10% -> +10.
+    assert daily[3]["member_signals"] == {"AAA": "Short"}
+    assert daily[3]["combined_signal"] == "Short"
+    # Cumulative monotonic non-decreasing through these gains.
+    cums = [r["cumulative_capture_pct"] for r in daily]
+    assert cums[0] == 0.0
+    assert cums[1] > 0
+    assert cums[3] > cums[2]
+
+
+def test_stack_artifact_from_local_handles_missing_member(
+    tmp_path: Path,
+):
+    """When a member's Spymaster cache PKL is missing, the
+    from-local builder marks its daily column as 'missing' but still
+    returns a valid artifact for the other members."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "TGT_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    aaa_payload = {
+        "preprocessed_data": target_df,
+        "primary_signals": ["Buy", "Buy", "Buy", "Buy"],
+        "dates": [d.strftime("%Y-%m-%d") for d in idx],
+    }
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump(aaa_payload, fh)
+
+    art = ra.build_stackbuilder_day_artifact_from_local(
+        "TGT", "run42",
+        members_str="AAA[D], BBB[D]", K=1,
+        cache_dir=cache,
+        persist_skip_bars=0,
+    )
+    assert art is not None
+    assert "AAA" in art.members
+    assert "BBB" in art.members
+    last = art.daily[-1]
+    assert last["member_signals"]["AAA"] == "Buy"
+    assert last["member_signals"]["BBB"] == "missing"
+
+
+def test_stack_artifact_from_local_returns_none_when_target_missing(
+    tmp_path: Path,
+):
+    """No target cache -> None, never raise."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    assert ra.build_stackbuilder_day_artifact_from_local(
+        "NOPE", "run",
+        members_str="AAA[D]", K=1,
+        cache_dir=cache,
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Catalogue index
+# ---------------------------------------------------------------------------
+
+
+def test_catalogue_index_discovers_impactsearch_and_stackbuilder(
+    tmp_path: Path,
+):
+    """The catalogue index must enumerate both ImpactSearch and
+    StackBuilder artifacts saved under output/research_artifacts/."""
+    base = tmp_path / "research_artifacts"
+    art_imp = ra.build_impactsearch_day_artifact(
+        target_ticker="SPY", signal_source="HRNNF",
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        signals=["Buy", "Buy", "None"],
+        target_close=[100.0, 105.0, 102.0],
+        persist_skip_bars=0,
+    )
+    p_imp = ra.artifact_path_for_impactsearch(
+        "SPY", "HRNNF", base_dir=base,
+    )
+    ra.write_research_day_artifact(art_imp, p_imp)
+    art_stk = ra.build_stackbuilder_day_artifact(
+        target_ticker="SPY", run_id="seed_run", K=2,
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 105.0, 102.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "None"],
+            "BBB": ["Buy", "Buy", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    p_stk = ra.artifact_path_for_stackbuilder(
+        "SPY", "seed_run", K=2, base_dir=base,
+    )
+    ra.write_research_day_artifact(art_stk, p_stk)
+
+    found = ra.discover_research_artifacts(base)
+    assert len(found) == 2
+    idx = ra.build_research_catalogue_index(base)
+    assert idx["counts"]["impactsearch"] == 1
+    assert idx["counts"]["stackbuilder"] == 1
+    assert "SPY" in idx["targets"]
+    engines = sorted(e["engine"] for e in idx["entries"])
+    assert engines == ["impactsearch", "stackbuilder"]
+    stack_entry = next(
+        e for e in idx["entries"] if e["engine"] == "stackbuilder"
+    )
+    assert stack_entry["K"] == 2
+    assert stack_entry["run_id"] == "seed_run"
+
+    idx_path = ra.write_research_catalogue_index(base)
+    assert idx_path.exists()
+    idx_read = ra.read_research_catalogue_index(base)
+    assert idx_read is not None
+    assert idx_read["counts"] == idx["counts"]
+
+
+def test_catalogue_index_empty_when_dir_missing(tmp_path: Path):
+    base = tmp_path / "no_such_dir"
+    assert ra.discover_research_artifacts(base) == []
+    idx = ra.build_research_catalogue_index(base)
+    assert idx["counts"]["impactsearch"] == 0
+    assert idx["counts"]["stackbuilder"] == 0
+    assert idx["targets"] == []
+    assert idx["entries"] == []
 
 
 @pytest.mark.skip(reason="Phase 6B-3 scope (Confluence day-by-day)")
