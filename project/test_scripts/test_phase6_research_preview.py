@@ -4927,14 +4927,16 @@ def test_catalogue_browser_callbacks_registered():
 
 def test_catalogue_browser_renders_required_text(monkeypatch):
     """The catalogue browser must surface the required headings,
-    the sort-rule caption, and the financially-correct labels."""
+    the sort-rule caption, and the financially-correct labels.
+    Phase 6C-2 amendment: input shape is the bounded browser
+    PAYLOAD, not the full snapshot."""
     pytest.importorskip("dash")
     import json as _json
     app = preview.build_app()
     entry = app.callback_map["catalogue-browser-section.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    snapshot = {
-        "schema": "research_catalogue_snapshot_v1",
+    payload = {
+        "schema": "research_catalogue_browser_payload_v1",
         "counts": {
             "engine": {
                 "market_scan": 1, "impactsearch": 2,
@@ -4944,11 +4946,7 @@ def test_catalogue_browser_renders_required_text(monkeypatch):
                       "no_saved_research": 0},
             "targets_total": 2,
         },
-        "targets": ["QQQ", "SPY"],
-        "chart_ready_targets": ["SPY"],
-        "targets_needing_chart_data": ["QQQ"],
-        "complete_coverage_targets": ["SPY"],
-        "entries": [],
+        "targets_total": 2,
         "top_opportunities": [
             {
                 "engine": "impactsearch", "label": "Single signals",
@@ -4959,8 +4957,19 @@ def test_catalogue_browser_renders_required_text(monkeypatch):
                 "trigger_days": 200, "significant_95": True,
             },
         ],
+        "top_opportunities_total": 1,
+        "targets_needing_chart_data": ["QQQ"],
+        "targets_needing_chart_data_total": 1,
+        "complete_coverage_targets": ["SPY"],
+        "complete_coverage_targets_total": 1,
+        "dropdown_targets": [
+            {"ticker": "SPY", "chart_ready": True},
+            {"ticker": "QQQ", "chart_ready": False},
+        ],
+        "dropdown_targets_total": 2,
+        "chart_ready_targets_total": 1,
     }
-    component = inner(snapshot)
+    component = inner(payload)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -4972,7 +4981,11 @@ def test_catalogue_browser_renders_required_text(monkeypatch):
 
     assert "RESEARCH CATALOGUE" in text
     assert "Best chart-ready research" in text
-    assert "Strong saved research that needs charts" in text
+    # Phase 6C-2 amendment: heading dropped the misleading "Strong"
+    # qualifier - saved-only rows have no Sharpe / Total Capture
+    # data so they cannot be called "strong".
+    assert "Saved research that needs charts" in text
+    assert "Strong saved research that needs charts" not in text
     assert "Targets with complete coverage" in text
     assert (
         "Sorted to put chart-ready, high-signal research first."
@@ -4990,26 +5003,30 @@ def test_catalogue_browser_renders_required_text(monkeypatch):
     assert "AAA" in text
 
 
-def test_catalogue_browser_dropdown_options_sourced_from_snapshot():
-    """The dropdown options callback must turn the snapshot's
-    targets list into selectable options, with chart-ready targets
-    on top and the option labels reflecting the chart-ready hint."""
+def test_catalogue_browser_dropdown_options_sourced_from_payload():
+    """The dropdown options callback must turn the bounded
+    ``dropdown_targets`` list of ``{"ticker", "chart_ready"}`` dicts
+    into selectable options. Chart-ready hint surfaces in the
+    label."""
     pytest.importorskip("dash")
     app = preview.build_app()
     entry = app.callback_map["catalogue-target-dropdown.options"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    snapshot = {
-        "targets": ["QQQ", "SPY", "TLT"],
-        "chart_ready_targets": ["SPY"],
+    payload = {
+        "dropdown_targets": [
+            {"ticker": "SPY", "chart_ready": True},
+            {"ticker": "QQQ", "chart_ready": False},
+            {"ticker": "TLT", "chart_ready": False},
+        ],
     }
-    options = inner(snapshot)
+    options = inner(payload)
     assert isinstance(options, list)
     values = [o["value"] for o in options]
-    # Chart-ready first
-    assert values.index("SPY") < values.index("QQQ")
-    assert values.index("SPY") < values.index("TLT")
+    assert values == ["SPY", "QQQ", "TLT"]
     spy_label = next(o["label"] for o in options if o["value"] == "SPY")
     assert "chart ready" in spy_label.lower()
+    qqq_label = next(o["label"] for o in options if o["value"] == "QQQ")
+    assert "chart ready" not in qqq_label.lower()
 
 
 def test_catalogue_browser_handles_empty_snapshot():
@@ -5176,9 +5193,25 @@ def test_build_missing_charts_returns_post_build_snapshot(monkeypatch):
     out = inner(1, {"target": "TGT9"}, [], None, [])
     assert isinstance(out, tuple) and len(out) == 3
     _log, _cat, snap = out
+    # Phase 6C-2 amendment: snap is now the bounded BROWSER PAYLOAD
+    # produced by build_catalogue_browser_payload, not the full
+    # snapshot. The full snapshot's ``targets`` list maps to the
+    # payload's ``dropdown_targets`` (capped) and
+    # ``dropdown_targets_total``; ``chart_ready_targets`` collapses
+    # to a count.
     assert isinstance(snap, dict)
-    assert snap.get("targets") == ["TGT9"]
-    assert snap.get("chart_ready_targets") == ["TGT9"]
+    assert snap.get("schema") == "research_catalogue_browser_payload_v1"
+    assert "entries" not in snap, (
+        "browser payload must not carry the full per-row entries "
+        "list; that stays server-side."
+    )
+    dropdown = snap.get("dropdown_targets") or []
+    assert any(
+        (d.get("ticker") == "TGT9" if isinstance(d, dict) else d == "TGT9")
+        for d in dropdown
+    )
+    assert snap.get("chart_ready_targets_total") == 1
+    assert snap.get("dropdown_targets_total") == 1
 
 
 def test_catalogue_browser_text_avoids_developer_only_words(monkeypatch):
@@ -5232,3 +5265,232 @@ def test_catalogue_browser_text_avoids_developer_only_words(monkeypatch):
             f"banned developer-only term {tok!r} leaked into "
             "the Research Catalogue browser"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-2 amendment: catalogue browser scale + sanitisation
+# ---------------------------------------------------------------------------
+
+
+def _payload_with_caps(
+    *, top: int, needing: int, complete: int, dropdown: int,
+    top_total: int = None, needing_total: int = None,
+    complete_total: int = None, dropdown_total: int = None,
+):
+    """Build a synthetic browser payload for UI-render tests."""
+    return {
+        "schema": "research_catalogue_browser_payload_v1",
+        "counts": {
+            "engine": {
+                "market_scan": 0, "impactsearch": top,
+                "stackbuilder": 0, "confluence": 0, "trafficflow": 0,
+            },
+            "state": {"chart_ready": top, "saved_research_found": 0,
+                      "no_saved_research": 0},
+            "targets_total": (
+                dropdown_total if dropdown_total is not None
+                else dropdown
+            ),
+        },
+        "targets_total": (
+            dropdown_total if dropdown_total is not None
+            else dropdown
+        ),
+        "top_opportunities": [
+            {"engine": "impactsearch", "label": "Single signals",
+             "target_ticker": f"T{i:05d}", "signal_source": "AAA",
+             "state": "chart_ready",
+             "total_capture_pct": 10.0, "sharpe_ratio": 1.0,
+             "trigger_days": 50, "significant_95": True}
+            for i in range(top)
+        ],
+        "top_opportunities_total": (
+            top_total if top_total is not None else top
+        ),
+        "targets_needing_chart_data": [
+            f"N{i:05d}" for i in range(needing)
+        ],
+        "targets_needing_chart_data_total": (
+            needing_total if needing_total is not None else needing
+        ),
+        "complete_coverage_targets": [
+            f"C{i:05d}" for i in range(complete)
+        ],
+        "complete_coverage_targets_total": (
+            complete_total if complete_total is not None else complete
+        ),
+        "dropdown_targets": [
+            {"ticker": f"D{i:05d}", "chart_ready": False}
+            for i in range(dropdown)
+        ],
+        "dropdown_targets_total": (
+            dropdown_total if dropdown_total is not None else dropdown
+        ),
+        "chart_ready_targets_total": top,
+    }
+
+
+def test_catalogue_browser_renders_showing_first_caption_when_capped():
+    """When the visible list is shorter than the total, the
+    browser must surface 'Showing first N of M.' so the user
+    knows the catalogue extends beyond what's rendered."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-browser-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = _payload_with_caps(
+        top=5, needing=50, complete=2, dropdown=500,
+        top_total=8,
+        needing_total=72_740,
+        complete_total=2,
+        dropdown_total=72_742,
+    )
+    component = inner(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    assert "Showing first 50 of 72,740." in text
+    # Top opportunities cap (5 visible / 8 total) also surfaces.
+    assert "Showing first 5 of 8." in text
+
+
+def test_catalogue_browser_does_not_render_70k_ticker_list():
+    """The needs-chart list must never be rendered as a 70k ticker
+    comma-list. With a capped payload, only ``max_needing`` strings
+    are visible."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-browser-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = _payload_with_caps(
+        top=0, needing=50, complete=0, dropdown=500,
+        needing_total=72_740, dropdown_total=72_742,
+    )
+    component = inner(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    # 50 visible -> N00000..N00049 strings appear, N00050+ do not.
+    assert "N00049" in text
+    assert "N00050" not in text
+    assert "N00100" not in text
+
+
+def test_catalogue_browser_payload_size_remains_bounded_at_scale():
+    """End-to-end scale assertion: feed the payload helper a
+    real-data-shaped input and confirm the rendered component's
+    JSON stays small."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-browser-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = _payload_with_caps(
+        top=25, needing=50, complete=50, dropdown=500,
+        needing_total=72_740, dropdown_total=72_742,
+    )
+    component = inner(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    blob = _json.dumps(_to_jsonlike(component), default=str)
+    # Bounded render: the static text + 25 row table + 50 needs
+    # tickers + 50 complete tickers + 500 hidden dropdown options
+    # is well under 500KB.
+    assert len(blob) < 500_000, (
+        f"rendered catalogue browser is {len(blob)} bytes; caps "
+        "are not constraining the surface enough."
+    )
+
+
+def test_catalogue_browser_dropdown_options_capped(monkeypatch):
+    """Dropdown options must come from dropdown_targets only, so
+    feeding 500 dicts returns 500 options regardless of the
+    underlying targets_total."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-target-dropdown.options"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = {
+        "dropdown_targets": [
+            {"ticker": f"T{i:05d}", "chart_ready": (i < 8)}
+            for i in range(500)
+        ],
+        "dropdown_targets_total": 73_000,
+    }
+    options = inner(payload)
+    assert len(options) == 500
+    # Chart-ready hint surfaces in the first eight labels.
+    chart_ready_count = sum(
+        1 for o in options if "chart ready" in (o.get("label") or "").lower()
+    )
+    assert chart_ready_count == 8
+
+
+def test_catalogue_browser_heading_drops_strong_qualifier():
+    """The 'Strong saved research that needs charts' heading is
+    misleading because saved-only rows lack Sharpe Ratio / Total
+    Capture (%) / Signal days. It has been replaced with 'Saved
+    research that needs charts'."""
+    src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
+        encoding="utf-8"
+    )
+    # The misleading literal must be gone from rendered code paths.
+    assert "Strong saved research that needs charts" not in src
+    assert "Saved research that needs charts" in src
+
+
+def test_dashboard_render_does_not_carry_full_targets_list_to_browser():
+    """Confirm the dashboard render callback does not feed the
+    catalogue browser the full snapshot - only the bounded
+    payload. Defensive scan of source so a future refactor can't
+    regress to ``.get('targets')`` on the browser callback's
+    Input."""
+    src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
+        encoding="utf-8"
+    )
+    # The browser render must read dropdown_targets / *_total from
+    # the payload, not the unbounded targets list.
+    assert "dropdown_targets" in src
+    assert "targets_needing_chart_data_total" in src
+    assert "top_opportunities_total" in src
+    assert "complete_coverage_targets_total" in src
+
+
+def test_empty_browser_payload_renders_without_raising(monkeypatch):
+    """Empty fallback payload (returned by the snapshot-store
+    callback when the catalogue module fails) must render the
+    browser cleanly with the empty-state copy."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-browser-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(preview._empty_browser_payload())
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    assert "RESEARCH CATALOGUE" in text
+    assert "No chart-ready research yet" in text
+    assert "No saved-only tickers waiting for chart data." in text

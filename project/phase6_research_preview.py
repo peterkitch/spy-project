@@ -992,6 +992,34 @@ def _build_stack_artifact_for_top_run(
         return None, "write_failed"
 
 
+def _empty_browser_payload() -> dict:
+    """Phase 6C-2 amendment: bounded fallback payload returned by the
+    snapshot-store callback when the catalogue module is
+    unavailable. Matches the schema produced by
+    ``research_catalogue.build_catalogue_browser_payload`` so the
+    downstream render does not branch on missing keys."""
+    return {
+        "schema": "research_catalogue_browser_payload_v1",
+        "generated_at": None,
+        "counts": {
+            "engine": {},
+            "state": {},
+            "targets_total": 0,
+        },
+        "targets_total": 0,
+        "top_opportunities": [],
+        "top_opportunities_total": 0,
+        "targets_needing_chart_data": [],
+        "targets_needing_chart_data_total": 0,
+        "complete_coverage_targets": [],
+        "complete_coverage_targets_total": 0,
+        "dropdown_targets": [],
+        "dropdown_targets_total": 0,
+        "chart_ready_targets_total": 0,
+        "caps": {},
+    }
+
+
 def _reason_text(reason: Optional[str], target: str) -> str:
     """Phase 6C-1: short, plain-language sentence for the build-
     missing-charts log lines. Mirrors the reason codes returned by
@@ -3118,6 +3146,14 @@ def build_app() -> Any:
     # ticker-change (uses TTL cache) and on Refresh catalogue index
     # clicks (force_refresh + persist). Build missing charts also
     # writes here via its own multi-output callback below.
+    #
+    # Phase 6C-2 amendment: dcc.Store holds the browser PAYLOAD, not
+    # the full snapshot. The full snapshot can be 30+ MB on a real
+    # catalogue and contains absolute filesystem paths the browser
+    # has no business seeing. The persistent on-disk JSON keeps the
+    # full snapshot for power-user inspection; the in-memory module
+    # cache holds the full snapshot for fast subsequent payload
+    # builds.
     @app.callback(
         Output("catalogue-snapshot-store", "data"),
         Input("meta-store", "data"),
@@ -3132,25 +3168,13 @@ def build_app() -> Any:
         force = trigger == "btn-refresh-catalogue-index"
         try:
             import research_catalogue as rc
-            return rc.get_catalogue_snapshot(
+            full_snapshot = rc.get_catalogue_snapshot(
                 force_refresh=force,
                 persist_if_built=force,
             )
+            return rc.build_catalogue_browser_payload(full_snapshot)
         except Exception:
-            return {
-                "schema": "research_catalogue_snapshot_v1",
-                "counts": {
-                    "engine": {},
-                    "state": {},
-                    "targets_total": 0,
-                },
-                "targets": [],
-                "chart_ready_targets": [],
-                "targets_needing_chart_data": [],
-                "complete_coverage_targets": [],
-                "entries": [],
-                "top_opportunities": [],
-            }
+            return _empty_browser_payload()
 
     # Phase 6C-1: refresh the catalogue store on ticker-change and
     # Refresh-catalogue clicks. Build missing charts owns its own
@@ -3439,8 +3463,17 @@ def build_app() -> Any:
         # rows produced by this sweep. Same race avoidance: own the
         # refresh here rather than letting another callback fire on
         # the same trigger.
+        # Phase 6C-2 amendment: emit the bounded BROWSER PAYLOAD,
+        # not the full snapshot. catalogue-snapshot-store ships
+        # through the websocket on every change, so we keep it
+        # small.
         try:
-            post_snapshot = rc.get_catalogue_snapshot(force_refresh=True)
+            post_snapshot_full = rc.get_catalogue_snapshot(
+                force_refresh=True,
+            )
+            post_snapshot = rc.build_catalogue_browser_payload(
+                post_snapshot_full,
+            )
         except Exception:
             post_snapshot = no_update
         return log[-200:], post_summary, post_snapshot
@@ -3748,29 +3781,33 @@ def build_app() -> Any:
         return _render_catalogue_browser(snapshot)
 
     # Update the dropdown options whenever the snapshot refreshes.
-    # Keeping options in sync with the snapshot lets a Refresh-
-    # catalogue-index click (or a successful Build missing charts
-    # sweep) immediately surface newly-discovered tickers in the
-    # selector without a page reload.
+    # Phase 6C-2 amendment: read the bounded ``dropdown_targets``
+    # list of ``{"ticker", "chart_ready"}`` dicts from the browser
+    # payload (capped at DEFAULT_MAX_DROPDOWN). The full targets
+    # list - up to 70k tickers in production - never reaches the
+    # browser. Tickers not in the dropdown stay reachable via the
+    # left-rail ticker input.
     @app.callback(
         Output("catalogue-target-dropdown", "options"),
         Input("catalogue-snapshot-store", "data"),
     )
     def _update_catalogue_dropdown_options(snapshot):
         snapshot = snapshot or {}
-        targets = list(snapshot.get("targets") or [])
-        chart_ready = set(snapshot.get("chart_ready_targets") or [])
-        # Sort: chart-ready first, then alphabetic for stability.
-        targets_sorted = sorted(
-            targets,
-            key=lambda t: (0 if t in chart_ready else 1, str(t).upper()),
-        )
+        dropdown_targets = list(snapshot.get("dropdown_targets") or [])
         options = []
-        for t in targets_sorted:
-            label = str(t)
-            if t in chart_ready:
-                label = f"{t}  -  chart ready"
-            options.append({"label": label, "value": t})
+        for d in dropdown_targets:
+            if isinstance(d, dict):
+                ticker = d.get("ticker")
+                ready = bool(d.get("chart_ready"))
+            else:
+                ticker = str(d)
+                ready = False
+            if not ticker:
+                continue
+            label = (
+                f"{ticker}  -  chart ready" if ready else str(ticker)
+            )
+            options.append({"label": label, "value": str(ticker)})
         return options
 
     # Independent callback that updates ONLY the Selected Pattern card.
@@ -4105,22 +4142,33 @@ def build_app() -> Any:
     def _render_catalogue_browser(snapshot):
         """Phase 6C-2 Research Catalogue browser.
 
-        Renders three lists fed by the cross-ticker snapshot:
+        Renders three lists fed by the cross-ticker browser payload:
           * Best chart-ready research      - top_opportunities table
-          * Strong saved research that
+          * Saved research that
             needs charts                   - targets_needing_chart_data
           * Targets with complete coverage - complete_coverage_targets
         Plus a target search/selector dropdown sourced from
-        snapshot["targets"]. The dropdown's options are populated by
+        ``dropdown_targets``. The dropdown's options are populated by
         a separate callback so the snapshot refresh stays in one
         place.
+
+        Phase 6C-2 amendment: this function reads the BROWSER
+        PAYLOAD shape (``research_catalogue_browser_payload_v1``).
+        Each list is already capped server-side; the render adds
+        ``"Showing first N of M."`` copy when the underlying total
+        exceeds the cap, so the user can see both what's visible
+        and the full count.
         """
         snapshot = snapshot or {}
         top_opps = list(snapshot.get("top_opportunities") or [])
+        top_total = int(snapshot.get("top_opportunities_total") or 0)
         needing = list(snapshot.get("targets_needing_chart_data") or [])
+        needing_total = int(
+            snapshot.get("targets_needing_chart_data_total") or 0,
+        )
         complete = list(snapshot.get("complete_coverage_targets") or [])
-        chart_ready_targets = list(
-            snapshot.get("chart_ready_targets") or []
+        complete_total = int(
+            snapshot.get("complete_coverage_targets_total") or 0,
         )
         counts = snapshot.get("counts") or {}
         engine_counts = counts.get("engine") or {}
@@ -4281,6 +4329,23 @@ def build_app() -> Any:
                 ],
             )
 
+        def _showing_first_caption(visible_count: int, total: int):
+            """Plain caption surfaced under each capped list when the
+            underlying total exceeds what's rendered. The text is
+            stable enough that tests can pin it - 'Showing first N
+            of M.' Numeric formatting uses thousands separators so
+            a 70k+ catalogue reads correctly on real data."""
+            if visible_count < total:
+                return html.Div(
+                    f"Showing first {visible_count:,} of {total:,}.",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "fontStyle": "italic",
+                           "marginTop": "4px",
+                           "marginBottom": "4px"},
+                )
+            return None
+
         body.append(html.Div(
             "Best chart-ready research",
             id="catalogue-browser-best-heading",
@@ -4293,10 +4358,17 @@ def build_app() -> Any:
                    "fontWeight": "bold"},
         ))
         body.append(_opp_table(top_opps))
+        cap_note = _showing_first_caption(len(top_opps), top_total)
+        if cap_note is not None:
+            body.append(cap_note)
 
-        # "Strong saved research that needs charts"
+        # Phase 6C-2 amendment: "Strong" was misleading because
+        # saved-only rows lack Sharpe Ratio / Total Capture (%) /
+        # Signal days. The heading now plainly describes what's in
+        # the list - tickers that have raw saved research but no
+        # chart-ready file yet.
         body.append(html.Div(
-            "Strong saved research that needs charts",
+            "Saved research that needs charts",
             id="catalogue-browser-needing-heading",
             style={"color": PRJCT9_GREEN,
                    "fontSize": "11px",
@@ -4322,6 +4394,9 @@ def build_app() -> Any:
                        "lineHeight": "1.5",
                        "wordBreak": "break-word"},
             ))
+            cap_note = _showing_first_caption(len(needing), needing_total)
+            if cap_note is not None:
+                body.append(cap_note)
 
         # "Targets with complete coverage"
         body.append(html.Div(
@@ -4353,6 +4428,11 @@ def build_app() -> Any:
                        "fontWeight": "bold",
                        "wordBreak": "break-word"},
             ))
+            cap_note = _showing_first_caption(
+                len(complete), complete_total,
+            )
+            if cap_note is not None:
+                body.append(cap_note)
 
         # Per-engine count strip so the user can see what kinds of
         # research dominate the catalogue at a glance.

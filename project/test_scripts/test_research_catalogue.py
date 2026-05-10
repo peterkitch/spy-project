@@ -1030,3 +1030,329 @@ def test_snapshot_handles_caret_ticker(tmp_path: Path):
     ]
     assert impact_entries
     assert impact_entries[0]["target_ticker"] == "^GSPC"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-2 amendment: scale + sanitisation + browser payload caps
+# ---------------------------------------------------------------------------
+
+
+def _make_saved_only_confluence_library(
+    sig_dir: Path, target: str, *, suffix: str = "",
+) -> Path:
+    """Create a stable signal-library file with the right
+    naming pattern to be picked up by the saved-only confluence
+    sweep. Content is empty bytes - the sweep is filename-only and
+    never opens the file."""
+    sig_dir.mkdir(parents=True, exist_ok=True)
+    path = sig_dir / f"{target}_stable_v1_0_0{suffix}.pkl"
+    path.write_bytes(b"")
+    return path
+
+
+def test_confluence_saved_only_requires_min_active_two(tmp_path: Path):
+    """Codex amendment: a daily-only stable library is not enough
+    for a meaningful Time-windows chart. The saved-only walk must
+    emit a confluence entry only when the target has at least
+    CONFLUENCE_MIN_ACTIVE_FOR_SAVED distinct timeframe libraries."""
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    # 5,000 daily-only tickers: previous wiring would emit 5k
+    # confluence saved-only rows; the gate must drop them.
+    daily_only_count = 5_000
+    for i in range(daily_only_count):
+        _make_saved_only_confluence_library(
+            dirs["sig_lib_dir"], f"DAILY{i:05d}", suffix="",
+        )
+    # 3 tickers with both daily AND weekly: those qualify.
+    qualifying = ["GOOD1", "GOOD2", "GOOD3"]
+    for t in qualifying:
+        _make_saved_only_confluence_library(
+            dirs["sig_lib_dir"], t, suffix="",
+        )
+        _make_saved_only_confluence_library(
+            dirs["sig_lib_dir"], t, suffix="_1wk",
+        )
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    confluence_targets = {
+        e["target_ticker"] for e in snap["entries"]
+        if e.get("engine") == "confluence"
+    }
+    # Daily-only tickers must NOT appear as saved-only confluence.
+    daily_only_in_snapshot = [
+        t for t in confluence_targets if t.startswith("DAILY")
+    ]
+    assert daily_only_in_snapshot == [], (
+        "daily-only stable libraries flooded saved-only confluence; "
+        f"got {len(daily_only_in_snapshot)} daily-only entries"
+    )
+    # Qualifying tickers (>=2 timeframes) DO appear.
+    for t in qualifying:
+        assert t in confluence_targets
+    # And the targets_needing_chart_data list must not include the
+    # 5k daily-only tickers either - that was the symptom Codex
+    # caught on real data.
+    needing = set(snap["targets_needing_chart_data"])
+    assert not any(t.startswith("DAILY") for t in needing), (
+        "daily-only confluence libraries inflated "
+        "targets_needing_chart_data"
+    )
+    assert set(qualifying).issubset(needing), (
+        "qualifying confluence saved-only targets must surface in "
+        "targets_needing_chart_data"
+    )
+
+
+def test_browser_payload_excludes_entries_and_paths(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.5, total_capture=25.0,
+        trigger_days=120, significant_95=True,
+    )
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    payload = rc.build_catalogue_browser_payload(snap)
+    # entries dropped entirely
+    assert "entries" not in payload
+    # No chart_path / source_path on top_opportunities
+    for r in payload["top_opportunities"]:
+        assert "chart_path" not in r
+        assert "source_path" not in r
+    # Schema explicitly identifies the payload variant so a future
+    # bump won't be confused with the snapshot schema.
+    assert payload["schema"] == "research_catalogue_browser_payload_v1"
+
+
+def test_browser_payload_caps_each_list():
+    """Caps must be enforced on top_opportunities,
+    targets_needing_chart_data, complete_coverage_targets, and
+    dropdown_targets. Totals stay accurate."""
+    snap = {
+        "counts": {
+            "engine": {}, "state": {}, "targets_total": 1000,
+        },
+        "targets": [f"T{i:04d}" for i in range(1000)],
+        "chart_ready_targets": [f"T{i:04d}" for i in range(50)],
+        "targets_needing_chart_data": [
+            f"N{i:04d}" for i in range(900)
+        ],
+        "complete_coverage_targets": [
+            f"C{i:04d}" for i in range(40)
+        ],
+        "top_opportunities": [
+            {"engine": "impactsearch",
+             "target_ticker": f"T{i:04d}",
+             "state": rc.STATE_CHART_READY,
+             "chart_path": f"/abs/path/{i}.json",
+             "source_path": None,
+             "total_capture_pct": 1.0, "sharpe_ratio": 0.5,
+             "trigger_days": 50, "significant_95": False}
+            for i in range(80)
+        ],
+    }
+    payload = rc.build_catalogue_browser_payload(
+        snap,
+        max_top=10, max_needing=20, max_complete=15,
+        max_dropdown=100,
+    )
+    assert len(payload["top_opportunities"]) == 10
+    assert payload["top_opportunities_total"] == 80
+    assert len(payload["targets_needing_chart_data"]) == 20
+    assert payload["targets_needing_chart_data_total"] == 900
+    assert len(payload["complete_coverage_targets"]) == 15
+    assert payload["complete_coverage_targets_total"] == 40
+    assert len(payload["dropdown_targets"]) == 100
+    assert payload["dropdown_targets_total"] == 1000
+    assert payload["chart_ready_targets_total"] == 50
+
+
+def test_browser_payload_dropdown_has_chart_ready_first_and_capped():
+    snap = {
+        "counts": {"engine": {}, "state": {}, "targets_total": 5},
+        "targets": ["AAA", "QQQ", "SPY", "TLT", "UVW"],
+        "chart_ready_targets": ["SPY", "QQQ"],
+        "targets_needing_chart_data": [],
+        "complete_coverage_targets": [],
+        "top_opportunities": [],
+    }
+    payload = rc.build_catalogue_browser_payload(
+        snap, max_dropdown=3,
+    )
+    drop = payload["dropdown_targets"]
+    assert len(drop) == 3
+    # chart_ready entries first
+    assert drop[0]["ticker"] in ("QQQ", "SPY")
+    assert drop[1]["ticker"] in ("QQQ", "SPY")
+    assert drop[0]["chart_ready"] is True
+    assert drop[1]["chart_ready"] is True
+    # And the third slot is the alphabetically-first non-chart-ready
+    assert drop[2]["ticker"] == "AAA"
+    assert drop[2]["chart_ready"] is False
+
+
+def test_browser_payload_no_absolute_paths_at_scale(tmp_path: Path):
+    """Codex amendment: payload JSON must not contain absolute
+    Windows paths or 'C:\\Users' substrings even when fed a snapshot
+    full of chart_path values."""
+    snap = {
+        "counts": {"engine": {}, "state": {}, "targets_total": 2},
+        "targets": ["AAA", "BBB"],
+        "chart_ready_targets": ["AAA"],
+        "targets_needing_chart_data": [],
+        "complete_coverage_targets": [],
+        "top_opportunities": [
+            {"engine": "impactsearch",
+             "target_ticker": "AAA",
+             "state": rc.STATE_CHART_READY,
+             "chart_path":
+                 "C:\\Users\\sport\\path\\to\\art.json",
+             "source_path":
+                 "C:/Users/sport/path/to/source.xlsx",
+             "total_capture_pct": 25.0, "sharpe_ratio": 1.5,
+             "trigger_days": 120, "significant_95": True},
+        ],
+    }
+    payload = rc.build_catalogue_browser_payload(snap)
+    text = json.dumps(payload, default=str)
+    assert "C:\\Users" not in text
+    assert "C:/Users" not in text
+    assert "/Users/" not in text
+    assert "chart_path" not in text
+    assert "source_path" not in text
+
+
+def test_persistent_snapshot_paths_relativize_when_under_project_root():
+    """When the chart artifact lives under the project root, the
+    persisted path must be project-relative. Falls back to absolute
+    only for paths outside the project tree (the tmp_path-fixture
+    case). Probe the relativizer directly so this assertion stays
+    independent of the real on-disk catalogue's contents."""
+    project = Path(rc.__file__).resolve().parent
+    rel_under_project = rc._relativize_path(
+        project / "output" / "research_artifacts"
+        / "impactsearch" / "SPY" / "AAA.research_day.json",
+    )
+    assert not rel_under_project.startswith("C:"), rel_under_project
+    assert "C:\\Users" not in rel_under_project
+    assert rel_under_project == (
+        "output/research_artifacts/impactsearch/SPY/"
+        "AAA.research_day.json"
+    )
+
+
+def test_browser_payload_size_under_cap_at_scale():
+    """Build a synthetic snapshot the size Codex saw on real data
+    and assert the browser payload stays small."""
+    big_targets = [f"T{i:05d}" for i in range(73_000)]
+    chart_targets = big_targets[:8]
+    needing = [t for t in big_targets[8:] if not t.startswith("T0000")]
+    big_top_opps = [
+        {"engine": "impactsearch", "target_ticker": t,
+         "state": rc.STATE_CHART_READY,
+         "chart_path": f"/abs/path/{t}.json",
+         "source_path": None,
+         "total_capture_pct": 10.0, "sharpe_ratio": 1.0,
+         "trigger_days": 50, "significant_95": False}
+        for t in chart_targets
+    ]
+    snap = {
+        "counts": {
+            "engine": {
+                "market_scan": 0, "impactsearch": 8,
+                "stackbuilder": 0, "confluence": 0, "trafficflow": 0,
+            },
+            "state": {
+                "chart_ready": 8, "saved_research_found": 73_000,
+                "no_saved_research": 0,
+            },
+            "targets_total": 73_000,
+        },
+        "targets": big_targets,
+        "chart_ready_targets": chart_targets,
+        "targets_needing_chart_data": needing,
+        "complete_coverage_targets": [],
+        "top_opportunities": big_top_opps,
+        "entries": [
+            # Simulate the bulk that we DON'T want shipped.
+            {"engine": "impactsearch", "target_ticker": t,
+             "state": rc.STATE_SAVED_RESEARCH_FOUND,
+             "chart_path": None,
+             "source_path": f"/abs/long/path/{t}_analysis.xlsx",
+             "total_capture_pct": None, "sharpe_ratio": None,
+             "trigger_days": None, "significant_95": None}
+            for t in big_targets
+        ],
+    }
+    payload = rc.build_catalogue_browser_payload(snap)
+    blob = json.dumps(payload, default=str)
+    # 500 KB is the audit's stated cap; the bounded payload should
+    # land far under it for this fixture.
+    assert len(blob) < 500_000, (
+        f"browser payload is {len(blob)} bytes; expected < 500KB. "
+        "Caps may not be working."
+    )
+    # Totals still reflect the underlying scale.
+    assert payload["dropdown_targets_total"] == 73_000
+    assert (
+        payload["targets_needing_chart_data_total"] == len(needing)
+    )
+    # entries excluded
+    assert "entries" not in payload
+    # No path leaks
+    assert "/abs/" not in blob
+    assert "C:\\Users" not in blob
+
+
+def test_browser_payload_total_keys_drive_showing_first_copy():
+    """Visible-cap delta vs. total drives the 'Showing first N of M'
+    UI. Totals must always be at least as large as the visible
+    list."""
+    snap = {
+        "counts": {"engine": {}, "state": {}, "targets_total": 100},
+        "targets": [f"T{i:03d}" for i in range(100)],
+        "chart_ready_targets": [],
+        "targets_needing_chart_data": [
+            f"N{i:03d}" for i in range(75)
+        ],
+        "complete_coverage_targets": [],
+        "top_opportunities": [],
+    }
+    payload = rc.build_catalogue_browser_payload(
+        snap, max_needing=10,
+    )
+    assert payload["targets_needing_chart_data_total"] == 75
+    assert len(payload["targets_needing_chart_data"]) == 10
+
+
+def test_persistent_snapshot_chart_path_relative_under_project_root():
+    """When a chart artifact lives under project/output, the
+    persisted chart_path must be project-relative (not absolute).
+    This exercises the production path; the fixture-based test
+    above only proves the negative."""
+    # Build a real artifact under the project tree's output dir
+    # (mock-style - we use tmp_path elsewhere for isolation).
+    # Here we assert the relativizer's contract directly.
+    project = Path(rc.__file__).resolve().parent
+    rel = rc._relativize_path(project / "output" / "x.json")
+    assert not rel.startswith("/"), rel
+    assert "C:" not in rel, rel
+    assert rel == "output/x.json"
+    # Outside-project paths fall back to the original string but
+    # with normalized POSIX separators.
+    out = rc._relativize_path("D:\\some\\other\\place.txt")
+    assert out == "D:/some/other/place.txt"

@@ -817,6 +817,26 @@ SNAPSHOT_SCHEMA_VERSION = "research_catalogue_snapshot_v1"
 DEFAULT_SNAPSHOT_TTL_SECONDS = 60
 DEFAULT_TOP_N = 10
 
+# Phase 6C-2 amendment: browser-payload caps. The persistent
+# snapshot can be 30+ MB on a real catalogue (73k+ entries),
+# which is too large to ship through dcc.Store and re-render every
+# UI update. The browser-safe view caps every list and excludes
+# the per-row entries / chart_path / source_path fields entirely.
+BROWSER_PAYLOAD_SCHEMA_VERSION = "research_catalogue_browser_payload_v1"
+DEFAULT_MAX_TOP = 25
+DEFAULT_MAX_NEEDING = 50
+DEFAULT_MAX_COMPLETE = 50
+DEFAULT_MAX_DROPDOWN = 500
+
+# Phase 6C-2 amendment: confluence saved-research gate. A single
+# daily stable library (the only-1d case) is not enough to render a
+# meaningful multi-timeframe confluence chart. Require at least
+# this many distinct timeframe libraries before a target counts as
+# saved-research-found for the confluence engine. Mirrors the
+# confluence engine's min_active=2 default so this gate matches
+# what the build path would actually use.
+CONFLUENCE_MIN_ACTIVE_FOR_SAVED = 2
+
 # Per-ticker engines that contribute to "complete coverage". Market
 # scan is target-agnostic (universe-wide saved scan), so it is not
 # part of the four-engine completeness check.
@@ -946,6 +966,34 @@ def _enrich_entry_score(entry: dict) -> dict:
     return entry
 
 
+def _relativize_path(p: Any) -> Optional[str]:
+    """Phase 6C-2 amendment: convert an absolute path to a project-
+    relative POSIX-style string when possible. Returns None for None
+    inputs. Falls back to the original string when the path lives
+    outside the project tree (the persistent JSON would otherwise
+    leak ``C:\\Users\\<username>\\...`` to anyone reading the file).
+
+    The browser payload also strips chart_path / source_path
+    entirely - this helper only sanitises the persisted on-disk
+    snapshot.
+    """
+    if p is None:
+        return None
+    s = str(p)
+    if not s:
+        return s
+    try:
+        path = Path(s).resolve()
+    except (OSError, RuntimeError):
+        return s.replace("\\", "/")
+    try:
+        project_root = _project_dir().resolve()
+        rel = path.relative_to(project_root)
+        return str(rel).replace("\\", "/")
+    except (ValueError, OSError):
+        return s.replace("\\", "/")
+
+
 def _build_chart_ready_entries(
     artifact_root: Path,
 ) -> tuple[list[dict], dict[str, set[str]]]:
@@ -986,7 +1034,11 @@ def _build_chart_ready_entries(
             "run_id": art.run_id,
             "K": art.K,
             "state": STATE_CHART_READY,
-            "chart_path": str(path),
+            # Path is relativized so the persisted snapshot does not
+            # leak local user-home paths. Browser payloads strip
+            # chart_path / source_path entirely (see
+            # build_catalogue_browser_payload).
+            "chart_path": _relativize_path(path),
             "source_path": None,
             "total_capture_pct": s.get("total_capture_pct"),
             "sharpe_ratio": s.get("sharpe_ratio"),
@@ -1044,7 +1096,7 @@ def _build_saved_only_entries(
                 "K": None,
                 "state": STATE_SAVED_RESEARCH_FOUND,
                 "chart_path": None,
-                "source_path": str(f),
+                "source_path": _relativize_path(f),
                 "total_capture_pct": None,
                 "sharpe_ratio": None,
                 "trigger_days": None,
@@ -1087,7 +1139,7 @@ def _build_saved_only_entries(
                 "K": None,
                 "state": STATE_SAVED_RESEARCH_FOUND,
                 "chart_path": None,
-                "source_path": str(run_dir),
+                "source_path": _relativize_path(run_dir),
                 "total_capture_pct": None,
                 "sharpe_ratio": None,
                 "trigger_days": None,
@@ -1108,7 +1160,7 @@ def _build_saved_only_entries(
                 "K": None,
                 "state": STATE_SAVED_RESEARCH_FOUND,
                 "chart_path": None,
-                "source_path": str(run_dir),
+                "source_path": _relativize_path(run_dir),
                 "total_capture_pct": None,
                 "sharpe_ratio": None,
                 "trigger_days": None,
@@ -1118,17 +1170,34 @@ def _build_saved_only_entries(
             }
             entries.append(_enrich_entry_score(entry))
 
-    # confluence saved time-window libraries
+    # confluence saved time-window libraries. Phase 6C-2 amendment:
+    # require at least CONFLUENCE_MIN_ACTIVE_FOR_SAVED distinct
+    # timeframe libraries before a target counts as
+    # saved-research-found for the confluence engine. A daily-only
+    # library is not enough for the multi-timeframe chart (the
+    # confluence engine itself uses min_active=2). Without this
+    # gate, a real catalogue with ~73k daily-only libraries floods
+    # targets_needing_chart_data with rows that cannot actually
+    # produce a chart.
     if sig_lib_dir.exists() and sig_lib_dir.is_dir():
-        saved_conf: dict[str, Path] = {}
+        saved_conf_files: dict[str, list[Path]] = {}
         for f in sorted(sig_lib_dir.iterdir()):
             if not f.is_file():
                 continue
             target_real = _confluence_target_from_filename(f.name)
             if not target_real:
                 continue
-            saved_conf.setdefault(target_real, f)
-        for target_real, f in saved_conf.items():
+            saved_conf_files.setdefault(target_real, []).append(f)
+        for target_real, files in saved_conf_files.items():
+            # Below the min_active gate: do not count this target as
+            # saved-research-found for confluence. We deliberately
+            # do NOT add it to ``targets`` from this branch either -
+            # if the same ticker has saved research in another
+            # engine it will be picked up there, otherwise it has
+            # no place in the catalogue.
+            if len(files) < CONFLUENCE_MIN_ACTIVE_FOR_SAVED:
+                continue
+            f = files[0]
             targets.add(target_real)
             if target_real in chart_ready_per_engine.get(
                 "confluence", set(),
@@ -1143,7 +1212,7 @@ def _build_saved_only_entries(
                 "K": None,
                 "state": STATE_SAVED_RESEARCH_FOUND,
                 "chart_path": None,
-                "source_path": str(f),
+                "source_path": _relativize_path(f),
                 "total_capture_pct": None,
                 "sharpe_ratio": None,
                 "trigger_days": None,
@@ -1176,7 +1245,7 @@ def _build_saved_only_entries(
                 "K": None,
                 "state": STATE_CHART_READY,
                 "chart_path": None,
-                "source_path": str(f),
+                "source_path": _relativize_path(f),
                 "total_capture_pct": None,
                 "sharpe_ratio": None,
                 "trigger_days": None,
@@ -1484,3 +1553,118 @@ def get_catalogue_snapshot(
     out["cache_hit"] = False
     out["loaded_from_disk"] = False
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-2 amendment: browser-safe catalogue payload
+# ---------------------------------------------------------------------------
+
+
+def _strip_paths_from_entry(entry: Mapping[str, Any]) -> dict:
+    """Return a copy of ``entry`` with ``chart_path`` and
+    ``source_path`` removed. The browser payload must never carry
+    absolute filesystem paths - those exist only in the persisted
+    on-disk snapshot for power-user inspection."""
+    out = dict(entry)
+    out.pop("chart_path", None)
+    out.pop("source_path", None)
+    return out
+
+
+def build_catalogue_browser_payload(
+    snapshot: Mapping[str, Any],
+    *,
+    max_top: int = DEFAULT_MAX_TOP,
+    max_needing: int = DEFAULT_MAX_NEEDING,
+    max_complete: int = DEFAULT_MAX_COMPLETE,
+    max_dropdown: int = DEFAULT_MAX_DROPDOWN,
+) -> dict:
+    """Phase 6C-2 amendment: build the bounded, browser-safe view of
+    the cross-ticker catalogue snapshot.
+
+    The persistent snapshot at ``catalogue_snapshot.json`` can grow
+    to 30+ MB on a real catalogue (73k+ entries). Sending that
+    through ``dcc.Store`` would clog the websocket round-trip, force
+    the dashboard to re-deserialize multi-MB JSON on every render,
+    and leak absolute filesystem paths to the browser.
+
+    The browser payload:
+
+      * excludes ``entries`` entirely - the full per-row table stays
+        server-side in the in-memory cache and the persistent JSON.
+      * excludes ``chart_path`` and ``source_path`` from every
+        ``top_opportunities`` row so the browser never sees a
+        ``C:\\Users\\...`` substring.
+      * caps ``top_opportunities``, ``targets_needing_chart_data``,
+        ``complete_coverage_targets``, and ``dropdown_targets``.
+      * surfaces each list's full pre-cap length under a
+        corresponding ``*_total`` key so the UI can render
+        ``"Showing first N of M."`` when items are clipped.
+      * normalises ``dropdown_targets`` into ``{"ticker": str,
+        "chart_ready": bool}`` dicts so the dropdown options
+        callback can label chart-ready tickers without needing the
+        separate full ``chart_ready_targets`` list.
+
+    The payload is the schema sent to ``dcc.Store(id=
+    "catalogue-snapshot-store")``. ``schema`` carries
+    ``research_catalogue_browser_payload_v1`` so a future schema
+    bump can be detected without colliding with the persistent
+    snapshot's schema.
+    """
+    snapshot = snapshot or {}
+    counts = snapshot.get("counts") or {}
+    targets_total = int(counts.get("targets_total") or 0)
+
+    top_full = list(snapshot.get("top_opportunities") or [])
+    top_capped = [
+        _strip_paths_from_entry(e) for e in top_full[: int(max_top)]
+    ]
+
+    needing_full = list(snapshot.get("targets_needing_chart_data") or [])
+    needing_capped = list(needing_full[: int(max_needing)])
+
+    complete_full = list(snapshot.get("complete_coverage_targets") or [])
+    complete_capped = list(complete_full[: int(max_complete)])
+
+    chart_ready_targets = list(
+        snapshot.get("chart_ready_targets") or [],
+    )
+    chart_ready_set = {str(t) for t in chart_ready_targets}
+    all_targets = list(snapshot.get("targets") or [])
+    sorted_for_dropdown = sorted(
+        all_targets,
+        key=lambda t: (
+            0 if str(t) in chart_ready_set else 1,
+            str(t).upper(),
+        ),
+    )
+    dropdown_targets = [
+        {"ticker": str(t), "chart_ready": str(t) in chart_ready_set}
+        for t in sorted_for_dropdown[: int(max_dropdown)]
+    ]
+
+    return {
+        "schema": BROWSER_PAYLOAD_SCHEMA_VERSION,
+        "generated_at": snapshot.get("generated_at"),
+        "counts": {
+            "engine": dict(counts.get("engine") or {}),
+            "state": dict(counts.get("state") or {}),
+            "targets_total": targets_total,
+        },
+        "targets_total": targets_total,
+        "top_opportunities": top_capped,
+        "top_opportunities_total": len(top_full),
+        "targets_needing_chart_data": needing_capped,
+        "targets_needing_chart_data_total": len(needing_full),
+        "complete_coverage_targets": complete_capped,
+        "complete_coverage_targets_total": len(complete_full),
+        "dropdown_targets": dropdown_targets,
+        "dropdown_targets_total": len(all_targets),
+        "chart_ready_targets_total": len(chart_ready_set),
+        "caps": {
+            "max_top": int(max_top),
+            "max_needing": int(max_needing),
+            "max_complete": int(max_complete),
+            "max_dropdown": int(max_dropdown),
+        },
+    }
