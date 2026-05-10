@@ -1,4 +1,4 @@
-"""Phase 6B-1: canonical day-by-day research artifacts.
+"""Phase 6B: canonical day-by-day research artifacts.
 
 Saved ranking tables (ImpactSearch's per-row ``Total Capture (%)`` /
 ``Sharpe Ratio`` / ``Trigger Days`` / etc.) are point-in-time
@@ -14,15 +14,14 @@ summary (Total Capture, Avg Daily Capture, Sharpe Ratio, Wins,
 Losses, p-value, 95% Confidence) in a single JSON blob per
 (target, signal source, run_id) tuple.
 
-Phase 6B-1 wires only the ImpactSearch single-signal slice. Future
-phases extend the same shape:
-
-  TODO Phase 6B-2: StackBuilder day-by-day stack capture artifacts
-                   (engine="stackbuilder").
-  TODO Phase 6B-3: Confluence day-by-day confluence artifacts
-                   (engine="confluence").
+  Phase 6B-1: ImpactSearch single-signal slice (engine="impactsearch").
+  Phase 6B-2: StackBuilder day-by-day stack capture
+              (engine="stackbuilder") + catalogue_index.json.
+  Phase 6B-3: Confluence day-by-day 7-tier path
+              (engine="confluence").
   TODO Phase 6B-4: Traffic Flow per-day pressure artifacts
                    (engine="trafficflow").
+  TODO Phase 6C: public catalogue UX + caching model.
 
 All read paths are strictly read-only and offline. The single write
 helper persists JSON to ``output/research_artifacts/<engine>/<TARGET>/``.
@@ -147,6 +146,11 @@ class ResearchDayArtifact:
     K: Optional[int] = None
     members: list[str] = field(default_factory=list)
     protocol_per_member: dict = field(default_factory=dict)
+    # Confluence-only fields. Populated by
+    # ``build_confluence_day_artifact``; left at defaults for
+    # ``impactsearch`` / ``stackbuilder`` artifacts.
+    timeframes: list[str] = field(default_factory=list)
+    min_active: Optional[int] = None
 
 
 def _to_iso_date(value: Any) -> str:
@@ -375,6 +379,11 @@ def write_research_day_artifact(
         payload["members"] = list(artifact.members)
     if artifact.protocol_per_member:
         payload["protocol_per_member"] = dict(artifact.protocol_per_member)
+    # Confluence-only fields: only persisted when populated.
+    if artifact.timeframes:
+        payload["timeframes"] = list(artifact.timeframes)
+    if artifact.min_active is not None:
+        payload["min_active"] = int(artifact.min_active)
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
     return out_path
@@ -401,6 +410,7 @@ def read_research_day_artifact(
         return None
     try:
         K_val = payload.get("K")
+        ma_val = payload.get("min_active")
         return ResearchDayArtifact(
             artifact_version=str(version),
             engine=str(payload.get("engine") or ""),
@@ -417,6 +427,8 @@ def read_research_day_artifact(
             protocol_per_member=dict(
                 payload.get("protocol_per_member") or {}
             ),
+            timeframes=list(payload.get("timeframes") or []),
+            min_active=int(ma_val) if ma_val is not None else None,
         )
     except Exception:
         return None
@@ -1247,13 +1259,859 @@ def read_research_catalogue_index(
         return None
 
 
-# Phase 6B-3 / 6B-4 / 6C scope reminders kept in source so a future
+# ---------------------------------------------------------------------------
+# Phase 6B-3: Confluence day-by-day artifacts
+# ---------------------------------------------------------------------------
+
+
+# Default 7-tier-engine timeframes. Mirrors
+# ``signal_library.confluence_analyzer.load_confluence_data`` defaults so
+# this module never needs to import the analyzer at module load time.
+CONFLUENCE_TIMEFRAMES_DEFAULT: list[str] = ["1d", "1wk", "1mo", "3mo", "1y"]
+CONFLUENCE_MIN_ACTIVE_DEFAULT = 2
+
+
+# 7-tier label set. Anything outside this set falls through to "None"
+# / "Neutral" depending on call site.
+_CONFLUENCE_TIER_TO_SIGNAL = {
+    "strong buy": "Buy",
+    "buy": "Buy",
+    "weak buy": "Buy",
+    "neutral": "None",
+    "weak short": "Short",
+    "short": "Short",
+    "strong short": "Short",
+}
+
+
+def _normalize_confluence_tier(value: Any) -> str:
+    """Coerce a raw tier label to one of the seven canonical strings.
+    Unknown / missing -> ``"Neutral"``."""
+    if value is None:
+        return "Neutral"
+    s = str(value).strip()
+    if not s:
+        return "Neutral"
+    low = s.lower()
+    if low == "strong buy":
+        return "Strong Buy"
+    if low == "buy":
+        return "Buy"
+    if low == "weak buy":
+        return "Weak Buy"
+    if low == "neutral":
+        return "Neutral"
+    if low == "weak short":
+        return "Weak Short"
+    if low == "short":
+        return "Short"
+    if low == "strong short":
+        return "Strong Short"
+    return "Neutral"
+
+
+def confluence_tier_to_signal(tier: Any) -> str:
+    """Phase 6B-3 mapping. Strong Buy / Buy / Weak Buy -> ``Buy``;
+    Strong Short / Short / Weak Short -> ``Short``; Neutral / Unknown /
+    missing -> ``None``."""
+    if tier is None:
+        return "None"
+    return _CONFLUENCE_TIER_TO_SIGNAL.get(str(tier).strip().lower(), "None")
+
+
+def _compute_confluence_tier_from_counts(
+    buy: int,
+    short: int,
+    none: int,
+    min_active: int = CONFLUENCE_MIN_ACTIVE_DEFAULT,
+) -> str:
+    """Pure O(1) confluence-tier helper.
+
+    Mirrors ``signal_library.confluence_analyzer.calculate_confluence``
+    decision rules without the analyzer's per-date
+    ``alignment_since`` walk (which is O(N) and turns the analyzer's
+    per-date call into O(N^2) when used inside an artifact builder).
+
+    Inputs are the per-row Buy / Short / None timeframe counts. The
+    ``active`` denominator follows the analyzer's
+    ``max(1, total - none_count)`` rule so an all-None row collapses
+    to Neutral via the ``min_active`` gate, not via a divide-by-zero.
+
+    Tier thresholds (mirroring confluence_analyzer):
+      * Strong Buy   : all active frames are Buy
+      * Strong Short : all active frames are Short
+      * Buy          : buy_pct >= 0.75 and short == 0
+      * Short        : short_pct >= 0.75 and buy == 0
+      * Weak Buy     : buy_pct >= 0.50 and short_pct < 0.25
+      * Weak Short   : short_pct >= 0.50 and buy_pct < 0.25
+      * Neutral      : everything else, including
+                       active < min_active (the min-active gate).
+    """
+    b = int(buy)
+    s = int(short)
+    n = int(none)
+    total = b + s + n
+    active = max(1, total - n)  # = max(1, b + s)
+    try:
+        ma = int(min_active)
+    except Exception:
+        ma = CONFLUENCE_MIN_ACTIVE_DEFAULT
+    if active < ma:
+        return "Neutral"
+    if b == active:
+        return "Strong Buy"
+    if s == active:
+        return "Strong Short"
+    buy_pct = b / active
+    short_pct = s / active
+    if buy_pct >= 0.75 and s == 0:
+        return "Buy"
+    if short_pct >= 0.75 and b == 0:
+        return "Short"
+    if buy_pct >= 0.50 and short_pct < 0.25:
+        return "Weak Buy"
+    if short_pct >= 0.50 and buy_pct < 0.25:
+        return "Weak Short"
+    return "Neutral"
+
+
+def artifact_path_for_confluence(
+    target_ticker: str,
+    run_id: Optional[str] = None,
+    base_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the canonical local artifact path for a Confluence
+    target. Confluence artifacts are one-per-target by default; the
+    optional ``run_id`` lets multiple runs coexist (e.g., re-runs
+    after a signal-library refresh).
+
+    Returns None if the target normalizes to empty.
+    """
+    safe_target = _normalize_ticker_for_filename(target_ticker)
+    if not safe_target:
+        return None
+    base = (
+        Path(base_dir) if base_dir is not None
+        else _project_dir() / _DEFAULT_BASE
+    )
+    folder = base / "confluence" / safe_target
+    if run_id:
+        suffix = _normalize_ticker_for_filename(run_id) or str(run_id)
+        return folder / f"{safe_target}__{suffix}.research_day.json"
+    return folder / f"{safe_target}.research_day.json"
+
+
+_CONFLUENCE_TIER_KEYS = (
+    "strong_buy", "buy", "weak_buy", "neutral",
+    "weak_short", "short", "strong_short",
+)
+
+_TIER_TO_KEY = {
+    "Strong Buy": "strong_buy",
+    "Buy": "buy",
+    "Weak Buy": "weak_buy",
+    "Neutral": "neutral",
+    "Weak Short": "weak_short",
+    "Short": "short",
+    "Strong Short": "strong_short",
+}
+
+
+def build_confluence_day_artifact(
+    target_ticker: str,
+    *,
+    dates: Sequence[Any],
+    target_close: Sequence[float],
+    confluence_tiers: Sequence[Any],
+    timeframe_signals: Sequence[Mapping[str, Any]],
+    timeframes: Optional[Sequence[str]] = None,
+    alignment_pcts: Optional[Sequence[Any]] = None,
+    min_active: int = CONFLUENCE_MIN_ACTIVE_DEFAULT,
+    persist_skip_bars: Optional[int] = None,
+    metric_basis: str = "Close",
+    run_id: Optional[str] = None,
+    summary_overrides: Optional[Mapping[str, Any]] = None,
+) -> ResearchDayArtifact:
+    """Build the canonical day-by-day artifact for the Confluence
+    engine.
+
+    Each daily row carries:
+      * ``confluence_tier``      : one of Strong Buy / Buy / Weak Buy /
+                                   Neutral / Weak Short / Short /
+                                   Strong Short.
+      * ``confluence_signal``    : Buy / Short / None (from the tier
+                                   via the documented mapping).
+      * ``timeframe_signals``    : per-timeframe Buy / Short / None /
+                                   ``"missing"`` snapshot.
+      * ``alignment_pct``        : 0..100 alignment among active
+                                   frames. Active denominator = Buy
+                                   + Short only (not None and not
+                                   missing). Mirrors the production
+                                   confluence_analyzer's active-frame
+                                   semantics.
+      * ``buy_count`` / ``short_count``  : per-timeframe Buy / Short
+                                   counts.
+      * ``none_count``           : per-timeframe None count.
+      * ``active_count``         : Buy + Short (excluding None and
+                                   missing). This matches the
+                                   production confluence engine; do
+                                   not count ``None`` as active.
+      * ``available_count``      : Buy + Short + None (loaded
+                                   timeframes only, missing
+                                   excluded). Useful when the caller
+                                   needs a "non-missing" count
+                                   without conflating None with
+                                   active.
+
+    Capture mapping mirrors ImpactSearch / Stack:
+      * Buy day -> +pct_change(target_close) * 100
+      * Short day -> -pct_change(target_close) * 100
+      * None / Neutral / missing -> 0
+
+    Trigger days = Buy or Short. T-1 persist skip applied to the
+    trailing N bars before the cumulative sum.
+
+    Summary block: ``total_capture_pct``, ``avg_daily_capture_pct``,
+    ``sharpe_ratio``, ``trigger_days``, ``wins``, ``losses``,
+    ``p_value``, ``significant_95``, plus rebuilt-from-rows mirrors
+    ``rebuilt_total_capture_pct`` / ``rebuilt_sharpe_ratio`` /
+    ``rebuilt_trigger_days``, plus ``tier_counts`` (one count per
+    canonical tier).
+    """
+    if not isinstance(dates, (list, tuple, np.ndarray, pd.Series, pd.Index)):
+        raise TypeError("dates must be a sequence")
+    if not isinstance(target_close, (list, tuple, np.ndarray, pd.Series)):
+        raise TypeError("target_close must be a sequence")
+    if not isinstance(
+        confluence_tiers, (list, tuple, np.ndarray, pd.Series),
+    ):
+        raise TypeError("confluence_tiers must be a sequence")
+    if not isinstance(
+        timeframe_signals, (list, tuple, np.ndarray, pd.Series),
+    ):
+        raise TypeError("timeframe_signals must be a sequence")
+    n = len(dates)
+    if (
+        n != len(target_close) or n != len(confluence_tiers)
+        or n != len(timeframe_signals)
+    ):
+        raise ValueError(
+            "dates / target_close / confluence_tiers / "
+            "timeframe_signals must have equal length"
+        )
+    if alignment_pcts is not None and len(alignment_pcts) != n:
+        raise ValueError("alignment_pcts must have the same length as dates")
+
+    skip = (
+        DEFAULT_PERSIST_SKIP_BARS if persist_skip_bars is None
+        else int(persist_skip_bars)
+    )
+    timeframes_list = list(timeframes) if timeframes else list(
+        CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+    timeframes_list = [str(tf) for tf in timeframes_list]
+
+    df = pd.DataFrame({
+        "date": pd.to_datetime(list(dates), errors="coerce"),
+        "target_close": pd.to_numeric(list(target_close), errors="coerce"),
+        "confluence_tier": [
+            _normalize_confluence_tier(t) for t in confluence_tiers
+        ],
+    })
+    df["confluence_signal"] = df["confluence_tier"].map(
+        confluence_tier_to_signal,
+    )
+
+    tf_rows: list[dict[str, str]] = []
+    for raw in timeframe_signals:
+        snap = {}
+        if isinstance(raw, Mapping):
+            for tf in timeframes_list:
+                v = raw.get(tf)
+                if v is None:
+                    snap[tf] = "missing"
+                    continue
+                vs = str(v).strip()
+                if not vs:
+                    snap[tf] = "missing"
+                elif vs.lower() == "buy":
+                    snap[tf] = "Buy"
+                elif vs.lower() == "short":
+                    snap[tf] = "Short"
+                elif vs.lower() == "none":
+                    snap[tf] = "None"
+                else:
+                    snap[tf] = "missing"
+        else:
+            snap = {tf: "missing" for tf in timeframes_list}
+        tf_rows.append(snap)
+    df["timeframe_signals"] = tf_rows
+
+    buy_counts: list[int] = []
+    short_counts: list[int] = []
+    none_counts: list[int] = []
+    active_counts: list[int] = []
+    available_counts: list[int] = []
+    for snap in tf_rows:
+        b = sum(1 for v in snap.values() if v == "Buy")
+        s = sum(1 for v in snap.values() if v == "Short")
+        n_none = sum(1 for v in snap.values() if v == "None")
+        # active_count = Buy + Short ONLY. Mirrors the production
+        # confluence_analyzer.calculate_confluence's active-frame
+        # rule (None is not active). available_count includes None
+        # so a caller that needs the non-missing total has it.
+        a = b + s
+        avail = b + s + n_none
+        buy_counts.append(b)
+        short_counts.append(s)
+        none_counts.append(n_none)
+        active_counts.append(a)
+        available_counts.append(avail)
+    df["buy_count"] = buy_counts
+    df["short_count"] = short_counts
+    df["none_count"] = none_counts
+    df["active_count"] = active_counts
+    df["available_count"] = available_counts
+    if alignment_pcts is None:
+        # alignment_pct: max(buy, short) / active. min_active gates
+        # Strong tiers; the alignment number is reported as 0 when
+        # the active denominator is below ``min_active`` to mirror
+        # the production analyzer's behavior.
+        align_vals: list[Optional[float]] = []
+        for b, s, a in zip(buy_counts, short_counts, active_counts):
+            if a <= 0 or a < int(min_active):
+                align_vals.append(0.0)
+            else:
+                align_vals.append(round(100.0 * max(b, s) / a, 1))
+        df["alignment_pct"] = align_vals
+    else:
+        df["alignment_pct"] = [_safe_float(v) for v in alignment_pcts]
+
+    df = df[df["date"].notna()].sort_values("date").reset_index(drop=True)
+    df["target_return_pct"] = (
+        df["target_close"].pct_change().fillna(0.0) * 100.0
+    )
+    sig_norm = df["confluence_signal"].str.lower()
+    df["daily_capture_pct"] = 0.0
+    df.loc[sig_norm.eq("buy"), "daily_capture_pct"] = (
+        df.loc[sig_norm.eq("buy"), "target_return_pct"]
+    )
+    df.loc[sig_norm.eq("short"), "daily_capture_pct"] = (
+        -df.loc[sig_norm.eq("short"), "target_return_pct"]
+    )
+    df["is_trigger_day"] = sig_norm.isin({"buy", "short"})
+
+    if skip and skip > 0 and len(df) > skip:
+        df_trim = df.iloc[:-skip].copy()
+    else:
+        df_trim = df.copy()
+    df_trim["cumulative_capture_pct"] = (
+        df_trim["daily_capture_pct"].cumsum()
+    )
+
+    trigger_mask = df_trim["is_trigger_day"]
+    trigger_caps = df_trim.loc[trigger_mask, "daily_capture_pct"]
+    n_trigger = int(trigger_mask.sum())
+    if n_trigger > 0:
+        total_capture_pct = float(trigger_caps.sum())
+        avg_daily_capture_pct = float(trigger_caps.mean())
+        wins = int((trigger_caps > 0).sum())
+        losses = int((trigger_caps < 0).sum())
+    else:
+        total_capture_pct = 0.0
+        avg_daily_capture_pct = 0.0
+        wins = 0
+        losses = 0
+    if n_trigger > 1:
+        std_dev = float(trigger_caps.std(ddof=1))
+        sharpe_ratio = (
+            avg_daily_capture_pct / std_dev if std_dev > 0
+            else 0.0
+        )
+    else:
+        sharpe_ratio = 0.0
+
+    tier_counts = {k: 0 for k in _CONFLUENCE_TIER_KEYS}
+    for tier in df_trim["confluence_tier"]:
+        key = _TIER_TO_KEY.get(str(tier))
+        if key is not None:
+            tier_counts[key] += 1
+        else:
+            tier_counts["neutral"] += 1
+
+    overrides = dict(summary_overrides or {})
+    summary: dict = {
+        "total_capture_pct": _safe_float(
+            overrides.get("total_capture_pct", total_capture_pct),
+        ),
+        "avg_daily_capture_pct": _safe_float(
+            overrides.get(
+                "avg_daily_capture_pct", avg_daily_capture_pct,
+            ),
+        ),
+        "sharpe_ratio": _safe_float(
+            overrides.get("sharpe_ratio", sharpe_ratio),
+        ),
+        "trigger_days": _safe_int(
+            overrides.get("trigger_days", n_trigger),
+        ),
+        "wins": _safe_int(overrides.get("wins", wins)),
+        "losses": _safe_int(overrides.get("losses", losses)),
+        "p_value": _safe_float(overrides.get("p_value")),
+        "significant_95": (
+            None if overrides.get("significant_95") is None
+            else bool(overrides.get("significant_95"))
+        ),
+        "rebuilt_total_capture_pct": total_capture_pct,
+        "rebuilt_sharpe_ratio": sharpe_ratio,
+        "rebuilt_trigger_days": n_trigger,
+        "tier_counts": tier_counts,
+    }
+
+    daily: list[dict] = []
+    for _, row in df_trim.iterrows():
+        daily.append({
+            "date": _to_iso_date(row["date"]),
+            "target_close": _safe_float(row["target_close"]),
+            "target_return_pct": _safe_float(row["target_return_pct"]),
+            "confluence_tier": str(row["confluence_tier"]),
+            "confluence_signal": str(row["confluence_signal"]),
+            "timeframe_signals": dict(row["timeframe_signals"]),
+            "alignment_pct": _safe_float(row["alignment_pct"]),
+            "buy_count": int(row["buy_count"]),
+            "short_count": int(row["short_count"]),
+            "none_count": int(row["none_count"]),
+            "active_count": int(row["active_count"]),
+            "available_count": int(row["available_count"]),
+            "daily_capture_pct": _safe_float(row["daily_capture_pct"]),
+            "cumulative_capture_pct": _safe_float(
+                row["cumulative_capture_pct"],
+            ),
+            "is_trigger_day": bool(row["is_trigger_day"]),
+        })
+
+    return ResearchDayArtifact(
+        artifact_version=ARTIFACT_VERSION,
+        engine="confluence",
+        target_ticker=str(target_ticker).strip().upper(),
+        signal_source="",
+        run_id=run_id,
+        metric_basis=str(metric_basis or "Close"),
+        persist_skip_bars=int(skip),
+        generated_at=datetime.now(timezone.utc).isoformat(
+            timespec="seconds",
+        ),
+        summary=summary,
+        daily=daily,
+        timeframes=timeframes_list,
+        min_active=int(min_active),
+    )
+
+
+def _confluence_ticker_form_candidates(
+    ticker: str,
+) -> list[str]:
+    """Return ordered, de-duplicated ticker-name forms to try when
+    looking up local Confluence input files.
+
+    Real local PKLs typically retain the original ticker (e.g.,
+    ``^GSPC_precomputed_results.pkl``). The filename-safe form
+    (``_GSPC``) is the artifact-output form. Some data flows save
+    one, some save the other, so reads must try the real form first
+    and the filename-safe form second.
+    """
+    real = str(ticker or "").strip().upper()
+    safe = _normalize_ticker_for_filename(ticker)
+    forms: list[str] = []
+    for f in (real, safe):
+        if f and f not in forms:
+            forms.append(f)
+    return forms
+
+
+def _resolve_local_target_cache_path(
+    ticker: str,
+    cache_base: Path,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve the local Spymaster cache PKL path for ``ticker``,
+    trying the real ticker form first and the filename-safe form
+    second.
+
+    Returns ``(path, form)`` when a candidate file exists, or
+    ``(None, None)`` when neither form has a cache on disk. The
+    ``form`` is the ticker-name form that produced the resolved
+    path so callers can pass that exact form into helpers that
+    re-derive a filename later.
+    """
+    for form in _confluence_ticker_form_candidates(ticker):
+        p = cache_base / f"{form}_precomputed_results.pkl"
+        if p.exists():
+            return p, form
+    return None, None
+
+
+def _resolve_local_signal_library_form(
+    ticker: str,
+    sig_base: Path,
+    timeframes_list: Sequence[str],
+) -> Optional[str]:
+    """Resolve the ticker-name form for which at least one local
+    signal-library PKL exists in ``sig_base``. Real ticker form
+    (e.g. ``^GSPC``) wins over the filename-safe form (``_GSPC``);
+    returns None when neither form has any matching library file.
+    """
+    for form in _confluence_ticker_form_candidates(ticker):
+        if (sig_base / f"{form}_stable_v1_0_0.pkl").exists():
+            return form
+        for tf in timeframes_list:
+            if tf == "1d":
+                continue
+            if (sig_base / f"{form}_stable_v1_0_0_{tf}.pkl").exists():
+                return form
+    return None
+
+
+def _resolve_local_ticker_form(
+    ticker: str,
+    sig_base: Path,
+    cache_base: Path,
+    timeframes_list: Sequence[str],
+) -> Optional[str]:
+    """Convenience helper: returns the ticker-name form that has
+    actual files on disk, preferring the form that produced a target
+    Spymaster cache hit. Falls back to the signal-library form when
+    no cache file exists. Returns None when neither resolver finds
+    anything.
+
+    This is a thin wrapper around the two split resolvers
+    (``_resolve_local_target_cache_path`` and
+    ``_resolve_local_signal_library_form``). Prefer the split form
+    in callers that need to handle mixed-form fixtures (cache and
+    library saved under different ticker forms).
+    """
+    _path, cache_form = _resolve_local_target_cache_path(
+        ticker, cache_base,
+    )
+    if cache_form is not None:
+        return cache_form
+    return _resolve_local_signal_library_form(
+        ticker, sig_base, timeframes_list,
+    )
+
+
+def build_confluence_day_artifact_from_local(
+    target_ticker: str,
+    *,
+    persist_skip_bars: Optional[int] = None,
+    min_active: int = CONFLUENCE_MIN_ACTIVE_DEFAULT,
+    sig_lib_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    timeframes: Optional[Sequence[str]] = None,
+    summary_overrides: Optional[Mapping[str, Any]] = None,
+    run_id: Optional[str] = None,
+) -> Optional[ResearchDayArtifact]:
+    """Build the Confluence day-by-day artifact for ``target_ticker``
+    using saved local timeframe libraries + the local Spymaster cache.
+
+    Calls the production
+    ``signal_library.confluence_analyzer`` engine
+    (``load_confluence_data`` + ``align_signals_to_daily`` +
+    ``calculate_confluence``) on saved local libraries; reads
+    ``cache/results/<TARGET>_precomputed_results.pkl`` for the daily
+    Close series. Strictly read-only / offline. Never imports
+    ``confluence.py`` (Dash-heavy) or ``trafficflow.py``.
+
+    Returns None when:
+      - target normalizes to empty
+      - no saved libraries exist for the target
+      - the target Spymaster cache is missing or has no Close column
+      - alignment grid is empty
+      - the confluence_analyzer cannot be imported
+
+    The Phase 6A preview button serializes one artifact per click; no
+    universe scan, no batch.
+    """
+    import pickle
+
+    if not target_ticker:
+        return None
+    safe_target = _normalize_ticker_for_filename(target_ticker)
+    if not safe_target:
+        return None
+    timeframes_list = list(timeframes) if timeframes else list(
+        CONFLUENCE_TIMEFRAMES_DEFAULT,
+    )
+
+    project_dir = _project_dir()
+    sig_base = (
+        Path(sig_lib_dir) if sig_lib_dir is not None
+        else project_dir / "signal_library" / "data" / "stable"
+    )
+    cache_base = (
+        Path(cache_dir) if cache_dir is not None
+        else project_dir / "cache" / "results"
+    )
+
+    # Resolve cache and library form INDEPENDENTLY. Real local PKLs
+    # typically retain the original symbol (e.g.,
+    # ``^GSPC_precomputed_results.pkl``); the filename-safe form
+    # (``_GSPC``) is the artifact-output form. The two file kinds
+    # may live under different ticker forms (mixed-form fixtures),
+    # so we resolve each side separately.
+    target_pkl, cache_form = _resolve_local_target_cache_path(
+        target_ticker, cache_base,
+    )
+    if target_pkl is None:
+        return None
+    library_form = _resolve_local_signal_library_form(
+        target_ticker, sig_base, timeframes_list,
+    )
+    # If neither form has any library file, the analyzer's 1d
+    # Spymaster-cache fallback can still satisfy "any signal" using
+    # the resolved target cache. The analyzer is invoked with
+    # ``library_form`` if available, otherwise with ``cache_form``
+    # so the fallback receives a ticker name that points at a real
+    # cache file.
+    analyzer_form = library_form or cache_form
+    if analyzer_form is None:
+        return None
+
+    try:
+        with target_pkl.open("rb") as fh:
+            target_obj = pickle.load(fh)
+    except Exception:
+        return None
+    if not isinstance(target_obj, dict):
+        return None
+    pre = target_obj.get("preprocessed_data")
+    if pre is None or not isinstance(pre, pd.DataFrame):
+        return None
+    if "Close" not in pre.columns:
+        return None
+    closes = pd.to_numeric(pre["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return None
+    closes_df = pd.DataFrame({
+        "date": pd.to_datetime(closes.index, errors="coerce"),
+        "close": closes.values,
+    }).dropna(subset=["date"]).sort_values("date").drop_duplicates(
+        subset=["date"], keep="last",
+    ).reset_index(drop=True)
+
+    # The analyzer reads relative paths and a hard-coded
+    # ``cache/results`` prefix for its 1d Spymaster fallback. To
+    # confine all reads to the user-supplied ``sig_lib_dir`` /
+    # ``cache_dir`` we monkey-patch the analyzer module attributes
+    # for the duration of this call (and restore them afterwards).
+    saved_cwd = os.getcwd()
+    try:
+        try:
+            os.chdir(project_dir)
+        except Exception:
+            pass
+        try:
+            import signal_library.confluence_analyzer as _ca
+            from signal_library.confluence_analyzer import (
+                align_signals_to_daily,
+                load_signal_library_interval,
+            )
+        except Exception:
+            return None
+        saved_sig_dir = getattr(_ca, "SIGNAL_LIBRARY_DIR", None)
+        saved_fallback = getattr(_ca, "_load_spymaster_cache_fallback", None)
+
+        def _local_spymaster_fallback(
+            ticker: str, _cache_base=cache_base,
+        ):
+            """In-place override that resolves the Spymaster cache via
+            the user-supplied ``cache_dir`` instead of the analyzer's
+            hard-coded ``cache/results`` relative path. Tries the
+            real ticker form first and the filename-safe form second
+            so caret-style symbols (e.g., ``^GSPC``) resolve."""
+            spymaster_path = None
+            for form in _confluence_ticker_form_candidates(ticker):
+                p = (
+                    Path(_cache_base)
+                    / f"{form}_precomputed_results.pkl"
+                )
+                if p.exists():
+                    spymaster_path = p
+                    break
+            if spymaster_path is None:
+                return None
+            try:
+                with spymaster_path.open("rb") as fh:
+                    sd = pickle.load(fh)
+            except Exception:
+                return None
+            if not isinstance(sd, dict):
+                return None
+            buy_map = sd.get("daily_top_buy_pairs") or {}
+            short_map = sd.get("daily_top_short_pairs") or {}
+            if not isinstance(buy_map, dict) or not buy_map:
+                return None
+            dates = list(buy_map.keys())
+            signals: list = []
+            try:
+                MAX_SMA_DAY = int(
+                    getattr(_ca, "MAX_SMA_DAY", 114),
+                )
+            except Exception:
+                MAX_SMA_DAY = 114
+            for d in dates:
+                _bp, bcap = buy_map.get(
+                    d, ((MAX_SMA_DAY, MAX_SMA_DAY - 1), 0.0),
+                )
+                _sp, scap = short_map.get(
+                    d, ((MAX_SMA_DAY - 1, MAX_SMA_DAY), 0.0),
+                )
+                if bcap > scap:
+                    signals.append("Buy")
+                elif scap > bcap:
+                    signals.append("Short")
+                else:
+                    signals.append("None")
+            return {
+                "dates": dates,
+                "signals": signals,
+                "primary_signals": signals,
+                "source": "spymaster_cache",
+            }
+
+        try:
+            _ca.SIGNAL_LIBRARY_DIR = str(sig_base)
+            _ca._load_spymaster_cache_fallback = _local_spymaster_fallback
+            try:
+                libs = {}
+                for tf in timeframes_list:
+                    try:
+                        lib = load_signal_library_interval(
+                            analyzer_form, tf,
+                        )
+                    except Exception:
+                        lib = None
+                    if lib is None:
+                        continue
+                    if "signals" not in lib and "primary_signals" in lib:
+                        lib["signals"] = lib["primary_signals"]
+                    if "dates" not in lib and "date_index" in lib:
+                        lib["dates"] = lib["date_index"]
+                    if "signals" not in lib or "dates" not in lib:
+                        continue
+                    libs[tf] = lib
+            except Exception:
+                libs = {}
+            if not libs:
+                return None
+            try:
+                aligned = align_signals_to_daily(libs)
+            except Exception:
+                return None
+            if aligned is None or aligned.empty:
+                return None
+
+            # Linear-time per-row tier computation. The production
+            # analyzer's ``calculate_confluence`` walks backward to
+            # compute ``alignment_since`` (used by the snapshot UI
+            # but NOT by the artifact day-by-day path). That walk
+            # is O(N) per call, so calling it per date over a long
+            # history (e.g. ^GSPC's 25500-day grid) becomes O(N^2)
+            # and exceeds 6 minutes. The pure helper
+            # ``_compute_confluence_tier_from_counts`` mirrors the
+            # analyzer's tier rules in O(1), keeping the artifact
+            # build time linear in the number of dates.
+            tier_per_date: list[str] = []
+            snap_per_date: list[dict] = []
+            available_columns = [
+                tf for tf in timeframes_list if tf in aligned.columns
+            ]
+            row_records = aligned[available_columns].to_dict(
+                orient="records",
+            )
+            aligned_index_list = list(aligned.index)
+            for raw_row in row_records:
+                snap: dict[str, str] = {}
+                for tf in timeframes_list:
+                    if tf not in available_columns:
+                        snap[tf] = "missing"
+                        continue
+                    v = raw_row.get(tf)
+                    if v is None:
+                        snap[tf] = "missing"
+                        continue
+                    try:
+                        if pd.isna(v):
+                            snap[tf] = "missing"
+                            continue
+                    except Exception:
+                        pass
+                    vs = str(v).strip()
+                    if not vs:
+                        snap[tf] = "missing"
+                    elif vs.lower() == "buy":
+                        snap[tf] = "Buy"
+                    elif vs.lower() == "short":
+                        snap[tf] = "Short"
+                    elif vs.lower() == "none":
+                        snap[tf] = "None"
+                    else:
+                        snap[tf] = "missing"
+                buy_n = sum(1 for x in snap.values() if x == "Buy")
+                short_n = sum(1 for x in snap.values() if x == "Short")
+                none_n = sum(1 for x in snap.values() if x == "None")
+                tier = _compute_confluence_tier_from_counts(
+                    buy_n, short_n, none_n, min_active=min_active,
+                )
+                tier_per_date.append(tier)
+                snap_per_date.append(snap)
+
+            align_df = pd.DataFrame({
+                "date": aligned_index_list,
+                "tier": tier_per_date,
+                "snap": snap_per_date,
+            })
+            align_df["date"] = pd.to_datetime(
+                align_df["date"], errors="coerce",
+            )
+            align_df = align_df.dropna(subset=["date"]).reset_index(drop=True)
+        finally:
+            try:
+                if saved_sig_dir is not None:
+                    _ca.SIGNAL_LIBRARY_DIR = saved_sig_dir
+                if saved_fallback is not None:
+                    _ca._load_spymaster_cache_fallback = saved_fallback
+            except Exception:
+                pass
+    finally:
+        try:
+            os.chdir(saved_cwd)
+        except Exception:
+            pass
+
+    merged = closes_df.merge(align_df, on="date", how="inner")
+    if merged.empty:
+        return None
+    # Do not pass ``alignment_pcts``: the builder recomputes it from
+    # the per-row buy / short / active counts using the production
+    # analyzer's max(buy_pct, short_pct) rule and the min_active
+    # gate. Identical to the analyzer's value when active >=
+    # min_active, and 0.0 when below the gate.
+    return build_confluence_day_artifact(
+        target_ticker,
+        dates=merged["date"].tolist(),
+        target_close=merged["close"].tolist(),
+        confluence_tiers=merged["tier"].tolist(),
+        timeframe_signals=merged["snap"].tolist(),
+        timeframes=timeframes_list,
+        min_active=min_active,
+        persist_skip_bars=persist_skip_bars,
+        run_id=run_id,
+        summary_overrides=summary_overrides,
+    )
+
+
+# Phase 6B-4 / 6C scope reminders kept in source so a future
 # maintainer sees the intended extension points.
-#
-#   TODO Phase 6B-3: build_confluence_day_artifact(...). Daily rows
-#   gain `confluence_tier` (one of the 7 tiers), per-timeframe
-#   `breakdown` snapshot, and `alignment_pct`. Path:
-#     output/research_artifacts/confluence/<TARGET>/.research_day.json
 #
 #   TODO Phase 6B-4: build_trafficflow_day_artifact(...). Daily rows
 #   gain per-member Buy/Short/None pressure + aggregate pressure

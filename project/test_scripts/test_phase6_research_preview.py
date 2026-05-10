@@ -3247,3 +3247,477 @@ def test_full_price_chart_section_below_first_view():
     # halves that survive.
     assert "Cumulative capture chart needs saved daily" in src
     assert "signal history for this signal source." in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-2 cleanup: stack chart reconciliation
+# ---------------------------------------------------------------------------
+
+
+def _build_preview_component(monkeypatch, sample, meta, log):
+    """Helper: drive the dashboard-main callback and return the
+    rendered Dash component."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["dashboard-main.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    return inner(sample, meta, log, None)
+
+
+def _recursive_jsonlike(c):
+    """Walk a Dash component tree end-to-end and convert nested
+    components to plain dicts so ``json.dumps`` produces a fully
+    flattened text view (rather than the one-level
+    ``component.to_plotly_json()`` which leaves children as truncated
+    reprs). Used by the Phase 6B-2/6B-3 tests that look for component
+    IDs deep in the cockpit."""
+    if hasattr(c, "to_plotly_json"):
+        d = c.to_plotly_json()
+        if isinstance(d, dict):
+            d = dict(d)
+            props = d.get("props")
+            if isinstance(props, dict):
+                d["props"] = {
+                    k: _recursive_jsonlike(v)
+                    for k, v in props.items()
+                }
+        return d
+    if isinstance(c, (list, tuple)):
+        return [_recursive_jsonlike(x) for x in c]
+    if isinstance(c, dict):
+        return {k: _recursive_jsonlike(v) for k, v in c.items()}
+    return c
+
+
+def _component_json_text(component) -> str:
+    """Render a Dash component tree to a single JSON-style string for
+    substring assertions."""
+    return json.dumps(_recursive_jsonlike(component), default=str)
+
+
+def test_stack_reconciliation_line_appears_when_artifact_exists(
+    monkeypatch,
+):
+    """When a saved stack artifact exists, Combined Signals Detail
+    must show a reconciliation line: Final Cumulative Capture (from
+    the daily rows) AND the saved leaderboard Total Capture (when
+    present in summary)."""
+    pytest.importorskip("dash")
+    import research_artifacts as ra
+
+    art = ra.build_stackbuilder_day_artifact(
+        target_ticker="SPY", run_id="seed_run", K=2,
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 110.0, 121.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy"],
+            "BBB": ["Buy", "Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+        summary_overrides={"total_capture_pct": 25.00},
+    )
+    monkeypatch.setattr(
+        preview, "_read_stack_artifact_for_run",
+        lambda target, run_id, K: art,
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 1,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text_json = _component_json_text(component)
+    text = _extract_ui_text(component)
+    assert "stack-reconciliation-line" in text_json
+    assert "Final Cumulative Capture" in text
+    assert "Saved Total Capture" in text
+
+
+def test_stack_reconciliation_mismatch_note_only_when_material(
+    monkeypatch,
+):
+    """The 'Chart and leaderboard use different saved date windows.'
+    note must appear when the rebuilt-vs-saved gap exceeds 1
+    percentage point and stay hidden when the values agree to
+    within 1pp."""
+    pytest.importorskip("dash")
+    import research_artifacts as ra
+
+    # Material gap: rebuilt 21% vs saved 30% -> mismatch should fire.
+    art_mismatch = ra.build_stackbuilder_day_artifact(
+        target_ticker="SPY", run_id="seed_run", K=2,
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 110.0, 121.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy"],
+            "BBB": ["Buy", "Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+        summary_overrides={"total_capture_pct": 30.00},
+    )
+    monkeypatch.setattr(
+        preview, "_read_stack_artifact_for_run",
+        lambda target, run_id, K: art_mismatch,
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 1,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text = _component_json_text(component)
+    assert (
+        "Chart and leaderboard use different saved date windows."
+        in text
+    )
+
+    # Close enough: rebuilt 20% (0 + 10 + 10 from the fixture above)
+    # vs saved 20.5% -> diff 0.5pp <= 1pp threshold, note must NOT
+    # fire.
+    art_close = ra.build_stackbuilder_day_artifact(
+        target_ticker="SPY", run_id="seed_run", K=2,
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 110.0, 121.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy"],
+            "BBB": ["Buy", "Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+        summary_overrides={"total_capture_pct": 20.5},
+    )
+    monkeypatch.setattr(
+        preview, "_read_stack_artifact_for_run",
+        lambda target, run_id, K: art_close,
+    )
+    component2 = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text2 = _component_json_text(component2)
+    assert (
+        "Chart and leaderboard use different saved date windows."
+        not in text2
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-3: Confluence day-by-day in Time Windows Detail
+# ---------------------------------------------------------------------------
+
+
+def test_time_windows_renders_confluence_chart_when_artifact_present(
+    monkeypatch,
+):
+    """When a saved confluence artifact exists, Time Windows Detail
+    must render the Confluence Capture Over Time chart with the
+    'Chart data: exact saved confluence path' source line and a tier
+    distribution summary."""
+    pytest.importorskip("dash")
+    import research_artifacts as ra
+
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=pd.bdate_range("2024-01-02", periods=4),
+        target_close=[100.0, 110.0, 99.0, 99.0],
+        confluence_tiers=["Strong Buy", "Buy", "Strong Short", "Neutral"],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "None", "1y": "None"},
+            {"1d": "Short", "1wk": "Short", "1mo": "Short",
+             "3mo": "Short", "1y": "Short"},
+            {"1d": "Buy", "1wk": "Short", "1mo": "Short",
+             "3mo": "Buy", "1y": "None"},
+        ],
+        persist_skip_bars=0,
+    )
+    monkeypatch.setattr(
+        preview, "_read_confluence_artifact_for_target",
+        lambda target: art,
+    )
+    # Force the Time Windows engine snapshot path to None so the chart
+    # block always runs regardless of the local signal-library state.
+    monkeypatch.setattr(
+        preview, "_real_confluence_snapshot_for_target",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setattr(
+        preview, "_confluence_status_for_target",
+        lambda *_a, **_kw: [
+            {"timeframe": "Daily", "available": True,
+             "signal": "Buy", "bars_in_signal": 5,
+             "signal_start_date": "2024-01-02"},
+        ],
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 0,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text_json = _component_json_text(component)
+    assert "confluence-cumulative-capture-chart" in text_json
+    assert "Chart data: exact saved confluence path" in text_json
+    assert "Confluence Capture Over Time" in text_json
+    # Tier distribution summary present.
+    assert "TIER DISTRIBUTION" in text_json
+    assert "Strong Buy" in text_json
+    assert "Strong Short" in text_json
+
+
+def test_time_windows_falls_back_when_no_confluence_artifact(
+    monkeypatch,
+):
+    """When no confluence artifact exists, Time Windows Detail must
+    show the 'Confluence chart data has not been built yet.' copy
+    and NOT a confluence-cumulative-capture chart."""
+    pytest.importorskip("dash")
+
+    monkeypatch.setattr(
+        preview, "_read_confluence_artifact_for_target",
+        lambda target: None,
+    )
+    # Make sure the engine snapshot path runs (returns a usable dict)
+    # so the artifact-fallback code path actually executes.
+    monkeypatch.setattr(
+        preview, "_real_confluence_snapshot_for_target",
+        lambda target, sig_lib_dir=None: {
+            "tier": "Buy", "strength": "MODERATE",
+            "alignment_pct": 75.0,
+            "buy_count": 3, "short_count": 0, "none_count": 1,
+            "active_count": 4, "total_count": 4,
+            "alignment_since": "2024-01-02",
+            "breakdown": {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+                          "3mo": "None", "1y": "Buy"},
+            "time_in_signal": {},
+            "as_of": "2024-01-09",
+        },
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 0,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text_json = _component_json_text(component)
+    assert "Confluence chart data has not been built yet." in text_json
+    assert "confluence-cumulative-capture-chart" not in text_json
+    # Build button must remain so the user can materialize the
+    # artifact.
+    assert "Build confluence chart data" in text_json
+
+
+def test_build_confluence_chart_data_button_present_in_layout():
+    """Phase 6B-3 lock: Time Windows Detail must render the
+    'Build confluence chart data' button + its callback id."""
+    pytest.importorskip("dash")
+    src = (
+        PROJECT_DIR / "phase6_research_preview.py"
+    ).read_text(encoding="utf-8")
+    assert "Build confluence chart data" in src
+    assert 'id="btn-build-confluence-chart-data"' in src
+    assert "Confluence chart data has not been built yet." in src
+    assert "Chart data: exact saved confluence path" in src
+
+
+def test_build_confluence_returns_reason_codes(monkeypatch, tmp_path):
+    """``_build_confluence_artifact_for_target`` returns
+    ``(path, reason)`` with each reason code distinguishable from
+    the others. ``no_libraries`` / ``target_cache_missing`` /
+    ``build_failed`` / ``write_failed`` / ``engine_unavailable``."""
+    pytest.importorskip("dash")
+
+    # 1) target_cache_missing: empty cache dir.
+    monkeypatch.setattr(
+        preview, "_spymaster_cache_dir", lambda: tmp_path / "no_cache",
+    )
+    monkeypatch.setattr(
+        preview, "_signal_library_dir",
+        lambda: tmp_path / "no_lib",
+    )
+    out, reason = preview._build_confluence_artifact_for_target("SPY")
+    assert out is None
+    assert reason == "target_cache_missing"
+
+
+def test_build_confluence_for_caret_ticker_no_false_target_cache_missing(
+    monkeypatch, tmp_path,
+):
+    """Phase 6B-3 amendment: a caret-named target cache file
+    (``^GSPC_precomputed_results.pkl``) must NOT trigger
+    ``target_cache_missing``. The preflight must probe both real and
+    filename-safe ticker forms before declaring missing."""
+    pytest.importorskip("dash")
+    import pickle as _pkl
+    cache = tmp_path / "cache" / "results"
+    cache.mkdir(parents=True)
+    sig = tmp_path / "sig"
+    sig.mkdir()
+    # Lay down a real-form ^GSPC cache + library; no filename-safe
+    # files at all.
+    idx = pd.date_range("2024-01-02", periods=3, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "daily_top_buy_pairs": {
+                d: ((1, 2), 1.0) for d in idx
+            },
+            "daily_top_short_pairs": {
+                d: ((2, 1), 0.0) for d in idx
+            },
+        }, fh)
+    with (sig / "^GSPC_stable_v1_0_0.pkl").open("wb") as fh:
+        _pkl.dump({
+            "primary_signals": ["Buy", "Buy", "Short"],
+            "dates": list(idx),
+        }, fh)
+
+    monkeypatch.setattr(
+        preview, "_spymaster_cache_dir", lambda: cache,
+    )
+    monkeypatch.setattr(
+        preview, "_signal_library_dir", lambda: sig,
+    )
+    out, reason = preview._build_confluence_artifact_for_target(
+        "^GSPC",
+    )
+    # Must NOT report target_cache_missing or no_libraries when the
+    # caret-form files exist on disk; build should succeed and the
+    # output path is filename-safe.
+    assert reason is None, (
+        f"caret-form fixture should not produce a reason; got "
+        f"reason={reason!r}"
+    )
+    assert out is not None
+    assert "_GSPC" in str(out), (
+        "artifact output path must remain filename-safe even when "
+        "input files use the caret form"
+    )
+
+
+def test_build_confluence_chart_action_logs_differentiated_copy(
+    monkeypatch,
+):
+    """The confluence-build callback's Activity message must differ
+    per reason code so the user knows which saved-data piece is
+    missing."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    cbmap = app.callback_map
+    inner = None
+    for key, entry in cbmap.items():
+        if "log-store" not in str(key):
+            continue
+        inputs = entry.get("inputs") or []
+        input_ids = [
+            inp.component_id if hasattr(inp, "component_id")
+            else inp.get("id") if isinstance(inp, dict) else None
+            for inp in inputs
+        ]
+        if "btn-build-confluence-chart-data" in input_ids:
+            cb = entry.get("callback")
+            inner = getattr(cb, "__wrapped__", cb)
+            break
+    assert inner is not None, (
+        "expected a callback bound to btn-build-confluence-chart-data"
+    )
+
+    cases = [
+        ("no_libraries", "no saved confluence libraries"),
+        ("target_cache_missing", "price cache"),
+        ("build_failed", "confluence build"),
+        ("write_failed", "could not be saved"),
+        ("engine_unavailable", "engine unavailable"),
+    ]
+    for reason, expected_substring in cases:
+        monkeypatch.setattr(
+            preview, "_build_confluence_artifact_for_target",
+            lambda target, _r=reason: (None, _r),
+        )
+        log = inner(1, {"target": "SPY"}, [])
+        assert log, "expected at least one Activity log line"
+        last = str(log[-1])
+        assert expected_substring in last, (
+            f"reason {reason!r} should produce a message containing "
+            f"{expected_substring!r}; got {last!r}"
+        )
+
+
+def test_time_windows_does_not_reintroduce_banned_labels(monkeypatch):
+    """Banned labels (risk score / risk-adjusted score / manifest /
+    sidecar / XLSX) must not appear in the rendered Time Windows
+    Detail, regardless of whether the confluence artifact exists."""
+    pytest.importorskip("dash")
+    import research_artifacts as ra
+
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY",
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100.0, 110.0, 99.0],
+        confluence_tiers=["Strong Buy", "Buy", "Strong Short"],
+        timeframe_signals=[
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+             "3mo": "Buy", "1y": "Buy"},
+            {"1d": "Short", "1wk": "Short", "1mo": "Short",
+             "3mo": "Short", "1y": "Short"},
+        ],
+        persist_skip_bars=0,
+    )
+    monkeypatch.setattr(
+        preview, "_read_confluence_artifact_for_target",
+        lambda target: art,
+    )
+    monkeypatch.setattr(
+        preview, "_real_confluence_snapshot_for_target",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setattr(
+        preview, "_confluence_status_for_target",
+        lambda *_a, **_kw: [
+            {"timeframe": "Daily", "available": True,
+             "signal": "Buy", "bars_in_signal": 5,
+             "signal_start_date": "2024-01-02"},
+        ],
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 0,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text = _extract_ui_text(component)
+    for banned in ("Risk score", "Risk-adjusted score",
+                   "manifest", "sidecar"):
+        assert banned not in text, (
+            f"banned label {banned!r} reappeared in rendered Time "
+            f"Windows / cockpit text"
+        )
