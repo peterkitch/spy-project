@@ -2496,6 +2496,21 @@ def build_app() -> Any:
                                        "width": "100%",
                                        "boxSizing": "border-box"},
                             ),
+                            # Phase 6C-2: refresh the cross-ticker
+                            # catalogue snapshot index from disk and
+                            # persist a fresh JSON snapshot for the
+                            # next process-restart fast-load.
+                            html.Button(
+                                "Refresh catalogue index",
+                                id="btn-refresh-catalogue-index",
+                                n_clicks=0,
+                                style={**btn_style,
+                                       "marginRight": "0",
+                                       "marginTop": "6px",
+                                       "marginBottom": "0",
+                                       "width": "100%",
+                                       "boxSizing": "border-box"},
+                            ),
                             html.Div(
                                 id="output-discovery-status",
                                 style={
@@ -2677,6 +2692,19 @@ def build_app() -> Any:
                         className="prjct9-main",
                         style=panel_style,
                         children=[
+                            # Phase 6C-2: Research Catalogue browser
+                            # renders above the per-ticker dashboard
+                            # so the user sees what exists across the
+                            # whole catalogue before drilling into a
+                            # single ticker. Updated by a separate
+                            # callback that reads
+                            # catalogue-snapshot-store; the dashboard
+                            # render below stays untouched.
+                            html.Div(
+                                id="catalogue-browser-section",
+                                style={"padding": "0",
+                                       "marginBottom": "10px"},
+                            ),
                             dcc.Loading(
                                 id="dashboard-loading",
                                 type="circle",
@@ -2703,6 +2731,14 @@ def build_app() -> Any:
             # the user clicks Refresh catalogue, and after Build
             # missing charts finishes a sweep.
             dcc.Store(id="catalogue-store"),
+            # Phase 6C-2: cross-ticker catalogue snapshot. Holds the
+            # whole-catalogue summary used by the Research Catalogue
+            # browser - top opportunities, targets needing chart
+            # data, complete-coverage targets, and the dropdown
+            # options. Refreshed when the studied ticker changes,
+            # when the user clicks Refresh catalogue index, and
+            # after Build missing charts.
+            dcc.Store(id="catalogue-snapshot-store"),
             # Tracks the most recent left-rail nav target. Written
             # by clientside scrollIntoView callbacks so the Dash
             # callback graph has a registered output.
@@ -3078,6 +3114,44 @@ def build_app() -> Any:
         return log[-200:]
 
     # ----------------------------------------------------------------- catalogue
+    # Phase 6C-2: cross-ticker catalogue snapshot. Refreshed on
+    # ticker-change (uses TTL cache) and on Refresh catalogue index
+    # clicks (force_refresh + persist). Build missing charts also
+    # writes here via its own multi-output callback below.
+    @app.callback(
+        Output("catalogue-snapshot-store", "data"),
+        Input("meta-store", "data"),
+        Input("btn-refresh-catalogue-index", "n_clicks"),
+        prevent_initial_call=False,
+    )
+    def _update_catalogue_snapshot_store(_meta, _refresh_n):
+        trigger = (
+            callback_context.triggered[0]["prop_id"].split(".")[0]
+            if callback_context.triggered else ""
+        )
+        force = trigger == "btn-refresh-catalogue-index"
+        try:
+            import research_catalogue as rc
+            return rc.get_catalogue_snapshot(
+                force_refresh=force,
+                persist_if_built=force,
+            )
+        except Exception:
+            return {
+                "schema": "research_catalogue_snapshot_v1",
+                "counts": {
+                    "engine": {},
+                    "state": {},
+                    "targets_total": 0,
+                },
+                "targets": [],
+                "chart_ready_targets": [],
+                "targets_needing_chart_data": [],
+                "complete_coverage_targets": [],
+                "entries": [],
+                "top_opportunities": [],
+            }
+
     # Phase 6C-1: refresh the catalogue store on ticker-change and
     # Refresh-catalogue clicks. Build missing charts owns its own
     # catalogue refresh (the build callback co-writes catalogue-
@@ -3136,6 +3210,7 @@ def build_app() -> Any:
     @app.callback(
         Output("log-store", "data", allow_duplicate=True),
         Output("catalogue-store", "data", allow_duplicate=True),
+        Output("catalogue-snapshot-store", "data", allow_duplicate=True),
         Input("btn-build-missing-charts", "n_clicks"),
         State("meta-store", "data"),
         State("results-store", "data"),
@@ -3157,9 +3232,9 @@ def build_app() -> Any:
                 f"[{ts}] build missing charts failed: "
                 f"{type(exc).__name__}: {exc}"
             )
-            # Catalogue module unavailable - leave catalogue-store as
-            # is rather than overwriting with a partial snapshot.
-            return log[-200:], no_update
+            # Catalogue module unavailable - leave both stores as is
+            # rather than overwriting with a partial snapshot.
+            return log[-200:], no_update, no_update
         try:
             summary = rc.summarize_ticker_catalogue(
                 target, force_refresh=True,
@@ -3169,7 +3244,7 @@ def build_app() -> Any:
                 f"[{ts}] build missing charts failed: "
                 f"{type(exc).__name__}: {exc}"
             )
-            return log[-200:], no_update
+            return log[-200:], no_update, no_update
         statuses = summary.get("statuses") or []
         log.append(f"[{ts}] Build missing charts: {target}.")
         for row in statuses:
@@ -3359,7 +3434,16 @@ def build_app() -> Any:
             )
         except Exception:
             post_summary = summary
-        return log[-200:], post_summary
+        # Phase 6C-2: also refresh the cross-ticker snapshot so the
+        # Research Catalogue browser reflects the new chart-ready
+        # rows produced by this sweep. Same race avoidance: own the
+        # refresh here rather than letting another callback fire on
+        # the same trigger.
+        try:
+            post_snapshot = rc.get_catalogue_snapshot(force_refresh=True)
+        except Exception:
+            post_snapshot = no_update
+        return log[-200:], post_summary, post_snapshot
 
     # Clientside scroll-into-view callbacks for the three left-rail
     # navigate buttons. They run in the browser (no server hop) and
@@ -3428,6 +3512,20 @@ def build_app() -> Any:
         prevent_initial_call=True,
     )
 
+    # Phase 6C-2: copy a catalogue-target-dropdown selection into the
+    # ticker input box so the user can see what they picked. The
+    # dropdown also fires the load action via _on_action's
+    # catalogue-target-dropdown Input below.
+    @app.callback(
+        Output("target-ticker", "value"),
+        Input("catalogue-target-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _propagate_dropdown_to_ticker_input(value):
+        if not value:
+            return no_update
+        return str(value).strip().upper()
+
     @app.callback(
         Output("results-store", "data"),
         Output("meta-store", "data"),
@@ -3435,6 +3533,7 @@ def build_app() -> Any:
         Input("btn-load", "n_clicks"),
         Input("btn-run", "n_clicks"),
         Input("boot-trigger", "n_intervals"),
+        Input("catalogue-target-dropdown", "value"),
         State("target-ticker", "value"),
         State("universe-preset", "value"),
         State("custom-primaries", "value"),
@@ -3443,7 +3542,7 @@ def build_app() -> Any:
         prevent_initial_call=True,
     )
     def _on_action(
-        _load_n, _run_n, boot_n, target, preset, custom_text,
+        _load_n, _run_n, boot_n, dropdown_value, target, preset, custom_text,
         log, current_results,
     ):
         log = list(log or [])
@@ -3452,6 +3551,12 @@ def build_app() -> Any:
             callback_context.triggered[0]["prop_id"].split(".")[0]
             if callback_context.triggered else ""
         )
+        # Phase 6C-2: catalogue dropdown fires this callback like a
+        # "load" click. Use the dropdown value as the target so the
+        # Catalogue Browser jumps straight to the picked ticker
+        # without a second user step.
+        if trigger == "catalogue-target-dropdown" and dropdown_value:
+            target = str(dropdown_value).strip().upper() or DEFAULT_TARGET
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         # The "Run quick study" button always implies the live (capped)
         # path; "Show saved study" always implies browse. The legacy
@@ -3534,6 +3639,10 @@ def build_app() -> Any:
 
         # "Show saved study" -> always browse path
         if trigger == "btn-load":
+            return _do_load(quiet=False)
+
+        # Catalogue dropdown -> load the picked ticker.
+        if trigger == "catalogue-target-dropdown":
             return _do_load(quiet=False)
 
         # "Run quick study" -> always live path
@@ -3624,6 +3733,45 @@ def build_app() -> Any:
             results_data, meta, log or [], selected_row,
             catalogue_summary=catalogue_data,
         )
+
+    # Phase 6C-2: catalogue browser section. Reads
+    # catalogue-snapshot-store and renders the cross-ticker overview
+    # (top opportunities, targets needing chart data, complete-
+    # coverage targets, target dropdown). Lives ABOVE the per-ticker
+    # dashboard so the user sees what's saved across the catalogue
+    # before diving into one ticker.
+    @app.callback(
+        Output("catalogue-browser-section", "children"),
+        Input("catalogue-snapshot-store", "data"),
+    )
+    def _render_catalogue_browser_section(snapshot):
+        return _render_catalogue_browser(snapshot)
+
+    # Update the dropdown options whenever the snapshot refreshes.
+    # Keeping options in sync with the snapshot lets a Refresh-
+    # catalogue-index click (or a successful Build missing charts
+    # sweep) immediately surface newly-discovered tickers in the
+    # selector without a page reload.
+    @app.callback(
+        Output("catalogue-target-dropdown", "options"),
+        Input("catalogue-snapshot-store", "data"),
+    )
+    def _update_catalogue_dropdown_options(snapshot):
+        snapshot = snapshot or {}
+        targets = list(snapshot.get("targets") or [])
+        chart_ready = set(snapshot.get("chart_ready_targets") or [])
+        # Sort: chart-ready first, then alphabetic for stability.
+        targets_sorted = sorted(
+            targets,
+            key=lambda t: (0 if t in chart_ready else 1, str(t).upper()),
+        )
+        options = []
+        for t in targets_sorted:
+            label = str(t)
+            if t in chart_ready:
+                label = f"{t}  -  chart ready"
+            options.append({"label": label, "value": t})
+        return options
 
     # Independent callback that updates ONLY the Selected Pattern card.
     # selected-row-store is an Input here (so clicking a row repaints
@@ -3952,6 +4100,304 @@ def build_app() -> Any:
             "BEST PATTERN SUMMARY",
             "quick read",
             body,
+        )
+
+    def _render_catalogue_browser(snapshot):
+        """Phase 6C-2 Research Catalogue browser.
+
+        Renders three lists fed by the cross-ticker snapshot:
+          * Best chart-ready research      - top_opportunities table
+          * Strong saved research that
+            needs charts                   - targets_needing_chart_data
+          * Targets with complete coverage - complete_coverage_targets
+        Plus a target search/selector dropdown sourced from
+        snapshot["targets"]. The dropdown's options are populated by
+        a separate callback so the snapshot refresh stays in one
+        place.
+        """
+        snapshot = snapshot or {}
+        top_opps = list(snapshot.get("top_opportunities") or [])
+        needing = list(snapshot.get("targets_needing_chart_data") or [])
+        complete = list(snapshot.get("complete_coverage_targets") or [])
+        chart_ready_targets = list(
+            snapshot.get("chart_ready_targets") or []
+        )
+        counts = snapshot.get("counts") or {}
+        engine_counts = counts.get("engine") or {}
+        state_counts = counts.get("state") or {}
+
+        header = html.Div(
+            style={"display": "flex",
+                   "alignItems": "baseline",
+                   "gap": "8px",
+                   "flexWrap": "wrap",
+                   "marginBottom": "6px"},
+            children=[
+                html.Span(
+                    "RESEARCH CATALOGUE",
+                    style={"color": PRJCT9_GREEN,
+                           "letterSpacing": "2px",
+                           "fontSize": "12px",
+                           "fontWeight": "bold"},
+                ),
+                html.Span(
+                    "what PRJCT9 has saved across all studied "
+                    "tickers",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "lineHeight": "1.4"},
+                ),
+            ],
+        )
+
+        sort_caption = html.Div(
+            "Sorted to put chart-ready, high-signal research first.",
+            id="catalogue-browser-sort-caption",
+            style={"color": PRJCT9_TEXT,
+                   "fontSize": "11px",
+                   "lineHeight": "1.5",
+                   "marginBottom": "8px"},
+        )
+
+        # Compact totals strip so the user can see the whole
+        # catalogue at a glance.
+        totals_text = (
+            f"{int(state_counts.get('chart_ready') or 0)} chart-ready "
+            "/ "
+            f"{int(state_counts.get('saved_research_found') or 0)} "
+            "to build / "
+            f"{int(counts.get('targets_total') or 0)} tickers"
+        )
+        totals_div = html.Div(
+            totals_text,
+            id="catalogue-browser-totals",
+            style={"color": PRJCT9_GREEN,
+                   "fontSize": "10px",
+                   "letterSpacing": "1px",
+                   "textTransform": "uppercase",
+                   "marginBottom": "8px"},
+        )
+
+        # Target search/selector dropdown. Options are filled in by
+        # the catalogue-target-dropdown callback so the menu stays in
+        # sync with the snapshot.
+        dropdown = dcc.Dropdown(
+            id="catalogue-target-dropdown",
+            options=[],
+            value=None,
+            placeholder="Open a saved ticker from the catalogue ...",
+            clearable=True,
+            searchable=True,
+            style={
+                "backgroundColor": PRJCT9_BLACK,
+                "color": PRJCT9_TEXT,
+                "fontSize": "12px",
+                "marginBottom": "10px",
+            },
+        )
+
+        body: list = [header, sort_caption, totals_div, dropdown]
+
+        def _opp_table(rows: list[dict]):
+            if not rows:
+                return html.Div(
+                    "No chart-ready research yet. Build chart data "
+                    "for a ticker to populate this list.",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "11px",
+                           "lineHeight": "1.5",
+                           "marginBottom": "8px"},
+                )
+            display_rows = []
+            for r in rows:
+                eng_label = str(r.get("label") or r.get("engine") or "")
+                target = str(r.get("target_ticker") or "")
+                source = r.get("signal_source") or ""
+                if r.get("engine") == "stackbuilder":
+                    K = r.get("K")
+                    source = (f"K={K}" if K is not None else "")
+                if r.get("engine") in ("trafficflow", "stackbuilder"):
+                    rid = r.get("run_id") or ""
+                    if rid:
+                        source = (
+                            f"{source} - {rid}" if source else str(rid)
+                        )
+                cap = r.get("total_capture_pct")
+                sharpe = r.get("sharpe_ratio")
+                td = r.get("trigger_days")
+                sig95 = r.get("significant_95")
+                display_rows.append({
+                    "Ticker": target,
+                    "Engine": eng_label,
+                    "Source": source,
+                    "Total Capture (%)": (
+                        f"{float(cap):.2f}" if cap is not None else "-"
+                    ),
+                    "Sharpe Ratio": (
+                        f"{float(sharpe):.2f}"
+                        if sharpe is not None else "-"
+                    ),
+                    "Signal days": (
+                        str(int(td)) if td is not None else "-"
+                    ),
+                    "95% Confidence": (
+                        "Yes" if sig95 is True
+                        else ("No" if sig95 is False else "-")
+                    ),
+                })
+            cols = [
+                "Ticker", "Engine", "Source",
+                "Total Capture (%)", "Sharpe Ratio", "Signal days",
+                "95% Confidence",
+            ]
+            return dash_table.DataTable(
+                id="catalogue-browser-top-opportunities",
+                columns=[{"name": c, "id": c} for c in cols],
+                data=display_rows,
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "backgroundColor": PRJCT9_BLACK,
+                    "color": PRJCT9_TEXT,
+                    "fontFamily": "Consolas, 'Courier New', monospace",
+                    "fontSize": "11px",
+                    "padding": "4px 8px",
+                    "border": f"1px solid {PRJCT9_BORDER}",
+                    "textAlign": "left",
+                },
+                style_header={
+                    "backgroundColor": PRJCT9_DIM,
+                    "color": PRJCT9_GREEN,
+                    "fontWeight": "bold",
+                    "border": f"1px solid {PRJCT9_GREEN}",
+                    "letterSpacing": "1px",
+                    "fontSize": "10px",
+                },
+                style_data_conditional=[
+                    {"if": {
+                        "filter_query": '{95% Confidence} = "Yes"',
+                        "column_id": "95% Confidence",
+                    },
+                     "color": PRJCT9_GREEN, "fontWeight": "bold"},
+                ],
+            )
+
+        body.append(html.Div(
+            "Best chart-ready research",
+            id="catalogue-browser-best-heading",
+            style={"color": PRJCT9_GREEN,
+                   "fontSize": "11px",
+                   "letterSpacing": "1px",
+                   "textTransform": "uppercase",
+                   "marginTop": "4px",
+                   "marginBottom": "4px",
+                   "fontWeight": "bold"},
+        ))
+        body.append(_opp_table(top_opps))
+
+        # "Strong saved research that needs charts"
+        body.append(html.Div(
+            "Strong saved research that needs charts",
+            id="catalogue-browser-needing-heading",
+            style={"color": PRJCT9_GREEN,
+                   "fontSize": "11px",
+                   "letterSpacing": "1px",
+                   "textTransform": "uppercase",
+                   "marginTop": "10px",
+                   "marginBottom": "4px",
+                   "fontWeight": "bold"},
+        ))
+        if not needing:
+            body.append(html.Div(
+                "No saved-only tickers waiting for chart data.",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5"},
+            ))
+        else:
+            body.append(html.Div(
+                ", ".join(needing),
+                id="catalogue-browser-needing-list",
+                style={"color": PRJCT9_TEXT,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5",
+                       "wordBreak": "break-word"},
+            ))
+
+        # "Targets with complete coverage"
+        body.append(html.Div(
+            "Targets with complete coverage",
+            id="catalogue-browser-complete-heading",
+            style={"color": PRJCT9_GREEN,
+                   "fontSize": "11px",
+                   "letterSpacing": "1px",
+                   "textTransform": "uppercase",
+                   "marginTop": "10px",
+                   "marginBottom": "4px",
+                   "fontWeight": "bold"},
+        ))
+        if not complete:
+            body.append(html.Div(
+                "No tickers yet have chart-ready research in every "
+                "engine. Build chart data to fill the gaps.",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5"},
+            ))
+        else:
+            body.append(html.Div(
+                ", ".join(complete),
+                id="catalogue-browser-complete-list",
+                style={"color": PRJCT9_GREEN,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5",
+                       "fontWeight": "bold",
+                       "wordBreak": "break-word"},
+            ))
+
+        # Per-engine count strip so the user can see what kinds of
+        # research dominate the catalogue at a glance.
+        engine_strip_cells = []
+        engine_label_map = {
+            "market_scan": "Market scans",
+            "impactsearch": "Single-signal studies",
+            "stackbuilder": "Combined-signal studies",
+            "confluence": "Time-window studies",
+            "trafficflow": "Traffic-flow studies",
+        }
+        for engine, label in engine_label_map.items():
+            n = int(engine_counts.get(engine) or 0)
+            engine_strip_cells.append(html.Div(
+                style={"backgroundColor": PRJCT9_DIM,
+                       "border": f"1px solid {PRJCT9_BORDER}",
+                       "padding": "4px 8px",
+                       "minWidth": "0"},
+                children=[
+                    html.Div(label,
+                             style={"color": PRJCT9_MUTED,
+                                    "fontSize": "9px",
+                                    "letterSpacing": "1px",
+                                    "textTransform": "uppercase"}),
+                    html.Div(str(n),
+                             style={"color": PRJCT9_GREEN,
+                                    "fontSize": "12px",
+                                    "fontWeight": "bold",
+                                    "marginTop": "2px"}),
+                ],
+            ))
+        body.append(html.Div(
+            id="catalogue-browser-engine-strip",
+            style={"display": "grid",
+                   "gridTemplateColumns":
+                       "repeat(auto-fit, minmax(120px, 1fr))",
+                   "gap": "6px",
+                   "marginTop": "10px"},
+            children=engine_strip_cells,
+        ))
+
+        return html.Div(
+            id="catalogue-browser-panel",
+            className="prjct9-cockpit-panel",
+            children=body,
         )
 
     def _render_catalogue_coverage(meta, catalogue_summary):

@@ -543,3 +543,490 @@ def test_read_cached_catalogue_index_round_trips(tmp_path: Path):
     assert payload is not None
     assert payload["counts"]["impactsearch"] >= 1
     assert "SPY" in (payload["targets"] or [])
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-2: catalogue snapshot
+# ---------------------------------------------------------------------------
+
+
+def _make_chart_ready_impactsearch(
+    base_dir: Path, target: str, source: str,
+    *, sharpe: float, total_capture: float, trigger_days: int,
+    significant_95: bool,
+) -> Path:
+    """Build a chart_ready impactsearch artifact whose summary
+    carries the controlled stats we want to assert on."""
+    art = ra.build_impactsearch_day_artifact(
+        target_ticker=target, signal_source=source,
+        dates=pd.bdate_range("2024-01-02", periods=5),
+        signals=["Buy", "Buy", "Short", "None", "Buy"],
+        target_close=[100.0, 110.0, 105.0, 102.0, 108.0],
+        persist_skip_bars=0,
+        summary_overrides={
+            "sharpe_ratio": sharpe,
+            "total_capture_pct": total_capture,
+            "trigger_days": trigger_days,
+            "significant_95": significant_95,
+        },
+    )
+    path = ra.artifact_path_for_impactsearch(target, source, base_dir=base_dir)
+    assert path is not None
+    return ra.write_research_day_artifact(art, path)
+
+
+def test_compute_display_rank_score_orders_chart_ready_first():
+    """A chart_ready entry with no stats must rank above a
+    saved_research_found entry with strong stats. The state weight
+    dominates the ranking - this is the contract that keeps
+    "Build chart data" rows below "Chart ready" rows in the UI
+    list."""
+    chart_no_stats = {
+        "state": rc.STATE_CHART_READY,
+        "significant_95": False,
+        "sharpe_ratio": 0.0,
+        "total_capture_pct": 0.0,
+        "trigger_days": 0,
+    }
+    saved_strong = {
+        "state": rc.STATE_SAVED_RESEARCH_FOUND,
+        "significant_95": True,
+        "sharpe_ratio": 5.0,
+        "total_capture_pct": 100.0,
+        "trigger_days": 1000,
+    }
+    assert (
+        rc.compute_display_rank_score(chart_no_stats)
+        > rc.compute_display_rank_score(saved_strong)
+    ), (
+        "chart_ready must dominate saved_research_found regardless "
+        "of stats - the UI list puts chart-ready rows first."
+    )
+
+
+def test_compute_display_rank_score_rewards_strong_stats():
+    """Within chart_ready, a strong-stats entry must outrank a
+    weak-stats entry."""
+    weak = {
+        "state": rc.STATE_CHART_READY,
+        "significant_95": False, "sharpe_ratio": 0.0,
+        "total_capture_pct": 0.0, "trigger_days": 5,
+    }
+    strong = {
+        "state": rc.STATE_CHART_READY,
+        "significant_95": True, "sharpe_ratio": 2.5,
+        "total_capture_pct": 40.0, "trigger_days": 250,
+    }
+    assert (
+        rc.compute_display_rank_score(strong)
+        > rc.compute_display_rank_score(weak)
+    )
+
+
+def test_compute_display_rank_score_handles_missing_fields_safely():
+    """None / missing stats must not raise. Score must be a finite
+    float and bounded sensibly."""
+    score = rc.compute_display_rank_score(
+        {"state": rc.STATE_CHART_READY},
+    )
+    assert isinstance(score, float)
+    assert 0.0 <= score <= 4.5
+    assert rc.compute_display_rank_score({}) == 0.0
+
+
+def test_build_catalogue_snapshot_represents_all_five_engines(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    # impactsearch chart-ready
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.5, total_capture=25.0,
+        trigger_days=120, significant_95=True,
+    )
+    # stackbuilder chart-ready (plus a saved run as input)
+    _write_saved_stack_run(dirs["stack_dir"], "SPY", "seed-run-1")
+    _write_stack_artifact(dirs["base_dir"], "SPY", "seed-run-1", K=2)
+    # confluence chart-ready
+    _write_confluence_artifact(dirs["base_dir"], "SPY")
+    # trafficflow chart-ready
+    _write_trafficflow_artifact(dirs["base_dir"], "SPY", "seed-run-1")
+    # market_scan via a saved OnePass output
+    dirs["onepass_dir"].mkdir(parents=True, exist_ok=True)
+    (dirs["onepass_dir"] / "onepass_run.xlsx").write_bytes(b"")
+
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert snap["schema"] == rc.SNAPSHOT_SCHEMA_VERSION
+    counts = snap["counts"]["engine"]
+    for engine in ("market_scan", "impactsearch", "stackbuilder",
+                   "confluence", "trafficflow"):
+        assert engine in counts, (
+            f"snapshot counts missing engine {engine!r}"
+        )
+    assert counts["impactsearch"] >= 1
+    assert counts["stackbuilder"] >= 1
+    assert counts["confluence"] >= 1
+    assert counts["trafficflow"] >= 1
+    assert counts["market_scan"] >= 1
+    assert "SPY" in snap["targets"]
+    # SPY is chart_ready in all four per-ticker engines -> complete
+    # coverage row.
+    assert "SPY" in snap["complete_coverage_targets"]
+    # And it lands in chart_ready_targets.
+    assert "SPY" in snap["chart_ready_targets"]
+
+
+def test_snapshot_separates_chart_ready_and_needing_chart_data(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    # SPY chart-ready impactsearch
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.0, total_capture=15.0,
+        trigger_days=80, significant_95=False,
+    )
+    # QQQ saved-only (XLSX with no chart artifact)
+    dirs["impactsearch_dir"].mkdir(parents=True, exist_ok=True)
+    (dirs["impactsearch_dir"] / "QQQ_analysis.xlsx").write_bytes(b"")
+
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert "SPY" in snap["chart_ready_targets"]
+    assert "QQQ" in snap["targets_needing_chart_data"]
+    assert "QQQ" not in snap["chart_ready_targets"]
+
+
+def test_snapshot_top_opportunities_orders_strongest_first(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "WEAK",
+        sharpe=0.2, total_capture=2.0,
+        trigger_days=15, significant_95=False,
+    )
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "MEDIUM",
+        sharpe=1.2, total_capture=18.0,
+        trigger_days=80, significant_95=False,
+    )
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "QQQ", "STRONG",
+        sharpe=2.5, total_capture=42.0,
+        trigger_days=300, significant_95=True,
+    )
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    top = snap["top_opportunities"]
+    assert top, "top_opportunities should not be empty"
+    assert top[0]["signal_source"] == "STRONG"
+    assert top[0]["state"] == rc.STATE_CHART_READY
+    assert top[0]["significant_95"] is True
+    sources_in_order = [r.get("signal_source") for r in top]
+    assert sources_in_order.index("STRONG") < sources_in_order.index(
+        "MEDIUM",
+    )
+    assert sources_in_order.index("MEDIUM") < sources_in_order.index(
+        "WEAK",
+    )
+
+
+def test_top_opportunities_excludes_saved_only_and_market_scan(tmp_path: Path):
+    """top_opportunities is the chart-ready leaderboard. Saved-
+    only impactsearch entries and target-agnostic market_scan
+    rows must not appear there."""
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "WEAK",
+        sharpe=0.1, total_capture=1.0,
+        trigger_days=10, significant_95=False,
+    )
+    dirs["impactsearch_dir"].mkdir(parents=True, exist_ok=True)
+    (dirs["impactsearch_dir"] / "QQQ_analysis.xlsx").write_bytes(b"")
+    dirs["onepass_dir"].mkdir(parents=True, exist_ok=True)
+    (dirs["onepass_dir"] / "onepass_run.xlsx").write_bytes(b"")
+
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    states = {e.get("state") for e in snap["top_opportunities"]}
+    assert states == {rc.STATE_CHART_READY}
+    engines = {e.get("engine") for e in snap["top_opportunities"]}
+    assert "market_scan" not in engines
+
+
+def test_snapshot_roundtrip_write_then_read(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.5, total_capture=25.0,
+        trigger_days=120, significant_95=True,
+    )
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    out = rc.write_catalogue_snapshot(snap, base_dir=dirs["base_dir"])
+    assert out.exists() and out.name == rc.SNAPSHOT_FILENAME
+    again = rc.read_catalogue_snapshot(base_dir=dirs["base_dir"])
+    assert again is not None
+    assert again["schema"] == rc.SNAPSHOT_SCHEMA_VERSION
+    assert again["counts"]["engine"]["impactsearch"] == 1
+    assert "SPY" in (again["targets"] or [])
+
+
+def test_read_catalogue_snapshot_rejects_unknown_schema(tmp_path: Path):
+    """Schema mismatch must return None rather than raising or
+    returning a corrupt payload."""
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    dirs["base_dir"].mkdir(parents=True, exist_ok=True)
+    (dirs["base_dir"] / rc.SNAPSHOT_FILENAME).write_text(
+        json.dumps({"schema": "future_v9", "entries": []}),
+        encoding="utf-8",
+    )
+    out = rc.read_catalogue_snapshot(base_dir=dirs["base_dir"])
+    assert out is None
+
+
+def test_get_catalogue_snapshot_cache_hit_avoids_rescan(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.0, total_capture=10.0,
+        trigger_days=50, significant_95=False,
+    )
+    first = rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert first["cache_hit"] is False
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "BBB",
+        sharpe=1.5, total_capture=20.0,
+        trigger_days=100, significant_95=True,
+    )
+    second = rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert second["cache_hit"] is True
+    assert (
+        second["counts"]["engine"]["impactsearch"]
+        == first["counts"]["engine"]["impactsearch"]
+    ), "cache hit must return cached counts, not a fresh walk"
+
+
+def test_get_catalogue_snapshot_force_refresh_rebuilds(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.0, total_capture=10.0,
+        trigger_days=50, significant_95=False,
+    )
+    rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "BBB",
+        sharpe=1.5, total_capture=20.0,
+        trigger_days=100, significant_95=True,
+    )
+    refreshed = rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+        force_refresh=True,
+    )
+    assert refreshed["cache_hit"] is False
+    assert refreshed["counts"]["engine"]["impactsearch"] == 2
+
+
+def test_get_catalogue_snapshot_loads_from_disk_when_no_cache(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.0, total_capture=10.0,
+        trigger_days=50, significant_95=False,
+    )
+    # Persist a snapshot so the next get() can read it.
+    rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+        persist_if_built=True,
+    )
+    # Reset in-memory cache to simulate a fresh process.
+    rc.reset_snapshot_cache()
+    # Add new disk evidence post-persist; this MUST be ignored when
+    # the snapshot loads from disk (force_refresh=False is the
+    # contract - the disk file is the cached state).
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "ZZZ",
+        sharpe=2.0, total_capture=30.0,
+        trigger_days=150, significant_95=True,
+    )
+    out = rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert out["loaded_from_disk"] is True
+    assert out["counts"]["engine"]["impactsearch"] == 1
+
+
+def test_get_catalogue_snapshot_persist_if_built_writes_disk(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.0, total_capture=10.0,
+        trigger_days=50, significant_95=False,
+    )
+    snap_path = dirs["base_dir"] / rc.SNAPSHOT_FILENAME
+    assert not snap_path.exists()
+    rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+        persist_if_built=True,
+    )
+    assert snap_path.exists()
+
+
+def test_get_catalogue_snapshot_no_persist_unless_requested(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "SPY", "AAA",
+        sharpe=1.0, total_capture=10.0,
+        trigger_days=50, significant_95=False,
+    )
+    snap_path = dirs["base_dir"] / rc.SNAPSHOT_FILENAME
+    rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert not snap_path.exists(), (
+        "snapshot file must not be written unless persist_if_built "
+        "is True; only Refresh catalogue index persists."
+    )
+
+
+def test_snapshot_does_not_invoke_live_engines(monkeypatch, tmp_path: Path):
+    """Pin the offline contract: snapshot helpers must never reach
+    for impactsearch / spymaster / trafficflow / stackbuilder /
+    yfinance."""
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    sentinel: list[str] = []
+
+    class _Boom:
+        def __getattr__(self, name):
+            sentinel.append(name)
+            raise RuntimeError(
+                f"snapshot must not call live engine: {name}"
+            )
+
+    monkeypatch.setitem(sys.modules, "impactsearch", _Boom())
+    monkeypatch.setitem(sys.modules, "spymaster", _Boom())
+    monkeypatch.setitem(sys.modules, "stackbuilder", _Boom())
+    monkeypatch.setitem(sys.modules, "trafficflow", _Boom())
+    monkeypatch.setitem(sys.modules, "yfinance", _Boom())
+
+    snap = rc.get_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    assert snap["schema"] == rc.SNAPSHOT_SCHEMA_VERSION
+    assert sentinel == [], (
+        f"snapshot inadvertently reached for live engines: {sentinel!r}"
+    )
+
+
+def test_snapshot_handles_caret_ticker(tmp_path: Path):
+    rc.reset_cache()
+    rc.reset_snapshot_cache()
+    dirs = _setup_dirs(tmp_path)
+    _make_chart_ready_impactsearch(
+        dirs["base_dir"], "^GSPC", "AAA",
+        sharpe=1.0, total_capture=10.0,
+        trigger_days=50, significant_95=False,
+    )
+    snap = rc.build_catalogue_snapshot(
+        base_dir=dirs["base_dir"],
+        impactsearch_dir=dirs["impactsearch_dir"],
+        onepass_dir=dirs["onepass_dir"],
+        stack_dir=dirs["stack_dir"],
+        sig_lib_dir=dirs["sig_lib_dir"],
+    )
+    # Real-form tickers in the surfaced sets, not filename-safe.
+    assert "^GSPC" in snap["targets"]
+    impact_entries = [
+        e for e in snap["entries"]
+        if e.get("engine") == "impactsearch"
+    ]
+    assert impact_entries
+    assert impact_entries[0]["target_ticker"] == "^GSPC"
