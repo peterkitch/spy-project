@@ -66,6 +66,28 @@ DEFAULT_TARGET = "SPY"
 DEFAULT_PORT = int(os.environ.get("PRJCT9_PREVIEW_PORT", "8060"))
 MAX_PRIMARIES_LIVE = 10
 
+
+def is_public_read_only_mode() -> bool:
+    """Phase 6C-3: ``PRJCT9_PUBLIC_READ_ONLY=1`` puts the preview in
+    public read-only mode. Hides Build missing charts, Refresh
+    catalogue index, and the live signal-source test, and gates the
+    write/build/live callbacks so a public deployment cannot touch
+    disk or run impactsearch live. Local Peter-mode is unchanged
+    when the env var is unset.
+
+    Accepts the common truthy spellings ``1``, ``true``, ``yes``,
+    ``on`` (case-insensitive). Anything else - including the empty
+    string - is treated as off.
+    """
+    raw = os.environ.get("PRJCT9_PUBLIC_READ_ONLY", "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Cached at import-time so the layout build / callback gates use a
+# single source of truth even if the env var is mutated mid-process.
+PUBLIC_READ_ONLY = is_public_read_only_mode()
+HIDDEN_STYLE = {"display": "none"}
+
 PRJCT9_BLACK = "#000000"
 PRJCT9_GREEN = "#80ff00"
 PRJCT9_DIM = "#1a1a1a"
@@ -990,6 +1012,18 @@ def _build_stack_artifact_for_top_run(
         return ra.write_research_day_artifact(artifact, path), None
     except Exception:
         return None, "write_failed"
+
+
+def _hide_in_public_mode(base_style: Optional[dict] = None) -> dict:
+    """Phase 6C-3: helper that returns the right ``style`` dict for
+    a button or section that should disappear in public read-only
+    mode. In local Peter-mode it returns the original style. In
+    public mode it returns a style dict with ``display: none`` so
+    the rendered surface drops the element entirely (the callback
+    can still be registered for callback-graph stability)."""
+    if PUBLIC_READ_ONLY:
+        return dict(HIDDEN_STYLE)
+    return dict(base_style or {})
 
 
 def _empty_browser_payload() -> dict:
@@ -2320,6 +2354,13 @@ def build_app() -> Any:
                 .prjct9-shell { padding: 8px; gap: 8px; }
                 .prjct9-controls,
                 .prjct9-main { flex: 1 1 100%; }
+                /* Phase 6C-3: on mobile the Research Catalogue
+                   browser must be visible above the fold so the
+                   first viewport answers "what should I open?".
+                   The flex wrap stacks controls + main; flex order
+                   here floats the main panel above the controls. */
+                .prjct9-main { order: 1; }
+                .prjct9-controls { order: 2; }
                 .prjct9-header-tagline { display: none; }
                 .prjct9-charts {
                     grid-template-columns: 1fr;
@@ -2502,16 +2543,23 @@ def build_app() -> Any:
                             # build-missing-charts buttons. Both act on
                             # the currently studied ticker only; they
                             # never trigger a universe-wide rebuild.
+                            # Phase 6C-3: hidden in public read-only
+                            # mode (the public web app must not be
+                            # able to write or build). The component
+                            # IDs stay registered so the existing
+                            # callback graph compiles either way.
                             html.Button(
                                 "Build missing charts",
                                 id="btn-build-missing-charts",
                                 n_clicks=0,
-                                style={**btn_style,
-                                       "marginRight": "0",
-                                       "marginTop": "6px",
-                                       "marginBottom": "0",
-                                       "width": "100%",
-                                       "boxSizing": "border-box"},
+                                style=_hide_in_public_mode({
+                                    **btn_style,
+                                    "marginRight": "0",
+                                    "marginTop": "6px",
+                                    "marginBottom": "0",
+                                    "width": "100%",
+                                    "boxSizing": "border-box",
+                                }),
                             ),
                             html.Button(
                                 "Refresh catalogue",
@@ -2528,16 +2576,21 @@ def build_app() -> Any:
                             # catalogue snapshot index from disk and
                             # persist a fresh JSON snapshot for the
                             # next process-restart fast-load.
+                            # Phase 6C-3: hidden in public mode -
+                            # writing the persistent index is a
+                            # local-only action.
                             html.Button(
                                 "Refresh catalogue index",
                                 id="btn-refresh-catalogue-index",
                                 n_clicks=0,
-                                style={**btn_style,
-                                       "marginRight": "0",
-                                       "marginTop": "6px",
-                                       "marginBottom": "0",
-                                       "width": "100%",
-                                       "boxSizing": "border-box"},
+                                style=_hide_in_public_mode({
+                                    **btn_style,
+                                    "marginRight": "0",
+                                    "marginTop": "6px",
+                                    "marginBottom": "0",
+                                    "width": "100%",
+                                    "boxSizing": "border-box",
+                                }),
                             ),
                             html.Div(
                                 id="output-discovery-status",
@@ -2555,10 +2608,19 @@ def build_app() -> Any:
                             # Signal sources for the live test
                             # (collapsed by default so the rest of
                             # the research-flow steps stay visible).
+                            # Phase 6C-3: the entire live-test
+                            # surface is hidden in public read-only
+                            # mode (no live engine path is allowed
+                            # there). Component IDs stay registered
+                            # so the existing callback graph compiles.
                             html.Details(
-                                style={"marginTop": "14px",
-                                       "borderTop": f"1px dashed {PRJCT9_BORDER}",
-                                       "paddingTop": "10px"},
+                                style=_hide_in_public_mode({
+                                    "marginTop": "14px",
+                                    "borderTop": (
+                                        f"1px dashed {PRJCT9_BORDER}"
+                                    ),
+                                    "paddingTop": "10px",
+                                }),
                                 children=[
                                     html.Summary(
                                         "Signal sources for live test",
@@ -2767,6 +2829,11 @@ def build_app() -> Any:
             # when the user clicks Refresh catalogue index, and
             # after Build missing charts.
             dcc.Store(id="catalogue-snapshot-store"),
+            # Phase 6C-3: when a catalogue row is clicked, the bridge
+            # callback writes the picked signal source here. The
+            # patterns table's selected_rows callback reads it AFTER
+            # the load completes and reflects the matching row.
+            dcc.Store(id="catalogue-pinned-source-store"),
             # Tracks the most recent left-rail nav target. Written
             # by clientside scrollIntoView callbacks so the Dash
             # callback graph has a registered output.
@@ -2884,7 +2951,12 @@ def build_app() -> Any:
         """Phase 6B-1 single-row artifact generator. Builds and saves
         exactly one ``research_day_v1`` artifact for the currently
         selected pattern. Bounded, offline, error-trapped, never
-        triggers a 36k-row batch."""
+        triggers a 36k-row batch.
+
+        Phase 6C-3 amendment: short-circuits in public read-only
+        mode so a public deployment cannot write chart data."""
+        if PUBLIC_READ_ONLY:
+            return no_update
         log = list(log or [])
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         row = selected_row or _auto_select_best_row(
@@ -2958,7 +3030,12 @@ def build_app() -> Any:
         """Phase 6B-2 single-row stack artifact generator. Builds and
         saves exactly one ``research_day_v1`` artifact for the top
         leaderboard row of the studied ticker's most recent saved
-        StackBuilder run. Bounded, offline, error-trapped."""
+        StackBuilder run. Bounded, offline, error-trapped.
+
+        Phase 6C-3 amendment: short-circuits in public read-only
+        mode."""
+        if PUBLIC_READ_ONLY:
+            return no_update
         log = list(log or [])
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         target = (meta or {}).get("target") or DEFAULT_TARGET
@@ -3024,7 +3101,12 @@ def build_app() -> Any:
         """Phase 6B-3 single-target confluence artifact generator.
         Builds and saves exactly one ``research_day_v1`` artifact for
         the studied ticker. Bounded, offline, error-trapped; never
-        triggers a universe scan."""
+        triggers a universe scan.
+
+        Phase 6C-3 amendment: short-circuits in public read-only
+        mode."""
+        if PUBLIC_READ_ONLY:
+            return no_update
         log = list(log or [])
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         target = (meta or {}).get("target") or DEFAULT_TARGET
@@ -3087,7 +3169,12 @@ def build_app() -> Any:
         """Phase 6B-4 single-row TrafficFlow artifact generator.
         Builds and saves exactly one ``research_day_v1`` artifact
         for the studied ticker's most recent saved StackBuilder
-        run. Bounded, offline, error-trapped."""
+        run. Bounded, offline, error-trapped.
+
+        Phase 6C-3 amendment: short-circuits in public read-only
+        mode."""
+        if PUBLIC_READ_ONLY:
+            return no_update
         log = list(log or [])
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         target = (meta or {}).get("target") or DEFAULT_TARGET
@@ -3166,6 +3253,13 @@ def build_app() -> Any:
             if callback_context.triggered else ""
         )
         force = trigger == "btn-refresh-catalogue-index"
+        # Phase 6C-3: in public read-only mode the Refresh
+        # catalogue index button is hidden and the persist path
+        # must never run. Even if a malicious client posts the
+        # button event, the callback drops the persist_if_built
+        # flag so no disk write happens.
+        if PUBLIC_READ_ONLY:
+            force = False
         try:
             import research_catalogue as rc
             full_snapshot = rc.get_catalogue_snapshot(
@@ -3245,6 +3339,13 @@ def build_app() -> Any:
     def _build_missing_charts_action(
         _clicks, meta, results_data, selected_row, log,
     ):
+        # Phase 6C-3: in public read-only mode the Build missing
+        # charts button is hidden, but a malicious client could
+        # still POST the click event. Short-circuit here so no
+        # build helper, no disk write, and no live-engine call
+        # leaks through the callback boundary.
+        if PUBLIC_READ_ONLY:
+            return no_update, no_update, no_update
         log = list(log or [])
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         target = ((meta or {}).get("target") or DEFAULT_TARGET)
@@ -3679,6 +3780,16 @@ def build_app() -> Any:
             return _do_load(quiet=False)
 
         # "Run quick study" -> always live path
+        # Phase 6C-3: in public read-only mode the live engine is
+        # off-limits. The button is hidden, but if a client
+        # synthesizes the click, this branch refuses to call the
+        # impactsearch live path.
+        if trigger == "btn-run" and PUBLIC_READ_ONLY:
+            log.append(
+                f"[{ts}] live test is disabled in public read-only "
+                "mode."
+            )
+            return no_update, no_update, log[-200:]
         if trigger == "btn-run":
             if not primaries:
                 log.append(
@@ -3809,6 +3920,95 @@ def build_app() -> Any:
             )
             options.append({"label": label, "value": str(ticker)})
         return options
+
+    # Phase 6C-3: clickable catalogue. Selecting a row in the
+    # "Best chart-ready research" table loads the picked ticker
+    # through the existing saved-ticker flow without making the user
+    # copy a symbol into the ticker input. Writes:
+    #   - catalogue-target-dropdown.value -> _on_action triggers a
+    #     load (allow_duplicate=True so this can coexist with the
+    #     dropdown's own setter).
+    #   - catalogue-pinned-source-store.data -> the patterns-table
+    #     selected_rows callback reads this AFTER the load completes
+    #     and reflects the row whose Primary Ticker matches the
+    #     catalogue's signal_source. Non-impactsearch rows write
+    #     None so the patterns table falls back to its default
+    #     auto-selection.
+    @app.callback(
+        Output("catalogue-target-dropdown", "value", allow_duplicate=True),
+        Output("catalogue-pinned-source-store", "data"),
+        Input("catalogue-browser-top-opportunities",
+              "derived_virtual_selected_rows"),
+        State("catalogue-browser-top-opportunities",
+              "derived_virtual_data"),
+        prevent_initial_call=True,
+    )
+    def _catalogue_row_click_to_load(selected_rows, virtual_data):
+        if not selected_rows:
+            return no_update, None
+        if not virtual_data:
+            return no_update, None
+        try:
+            idx = int(selected_rows[0])
+        except (TypeError, ValueError):
+            return no_update, None
+        if idx < 0 or idx >= len(virtual_data):
+            return no_update, None
+        row = virtual_data[idx]
+        if not isinstance(row, dict):
+            return no_update, None
+        ticker = (row.get("Ticker") or "").strip().upper()
+        if not ticker:
+            return no_update, None
+        engine = (row.get("Engine") or "").strip()
+        # The catalogue display table puts the impactsearch signal
+        # source in the "Source" column. Stack/Confluence/Traffic
+        # rows put a K=N or run-id string there; those are not
+        # patterns-table primary tickers, so don't pin them.
+        pinned_source = None
+        source = (row.get("Source") or "").strip()
+        if source and engine == "Single signals":
+            pinned_source = source.upper()
+        return ticker, pinned_source
+
+    # Phase 6C-3: when a catalogue row pins an ImpactSearch signal
+    # source, drive the patterns-table selection to the matching
+    # Primary Ticker AFTER the load completes. results-store is the
+    # trigger that fires the load; reading both in one callback
+    # lets us pick the row whose Primary Ticker == pinned_source.
+    @app.callback(
+        Output("results-table", "selected_rows", allow_duplicate=True),
+        Input("results-store", "data"),
+        Input("catalogue-pinned-source-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _apply_catalogue_pinned_source_to_patterns_table(
+        results_data, pinned_source,
+    ):
+        if not pinned_source or not results_data:
+            return no_update
+        target_source = str(pinned_source).strip().upper()
+        if not target_source:
+            return no_update
+        # Cross-reference against the same "interesting rows" view
+        # the patterns table renders so the index aligns. Falls back
+        # to the raw rows if the helper doesn't yield a match.
+        try:
+            df = pd.DataFrame(results_data)
+            interesting = _overview_interesting_rows(df, top_n=10)
+        except Exception:
+            return no_update
+        if interesting is None or interesting.empty:
+            return no_update
+        if "Primary Ticker" not in interesting.columns:
+            return no_update
+        primaries = (
+            interesting["Primary Ticker"].astype(str).str.strip().str.upper()
+        )
+        match_idx = primaries[primaries == target_source].index
+        if len(match_idx) == 0:
+            return no_update
+        return [int(match_idx[0])]
 
     # Independent callback that updates ONLY the Selected Pattern card.
     # selected-row-store is an Input here (so clicking a row repaints
@@ -4198,10 +4398,23 @@ def build_app() -> Any:
             ],
         )
 
+        # Phase 6C-3: launch-candidate copy. The first sentence is
+        # the user-facing answer to "what should I do next?" - tap a
+        # chart-ready row, see the full signal story for that ticker.
+        launch_caption = html.Div(
+            "Start with chart-ready research, then open a ticker "
+            "to see the full signal story.",
+            id="catalogue-browser-launch-caption",
+            style={"color": PRJCT9_TEXT,
+                   "fontSize": "12px",
+                   "lineHeight": "1.5",
+                   "marginBottom": "4px",
+                   "fontWeight": "bold"},
+        )
         sort_caption = html.Div(
             "Sorted to put chart-ready, high-signal research first.",
             id="catalogue-browser-sort-caption",
-            style={"color": PRJCT9_TEXT,
+            style={"color": PRJCT9_MUTED,
                    "fontSize": "11px",
                    "lineHeight": "1.5",
                    "marginBottom": "8px"},
@@ -4244,7 +4457,9 @@ def build_app() -> Any:
             },
         )
 
-        body: list = [header, sort_caption, totals_div, dropdown]
+        body: list = [
+            header, launch_caption, sort_caption, totals_div, dropdown,
+        ]
 
         def _opp_table(rows: list[dict]):
             if not rows:
@@ -4302,6 +4517,13 @@ def build_app() -> Any:
                 id="catalogue-browser-top-opportunities",
                 columns=[{"name": c, "id": c} for c in cols],
                 data=display_rows,
+                # Phase 6C-3: catalogue rows are clickable. Selecting
+                # a row routes through the existing saved-ticker
+                # flow via a small bridge callback below; the
+                # DataTable's own selected_rows / derived_virtual_*
+                # properties feed it.
+                row_selectable="single",
+                selected_rows=[],
                 style_table={"overflowX": "auto"},
                 style_cell={
                     "backgroundColor": PRJCT9_BLACK,
@@ -4311,6 +4533,7 @@ def build_app() -> Any:
                     "padding": "4px 8px",
                     "border": f"1px solid {PRJCT9_BORDER}",
                     "textAlign": "left",
+                    "cursor": "pointer",
                 },
                 style_header={
                     "backgroundColor": PRJCT9_DIM,
@@ -4835,12 +5058,14 @@ def build_app() -> Any:
                 "Build chart data for this pattern",
                 id="btn-build-chart-data",
                 n_clicks=0,
-                style={**btn_style,
-                       "marginTop": "6px",
-                       "marginBottom": "0",
-                       "width": "100%",
-                       "boxSizing": "border-box",
-                       "fontSize": "11px"},
+                style=_hide_in_public_mode({
+                    **btn_style,
+                    "marginTop": "6px",
+                    "marginBottom": "0",
+                    "width": "100%",
+                    "boxSizing": "border-box",
+                    "fontSize": "11px",
+                }),
             ),
             # The id="selected-pattern-body" is the target of the
             # _render_selected_pattern_only callback, which updates
@@ -5246,12 +5471,14 @@ def build_app() -> Any:
             "Build stack chart data",
             id="btn-build-stack-chart-data",
             n_clicks=0,
-            style={**btn_style,
-                   "marginTop": "8px",
-                   "marginBottom": "0",
-                   "width": "100%",
-                   "boxSizing": "border-box",
-                   "fontSize": "11px"},
+            style=_hide_in_public_mode({
+                **btn_style,
+                "marginTop": "8px",
+                "marginBottom": "0",
+                "width": "100%",
+                "boxSizing": "border-box",
+                "fontSize": "11px",
+            }),
         ))
 
         return _section_wrapper(
@@ -5461,12 +5688,14 @@ def build_app() -> Any:
                 "Build confluence chart data",
                 id="btn-build-confluence-chart-data",
                 n_clicks=0,
-                style={**btn_style,
-                       "marginTop": "8px",
-                       "marginBottom": "0",
-                       "width": "100%",
-                       "boxSizing": "border-box",
-                       "fontSize": "11px"},
+                style=_hide_in_public_mode({
+                    **btn_style,
+                    "marginTop": "8px",
+                    "marginBottom": "0",
+                    "width": "100%",
+                    "boxSizing": "border-box",
+                    "fontSize": "11px",
+                }),
             ))
 
         # Engine import / load failure - fall back to the simple
@@ -6062,12 +6291,14 @@ def build_app() -> Any:
                 "Build traffic flow chart data",
                 id="btn-build-trafficflow-chart-data",
                 n_clicks=0,
-                style={**btn_style,
-                       "marginTop": "8px",
-                       "marginBottom": "0",
-                       "width": "100%",
-                       "boxSizing": "border-box",
-                       "fontSize": "11px"},
+                style=_hide_in_public_mode({
+                    **btn_style,
+                    "marginTop": "8px",
+                    "marginBottom": "0",
+                    "width": "100%",
+                    "boxSizing": "border-box",
+                    "fontSize": "11px",
+                }),
             ))
 
         snap = _traffic_flow_snapshot_for_target(target)

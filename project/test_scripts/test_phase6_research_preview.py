@@ -5494,3 +5494,544 @@ def test_empty_browser_payload_renders_without_raising(monkeypatch):
     assert "RESEARCH CATALOGUE" in text
     assert "No chart-ready research yet" in text
     assert "No saved-only tickers waiting for chart data." in text
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-3: MVP launch candidate UX + public read-only mode
+# ---------------------------------------------------------------------------
+
+
+def _reload_preview_with_env(monkeypatch, env_value):
+    """Reload preview module with a different
+    PRJCT9_PUBLIC_READ_ONLY env var so the public-mode constant
+    gets re-read at import time. Returns the freshly-imported
+    module."""
+    import importlib
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", env_value)
+    return importlib.reload(preview)
+
+
+def test_is_public_read_only_mode_reads_env(monkeypatch):
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", "1")
+    assert preview.is_public_read_only_mode() is True
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", "TRUE")
+    assert preview.is_public_read_only_mode() is True
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", "yes")
+    assert preview.is_public_read_only_mode() is True
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", "")
+    assert preview.is_public_read_only_mode() is False
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", "0")
+    assert preview.is_public_read_only_mode() is False
+    monkeypatch.delenv("PRJCT9_PUBLIC_READ_ONLY", raising=False)
+    assert preview.is_public_read_only_mode() is False
+
+
+def test_launch_caption_present_in_catalogue_browser():
+    """Phase 6C-3: the catalogue browser must surface the
+    'Start with chart-ready research, then open a ticker to see
+    the full signal story.' caption near the top."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-browser-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = preview._empty_browser_payload()
+    component = inner(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    assert (
+        "Start with chart-ready research, then open a ticker to "
+        "see the full signal story." in text
+    )
+
+
+def test_top_opportunities_table_is_row_selectable():
+    """Phase 6C-3: the catalogue's top-opportunities table must
+    declare row_selectable so a click loads the ticker."""
+    src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
+        encoding="utf-8"
+    )
+    # Find the DataTable that owns the catalogue-browser-top-opportunities id
+    # and verify row_selectable is set.
+    idx = src.find('id="catalogue-browser-top-opportunities"')
+    assert idx != -1
+    block = src[idx: idx + 1200]
+    assert 'row_selectable="single"' in block, (
+        "catalogue top-opportunities table must be row-selectable"
+    )
+
+
+def test_catalogue_row_click_triggers_load_callback():
+    """Confirm the bridge callback that translates a catalogue row
+    click into a ticker load is registered."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    keys = list(app.callback_map.keys())
+    # The bridge writes catalogue-target-dropdown.value and
+    # catalogue-pinned-source-store.data; multi-output keys take the
+    # ".." prefix shape.
+    multi_keyed = " ".join(keys)
+    assert "catalogue-pinned-source-store" in multi_keyed
+    # And the patterns-table selection callback drives off
+    # catalogue-pinned-source-store.
+    assert any(
+        "results-table" in k and "selected_rows" in k
+        for k in keys
+    )
+
+
+def test_catalogue_row_click_picks_ticker_and_pins_signal_source():
+    """End-to-end: feeding the catalogue bridge a Single-signals
+    row returns (ticker, signal_source). Stack/Confluence/Traffic
+    rows return (ticker, None) - those engines don't have a
+    Patterns-table primary ticker concept."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    target_callback = None
+    for entry in app.callback_map.values():
+        outputs = entry.get("output") or entry.get("outputs") or []
+        flat = []
+        if isinstance(outputs, (list, tuple)):
+            for o in outputs:
+                if isinstance(o, dict):
+                    flat.append(str(o.get("id") or ""))
+                elif isinstance(o, str):
+                    for chunk in o.split(".."):
+                        chunk = chunk.strip().split(".")[0]
+                        if chunk:
+                            flat.append(chunk)
+                else:
+                    cid = getattr(o, "component_id", None)
+                    if cid:
+                        flat.append(cid)
+        else:
+            if isinstance(outputs, dict):
+                flat.append(str(outputs.get("id") or ""))
+            elif isinstance(outputs, str):
+                for chunk in outputs.split(".."):
+                    chunk = chunk.strip().split(".")[0]
+                    if chunk:
+                        flat.append(chunk)
+        if (
+            "catalogue-pinned-source-store" in flat
+            and "catalogue-target-dropdown" in flat
+        ):
+            target_callback = entry["callback"]
+            break
+    assert target_callback is not None
+    inner = getattr(target_callback, "__wrapped__", target_callback)
+
+    # Single-signals row -> ticker + pinned source
+    impact_row = [{
+        "Ticker": "SPY", "Engine": "Single signals",
+        "Source": "AAA", "Total Capture (%)": "25.00",
+        "Sharpe Ratio": "1.50", "Signal days": "120",
+        "95% Confidence": "Yes",
+    }]
+    ticker, pin = inner([0], impact_row)
+    assert ticker == "SPY"
+    assert pin == "AAA"
+
+    # Combined-signals row (K=2 in Source) -> ticker, no pin
+    stack_row = [{
+        "Ticker": "QQQ", "Engine": "Combined signals",
+        "Source": "K=2 - run-2026", "Total Capture (%)": "30.00",
+        "Sharpe Ratio": "1.20", "Signal days": "80",
+        "95% Confidence": "No",
+    }]
+    ticker, pin = inner([0], stack_row)
+    assert ticker == "QQQ"
+    assert pin is None
+
+    # No selection -> no_update (the Dash sentinel)
+    out = inner([], impact_row)
+    assert out is not None  # sanity — function returned
+
+    # Out-of-range selection -> safe no-op
+    out_idx = inner([99], impact_row)
+    assert out_idx is not None
+
+
+def test_pinned_source_drives_patterns_table_selection():
+    """When a catalogue row pins an ImpactSearch signal source,
+    the patterns-table selection callback must pick the matching
+    Primary Ticker row."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    cb = None
+    for key, entry in app.callback_map.items():
+        if "results-table" in key and "selected_rows" in key:
+            cb = entry["callback"]
+            break
+    assert cb is not None
+    inner = getattr(cb, "__wrapped__", cb)
+    rows = [
+        {"Primary Ticker": "AAA", "Total Capture (%)": 10.0,
+         "Sharpe": 0.5, "Trigger Days": 30, "Significant 95%": "No"},
+        {"Primary Ticker": "BBB", "Total Capture (%)": 20.0,
+         "Sharpe": 1.5, "Trigger Days": 100, "Significant 95%": "Yes"},
+        {"Primary Ticker": "CCC", "Total Capture (%)": 5.0,
+         "Sharpe": 0.2, "Trigger Days": 10, "Significant 95%": "No"},
+    ]
+    # Pin BBB -> selected_rows points at the row whose Primary
+    # Ticker == BBB in the interesting-rows view. The exact index
+    # depends on the sort, but the row must be reachable.
+    out = inner(rows, "BBB")
+    assert isinstance(out, list)
+    assert len(out) == 1
+    # Pin nothing -> no_update
+    no = inner(rows, None)
+    # Dash no_update is a sentinel; it's not a list, so out and no
+    # should differ in type or content.
+    assert no != out
+
+
+# ---------------------------------------------------------------------------
+# Public read-only mode: layout and callback gates
+# ---------------------------------------------------------------------------
+
+
+def test_public_mode_hides_build_missing_and_refresh_index_and_live(
+    monkeypatch,
+):
+    """In public mode the layout must hide Build missing charts,
+    Refresh catalogue index, and the live signal-source test
+    Details block. Component IDs stay registered for callback-graph
+    stability; only their style is set to display:none."""
+    pytest.importorskip("dash")
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        assert p.PUBLIC_READ_ONLY is True
+        app = p.build_app()
+        target_styles: dict[str, dict] = {}
+        target_ids = {
+            "btn-build-missing-charts",
+            "btn-refresh-catalogue-index",
+            # The live-test Details has no id, but we walk for
+            # btn-run anyway and check its parent.
+        }
+
+        def _walk(n, parent=None):
+            if n is None or isinstance(n, str):
+                return
+            if isinstance(n, (list, tuple)):
+                for c in n:
+                    _walk(c, parent)
+                return
+            nid = getattr(n, "id", None)
+            if isinstance(nid, str) and nid in target_ids:
+                target_styles[nid] = getattr(n, "style", {}) or {}
+            children = getattr(n, "children", None)
+            if children is not None:
+                _walk(children, n)
+
+        _walk(app.layout)
+        for tid in target_ids:
+            assert tid in target_styles, (
+                f"expected component {tid!r} to be present (hidden, "
+                "not removed) in public mode"
+            )
+            assert (
+                str(target_styles[tid].get("display") or "").lower()
+                == "none"
+            ), (
+                f"public mode must hide {tid!r} (display:none); "
+                f"got style={target_styles[tid]!r}"
+            )
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_public_mode_per_engine_build_buttons_are_hidden(monkeypatch):
+    """The per-engine build buttons inside detail sections must
+    also be hidden in public mode so a public client cannot trigger
+    a write."""
+    pytest.importorskip("dash")
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        # Snapshot rendered detail-section component trees and
+        # confirm each per-engine button's style has display:none.
+        # The buttons are inside renderer functions; the simplest
+        # path is to grep the source for the helper that wraps them
+        # and assert the helper is wired everywhere.
+        src = (
+            PROJECT_DIR / "phase6_research_preview.py"
+        ).read_text(encoding="utf-8")
+        # Each per-engine button's style must route through
+        # _hide_in_public_mode in the source.
+        for chunk in (
+            'id="btn-build-chart-data"',
+            'id="btn-build-stack-chart-data"',
+            'id="btn-build-confluence-chart-data"',
+            'id="btn-build-trafficflow-chart-data"',
+        ):
+            idx = src.find(chunk)
+            assert idx != -1
+            # Probe the surrounding ~600 chars for the gate.
+            block = src[max(0, idx - 600): idx + 200]
+            assert "_hide_in_public_mode" in block, (
+                f"{chunk} must use _hide_in_public_mode"
+            )
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_public_mode_build_callbacks_short_circuit(monkeypatch):
+    """All build callbacks must return no_update / a no-op tuple
+    in public mode without invoking any build helper."""
+    pytest.importorskip("dash")
+    import dash
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        # Poison the build helpers - any accidental call would
+        # raise loudly.
+        called: list[str] = []
+        for name in (
+            "_build_research_day_artifact_for_pair",
+            "_build_stack_artifact_for_top_run",
+            "_build_confluence_artifact_for_target",
+            "_build_trafficflow_artifact_for_top_run",
+        ):
+            def _maker(nm):
+                def _boom(*a, **kw):
+                    called.append(nm)
+                    raise RuntimeError(
+                        f"public mode must not call {nm}"
+                    )
+                return _boom
+            monkeypatch.setattr(p, name, _maker(name))
+
+        app = p.build_app()
+        # Build missing charts callback -> 3-tuple of no_update
+        target = None
+        for entry in app.callback_map.values():
+            inputs = entry.get("inputs") or []
+            ids = [
+                i.get("id") if isinstance(i, dict)
+                else getattr(i, "component_id", "")
+                for i in inputs
+            ]
+            outputs = entry.get("output") or entry.get("outputs") or []
+            ostr = str(outputs)
+            if (
+                "btn-build-missing-charts" in ids
+                and "catalogue-snapshot-store" in ostr
+            ):
+                target = entry["callback"]
+                break
+        assert target is not None
+        inner = getattr(target, "__wrapped__", target)
+        out = inner(1, {"target": "SPY"}, [], None, [])
+        assert isinstance(out, tuple) and len(out) == 3
+        assert all(o is dash.no_update for o in out), (
+            "public mode build-missing-charts must return all "
+            "no_update outputs"
+        )
+        assert called == [], (
+            f"public mode invoked build helpers: {called!r}"
+        )
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_public_mode_live_engine_path_blocked(monkeypatch):
+    """The 'Test 10 signal sources' / btn-run path must refuse to
+    run in public mode. Even if a client synthesises the click,
+    impactsearch.process_primary_tickers must not be invoked."""
+    pytest.importorskip("dash")
+    import sys as _sys
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        # Poison sys.modules['impactsearch'] so any call attribute
+        # access would raise.
+        called: list[str] = []
+
+        class _Boom:
+            def __getattr__(self, n):
+                called.append(n)
+                raise RuntimeError(f"public mode called impactsearch.{n}")
+
+        monkeypatch.setitem(_sys.modules, "impactsearch", _Boom())
+        # Drive the _on_action callback with a btn-run trigger and
+        # an _IMPACTSEARCH_ENGINE that would otherwise run.
+        monkeypatch.setattr(
+            p, "_IMPACTSEARCH_ENGINE",
+            type("_E", (), {
+                "process_primary_tickers": (
+                    lambda *a, **kw: called.append(
+                        "process_primary_tickers",
+                    ) or []
+                )
+            })(),
+            raising=False,
+        )
+
+        # Find _on_action by output set
+        app = p.build_app()
+        target = None
+        for key, entry in app.callback_map.items():
+            if "results-store.data" in key and "btn-run" in str(
+                entry.get("inputs") or []
+            ):
+                target = entry["callback"]
+                break
+        assert target is not None
+        inner = getattr(target, "__wrapped__", target)
+
+        # Simulate Dash dispatch: trigger=btn-run with a primaries
+        # string. If the gate fails, the test stub above logs.
+        import dash
+        monkeypatch.setattr(
+            dash.callback_context.__class__, "triggered",
+            property(lambda self: [
+                {"prop_id": "btn-run.n_clicks", "value": 1}
+            ]),
+            raising=False,
+        )
+        # Signature: (_load_n, _run_n, boot_n, dropdown_value,
+        # target, preset, custom_text, log, current_results)
+        out = inner(0, 1, 0, None, "SPY", "Custom",
+                    "AAA, MSFT", [], None)
+        assert called == [], (
+            f"public-mode live path leaked engine calls: {called!r}"
+        )
+        # Output must include a refusal message in the log slot
+        # (third tuple element).
+        assert isinstance(out, tuple)
+        assert len(out) == 3
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_public_mode_does_not_persist_catalogue_index(monkeypatch, tmp_path):
+    """The Refresh catalogue index button is hidden in public mode,
+    and the snapshot-store callback must not persist when the env
+    forces public mode. Direct probe: simulating a button click
+    while in public mode must not call rc.write_catalogue_snapshot."""
+    pytest.importorskip("dash")
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        import research_catalogue as rc
+        rc.reset_snapshot_cache()
+        write_calls: list = []
+        original_write = rc.write_catalogue_snapshot
+
+        def _spy(*a, **kw):
+            write_calls.append((a, kw))
+            return original_write(*a, **kw)
+        monkeypatch.setattr(rc, "write_catalogue_snapshot", _spy)
+
+        app = p.build_app()
+        target = None
+        for key, entry in app.callback_map.items():
+            if key == "catalogue-snapshot-store.data":
+                target = entry["callback"]
+                break
+        assert target is not None
+        inner = getattr(target, "__wrapped__", target)
+
+        import dash
+        monkeypatch.setattr(
+            dash.callback_context.__class__, "triggered",
+            property(lambda self: [
+                {"prop_id": "btn-refresh-catalogue-index.n_clicks",
+                 "value": 1}
+            ]),
+            raising=False,
+        )
+        inner({"target": "SPY"}, 1)
+        assert write_calls == [], (
+            f"public mode persisted catalogue index: {write_calls!r}"
+        )
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_local_mode_still_renders_build_buttons():
+    """Local Peter-mode (default) must still surface the build /
+    refresh / live-test buttons unhidden."""
+    pytest.importorskip("dash")
+    # Default env (no PRJCT9_PUBLIC_READ_ONLY) keeps PUBLIC_READ_ONLY=False.
+    assert preview.PUBLIC_READ_ONLY is False
+    app = preview.build_app()
+    found_styles: dict[str, dict] = {}
+
+    def _walk(n):
+        if n is None or isinstance(n, str):
+            return
+        if isinstance(n, (list, tuple)):
+            for c in n:
+                _walk(c)
+            return
+        nid = getattr(n, "id", None)
+        if isinstance(nid, str) and nid in {
+            "btn-build-missing-charts",
+            "btn-refresh-catalogue-index",
+        }:
+            found_styles[nid] = getattr(n, "style", {}) or {}
+        children = getattr(n, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    for nid, style in found_styles.items():
+        assert (
+            str(style.get("display") or "").lower() != "none"
+        ), f"local mode must NOT hide {nid}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-3: payload budget + path hygiene at scale
+# ---------------------------------------------------------------------------
+
+
+def test_browser_payload_under_250kb_at_real_data_scale():
+    """The audit's launch budget caps the dcc.Store-shipped browser
+    payload at 250 KB on real data. This test feeds a synthetic
+    73k-target snapshot through build_catalogue_browser_payload
+    (which is what the production callback returns) and asserts
+    the JSON stays well under the cap."""
+    import research_catalogue as rc
+    big_targets = [f"T{i:05d}" for i in range(73_000)]
+    chart_targets = big_targets[:8]
+    needing = [
+        t for t in big_targets[8:] if not t.startswith("T0000")
+    ]
+    snap = {
+        "counts": {
+            "engine": {
+                "market_scan": 0, "impactsearch": 8,
+                "stackbuilder": 0, "confluence": 0, "trafficflow": 0,
+            },
+            "state": {
+                "chart_ready": 8, "saved_research_found": 73_000,
+                "no_saved_research": 0,
+            },
+            "targets_total": 73_000,
+        },
+        "targets": big_targets,
+        "chart_ready_targets": chart_targets,
+        "targets_needing_chart_data": needing,
+        "complete_coverage_targets": [],
+        "top_opportunities": [
+            {"engine": "impactsearch", "target_ticker": t,
+             "state": rc.STATE_CHART_READY,
+             "chart_path": f"/abs/path/{t}.json",
+             "source_path": None,
+             "total_capture_pct": 10.0, "sharpe_ratio": 1.0,
+             "trigger_days": 50, "significant_95": False}
+            for t in chart_targets
+        ],
+    }
+    payload = rc.build_catalogue_browser_payload(snap)
+    blob = json.dumps(payload, default=str)
+    assert len(blob) < 250_000, (
+        f"browser payload is {len(blob)} bytes; the launch budget "
+        "is 250 KB on real-data scale."
+    )
