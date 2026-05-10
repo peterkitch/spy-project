@@ -6523,6 +6523,23 @@ def _signal_engine_text(payload) -> str:
     return _json.dumps(_to_jsonlike(component), default=str)
 
 
+def _find_component_by_id(component, target_id):
+    if component is None or isinstance(component, str):
+        return None
+    if isinstance(component, (list, tuple)):
+        for child in component:
+            found = _find_component_by_id(child, target_id)
+            if found is not None:
+                return found
+        return None
+    if getattr(component, "id", None) == target_id:
+        return component
+    children = getattr(component, "children", None)
+    if children is not None:
+        return _find_component_by_id(children, target_id)
+    return None
+
+
 def test_signal_engine_section_present_in_layout():
     pytest.importorskip("dash")
     app = preview.build_app()
@@ -6632,14 +6649,64 @@ def test_signal_engine_renders_required_text_on_available_payload():
             f"required Signal Engine label {label!r} missing"
         )
     # Honest chart caption.
-    assert (
-        "Signal-day capture, not portfolio return." in text
-    )
+    assert "Green line is Signal Engine cumulative capture" in text
+    assert "raw historical close on the right axis" in text
     # Current state surfaces.
     assert "Short" in text
     assert "11/5" in text or "Short 11,5" in text
     # Date range surfaces.
     assert "1993-01-29 to 2026-05-04" in text
+
+
+def test_signal_engine_chart_overlays_raw_close_price_on_right_axis():
+    pytest.importorskip("plotly")
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "SPY",
+        "available": True,
+        "reason": None,
+        "date_range": {"start": "2024-01-02", "end": "2024-01-04"},
+        "current_signal": "Buy",
+        "current_active_pair_raw": "Buy 3,2",
+        "current_sma_pair": [3, 2],
+        "total_capture_pct": 3.0,
+        "sharpe_ratio": 0.10,
+        "signal_days": 2,
+        "win_rate_pct": 50.0,
+        "latest_close": 110.0,
+        "chart_rows": [
+            {"date": "2024-01-02", "close": 100.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 0.0,
+             "cumulative_capture_pct": 0.0},
+            {"date": "2024-01-03", "close": 120.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 5.0,
+             "cumulative_capture_pct": 5.0},
+            {"date": "2024-01-04", "close": 110.0, "signal": "Short",
+             "raw_active_pair": "Short 5,1",
+             "daily_capture_pct": -2.0,
+             "cumulative_capture_pct": 3.0},
+        ],
+        "recent_rows": [],
+        "metric_basis":
+            "Spymaster cache (preprocessed_data + active_pairs)",
+    }
+    component = _render_signal_engine_with_payload(payload)
+    graph = _find_component_by_id(component, "signal-engine-chart")
+    assert graph is not None
+    fig = graph.figure
+
+    assert len(fig.data) == 2
+    assert fig.data[0].name == "Engine cumulative capture"
+    assert list(fig.data[0].y) == [0.0, 5.0, 3.0]
+    assert fig.data[1].name == "SPY close price"
+    assert list(fig.data[1].y) == [100.0, 120.0, 110.0]
+    assert fig.data[1].yaxis == "y2"
+    assert fig.layout.yaxis.title.text == "Cumulative Capture (%)"
+    assert fig.layout.yaxis2.title.text == "Close Price"
+    assert fig.layout.yaxis2.overlaying == "y"
+    assert fig.layout.yaxis2.side == "right"
 
 
 def test_signal_engine_renders_clean_unavailable_for_missing_cache():

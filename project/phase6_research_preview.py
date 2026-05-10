@@ -5508,7 +5508,9 @@ def build_app() -> Any:
             ],
         )
 
-        # Build the cumulative capture line chart.
+        # Build the cumulative capture chart with raw close overlaid
+        # on a right-side axis. The close values already come from
+        # the saved cache payload, so this remains a read-only view.
         chart_div: Any = html.Div(
             "Saved local data has no chart rows.",
             style={"color": PRJCT9_MUTED,
@@ -5519,25 +5521,47 @@ def build_app() -> Any:
         if chart_rows:
             try:
                 import plotly.graph_objects as go
+
+                def _chart_float(v):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return None
+
                 dates = [r.get("date") for r in chart_rows]
                 cum = [
-                    r.get("cumulative_capture_pct") or 0.0
+                    _chart_float(r.get("cumulative_capture_pct")) or 0.0
                     for r in chart_rows
                 ]
                 signals = [r.get("signal") for r in chart_rows]
-                closes = [r.get("close") for r in chart_rows]
+                closes = [_chart_float(r.get("close")) for r in chart_rows]
                 hover = [
                     f"{d}<br>"
-                    f"Close: {c}<br>"
+                    f"Close: {_fmt_num(c)}<br>"
                     f"Signal: {s}<br>"
                     f"Cumulative Capture: {cc:.4f}%"
                     for d, c, s, cc in zip(dates, closes, signals, cum)
                 ]
-                fig = go.Figure(go.Scatter(
-                    x=dates, y=cum, mode="lines",
-                    line={"color": PRJCT9_GREEN, "width": 1.4},
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    name="Engine cumulative capture",
+                    x=dates, y=cum, mode="lines", yaxis="y",
+                    line={"color": PRJCT9_GREEN, "width": 1.6},
                     hovertext=hover, hoverinfo="text",
                 ))
+                if any(c is not None for c in closes):
+                    fig.add_trace(go.Scatter(
+                        name=f"{ticker} close price",
+                        x=dates, y=closes, mode="lines", yaxis="y2",
+                        line={"color": PRJCT9_TEXT,
+                              "width": 1.0,
+                              "dash": "dot"},
+                        opacity=0.62,
+                        hovertemplate=(
+                            "%{x}<br>Close Price: %{y:.2f}"
+                            "<extra></extra>"
+                        ),
+                    ))
                 fig.add_hline(
                     y=0.0, line_color=PRJCT9_BORDER, line_width=1,
                 )
@@ -5550,10 +5574,20 @@ def build_app() -> Any:
                            "title": "Date"},
                     yaxis={"gridcolor": PRJCT9_BORDER,
                            "title": "Cumulative Capture (%)"},
-                    margin={"l": 56, "r": 12, "t": 28, "b": 36},
+                    yaxis2={"overlaying": "y",
+                            "side": "right",
+                            "showgrid": False,
+                            "zeroline": False,
+                            "title": "Close Price"},
+                    legend={"orientation": "h",
+                            "yanchor": "bottom",
+                            "y": 1.02,
+                            "xanchor": "left",
+                            "x": 0},
+                    margin={"l": 64, "r": 64, "t": 44, "b": 36},
                     height=260,
                     title={
-                        "text": "Cumulative Capture (%)",
+                        "text": "Signal Engine Capture vs Raw Price",
                         "font": {"color": PRJCT9_GREEN, "size": 13},
                     },
                 )
@@ -5572,9 +5606,9 @@ def build_app() -> Any:
                 )
 
         chart_caption = html.Div(
-            "Signal-day capture, not portfolio return. This line "
-            "sums historical capture from the saved signal state "
-            "without trade-cost or position-sizing assumptions.",
+            "Green line is Signal Engine cumulative capture, not "
+            "portfolio return. Dotted price line is the ticker's raw "
+            "historical close on the right axis.",
             id="signal-engine-chart-caption",
             style={"color": PRJCT9_MUTED,
                    "fontSize": "10px",
