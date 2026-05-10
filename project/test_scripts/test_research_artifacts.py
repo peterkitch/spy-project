@@ -2087,10 +2087,572 @@ def test_build_confluence_from_local_mixed_form_safe_lib_caret_cache(
     assert out_path.parts[-2] == "_GSPC"
 
 
-@pytest.mark.skip(reason="Phase 6B-4 scope (Traffic Flow pressure)")
-def test_phase_6b4_traffic_flow_artifact_placeholder():
-    raise NotImplementedError(
-        "Phase 6B-4 will add per-day Buy/Short/None pressure "
-        "artifacts via build_trafficflow_day_artifact "
-        "(engine='trafficflow')."
+# ---------------------------------------------------------------------------
+# Phase 6B-4: TrafficFlow day-by-day pressure artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_path_for_trafficflow(tmp_path: Path):
+    """TrafficFlow artifacts live under
+    ``output/research_artifacts/trafficflow/<TARGET>/<RUN_ID>.research_day.json``.
+    Output path stays filename-safe (^GSPC -> _GSPC)."""
+    p = ra.artifact_path_for_trafficflow(
+        "SPY", "seedTC__AAA-D_BBB-I", base_dir=tmp_path,
+    )
+    assert p is not None
+    assert p == (
+        tmp_path / "trafficflow" / "SPY"
+        / "seedTC__AAA-D_BBB-I.research_day.json"
+    )
+    p_gspc = ra.artifact_path_for_trafficflow(
+        "^GSPC", "run", base_dir=tmp_path,
+    )
+    assert p_gspc is not None
+    assert p_gspc.parts[-2] == "_GSPC"
+    assert ra.artifact_path_for_trafficflow(
+        "", "run", base_dir=tmp_path,
+    ) is None
+    assert ra.artifact_path_for_trafficflow(
+        "SPY", "", base_dir=tmp_path,
+    ) is None
+
+
+def test_trafficflow_artifact_unanimity_pressure_rule():
+    """Pressure rule mirrors trafficflow._combine_positions_unanimity:
+    all active members agree on Buy -> Buy; all agree on Short ->
+    Short; mixed -> None; no active members -> None. ``missing``
+    members are excluded from the unanimity check."""
+    idx = pd.bdate_range("2024-01-02", periods=5)
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run-uni",
+        dates=idx, target_close=[100, 110, 121, 108.9, 115],
+        member_signal_columns={
+            # Day 0 all agree Buy -> Buy
+            # Day 1 all agree Short -> Short
+            # Day 2 mixed Buy + Short -> None
+            # Day 3 all None -> None (no active)
+            # Day 4 Buy + Buy with one missing -> Buy (missing excluded)
+            "AAA": ["Buy", "Short", "Buy", "None", "Buy"],
+            "BBB": ["Buy", "Short", "Short", "None", "Buy"],
+            "CCC": ["Buy", "Short", "Buy", "None", "missing"],
+        },
+        protocol_per_member={
+            "AAA": "D", "BBB": "D", "CCC": "D",
+        },
+        K=2, persist_skip_bars=0,
+    )
+    pressures = [r["pressure_signal"] for r in art.daily]
+    assert pressures == ["Buy", "Short", "None", "None", "Buy"]
+    # Day 4: missing member excluded from active count.
+    day4 = art.daily[4]
+    assert day4["missing_count"] == 1
+    assert day4["active_count"] == 2
+    assert day4["buy_count"] == 2
+    assert day4["short_count"] == 0
+
+
+def test_trafficflow_artifact_inverse_protocol_flips_signal():
+    """Inverse member protocol flips the raw signal before pressure
+    counting. Inverse + Buy -> Short, Inverse + Short -> Buy."""
+    idx = pd.bdate_range("2024-01-02", periods=2)
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run-inv",
+        dates=idx, target_close=[100, 110],
+        member_signal_columns={
+            # Both raw signals are Buy. With AAA Direct + BBB
+            # Inverse, BBB flips to Short -> mixed -> pressure None.
+            "AAA": ["Buy", "Buy"],
+            "BBB": ["Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "I"},
+        persist_skip_bars=0,
+    )
+    assert art.daily[0]["member_signals"]["AAA"] == "Buy"
+    assert art.daily[0]["member_signals"]["BBB"] == "Short"
+    assert art.daily[0]["pressure_signal"] == "None"
+    assert art.daily[1]["pressure_signal"] == "None"
+
+
+def test_trafficflow_artifact_capture_and_t1_skip():
+    """Buy pressure -> +pct_change*100; Short pressure -> -pct_change
+    *100; None pressure -> 0. Cumulative is running sum. T-1 skip
+    drops the trailing bar by default."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    art_no_skip = ra.build_trafficflow_day_artifact(
+        "SPY", "run-cap",
+        dates=idx, target_close=[100, 110, 121, 108.9],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Short", "None"],
+            "BBB": ["Buy", "Buy", "Short", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    daily = art_no_skip.daily
+    pressures = [r["pressure_signal"] for r in daily]
+    assert pressures == ["Buy", "Buy", "Short", "None"]
+    expected = [0.0, 10.0, -10.0, 0.0]
+    actual = [round(r["daily_capture_pct"], 6) for r in daily]
+    assert actual == expected
+    # Default T-1 skip drops the trailing bar.
+    art_default = ra.build_trafficflow_day_artifact(
+        "SPY", "run-cap-t1",
+        dates=idx, target_close=[100, 110, 121, 108.9],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Short", "None"],
+            "BBB": ["Buy", "Buy", "Short", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    assert art_default.persist_skip_bars == 1
+    assert len(art_default.daily) == 3
+
+
+def test_trafficflow_artifact_pressure_counts_summary():
+    """Summary's ``pressure_counts`` reflects the per-row pressure
+    after the T-1 skip."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run-counts",
+        dates=idx, target_close=[100, 110, 99, 99],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Short", "None"],
+            "BBB": ["Buy", "Buy", "Short", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    pc = art.summary["pressure_counts"]
+    assert pc["buy"] == 2
+    assert pc["short"] == 1
+    assert pc["none"] == 1
+
+
+def test_trafficflow_artifact_write_read_roundtrip(tmp_path: Path):
+    """write/read roundtrip preserves engine + members + protocol +
+    K + pressure_counts."""
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run42",
+        dates=idx, target_close=[100, 110, 99],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Short"],
+            "BBB": ["Buy", "Buy", "Short"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "I"},
+        K=2, persist_skip_bars=0,
+    )
+    p = ra.artifact_path_for_trafficflow(
+        "SPY", "run42", base_dir=tmp_path,
+    )
+    written = ra.write_research_day_artifact(art, p)
+    assert written.exists()
+    reh = ra.read_research_day_artifact(written)
+    assert reh is not None
+    assert reh.engine == "trafficflow"
+    assert reh.K == 2
+    assert reh.members == ["AAA", "BBB"]
+    assert reh.protocol_per_member == {"AAA": "D", "BBB": "I"}
+    assert "pressure_counts" in (reh.summary or {})
+    # Daily row schema preserved.
+    first = reh.daily[0]
+    assert "pressure_signal" in first
+    assert "member_signals" in first
+    assert "missing_count" in first
+    assert "active_count" in first
+
+
+def test_trafficflow_from_local_real_shape_member_cache(
+    tmp_path: Path,
+):
+    """End-to-end: real Spymaster cache shape (preprocessed_data +
+    active_pairs, no primary_signals/dates) drives a valid pressure
+    artifact via the existing extractor."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.date_range("2024-01-02", periods=5, freq="D")
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9, 115.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "TGT_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    member_pre = pd.DataFrame(
+        {"Close": [10.0, 11.0, 12.1, 10.89, 11.5]}, index=idx,
+    )
+    member_pre.index.name = "Date"
+    member_cache = {
+        "preprocessed_data": member_pre,
+        # Off-by-one: len(active_pairs) = 4, index = 5.
+        "active_pairs": [
+            "Buy 3,2", "Buy 3,2", "Short 1,2", "None",
+        ],
+    }
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump(member_cache, fh)
+
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "TGT", "run-real",
+        members_str="AAA[D]", K=1,
+        cache_dir=cache,
+        persist_skip_bars=0,
+    )
+    assert art is not None
+    assert art.engine == "trafficflow"
+    assert art.K == 1
+    assert art.members == ["AAA"]
+    daily = art.daily
+    assert len(daily) == 5
+    # Day 0: AAA missing (off-by-one alignment) -> pressure None.
+    assert daily[0]["member_signals"] == {"AAA": "missing"}
+    assert daily[0]["missing_count"] == 1
+    assert daily[0]["active_count"] == 0
+    assert daily[0]["pressure_signal"] == "None"
+    # Day 1: AAA = Buy (Direct) -> pressure Buy. Return +10% -> +10.
+    assert daily[1]["member_signals"] == {"AAA": "Buy"}
+    assert daily[1]["pressure_signal"] == "Buy"
+    assert round(daily[1]["daily_capture_pct"], 6) == 10.0
+    # Day 3: AAA = Short -> pressure Short. Return -10% -> +10.
+    assert daily[3]["member_signals"] == {"AAA": "Short"}
+    assert daily[3]["pressure_signal"] == "Short"
+
+
+def test_trafficflow_from_local_handles_missing_member(tmp_path: Path):
+    """A member with an absent cache PKL renders as 'missing' in
+    daily rows and is excluded from the unanimity check; the artifact
+    still builds for the other readable members."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "TGT_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    aaa_payload = {
+        "preprocessed_data": target_df,
+        "primary_signals": ["Buy"] * 4,
+        "dates": [d.strftime("%Y-%m-%d") for d in idx],
+    }
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump(aaa_payload, fh)
+
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "TGT", "run-missing",
+        members_str="AAA[D], BBB[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None
+    last = art.daily[-1]
+    assert last["member_signals"]["AAA"] == "Buy"
+    assert last["member_signals"]["BBB"] == "missing"
+    assert last["missing_count"] == 1
+    # Active = AAA (Buy) only -> pressure Buy.
+    assert last["active_count"] == 1
+    assert last["pressure_signal"] == "Buy"
+
+
+def test_trafficflow_from_local_target_cache_missing_returns_none(
+    tmp_path: Path,
+):
+    """No target Spymaster cache PKL on disk -> None, never raise."""
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    assert ra.build_trafficflow_day_artifact_from_local(
+        "NOPE", "run",
+        members_str="AAA[D]", K=1,
+        cache_dir=cache,
+    ) is None
+
+
+def test_trafficflow_from_local_corrupt_member_cache_renders_missing(
+    tmp_path: Path,
+):
+    """A corrupt member PKL (unpickleable) is treated as missing
+    rather than raising. The artifact still builds when at least
+    one other member's cache is readable."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "TGT_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    # Readable AAA member.
+    with (cache / "AAA_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Buy"],
+            "dates": [d.strftime("%Y-%m-%d") for d in idx],
+        }, fh)
+    # Corrupt BBB member -- random bytes that don't unpickle.
+    (cache / "BBB_precomputed_results.pkl").write_bytes(
+        b"this is not a valid pickle stream",
+    )
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "TGT", "run-corrupt",
+        members_str="AAA[D], BBB[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None
+    last = art.daily[-1]
+    assert last["member_signals"]["AAA"] == "Buy"
+    assert last["member_signals"]["BBB"] == "missing"
+
+
+def test_catalogue_index_includes_trafficflow(tmp_path: Path):
+    """Catalogue index counts trafficflow artifacts alongside the
+    other engines."""
+    base = tmp_path / "research_artifacts"
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run42",
+        dates=pd.bdate_range("2024-01-02", periods=3),
+        target_close=[100, 110, 99],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Short"],
+            "BBB": ["Buy", "Buy", "Short"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        K=2, persist_skip_bars=0,
+    )
+    p = ra.artifact_path_for_trafficflow(
+        "SPY", "run42", base_dir=base,
+    )
+    ra.write_research_day_artifact(art, p)
+    idx = ra.build_research_catalogue_index(base)
+    assert idx["counts"]["trafficflow"] == 1
+    engines = sorted(e["engine"] for e in idx["entries"])
+    assert "trafficflow" in engines
+
+
+def test_research_artifacts_still_clean_imports_after_phase_6b4():
+    """After adding the TrafficFlow builders, ``research_artifacts``
+    must still NOT pull dash / spymaster / trafficflow / impactsearch
+    / confluence at import time."""
+    import subprocess
+    code = (
+        "import sys; "
+        "sys.path.insert(0, r'" + str(PROJECT_DIR) + "'); "
+        "import research_artifacts as ra; "
+        "loaded = list(sys.modules); "
+        "banned = ["
+        "    'impactsearch', 'spymaster', 'trafficflow', "
+        "    'confluence', 'cross_ticker_confluence', 'dash', "
+        "    'signal_library.confluence_analyzer', "
+        "]; "
+        "leaks = [m for m in banned if m in loaded]; "
+        "print('LEAKS=' + ','.join(leaks))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0
+    out = proc.stdout.strip().splitlines()[-1]
+    leaked = (
+        out[len("LEAKS="):].split(",") if out != "LEAKS=" else []
+    )
+    leaked = [m for m in leaked if m]
+    assert not leaked, (
+        f"importing research_artifacts after Phase 6B-4 leaked "
+        f"heavy modules: {leaked!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-4 amendment: caret/index ticker file resolution
+# ---------------------------------------------------------------------------
+
+
+def test_trafficflow_from_local_caret_target_resolves(tmp_path: Path):
+    """Real local files retain the original ticker form (^GSPC).
+    The TrafficFlow from-local builder must succeed when only the
+    caret-form target cache + caret-form member cache are on disk
+    (not the filename-safe forms)."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    # Caret-form target only -- no _GSPC fallback file.
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    # Plain-name member.
+    with (cache / "PRGO_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Short", "Short"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "^GSPC", "audit",
+        members_str="PRGO[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None, (
+        "caret-form ^GSPC target cache must resolve via the real-"
+        "form-first lookup; previously only the filename-safe form "
+        "was tried, producing a spurious None"
+    )
+    assert art.engine == "trafficflow"
+    assert art.target_ticker == "^GSPC"
+
+
+def test_trafficflow_from_local_caret_member_resolves(tmp_path: Path):
+    """A caret-form member cache (e.g., ^IXIC) must resolve via the
+    real-form-first member lookup."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    # Plain-name target.
+    with (cache / "SPY_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    # Caret-form member only.
+    with (cache / "^IXIC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Short", "Short"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "SPY", "audit",
+        members_str="^IXIC[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None, (
+        "caret-form ^IXIC member cache must resolve via the real-"
+        "form-first lookup"
+    )
+    assert "^IXIC" in art.members
+    last = art.daily[-1]
+    # Member resolved to a real signal, not "missing".
+    assert last["member_signals"]["^IXIC"] in ("Buy", "Short", "None")
+
+
+def test_trafficflow_artifact_output_path_caret_normalizes(
+    tmp_path: Path,
+):
+    """Output paths stay filename-safe (^GSPC -> _GSPC) regardless
+    of the input-side ticker form on disk."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    with (cache / "PRGO_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Short"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "^GSPC", "audit",
+        members_str="PRGO[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None
+    out_path = ra.artifact_path_for_trafficflow(
+        "^GSPC", "audit", base_dir=tmp_path,
+    )
+    assert out_path is not None
+    # Output path uses the filename-safe form even though the input
+    # cache uses the caret form. ``_normalize_ticker_for_filename``
+    # also uppercases the run_id segment (mirrors the existing
+    # artifact_path_for_stackbuilder convention; Path equality on
+    # Windows is case-insensitive but the .name string is not, so
+    # compare via lower()).
+    assert out_path.parts[-2] == "_GSPC"
+    assert out_path.name.lower() == "audit.research_day.json"
+
+
+def test_trafficflow_from_local_safe_target_caret_member(
+    tmp_path: Path,
+):
+    """Mixed-form fixture: filename-safe target cache + caret-form
+    member cache. Both reads succeed via the same resolver."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    # Safe-form target.
+    with (cache / "_GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    # Caret-form member.
+    with (cache / "^IXIC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Buy"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "^GSPC", "audit",
+        members_str="^IXIC[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None
+
+
+def test_trafficflow_from_local_caret_target_safe_member(
+    tmp_path: Path,
+):
+    """Reverse mixed-form fixture: caret-form target cache +
+    filename-safe member cache."""
+    import pickle as _pkl
+    cache = tmp_path / "cache_results"
+    cache.mkdir()
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    with (cache / "_IXIC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Buy"],
+            "dates": list(idx),
+        }, fh)
+    art = ra.build_trafficflow_day_artifact_from_local(
+        "^GSPC", "audit",
+        members_str="^IXIC[D]", K=1,
+        cache_dir=cache, persist_skip_bars=0,
+    )
+    assert art is not None
+
+
+def test_local_ticker_form_candidates_engine_agnostic_alias():
+    """Phase 6B-4 amendment renamed the helper to
+    ``_local_ticker_form_candidates`` (engine-agnostic). The old
+    ``_confluence_ticker_form_candidates`` name remains as a
+    backward-compat alias so prior Phase 6B-3 tests / external
+    callers continue to work without churn."""
+    forms = ra._local_ticker_form_candidates("^GSPC")
+    assert forms == ["^GSPC", "_GSPC"]
+    assert (
+        ra._confluence_ticker_form_candidates("^GSPC")
+        == ra._local_ticker_form_candidates("^GSPC")
     )

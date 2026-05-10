@@ -3721,3 +3721,315 @@ def test_time_windows_does_not_reintroduce_banned_labels(monkeypatch):
             f"banned label {banned!r} reappeared in rendered Time "
             f"Windows / cockpit text"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-4: TrafficFlow day-by-day pressure cockpit wiring
+# ---------------------------------------------------------------------------
+
+
+def test_traffic_flow_renders_pressure_chart_when_artifact_present(
+    monkeypatch,
+):
+    """When a saved TrafficFlow pressure artifact exists for the
+    studied ticker, Traffic Flow Detail must render the
+    Traffic Flow Pressure Over Time chart with the
+    'Chart data: exact saved traffic flow path' source line and a
+    pressure distribution summary."""
+    pytest.importorskip("dash")
+    import research_artifacts as ra
+
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "seed_run",
+        dates=pd.bdate_range("2024-01-02", periods=4),
+        target_close=[100, 110, 99, 99],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Short", "None"],
+            "BBB": ["Buy", "Buy", "Short", "None"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        K=2, persist_skip_bars=0,
+    )
+    monkeypatch.setattr(
+        preview, "_read_trafficflow_artifact_for_run",
+        lambda target, run_id: art,
+    )
+    # Drive _discover_stack_runs to find a target run so the section
+    # has a run_id to pair the artifact with.
+    monkeypatch.setattr(
+        preview, "_discover_stack_runs",
+        lambda root: [{
+            "ticker": "SPY", "run_dir": "seed_run",
+            "run_name": "seed_run",
+            "run_path": Path("/dev/null"),
+        }],
+    )
+    # Force the snapshot helper to None so the section's
+    # no-saved-stack-runs fallback fires; the artifact block must
+    # still render.
+    monkeypatch.setattr(
+        preview, "_traffic_flow_snapshot_for_target",
+        lambda *_a, **_kw: None,
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 1,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text_json = _component_json_text(component)
+    assert "trafficflow-pressure-chart" in text_json
+    assert "Chart data: exact saved traffic flow path" in text_json
+    assert "Traffic Flow Pressure Over Time" in text_json
+    assert "PRESSURE DISTRIBUTION" in text_json
+    assert "Buy pressure" in text_json
+    assert "Short pressure" in text_json
+
+
+def test_traffic_flow_falls_back_when_no_artifact(monkeypatch):
+    """When no TrafficFlow artifact exists, Traffic Flow Detail
+    must show the 'Traffic flow chart data has not been built yet.'
+    copy and NOT a pressure chart. Build button stays reachable."""
+    pytest.importorskip("dash")
+
+    monkeypatch.setattr(
+        preview, "_read_trafficflow_artifact_for_run",
+        lambda target, run_id: None,
+    )
+    monkeypatch.setattr(
+        preview, "_discover_stack_runs",
+        lambda root: [{
+            "ticker": "SPY", "run_dir": "seed_run",
+            "run_name": "seed_run",
+            "run_path": Path("/dev/null"),
+        }],
+    )
+    # Snapshot path returns a usable dict so the section's success
+    # branch runs.
+    monkeypatch.setattr(
+        preview, "_traffic_flow_snapshot_for_target",
+        lambda *_a, **_kw: {
+            "target": "SPY", "run_path": "/dev/null", "top_k": 2,
+            "members": [
+                {"ticker": "AAA", "protocol": "D", "signal": "Buy"},
+                {"ticker": "BBB", "protocol": "D", "signal": "Buy"},
+            ],
+            "buy_count": 2, "short_count": 0,
+            "none_count": 0, "missing_count": 0,
+            "pressure": "Buy pressure", "protocol_mix": "2/2",
+        },
+    )
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 21.0, "Sharpe": 1.5, "Trigger Days": 2,
+    }]
+    meta = {"target": "SPY", "stack_runs_for_target": 1,
+            "timeframes_available": 5, "timeframes_total": 5,
+            "primaries": []}
+    component = _build_preview_component(
+        monkeypatch, sample, meta, [],
+    )
+    text_json = _component_json_text(component)
+    assert (
+        "Traffic flow chart data has not been built yet."
+        in text_json
+    )
+    assert "trafficflow-pressure-chart" not in text_json
+    assert "Build traffic flow chart data" in text_json
+
+
+def test_build_trafficflow_chart_data_button_present_in_layout():
+    """Phase 6B-4 lock: Traffic Flow Detail must render the
+    'Build traffic flow chart data' button + its callback id."""
+    pytest.importorskip("dash")
+    src = (
+        PROJECT_DIR / "phase6_research_preview.py"
+    ).read_text(encoding="utf-8")
+    assert "Build traffic flow chart data" in src
+    assert 'id="btn-build-trafficflow-chart-data"' in src
+    assert "Traffic flow chart data has not been built yet." in src
+    assert "Chart data: exact saved traffic flow path" in src
+
+
+def test_build_trafficflow_returns_reason_codes(monkeypatch):
+    """``_build_trafficflow_artifact_for_top_run`` returns
+    ``(path, reason)`` with the no_run reason when no saved
+    StackBuilder run exists for the target."""
+    pytest.importorskip("dash")
+    monkeypatch.setattr(
+        preview, "_discover_stack_runs", lambda *_a, **_kw: [],
+    )
+    out, reason = preview._build_trafficflow_artifact_for_top_run(
+        "ZZZNONE",
+    )
+    assert out is None
+    assert reason == "no_run"
+
+
+def test_build_trafficflow_chart_action_logs_differentiated_copy(
+    monkeypatch,
+):
+    """The trafficflow-build callback's Activity message must differ
+    per reason code so the user knows which saved-data piece is
+    missing."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    cbmap = app.callback_map
+    inner = None
+    for key, entry in cbmap.items():
+        if "log-store" not in str(key):
+            continue
+        inputs = entry.get("inputs") or []
+        input_ids = [
+            inp.component_id if hasattr(inp, "component_id")
+            else inp.get("id") if isinstance(inp, dict) else None
+            for inp in inputs
+        ]
+        if "btn-build-trafficflow-chart-data" in input_ids:
+            cb = entry.get("callback")
+            inner = getattr(cb, "__wrapped__", cb)
+            break
+    assert inner is not None, (
+        "expected a callback bound to btn-build-trafficflow-chart-data"
+    )
+    cases = [
+        ("no_run", "no saved combined-signal run found"),
+        ("target_cache_missing", "price cache"),
+        ("no_member_caches", "stack member caches"),
+        ("write_failed", "could not be saved"),
+        ("engine_unavailable", "engine unavailable"),
+    ]
+    for reason, expected_substring in cases:
+        monkeypatch.setattr(
+            preview, "_build_trafficflow_artifact_for_top_run",
+            lambda target, _r=reason: (None, _r),
+        )
+        log = inner(1, {"target": "SPY"}, [])
+        assert log, "expected at least one Activity log line"
+        last = str(log[-1])
+        assert expected_substring in last, (
+            f"reason {reason!r} should produce a message containing "
+            f"{expected_substring!r}; got {last!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B-4 amendment: caret/index ticker preflight
+# ---------------------------------------------------------------------------
+
+
+def test_build_trafficflow_for_caret_ticker_no_false_target_cache_missing(
+    monkeypatch, tmp_path,
+):
+    """Phase 6B-4 amendment: a caret-named target cache file
+    (``^GSPC_precomputed_results.pkl``) must NOT trigger
+    ``target_cache_missing`` in the TrafficFlow preflight. The
+    preflight must probe both real and filename-safe ticker forms
+    before declaring missing."""
+    pytest.importorskip("dash")
+    import pickle as _pkl
+    cache = tmp_path / "cache" / "results"
+    cache.mkdir(parents=True)
+    sb_root = tmp_path / "stackbuilder"
+    sb_run = sb_root / "^GSPC" / "seed_run"
+    sb_run.mkdir(parents=True)
+    # Stub leaderboard so _load_stack_leaderboard finds members.
+    import pandas as pd
+    lb = pd.DataFrame({
+        "K": [1],
+        "Members": ["PRGO[D]"],
+        "Total Capture (%)": [50.0],
+        "Sharpe Ratio": [1.2],
+        "Trigger Days": [10],
+    })
+    lb.to_excel(sb_run / "combo_leaderboard.xlsx", index=False)
+    # Caret-form target cache + plain member cache.
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 121.0, 108.9]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    with (cache / "^GSPC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    with (cache / "PRGO_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Short", "Short"],
+            "dates": list(idx),
+        }, fh)
+
+    monkeypatch.setattr(
+        preview, "_spymaster_cache_dir", lambda: cache,
+    )
+    monkeypatch.setattr(
+        preview, "_stack_output_dir", lambda: sb_root,
+    )
+    out, reason = preview._build_trafficflow_artifact_for_top_run(
+        "^GSPC",
+    )
+    assert reason is None, (
+        f"caret-form ^GSPC target cache should not produce a "
+        f"reason; got reason={reason!r}"
+    )
+    assert out is not None
+    # Output path uses filename-safe form.
+    assert "_GSPC" in str(out)
+
+
+def test_build_trafficflow_caret_member_no_false_no_member_caches(
+    monkeypatch, tmp_path,
+):
+    """Caret-form member cache (^IXIC) must satisfy the
+    no_member_caches preflight gate without false-failing. Stack
+    leaderboard members can be caret-named just like target
+    tickers."""
+    pytest.importorskip("dash")
+    import pickle as _pkl
+    cache = tmp_path / "cache" / "results"
+    cache.mkdir(parents=True)
+    sb_root = tmp_path / "stackbuilder"
+    sb_run = sb_root / "SPY" / "seed_run"
+    sb_run.mkdir(parents=True)
+    import pandas as pd
+    lb = pd.DataFrame({
+        "K": [1],
+        "Members": ["^IXIC[D]"],
+        "Total Capture (%)": [50.0],
+        "Sharpe Ratio": [1.2],
+        "Trigger Days": [10],
+    })
+    lb.to_excel(sb_run / "combo_leaderboard.xlsx", index=False)
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    target_df = pd.DataFrame(
+        {"Close": [100.0, 110.0, 99.0]}, index=idx,
+    )
+    target_df.index.name = "Date"
+    # Plain target.
+    with (cache / "SPY_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({"preprocessed_data": target_df}, fh)
+    # Caret-form member only.
+    with (cache / "^IXIC_precomputed_results.pkl").open("wb") as fh:
+        _pkl.dump({
+            "preprocessed_data": target_df,
+            "primary_signals": ["Buy", "Buy", "Short"],
+            "dates": list(idx),
+        }, fh)
+
+    monkeypatch.setattr(
+        preview, "_spymaster_cache_dir", lambda: cache,
+    )
+    monkeypatch.setattr(
+        preview, "_stack_output_dir", lambda: sb_root,
+    )
+    out, reason = preview._build_trafficflow_artifact_for_top_run(
+        "SPY",
+    )
+    assert reason is None, (
+        f"caret-form ^IXIC member cache should not produce a "
+        f"no_member_caches reason; got reason={reason!r}"
+    )
+    assert out is not None
