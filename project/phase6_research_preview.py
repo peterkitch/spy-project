@@ -992,6 +992,42 @@ def _build_stack_artifact_for_top_run(
         return None, "write_failed"
 
 
+def _reason_text(reason: Optional[str], target: str) -> str:
+    """Phase 6C-1: short, plain-language sentence for the build-
+    missing-charts log lines. Mirrors the reason codes returned by
+    the per-engine build helpers so the user sees what saved data is
+    missing rather than a vague 'failed' message."""
+    target = str(target or "").strip().upper() or "this ticker"
+    if reason == "no_run":
+        return (
+            f"no saved combined-signal study for {target}"
+        )
+    if reason == "no_libraries":
+        return (
+            f"no saved time-window data for {target}"
+        )
+    if reason == "target_cache_missing":
+        return (
+            f"{target} price cache missing on this computer"
+        )
+    if reason == "no_member_caches":
+        return (
+            f"stack member caches are missing for {target}"
+        )
+    if reason == "build_failed":
+        return f"build failed for {target}"
+    if reason == "write_failed":
+        return (
+            f"chart data built for {target} but the file could not "
+            "be saved"
+        )
+    if reason == "engine_unavailable":
+        return (
+            "research engine unavailable; restart the launcher"
+        )
+    return f"unknown failure for {target}"
+
+
 def _spymaster_cache_dir() -> Path:
     """Resolve the standalone Spymaster cache directory the artifact
     builders read. Uses a project-relative path so it works under any
@@ -2434,6 +2470,32 @@ def build_app() -> Any:
                                        "width": "100%",
                                        "boxSizing": "border-box"},
                             ),
+                            # Phase 6C-1: catalogue refresh + unified
+                            # build-missing-charts buttons. Both act on
+                            # the currently studied ticker only; they
+                            # never trigger a universe-wide rebuild.
+                            html.Button(
+                                "Build missing charts",
+                                id="btn-build-missing-charts",
+                                n_clicks=0,
+                                style={**btn_style,
+                                       "marginRight": "0",
+                                       "marginTop": "6px",
+                                       "marginBottom": "0",
+                                       "width": "100%",
+                                       "boxSizing": "border-box"},
+                            ),
+                            html.Button(
+                                "Refresh catalogue",
+                                id="btn-refresh-catalogue",
+                                n_clicks=0,
+                                style={**btn_style,
+                                       "marginRight": "0",
+                                       "marginTop": "6px",
+                                       "marginBottom": "0",
+                                       "width": "100%",
+                                       "boxSizing": "border-box"},
+                            ),
                             html.Div(
                                 id="output-discovery-status",
                                 style={
@@ -2635,6 +2697,12 @@ def build_app() -> Any:
             dcc.Store(id="meta-store"),
             dcc.Store(id="log-store", data=[]),
             dcc.Store(id="selected-row-store"),
+            # Phase 6C-1: Catalogue Coverage cache. Holds the per-
+            # ticker engine-status snapshot read by the dashboard
+            # render. Updated when the studied ticker changes, when
+            # the user clicks Refresh catalogue, and after Build
+            # missing charts finishes a sweep.
+            dcc.Store(id="catalogue-store"),
             # Tracks the most recent left-rail nav target. Written
             # by clientside scrollIntoView callbacks so the Dash
             # callback graph has a registered output.
@@ -2860,13 +2928,13 @@ def build_app() -> Any:
                 )
             elif reason == "write_failed":
                 msg = (
-                    f"build stack chart data: artifact built for "
+                    f"build stack chart data: chart data built for "
                     f"{target} but the file could not be saved."
                 )
             elif reason == "engine_unavailable":
                 msg = (
-                    "build stack chart data: research artifact "
-                    "engine unavailable; restart the launcher."
+                    "build stack chart data: research engine "
+                    "unavailable; restart the launcher."
                 )
             else:
                 msg = (
@@ -2923,13 +2991,13 @@ def build_app() -> Any:
                 )
             elif reason == "write_failed":
                 msg = (
-                    f"build confluence chart data: artifact built "
+                    f"build confluence chart data: chart data built "
                     f"for {target} but the file could not be saved."
                 )
             elif reason == "engine_unavailable":
                 msg = (
-                    "build confluence chart data: research artifact "
-                    "engine unavailable; restart the launcher."
+                    "build confluence chart data: research engine "
+                    "unavailable; restart the launcher."
                 )
             else:
                 msg = (
@@ -2988,13 +3056,13 @@ def build_app() -> Any:
                 )
             elif reason == "write_failed":
                 msg = (
-                    f"build traffic flow chart data: artifact built "
+                    f"build traffic flow chart data: chart data built "
                     f"for {target} but the file could not be saved."
                 )
             elif reason == "engine_unavailable":
                 msg = (
-                    "build traffic flow chart data: research artifact "
-                    "engine unavailable; restart the launcher."
+                    "build traffic flow chart data: research engine "
+                    "unavailable; restart the launcher."
                 )
             else:
                 msg = (
@@ -3008,6 +3076,290 @@ def build_app() -> Any:
             "Re-open the saved ticker study to refresh the chart."
         )
         return log[-200:]
+
+    # ----------------------------------------------------------------- catalogue
+    # Phase 6C-1: refresh the catalogue store on ticker-change and
+    # Refresh-catalogue clicks. Build missing charts owns its own
+    # catalogue refresh (the build callback co-writes catalogue-
+    # store) so that the post-build snapshot is always fresh; the
+    # earlier wiring listened on btn-build-missing-charts AND
+    # log-store from this callback as well, which let it re-fire
+    # before the build helpers had written their files and cached
+    # a stale "Build chart data" snapshot. Inputs here are now
+    # only the two events that should refresh independently of
+    # the build sweep.
+    @app.callback(
+        Output("catalogue-store", "data"),
+        Input("meta-store", "data"),
+        Input("btn-refresh-catalogue", "n_clicks"),
+        prevent_initial_call=False,
+    )
+    def _update_catalogue_store(meta, _refresh_n):
+        target = ((meta or {}).get("target") or DEFAULT_TARGET)
+        target = str(target).strip().upper() or DEFAULT_TARGET
+        trigger = (
+            callback_context.triggered[0]["prop_id"].split(".")[0]
+            if callback_context.triggered else ""
+        )
+        force = trigger == "btn-refresh-catalogue"
+        try:
+            import research_catalogue as rc
+            return rc.summarize_ticker_catalogue(
+                target, force_refresh=force,
+            )
+        except Exception:
+            return {
+                "target": target,
+                "statuses": [],
+                "totals": {
+                    "chart_ready": 0,
+                    "saved_research_found": 0,
+                    "no_saved_research": 0,
+                },
+            }
+
+    # Phase 6C-1: unified Build missing charts action. Iterates the
+    # five engines in catalogue order and calls the existing single-
+    # ticker build helpers ONLY for engines whose state needs and can
+    # use a build step. Market scan stays saved-output-only - this
+    # callback never invokes a universe-wide OnePass scan.
+    #
+    # Phase 6C-1 amendment: this callback now also writes
+    # catalogue-store so the post-build snapshot is always fresh.
+    # Earlier wiring let _update_catalogue_store fire on the same
+    # button click and cache the pre-build snapshot before the
+    # build helpers wrote their files; the result was a stale
+    # "Build chart data" state in Catalogue Coverage even after a
+    # successful build. Owning the post-build refresh here
+    # eliminates the race - we always summarize AFTER the build
+    # loop with force_refresh=True.
+    @app.callback(
+        Output("log-store", "data", allow_duplicate=True),
+        Output("catalogue-store", "data", allow_duplicate=True),
+        Input("btn-build-missing-charts", "n_clicks"),
+        State("meta-store", "data"),
+        State("results-store", "data"),
+        State("selected-row-store", "data"),
+        State("log-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _build_missing_charts_action(
+        _clicks, meta, results_data, selected_row, log,
+    ):
+        log = list(log or [])
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        target = ((meta or {}).get("target") or DEFAULT_TARGET)
+        target = str(target).strip().upper() or DEFAULT_TARGET
+        try:
+            import research_catalogue as rc
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build missing charts failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            # Catalogue module unavailable - leave catalogue-store as
+            # is rather than overwriting with a partial snapshot.
+            return log[-200:], no_update
+        try:
+            summary = rc.summarize_ticker_catalogue(
+                target, force_refresh=True,
+            )
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build missing charts failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return log[-200:], no_update
+        statuses = summary.get("statuses") or []
+        log.append(f"[{ts}] Build missing charts: {target}.")
+        for row in statuses:
+            engine = row.get("engine")
+            state = row.get("state")
+            if engine == "market_scan":
+                if state == rc.STATE_NO_SAVED_RESEARCH:
+                    log.append(
+                        f"[{ts}] Market scan: no saved scan to use."
+                    )
+                else:
+                    log.append(
+                        f"[{ts}] Market scan: saved scan already "
+                        "ready."
+                    )
+                continue
+            if state == rc.STATE_CHART_READY:
+                if engine == "impactsearch":
+                    msg = "Single-signal chart already ready."
+                elif engine == "stackbuilder":
+                    msg = "Combined-signal chart already ready."
+                elif engine == "confluence":
+                    msg = "Time-window chart already ready."
+                elif engine == "trafficflow":
+                    msg = "Traffic-flow chart already ready."
+                else:
+                    msg = f"{engine} chart already ready."
+                log.append(f"[{ts}] {msg}")
+                continue
+            if state == rc.STATE_NO_SAVED_RESEARCH:
+                if engine == "impactsearch":
+                    msg = (
+                        "Single-signal chart could not be built: "
+                        f"no saved single-signal study for {target}."
+                    )
+                elif engine == "stackbuilder":
+                    msg = (
+                        "Combined-signal chart could not be built: "
+                        f"no saved combined-signal study for {target}."
+                    )
+                elif engine == "confluence":
+                    msg = (
+                        "Time-window chart could not be built: "
+                        f"no saved time-window data for {target}."
+                    )
+                elif engine == "trafficflow":
+                    msg = (
+                        "Traffic-flow chart could not be built: "
+                        f"no saved combined-signal study for {target}."
+                    )
+                else:
+                    msg = f"{engine} chart could not be built."
+                log.append(f"[{ts}] {msg}")
+                continue
+            # state == saved_research_found -> attempt the build.
+            if engine == "impactsearch":
+                row_for_build = (
+                    selected_row
+                    or _auto_select_best_row(results_data, meta or {})
+                )
+                if not isinstance(row_for_build, dict):
+                    log.append(
+                        f"[{ts}] Single-signal chart could not be "
+                        "built: pick a row in Patterns worth a look "
+                        "first."
+                    )
+                    continue
+                signal_source = (
+                    row_for_build.get("Primary Ticker")
+                    or row_for_build.get("primary_ticker")
+                )
+                row_target = (
+                    row_for_build.get("Secondary Ticker")
+                    or row_for_build.get("secondary_ticker")
+                    or target
+                )
+                if not signal_source or not row_target:
+                    log.append(
+                        f"[{ts}] Single-signal chart could not be "
+                        "built: signal source or ticker missing on "
+                        "the selected pattern."
+                    )
+                    continue
+                signal_source = str(signal_source).strip().upper()
+                row_target = str(row_target).strip().upper()
+                overrides = {
+                    "total_capture_pct": row_for_build.get(
+                        "Total Capture (%)",
+                    ),
+                    "sharpe_ratio": row_for_build.get("Sharpe"),
+                    "trigger_days": row_for_build.get("Trigger Days"),
+                }
+                try:
+                    path = _build_research_day_artifact_for_pair(
+                        signal_source, row_target,
+                        summary_overrides=overrides,
+                    )
+                except Exception as exc:
+                    log.append(
+                        f"[{ts}] Single-signal chart could not be "
+                        f"built: {type(exc).__name__}: {exc}."
+                    )
+                    continue
+                if path is None:
+                    log.append(
+                        f"[{ts}] Single-signal chart could not be "
+                        f"built: saved local data missing for "
+                        f"{signal_source} on {row_target}."
+                    )
+                else:
+                    log.append(
+                        f"[{ts}] Single-signal chart built."
+                    )
+                continue
+            if engine == "stackbuilder":
+                try:
+                    path, reason = _build_stack_artifact_for_top_run(
+                        target,
+                    )
+                except Exception as exc:
+                    log.append(
+                        f"[{ts}] Combined-signal chart could not be "
+                        f"built: {type(exc).__name__}: {exc}."
+                    )
+                    continue
+                if path is not None:
+                    log.append(
+                        f"[{ts}] Combined-signal chart built."
+                    )
+                else:
+                    log.append(
+                        f"[{ts}] Combined-signal chart could not be "
+                        f"built: {_reason_text(reason, target)}."
+                    )
+                continue
+            if engine == "confluence":
+                try:
+                    path, reason = _build_confluence_artifact_for_target(
+                        target,
+                    )
+                except Exception as exc:
+                    log.append(
+                        f"[{ts}] Time-window chart could not be "
+                        f"built: {type(exc).__name__}: {exc}."
+                    )
+                    continue
+                if path is not None:
+                    log.append(
+                        f"[{ts}] Time-window chart built."
+                    )
+                else:
+                    log.append(
+                        f"[{ts}] Time-window chart could not be "
+                        f"built: {_reason_text(reason, target)}."
+                    )
+                continue
+            if engine == "trafficflow":
+                try:
+                    path, reason = _build_trafficflow_artifact_for_top_run(
+                        target,
+                    )
+                except Exception as exc:
+                    log.append(
+                        f"[{ts}] Traffic-flow chart could not be "
+                        f"built: {type(exc).__name__}: {exc}."
+                    )
+                    continue
+                if path is not None:
+                    log.append(
+                        f"[{ts}] Traffic-flow chart built."
+                    )
+                else:
+                    log.append(
+                        f"[{ts}] Traffic-flow chart could not be "
+                        f"built: {_reason_text(reason, target)}."
+                    )
+                continue
+        # Phase 6C-1 amendment: re-summarize AFTER the build loop
+        # with force_refresh=True so the catalogue-store payload
+        # picks up any artifact files the build helpers just wrote.
+        # Falling back to the pre-build summary on failure is the
+        # right move - it is still better than a noisily-empty
+        # snapshot.
+        try:
+            post_summary = rc.summarize_ticker_catalogue(
+                target, force_refresh=True,
+            )
+        except Exception:
+            post_summary = summary
+        return log[-200:], post_summary
 
     # Clientside scroll-into-view callbacks for the three left-rail
     # navigate buttons. They run in the browser (no server hop) and
@@ -3261,12 +3613,16 @@ def build_app() -> Any:
         Input("results-store", "data"),
         Input("meta-store", "data"),
         Input("log-store", "data"),
+        Input("catalogue-store", "data"),
         State("selected-row-store", "data"),
     )
-    def _render_dashboard(results_data, meta, log, selected_row):
+    def _render_dashboard(
+        results_data, meta, log, catalogue_data, selected_row,
+    ):
         meta = meta or {}
         return _render_research_cockpit(
             results_data, meta, log or [], selected_row,
+            catalogue_summary=catalogue_data,
         )
 
     # Independent callback that updates ONLY the Selected Pattern card.
@@ -3598,100 +3954,160 @@ def build_app() -> Any:
             body,
         )
 
-    def _render_engine_coverage_summary(meta, log):
-        """Compact first-view Engine Coverage panel that combines
-        Combined Signals / Time Windows / Signal Rules / latest
-        Activity into four short summary lines. The fuller per-area
-        panels live in the detail sections below."""
+    def _render_catalogue_coverage(meta, catalogue_summary):
+        """Phase 6C-1: Catalogue Coverage panel.
+
+        Reads a per-engine status snapshot from
+        ``research_catalogue.summarize_ticker_catalogue`` and renders
+        one compact row per engine: Market scan / Single signals /
+        Combined signals / Time windows / Traffic flow. Each row
+        shows the plain-English state ("Chart ready", "Saved
+        research found", "Build chart data", "No saved research yet")
+        plus the engine's short message.
+
+        ``catalogue_summary`` is the dict produced by the catalogue
+        module. When ``None`` the panel still renders by computing
+        the snapshot in line so the first paint never blanks.
+        """
         meta = meta or {}
         target = (meta.get("target") or DEFAULT_TARGET).strip().upper()
-        stack_n = int(meta.get("stack_runs_for_target") or 0)
-        tf_avail = meta.get("timeframes_available")
-        tf_total = meta.get("timeframes_total")
-        s = _signal_engine_settings()
 
-        if stack_n == 0:
-            stack_line = "no combined-signal study yet."
-        elif stack_n == 1:
-            stack_line = "1 combined-signal study saved."
-        else:
-            stack_line = f"{stack_n} combined-signal studies saved."
-
-        if tf_avail is None or tf_total is None:
-            tw_line = "time windows not loaded yet."
-        elif tf_avail == 0:
-            tw_line = "no time windows found yet."
-        else:
-            tw_line = f"{tf_avail} of {tf_total} time windows found."
-
-        rules_line = (
-            f"Rules up to {s['max_sma_day']} days, "
-            "moving-average windows on daily Close prices."
-        )
-
-        latest = ""
-        if log:
+        if not catalogue_summary or catalogue_summary.get("target") != target:
             try:
-                latest = str(list(log)[-1]).strip()
+                import research_catalogue as rc
+                catalogue_summary = rc.summarize_ticker_catalogue(target)
             except Exception:
-                latest = ""
-        if latest:
-            if len(latest) > 80:
-                latest = latest[:77] + "..."
-            activity_line = latest
-        else:
-            activity_line = "Nothing yet."
+                catalogue_summary = {
+                    "target": target,
+                    "statuses": [],
+                    "totals": {
+                        "chart_ready": 0,
+                        "saved_research_found": 0,
+                        "no_saved_research": 0,
+                    },
+                }
 
-        # Phase 6B-2: count of saved chartable research artifacts
-        # discovered under output/research_artifacts/. Filesystem-only;
-        # no engine import.
         try:
-            import research_artifacts as _ra
-            artifacts = _ra.discover_research_artifacts()
-            n_chartable = len(artifacts)
+            import research_catalogue as rc_mod
+            STATE_CHART_READY = rc_mod.STATE_CHART_READY
+            STATE_SAVED_RESEARCH_FOUND = rc_mod.STATE_SAVED_RESEARCH_FOUND
+            STATE_NO_SAVED_RESEARCH = rc_mod.STATE_NO_SAVED_RESEARCH
         except Exception:
-            n_chartable = 0
-        if n_chartable == 0:
-            chartable_line = "none built yet."
-        elif n_chartable == 1:
-            chartable_line = "1 saved chart artifact."
-        else:
-            chartable_line = f"{n_chartable} saved chart artifacts."
+            STATE_CHART_READY = "chart_ready"
+            STATE_SAVED_RESEARCH_FOUND = "saved_research_found"
+            STATE_NO_SAVED_RESEARCH = "no_saved_research"
 
-        cells = [
-            ("Combined signals", stack_line),
-            ("Time windows", tw_line),
-            ("Signal rules", rules_line),
-            ("Chartable artifacts", chartable_line),
-            ("Latest activity", activity_line),
-        ]
+        statuses = list(catalogue_summary.get("statuses") or [])
+        totals = catalogue_summary.get("totals") or {}
 
-        def _row(label, line):
+        body: list = []
+        body.append(html.Div(
+            "PRJCT9 checks saved market research, signal studies, "
+            "combined signals, time windows, and pressure history "
+            "for this ticker.",
+            id="catalogue-coverage-explainer",
+            style={"color": PRJCT9_TEXT,
+                   "fontSize": "11px",
+                   "lineHeight": "1.5",
+                   "marginBottom": "8px"},
+        ))
+
+        def _state_label(state, count):
+            if state == STATE_CHART_READY:
+                return "Chart ready", PRJCT9_GREEN
+            if state == STATE_SAVED_RESEARCH_FOUND:
+                return "Build chart data", PRJCT9_TEXT
+            if state == STATE_NO_SAVED_RESEARCH:
+                return "No saved research yet", PRJCT9_MUTED
+            return "Status unknown", PRJCT9_MUTED
+
+        def _row(status):
+            label = str(status.get("label") or "")
+            state = str(status.get("state") or "")
+            count = status.get("count")
+            message = str(status.get("message") or "")
+            state_text, color = _state_label(state, count)
+            count_chip = ""
+            try:
+                if count is not None:
+                    n = int(count)
+                    if n > 0:
+                        count_chip = f"  ({n})"
+            except (TypeError, ValueError):
+                count_chip = ""
+            engine_id = str(status.get("engine") or "").strip()
+            row_id = (
+                f"catalogue-row-{engine_id}" if engine_id
+                else "catalogue-row-unknown"
+            )
             return html.Div(
+                id=row_id,
+                className=(
+                    "prjct9-catalogue-row "
+                    f"prjct9-catalogue-state-{state}"
+                ),
                 style={
                     "padding": "6px 0",
                     "borderBottom": f"1px solid {PRJCT9_BORDER}",
                 },
                 children=[
-                    html.Div(label,
-                             style={"color": PRJCT9_GREEN,
-                                    "fontSize": "10px",
-                                    "letterSpacing": "1px",
-                                    "textTransform": "uppercase",
-                                    "marginBottom": "2px"}),
-                    html.Div(line,
+                    html.Div(
+                        style={"display": "flex",
+                               "justifyContent": "space-between",
+                               "gap": "8px",
+                               "flexWrap": "wrap"},
+                        children=[
+                            html.Span(label,
+                                      style={"color": PRJCT9_GREEN,
+                                             "fontSize": "10px",
+                                             "letterSpacing": "1px",
+                                             "textTransform": "uppercase",
+                                             "fontWeight": "bold"}),
+                            html.Span(
+                                state_text + count_chip,
+                                style={"color": color,
+                                       "fontSize": "11px",
+                                       "fontWeight": "bold"},
+                            ),
+                        ],
+                    ),
+                    html.Div(message,
                              style={"color": PRJCT9_TEXT,
                                     "fontSize": "11px",
                                     "lineHeight": "1.5",
+                                    "marginTop": "2px",
                                     "wordBreak": "break-word"}),
                 ],
             )
 
-        body = [_row(label, line) for label, line in cells]
+        if not statuses:
+            body.append(html.Div(
+                "Catalogue is empty for this ticker.",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "11px"},
+            ))
+        else:
+            body.extend(_row(s) for s in statuses)
+
+        body.append(html.Div(
+            id="catalogue-coverage-totals",
+            style={"color": PRJCT9_MUTED,
+                   "fontSize": "10px",
+                   "letterSpacing": "1px",
+                   "textTransform": "uppercase",
+                   "marginTop": "8px"},
+            children=(
+                f"{int(totals.get('chart_ready') or 0)} ready / "
+                f"{int(totals.get('saved_research_found') or 0)} "
+                "to build / "
+                f"{int(totals.get('no_saved_research') or 0)} missing"
+            ),
+        ))
+
         return _section_wrapper(
-            "engine-coverage-summary",
-            "ENGINE COVERAGE",
-            f"what the engine has saved for {target}",
+            "catalogue-coverage-summary",
+            "CATALOGUE COVERAGE",
+            f"what PRJCT9 knows about {target} right now",
             body,
         )
 
@@ -4953,7 +5369,9 @@ def build_app() -> Any:
             body,
         )
 
-    def _render_research_cockpit(results_data, meta, log, selected_row):
+    def _render_research_cockpit(
+        results_data, meta, log, selected_row, catalogue_summary=None,
+    ):
         """Compose the single-screen research cockpit.
 
         First viewport (desktop 1365x768 / mobile 390x844):
@@ -4961,7 +5379,8 @@ def build_app() -> Any:
           - 'At a glance' grid (Patterns / Combined signals / Time
             windows / Signal rules)
           - 3-column first-view summary row:
-              Best Pattern Summary | Selected Pattern | Engine Coverage
+              Best Pattern Summary | Selected Pattern | Catalogue
+              Coverage
 
         Below the first viewport, detail sections stack naturally and
         scroll with the page:
@@ -4986,7 +5405,9 @@ def build_app() -> Any:
                             _render_selected_pattern_section(
                                 results_data, meta, selected_row,
                             ),
-                            _render_engine_coverage_summary(meta, log),
+                            _render_catalogue_coverage(
+                                meta, catalogue_summary,
+                            ),
                         ],
                     ),
                 ],

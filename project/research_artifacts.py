@@ -19,9 +19,11 @@ Losses, p-value, 95% Confidence) in a single JSON blob per
               (engine="stackbuilder") + catalogue_index.json.
   Phase 6B-3: Confluence day-by-day 7-tier path
               (engine="confluence").
-  TODO Phase 6B-4: Traffic Flow per-day pressure artifacts
-                   (engine="trafficflow").
-  TODO Phase 6C: public catalogue UX + caching model.
+  Phase 6B-4: Traffic Flow per-day pressure artifacts
+              (engine="trafficflow").
+  Phase 6C-1: research_catalogue.py wraps these readers in a
+              per-ticker, TTL-cached coverage summary used by the
+              Phase 6 preview's Catalogue Coverage panel.
 
 All read paths are strictly read-only and offline. The single write
 helper persists JSON to ``output/research_artifacts/<engine>/<TARGET>/``.
@@ -2524,8 +2526,10 @@ def build_trafficflow_day_artifact_from_local(
     )
 
 
-# Phase 6C scope reminder kept in source so a future maintainer sees
-# the intended extension point.
-#
-#   TODO Phase 6C: public catalogue UX + server caching model. The
-#   catalogue index above is the seed.
+# Phase 6C-1 (delivered) consumes the helpers above via
+# project/research_catalogue.py: per-ticker engine-coverage status
+# (chart_ready / saved_research_found / no_saved_research) backed by
+# an in-memory TTL cache. The catalogue index here remains the
+# durable cross-target summary; the Phase 6 preview reads
+# per-ticker snapshots via research_catalogue's helpers, not by
+# walking this tree directly.

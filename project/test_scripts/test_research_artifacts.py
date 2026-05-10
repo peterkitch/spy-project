@@ -329,7 +329,7 @@ def test_preview_prefers_artifact_when_available(tmp_path, monkeypatch):
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -387,7 +387,7 @@ def test_preview_falls_back_when_no_artifact(monkeypatch):
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -473,7 +473,7 @@ def test_preview_combined_signals_uses_stack_artifact_when_present(
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -518,7 +518,7 @@ def test_preview_combined_signals_falls_back_when_no_stack_artifact(
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
