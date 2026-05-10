@@ -4219,24 +4219,13 @@ def test_rendered_dashboard_omits_developer_only_words(monkeypatch):
         )
 
 
-def test_build_missing_charts_callback_is_reason_coded(monkeypatch):
-    """The Build missing charts action must produce reason-coded log
-    messages for each engine state. With no saved data on disk for
-    the studied ticker, every engine row must surface a specific
-    plain-language message rather than a vague 'failed' line."""
-    pytest.importorskip("dash")
-    app = preview.build_app()
-    # Pick the build-missing-charts callback by inspecting the
-    # callback map for a Dash group whose Input list mentions the
-    # btn-build-missing-charts component.
-    target_callback = None
-    for key, entry in app.callback_map.items():
-        # Want the callback whose Output is log-store and whose
-        # Input list mentions btn-build-missing-charts. The
-        # catalogue-store callback also lists that button as an
-        # Input, but its Output is catalogue-store; skip it.
-        if not key.startswith("log-store"):
-            continue
+def _find_build_missing_charts_callback(app):
+    """Resolve the multi-output Build missing charts callback in
+    the Dash callback map. Phase 6C-1 amendment: this callback now
+    writes BOTH log-store and catalogue-store, so its callback_map
+    key starts with the multi-output ``..`` prefix rather than
+    ``log-store``. Match by Input id instead."""
+    for entry in app.callback_map.values():
         inputs = entry.get("inputs") or []
         flat: list[str] = []
         for i in inputs:
@@ -4244,13 +4233,37 @@ def test_build_missing_charts_callback_is_reason_coded(monkeypatch):
                 flat.append(str(i.get("id") or ""))
             else:
                 flat.append(getattr(i, "component_id", "") or "")
-        if "btn-build-missing-charts" in flat:
-            target_callback = entry["callback"]
-            break
-    assert target_callback is not None, (
-        "build-missing-charts callback (log-store output) not found "
-        "in app.callback_map"
+        if (
+            "btn-build-missing-charts" in flat
+            and "meta-store" not in flat
+        ):
+            # The catalogue-store update callback also mentions
+            # btn-build-missing-charts in earlier code revisions but
+            # is keyed by meta-store; this filter picks the build
+            # callback uniquely now that catalogue-store no longer
+            # listens on the build button.
+            return entry
+        if (
+            "btn-build-missing-charts" in flat
+            and len(flat) >= 1
+            and flat[0] == "btn-build-missing-charts"
+        ):
+            return entry
+    return None
+
+
+def test_build_missing_charts_callback_is_reason_coded(monkeypatch):
+    """The Build missing charts action must produce reason-coded log
+    messages for each engine state. With no saved data on disk for
+    the studied ticker, every engine row must surface a specific
+    plain-language message rather than a vague 'failed' line."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = _find_build_missing_charts_callback(app)
+    assert entry is not None, (
+        "build-missing-charts callback not found in app.callback_map"
     )
+    target_callback = entry["callback"]
     inner = getattr(target_callback, "__wrapped__", target_callback)
     # Steer the catalogue toward an empty-state by using a tmp
     # ticker that has nothing saved on disk. Pre-clear the catalogue
@@ -4259,7 +4272,13 @@ def test_build_missing_charts_callback_is_reason_coded(monkeypatch):
     rc.reset_cache()
     meta = {"target": "ZZZZZZ"}
     log = ["pre-existing"]
-    out_log = inner(1, meta, [], None, list(log))
+    # Phase 6C-1 amendment: callback now returns (log, catalogue).
+    out = inner(1, meta, [], None, list(log))
+    assert isinstance(out, tuple) and len(out) == 2, (
+        "build-missing-charts callback must return a 2-tuple "
+        "(log, catalogue) so it can co-write both stores"
+    )
+    out_log, out_catalogue = out
     text = " | ".join(out_log)
     # The callback must mention the engine in plain language.
     assert "Build missing charts: ZZZZZZ" in text
@@ -4274,6 +4293,10 @@ def test_build_missing_charts_callback_is_reason_coded(monkeypatch):
     assert "no saved single-signal study for ZZZZZZ" in text
     assert "no saved combined-signal study for ZZZZZZ" in text
     assert "no saved time-window data for ZZZZZZ" in text
+    # Catalogue payload must be present and target-correct so the
+    # Catalogue Coverage panel does not lag the Activity log.
+    assert isinstance(out_catalogue, dict)
+    assert out_catalogue.get("target") == "ZZZZZZ"
 
 
 def test_no_full_universe_build_path_reachable_from_preview():
@@ -4386,3 +4409,447 @@ def test_catalogue_store_callback_uses_catalogue_module():
     assert "research_catalogue" in block
     assert "summarize_ticker_catalogue" in block
     assert "force_refresh" in block
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-1 amendment: stale-Catalogue-Coverage fix
+#
+# Codex audit caught a race: the catalogue update callback used to
+# also listen on btn-build-missing-charts (and on log-store), so it
+# could fire BEFORE the build callback wrote artifact files to disk.
+# That cached the pre-build snapshot, so Catalogue Coverage said
+# "Build chart data" even after the build succeeded. Fix: the build
+# callback now co-writes catalogue-store AFTER its build loop, with
+# force_refresh=True. The catalogue update callback is restricted to
+# meta-store / btn-refresh-catalogue.
+# ---------------------------------------------------------------------------
+
+
+def test_update_catalogue_store_inputs_drop_build_button_and_log_store():
+    """Codex amendment: _update_catalogue_store must NOT listen to
+    btn-build-missing-charts or log-store. Those triggers race
+    against the build callback's disk writes; the build callback
+    owns its own post-build catalogue refresh now."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map.get("catalogue-store.data")
+    assert entry is not None, (
+        "catalogue-store.data callback missing"
+    )
+    inputs = entry.get("inputs") or []
+    flat: list[str] = []
+    for i in inputs:
+        if isinstance(i, dict):
+            flat.append(str(i.get("id") or ""))
+        else:
+            flat.append(getattr(i, "component_id", "") or "")
+    # Required inputs: meta-store + btn-refresh-catalogue.
+    assert "meta-store" in flat
+    assert "btn-refresh-catalogue" in flat
+    # Forbidden inputs (the source of the stale-cache race).
+    assert "btn-build-missing-charts" not in flat, (
+        "_update_catalogue_store must not listen on "
+        "btn-build-missing-charts; the build callback owns its own "
+        "post-build catalogue refresh."
+    )
+    assert "log-store" not in flat, (
+        "_update_catalogue_store must not refire on log-store "
+        "updates; that wiring caused stale catalogue snapshots "
+        "after build callbacks wrote files to disk."
+    )
+
+
+def test_build_missing_charts_callback_outputs_log_and_catalogue():
+    """The Build missing charts callback must own its own catalogue
+    refresh. Confirm it has TWO outputs (log-store + catalogue-store)
+    so the Catalogue Coverage panel re-renders synchronously with the
+    Activity log."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = _find_build_missing_charts_callback(app)
+    assert entry is not None
+    # Dash stores the output spec under either "output" (string) or
+    # "outputs" (list); flatten either shape into a list of (id,
+    # property) tuples.
+    output_spec = entry.get("output") or entry.get("outputs")
+    output_ids: list[str] = []
+
+    def _add(o):
+        if isinstance(o, str):
+            # Format: "<id>.<property>" or "..<id>.<property>...." for
+            # multi-output groupings.
+            for chunk in o.split(".."):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                output_ids.append(chunk.split(".")[0])
+        elif isinstance(o, dict):
+            output_ids.append(str(o.get("id") or ""))
+        else:
+            cid = getattr(o, "component_id", None)
+            if cid:
+                output_ids.append(cid)
+
+    if isinstance(output_spec, (list, tuple)):
+        for o in output_spec:
+            _add(o)
+    else:
+        _add(output_spec)
+    assert "log-store" in output_ids, (
+        f"build-missing-charts must output log-store; got {output_ids!r}"
+    )
+    assert "catalogue-store" in output_ids, (
+        "build-missing-charts must co-write catalogue-store so the "
+        "Catalogue Coverage panel refreshes after the build loop. "
+        f"Got outputs: {output_ids!r}"
+    )
+
+
+def test_build_missing_charts_returns_post_build_summary(monkeypatch):
+    """The build callback must call summarize_ticker_catalogue with
+    force_refresh=True AFTER the build loop, not just at the start.
+    Stub the catalogue helper to return a pre-build "saved_research_
+    found" snapshot first and a post-build "chart_ready" snapshot on
+    the second force_refresh call; assert the returned tuple's
+    catalogue payload reflects post-build state."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = _find_build_missing_charts_callback(app)
+    assert entry is not None
+    target_callback = entry["callback"]
+    inner = getattr(target_callback, "__wrapped__", target_callback)
+
+    import research_catalogue as rc
+    rc.reset_cache()
+
+    pre_build = {
+        "target": "TGT9",
+        "statuses": [
+            {"engine": "market_scan", "label": "Market scan",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "no saved scan"},
+            {"engine": "impactsearch", "label": "Single signals",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "none"},
+            {"engine": "stackbuilder", "label": "Combined signals",
+             "state": rc.STATE_SAVED_RESEARCH_FOUND, "count": 1,
+             "best_artifact_path": None,
+             "best_source_path": "/run/seed",
+             "message": "saved run found"},
+            {"engine": "confluence", "label": "Time windows",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "none"},
+            {"engine": "trafficflow", "label": "Traffic flow",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "none"},
+        ],
+        "totals": {"chart_ready": 0, "saved_research_found": 1,
+                   "no_saved_research": 4},
+    }
+    post_build = {
+        "target": "TGT9",
+        "statuses": [
+            {"engine": "market_scan", "label": "Market scan",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "no saved scan"},
+            {"engine": "impactsearch", "label": "Single signals",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "none"},
+            {"engine": "stackbuilder", "label": "Combined signals",
+             "state": rc.STATE_CHART_READY, "count": 1,
+             "best_artifact_path": "/art/stack.json",
+             "best_source_path": None,
+             "message": "1 combined-signal chart ready."},
+            {"engine": "confluence", "label": "Time windows",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "none"},
+            {"engine": "trafficflow", "label": "Traffic flow",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": "none"},
+        ],
+        "totals": {"chart_ready": 1, "saved_research_found": 0,
+                   "no_saved_research": 4},
+    }
+
+    call_count = {"n": 0}
+
+    def fake_summarize(target, *, force_refresh=False, **kwargs):
+        call_count["n"] += 1
+        return pre_build if call_count["n"] == 1 else post_build
+
+    monkeypatch.setattr(
+        rc, "summarize_ticker_catalogue", fake_summarize,
+    )
+    # Make the per-engine build helpers succeed without touching disk.
+    monkeypatch.setattr(
+        preview, "_build_stack_artifact_for_top_run",
+        lambda target: ("/tmp/fake_stack.json", None),
+    )
+    monkeypatch.setattr(
+        preview, "_build_confluence_artifact_for_target",
+        lambda target: (None, "no_libraries"),
+    )
+    monkeypatch.setattr(
+        preview, "_build_trafficflow_artifact_for_top_run",
+        lambda target: (None, "no_run"),
+    )
+
+    out = inner(1, {"target": "TGT9"}, [], None, [])
+    assert isinstance(out, tuple) and len(out) == 2
+    out_log, out_catalogue = out
+    assert call_count["n"] == 2, (
+        "build callback must summarize twice: once before the build "
+        "loop (pre-build snapshot) and once after with "
+        "force_refresh=True (post-build snapshot)"
+    )
+    # Returned catalogue must reflect the POST-build snapshot, not
+    # the pre-build snapshot. This is the assertion that pins the
+    # stale-cache fix.
+    stackbuilder_row = next(
+        s for s in out_catalogue["statuses"]
+        if s["engine"] == "stackbuilder"
+    )
+    assert stackbuilder_row["state"] == rc.STATE_CHART_READY, (
+        "post-build catalogue must show chart_ready for stackbuilder; "
+        f"got {stackbuilder_row['state']!r} - the build callback is "
+        "returning the pre-build (stale) snapshot."
+    )
+    assert out_catalogue["totals"]["chart_ready"] == 1
+    # Activity log must mention the successful build line.
+    text = " | ".join(out_log)
+    assert "Combined-signal chart built." in text
+
+
+def test_build_missing_charts_returns_no_update_when_catalogue_module_unavailable(
+    monkeypatch,
+):
+    """Early-exception path: when research_catalogue cannot be
+    imported, the build callback must return dash.no_update for
+    catalogue-store rather than overwriting the previous snapshot
+    with an empty payload."""
+    pytest.importorskip("dash")
+    import dash
+    app = preview.build_app()
+    entry = _find_build_missing_charts_callback(app)
+    assert entry is not None
+    target_callback = entry["callback"]
+    inner = getattr(target_callback, "__wrapped__", target_callback)
+
+    # Force the dynamic import inside the callback to fail by stuffing
+    # a poison module under the import name.
+    import sys as _sys
+
+    class _Poison:
+        def __getattr__(self, name):
+            raise ImportError("poisoned for test")
+
+    monkeypatch.setitem(_sys.modules, "research_catalogue", _Poison())
+
+    out = inner(1, {"target": "TGT9"}, [], None, [])
+    assert isinstance(out, tuple) and len(out) == 2
+    out_log, out_catalogue = out
+    assert out_catalogue is dash.no_update, (
+        "early-exception path must return dash.no_update for "
+        "catalogue-store; otherwise the previous catalogue snapshot "
+        "is clobbered by an empty payload."
+    )
+    assert any(
+        "build missing charts failed" in line.lower() for line in out_log
+    )
+
+
+def test_refresh_catalogue_force_refreshes_via_update_callback(monkeypatch):
+    """Refresh catalogue must still go through the catalogue update
+    callback with force_refresh=True. Pin both the trigger detection
+    and the force_refresh argument."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map.get("catalogue-store.data")
+    assert entry is not None
+    inner = getattr(
+        entry["callback"], "__wrapped__", entry["callback"],
+    )
+
+    import research_catalogue as rc
+    captured = {"force": None, "target": None}
+
+    def fake_summarize(target, *, force_refresh=False, **kwargs):
+        captured["force"] = force_refresh
+        captured["target"] = target
+        return {"target": target, "statuses": [], "totals": {
+            "chart_ready": 0, "saved_research_found": 0,
+            "no_saved_research": 0,
+        }}
+
+    monkeypatch.setattr(
+        rc, "summarize_ticker_catalogue", fake_summarize,
+    )
+
+    # Simulate the Refresh catalogue button firing. Dash exposes the
+    # trigger to the callback via dash.callback_context; patch that
+    # to surface btn-refresh-catalogue.
+    import dash
+    monkeypatch.setattr(
+        dash.callback_context.__class__, "triggered",
+        property(lambda self: [
+            {"prop_id": "btn-refresh-catalogue.n_clicks", "value": 1}
+        ]),
+        raising=False,
+    )
+    inner({"target": "SPY"}, 1)
+    assert captured["target"] == "SPY"
+    assert captured["force"] is True
+
+
+def test_meta_store_change_uses_catalogue_module_without_force(monkeypatch):
+    """Ticker / meta change must summarize through the catalogue
+    module with force_refresh=False so the TTL cache absorbs
+    repeated reads."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map.get("catalogue-store.data")
+    assert entry is not None
+    inner = getattr(
+        entry["callback"], "__wrapped__", entry["callback"],
+    )
+
+    import research_catalogue as rc
+    captured = {"force": None, "target": None}
+
+    def fake_summarize(target, *, force_refresh=False, **kwargs):
+        captured["force"] = force_refresh
+        captured["target"] = target
+        return {"target": target, "statuses": [], "totals": {
+            "chart_ready": 0, "saved_research_found": 0,
+            "no_saved_research": 0,
+        }}
+
+    monkeypatch.setattr(
+        rc, "summarize_ticker_catalogue", fake_summarize,
+    )
+
+    import dash
+    monkeypatch.setattr(
+        dash.callback_context.__class__, "triggered",
+        property(lambda self: [
+            {"prop_id": "meta-store.data", "value": {"target": "QQQ"}}
+        ]),
+        raising=False,
+    )
+    inner({"target": "QQQ"}, 0)
+    assert captured["target"] == "QQQ"
+    assert captured["force"] is False
+
+
+def test_build_missing_charts_does_not_call_full_universe_engines(
+    monkeypatch,
+):
+    """The build sweep must NEVER reach for impactsearch /
+    process_primary_tickers / yfinance. Stub those modules so any
+    accidental call raises loudly, then drive the callback through a
+    successful build to confirm it stays offline."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = _find_build_missing_charts_callback(app)
+    assert entry is not None
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+
+    import sys as _sys
+    forbidden_calls: list[str] = []
+
+    class _Boom:
+        def __getattr__(self, name):
+            forbidden_calls.append(name)
+            raise RuntimeError(
+                f"Build missing charts must not call live engine: {name}"
+            )
+
+    monkeypatch.setitem(_sys.modules, "yfinance", _Boom())
+
+    # Drive a successful build path by stubbing the per-engine build
+    # helpers. The pre-build summary forces the loop into a "build"
+    # branch for stackbuilder; the post-build summary returns chart
+    # ready.
+    import research_catalogue as rc
+    rc.reset_cache()
+    pre = {
+        "target": "TGT9",
+        "statuses": [
+            {"engine": "market_scan", "label": "Market scan",
+             "state": rc.STATE_NO_SAVED_RESEARCH, "count": None,
+             "best_artifact_path": None, "best_source_path": None,
+             "message": ""},
+            {"engine": "impactsearch", "label": "Single signals",
+             "state": rc.STATE_SAVED_RESEARCH_FOUND, "count": 1,
+             "best_artifact_path": None,
+             "best_source_path": "/x.xlsx", "message": ""},
+            {"engine": "stackbuilder", "label": "Combined signals",
+             "state": rc.STATE_SAVED_RESEARCH_FOUND, "count": 1,
+             "best_artifact_path": None,
+             "best_source_path": "/run/seed", "message": ""},
+            {"engine": "confluence", "label": "Time windows",
+             "state": rc.STATE_SAVED_RESEARCH_FOUND, "count": 1,
+             "best_artifact_path": None,
+             "best_source_path": "/lib", "message": ""},
+            {"engine": "trafficflow", "label": "Traffic flow",
+             "state": rc.STATE_SAVED_RESEARCH_FOUND, "count": 1,
+             "best_artifact_path": None,
+             "best_source_path": "/run/seed", "message": ""},
+        ],
+        "totals": {"chart_ready": 0, "saved_research_found": 4,
+                   "no_saved_research": 1},
+    }
+    post = {
+        "target": "TGT9",
+        "statuses": [],
+        "totals": {"chart_ready": 4, "saved_research_found": 0,
+                   "no_saved_research": 1},
+    }
+    state = {"n": 0}
+
+    def fake_summarize(target, *, force_refresh=False, **kwargs):
+        state["n"] += 1
+        return pre if state["n"] == 1 else post
+
+    monkeypatch.setattr(rc, "summarize_ticker_catalogue", fake_summarize)
+    monkeypatch.setattr(
+        preview, "_build_research_day_artifact_for_pair",
+        lambda *a, **kw: "/art/single.json",
+    )
+    monkeypatch.setattr(
+        preview, "_build_stack_artifact_for_top_run",
+        lambda target: ("/art/stack.json", None),
+    )
+    monkeypatch.setattr(
+        preview, "_build_confluence_artifact_for_target",
+        lambda target: ("/art/confluence.json", None),
+    )
+    monkeypatch.setattr(
+        preview, "_build_trafficflow_artifact_for_top_run",
+        lambda target: ("/art/traffic.json", None),
+    )
+
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "TGT9",
+        "Total Capture (%)": 25.0, "Sharpe": 1.5, "Trigger Days": 100,
+    }]
+    out = inner(1, {"target": "TGT9"}, sample, None, [])
+    assert isinstance(out, tuple) and len(out) == 2
+    assert forbidden_calls == [], (
+        f"Build missing charts inadvertently called yfinance: "
+        f"{forbidden_calls!r}"
+    )
+    text = " | ".join(out[0])
+    # Confirm the build branches actually fired
+    assert "Single-signal chart built." in text
+    assert "Combined-signal chart built." in text
+    assert "Time-window chart built." in text
+    assert "Traffic-flow chart built." in text

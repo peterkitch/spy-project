@@ -3078,29 +3078,30 @@ def build_app() -> Any:
         return log[-200:]
 
     # ----------------------------------------------------------------- catalogue
-    # Phase 6C-1: refresh the catalogue store when the studied ticker
-    # changes, when the user clicks Refresh catalogue, or after a
-    # Build missing charts sweep. Reads only the catalogue module
-    # (offline). Refresh / build-missing clicks force a rescan;
-    # ticker-change reads use the in-memory TTL cache.
+    # Phase 6C-1: refresh the catalogue store on ticker-change and
+    # Refresh-catalogue clicks. Build missing charts owns its own
+    # catalogue refresh (the build callback co-writes catalogue-
+    # store) so that the post-build snapshot is always fresh; the
+    # earlier wiring listened on btn-build-missing-charts AND
+    # log-store from this callback as well, which let it re-fire
+    # before the build helpers had written their files and cached
+    # a stale "Build chart data" snapshot. Inputs here are now
+    # only the two events that should refresh independently of
+    # the build sweep.
     @app.callback(
         Output("catalogue-store", "data"),
         Input("meta-store", "data"),
         Input("btn-refresh-catalogue", "n_clicks"),
-        Input("btn-build-missing-charts", "n_clicks"),
-        Input("log-store", "data"),
         prevent_initial_call=False,
     )
-    def _update_catalogue_store(meta, _refresh_n, _build_n, _log):
+    def _update_catalogue_store(meta, _refresh_n):
         target = ((meta or {}).get("target") or DEFAULT_TARGET)
         target = str(target).strip().upper() or DEFAULT_TARGET
         trigger = (
             callback_context.triggered[0]["prop_id"].split(".")[0]
             if callback_context.triggered else ""
         )
-        force = trigger in (
-            "btn-refresh-catalogue", "btn-build-missing-charts",
-        )
+        force = trigger == "btn-refresh-catalogue"
         try:
             import research_catalogue as rc
             return rc.summarize_ticker_catalogue(
@@ -3122,8 +3123,19 @@ def build_app() -> Any:
     # ticker build helpers ONLY for engines whose state needs and can
     # use a build step. Market scan stays saved-output-only - this
     # callback never invokes a universe-wide OnePass scan.
+    #
+    # Phase 6C-1 amendment: this callback now also writes
+    # catalogue-store so the post-build snapshot is always fresh.
+    # Earlier wiring let _update_catalogue_store fire on the same
+    # button click and cache the pre-build snapshot before the
+    # build helpers wrote their files; the result was a stale
+    # "Build chart data" state in Catalogue Coverage even after a
+    # successful build. Owning the post-build refresh here
+    # eliminates the race - we always summarize AFTER the build
+    # loop with force_refresh=True.
     @app.callback(
         Output("log-store", "data", allow_duplicate=True),
+        Output("catalogue-store", "data", allow_duplicate=True),
         Input("btn-build-missing-charts", "n_clicks"),
         State("meta-store", "data"),
         State("results-store", "data"),
@@ -3140,6 +3152,15 @@ def build_app() -> Any:
         target = str(target).strip().upper() or DEFAULT_TARGET
         try:
             import research_catalogue as rc
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build missing charts failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            # Catalogue module unavailable - leave catalogue-store as
+            # is rather than overwriting with a partial snapshot.
+            return log[-200:], no_update
+        try:
             summary = rc.summarize_ticker_catalogue(
                 target, force_refresh=True,
             )
@@ -3148,7 +3169,7 @@ def build_app() -> Any:
                 f"[{ts}] build missing charts failed: "
                 f"{type(exc).__name__}: {exc}"
             )
-            return log[-200:]
+            return log[-200:], no_update
         statuses = summary.get("statuses") or []
         log.append(f"[{ts}] Build missing charts: {target}.")
         for row in statuses:
@@ -3326,7 +3347,19 @@ def build_app() -> Any:
                         f"built: {_reason_text(reason, target)}."
                     )
                 continue
-        return log[-200:]
+        # Phase 6C-1 amendment: re-summarize AFTER the build loop
+        # with force_refresh=True so the catalogue-store payload
+        # picks up any artifact files the build helpers just wrote.
+        # Falling back to the pre-build summary on failure is the
+        # right move - it is still better than a noisily-empty
+        # snapshot.
+        try:
+            post_summary = rc.summarize_ticker_catalogue(
+                target, force_refresh=True,
+            )
+        except Exception:
+            post_summary = summary
+        return log[-200:], post_summary
 
     # Clientside scroll-into-view callbacks for the three left-rail
     # navigate buttons. They run in the browser (no server hop) and
