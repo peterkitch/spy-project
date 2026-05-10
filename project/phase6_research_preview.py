@@ -22,11 +22,21 @@ import json
 import os
 import pickle
 import re
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+
+
+# Phase 6C-4: lightweight perf timing for the preview's hot paths.
+# Imported as a soft optional so the preview boots even when the
+# perf module is absent (e.g. in stripped test environments).
+try:
+    import perf_timing as _perf
+except Exception:  # pragma: no cover - perf timing is best-effort
+    _perf = None
 
 
 # Make the global_ticker_library / signal_library shared loaders find
@@ -1026,6 +1036,114 @@ def _hide_in_public_mode(base_style: Optional[dict] = None) -> dict:
     return dict(base_style or {})
 
 
+def _empty_health_payload() -> dict:
+    """Phase 6C-4: bounded fallback payload for the
+    catalogue-health-store when the health module is unavailable
+    or the report has not been generated yet."""
+    return {
+        "schema": "catalogue_health_browser_payload_v1",
+        "generated_at": None,
+        "cache_hit": False,
+        "loaded_from_disk": False,
+        "totals": {
+            "targets_total": 0,
+            "chart_ready_slots": 0,
+            "engine_slots_total": 0,
+            "daily_only_confluence_count": 0,
+        },
+        "by_engine": {},
+        "top_gap_reasons": [],
+        "top_buildable_targets": [],
+        "top_blocked_targets": [],
+        "complete_coverage_targets_count": 0,
+        "targets_with_no_charts_count": 0,
+        "chart_ready_ratio": 0.0,
+    }
+
+
+def _build_health_browser_payload(report: Mapping[str, Any]) -> dict:
+    """Phase 6C-4: shape the health report into the small
+    browser-safe payload the Catalogue Health UI consumes. Excludes
+    by_target (can be hundreds of rows) and any absolute paths.
+    Caps top_gap_reasons / top_*_targets so the dcc.Store payload
+    stays under a few KB even on a 70k-target catalogue."""
+    if not isinstance(report, Mapping):
+        return _empty_health_payload()
+    totals = dict(report.get("totals") or {})
+    by_engine = {}
+    for engine, info in (report.get("by_engine") or {}).items():
+        if isinstance(info, Mapping):
+            by_engine[engine] = {
+                k: int(v) if isinstance(v, (int, float)) else v
+                for k, v in info.items()
+            }
+
+    gap_reasons = report.get("gap_reasons") or {}
+    sorted_reasons = sorted(
+        gap_reasons.items(),
+        key=lambda kv: -int(kv[1] or 0),
+    )
+    top_gap = [
+        {"reason": r, "count": int(n or 0)}
+        for r, n in sorted_reasons[:8]
+    ]
+
+    def _trim_target_rows(rows, n=10):
+        out = []
+        for r in (rows or [])[:n]:
+            if not isinstance(r, Mapping):
+                continue
+            out.append({
+                "target_ticker": r.get("target_ticker"),
+                "engines_chart_ready": list(
+                    r.get("engines_chart_ready") or [],
+                ),
+                "engines_buildable": list(
+                    r.get("engines_buildable") or [],
+                ),
+                "engines_blocked": list(
+                    r.get("engines_blocked") or [],
+                ),
+            })
+        return out
+
+    return {
+        "schema": "catalogue_health_browser_payload_v1",
+        "generated_at": report.get("generated_at"),
+        "cache_hit": bool(report.get("cache_hit")),
+        "loaded_from_disk": bool(report.get("loaded_from_disk")),
+        "totals": {
+            "targets_total": int(totals.get("targets_total") or 0),
+            "chart_ready_slots": int(
+                totals.get("chart_ready_slots") or 0,
+            ),
+            "engine_slots_total": int(
+                totals.get("engine_slots_total") or 0,
+            ),
+            "daily_only_confluence_count": int(
+                totals.get("daily_only_confluence_count") or 0,
+            ),
+        },
+        "by_engine": by_engine,
+        "top_gap_reasons": top_gap,
+        "top_buildable_targets": _trim_target_rows(
+            report.get("top_buildable_targets"), n=10,
+        ),
+        "top_blocked_targets": _trim_target_rows(
+            report.get("top_blocked_targets"), n=10,
+        ),
+        "complete_coverage_targets_count": len(
+            report.get("complete_coverage_targets") or [],
+        ),
+        "targets_with_no_charts_count": len(
+            report.get("targets_with_no_charts") or [],
+        ),
+        "chart_ready_ratio": float(
+            report.get("chart_ready_ratio") or 0.0,
+        ),
+    }
+
+
 def _empty_browser_payload() -> dict:
     """Phase 6C-2 amendment: bounded fallback payload returned by the
     snapshot-store callback when the catalogue module is
@@ -1466,6 +1584,7 @@ def _real_confluence_snapshot_for_target(
         return None
     project_dir = Path(__file__).resolve().parent
     saved_cwd = os.getcwd()
+    perf_start = time.perf_counter() if _perf is not None else None
     try:
         os.chdir(project_dir)
         try:
@@ -1540,6 +1659,12 @@ def _real_confluence_snapshot_for_target(
             os.chdir(saved_cwd)
         except Exception:
             pass
+        if _perf is not None and perf_start is not None:
+            _perf.record(
+                "confluence_status_read",
+                time.perf_counter() - perf_start,
+                extra={"target": safe},
+            )
 
 
 def _traffic_flow_snapshot_for_target(
@@ -1586,6 +1711,7 @@ def _traffic_flow_snapshot_for_target(
     safe = target.strip().upper()
     if not safe:
         return None
+    perf_start = time.perf_counter() if _perf is not None else None
     runs = _discover_stack_runs(_stack_output_dir() if stack_root is None
                                 else Path(stack_root))
     target_runs = [r for r in runs if r["ticker"].upper() == safe]
@@ -1680,6 +1806,12 @@ def _traffic_flow_snapshot_for_target(
             os.chdir(saved_cwd)
         except Exception:
             pass
+        if _perf is not None and perf_start is not None:
+            _perf.record(
+                "trafficflow_snapshot_read",
+                time.perf_counter() - perf_start,
+                extra={"target": safe},
+            )
 
 
 def _selected_row_from_table_state(
@@ -2592,6 +2724,24 @@ def build_app() -> Any:
                                     "boxSizing": "border-box",
                                 }),
                             ),
+                            # Phase 6C-4: rebuild + persist the
+                            # catalogue health report. Local-only -
+                            # writes JSON to disk. Hidden in public
+                            # mode; the public app reads the last
+                            # saved JSON, never builds.
+                            html.Button(
+                                "Refresh health report",
+                                id="btn-refresh-health-report",
+                                n_clicks=0,
+                                style=_hide_in_public_mode({
+                                    **btn_style,
+                                    "marginRight": "0",
+                                    "marginTop": "6px",
+                                    "marginBottom": "0",
+                                    "width": "100%",
+                                    "boxSizing": "border-box",
+                                }),
+                            ),
                             html.Div(
                                 id="output-discovery-status",
                                 style={
@@ -2795,6 +2945,21 @@ def build_app() -> Any:
                                 style={"padding": "0",
                                        "marginBottom": "10px"},
                             ),
+                            # Phase 6C-4: catalogue health summary +
+                            # performance row. Both render above the
+                            # per-ticker dashboard so the user sees
+                            # "what's missing? what's slow?" before
+                            # diving into a single ticker.
+                            html.Div(
+                                id="catalogue-health-section",
+                                style={"padding": "0",
+                                       "marginBottom": "10px"},
+                            ),
+                            html.Div(
+                                id="performance-section",
+                                style={"padding": "0",
+                                       "marginBottom": "10px"},
+                            ),
                             dcc.Loading(
                                 id="dashboard-loading",
                                 type="circle",
@@ -2834,6 +2999,16 @@ def build_app() -> Any:
             # patterns table's selected_rows callback reads it AFTER
             # the load completes and reflects the matching row.
             dcc.Store(id="catalogue-pinned-source-store"),
+            # Phase 6C-4: catalogue-health browser-payload store.
+            # Holds the small summary used by the Catalogue Health
+            # render (top counts, top reasons, ratio). The full
+            # health report stays in the in-memory module cache and
+            # the optional on-disk JSON.
+            dcc.Store(id="catalogue-health-store"),
+            # Phase 6C-4: perf-tick counter. The dashboard render
+            # callback reads this to refresh the Performance row
+            # whenever a tracked operation completes.
+            dcc.Store(id="performance-tick-store", data=0),
             # Tracks the most recent left-rail nav target. Written
             # by clientside scrollIntoView callbacks so the Dash
             # callback graph has a registered output.
@@ -3269,6 +3444,47 @@ def build_app() -> Any:
             return rc.build_catalogue_browser_payload(full_snapshot)
         except Exception:
             return _empty_browser_payload()
+
+    # Phase 6C-4: catalogue health-report store. Click on
+    # "Refresh health report" rebuilds AND persists. In public
+    # mode the button is hidden and the persist flag is dropped;
+    # the public app reads the last saved JSON via
+    # get_health_report's disk fallback path.
+    @app.callback(
+        Output("catalogue-health-store", "data"),
+        Input("meta-store", "data"),
+        Input("btn-refresh-health-report", "n_clicks"),
+        prevent_initial_call=False,
+    )
+    def _update_catalogue_health_store(_meta, _refresh_n):
+        trigger = (
+            callback_context.triggered[0]["prop_id"].split(".")[0]
+            if callback_context.triggered else ""
+        )
+        force = trigger == "btn-refresh-health-report"
+        if PUBLIC_READ_ONLY:
+            # Public mode never builds nor writes the report. Read
+            # whatever was persisted by the local maintainer.
+            try:
+                import research_catalogue_health as rch
+                existing = rch.read_catalogue_health_report()
+                if existing is not None:
+                    out = dict(existing)
+                    out["cache_hit"] = False
+                    out["loaded_from_disk"] = True
+                    return _build_health_browser_payload(out)
+            except Exception:
+                pass
+            return _empty_health_payload()
+        try:
+            import research_catalogue_health as rch
+            report = rch.get_health_report(
+                force_refresh=force,
+                persist_if_built=force,
+            )
+            return _build_health_browser_payload(report)
+        except Exception:
+            return _empty_health_payload()
 
     # Phase 6C-1: refresh the catalogue store on ticker-change and
     # Refresh-catalogue clicks. Build missing charts owns its own
@@ -3713,6 +3929,9 @@ def build_app() -> Any:
             # Look across all engine modes for this ticker so the
             # cockpit can show real status rather than asking the
             # user to pick a mode first.
+            perf_load_start = (
+                time.perf_counter() if _perf is not None else None
+            )
             stack_runs_all = _discover_stack_runs(_stack_output_dir())
             stack_runs_for_target = [
                 r for r in stack_runs_all
@@ -3748,12 +3967,30 @@ def build_app() -> Any:
                 # Even when there's no single-signal file, the meta
                 # carries discovered stack/timeframe counts so Overview
                 # can still render their status.
+                if _perf is not None and perf_load_start is not None:
+                    _perf.record(
+                        "saved_ticker_load",
+                        time.perf_counter() - perf_load_start,
+                        extra={
+                            "target": target, "rows": 0,
+                            "outcome": "no_xlsx",
+                        },
+                    )
                 return [], meta, log[-200:]
             df_raw = _load_impactsearch_xlsx(xlsx)
             if df_raw.empty:
                 log.append(
                     f"[{ts}] saved research for '{target}' returned no rows."
                 )
+                if _perf is not None and perf_load_start is not None:
+                    _perf.record(
+                        "saved_ticker_load",
+                        time.perf_counter() - perf_load_start,
+                        extra={
+                            "target": target, "rows": 0,
+                            "outcome": "empty_xlsx",
+                        },
+                    )
                 return [], meta, log[-200:]
             df_norm = _normalize_results_frame(df_raw)
             sidecar = _read_sidecar(xlsx)
@@ -3763,6 +4000,15 @@ def build_app() -> Any:
                 f"[{ts}] research loaded for {target}: {len(df_norm)} rows."
             )
             data = df_norm.to_dict("records")
+            if _perf is not None and perf_load_start is not None:
+                _perf.record(
+                    "saved_ticker_load",
+                    time.perf_counter() - perf_load_start,
+                    extra={
+                        "target": target, "rows": len(df_norm),
+                        "outcome": "loaded",
+                    },
+                )
             return data, meta, log[-200:]
 
         # Boot trigger: auto-load SPY once on page load if no results yet.
@@ -3873,10 +4119,26 @@ def build_app() -> Any:
         results_data, meta, log, catalogue_data, selected_row,
     ):
         meta = meta or {}
-        return _render_research_cockpit(
-            results_data, meta, log or [], selected_row,
-            catalogue_summary=catalogue_data,
-        )
+        perf_start = time.perf_counter() if _perf is not None else None
+        try:
+            return _render_research_cockpit(
+                results_data, meta, log or [], selected_row,
+                catalogue_summary=catalogue_data,
+            )
+        finally:
+            if _perf is not None and perf_start is not None:
+                _perf.record(
+                    "dashboard_render",
+                    time.perf_counter() - perf_start,
+                    extra={
+                        "target": (
+                            (meta or {}).get("target") or DEFAULT_TARGET
+                        ),
+                        "rows": (
+                            len(results_data) if results_data else 0
+                        ),
+                    },
+                )
 
     # Phase 6C-2: catalogue browser section. Reads
     # catalogue-snapshot-store and renders the cross-ticker overview
@@ -3890,6 +4152,29 @@ def build_app() -> Any:
     )
     def _render_catalogue_browser_section(snapshot):
         return _render_catalogue_browser(snapshot)
+
+    # Phase 6C-4: render the catalogue-health summary section. Reads
+    # the small browser payload built by
+    # _build_health_browser_payload; never touches the full report.
+    @app.callback(
+        Output("catalogue-health-section", "children"),
+        Input("catalogue-health-store", "data"),
+    )
+    def _render_catalogue_health_section(payload):
+        return _render_catalogue_health(payload)
+
+    # Phase 6C-4: render the small Performance row. Reads
+    # perf_timing recent history each tick; the
+    # performance-tick-store is bumped by the dashboard render
+    # callback so the row stays fresh as operations complete.
+    @app.callback(
+        Output("performance-section", "children"),
+        Input("catalogue-snapshot-store", "data"),
+        Input("catalogue-health-store", "data"),
+        Input("results-store", "data"),
+    )
+    def _render_performance_section(_snap, _health, _results):
+        return _render_performance_row()
 
     # Update the dropdown options whenever the snapshot refreshes.
     # Phase 6C-2 amendment: read the bounded ``dropdown_targets``
@@ -4701,6 +4986,317 @@ def build_app() -> Any:
             id="catalogue-browser-panel",
             className="prjct9-cockpit-panel",
             children=body,
+        )
+
+    def _render_catalogue_health(payload):
+        """Phase 6C-4 Catalogue Health panel.
+
+        Compact summary: chart-ready coverage, buildable next,
+        blocked / missing data, top missing reason. Reads the
+        bounded health browser payload (no per-target rows beyond
+        top buildable / top blocked).
+        """
+        if not isinstance(payload, Mapping) or not payload:
+            payload = _empty_health_payload()
+        totals = payload.get("totals") or {}
+        by_engine = payload.get("by_engine") or {}
+        top_gap = list(payload.get("top_gap_reasons") or [])
+        top_buildable = list(payload.get("top_buildable_targets") or [])
+        ratio = float(payload.get("chart_ready_ratio") or 0.0)
+        complete_count = int(
+            payload.get("complete_coverage_targets_count") or 0,
+        )
+        no_chart_count = int(
+            payload.get("targets_with_no_charts_count") or 0,
+        )
+        daily_only_count = int(
+            totals.get("daily_only_confluence_count") or 0,
+        )
+
+        # Sums across per-ticker engines.
+        chart_ready_total = sum(
+            int(v.get("chart_ready_count") or 0)
+            for v in by_engine.values()
+        )
+        buildable_total = sum(
+            int(v.get("buildable_count") or 0)
+            for v in by_engine.values()
+        )
+        blocked_total = sum(
+            int(v.get("blocked_count") or 0)
+            for v in by_engine.values()
+        )
+
+        loaded_from_disk = bool(payload.get("loaded_from_disk"))
+        generated_at = payload.get("generated_at")
+
+        header = html.Div(
+            style={"display": "flex",
+                   "alignItems": "baseline",
+                   "gap": "8px",
+                   "flexWrap": "wrap",
+                   "marginBottom": "6px"},
+            children=[
+                html.Span(
+                    "CATALOGUE HEALTH",
+                    style={"color": PRJCT9_GREEN,
+                           "letterSpacing": "2px",
+                           "fontSize": "12px",
+                           "fontWeight": "bold"},
+                ),
+                html.Span(
+                    "what's ready, what can be built, what is "
+                    "missing",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "lineHeight": "1.4"},
+                ),
+            ],
+        )
+
+        if generated_at:
+            stamp_text = (
+                f"Snapshot built {generated_at}."
+                if not loaded_from_disk
+                else f"Last saved snapshot from {generated_at}."
+            )
+        else:
+            stamp_text = (
+                "No health report yet. Click Refresh health "
+                "report to build one."
+                if not PUBLIC_READ_ONLY
+                else "No saved health report yet."
+            )
+        stamp = html.Div(
+            stamp_text,
+            id="catalogue-health-timestamp",
+            style={"color": PRJCT9_MUTED,
+                   "fontSize": "10px",
+                   "marginBottom": "8px"},
+        )
+
+        cells = [
+            ("Chart-ready coverage",
+             f"{chart_ready_total}",
+             f"{ratio * 100.0:.1f}% of engine slots"),
+            ("Buildable next",
+             f"{buildable_total}",
+             "engine slots ready to render"),
+            ("Blocked",
+             f"{blocked_total}",
+             "missing input data"),
+            ("Daily-only tickers",
+             f"{daily_only_count:,}",
+             "single-timeframe libraries"),
+            ("Tickers with complete coverage",
+             f"{complete_count}",
+             "chart-ready in all four engines"),
+            ("Tickers with no charts",
+             f"{no_chart_count}",
+             "saved data exists, no chart yet"),
+        ]
+        cell_grid = html.Div(
+            id="catalogue-health-cells",
+            style={"display": "grid",
+                   "gridTemplateColumns":
+                       "repeat(auto-fit, minmax(160px, 1fr))",
+                   "gap": "6px",
+                   "marginBottom": "10px"},
+            children=[
+                html.Div(
+                    style={"backgroundColor": PRJCT9_DIM,
+                           "border": f"1px solid {PRJCT9_BORDER}",
+                           "padding": "6px 8px",
+                           "minWidth": "0"},
+                    children=[
+                        html.Div(label,
+                                 style={"color": PRJCT9_MUTED,
+                                        "fontSize": "9px",
+                                        "letterSpacing": "1px",
+                                        "textTransform": "uppercase"}),
+                        html.Div(value,
+                                 style={"color": PRJCT9_GREEN,
+                                        "fontSize": "13px",
+                                        "fontWeight": "bold",
+                                        "marginTop": "2px"}),
+                        html.Div(line,
+                                 style={"color": PRJCT9_TEXT,
+                                        "fontSize": "10px",
+                                        "lineHeight": "1.4",
+                                        "marginTop": "2px",
+                                        "wordBreak": "break-word"}),
+                    ],
+                )
+                for label, value, line in cells
+            ],
+        )
+
+        # Top missing reason - the single most common gap so the
+        # user sees "fix this first".
+        if top_gap:
+            top_reason = top_gap[0]
+            reason_text = (
+                f"Top missing reason: {top_reason.get('reason')} "
+                f"({int(top_reason.get('count') or 0):,} slots)"
+            )
+        else:
+            reason_text = "No missing-data reasons yet."
+        reason_div = html.Div(
+            reason_text,
+            id="catalogue-health-top-reason",
+            style={"color": PRJCT9_TEXT,
+                   "fontSize": "11px",
+                   "lineHeight": "1.5",
+                   "marginBottom": "6px"},
+        )
+
+        gap_breakdown_children: list = []
+        if top_gap:
+            gap_breakdown_children.append(html.Div(
+                "Missing-data reasons",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "10px",
+                       "letterSpacing": "1px",
+                       "textTransform": "uppercase",
+                       "marginBottom": "4px"},
+            ))
+            gap_breakdown_children.append(html.Div(
+                ", ".join(
+                    f"{g.get('reason')} ({int(g.get('count') or 0):,})"
+                    for g in top_gap
+                ),
+                id="catalogue-health-gap-list",
+                style={"color": PRJCT9_TEXT,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5",
+                       "wordBreak": "break-word",
+                       "marginBottom": "6px"},
+            ))
+
+        buildable_children: list = []
+        if top_buildable:
+            buildable_children.append(html.Div(
+                "Top tickers ready to build next",
+                style={"color": PRJCT9_MUTED,
+                       "fontSize": "10px",
+                       "letterSpacing": "1px",
+                       "textTransform": "uppercase",
+                       "marginBottom": "4px"},
+            ))
+            buildable_children.append(html.Div(
+                ", ".join(
+                    str(r.get("target_ticker") or "")
+                    for r in top_buildable
+                    if r.get("target_ticker")
+                ),
+                id="catalogue-health-buildable-list",
+                style={"color": PRJCT9_GREEN,
+                       "fontSize": "11px",
+                       "lineHeight": "1.5",
+                       "fontWeight": "bold",
+                       "wordBreak": "break-word"},
+            ))
+
+        return html.Div(
+            id="catalogue-health-panel",
+            className="prjct9-cockpit-panel",
+            children=[
+                header,
+                stamp,
+                cell_grid,
+                reason_div,
+                *gap_breakdown_children,
+                *buildable_children,
+            ],
+        )
+
+    def _render_performance_row():
+        """Phase 6C-4: compact Performance row showing the most
+        recent timed operation, its elapsed seconds, and the
+        slowest entry across the recent history. Pulls data from
+        ``perf_timing.recent``."""
+        try:
+            import perf_timing as pt
+        except Exception:
+            return html.Div(style={"display": "none"})
+        last_entry = pt.last()
+        slow_entry = pt.slowest_recent(limit=20)
+        history = pt.recent(limit=8)
+        if not last_entry and not slow_entry and not history:
+            return html.Div(style={"display": "none"})
+
+        def _fmt(entry):
+            if not entry:
+                return "-"
+            secs = float(entry.get("elapsed_seconds") or 0.0)
+            cache = entry.get("cache_hit")
+            extra = ""
+            if cache is True:
+                extra = " (cache hit)"
+            elif cache is False:
+                extra = " (rebuilt)"
+            return (
+                f"{entry.get('name')}: {secs:.3f}s{extra}"
+            )
+
+        history_text = " | ".join(_fmt(e) for e in history)
+
+        cells = [
+            ("Last operation", _fmt(last_entry)),
+            ("Slowest recent", _fmt(slow_entry)),
+        ]
+        cell_grid = html.Div(
+            style={"display": "grid",
+                   "gridTemplateColumns":
+                       "repeat(auto-fit, minmax(220px, 1fr))",
+                   "gap": "6px"},
+            children=[
+                html.Div(
+                    style={"backgroundColor": PRJCT9_DIM,
+                           "border": f"1px solid {PRJCT9_BORDER}",
+                           "padding": "6px 8px",
+                           "minWidth": "0"},
+                    children=[
+                        html.Div(label,
+                                 style={"color": PRJCT9_MUTED,
+                                        "fontSize": "9px",
+                                        "letterSpacing": "1px",
+                                        "textTransform": "uppercase"}),
+                        html.Div(value,
+                                 style={"color": PRJCT9_TEXT,
+                                        "fontSize": "11px",
+                                        "lineHeight": "1.4",
+                                        "marginTop": "2px",
+                                        "wordBreak": "break-word"}),
+                    ],
+                )
+                for label, value in cells
+            ],
+        )
+
+        return html.Div(
+            id="performance-panel",
+            className="prjct9-cockpit-panel",
+            children=[
+                html.Div(
+                    "PERFORMANCE",
+                    style={"color": PRJCT9_GREEN,
+                           "letterSpacing": "2px",
+                           "fontSize": "11px",
+                           "fontWeight": "bold",
+                           "marginBottom": "6px"},
+                ),
+                cell_grid,
+                html.Div(
+                    history_text,
+                    id="performance-history",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "lineHeight": "1.4",
+                           "marginTop": "6px",
+                           "wordBreak": "break-word"},
+                ),
+            ],
         )
 
     def _render_catalogue_coverage(meta, catalogue_summary):

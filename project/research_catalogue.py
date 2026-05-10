@@ -69,6 +69,13 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import research_artifacts as _ra
+# Phase 6C-4: lightweight perf timing for the catalogue layer.
+# Imported lazily only inside the wrapped operations so the module
+# stays small at import time when callers don't need the timing.
+try:
+    import perf_timing as _perf
+except Exception:  # pragma: no cover - perf timing is best-effort
+    _perf = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1513,46 +1520,61 @@ def get_catalogue_snapshot(
     }
     key = _snapshot_cache_key(dirs)
     now = time.time()
+    perf_start = time.perf_counter() if _perf is not None else None
+    perf_outcome: Optional[str] = None
 
-    if not force_refresh:
-        cached = _SNAPSHOT_CACHE.get(key)
-        if cached is not None:
-            ts, snap = cached
-            if now - ts <= float(ttl_seconds):
-                out = dict(snap)
-                out["cache_hit"] = True
-                out["loaded_from_disk"] = False
-                return out
-        existing = read_catalogue_snapshot(
-            base_dir=dirs["artifact_root"],
-        )
-        if existing is not None:
-            _SNAPSHOT_CACHE[key] = (now, existing)
-            out = dict(existing)
-            out["cache_hit"] = False
-            out["loaded_from_disk"] = True
-            return out
-
-    snapshot = build_catalogue_snapshot(
-        base_dir=dirs["artifact_root"],
-        impactsearch_dir=dirs["impactsearch_dir"],
-        onepass_dir=dirs["onepass_dir"],
-        stack_dir=dirs["stack_dir"],
-        sig_lib_dir=dirs["sig_lib_dir"],
-        top_n=top_n,
-    )
-    if persist_if_built:
-        try:
-            write_catalogue_snapshot(
-                snapshot, base_dir=dirs["artifact_root"],
+    try:
+        if not force_refresh:
+            cached = _SNAPSHOT_CACHE.get(key)
+            if cached is not None:
+                ts, snap = cached
+                if now - ts <= float(ttl_seconds):
+                    out = dict(snap)
+                    out["cache_hit"] = True
+                    out["loaded_from_disk"] = False
+                    perf_outcome = "cache_hit"
+                    return out
+            existing = read_catalogue_snapshot(
+                base_dir=dirs["artifact_root"],
             )
-        except Exception:
-            pass
-    _SNAPSHOT_CACHE[key] = (now, snapshot)
-    out = dict(snapshot)
-    out["cache_hit"] = False
-    out["loaded_from_disk"] = False
-    return out
+            if existing is not None:
+                _SNAPSHOT_CACHE[key] = (now, existing)
+                out = dict(existing)
+                out["cache_hit"] = False
+                out["loaded_from_disk"] = True
+                perf_outcome = "disk_read"
+                return out
+
+        snapshot = build_catalogue_snapshot(
+            base_dir=dirs["artifact_root"],
+            impactsearch_dir=dirs["impactsearch_dir"],
+            onepass_dir=dirs["onepass_dir"],
+            stack_dir=dirs["stack_dir"],
+            sig_lib_dir=dirs["sig_lib_dir"],
+            top_n=top_n,
+        )
+        if persist_if_built:
+            try:
+                write_catalogue_snapshot(
+                    snapshot, base_dir=dirs["artifact_root"],
+                )
+            except Exception:
+                pass
+        _SNAPSHOT_CACHE[key] = (now, snapshot)
+        out = dict(snapshot)
+        out["cache_hit"] = False
+        out["loaded_from_disk"] = False
+        perf_outcome = "rebuilt"
+        return out
+    finally:
+        if _perf is not None and perf_start is not None:
+            elapsed = time.perf_counter() - perf_start
+            _perf.record(
+                "snapshot_fetch",
+                elapsed,
+                cache_hit=(perf_outcome == "cache_hit"),
+                extra={"outcome": perf_outcome},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1633,7 @@ def build_catalogue_browser_payload(
     bump can be detected without colliding with the persistent
     snapshot's schema.
     """
+    perf_start = time.perf_counter() if _perf is not None else None
     snapshot = snapshot or {}
     counts = snapshot.get("counts") or {}
     targets_total = int(counts.get("targets_total") or 0)
@@ -1643,7 +1666,7 @@ def build_catalogue_browser_payload(
         for t in sorted_for_dropdown[: int(max_dropdown)]
     ]
 
-    return {
+    payload = {
         "schema": BROWSER_PAYLOAD_SCHEMA_VERSION,
         "generated_at": snapshot.get("generated_at"),
         "counts": {
@@ -1668,3 +1691,13 @@ def build_catalogue_browser_payload(
             "max_dropdown": int(max_dropdown),
         },
     }
+    if _perf is not None and perf_start is not None:
+        _perf.record(
+            "browser_payload_build",
+            time.perf_counter() - perf_start,
+            extra={
+                "targets_total": targets_total,
+                "top_opportunities_total": len(top_full),
+            },
+        )
+    return payload

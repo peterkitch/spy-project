@@ -6035,3 +6035,426 @@ def test_browser_payload_under_250kb_at_real_data_scale():
         f"browser payload is {len(blob)} bytes; the launch budget "
         "is 250 KB on real-data scale."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-4: Catalogue Health UI + Performance row
+# ---------------------------------------------------------------------------
+
+
+def test_catalogue_health_section_present_in_layout():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    found_ids: list[str] = []
+
+    def _walk(node):
+        if node is None or isinstance(node, str):
+            return
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                _walk(c)
+            return
+        nid = getattr(node, "id", None)
+        if isinstance(nid, str):
+            found_ids.append(nid)
+        children = getattr(node, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    assert "catalogue-health-section" in found_ids
+    assert "catalogue-health-store" in found_ids
+    assert "performance-section" in found_ids
+
+
+def test_refresh_health_report_button_in_local_mode():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    text = _extract_ui_text(app.layout)
+    assert "Refresh health report" in text
+
+
+def test_health_section_callback_registered():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    keys = list(app.callback_map.keys())
+    assert "catalogue-health-store.data" in keys
+    assert "catalogue-health-section.children" in keys
+    assert "performance-section.children" in keys
+
+
+def test_health_section_renders_required_text():
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-health-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = {
+        "schema": "catalogue_health_browser_payload_v1",
+        "generated_at": "2026-05-10T01:00:00+00:00",
+        "cache_hit": False,
+        "loaded_from_disk": False,
+        "totals": {
+            "targets_total": 281,
+            "chart_ready_slots": 6,
+            "engine_slots_total": 1124,
+            "daily_only_confluence_count": 72461,
+        },
+        "by_engine": {
+            "impactsearch": {
+                "saved_source_count": 247,
+                "chart_ready_count": 1,
+                "buildable_count": 20,
+                "blocked_count": 226,
+            },
+            "stackbuilder": {
+                "saved_source_count": 247,
+                "chart_ready_count": 1,
+                "buildable_count": 20,
+                "blocked_count": 226,
+            },
+            "confluence": {
+                "saved_source_count": 274,
+                "chart_ready_count": 2,
+                "buildable_count": 32,
+                "blocked_count": 240,
+            },
+            "trafficflow": {
+                "saved_source_count": 247,
+                "chart_ready_count": 2,
+                "buildable_count": 19,
+                "blocked_count": 226,
+            },
+        },
+        "top_gap_reasons": [
+            {"reason": "confluence_daily_only", "count": 72461},
+            {"reason": "target_cache_missing", "count": 686},
+        ],
+        "top_buildable_targets": [
+            {"target_ticker": "SPY",
+             "engines_chart_ready": [], "engines_buildable":
+             ["impactsearch", "stackbuilder", "confluence",
+              "trafficflow"], "engines_blocked": []},
+        ],
+        "top_blocked_targets": [],
+        "complete_coverage_targets_count": 1,
+        "targets_with_no_charts_count": 99,
+        "chart_ready_ratio": 0.005,
+    }
+    component = inner(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    assert "CATALOGUE HEALTH" in text
+    assert "Chart-ready coverage" in text
+    assert "Buildable next" in text
+    assert "Blocked" in text
+    assert "Top missing reason" in text
+    assert "confluence_daily_only" in text
+    assert "SPY" in text
+
+
+def test_health_section_handles_empty_payload():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-health-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(None)
+    import json as _json
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    assert "CATALOGUE HEALTH" in text
+    assert "No health report yet" in text
+
+
+def test_performance_row_renders_after_recording():
+    pytest.importorskip("dash")
+    import perf_timing as pt
+    pt.reset()
+    pt.record("snapshot_fetch", 0.05, cache_hit=False)
+    pt.record("dashboard_render", 0.20, extra={"target": "SPY"})
+
+    app = preview.build_app()
+    entry = app.callback_map["performance-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(None, None, None)
+    import json as _json
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    assert "PERFORMANCE" in text
+    assert "dashboard_render" in text
+    assert "snapshot_fetch" in text
+
+
+def test_performance_row_hides_when_no_history():
+    pytest.importorskip("dash")
+    import perf_timing as pt
+    pt.reset()
+    app = preview.build_app()
+    entry = app.callback_map["performance-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(None, None, None)
+    # Component should still exist as a Div but with no visible
+    # children. We just confirm it doesn't raise and has minimal
+    # rendered text.
+    import json as _json
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    # When no history is recorded, the renderer returns a hidden
+    # div - "PERFORMANCE" header should not appear.
+    assert "PERFORMANCE" not in text
+
+
+def _reload_preview_with_env(monkeypatch, env_value):
+    """Reload preview module with a different
+    PRJCT9_PUBLIC_READ_ONLY env var so the public-mode constant
+    gets re-read at import time."""
+    import importlib
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", env_value)
+    return importlib.reload(preview)
+
+
+def test_public_mode_hides_refresh_health_report_button(monkeypatch):
+    pytest.importorskip("dash")
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        assert p.PUBLIC_READ_ONLY is True
+        app = p.build_app()
+        target_styles: dict[str, dict] = {}
+
+        def _walk(n):
+            if n is None or isinstance(n, str):
+                return
+            if isinstance(n, (list, tuple)):
+                for c in n:
+                    _walk(c)
+                return
+            nid = getattr(n, "id", None)
+            if isinstance(nid, str) and nid == "btn-refresh-health-report":
+                target_styles[nid] = getattr(n, "style", {}) or {}
+            children = getattr(n, "children", None)
+            if children is not None:
+                _walk(children)
+
+        _walk(app.layout)
+        assert "btn-refresh-health-report" in target_styles
+        assert (
+            str(target_styles["btn-refresh-health-report"]
+                .get("display") or "").lower() == "none"
+        )
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_public_mode_health_callback_does_not_persist(
+    monkeypatch, tmp_path,
+):
+    """Public mode must read the saved JSON without writing. Even
+    if a malicious client synthesises a Refresh-health-report
+    click, the persist path must not run."""
+    pytest.importorskip("dash")
+    p = _reload_preview_with_env(monkeypatch, "1")
+    try:
+        import research_catalogue_health as rch
+        rch.reset_health_cache()
+        write_calls: list = []
+        original = rch.write_catalogue_health_report
+
+        def _spy(*a, **kw):
+            write_calls.append((a, kw))
+            return original(*a, **kw)
+
+        monkeypatch.setattr(
+            rch, "write_catalogue_health_report", _spy,
+        )
+        app = p.build_app()
+        cb = app.callback_map["catalogue-health-store.data"]["callback"]
+        inner = getattr(cb, "__wrapped__", cb)
+        import dash
+        monkeypatch.setattr(
+            dash.callback_context.__class__, "triggered",
+            property(lambda self: [
+                {"prop_id": "btn-refresh-health-report.n_clicks",
+                 "value": 1}
+            ]),
+            raising=False,
+        )
+        inner({"target": "SPY"}, 1)
+        assert write_calls == [], (
+            f"public mode persisted health report: {write_calls!r}"
+        )
+    finally:
+        _reload_preview_with_env(monkeypatch, "")
+
+
+def test_local_mode_refresh_health_report_persists(monkeypatch, tmp_path):
+    """Local mode: Refresh health report must call
+    persist_if_built=True. Spy on get_health_report."""
+    pytest.importorskip("dash")
+    # Default env (no PRJCT9_PUBLIC_READ_ONLY) keeps PUBLIC_READ_ONLY=False.
+    assert preview.PUBLIC_READ_ONLY is False
+    app = preview.build_app()
+    cb = app.callback_map["catalogue-health-store.data"]["callback"]
+    inner = getattr(cb, "__wrapped__", cb)
+
+    import research_catalogue_health as rch
+    rch.reset_health_cache()
+    captured: dict = {"force": None, "persist": None}
+
+    def _stub(**kwargs):
+        captured["force"] = kwargs.get("force_refresh")
+        captured["persist"] = kwargs.get("persist_if_built")
+        return {
+            "schema": rch.HEALTH_SCHEMA_VERSION,
+            "generated_at": "2026-05-10T00:00:00+00:00",
+            "by_engine": {},
+            "by_target": [],
+            "gap_reasons": {},
+            "top_buildable_targets": [],
+            "top_blocked_targets": [],
+            "complete_coverage_targets": [],
+            "targets_with_no_charts": [],
+            "chart_ready_ratio": 0.0,
+            "totals": {
+                "targets_total": 0,
+                "chart_ready_slots": 0,
+                "engine_slots_total": 0,
+                "daily_only_confluence_count": 0,
+            },
+        }
+
+    monkeypatch.setattr(rch, "get_health_report", _stub)
+    import dash
+    monkeypatch.setattr(
+        dash.callback_context.__class__, "triggered",
+        property(lambda self: [
+            {"prop_id": "btn-refresh-health-report.n_clicks",
+             "value": 1}
+        ]),
+        raising=False,
+    )
+    out = inner({"target": "SPY"}, 1)
+    assert captured["force"] is True
+    assert captured["persist"] is True
+    # Returned shape is the bounded browser payload.
+    assert out.get("schema") == "catalogue_health_browser_payload_v1"
+
+
+def test_health_browser_payload_has_no_absolute_paths():
+    """The payload shipped through the dcc.Store must not carry
+    chart paths or local user-home strings."""
+    fake_report = {
+        "schema": "catalogue_health_v1",
+        "generated_at": "2026-05-10T00:00:00+00:00",
+        "by_engine": {},
+        "by_target": [],
+        "gap_reasons": {"confluence_daily_only": 100},
+        "top_buildable_targets": [],
+        "top_blocked_targets": [],
+        "complete_coverage_targets": [],
+        "targets_with_no_charts": [],
+        "chart_ready_ratio": 0.0,
+        "totals": {
+            "targets_total": 0, "chart_ready_slots": 0,
+            "engine_slots_total": 0,
+            "daily_only_confluence_count": 100,
+        },
+        "_internal_path": "C:" + chr(92) + "Users" + chr(92) + "x.json",
+    }
+    payload = preview._build_health_browser_payload(fake_report)
+    import json as _json
+    blob = _json.dumps(payload, default=str)
+    assert "C:" + chr(92) + "Users" not in blob
+    assert "/Users/" not in blob
+    assert "_internal_path" not in payload
+
+
+def test_no_full_universe_engines_called_during_health_render(
+    monkeypatch,
+):
+    """The health-store callback must not reach for impactsearch /
+    yfinance / process_primary_tickers."""
+    pytest.importorskip("dash")
+    import sys as _sys
+    sentinel: list[str] = []
+
+    class _Boom:
+        def __getattr__(self, n):
+            sentinel.append(n)
+            raise RuntimeError(f"unexpected live call: {n}")
+
+    for mod in (
+        "yfinance", "impactsearch", "spymaster", "stackbuilder",
+        "trafficflow",
+    ):
+        monkeypatch.setitem(_sys.modules, mod, _Boom())
+
+    app = preview.build_app()
+    cb = app.callback_map["catalogue-health-store.data"]["callback"]
+    inner = getattr(cb, "__wrapped__", cb)
+    import research_catalogue_health as rch
+    rch.reset_health_cache()
+    import dash
+    monkeypatch.setattr(
+        dash.callback_context.__class__, "triggered",
+        property(lambda self: []),
+        raising=False,
+    )
+    out = inner({"target": "SPY"}, 0)
+    # callback must complete; no live engine attribute access.
+    assert sentinel == [], (
+        f"health callback inadvertently called live engine: {sentinel!r}"
+    )
+    assert isinstance(out, dict)
+
+
+def test_rendered_health_section_avoids_developer_only_words():
+    """Health UI surface must not surface the prompt's banned
+    developer-only terms."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-health-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    payload = preview._empty_health_payload()
+    component = inner(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str).lower()
+    for tok in (
+        "artifact", "manifest", "sidecar", "schema", "dataframe",
+        "pickle", "output directory", "callback", "fastpath",
+        "bounded",
+    ):
+        assert tok not in text, (
+            f"banned developer-only term {tok!r} leaked into "
+            "Catalogue Health section"
+        )
