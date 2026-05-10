@@ -155,7 +155,36 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Sprint state (as of 2026-05-08)
+### 6. Current Sprint State as of 2026-05-10
+
+**main / origin/main HEAD:** `d4ee3a8` — `Phase 6C-5: Primary Signal Engine MVP reset (#191)`.
+
+**Current phase:** Phase 6C-5 is CLOSED / MERGED. Phases 4 / 5C / 5D-1 / 5G / 5G-2 / 6A / 6B-1..4 / 6C-1..5 have all landed since the 2026-05-08 snapshot captured below.
+
+**Testing root for 6C-5 work:** `C:\Users\sport\Documents\PythonProjects\spy-project` (the primary repo on `main`).
+
+**Stale emdash worktree warning:** the worktree at
+`C:\Users\sport\emdash\worktrees\spy-project\emdash\sprint-continued-qlpvw`
+is pinned to `8081f73` (Phase 3 close, PR #144 from 2026-05-03) and is **47 commits behind `origin/main`**. It is NOT valid for Phase 6C-5 testing unless explicitly synced.
+
+**PRJCT9 north star:**
+"PRJCT9 is a pattern-discovery engine. The MVP front door is: Pick a ticker. See PRJCT9's saved Signal Engine history and what it says now."
+
+**Practical current app behavior (Phase 6C-5):**
+
+  - The local research preview opens directly on the cache-first Primary Signal Engine view (chart + Current Signal + Active SMA Pair + metric strip + last 15 history rows), read from `project/cache/results/<TICKER>_precomputed_results.pkl`. No yfinance, no OnePass / ImpactSearch / StackBuilder / Confluence / TrafficFlow on boot or on "View ticker" click.
+  - The cross-ticker cockpit — catalogue browser, catalogue health, performance row, per-ticker dashboard, StackBuilder, Confluence, Traffic Flow — lives behind a collapsed-by-default `advanced-research-catalogue-details` Advanced section.
+  - `btn-view-signal-engine` (first-screen primary button) is wired ONLY to `signal-engine-store`. It is fully isolated from `btn-load`, which now lives inside Advanced as "Load cross-ticker study" and is the only path that triggers `_on_action`.
+  - `boot-trigger` no longer auto-loads the legacy cockpit — `_on_action`'s boot branch returns `(no_update, no_update, no_update)`. Initial page boot is Signal-Engine-only.
+  - `catalogue-snapshot-store` and `catalogue-health-store` require explicit Refresh clicks (`prevent_initial_call=True`). The heavy `_real_confluence_snapshot_for_target` only runs after the user explicitly loads cross-ticker from Advanced.
+
+**Phase 6C-5 test baseline:** full regression **954 passed, 0 failed, 60 pre-existing pandas fragmentation warnings**. 21 new in `test_primary_signal_engine.py`; +26 in `test_phase6_research_preview.py`.
+
+**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a 6C-6 (or later) PR landed without a refresh.
+
+---
+
+### 6. (Historical — superseded by Current Sprint State as of 2026-05-10 above) Sprint state (as of 2026-05-08)
 
 Phase 0 -> Phase 5D-1 onboarding merged to `main`:
 
@@ -502,9 +531,9 @@ Cross-cutting:
 - **Output**: Excel files for detailed analysis exports
 - **Logs**: `debug.log`, `analysis.log` for troubleshooting
 
-## Sprint State (as of 2026-05-08)
+## Sprint State (as of 2026-05-08 — HISTORICAL, superseded by § 6 "Current Sprint State as of 2026-05-10" above)
 
-The PRJCT9 sprint reached Phase 5D-1 onboarding closure on this date. Snapshot below for fast context recovery on session start.
+The PRJCT9 sprint reached Phase 5D-1 onboarding closure on this date. Snapshot below preserved for fast context recovery on session start; for the current trajectory through Phase 6C-5, refer to the 2026-05-10 block in section 6.
 
 ### Three-voice workflow doctrine (non-negotiable)
 
