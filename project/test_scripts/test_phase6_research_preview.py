@@ -1051,7 +1051,7 @@ def test_signal_engine_settings_returns_max_sma_day():
     assert s["single_signal_cadence"] == "daily close-to-close"
 def test_dashboard_main_callback_renders_all_sections():
     """The single dashboard render must produce both the first-view
-    summaries (Best Pattern Summary / Selected Pattern / Engine
+    summaries (Best Pattern Summary / Selected Pattern / Catalogue
     Coverage) AND the detail sections below (Patterns worth a look /
     Combined Signals detail / Time Windows detail / Signal Rules
     detail / Activity detail). Pin the section IDs and the rendered
@@ -1060,12 +1060,14 @@ def test_dashboard_main_callback_renders_all_sections():
     src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
         encoding="utf-8"
     )
-    # Section IDs (first-view summaries + detail panels)
+    # Section IDs (first-view summaries + detail panels). Phase 6C-1
+    # renamed engine-coverage-summary -> catalogue-coverage-summary
+    # to reflect the catalogue-driven coverage rows.
     for section_id in [
         "at-a-glance-cards",
         "best-pattern-summary",
         "selected-pattern-section",
-        "engine-coverage-summary",
+        "catalogue-coverage-summary",
         "market-scan-section",
         "best-patterns-section",
         "combined-signals-detail",
@@ -1081,7 +1083,7 @@ def test_dashboard_main_callback_renders_all_sections():
         "AT A GLANCE",
         "BEST PATTERN SUMMARY",
         "SELECTED PATTERN",
-        "ENGINE COVERAGE",
+        "CATALOGUE COVERAGE",
     ]:
         assert header in src, (
             f"required first-view summary header {header!r} missing"
@@ -1427,7 +1429,7 @@ def test_dashboard_renders_all_six_cockpit_panels_together():
 
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     found_ids: set[str] = set()
 
@@ -1488,7 +1490,7 @@ def test_rendered_dashboard_contains_no_banned_phrases():
     log = ["Loaded SPY research."]
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -1744,7 +1746,7 @@ def test_rendered_ui_avoids_sma_and_disk_phrases():
     log = ["Loaded SPY research."]
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -1827,7 +1829,7 @@ def test_detail_lower_sections_still_present_in_render():
     log = ["Loaded SPY research."]
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     found_ids: set[str] = set()
 
@@ -1862,7 +1864,7 @@ def test_detail_lower_sections_still_present_in_render():
         "at-a-glance-cards",
         "best-pattern-summary",
         "selected-pattern-section",
-        "engine-coverage-summary",
+        "catalogue-coverage-summary",
     ]
     for sid in first_view_required:
         assert sid in found_ids, (
@@ -1874,15 +1876,15 @@ def test_detail_lower_sections_still_present_in_render():
 def test_rules_card_uses_plain_phrase_not_sma_slug():
     """Phase 6A research-flow rebuild: the Signal Rules at-a-glance
     card has been removed from the four-card grid (rules now live in
-    the Engine Coverage block + the Signal Rules detail section).
-    The Engine Coverage line must still read 'Rules up to N days,
-    ...' in research-flow vocabulary, not the old 'SMA up to N
-    days' chip vocabulary."""
+    the Signal Rules detail section). Phase 6C-1 replaced Engine
+    Coverage with Catalogue Coverage; the rules vocabulary moved out
+    of the first-view summary panel and lives only in the Signal
+    Rules detail section. Pin the new long-form phrasing in source."""
     src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
         encoding="utf-8"
     )
-    # Engine Coverage line keeps the longer 'Rules up to ...' phrasing.
-    assert "Rules up to" in src
+    # Signal Rules detail section keeps the long-form phrasing.
+    assert "moving-average windows up to" in src
     # Old chip vocabulary must be gone from rendered code paths.
     assert "SMA up to" not in src
     # Signal rules card (which used to live in the at-a-glance grid)
@@ -2129,7 +2131,7 @@ def test_no_stale_load_research_or_quick_check_in_rendered_ui():
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -2288,7 +2290,7 @@ def test_section_ids_market_scan_combined_time_present():
     log = ["Loaded SPY research."]
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
     found_ids: set[str] = set()
 
     def _walk(n):
@@ -2551,7 +2553,7 @@ def test_rendered_dashboard_metric_labels_engine_truth():
     log = ["Loaded SPY research."]
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -2620,7 +2622,7 @@ def test_traffic_flow_section_renders_with_left_rail_row():
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     found_ids: set[str] = set()
 
@@ -2669,7 +2671,7 @@ def test_cumulative_capture_chart_target_in_selected_pattern():
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
     import json as _json
 
     def _to_jsonlike(c):
@@ -2822,7 +2824,7 @@ def test_time_windows_renders_seven_tier_label_in_dashboard():
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -2895,7 +2897,7 @@ def test_time_windows_no_data_message_when_libraries_missing(
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -2999,7 +3001,7 @@ def test_traffic_flow_section_renders_member_breakdown(
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
     import json as _json
 
     def _to_jsonlike(c):
@@ -3058,7 +3060,7 @@ def test_combined_signals_detail_uses_sharpe_ratio_label():
     log = []
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    component = inner(sample, meta, log, None)
+    component = inner(sample, meta, log, None, None)
 
     def _to_jsonlike(c):
         if hasattr(c, "to_plotly_json"):
@@ -3127,7 +3129,7 @@ def test_cumulative_capture_reconcile_line_present_when_data_loads():
         log = []
         entry = app.callback_map["dashboard-main.children"]
         inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-        component = inner(sample, meta, log, None)
+        component = inner(sample, meta, log, None, None)
 
         def _to_jsonlike(c):
             if hasattr(c, "to_plotly_json"):
@@ -3187,7 +3189,7 @@ def test_cumulative_capture_reconcile_mismatch_note_only_when_material(
         log = []
         entry = app.callback_map["dashboard-main.children"]
         inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-        component = inner(sample, meta, log, None)
+        component = inner(sample, meta, log, None, None)
         import json as _json
 
         def _to_jsonlike(c):
@@ -3213,7 +3215,7 @@ def test_cumulative_capture_reconcile_mismatch_note_only_when_material(
         sys.modules[preview.__name__]._selected_pattern_cumulative_capture = (
             fake_cum_b
         )
-        component = inner(sample, meta, log, None)
+        component = inner(sample, meta, log, None, None)
         text = _json.dumps(_to_jsonlike(component), default=str)
         assert (
             "Chart and table use different saved date windows."
@@ -3261,7 +3263,7 @@ def _build_preview_component(monkeypatch, sample, meta, log):
     app = preview.build_app()
     entry = app.callback_map["dashboard-main.children"]
     inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
-    return inner(sample, meta, log, None)
+    return inner(sample, meta, log, None, None)
 
 
 def _recursive_jsonlike(c):
@@ -4033,3 +4035,354 @@ def test_build_trafficflow_caret_member_no_false_no_member_caches(
         f"no_member_caches reason; got reason={reason!r}"
     )
     assert out is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-1: catalogue UX
+# ---------------------------------------------------------------------------
+
+
+def test_left_rail_includes_build_missing_and_refresh_catalogue_buttons():
+    """The left control panel must include the Phase 6C-1 unified
+    'Build missing charts' button and 'Refresh catalogue' button.
+    These act on the studied ticker only and never trigger a
+    universe-wide build."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    text = _extract_ui_text(app.layout)
+    assert "Build missing charts" in text
+    assert "Refresh catalogue" in text
+
+
+def test_catalogue_store_present_in_layout():
+    """The dashboard layout must declare a ``catalogue-store`` so the
+    dashboard render reads cached catalogue snapshots between
+    callbacks."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    found_ids: list[str] = []
+
+    def _walk(node):
+        if node is None:
+            return
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                _walk(c)
+            return
+        nid = getattr(node, "id", None)
+        if isinstance(nid, str):
+            found_ids.append(nid)
+        children = getattr(node, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    assert "catalogue-store" in found_ids
+
+
+def test_catalogue_callbacks_registered():
+    """The catalogue update callback (writes catalogue-store) and
+    the build-missing-charts callback (writes log-store) must both be
+    wired in build_app()."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    keys = list(app.callback_map.keys())
+    assert "catalogue-store.data" in keys, (
+        "catalogue-store.data callback missing; the catalogue cache "
+        "will not refresh on ticker change / refresh / build."
+    )
+    # build-missing-charts shares log-store with the per-engine
+    # build callbacks, so its key shows up under the hashed group
+    # entries. The presence of btn-build-missing-charts is the
+    # authoritative signal.
+    flat = " ".join(keys)
+    assert "log-store" in flat
+    # Probe the layout for the button id (the callback is bound to
+    # this Input).
+    found_ids: list[str] = []
+
+    def _walk(node):
+        if node is None:
+            return
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                _walk(c)
+            return
+        nid = getattr(node, "id", None)
+        if isinstance(nid, str):
+            found_ids.append(nid)
+        children = getattr(node, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    assert "btn-build-missing-charts" in found_ids
+    assert "btn-refresh-catalogue" in found_ids
+
+
+def test_rendered_dashboard_contains_catalogue_coverage_text(monkeypatch):
+    """Catalogue Coverage panel must render with the literal
+    'Catalogue Coverage' header text and the explainer sentence so
+    the user immediately sees what PRJCT9 has saved for this
+    ticker."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 25.0, "Sharpe": 1.5, "Trigger Days": 100,
+    }]
+    meta = {
+        "target": "SPY", "stack_runs_for_target": 0,
+        "timeframes_available": 0, "timeframes_total": 5,
+        "primaries": [],
+    }
+    log: list[str] = []
+    entry = app.callback_map["dashboard-main.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(sample, meta, log, None, None)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    # Heading + explainer sentence both render.
+    assert "CATALOGUE COVERAGE" in text
+    assert "PRJCT9 checks saved market research" in text
+    # Each engine's plain label must appear.
+    for engine_label in [
+        "Market scan",
+        "Single signals",
+        "Combined signals",
+        "Time windows",
+        "Traffic flow",
+    ]:
+        assert engine_label in text, (
+            f"required catalogue row label {engine_label!r} missing"
+        )
+
+
+def test_rendered_dashboard_omits_developer_only_words(monkeypatch):
+    """The Phase 6C-1 spec lists banned developer-only terms that
+    must never appear in the rendered Dash UI: artifact / manifest /
+    sidecar / XLSX / FastPath / callback / schema / dataframe /
+    pickle / bounded / output directory. The catalogue layer's
+    plain-language messages must keep these out of the rendered
+    surface."""
+    pytest.importorskip("dash")
+    import json as _json
+    app = preview.build_app()
+    sample = [{
+        "Primary Ticker": "AAA", "Secondary Ticker": "SPY",
+        "Total Capture (%)": 25.0, "Sharpe": 1.5, "Trigger Days": 100,
+    }]
+    meta = {
+        "target": "SPY", "stack_runs_for_target": 0,
+        "timeframes_available": 5, "timeframes_total": 5,
+        "primaries": [],
+    }
+    log: list[str] = []
+    entry = app.callback_map["dashboard-main.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    component = inner(sample, meta, log, None, None)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    text = _json.dumps(_to_jsonlike(component), default=str)
+    banned = [
+        "artifact",
+        "manifest",
+        "sidecar",
+        "XLSX",
+        "FastPath",
+        "callback",
+        "schema",
+        "dataframe",
+        "pickle",
+        "bounded",
+        "output directory",
+    ]
+    for tok in banned:
+        # Case-insensitive whole-word-ish check. "Pattern" / "data
+        # frame" must not be flagged; the banned tokens are exact
+        # strings that should not appear in the rendered surface.
+        assert tok.lower() not in text.lower(), (
+            f"banned developer-only term {tok!r} leaked into "
+            "rendered dashboard"
+        )
+
+
+def test_build_missing_charts_callback_is_reason_coded(monkeypatch):
+    """The Build missing charts action must produce reason-coded log
+    messages for each engine state. With no saved data on disk for
+    the studied ticker, every engine row must surface a specific
+    plain-language message rather than a vague 'failed' line."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    # Pick the build-missing-charts callback by inspecting the
+    # callback map for a Dash group whose Input list mentions the
+    # btn-build-missing-charts component.
+    target_callback = None
+    for key, entry in app.callback_map.items():
+        # Want the callback whose Output is log-store and whose
+        # Input list mentions btn-build-missing-charts. The
+        # catalogue-store callback also lists that button as an
+        # Input, but its Output is catalogue-store; skip it.
+        if not key.startswith("log-store"):
+            continue
+        inputs = entry.get("inputs") or []
+        flat: list[str] = []
+        for i in inputs:
+            if isinstance(i, dict):
+                flat.append(str(i.get("id") or ""))
+            else:
+                flat.append(getattr(i, "component_id", "") or "")
+        if "btn-build-missing-charts" in flat:
+            target_callback = entry["callback"]
+            break
+    assert target_callback is not None, (
+        "build-missing-charts callback (log-store output) not found "
+        "in app.callback_map"
+    )
+    inner = getattr(target_callback, "__wrapped__", target_callback)
+    # Steer the catalogue toward an empty-state by using a tmp
+    # ticker that has nothing saved on disk. Pre-clear the catalogue
+    # cache so we get a fresh scan for the synthetic ticker.
+    import research_catalogue as rc
+    rc.reset_cache()
+    meta = {"target": "ZZZZZZ"}
+    log = ["pre-existing"]
+    out_log = inner(1, meta, [], None, list(log))
+    text = " | ".join(out_log)
+    # The callback must mention the engine in plain language.
+    assert "Build missing charts: ZZZZZZ" in text
+    # Each engine must contribute a reason-coded line. The empty
+    # state surfaces one per engine.
+    assert "Single-signal chart could not be built" in text
+    assert "Combined-signal chart could not be built" in text
+    assert "Time-window chart could not be built" in text
+    assert "Traffic-flow chart could not be built" in text
+    # Vague "failed" messages must NOT be the only signal: each
+    # message names the specific reason (e.g. "no saved").
+    assert "no saved single-signal study for ZZZZZZ" in text
+    assert "no saved combined-signal study for ZZZZZZ" in text
+    assert "no saved time-window data for ZZZZZZ" in text
+
+
+def test_no_full_universe_build_path_reachable_from_preview():
+    """The preview must not reach for a full-universe scan. The
+    Build missing charts callback only calls existing per-ticker
+    build helpers, and the catalogue module never invokes a 73K-row
+    OnePass / impactsearch run."""
+    src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
+        encoding="utf-8"
+    )
+    # The OnePass / impactsearch live engines have a dedicated
+    # 'process_primary_tickers' bulk path. The build-missing-charts
+    # action must NOT call it (only the controlled live test button
+    # does).
+    build_cb_start = src.find("_build_missing_charts_action")
+    assert build_cb_start != -1
+    build_cb_end = src.find("def _", build_cb_start + 1)
+    if build_cb_end == -1:
+        build_cb_end = len(src)
+    block = src[build_cb_start:build_cb_end]
+    assert "process_primary_tickers" not in block, (
+        "Build missing charts callback must not invoke the universe-"
+        "scale process_primary_tickers entry point"
+    )
+    # Catalogue module must not contain a universe-scan reference
+    # either. Strip docstrings + line comments first so the test
+    # validates the executed code, not the doc surface (the module
+    # docstring lists yfinance as something it does NOT import,
+    # which is the contract under test).
+    cat_src = (
+        PROJECT_DIR / "research_catalogue.py"
+    ).read_text(encoding="utf-8")
+    import ast as _ast
+
+    def _strip_docstrings_and_comments(source: str) -> str:
+        tree = _ast.parse(source)
+        # Drop module docstring (Expr with Constant string at start
+        # of every block) and remove all string-only Expr nodes.
+        class _DocStripper(_ast.NodeTransformer):
+            def visit_Module(self, node):
+                node.body = [
+                    n for n in node.body
+                    if not (
+                        isinstance(n, _ast.Expr)
+                        and isinstance(n.value, _ast.Constant)
+                        and isinstance(n.value.value, str)
+                    )
+                ]
+                self.generic_visit(node)
+                return node
+
+            def visit_FunctionDef(self, node):
+                node.body = [
+                    n for n in node.body
+                    if not (
+                        isinstance(n, _ast.Expr)
+                        and isinstance(n.value, _ast.Constant)
+                        and isinstance(n.value.value, str)
+                    )
+                ]
+                self.generic_visit(node)
+                return node
+
+            def visit_AsyncFunctionDef(self, node):
+                return self.visit_FunctionDef(node)
+
+            def visit_ClassDef(self, node):
+                node.body = [
+                    n for n in node.body
+                    if not (
+                        isinstance(n, _ast.Expr)
+                        and isinstance(n.value, _ast.Constant)
+                        and isinstance(n.value.value, str)
+                    )
+                ]
+                self.generic_visit(node)
+                return node
+        cleaned = _DocStripper().visit(tree)
+        _ast.fix_missing_locations(cleaned)
+        out_lines: list[str] = []
+        for line in _ast.unparse(cleaned).splitlines():
+            sline = line
+            if "#" in sline:
+                sline = sline.split("#", 1)[0]
+            out_lines.append(sline)
+        return "\n".join(out_lines)
+
+    code_only = _strip_docstrings_and_comments(cat_src)
+    assert "process_primary_tickers" not in code_only
+    assert "yfinance" not in code_only, (
+        "research_catalogue.py code body must not import or call "
+        "yfinance — the catalogue layer is offline-only"
+    )
+
+
+def test_catalogue_store_callback_uses_catalogue_module():
+    """The catalogue update callback must read its summary from the
+    research_catalogue module, not from impactsearch / yfinance /
+    direct disk walks. The wiring keeps the preview offline."""
+    src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
+        encoding="utf-8"
+    )
+    # Locate the _update_catalogue_store callback body
+    start = src.find("_update_catalogue_store")
+    assert start != -1, "_update_catalogue_store callback not found"
+    end = src.find("def _", start + 1)
+    if end == -1:
+        end = len(src)
+    block = src[start:end]
+    assert "research_catalogue" in block
+    assert "summarize_ticker_catalogue" in block
+    assert "force_refresh" in block
