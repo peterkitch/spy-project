@@ -2596,6 +2596,12 @@ def build_app() -> Any:
                         className="prjct9-controls",
                         style=panel_style,
                         children=[
+                            # Phase 6C-5: directional reset. Lead with
+                            # the Primary Signal Engine view - one
+                            # ticker, one chart, the saved Spymaster
+                            # SMA history. Catalogue / market-scan /
+                            # cross-ticker tools demoted into the
+                            # collapsed Advanced block below.
                             html.Div(
                                 "Start here",
                                 style={"color": PRJCT9_GREEN,
@@ -2606,47 +2612,13 @@ def build_app() -> Any:
                                        "textTransform": "uppercase"},
                             ),
                             html.Div(
-                                "Scan first. Then study a ticker.",
+                                "Type a ticker to see PRJCT9's saved "
+                                "Signal Engine view.",
+                                id="start-here-caption",
                                 style={"color": PRJCT9_MUTED,
                                        "fontSize": "11px",
                                        "lineHeight": "1.5",
                                        "marginBottom": "10px"},
-                            ),
-
-                            # Step 1: Market scan (OnePass)
-                            html.Div(
-                                "1. Scan market",
-                                style={**label_style,
-                                       "color": PRJCT9_GREEN,
-                                       "fontWeight": "bold"},
-                            ),
-                            html.Div(
-                                id="market-scan-status",
-                                style={"color": PRJCT9_MUTED,
-                                       "fontSize": "11px",
-                                       "lineHeight": "1.5",
-                                       "marginTop": "2px",
-                                       "marginBottom": "6px",
-                                       "wordBreak": "break-word"},
-                            ),
-                            html.Button(
-                                "Open market scan",
-                                id="btn-market-scan",
-                                n_clicks=0,
-                                style={**btn_style,
-                                       "marginRight": "0",
-                                       "marginBottom": "0",
-                                       "width": "100%",
-                                       "boxSizing": "border-box"},
-                            ),
-
-                            # Step 2: Ticker study
-                            html.Div(
-                                "2. Study ticker",
-                                style={**label_style,
-                                       "color": PRJCT9_GREEN,
-                                       "fontWeight": "bold",
-                                       "marginTop": "14px"},
                             ),
                             dcc.Input(
                                 id="target-ticker",
@@ -2658,8 +2630,8 @@ def build_app() -> Any:
                                 debounce=True,
                             ),
                             html.Button(
-                                "Open saved ticker study",
-                                id="btn-load",
+                                "View ticker",
+                                id="btn-view-signal-engine",
                                 n_clicks=0,
                                 style={**btn_style,
                                        "backgroundColor": PRJCT9_GREEN,
@@ -2671,31 +2643,9 @@ def build_app() -> Any:
                                        "width": "100%",
                                        "boxSizing": "border-box"},
                             ),
-                            # Phase 6C-1: catalogue refresh + unified
-                            # build-missing-charts buttons. Both act on
-                            # the currently studied ticker only; they
-                            # never trigger a universe-wide rebuild.
-                            # Phase 6C-3: hidden in public read-only
-                            # mode (the public web app must not be
-                            # able to write or build). The component
-                            # IDs stay registered so the existing
-                            # callback graph compiles either way.
                             html.Button(
-                                "Build missing charts",
-                                id="btn-build-missing-charts",
-                                n_clicks=0,
-                                style=_hide_in_public_mode({
-                                    **btn_style,
-                                    "marginRight": "0",
-                                    "marginTop": "6px",
-                                    "marginBottom": "0",
-                                    "width": "100%",
-                                    "boxSizing": "border-box",
-                                }),
-                            ),
-                            html.Button(
-                                "Refresh catalogue",
-                                id="btn-refresh-catalogue",
+                                "Refresh saved view",
+                                id="btn-refresh-saved-view",
                                 n_clicks=0,
                                 style={**btn_style,
                                        "marginRight": "0",
@@ -2704,221 +2654,383 @@ def build_app() -> Any:
                                        "width": "100%",
                                        "boxSizing": "border-box"},
                             ),
-                            # Phase 6C-2: refresh the cross-ticker
-                            # catalogue snapshot index from disk and
-                            # persist a fresh JSON snapshot for the
-                            # next process-restart fast-load.
-                            # Phase 6C-3: hidden in public mode -
-                            # writing the persistent index is a
-                            # local-only action.
-                            html.Button(
-                                "Refresh catalogue index",
-                                id="btn-refresh-catalogue-index",
-                                n_clicks=0,
-                                style=_hide_in_public_mode({
-                                    **btn_style,
-                                    "marginRight": "0",
-                                    "marginTop": "6px",
-                                    "marginBottom": "0",
-                                    "width": "100%",
-                                    "boxSizing": "border-box",
-                                }),
-                            ),
-                            # Phase 6C-4: rebuild + persist the
-                            # catalogue health report. Local-only -
-                            # writes JSON to disk. Hidden in public
-                            # mode; the public app reads the last
-                            # saved JSON, never builds.
-                            html.Button(
-                                "Refresh health report",
-                                id="btn-refresh-health-report",
-                                n_clicks=0,
-                                style=_hide_in_public_mode({
-                                    **btn_style,
-                                    "marginRight": "0",
-                                    "marginTop": "6px",
-                                    "marginBottom": "0",
-                                    "width": "100%",
-                                    "boxSizing": "border-box",
-                                }),
-                            ),
                             html.Div(
-                                id="output-discovery-status",
-                                style={
-                                    "marginTop": "8px",
-                                    "fontSize": "11px",
-                                    "color": PRJCT9_MUTED,
-                                    "lineHeight": "1.5",
-                                    "maxWidth": "100%",
-                                    "wordBreak": "break-word",
-                                    "overflowWrap": "break-word",
-                                },
+                                id="signal-engine-status",
+                                style={"color": PRJCT9_MUTED,
+                                       "fontSize": "11px",
+                                       "lineHeight": "1.5",
+                                       "marginTop": "8px",
+                                       "marginBottom": "0",
+                                       "wordBreak": "break-word"},
                             ),
 
-                            # Signal sources for the live test
-                            # (collapsed by default so the rest of
-                            # the research-flow steps stay visible).
-                            # Phase 6C-3: the entire live-test
-                            # surface is hidden in public read-only
-                            # mode (no live engine path is allowed
-                            # there). Component IDs stay registered
-                            # so the existing callback graph compiles.
+                            # Phase 6C-5: every Phase 6C-1..6C-4
+                            # control is still here - the catalogue
+                            # browser, the market scan, the per-
+                            # engine builders, the live-test path -
+                            # but they live behind one collapsed
+                            # block so the first viewport stays
+                            # focused on the Signal Engine.
                             html.Details(
-                                style=_hide_in_public_mode({
-                                    "marginTop": "14px",
-                                    "borderTop": (
-                                        f"1px dashed {PRJCT9_BORDER}"
-                                    ),
-                                    "paddingTop": "10px",
-                                }),
+                                id="advanced-tools-details",
+                                open=False,
+                                style={"marginTop": "14px",
+                                       "borderTop":
+                                           f"1px solid {PRJCT9_BORDER}",
+                                       "paddingTop": "10px"},
                                 children=[
                                     html.Summary(
-                                        "Signal sources for live test",
-                                        style={"color": PRJCT9_MUTED,
+                                        "Advanced cross-ticker tools",
+                                        style={"color": PRJCT9_GREEN,
                                                "fontSize": "11px",
-                                               "letterSpacing": "1px",
-                                               "textTransform": "uppercase",
+                                               "letterSpacing": "2px",
+                                               "textTransform":
+                                                   "uppercase",
+                                               "fontWeight": "bold",
                                                "cursor": "pointer",
-                                               "outline": "none"},
+                                               "outline": "none",
+                                               "marginBottom": "6px"},
+                                    ),
+                                    # Step 1: Market scan (OnePass)
+                                    html.Div(
+                                        "1. Scan market",
+                                        style={**label_style,
+                                               "color": PRJCT9_GREEN,
+                                               "fontWeight": "bold"},
                                     ),
                                     html.Div(
-                                        "These tickers create signals "
-                                        "for the ticker studied.",
+                                        id="market-scan-status",
                                         style={"color": PRJCT9_MUTED,
                                                "fontSize": "11px",
                                                "lineHeight": "1.5",
-                                               "marginTop": "6px",
-                                               "marginBottom": "6px"},
-                                    ),
-                                    dcc.Dropdown(
-                                        id="universe-preset",
-                                        options=[
-                                            {"label": k, "value": k}
-                                            for k in PRIMARY_UNIVERSE_PRESETS.keys()
-                                        ],
-                                        value="Mega Cap 10",
-                                        clearable=False,
-                                        style={
-                                            "backgroundColor": PRJCT9_BLACK,
-                                            "color": PRJCT9_TEXT,
-                                            "fontSize": "12px",
-                                            "width": "100%",
-                                            "boxSizing": "border-box",
-                                        },
-                                    ),
-                                    dcc.Textarea(
-                                        id="custom-primaries",
-                                        placeholder="AAPL, MSFT, NVDA",
-                                        style={**input_style,
-                                               "height": "55px",
-                                               "fontFamily": "inherit",
-                                               "marginTop": "6px",
-                                               "width": "100%",
-                                               "boxSizing": "border-box"},
+                                               "marginTop": "2px",
+                                               "marginBottom": "6px",
+                                               "wordBreak":
+                                                   "break-word"},
                                     ),
                                     html.Button(
-                                        "Test 10 signal sources",
-                                        id="btn-run",
+                                        "Open market scan",
+                                        id="btn-market-scan",
                                         n_clicks=0,
                                         style={**btn_style,
                                                "marginRight": "0",
-                                               "marginTop": "8px",
                                                "marginBottom": "0",
                                                "width": "100%",
-                                               "boxSizing": "border-box"},
+                                               "boxSizing":
+                                                   "border-box"},
+                                    ),
+
+                                    # Step 2 (legacy): Ticker
+                                    # build/refresh tools that used
+                                    # to live next to the ticker
+                                    # input. Phase 6C-5 keeps them
+                                    # registered (callbacks rely on
+                                    # their IDs) but tucks them
+                                    # below the Signal Engine
+                                    # primary path.
+                                    html.Div(
+                                        "Per-ticker build / refresh",
+                                        style={**label_style,
+                                               "color": PRJCT9_GREEN,
+                                               "fontWeight": "bold",
+                                               "marginTop": "14px"},
+                                    ),
+                                    # Phase 6C-5 amendment: the
+                                    # legacy saved-study cross-ticker
+                                    # load (impactsearch XLSX +
+                                    # stack/timeframe meta) lives
+                                    # here only. The first-screen
+                                    # View ticker button (id=btn-
+                                    # view-signal-engine) is a pure
+                                    # cache read of the Spymaster
+                                    # PKL and never triggers
+                                    # _on_action.
+                                    html.Button(
+                                        "Load cross-ticker study",
+                                        id="btn-load",
+                                        n_clicks=0,
+                                        style={**btn_style,
+                                               "marginRight": "0",
+                                               "marginTop": "6px",
+                                               "marginBottom": "0",
+                                               "width": "100%",
+                                               "boxSizing":
+                                                   "border-box"},
+                                    ),
+                                    html.Button(
+                                        "Build missing charts",
+                                        id="btn-build-missing-charts",
+                                        n_clicks=0,
+                                        style=_hide_in_public_mode({
+                                            **btn_style,
+                                            "marginRight": "0",
+                                            "marginTop": "6px",
+                                            "marginBottom": "0",
+                                            "width": "100%",
+                                            "boxSizing":
+                                                "border-box",
+                                        }),
+                                    ),
+                                    html.Button(
+                                        "Refresh catalogue",
+                                        id="btn-refresh-catalogue",
+                                        n_clicks=0,
+                                        style={**btn_style,
+                                               "marginRight": "0",
+                                               "marginTop": "6px",
+                                               "marginBottom": "0",
+                                               "width": "100%",
+                                               "boxSizing":
+                                                   "border-box"},
+                                    ),
+                                    html.Button(
+                                        "Refresh catalogue index",
+                                        id=(
+                                            "btn-refresh-"
+                                            "catalogue-index"
+                                        ),
+                                        n_clicks=0,
+                                        style=_hide_in_public_mode({
+                                            **btn_style,
+                                            "marginRight": "0",
+                                            "marginTop": "6px",
+                                            "marginBottom": "0",
+                                            "width": "100%",
+                                            "boxSizing":
+                                                "border-box",
+                                        }),
+                                    ),
+                                    html.Button(
+                                        "Refresh health report",
+                                        id=(
+                                            "btn-refresh-health-report"
+                                        ),
+                                        n_clicks=0,
+                                        style=_hide_in_public_mode({
+                                            **btn_style,
+                                            "marginRight": "0",
+                                            "marginTop": "6px",
+                                            "marginBottom": "0",
+                                            "width": "100%",
+                                            "boxSizing":
+                                                "border-box",
+                                        }),
                                     ),
                                     html.Div(
-                                        "Max 10 sources.",
-                                        style={"fontSize": "11px",
-                                               "color": PRJCT9_MUTED,
+                                        id="output-discovery-status",
+                                        style={
+                                            "marginTop": "8px",
+                                            "fontSize": "11px",
+                                            "color": PRJCT9_MUTED,
+                                            "lineHeight": "1.5",
+                                            "maxWidth": "100%",
+                                            "wordBreak": "break-word",
+                                            "overflowWrap":
+                                                "break-word",
+                                        },
+                                    ),
+
+                                    # Signal sources for the live
+                                    # test (collapsed inside the
+                                    # outer Advanced block).
+                                    html.Details(
+                                        style=_hide_in_public_mode({
+                                            "marginTop": "14px",
+                                            "borderTop": (
+                                                "1px dashed "
+                                                f"{PRJCT9_BORDER}"
+                                            ),
+                                            "paddingTop": "10px",
+                                        }),
+                                        children=[
+                                            html.Summary(
+                                                "Signal sources for "
+                                                "live test",
+                                                style={
+                                                    "color":
+                                                        PRJCT9_MUTED,
+                                                    "fontSize": "11px",
+                                                    "letterSpacing":
+                                                        "1px",
+                                                    "textTransform":
+                                                        "uppercase",
+                                                    "cursor":
+                                                        "pointer",
+                                                    "outline": "none",
+                                                },
+                                            ),
+                                            html.Div(
+                                                "These tickers create "
+                                                "signals for the "
+                                                "ticker studied.",
+                                                style={
+                                                    "color":
+                                                        PRJCT9_MUTED,
+                                                    "fontSize": "11px",
+                                                    "lineHeight":
+                                                        "1.5",
+                                                    "marginTop": "6px",
+                                                    "marginBottom":
+                                                        "6px",
+                                                },
+                                            ),
+                                            dcc.Dropdown(
+                                                id="universe-preset",
+                                                options=[
+                                                    {"label": k,
+                                                     "value": k}
+                                                    for k in
+                                                    PRIMARY_UNIVERSE_PRESETS.keys()
+                                                ],
+                                                value="Mega Cap 10",
+                                                clearable=False,
+                                                style={
+                                                    "backgroundColor":
+                                                        PRJCT9_BLACK,
+                                                    "color":
+                                                        PRJCT9_TEXT,
+                                                    "fontSize": "12px",
+                                                    "width": "100%",
+                                                    "boxSizing":
+                                                        "border-box",
+                                                },
+                                            ),
+                                            dcc.Textarea(
+                                                id="custom-primaries",
+                                                placeholder=(
+                                                    "AAPL, MSFT, NVDA"
+                                                ),
+                                                style={
+                                                    **input_style,
+                                                    "height": "55px",
+                                                    "fontFamily":
+                                                        "inherit",
+                                                    "marginTop": "6px",
+                                                    "width": "100%",
+                                                    "boxSizing":
+                                                        "border-box",
+                                                },
+                                            ),
+                                            html.Button(
+                                                "Test 10 signal "
+                                                "sources",
+                                                id="btn-run",
+                                                n_clicks=0,
+                                                style={
+                                                    **btn_style,
+                                                    "marginRight": "0",
+                                                    "marginTop": "8px",
+                                                    "marginBottom":
+                                                        "0",
+                                                    "width": "100%",
+                                                    "boxSizing":
+                                                        "border-box",
+                                                },
+                                            ),
+                                            html.Div(
+                                                "Max 10 sources.",
+                                                style={
+                                                    "fontSize": "11px",
+                                                    "color":
+                                                        PRJCT9_MUTED,
+                                                    "lineHeight":
+                                                        "1.5",
+                                                    "marginTop": "6px",
+                                                },
+                                            ),
+                                        ],
+                                    ),
+
+                                    # Step 3: Combined signals
+                                    html.Div(
+                                        "3. Combined signals",
+                                        style={**label_style,
+                                               "color": PRJCT9_GREEN,
+                                               "fontWeight": "bold",
+                                               "marginTop": "14px"},
+                                    ),
+                                    html.Div(
+                                        id="left-combined-status",
+                                        style={"color": PRJCT9_MUTED,
+                                               "fontSize": "11px",
                                                "lineHeight": "1.5",
-                                               "marginTop": "6px"},
+                                               "marginTop": "2px",
+                                               "marginBottom": "6px",
+                                               "wordBreak":
+                                                   "break-word"},
+                                    ),
+                                    html.Button(
+                                        "Show combined studies",
+                                        id="btn-show-combined",
+                                        n_clicks=0,
+                                        style={**btn_style,
+                                               "marginRight": "0",
+                                               "marginBottom": "0",
+                                               "width": "100%",
+                                               "boxSizing":
+                                                   "border-box"},
+                                    ),
+
+                                    # Step 4: Time windows
+                                    html.Div(
+                                        "4. Time windows",
+                                        style={**label_style,
+                                               "color": PRJCT9_GREEN,
+                                               "fontWeight": "bold",
+                                               "marginTop": "14px"},
+                                    ),
+                                    html.Div(
+                                        id="left-timewindows-status",
+                                        style={"color": PRJCT9_MUTED,
+                                               "fontSize": "11px",
+                                               "lineHeight": "1.5",
+                                               "marginTop": "2px",
+                                               "marginBottom": "6px",
+                                               "wordBreak":
+                                                   "break-word"},
+                                    ),
+                                    html.Button(
+                                        "Show time-window check",
+                                        id="btn-show-time-windows",
+                                        n_clicks=0,
+                                        style={**btn_style,
+                                               "marginRight": "0",
+                                               "marginBottom": "0",
+                                               "width": "100%",
+                                               "boxSizing":
+                                                   "border-box"},
+                                    ),
+
+                                    # Step 5: Traffic Flow
+                                    html.Div(
+                                        "5. Traffic flow",
+                                        style={**label_style,
+                                               "color": PRJCT9_GREEN,
+                                               "fontWeight": "bold",
+                                               "marginTop": "14px"},
+                                    ),
+                                    html.Div(
+                                        id="left-trafficflow-status",
+                                        style={"color": PRJCT9_MUTED,
+                                               "fontSize": "11px",
+                                               "lineHeight": "1.5",
+                                               "marginTop": "2px",
+                                               "marginBottom": "6px",
+                                               "wordBreak":
+                                                   "break-word"},
+                                    ),
+                                    html.Button(
+                                        "Show traffic flow",
+                                        id="btn-show-traffic-flow",
+                                        n_clicks=0,
+                                        style={**btn_style,
+                                               "marginRight": "0",
+                                               "marginBottom": "0",
+                                               "width": "100%",
+                                               "boxSizing":
+                                                   "border-box"},
                                     ),
                                 ],
-                            ),
-
-                            # Step 3: Combined signals (saved studies)
-                            html.Div(
-                                "3. Combined signals",
-                                style={**label_style,
-                                       "color": PRJCT9_GREEN,
-                                       "fontWeight": "bold",
-                                       "marginTop": "14px"},
-                            ),
-                            html.Div(
-                                id="left-combined-status",
-                                style={"color": PRJCT9_MUTED,
-                                       "fontSize": "11px",
-                                       "lineHeight": "1.5",
-                                       "marginTop": "2px",
-                                       "marginBottom": "6px",
-                                       "wordBreak": "break-word"},
-                            ),
-                            html.Button(
-                                "Show combined studies",
-                                id="btn-show-combined",
-                                n_clicks=0,
-                                style={**btn_style,
-                                       "marginRight": "0",
-                                       "marginBottom": "0",
-                                       "width": "100%",
-                                       "boxSizing": "border-box"},
-                            ),
-
-                            # Step 4: Time windows (Confluence)
-                            html.Div(
-                                "4. Time windows",
-                                style={**label_style,
-                                       "color": PRJCT9_GREEN,
-                                       "fontWeight": "bold",
-                                       "marginTop": "14px"},
-                            ),
-                            html.Div(
-                                id="left-timewindows-status",
-                                style={"color": PRJCT9_MUTED,
-                                       "fontSize": "11px",
-                                       "lineHeight": "1.5",
-                                       "marginTop": "2px",
-                                       "marginBottom": "6px",
-                                       "wordBreak": "break-word"},
-                            ),
-                            html.Button(
-                                "Show time-window check",
-                                id="btn-show-time-windows",
-                                n_clicks=0,
-                                style={**btn_style,
-                                       "marginRight": "0",
-                                       "marginBottom": "0",
-                                       "width": "100%",
-                                       "boxSizing": "border-box"},
-                            ),
-
-                            # Step 5: Traffic Flow
-                            html.Div(
-                                "5. Traffic flow",
-                                style={**label_style,
-                                       "color": PRJCT9_GREEN,
-                                       "fontWeight": "bold",
-                                       "marginTop": "14px"},
-                            ),
-                            html.Div(
-                                id="left-trafficflow-status",
-                                style={"color": PRJCT9_MUTED,
-                                       "fontSize": "11px",
-                                       "lineHeight": "1.5",
-                                       "marginTop": "2px",
-                                       "marginBottom": "6px",
-                                       "wordBreak": "break-word"},
-                            ),
-                            html.Button(
-                                "Show traffic flow",
-                                id="btn-show-traffic-flow",
-                                n_clicks=0,
-                                style={**btn_style,
-                                       "marginRight": "0",
-                                       "marginBottom": "0",
-                                       "width": "100%",
-                                       "boxSizing": "border-box"},
                             ),
                         ],
                     ),
@@ -2932,43 +3044,89 @@ def build_app() -> Any:
                         className="prjct9-main",
                         style=panel_style,
                         children=[
-                            # Phase 6C-2: Research Catalogue browser
-                            # renders above the per-ticker dashboard
-                            # so the user sees what exists across the
-                            # whole catalogue before drilling into a
-                            # single ticker. Updated by a separate
-                            # callback that reads
-                            # catalogue-snapshot-store; the dashboard
-                            # render below stays untouched.
+                            # Phase 6C-5: Primary Signal Engine first
+                            # screen. Shows PRJCT9's saved Spymaster
+                            # SMA signal history for one ticker -
+                            # current Buy / Short / None state, the
+                            # active SMA pair, the cumulative capture
+                            # chart, the metric strip, and a recent
+                            # signal-history table. Cache-first; never
+                            # runs a live engine or yfinance.
                             html.Div(
-                                id="catalogue-browser-section",
+                                id="primary-signal-engine-section",
                                 style={"padding": "0",
                                        "marginBottom": "10px"},
                             ),
-                            # Phase 6C-4: catalogue health summary +
-                            # performance row. Both render above the
-                            # per-ticker dashboard so the user sees
-                            # "what's missing? what's slow?" before
-                            # diving into a single ticker.
-                            html.Div(
-                                id="catalogue-health-section",
-                                style={"padding": "0",
-                                       "marginBottom": "10px"},
-                            ),
-                            html.Div(
-                                id="performance-section",
-                                style={"padding": "0",
-                                       "marginBottom": "10px"},
-                            ),
-                            dcc.Loading(
-                                id="dashboard-loading",
-                                type="circle",
-                                color=PRJCT9_GREEN,
-                                children=html.Div(
-                                    id="dashboard-main",
-                                    style={"padding": "0",
-                                           "minHeight": "300px"},
-                                ),
+                            # Phase 6C-5: the Phase 6C-1..6C-4 cross-
+                            # ticker surfaces are still here, but
+                            # they no longer dominate the first
+                            # experience. Anyone who needs them can
+                            # expand the Advanced research catalogue
+                            # block; the MVP user gets a chart on
+                            # first click without picking an engine.
+                            html.Details(
+                                id="advanced-research-catalogue-details",
+                                open=False,
+                                style={"marginTop": "12px",
+                                       "borderTop":
+                                           f"1px solid {PRJCT9_BORDER}",
+                                       "paddingTop": "10px"},
+                                children=[
+                                    html.Summary(
+                                        "Advanced research catalogue",
+                                        style={"color": PRJCT9_GREEN,
+                                               "letterSpacing": "2px",
+                                               "fontSize": "11px",
+                                               "textTransform":
+                                                   "uppercase",
+                                               "fontWeight": "bold",
+                                               "cursor": "pointer",
+                                               "outline": "none",
+                                               "marginBottom": "8px"},
+                                    ),
+                                    html.Div(
+                                        "Cross-ticker catalogue, "
+                                        "health diagnostics, and the "
+                                        "per-ticker engine cockpit. "
+                                        "Open when the Signal Engine "
+                                        "is not enough.",
+                                        style={"color": PRJCT9_MUTED,
+                                               "fontSize": "11px",
+                                               "lineHeight": "1.5",
+                                               "marginBottom": "8px"},
+                                    ),
+                                    # Phase 6C-2: Research Catalogue
+                                    # browser. Updated by a separate
+                                    # callback that reads
+                                    # catalogue-snapshot-store.
+                                    html.Div(
+                                        id="catalogue-browser-section",
+                                        style={"padding": "0",
+                                               "marginBottom": "10px"},
+                                    ),
+                                    # Phase 6C-4: catalogue health
+                                    # summary + performance row.
+                                    html.Div(
+                                        id="catalogue-health-section",
+                                        style={"padding": "0",
+                                               "marginBottom": "10px"},
+                                    ),
+                                    html.Div(
+                                        id="performance-section",
+                                        style={"padding": "0",
+                                               "marginBottom": "10px"},
+                                    ),
+                                    dcc.Loading(
+                                        id="dashboard-loading",
+                                        type="circle",
+                                        color=PRJCT9_GREEN,
+                                        children=html.Div(
+                                            id="dashboard-main",
+                                            style={"padding": "0",
+                                                   "minHeight": "300px"},
+                                        ),
+                                    ),
+                                ],
                             ),
                         ],
                     ),
@@ -3005,6 +3163,12 @@ def build_app() -> Any:
             # health report stays in the in-memory module cache and
             # the optional on-disk JSON.
             dcc.Store(id="catalogue-health-store"),
+            # Phase 6C-5: Primary Signal Engine payload store. One
+            # cache read per ticker, no TTL - the underlying file
+            # mtime is the cache key. Holds the
+            # primary_signal_engine_payload_v1 dict produced by
+            # primary_signal_engine.load_primary_signal_engine_payload.
+            dcc.Store(id="signal-engine-store"),
             # Phase 6C-4: perf-tick counter. The dashboard render
             # callback reads this to refresh the Performance row
             # whenever a tracked operation completes.
@@ -3416,13 +3580,91 @@ def build_app() -> Any:
     # full snapshot for power-user inspection; the in-memory module
     # cache holds the full snapshot for fast subsequent payload
     # builds.
+    # Phase 6C-5: Primary Signal Engine cache reader. Fires on:
+    #   * boot (target-ticker.value default = SPY)
+    #   * ticker input change (debounced)
+    #   * View ticker click
+    #   * Refresh saved view click
+    # Strictly cache-first, offline. The reader never invokes a
+    # live engine and never writes to disk - looking at a ticker
+    # is a pure saved-file read.
     @app.callback(
-        Output("catalogue-snapshot-store", "data"),
-        Input("meta-store", "data"),
-        Input("btn-refresh-catalogue-index", "n_clicks"),
+        Output("signal-engine-store", "data"),
+        Input("target-ticker", "value"),
+        Input("btn-view-signal-engine", "n_clicks"),
+        Input("btn-refresh-saved-view", "n_clicks"),
         prevent_initial_call=False,
     )
-    def _update_catalogue_snapshot_store(_meta, _refresh_n):
+    def _update_signal_engine_store(target, _view_n, _refresh_n):
+        try:
+            import primary_signal_engine as pse
+        except Exception as exc:
+            return {
+                "schema": "primary_signal_engine_payload_v1",
+                "ticker": str(target or "").strip().upper(),
+                "available": False,
+                "reason": "module_unavailable",
+                "error_detail": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "chart_rows": [],
+                "recent_rows": [],
+            }
+        try:
+            return pse.load_primary_signal_engine_payload(target)
+        except Exception as exc:
+            # The reader is supposed to be exception-free, but we
+            # still wrap defensively so a Dash log never gets a
+            # bare traceback from normal clicking.
+            return {
+                "schema": "primary_signal_engine_payload_v1",
+                "ticker": str(target or "").strip().upper(),
+                "available": False,
+                "reason": "unknown_error",
+                "error_detail": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "chart_rows": [],
+                "recent_rows": [],
+            }
+
+    @app.callback(
+        Output("primary-signal-engine-section", "children"),
+        Input("signal-engine-store", "data"),
+    )
+    def _render_signal_engine_section(payload):
+        return _render_primary_signal_engine(payload)
+
+    @app.callback(
+        Output("signal-engine-status", "children"),
+        Input("signal-engine-store", "data"),
+    )
+    def _render_signal_engine_left_status(payload):
+        if not payload or not payload.get("available"):
+            return "No saved Signal Engine data for this ticker yet."
+        ticker = payload.get("ticker") or "?"
+        sig = payload.get("current_signal") or "None"
+        pair = payload.get("current_active_pair_raw") or "None"
+        dr = payload.get("date_range") or {}
+        start = dr.get("start") or "?"
+        end = dr.get("end") or "?"
+        return (
+            f"{ticker}: {sig} ({pair}). Saved range {start} to {end}."
+        )
+
+    # Phase 6C-5 amendment: lazy-load. The catalogue snapshot is
+    # cross-ticker work and is hidden behind the Advanced details
+    # block. Building it on every page boot wastes CPU even when
+    # the user never opens Advanced. Restrict the trigger to the
+    # explicit Refresh catalogue index button. The catalogue
+    # browser starts in its empty state and populates only when
+    # the user clicks Refresh inside Advanced.
+    @app.callback(
+        Output("catalogue-snapshot-store", "data"),
+        Input("btn-refresh-catalogue-index", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _update_catalogue_snapshot_store(_refresh_n):
         trigger = (
             callback_context.triggered[0]["prop_id"].split(".")[0]
             if callback_context.triggered else ""
@@ -3450,13 +3692,15 @@ def build_app() -> Any:
     # mode the button is hidden and the persist flag is dropped;
     # the public app reads the last saved JSON via
     # get_health_report's disk fallback path.
+    # Phase 6C-5 amendment: lazy-load. The health report is a
+    # cross-ticker walk hidden behind Advanced; build only on
+    # explicit Refresh click.
     @app.callback(
         Output("catalogue-health-store", "data"),
-        Input("meta-store", "data"),
         Input("btn-refresh-health-report", "n_clicks"),
-        prevent_initial_call=False,
+        prevent_initial_call=True,
     )
-    def _update_catalogue_health_store(_meta, _refresh_n):
+    def _update_catalogue_health_store(_refresh_n):
         trigger = (
             callback_context.triggered[0]["prop_id"].split(".")[0]
             if callback_context.triggered else ""
@@ -4011,11 +4255,18 @@ def build_app() -> Any:
                 )
             return data, meta, log[-200:]
 
-        # Boot trigger: auto-load SPY once on page load if no results yet.
+        # Boot trigger: Phase 6C-5 amendment: the boot-trigger no
+        # longer auto-loads the legacy ImpactSearch / cross-ticker
+        # cockpit. The first screen now is the Signal Engine,
+        # which loads itself from target-ticker.value with
+        # prevent_initial_call=False. Leaving the boot-trigger
+        # Input registered here keeps the callback graph stable
+        # without re-running the heavy saved-study path on every
+        # page open. Click "Load cross-ticker study" inside
+        # Advanced cross-ticker tools to populate the legacy
+        # cockpit on demand.
         if trigger == "boot-trigger":
-            if current_results:
-                return no_update, no_update, no_update
-            return _do_load(quiet=True)
+            return no_update, no_update, no_update
 
         # "Show saved study" -> always browse path
         if trigger == "btn-load":
@@ -4121,6 +4372,44 @@ def build_app() -> Any:
         meta = meta or {}
         perf_start = time.perf_counter() if _perf is not None else None
         try:
+            # Phase 6C-5 amendment: lazy dashboard render. The
+            # legacy cross-ticker cockpit (catalogue browser
+            # below, plus stack / confluence / traffic-flow
+            # sections) is heavy - in particular,
+            # _render_time_windows_section calls
+            # _real_confluence_snapshot_for_target which loads the
+            # confluence_analyzer engine for every render. With
+            # the Phase 6C-5 directional reset, the user does not
+            # ask for that work until they click "Load cross-
+            # ticker study" inside Advanced. When results-store is
+            # still empty (the initial Dash boot state), render a
+            # tiny placeholder so the heavy cockpit work happens
+            # only on demand.
+            if not results_data and not meta:
+                return html.Div(
+                    id="dashboard-main-placeholder",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "11px",
+                           "padding": "10px 12px",
+                           "border": f"1px solid {PRJCT9_BORDER}",
+                           "marginTop": "10px"},
+                    children=[
+                        html.Div(
+                            "Cross-ticker cockpit not loaded.",
+                            style={"color": PRJCT9_MUTED,
+                                   "letterSpacing": "1px",
+                                   "textTransform": "uppercase",
+                                   "fontSize": "10px",
+                                   "marginBottom": "4px"},
+                        ),
+                        html.Div(
+                            "Click Load cross-ticker study above "
+                            "to populate the catalogue / engine "
+                            "panels.",
+                            style={"lineHeight": "1.5"},
+                        ),
+                    ],
+                )
             return _render_research_cockpit(
                 results_data, meta, log or [], selected_row,
                 catalogue_summary=catalogue_data,
@@ -4986,6 +5275,417 @@ def build_app() -> Any:
             id="catalogue-browser-panel",
             className="prjct9-cockpit-panel",
             children=body,
+        )
+
+    def _render_primary_signal_engine(payload):
+        """Phase 6C-5 Primary Signal Engine first screen.
+
+        Renders:
+          * header "<TICKER> Signal Engine"
+          * one-line caption "Saved SMA signal history from PRJCT9."
+          * Cumulative Capture (%) chart
+          * Current Signal card (Buy / Short / None) with color
+          * Active SMA Pair card
+          * metric strip: Total Capture (%), Sharpe Ratio,
+            Signal Days, Date Range
+          * caption under chart explaining signal-day capture vs
+            portfolio return
+          * Recent Signal History table (last 15 rows)
+
+        Pure read of the payload produced by
+        ``primary_signal_engine.load_primary_signal_engine_payload``.
+        Fails closed: missing / corrupt cache shows a clean
+        unavailable card with a plain message.
+        """
+        if not isinstance(payload, Mapping) or not payload:
+            payload = {}
+        ticker = str(payload.get("ticker") or "?")
+        available = bool(payload.get("available"))
+        reason = payload.get("reason")
+        chart_rows = list(payload.get("chart_rows") or [])
+        recent_rows = list(payload.get("recent_rows") or [])
+
+        header = html.Div(
+            f"{ticker} Signal Engine",
+            id="signal-engine-header",
+            style={"color": PRJCT9_GREEN,
+                   "fontSize": "16px",
+                   "fontWeight": "bold",
+                   "letterSpacing": "1px",
+                   "marginBottom": "4px"},
+        )
+        caption = html.Div(
+            "Saved SMA signal history from PRJCT9.",
+            id="signal-engine-caption",
+            style={"color": PRJCT9_TEXT,
+                   "fontSize": "12px",
+                   "lineHeight": "1.5",
+                   "marginBottom": "8px"},
+        )
+
+        if not available:
+            reason_text = "No saved Signal Engine data for this ticker yet."
+            if reason == "cache_missing":
+                reason_text = (
+                    f"No saved Signal Engine data for {ticker} yet."
+                )
+            elif reason == "cache_unreadable":
+                reason_text = (
+                    f"Saved Signal Engine cache for {ticker} is "
+                    "unreadable. Re-save from Spymaster to recover."
+                )
+            elif reason == "wrong_cache_shape":
+                reason_text = (
+                    f"Saved Signal Engine cache for {ticker} is "
+                    "in an unexpected shape."
+                )
+            elif reason == "no_close_column":
+                reason_text = (
+                    f"Saved Signal Engine cache for {ticker} has "
+                    "no Close price column."
+                )
+            elif reason == "no_signal_data":
+                reason_text = (
+                    f"Saved Signal Engine cache for {ticker} has "
+                    "no signal history yet."
+                )
+            elif reason == "active_pairs_alignment_mismatch":
+                reason_text = (
+                    f"Saved Signal Engine cache for {ticker} is "
+                    "in an inconsistent shape (signal length does "
+                    "not match price history). Re-save from "
+                    "Spymaster to recover."
+                )
+            elif reason == "no_signal_history":
+                reason_text = (
+                    f"Saved Signal Engine cache for {ticker} has "
+                    "no aligned signal history yet."
+                )
+            elif reason == "no_ticker":
+                reason_text = "Type a ticker to view its Signal Engine."
+            return html.Div(
+                id="signal-engine-panel",
+                className="prjct9-cockpit-panel",
+                children=[
+                    header,
+                    caption,
+                    html.Div(
+                        reason_text,
+                        id="signal-engine-empty-message",
+                        style={"color": PRJCT9_MUTED,
+                               "fontSize": "12px",
+                               "lineHeight": "1.5",
+                               "marginTop": "10px",
+                               "padding": "10px 12px",
+                               "border":
+                                   f"1px solid {PRJCT9_BORDER}"},
+                    ),
+                ],
+            )
+
+        # Available path. Build the chart + metric cards + recent
+        # table.
+        sig = str(payload.get("current_signal") or "None")
+        sig_color = (
+            PRJCT9_GREEN if sig == "Buy"
+            else PRJCT9_RED if sig == "Short"
+            else PRJCT9_MUTED
+        )
+        active_raw = str(
+            payload.get("current_active_pair_raw") or "None"
+        )
+        sma_pair = payload.get("current_sma_pair")
+        if isinstance(sma_pair, (list, tuple)) and len(sma_pair) == 2:
+            sma_text = f"{sig} {int(sma_pair[0])}/{int(sma_pair[1])}"
+        elif active_raw and active_raw.lower() != "none":
+            sma_text = active_raw
+        else:
+            sma_text = "None"
+
+        cap_total = payload.get("total_capture_pct")
+        sharpe = payload.get("sharpe_ratio")
+        signal_days = payload.get("signal_days")
+        date_range = payload.get("date_range") or {}
+        date_text = (
+            f"{date_range.get('start') or '?'} to "
+            f"{date_range.get('end') or '?'}"
+        )
+
+        def _fmt_num(v, fmt=".2f"):
+            if v is None:
+                return "-"
+            try:
+                return format(float(v), fmt)
+            except (TypeError, ValueError):
+                return str(v)
+
+        # Two summary cards in a row: Current Signal + Active SMA Pair.
+        cards = html.Div(
+            id="signal-engine-cards",
+            style={"display": "grid",
+                   "gridTemplateColumns":
+                       "repeat(auto-fit, minmax(160px, 1fr))",
+                   "gap": "8px",
+                   "marginBottom": "10px"},
+            children=[
+                html.Div(
+                    style={"backgroundColor": PRJCT9_DIM,
+                           "border": f"2px solid {sig_color}",
+                           "padding": "8px 10px",
+                           "minWidth": "0"},
+                    children=[
+                        html.Div("Current Signal",
+                                 style={"color": PRJCT9_MUTED,
+                                        "fontSize": "9px",
+                                        "letterSpacing": "1px",
+                                        "textTransform": "uppercase",
+                                        "marginBottom": "2px"}),
+                        html.Div(sig,
+                                 id="signal-engine-current-signal",
+                                 style={"color": sig_color,
+                                        "fontSize": "18px",
+                                        "fontWeight": "bold",
+                                        "letterSpacing": "1px"}),
+                    ],
+                ),
+                html.Div(
+                    style={"backgroundColor": PRJCT9_DIM,
+                           "border": f"1px solid {PRJCT9_BORDER}",
+                           "padding": "8px 10px",
+                           "minWidth": "0"},
+                    children=[
+                        html.Div("Active SMA Pair",
+                                 style={"color": PRJCT9_MUTED,
+                                        "fontSize": "9px",
+                                        "letterSpacing": "1px",
+                                        "textTransform": "uppercase",
+                                        "marginBottom": "2px"}),
+                        html.Div(sma_text,
+                                 id="signal-engine-active-pair",
+                                 style={"color": PRJCT9_TEXT,
+                                        "fontSize": "14px",
+                                        "fontWeight": "bold",
+                                        "wordBreak": "break-word"}),
+                    ],
+                ),
+            ],
+        )
+
+        metric_cells = [
+            ("Total Capture (%)", _fmt_num(cap_total)),
+            ("Sharpe Ratio", _fmt_num(sharpe)),
+            ("Signal Days", str(int(signal_days)) if signal_days is not None else "-"),
+            ("Date Range", date_text),
+        ]
+        metric_strip = html.Div(
+            id="signal-engine-metrics",
+            style={"display": "grid",
+                   "gridTemplateColumns":
+                       "repeat(auto-fit, minmax(140px, 1fr))",
+                   "gap": "6px",
+                   "marginBottom": "10px"},
+            children=[
+                html.Div(
+                    style={"backgroundColor": PRJCT9_DIM,
+                           "border": f"1px solid {PRJCT9_BORDER}",
+                           "padding": "6px 8px",
+                           "minWidth": "0"},
+                    children=[
+                        html.Div(label,
+                                 style={"color": PRJCT9_MUTED,
+                                        "fontSize": "9px",
+                                        "letterSpacing": "1px",
+                                        "textTransform": "uppercase"}),
+                        html.Div(value,
+                                 style={"color": PRJCT9_GREEN,
+                                        "fontSize": "13px",
+                                        "fontWeight": "bold",
+                                        "marginTop": "2px",
+                                        "wordBreak": "break-word"}),
+                    ],
+                )
+                for label, value in metric_cells
+            ],
+        )
+
+        # Build the cumulative capture line chart.
+        chart_div: Any = html.Div(
+            "Saved local data has no chart rows.",
+            style={"color": PRJCT9_MUTED,
+                   "fontSize": "11px",
+                   "padding": "10px",
+                   "border": f"1px solid {PRJCT9_BORDER}"},
+        )
+        if chart_rows:
+            try:
+                import plotly.graph_objects as go
+                dates = [r.get("date") for r in chart_rows]
+                cum = [
+                    r.get("cumulative_capture_pct") or 0.0
+                    for r in chart_rows
+                ]
+                signals = [r.get("signal") for r in chart_rows]
+                closes = [r.get("close") for r in chart_rows]
+                hover = [
+                    f"{d}<br>"
+                    f"Close: {c}<br>"
+                    f"Signal: {s}<br>"
+                    f"Cumulative Capture: {cc:.4f}%"
+                    for d, c, s, cc in zip(dates, closes, signals, cum)
+                ]
+                fig = go.Figure(go.Scatter(
+                    x=dates, y=cum, mode="lines",
+                    line={"color": PRJCT9_GREEN, "width": 1.4},
+                    hovertext=hover, hoverinfo="text",
+                ))
+                fig.add_hline(
+                    y=0.0, line_color=PRJCT9_BORDER, line_width=1,
+                )
+                fig.update_layout(
+                    paper_bgcolor=PRJCT9_BLACK,
+                    plot_bgcolor=PRJCT9_BLACK,
+                    font={"color": PRJCT9_TEXT,
+                          "family": "Consolas, monospace"},
+                    xaxis={"gridcolor": PRJCT9_BORDER,
+                           "title": "Date"},
+                    yaxis={"gridcolor": PRJCT9_BORDER,
+                           "title": "Cumulative Capture (%)"},
+                    margin={"l": 56, "r": 12, "t": 28, "b": 36},
+                    height=260,
+                    title={
+                        "text": "Cumulative Capture (%)",
+                        "font": {"color": PRJCT9_GREEN, "size": 13},
+                    },
+                )
+                chart_div = dcc.Graph(
+                    id="signal-engine-chart",
+                    figure=fig,
+                    config={"displayModeBar": False},
+                )
+            except Exception:
+                chart_div = html.Div(
+                    "Cumulative capture chart could not be drawn.",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "11px",
+                           "padding": "10px",
+                           "border": f"1px solid {PRJCT9_BORDER}"},
+                )
+
+        chart_caption = html.Div(
+            "Signal-day capture, not portfolio return. This line "
+            "sums historical capture from the saved signal state "
+            "without trade-cost or position-sizing assumptions.",
+            id="signal-engine-chart-caption",
+            style={"color": PRJCT9_MUTED,
+                   "fontSize": "10px",
+                   "fontStyle": "italic",
+                   "lineHeight": "1.4",
+                   "marginTop": "4px",
+                   "marginBottom": "10px"},
+        )
+
+        # Recent signal history table.
+        recent_rendered: list[dict] = []
+        for r in recent_rows:
+            recent_rendered.append({
+                "Date": str(r.get("date") or ""),
+                "Close": (
+                    f"{float(r.get('close')):.2f}"
+                    if r.get("close") is not None else "-"
+                ),
+                "Signal": str(r.get("signal") or ""),
+                "Active Pair": str(r.get("raw_active_pair") or ""),
+                "Daily Capture (%)": (
+                    f"{float(r.get('daily_capture_pct')):.4f}"
+                    if r.get("daily_capture_pct") is not None else "-"
+                ),
+                "Cumulative Capture (%)": (
+                    f"{float(r.get('cumulative_capture_pct')):.4f}"
+                    if r.get("cumulative_capture_pct") is not None
+                    else "-"
+                ),
+            })
+        recent_cols = [
+            "Date", "Close", "Signal", "Active Pair",
+            "Daily Capture (%)", "Cumulative Capture (%)",
+        ]
+        # Phase 6C-5 amendment: keep the table's horizontal scroll
+        # inside its own scroller so the page never gets a full-
+        # width overflow on mobile. ``minWidth/maxWidth: 100%``
+        # plus the wrapper's ``overflowX: auto`` confines scroll
+        # to this DataTable.
+        recent_table_inner = dash_table.DataTable(
+            id="signal-engine-recent-table",
+            columns=[{"name": c, "id": c} for c in recent_cols],
+            data=recent_rendered,
+            style_table={
+                "overflowX": "auto",
+                "maxWidth": "100%",
+                "minWidth": "100%",
+            },
+            style_cell={
+                "backgroundColor": PRJCT9_BLACK,
+                "color": PRJCT9_TEXT,
+                "fontFamily": "Consolas, 'Courier New', monospace",
+                "fontSize": "11px",
+                "padding": "4px 8px",
+                "border": f"1px solid {PRJCT9_BORDER}",
+                "textAlign": "left",
+                "minWidth": "60px",
+                "maxWidth": "180px",
+                "whiteSpace": "normal",
+                "wordBreak": "break-word",
+            },
+            style_header={
+                "backgroundColor": PRJCT9_DIM,
+                "color": PRJCT9_GREEN,
+                "fontWeight": "bold",
+                "border": f"1px solid {PRJCT9_GREEN}",
+                "letterSpacing": "1px",
+                "fontSize": "10px",
+            },
+            style_data_conditional=[
+                {"if": {"filter_query": '{Signal} = "Buy"',
+                        "column_id": "Signal"},
+                 "color": PRJCT9_GREEN, "fontWeight": "bold"},
+                {"if": {"filter_query": '{Signal} = "Short"',
+                        "column_id": "Signal"},
+                 "color": PRJCT9_RED, "fontWeight": "bold"},
+                {"if": {"filter_query": '{Signal} = "None"',
+                        "column_id": "Signal"},
+                 "color": PRJCT9_MUTED},
+            ],
+        )
+        recent_table = html.Div(
+            id="signal-engine-recent-table-wrap",
+            style={"width": "100%",
+                   "maxWidth": "100%",
+                   "overflowX": "auto",
+                   "boxSizing": "border-box"},
+            children=[recent_table_inner],
+        )
+
+        return html.Div(
+            id="signal-engine-panel",
+            className="prjct9-cockpit-panel",
+            children=[
+                header,
+                caption,
+                cards,
+                chart_div,
+                chart_caption,
+                metric_strip,
+                html.Div(
+                    "RECENT SIGNAL HISTORY",
+                    style={"color": PRJCT9_GREEN,
+                           "letterSpacing": "2px",
+                           "fontSize": "10px",
+                           "fontWeight": "bold",
+                           "marginBottom": "4px",
+                           "marginTop": "4px"},
+                ),
+                recent_table,
+            ],
         )
 
     def _render_catalogue_health(payload):

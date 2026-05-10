@@ -795,17 +795,21 @@ _BANNED_UI_PHRASES: list[str] = [
     "saved output",
 ]
 
-# Plain-language phrases the first-screen research-flow workflow
-# must contain. Updated for the Phase 6A research-flow rebuild:
-# Market Scan -> Ticker Study -> Signal Sources -> Combined Signals
-# -> Time Windows.
+# Plain-language phrases the first-screen workflow must contain.
+# Phase 6C-5 directional reset: the Primary Signal Engine is the
+# first screen, with the cross-ticker tools demoted into the
+# Advanced collapsed block. The market-scan / combined-signals /
+# time-windows / traffic-flow buttons still exist (callbacks need
+# their IDs registered) but they no longer lead the first
+# experience.
 _REQUIRED_UI_PHRASES: list[str] = [
     "Start here",
-    "Scan first. Then study a ticker.",
+    "Type a ticker to see PRJCT9's saved Signal Engine view.",
+    "View ticker",
+    "Refresh saved view",
+    "Advanced cross-ticker tools",
     "1. Scan market",
     "Open market scan",
-    "2. Study ticker",
-    "Open saved ticker study",
     "Signal sources for live test",
     "Test 10 signal sources",
     "3. Combined signals",
@@ -1122,21 +1126,28 @@ def test_dashboard_renders_tab_less_for_loaded_data():
             f"old tab label {banned!r} present in tab-less layout"
         )
 def test_research_flow_workflow_present_on_layout():
-    """Pin the research-flow workflow vocabulary on the rendered
-    left rail: Start here / 1. Scan market / 2. Study ticker /
-    Signal sources for live test / 3. Combined signals / 4. Time
-    windows. The old 'Load research' / 'Run quick check' / 'Type a
-    ticker' wording must be gone from the rendered layout."""
+    """Phase 6C-5 directional reset: the rendered left rail must
+    lead with the Signal Engine and demote the cross-ticker tools
+    into a collapsed block. The legacy phrases (Open saved ticker
+    study, "Scan first..." caption, "2. Study ticker" header) are
+    replaced by the Signal Engine vocabulary; the cross-ticker
+    tools (Open market scan, Combined signals, Time windows) still
+    appear inside the Advanced details block so callbacks keep
+    working."""
     pytest.importorskip("dash")
     app = preview.build_app()
     text = _extract_ui_text(app.layout)
     for phrase in [
+        # New first-screen leads.
         "Start here",
-        "Scan first. Then study a ticker.",
+        "Type a ticker to see PRJCT9's saved Signal Engine view.",
+        "View ticker",
+        "Refresh saved view",
+        "Advanced cross-ticker tools",
+        # Cross-ticker tools still rendered (inside the demoted
+        # Advanced block).
         "1. Scan market",
         "Open market scan",
-        "2. Study ticker",
-        "Open saved ticker study",
         "Signal sources for live test",
         "Test 10 signal sources",
         "3. Combined signals",
@@ -1145,10 +1156,15 @@ def test_research_flow_workflow_present_on_layout():
         "Show time-window check",
     ]:
         assert phrase in text, (
-            f"required research-flow phrase {phrase!r} missing from "
+            f"required first-screen phrase {phrase!r} missing from "
             "rendered left rail"
         )
     for old in [
+        # Legacy first-screen copy that the directional reset
+        # explicitly drops.
+        "Scan first. Then study a ticker.",
+        "Open saved ticker study",
+        "2. Study ticker",
         "Load research",
         "Run quick check",
         "Comparison tickers",
@@ -2169,11 +2185,19 @@ def test_left_rail_uses_compact_short_copy():
     src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
         encoding="utf-8"
     )
-    # New compact copy. Source helper string is split across two
-    # adjacent string literals; check the halves.
+    # New compact copy. Source helper strings are split across
+    # adjacent string literals; the Phase 6C-5 demote moves these
+    # deeper, which adds extra indentation but keeps the rendered
+    # text intact. Check substrings that survive the wrap, then
+    # check the assembled rendered text so a future re-wrap
+    # cannot regress this contract silently.
     assert "{len(files)} saved ticker studies." in src
-    assert "These tickers create signals " in src
-    assert "for the ticker studied." in src
+    assert "These tickers create" in src
+    assert "ticker studied." in src
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    text = _extract_ui_text(app.layout)
+    assert "These tickers create signals for the ticker studied." in text
     assert "Max 10 sources." in src
     # Old long copy must be gone from source.
     assert "Saved ticker studies:" not in src, (
@@ -5945,7 +5969,11 @@ def test_public_mode_does_not_persist_catalogue_index(monkeypatch, tmp_path):
             ]),
             raising=False,
         )
-        inner({"target": "SPY"}, 1)
+        # Phase 6C-5 amendment: snapshot-store callback now only
+        # takes the refresh-button n_clicks (meta-store dropped
+        # so the heavy snapshot does not rebuild on every page
+        # load).
+        inner(1)
         assert write_calls == [], (
             f"public mode persisted catalogue index: {write_calls!r}"
         )
@@ -6302,7 +6330,9 @@ def test_public_mode_health_callback_does_not_persist(
             ]),
             raising=False,
         )
-        inner({"target": "SPY"}, 1)
+        # Phase 6C-5 amendment: health-store callback now only
+        # takes the refresh-button n_clicks.
+        inner(1)
         assert write_calls == [], (
             f"public mode persisted health report: {write_calls!r}"
         )
@@ -6356,7 +6386,9 @@ def test_local_mode_refresh_health_report_persists(monkeypatch, tmp_path):
         ]),
         raising=False,
     )
-    out = inner({"target": "SPY"}, 1)
+    # Phase 6C-5 amendment: health-store callback now only takes
+    # the refresh-button n_clicks (meta-store dropped).
+    out = inner(1)
     assert captured["force"] is True
     assert captured["persist"] is True
     # Returned shape is the bounded browser payload.
@@ -6423,7 +6455,9 @@ def test_no_full_universe_engines_called_during_health_render(
         property(lambda self: []),
         raising=False,
     )
-    out = inner({"target": "SPY"}, 0)
+    # Phase 6C-5 amendment: health-store callback now only takes
+    # the refresh-button n_clicks.
+    out = inner(0)
     # callback must complete; no live engine attribute access.
     assert sentinel == [], (
         f"health callback inadvertently called live engine: {sentinel!r}"
@@ -6458,3 +6492,730 @@ def test_rendered_health_section_avoids_developer_only_words():
             f"banned developer-only term {tok!r} leaked into "
             "Catalogue Health section"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-5: Primary Signal Engine first screen
+# ---------------------------------------------------------------------------
+
+
+def _render_signal_engine_with_payload(payload):
+    """Helper: invoke the primary-signal-engine-section render
+    callback with a synthetic payload and return the rendered
+    component."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["primary-signal-engine-section.children"]
+    inner = getattr(entry["callback"], "__wrapped__", entry["callback"])
+    return inner(payload)
+
+
+def _signal_engine_text(payload) -> str:
+    import json as _json
+    component = _render_signal_engine_with_payload(payload)
+
+    def _to_jsonlike(c):
+        if hasattr(c, "to_plotly_json"):
+            return c.to_plotly_json()
+        if isinstance(c, (list, tuple)):
+            return [_to_jsonlike(x) for x in c]
+        return c
+    return _json.dumps(_to_jsonlike(component), default=str)
+
+
+def test_signal_engine_section_present_in_layout():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    found_ids: list[str] = []
+
+    def _walk(n):
+        if n is None or isinstance(n, str):
+            return
+        if isinstance(n, (list, tuple)):
+            for c in n:
+                _walk(c)
+            return
+        nid = getattr(n, "id", None)
+        if isinstance(nid, str):
+            found_ids.append(nid)
+        children = getattr(n, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    assert "primary-signal-engine-section" in found_ids
+    assert "signal-engine-store" in found_ids
+    assert "btn-refresh-saved-view" in found_ids
+    assert "signal-engine-status" in found_ids
+
+
+def test_signal_engine_callbacks_registered():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    keys = list(app.callback_map.keys())
+    assert "signal-engine-store.data" in keys
+    assert "primary-signal-engine-section.children" in keys
+    assert "signal-engine-status.children" in keys
+
+
+def test_first_screen_leads_with_signal_engine_not_catalogue():
+    """Phase 6C-5: the rendered first screen must start with the
+    Signal Engine cues. The previous misleading leads ("Open
+    market scan", "Build missing charts" as primary actions, the
+    catalogue browser as the first thing) must be demoted."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    text = _extract_ui_text(app.layout)
+    # Required Signal Engine cues.
+    assert "Type a ticker to see PRJCT9's saved Signal Engine view." in text
+    assert "View ticker" in text
+    assert "Refresh saved view" in text
+    # The cross-ticker tools still exist but are demoted into the
+    # Advanced collapsed block. The Advanced block summary must
+    # be present.
+    assert "Advanced cross-ticker tools" in text
+    assert "Advanced research catalogue" in text
+    # The OLD primary leads must NOT appear at the top of the
+    # rail. We can't easily test "leads with" via _extract_ui_text
+    # ordering, but we can confirm the legacy primary copy is gone.
+    assert "Scan first. Then study a ticker." not in text
+    assert "Open saved ticker study" not in text
+    assert "2. Study ticker" not in text
+
+
+def test_signal_engine_renders_required_text_on_available_payload():
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "SPY",
+        "available": True,
+        "reason": None,
+        "date_range": {"start": "1993-01-29", "end": "2026-05-04"},
+        "current_signal": "Short",
+        "current_active_pair_raw": "Short 11,5",
+        "current_sma_pair": [11, 5],
+        "total_capture_pct": 201.14,
+        "sharpe_ratio": 0.061,
+        "signal_days": 8256,
+        "win_rate_pct": 50.48,
+        "latest_close": 718.01,
+        "chart_rows": [
+            {"date": "2024-01-02", "close": 100.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 0.0,
+             "cumulative_capture_pct": 0.0},
+            {"date": "2024-01-03", "close": 110.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 10.0,
+             "cumulative_capture_pct": 10.0},
+        ],
+        "recent_rows": [
+            {"date": "2024-01-03", "close": 110.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 10.0,
+             "cumulative_capture_pct": 10.0},
+        ],
+        "metric_basis":
+            "Spymaster cache (preprocessed_data + active_pairs)",
+    }
+    text = _signal_engine_text(payload)
+    # Header + caption.
+    assert "SPY Signal Engine" in text
+    assert "Saved SMA signal history from PRJCT9." in text
+    # Required vocabulary.
+    for label in (
+        "Current Signal", "Active SMA Pair",
+        "Total Capture (%)", "Sharpe Ratio", "Signal Days",
+        "Date Range", "Cumulative Capture (%)",
+        "RECENT SIGNAL HISTORY",
+    ):
+        assert label in text, (
+            f"required Signal Engine label {label!r} missing"
+        )
+    # Honest chart caption.
+    assert (
+        "Signal-day capture, not portfolio return." in text
+    )
+    # Current state surfaces.
+    assert "Short" in text
+    assert "11/5" in text or "Short 11,5" in text
+    # Date range surfaces.
+    assert "1993-01-29 to 2026-05-04" in text
+
+
+def test_signal_engine_renders_clean_unavailable_for_missing_cache():
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "ZZZZZZ",
+        "available": False,
+        "reason": "cache_missing",
+        "chart_rows": [],
+        "recent_rows": [],
+    }
+    text = _signal_engine_text(payload)
+    assert "ZZZZZZ Signal Engine" in text
+    assert "No saved Signal Engine data for ZZZZZZ yet." in text
+
+
+def test_signal_engine_renders_clean_unavailable_for_corrupt_cache():
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "TST",
+        "available": False,
+        "reason": "cache_unreadable",
+        "chart_rows": [],
+        "recent_rows": [],
+    }
+    text = _signal_engine_text(payload)
+    assert "TST Signal Engine" in text
+    assert "unreadable" in text
+
+
+def test_signal_engine_renders_clean_unavailable_for_alignment_mismatch():
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "TST",
+        "available": False,
+        "reason": "active_pairs_alignment_mismatch",
+        "chart_rows": [],
+        "recent_rows": [],
+    }
+    text = _signal_engine_text(payload)
+    assert "TST Signal Engine" in text
+    assert "inconsistent shape" in text
+
+
+def test_signal_engine_handles_empty_payload():
+    """First boot before the cache callback fires; the section
+    must still render cleanly."""
+    text = _signal_engine_text(None)
+    assert "Signal Engine" in text
+    assert "No saved Signal Engine data" in text
+
+
+def test_signal_engine_store_callback_returns_payload(tmp_path: Path):
+    """Drive the store-update callback with a pre-built tmp cache
+    so the real disk path is exercised without monkeypatch
+    surgery. The callback must return the
+    primary_signal_engine_payload_v1 schema."""
+    pytest.importorskip("dash")
+    import pickle as _pickle
+    cache_dir = tmp_path / "cache_results"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    idx = pd.bdate_range("2024-01-02", periods=5)
+    df = pd.DataFrame({"Close": [100.0, 110.0, 105.0, 102.0, 108.0]},
+                      index=idx)
+    obj = {
+        "preprocessed_data": df,
+        "active_pairs": [
+            "None", "Buy 3,2", "Buy 3,2", "Short 1,5", "Short 1,5",
+        ],
+    }
+    with (cache_dir / "TST_precomputed_results.pkl").open("wb") as fh:
+        _pickle.dump(obj, fh)
+
+    # Patch the module's default cache dir resolver so the
+    # callback finds our fixture without us reaching into the
+    # callback machinery.
+    import primary_signal_engine as pse
+    original = pse._default_cache_dir
+    pse._default_cache_dir = lambda: cache_dir
+    try:
+        app = preview.build_app()
+        cb = app.callback_map["signal-engine-store.data"]["callback"]
+        inner = getattr(cb, "__wrapped__", cb)
+        out = inner("TST", 0, 0)
+        assert isinstance(out, dict)
+        assert out["schema"] == "primary_signal_engine_payload_v1"
+        assert out["available"] is True
+        assert out["ticker"] == "TST"
+        assert len(out["chart_rows"]) == 5
+        assert out["current_signal"] == "Short"
+        assert out["current_active_pair_raw"] == "Short 1,5"
+    finally:
+        pse._default_cache_dir = original
+
+
+def test_signal_engine_callback_returns_unavailable_for_missing_ticker(
+    tmp_path: Path,
+):
+    pytest.importorskip("dash")
+    import primary_signal_engine as pse
+    original = pse._default_cache_dir
+    pse._default_cache_dir = lambda: tmp_path
+    try:
+        app = preview.build_app()
+        cb = app.callback_map["signal-engine-store.data"]["callback"]
+        inner = getattr(cb, "__wrapped__", cb)
+        out = inner("DOES_NOT_EXIST", 0, 0)
+        assert out["available"] is False
+        assert out["reason"] == "cache_missing"
+    finally:
+        pse._default_cache_dir = original
+
+
+def test_signal_engine_left_status_reflects_payload():
+    """The signal-engine-status div in the left rail should
+    summarize the loaded ticker + current signal + saved range
+    when a payload is available."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    cb = app.callback_map["signal-engine-status.children"]["callback"]
+    inner = getattr(cb, "__wrapped__", cb)
+    out = inner({
+        "ticker": "SPY",
+        "available": True,
+        "current_signal": "Buy",
+        "current_active_pair_raw": "Buy 3,2",
+        "date_range": {"start": "1993-01-29", "end": "2026-05-04"},
+    })
+    assert "SPY" in out
+    assert "Buy" in out
+    assert "1993-01-29" in out
+
+
+def test_signal_engine_left_status_handles_unavailable():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    cb = app.callback_map["signal-engine-status.children"]["callback"]
+    inner = getattr(cb, "__wrapped__", cb)
+    out = inner({"available": False, "reason": "cache_missing"})
+    assert "No saved Signal Engine data" in out
+
+
+def test_advanced_research_catalogue_collapsed_below_signal_engine():
+    """The catalogue browser, catalogue health, performance row,
+    and the per-ticker dashboard must all live INSIDE the
+    advanced-research-catalogue-details element so they no
+    longer dominate the first viewport."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    found = {"advanced_open": None}
+
+    def _walk(n):
+        if n is None or isinstance(n, str):
+            return
+        if isinstance(n, (list, tuple)):
+            for c in n:
+                _walk(c)
+            return
+        nid = getattr(n, "id", None)
+        if nid == "advanced-research-catalogue-details":
+            found["advanced_open"] = bool(getattr(n, "open", True))
+        children = getattr(n, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    # The Details element exists.
+    assert found["advanced_open"] is not None, (
+        "advanced-research-catalogue-details must wrap the catalogue "
+        "browser / health / dashboard sections"
+    )
+    # And it is collapsed by default so the Signal Engine has the
+    # first viewport to itself.
+    assert found["advanced_open"] is False
+
+
+def test_public_mode_signal_engine_callback_does_not_call_live(
+    monkeypatch, tmp_path,
+):
+    """Public read-only mode must not change the Signal Engine
+    behavior - it remains a pure cache read - and must never
+    reach for live engines."""
+    pytest.importorskip("dash")
+    monkeypatch.setenv("PRJCT9_PUBLIC_READ_ONLY", "1")
+    import importlib
+    p = importlib.reload(preview)
+    try:
+        assert p.PUBLIC_READ_ONLY is True
+        # Poison live modules.
+        import sys as _sys
+        sentinel: list[str] = []
+
+        class _Boom:
+            def __getattr__(self, n):
+                sentinel.append(n)
+                raise RuntimeError(
+                    f"public-mode signal engine touched live: {n}"
+                )
+
+        for mod in (
+            "yfinance", "impactsearch", "spymaster", "stackbuilder",
+            "trafficflow", "onepass",
+        ):
+            monkeypatch.setitem(_sys.modules, mod, _Boom())
+
+        # Build a tmp cache so the read returns success.
+        import pickle as _pickle
+        idx = pd.bdate_range("2024-01-02", periods=3)
+        df = pd.DataFrame({"Close": [1.0, 2.0, 3.0]}, index=idx)
+        obj = {
+            "preprocessed_data": df,
+            "active_pairs": ["None", "Buy 3,2", "Buy 3,2"],
+        }
+        cache_dir = tmp_path / "cache_results"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with (cache_dir / "TST_precomputed_results.pkl").open("wb") as fh:
+            _pickle.dump(obj, fh)
+
+        import primary_signal_engine as pse
+        original = pse._default_cache_dir
+        pse._default_cache_dir = lambda: cache_dir
+        try:
+            app = p.build_app()
+            cb = app.callback_map["signal-engine-store.data"]["callback"]
+            inner = getattr(cb, "__wrapped__", cb)
+            out = inner("TST", 0, 0)
+            assert out["available"] is True
+            assert sentinel == [], (
+                f"public-mode signal engine called live: {sentinel!r}"
+            )
+        finally:
+            pse._default_cache_dir = original
+    finally:
+        monkeypatch.delenv("PRJCT9_PUBLIC_READ_ONLY", raising=False)
+        importlib.reload(preview)
+
+
+def test_signal_engine_section_avoids_developer_only_words():
+    """Banned-words audit on the Signal Engine first-screen
+    surface."""
+    payload = {
+        "ticker": "SPY", "available": True, "reason": None,
+        "date_range": {"start": "1993-01-29", "end": "2026-05-04"},
+        "current_signal": "Buy", "current_active_pair_raw": "Buy 3,2",
+        "current_sma_pair": [3, 2],
+        "total_capture_pct": 100.0, "sharpe_ratio": 1.0,
+        "signal_days": 50, "win_rate_pct": 60.0,
+        "latest_close": 100.0,
+        "chart_rows": [
+            {"date": "2024-01-02", "close": 100.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 0.0,
+             "cumulative_capture_pct": 0.0},
+        ],
+        "recent_rows": [],
+    }
+    text = _signal_engine_text(payload).lower()
+    for tok in (
+        "artifact", "manifest", "sidecar", "schema", "dataframe",
+        "pickle", "output directory", "callback", "fastpath",
+        "bounded",
+    ):
+        assert tok not in text, (
+            f"banned developer-only term {tok!r} leaked into "
+            "Signal Engine section"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6C-5 amendment: isolate Signal Engine from legacy Advanced loads
+# ---------------------------------------------------------------------------
+
+
+def test_first_screen_view_button_uses_isolated_id():
+    """The first-screen primary button must NOT share id="btn-load"
+    with the legacy _on_action callback. The amendment renames it
+    to id="btn-view-signal-engine"."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    found_ids: list[str] = []
+
+    def _walk(n):
+        if n is None or isinstance(n, str):
+            return
+        if isinstance(n, (list, tuple)):
+            for c in n:
+                _walk(c)
+            return
+        nid = getattr(n, "id", None)
+        if isinstance(nid, str):
+            found_ids.append(nid)
+        children = getattr(n, "children", None)
+        if children is not None:
+            _walk(children)
+
+    _walk(app.layout)
+    assert "btn-view-signal-engine" in found_ids, (
+        "first-screen primary button must use id='btn-view-signal-engine'"
+    )
+    # btn-load still exists but lives inside Advanced.
+    assert "btn-load" in found_ids
+
+
+def test_signal_engine_store_listens_only_to_isolated_inputs():
+    """The signal-engine-store callback must listen on
+    target-ticker / btn-view-signal-engine / btn-refresh-saved-view
+    and NOT on btn-load. That isolation prevents the first-screen
+    View ticker click from triggering the legacy _on_action path
+    behind the demoted Advanced section."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["signal-engine-store.data"]
+    inputs = entry.get("inputs") or []
+    ids = [
+        i.get("id") if isinstance(i, dict)
+        else getattr(i, "component_id", "")
+        for i in inputs
+    ]
+    assert "target-ticker" in ids
+    assert "btn-view-signal-engine" in ids
+    assert "btn-refresh-saved-view" in ids
+    assert "btn-load" not in ids, (
+        "signal-engine-store must NOT listen on btn-load - "
+        "that would re-couple the MVP first screen to the "
+        "legacy _on_action saved-study path."
+    )
+
+
+def test_on_action_callback_keeps_btn_load_input():
+    """_on_action retains its btn-load Input - but the button
+    is now inside Advanced cross-ticker tools, not the first
+    screen. This test confirms the input is still wired so the
+    Advanced 'Load cross-ticker study' click still works."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    target = None
+    for key, entry in app.callback_map.items():
+        if "results-store.data" in key:
+            inputs = entry.get("inputs") or []
+            ids = [
+                i.get("id") if isinstance(i, dict)
+                else getattr(i, "component_id", "")
+                for i in inputs
+            ]
+            if "btn-load" in ids and "btn-run" in ids:
+                target = entry
+                break
+    assert target is not None, (
+        "_on_action callback (results-store / meta-store / log-store) "
+        "must remain wired to btn-load + btn-run"
+    )
+
+
+def test_advanced_cross_ticker_tools_contains_load_button():
+    """The renamed btn-load button must live INSIDE
+    advanced-tools-details so it is collapsed by default."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    found = {"btn_load_under_advanced": False}
+
+    def _walk(node, in_advanced=False):
+        if node is None or isinstance(node, str):
+            return
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                _walk(c, in_advanced=in_advanced)
+            return
+        nid = getattr(node, "id", None)
+        local_in_advanced = in_advanced or (
+            nid == "advanced-tools-details"
+        )
+        if nid == "btn-load" and local_in_advanced:
+            found["btn_load_under_advanced"] = True
+        children = getattr(node, "children", None)
+        if children is not None:
+            _walk(children, in_advanced=local_in_advanced)
+
+    _walk(app.layout)
+    assert found["btn_load_under_advanced"], (
+        "btn-load must live inside advanced-tools-details"
+    )
+
+
+def test_first_screen_renders_load_cross_ticker_study_label():
+    """The Advanced-only legacy loader must use a clearly-
+    labelled button 'Load cross-ticker study'."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    text = _extract_ui_text(app.layout)
+    assert "Load cross-ticker study" in text
+    assert "View ticker" in text
+    # First-screen primary action label must NOT be the legacy
+    # "Open saved ticker study".
+    assert "Open saved ticker study" not in text
+
+
+def test_view_ticker_click_does_not_trigger_legacy_engine_helpers(monkeypatch):
+    """Drive the signal-engine-store callback with a
+    btn-view-signal-engine click and assert none of the legacy
+    helpers (_resolve_xlsx_for_target, _load_impactsearch_xlsx,
+    _run_live_preview, _on_action's _do_load) are called."""
+    pytest.importorskip("dash")
+
+    # Poison every legacy load path. If any of them is touched,
+    # the test fails loudly.
+    sentinel: list[str] = []
+
+    def _make_stub(name):
+        def _boom(*a, **kw):
+            sentinel.append(name)
+            raise RuntimeError(
+                f"View ticker triggered legacy path: {name}"
+            )
+        return _boom
+
+    for name in (
+        "_resolve_xlsx_for_target",
+        "_load_impactsearch_xlsx",
+        "_run_live_preview",
+    ):
+        monkeypatch.setattr(preview, name, _make_stub(name))
+
+    # Poison live engine modules too.
+    import sys as _sys
+    for mod in (
+        "yfinance", "impactsearch", "spymaster", "stackbuilder",
+        "trafficflow", "onepass",
+    ):
+        class _Boom:
+            def __getattr__(self, n, _name=mod):
+                sentinel.append(f"{_name}.{n}")
+                raise RuntimeError(
+                    f"View ticker triggered live module: {_name}.{n}"
+                )
+        monkeypatch.setitem(_sys.modules, mod, _Boom())
+
+    app = preview.build_app()
+    cb = app.callback_map["signal-engine-store.data"]["callback"]
+    inner = getattr(cb, "__wrapped__", cb)
+    out = inner("SPY", 1, 0)
+    assert isinstance(out, dict)
+    assert sentinel == [], (
+        f"View ticker click triggered legacy paths: {sentinel!r}"
+    )
+
+
+def test_boot_trigger_does_not_auto_load_legacy_research():
+    """The boot-trigger no longer auto-loads the legacy ImpactSearch
+    cockpit. The _on_action branch for boot-trigger must return
+    no_update / no_update / no_update so the page open does not
+    consume the heavy saved-study walk."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    # Find _on_action by output triplet (results / meta / log) +
+    # boot-trigger Input.
+    target = None
+    for key, entry in app.callback_map.items():
+        if "results-store.data" not in key:
+            continue
+        inputs = entry.get("inputs") or []
+        ids = [
+            i.get("id") if isinstance(i, dict)
+            else getattr(i, "component_id", "")
+            for i in inputs
+        ]
+        if "boot-trigger" in ids and "btn-load" in ids:
+            target = entry["callback"]
+            break
+    assert target is not None
+    inner = getattr(target, "__wrapped__", target)
+
+    import dash
+    import unittest.mock as _mock
+    with _mock.patch.object(
+        dash.callback_context.__class__, "triggered",
+        property(lambda self: [
+            {"prop_id": "boot-trigger.n_intervals", "value": 1},
+        ]),
+    ):
+        # Signature: (_load_n, _run_n, boot_n, dropdown_value,
+        # target, preset, custom_text, log, current_results)
+        out = inner(0, 0, 1, None, "SPY", "Custom", "", [], None)
+    # All three outputs must be no_update (Dash's sentinel).
+    import dash as _dash
+    assert isinstance(out, tuple) and len(out) == 3
+    for o in out:
+        assert o is _dash.no_update, (
+            "boot-trigger branch of _on_action must return "
+            "no_update everywhere; auto-loading legacy research is "
+            "an MVP regression"
+        )
+
+
+def test_catalogue_snapshot_store_only_fires_on_explicit_refresh():
+    """Phase 6C-5 amendment: the catalogue-snapshot-store callback
+    must only listen on btn-refresh-catalogue-index.n_clicks. The
+    earlier wiring fired on every meta-store change (i.e. every
+    page boot), which rebuilt cross-ticker state behind a
+    collapsed Advanced block. The MVP first screen should not pay
+    that cost."""
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-snapshot-store.data"]
+    inputs = entry.get("inputs") or []
+    ids = [
+        i.get("id") if isinstance(i, dict)
+        else getattr(i, "component_id", "")
+        for i in inputs
+    ]
+    assert ids == ["btn-refresh-catalogue-index"], (
+        "catalogue-snapshot-store must only listen on the "
+        f"explicit Refresh button; got Inputs {ids!r}"
+    )
+
+
+def test_catalogue_health_store_only_fires_on_explicit_refresh():
+    pytest.importorskip("dash")
+    app = preview.build_app()
+    entry = app.callback_map["catalogue-health-store.data"]
+    inputs = entry.get("inputs") or []
+    ids = [
+        i.get("id") if isinstance(i, dict)
+        else getattr(i, "component_id", "")
+        for i in inputs
+    ]
+    assert ids == ["btn-refresh-health-report"], (
+        "catalogue-health-store must only listen on the explicit "
+        f"Refresh button; got Inputs {ids!r}"
+    )
+
+
+def test_first_screen_still_shows_signal_engine_after_amendment():
+    """Sanity: the directional reset is preserved end-to-end.
+    Render the Signal Engine section with a representative
+    payload and confirm the required vocabulary is on screen."""
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "SPY",
+        "available": True,
+        "reason": None,
+        "date_range": {"start": "1993-01-29", "end": "2026-05-04"},
+        "current_signal": "Short",
+        "current_active_pair_raw": "Short 11,5",
+        "current_sma_pair": [11, 5],
+        "total_capture_pct": 201.14,
+        "sharpe_ratio": 0.061,
+        "signal_days": 8256,
+        "win_rate_pct": 50.48,
+        "latest_close": 718.01,
+        "chart_rows": [
+            {"date": "2024-01-02", "close": 100.0, "signal": "Buy",
+             "raw_active_pair": "Buy 3,2",
+             "daily_capture_pct": 0.0,
+             "cumulative_capture_pct": 0.0},
+        ],
+        "recent_rows": [],
+        "metric_basis":
+            "Spymaster cache (preprocessed_data + active_pairs)",
+    }
+    text = _signal_engine_text(payload)
+    assert "SPY Signal Engine" in text
+    assert "Current Signal" in text
+    assert "Active SMA Pair" in text
+    assert "Cumulative Capture (%)" in text
+    assert "Sharpe Ratio" in text
+    assert "Signal Days" in text
+
+
+def test_recent_history_table_wrapped_for_mobile_overflow():
+    """Mobile polish: the Recent Signal History table must live
+    inside a wrapper that contains horizontal overflow so the
+    page itself never gets a horizontal scrollbar."""
+    src = (PROJECT_DIR / "phase6_research_preview.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="signal-engine-recent-table-wrap"' in src, (
+        "Recent Signal History table must be wrapped in a "
+        "container that contains its own horizontal scroll."
+    )
