@@ -21,3 +21,6 @@ test_*.py
 # Temporary outputs
 *.txt
 !requirements.txt
+
+# Codex (emdash) local tool config — keep out of repo
+.codex/config.toml
