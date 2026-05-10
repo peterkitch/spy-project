@@ -1092,6 +1092,141 @@ def _build_confluence_artifact_for_target(
         return None, "write_failed"
 
 
+def _read_trafficflow_artifact_for_run(target: str, run_id: str):
+    """Phase 6B-4: read the saved TrafficFlow day-by-day artifact for
+    (``target``, ``run_id``) when present. Returns None for missing /
+    corrupt files."""
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None
+    path = ra.artifact_path_for_trafficflow(target, run_id)
+    if path is None:
+        return None
+    return ra.read_research_day_artifact(path)
+
+
+def _build_trafficflow_artifact_for_top_run(
+    target: str,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Phase 6B-4: materialize a TrafficFlow day-by-day pressure
+    artifact for the top leaderboard row of the studied ticker's
+    most recent saved StackBuilder run.
+
+    Returns ``(path, None)`` on success or ``(None, reason_code)``
+    when a step in the pipeline cannot resolve. ``reason_code`` is
+    one of:
+
+      - ``"no_run"``            : no saved StackBuilder run for the
+                                  target (TrafficFlow needs the
+                                  run's member list to drive the
+                                  per-day pressure rebuild).
+      - ``"target_cache_missing"`` : target Spymaster cache PKL absent
+                                     (needed for the daily Close
+                                     series).
+      - ``"no_member_caches"``  : no readable member cache PKLs.
+      - ``"write_failed"``      : artifact built but write to disk
+                                  failed.
+      - ``"engine_unavailable"``: ``research_artifacts`` import
+                                  failed.
+
+    Strictly local; no network. Never imports trafficflow / spymaster.
+    """
+    try:
+        import research_artifacts as ra
+    except Exception:
+        return None, "engine_unavailable"
+    if not target or not isinstance(target, str):
+        return None, "no_run"
+    safe = target.strip().upper()
+    runs = _discover_stack_runs(_stack_output_dir())
+    target_runs = [r for r in runs if r["ticker"].upper() == safe]
+    if not target_runs:
+        return None, "no_run"
+    run = target_runs[0]
+    run_id = run.get("run_dir") or run.get("run_name")
+    if not run_id:
+        return None, "no_run"
+    lb = _load_stack_leaderboard(run["run_path"])
+    if lb is None or lb.empty:
+        return None, "no_run"
+    if "Members" not in lb.columns:
+        return None, "no_run"
+    members_str = str(lb["Members"].iloc[0])
+    K_val: Optional[int] = None
+    if "K" in lb.columns:
+        try:
+            K_val = int(pd.to_numeric(lb["K"], errors="coerce").iloc[0])
+        except Exception:
+            K_val = None
+
+    cache_base = _spymaster_cache_dir()
+    # Phase 6B-4 Amendment: real-form-first cache resolution. Real
+    # local files retain the original symbol (^GSPC); the filename-
+    # safe form (_GSPC) is the artifact-output form. The preflight
+    # was previously only probing the filename-safe form, which
+    # produced spurious target_cache_missing / no_member_caches
+    # codes for caret-style indices.
+    target_pkl, _target_form = ra._resolve_local_target_cache_path(
+        target, cache_base,
+    )
+    if target_pkl is None:
+        return None, "target_cache_missing"
+    parsed_members = ra.parse_stack_members_with_protocol(members_str)
+    any_member_readable = False
+    for ticker, _proto in parsed_members:
+        m_path, _m_form = ra._resolve_local_target_cache_path(
+            ticker, cache_base,
+        )
+        if m_path is not None and m_path.is_file():
+            any_member_readable = True
+            break
+    if not any_member_readable:
+        return None, "no_member_caches"
+
+    overrides = {
+        "total_capture_pct": (
+            lb["Total Capture (%)"].iloc[0]
+            if "Total Capture (%)" in lb.columns else None
+        ),
+        "sharpe_ratio": (
+            lb["Sharpe Ratio"].iloc[0]
+            if "Sharpe Ratio" in lb.columns else None
+        ),
+        "trigger_days": (
+            lb["Trigger Days"].iloc[0]
+            if "Trigger Days" in lb.columns else None
+        ),
+        "p_value": (
+            lb["p-Value"].iloc[0]
+            if "p-Value" in lb.columns else None
+        ),
+        "significant_95": (
+            (
+                str(lb["Significant 95%"].iloc[0]).strip().upper()
+                == "YES"
+            )
+            if "Significant 95%" in lb.columns else None
+        ),
+    }
+    artifact = ra.build_trafficflow_day_artifact_from_local(
+        target, run_id,
+        members_str=members_str,
+        K=K_val,
+        cache_dir=cache_base,
+        summary_overrides=overrides,
+    )
+    if artifact is None:
+        return None, "no_member_caches"
+    path = ra.artifact_path_for_trafficflow(target, run_id)
+    if path is None:
+        return None, "write_failed"
+    try:
+        return ra.write_research_day_artifact(artifact, path), None
+    except Exception:
+        return None, "write_failed"
+
+
 # Confluence stack: per-timeframe stable library suffixes. Mirrors
 # the order used by ``_timeframe_coverage_for_ticker``.
 _CONFLUENCE_TIMEFRAMES: list[tuple[str, str]] = [
@@ -2805,6 +2940,71 @@ def build_app() -> Any:
             return log[-200:]
         log.append(
             f"[{ts}] saved confluence chart data for {target}. "
+            "Re-open the saved ticker study to refresh the chart."
+        )
+        return log[-200:]
+
+    @app.callback(
+        Output("log-store", "data", allow_duplicate=True),
+        Input("btn-build-trafficflow-chart-data", "n_clicks"),
+        State("meta-store", "data"),
+        State("log-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _build_trafficflow_chart_data_action(_clicks, meta, log):
+        """Phase 6B-4 single-row TrafficFlow artifact generator.
+        Builds and saves exactly one ``research_day_v1`` artifact
+        for the studied ticker's most recent saved StackBuilder
+        run. Bounded, offline, error-trapped."""
+        log = list(log or [])
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        target = (meta or {}).get("target") or DEFAULT_TARGET
+        target = str(target).strip().upper()
+        try:
+            path, reason = _build_trafficflow_artifact_for_top_run(
+                target,
+            )
+        except Exception as exc:
+            log.append(
+                f"[{ts}] build traffic flow chart data failed for "
+                f"{target}: {type(exc).__name__}: {exc}"
+            )
+            return log[-200:]
+        if path is None:
+            if reason == "no_run":
+                msg = (
+                    f"build traffic flow chart data: no saved "
+                    f"combined-signal run found for {target}."
+                )
+            elif reason == "target_cache_missing":
+                msg = (
+                    f"build traffic flow chart data: {target} "
+                    "price cache missing on this computer."
+                )
+            elif reason == "no_member_caches":
+                msg = (
+                    f"build traffic flow chart data: stack member "
+                    f"caches are missing for {target}."
+                )
+            elif reason == "write_failed":
+                msg = (
+                    f"build traffic flow chart data: artifact built "
+                    f"for {target} but the file could not be saved."
+                )
+            elif reason == "engine_unavailable":
+                msg = (
+                    "build traffic flow chart data: research artifact "
+                    "engine unavailable; restart the launcher."
+                )
+            else:
+                msg = (
+                    f"build traffic flow chart data: unknown failure "
+                    f"for {target}."
+                )
+            log.append(f"[{ts}] {msg}")
+            return log[-200:]
+        log.append(
+            f"[{ts}] saved traffic flow chart data for {target}. "
             "Re-open the saved ticker study to refresh the chart."
         )
         return log[-200:]
@@ -4838,6 +5038,16 @@ def build_app() -> Any:
     def _render_traffic_flow_section(meta):
         """Traffic Flow detail section.
 
+        Phase 6B-4: when a saved TrafficFlow day-by-day pressure
+        artifact exists for the studied ticker's top stack run, the
+        section renders a real Pressure Over Time chart + a compact
+        pressure distribution summary, sourced exclusively from the
+        saved JSON. When no artifact exists, the section falls back
+        to the read-only snapshot built from each member's latest
+        cached signal (preserving the prior cockpit behavior). The
+        bounded "Build traffic flow chart data" button materializes
+        the artifact for the studied ticker.
+
         Real read-only snapshot: parse the top stack's members from
         the saved StackBuilder leaderboard, read each member's latest
         Spymaster signal, count Buy / Short / None, render the member
@@ -4855,6 +5065,64 @@ def build_app() -> Any:
                    "lineHeight": "1.5",
                    "marginBottom": "8px"},
         ))
+
+        # Phase 6B-4 artifact + build-button block. Threaded through
+        # both render branches (snapshot success, no-runs fallback)
+        # so the user can always see whether saved TrafficFlow chart
+        # data exists and can always reach the build button.
+        runs = _discover_stack_runs(_stack_output_dir())
+        target_runs = [
+            r for r in runs if r["ticker"].upper() == target
+        ]
+        run_id_for_artifact = (
+            (
+                target_runs[0].get("run_dir")
+                or target_runs[0].get("run_name")
+            )
+            if target_runs else None
+        )
+
+        def _append_trafficflow_artifact_block():
+            traffic_artifact = (
+                _read_trafficflow_artifact_for_run(
+                    target, run_id_for_artifact,
+                )
+                if run_id_for_artifact else None
+            )
+            if (
+                traffic_artifact is not None
+                and traffic_artifact.daily
+            ):
+                body.append(
+                    _render_trafficflow_pressure_chart(
+                        traffic_artifact,
+                    ),
+                )
+                body.append(
+                    _render_trafficflow_pressure_distribution(
+                        traffic_artifact,
+                    ),
+                )
+            else:
+                body.append(html.Div(
+                    "Traffic flow chart data has not been built yet.",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "11px",
+                           "lineHeight": "1.5",
+                           "marginTop": "8px"},
+                ))
+            body.append(html.Button(
+                "Build traffic flow chart data",
+                id="btn-build-trafficflow-chart-data",
+                n_clicks=0,
+                style={**btn_style,
+                       "marginTop": "8px",
+                       "marginBottom": "0",
+                       "width": "100%",
+                       "boxSizing": "border-box",
+                       "fontSize": "11px"},
+            ))
+
         snap = _traffic_flow_snapshot_for_target(target)
         if snap is None or not snap.get("members"):
             body.append(html.Div(
@@ -4865,6 +5133,7 @@ def build_app() -> Any:
                        "fontSize": "11px",
                        "lineHeight": "1.5"},
             ))
+            _append_trafficflow_artifact_block()
             return _section_wrapper(
                 "traffic-flow-detail",
                 "TRAFFIC FLOW",
@@ -5016,11 +5285,187 @@ def build_app() -> Any:
                    "lineHeight": "1.5",
                    "marginTop": "8px"},
         ))
+        _append_trafficflow_artifact_block()
         return _section_wrapper(
             "traffic-flow-detail",
             "TRAFFIC FLOW",
             "combined signal pressure across stack members",
             body,
+        )
+
+    def _render_trafficflow_pressure_chart(artifact):
+        """Render the saved TrafficFlow day-by-day artifact's
+        cumulative pressure-capture as a single Plotly line.
+        Sourced exclusively from the saved artifact -- never
+        reconstructs."""
+        try:
+            import plotly.graph_objects as go
+        except Exception:
+            return html.Div(
+                "Plotly unavailable; cannot draw traffic flow chart.",
+                style={"color": PRJCT9_MUTED, "fontSize": "11px"},
+            )
+        daily = artifact.daily or []
+        dates = [r.get("date") for r in daily]
+        cum = [r.get("cumulative_capture_pct") or 0.0 for r in daily]
+        signals = [r.get("pressure_signal") for r in daily]
+        daily_caps = [r.get("daily_capture_pct") or 0.0 for r in daily]
+        member_signals = [
+            r.get("member_signals") or {} for r in daily
+        ]
+        hover = []
+        for d, sig, ms, dc, cc in zip(
+            dates, signals, member_signals, daily_caps, cum,
+        ):
+            members_text = " / ".join(
+                f"{k}: {v}" for k, v in ms.items()
+            )
+            hover.append(
+                f"{d}<br>"
+                f"Pressure: {sig}<br>"
+                f"Members: {members_text}<br>"
+                f"Daily Capture: {dc:.4f}%<br>"
+                f"Cumulative Capture: {cc:.4f}%"
+            )
+        fig = go.Figure(go.Scatter(
+            x=dates, y=cum, mode="lines",
+            line={"color": PRJCT9_GREEN, "width": 1.4},
+            hovertext=hover, hoverinfo="text",
+        ))
+        fig.add_hline(
+            y=0.0, line_color=PRJCT9_BORDER, line_width=1,
+        )
+        member_label = ", ".join(artifact.members or [])[:80]
+        fig.update_layout(
+            paper_bgcolor=PRJCT9_BLACK,
+            plot_bgcolor=PRJCT9_BLACK,
+            font={"color": PRJCT9_TEXT,
+                  "family": "Consolas, monospace"},
+            xaxis={"gridcolor": PRJCT9_BORDER, "title": "Date"},
+            yaxis={"gridcolor": PRJCT9_BORDER,
+                   "title": "Cumulative Capture (%)"},
+            margin={"l": 56, "r": 12, "t": 28, "b": 36},
+            height=220,
+            title={
+                "text": (
+                    "Traffic Flow Pressure Over Time"
+                    + (
+                        f" - {artifact.target_ticker}"
+                        f" ({member_label})"
+                        if member_label else
+                        f" - {artifact.target_ticker}"
+                    )
+                ),
+                "font": {"color": PRJCT9_GREEN, "size": 12},
+            },
+        )
+        summary = artifact.summary or {}
+        final_cum = (
+            float(cum[-1]) if cum and cum[-1] is not None else None
+        )
+        rec_lines: list = []
+        if final_cum is not None:
+            rec_lines.append(
+                f"Final Cumulative Capture (%): {final_cum:.2f}"
+            )
+        trig = summary.get("rebuilt_trigger_days")
+        if trig is not None:
+            rec_lines.append(f"Signal-day capture: {int(trig)}")
+        return html.Div(
+            id="trafficflow-pressure-chart",
+            style={"marginTop": "10px",
+                   "border": f"1px solid {PRJCT9_BORDER}",
+                   "padding": "6px 8px"},
+            children=[
+                html.Div(
+                    "Chart data: exact saved traffic flow path",
+                    id="trafficflow-chart-source",
+                    style={"color": PRJCT9_GREEN,
+                           "fontSize": "10px",
+                           "letterSpacing": "1px",
+                           "textTransform": "uppercase",
+                           "marginBottom": "4px"},
+                ),
+                html.Div(
+                    " | ".join(rec_lines),
+                    id="trafficflow-reconciliation-line",
+                    style={"color": PRJCT9_TEXT,
+                           "fontSize": "11px",
+                           "marginTop": "2px",
+                           "marginBottom": "4px"},
+                ) if rec_lines else html.Div(),
+                html.Div(
+                    "Signal-day capture, not portfolio return: "
+                    "the cumulative line sums what the pressure "
+                    "signal would have captured each trigger day, "
+                    "without trade-cost or position-sizing "
+                    "assumptions.",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "fontStyle": "italic",
+                           "marginBottom": "4px"},
+                ),
+                dcc.Graph(figure=fig, config={"displayModeBar": False}),
+            ],
+        )
+
+    def _render_trafficflow_pressure_distribution(artifact):
+        """Render a compact pressure-count summary for the saved
+        TrafficFlow artifact: one row per pressure value (Buy /
+        Short / None), with the day-count from
+        ``summary.pressure_counts``."""
+        summary = artifact.summary or {}
+        counts = summary.get("pressure_counts") or {}
+        order = [
+            ("Buy pressure", "buy"),
+            ("Short pressure", "short"),
+            ("None / mixed", "none"),
+        ]
+        rows = []
+        for label, key in order:
+            cnt = counts.get(key)
+            try:
+                cnt_str = str(int(cnt)) if cnt is not None else "0"
+            except (TypeError, ValueError):
+                cnt_str = "0"
+            rows.append({"Pressure": label, "Days": cnt_str})
+        return html.Div(
+            id="trafficflow-pressure-distribution",
+            style={"marginTop": "8px"},
+            children=[
+                html.Div(
+                    "PRESSURE DISTRIBUTION",
+                    style={"color": PRJCT9_MUTED,
+                           "fontSize": "10px",
+                           "letterSpacing": "1px",
+                           "marginBottom": "4px"},
+                ),
+                dash_table.DataTable(
+                    columns=[
+                        {"name": "Pressure", "id": "Pressure"},
+                        {"name": "Days", "id": "Days"},
+                    ],
+                    data=rows,
+                    style_table={"overflowX": "auto"},
+                    style_cell={
+                        "backgroundColor": PRJCT9_BLACK,
+                        "color": PRJCT9_TEXT,
+                        "fontFamily": "Consolas, 'Courier New', monospace",
+                        "fontSize": "11px",
+                        "padding": "4px 8px",
+                        "border": f"1px solid {PRJCT9_BORDER}",
+                        "textAlign": "left",
+                    },
+                    style_header={
+                        "backgroundColor": PRJCT9_DIM,
+                        "color": PRJCT9_GREEN,
+                        "fontWeight": "bold",
+                        "border": f"1px solid {PRJCT9_GREEN}",
+                        "letterSpacing": "1px",
+                        "fontSize": "10px",
+                    },
+                ),
+            ],
         )
 
     def _render_market_scan_section(meta):

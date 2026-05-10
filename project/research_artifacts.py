@@ -1708,17 +1708,23 @@ def build_confluence_day_artifact(
     )
 
 
-def _confluence_ticker_form_candidates(
+def _local_ticker_form_candidates(
     ticker: str,
 ) -> list[str]:
     """Return ordered, de-duplicated ticker-name forms to try when
-    looking up local Confluence input files.
+    looking up local input PKLs (Spymaster cache, signal-library
+    stable, etc.).
 
     Real local PKLs typically retain the original ticker (e.g.,
     ``^GSPC_precomputed_results.pkl``). The filename-safe form
     (``_GSPC``) is the artifact-output form. Some data flows save
     one, some save the other, so reads must try the real form first
     and the filename-safe form second.
+
+    Engine-agnostic. Used by the Confluence from-local builder
+    (Phase 6B-3), the TrafficFlow from-local builder (Phase 6B-4),
+    and the preview's preflight checks for both engines, so all
+    callers share one resolver and avoid drifting apart.
     """
     real = str(ticker or "").strip().upper()
     safe = _normalize_ticker_for_filename(ticker)
@@ -1727,6 +1733,12 @@ def _confluence_ticker_form_candidates(
         if f and f not in forms:
             forms.append(f)
     return forms
+
+
+# Backward-compat alias: Phase 6B-3 introduced this helper under the
+# ``_confluence_*`` name. Kept for the existing tests + any external
+# callers; new code uses the engine-agnostic name.
+_confluence_ticker_form_candidates = _local_ticker_form_candidates
 
 
 def _resolve_local_target_cache_path(
@@ -1743,7 +1755,7 @@ def _resolve_local_target_cache_path(
     path so callers can pass that exact form into helpers that
     re-derive a filename later.
     """
-    for form in _confluence_ticker_form_candidates(ticker):
+    for form in _local_ticker_form_candidates(ticker):
         p = cache_base / f"{form}_precomputed_results.pkl"
         if p.exists():
             return p, form
@@ -1760,7 +1772,7 @@ def _resolve_local_signal_library_form(
     (e.g. ``^GSPC``) wins over the filename-safe form (``_GSPC``);
     returns None when neither form has any matching library file.
     """
-    for form in _confluence_ticker_form_candidates(ticker):
+    for form in _local_ticker_form_candidates(ticker):
         if (sig_base / f"{form}_stable_v1_0_0.pkl").exists():
             return form
         for tf in timeframes_list:
@@ -1929,7 +1941,7 @@ def build_confluence_day_artifact_from_local(
             real ticker form first and the filename-safe form second
             so caret-style symbols (e.g., ``^GSPC``) resolve."""
             spymaster_path = None
-            for form in _confluence_ticker_form_candidates(ticker):
+            for form in _local_ticker_form_candidates(ticker):
                 p = (
                     Path(_cache_base)
                     / f"{form}_precomputed_results.pkl"
@@ -2110,13 +2122,410 @@ def build_confluence_day_artifact_from_local(
     )
 
 
-# Phase 6B-4 / 6C scope reminders kept in source so a future
-# maintainer sees the intended extension points.
-#
-#   TODO Phase 6B-4: build_trafficflow_day_artifact(...). Daily rows
-#   gain per-member Buy/Short/None pressure + aggregate pressure
-#   counts. Path:
-#     output/research_artifacts/trafficflow/<TARGET>/<RUN_ID>.research_day.json
+# ---------------------------------------------------------------------------
+# Phase 6B-4: TrafficFlow day-by-day pressure artifacts
+# ---------------------------------------------------------------------------
+
+
+def artifact_path_for_trafficflow(
+    target_ticker: str,
+    run_id: str,
+    base_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the canonical local artifact path for a TrafficFlow
+    (target, run) pair. Returns None if either the ticker or run_id
+    normalizes to empty."""
+    safe_target = _normalize_ticker_for_filename(target_ticker)
+    if not safe_target or not run_id:
+        return None
+    safe_run = _normalize_ticker_for_filename(run_id) or str(run_id)
+    base = (
+        Path(base_dir) if base_dir is not None
+        else _project_dir() / _DEFAULT_BASE
+    )
+    folder = base / "trafficflow" / safe_target
+    return folder / f"{safe_run}.research_day.json"
+
+
+def build_trafficflow_day_artifact(
+    target_ticker: str,
+    run_id: str,
+    *,
+    dates: Sequence[Any],
+    target_close: Sequence[float],
+    member_signal_columns: Mapping[str, Sequence[Any]],
+    protocol_per_member: Optional[Mapping[str, Optional[str]]] = None,
+    K: Optional[int] = None,
+    persist_skip_bars: Optional[int] = None,
+    metric_basis: str = "Close",
+    summary_overrides: Optional[Mapping[str, Any]] = None,
+) -> ResearchDayArtifact:
+    """Build a TrafficFlow day-by-day pressure artifact from already-
+    aligned member signal columns.
+
+    The pressure rule is the same strict-unanimity combine
+    TrafficFlow uses
+    (``trafficflow._combine_positions_unanimity``):
+
+      * all active members agree on Buy  -> ``pressure_signal = "Buy"``
+      * all active members agree on Short -> ``pressure_signal = "Short"``
+      * mixed Buy and Short, or no active members -> ``"None"``
+      * members marked ``"missing"`` (cache absent / unreadable) are
+        excluded from the active set
+
+    "Active" means a member with a Buy or Short signal on that day.
+    None / Cash / missing members do NOT contribute to the agreement
+    check. This matches the TrafficFlow operator UI: "Buy pressure"
+    and "Short pressure" labels in the cockpit are renderings of
+    this underlying ``pressure_signal``.
+
+    Direct/Inverse protocol is applied here so the saved daily rows
+    reflect the post-protocol member signal each day.
+
+    Capture mapping mirrors ImpactSearch / Stack / Confluence:
+      * Buy day -> +pct_change(target_close) * 100
+      * Short day -> -pct_change(target_close) * 100
+      * None day -> 0
+    Trigger days = Buy or Short. T-1 persist skip applied to the
+    trailing N bars before the cumulative sum (default 1).
+
+    The ``K`` parameter is preserved for round-trippability with the
+    saved StackBuilder run that produced the member list. Set to the
+    saved leaderboard's K value when known. The combine rule stays
+    strict-unanimity regardless: ``K`` is metadata, not a vote
+    threshold.
+    """
+    if not isinstance(dates, (list, tuple, np.ndarray, pd.Series, pd.Index)):
+        raise TypeError("dates must be a sequence")
+    if not isinstance(target_close, (list, tuple, np.ndarray, pd.Series)):
+        raise TypeError("target_close must be a sequence")
+    if not isinstance(member_signal_columns, Mapping):
+        raise TypeError("member_signal_columns must be a mapping")
+    n = len(dates)
+    if n != len(target_close):
+        raise ValueError("dates and target_close must have equal length")
+    for member, col in member_signal_columns.items():
+        if len(col) != n:
+            raise ValueError(
+                f"member_signal_columns[{member!r}] length "
+                f"{len(col)} != dates length {n}"
+            )
+
+    skip = (
+        DEFAULT_PERSIST_SKIP_BARS if persist_skip_bars is None
+        else int(persist_skip_bars)
+    )
+    proto = dict(protocol_per_member or {})
+    members = list(member_signal_columns.keys())
+
+    df = pd.DataFrame({
+        "date": pd.to_datetime(list(dates), errors="coerce"),
+        "target_close": pd.to_numeric(
+            list(target_close), errors="coerce",
+        ),
+    })
+    for m in members:
+        df[m] = [str(v).strip() for v in member_signal_columns[m]]
+    df = df[df["date"].notna()].sort_values("date").reset_index(drop=True)
+    df["target_return_pct"] = (
+        df["target_close"].pct_change().fillna(0.0) * 100.0
+    )
+
+    pressure: list[str] = []
+    member_signal_rows: list[dict] = []
+    buy_counts: list[int] = []
+    short_counts: list[int] = []
+    none_counts: list[int] = []
+    missing_counts: list[int] = []
+    active_counts: list[int] = []
+    for _, row in df.iterrows():
+        per_member: dict[str, str] = {}
+        for m in members:
+            raw = str(row[m] or "").strip()
+            if not raw or raw.lower() == "missing":
+                per_member[m] = "missing"
+                continue
+            per_member[m] = _apply_protocol(raw, proto.get(m))
+        # Counts (post-protocol). "missing" excluded from active.
+        b = sum(1 for v in per_member.values() if v == "Buy")
+        s = sum(1 for v in per_member.values() if v == "Short")
+        nn = sum(1 for v in per_member.values() if v == "None")
+        miss = sum(1 for v in per_member.values() if v == "missing")
+        active = b + s  # Buy + Short only.
+        # Strict unanimity combine via the existing helper. K=1
+        # treats any all-active-Buy or all-active-Short row as a
+        # signal, mixed -> None. Matches
+        # trafficflow._combine_positions_unanimity exactly.
+        active_signals = {
+            mm: vv for mm, vv in per_member.items()
+            if vv in ("Buy", "Short", "None")
+        }
+        pressure.append(combine_member_signals(active_signals, K=1))
+        member_signal_rows.append(per_member)
+        buy_counts.append(b)
+        short_counts.append(s)
+        none_counts.append(nn)
+        missing_counts.append(miss)
+        active_counts.append(active)
+
+    df["pressure_signal"] = pressure
+    df["buy_count"] = buy_counts
+    df["short_count"] = short_counts
+    df["none_count"] = none_counts
+    df["missing_count"] = missing_counts
+    df["active_count"] = active_counts
+    sig_norm = df["pressure_signal"].str.lower()
+    df["daily_capture_pct"] = 0.0
+    df.loc[sig_norm.eq("buy"), "daily_capture_pct"] = (
+        df.loc[sig_norm.eq("buy"), "target_return_pct"]
+    )
+    df.loc[sig_norm.eq("short"), "daily_capture_pct"] = (
+        -df.loc[sig_norm.eq("short"), "target_return_pct"]
+    )
+    df["is_trigger_day"] = sig_norm.isin({"buy", "short"})
+
+    if skip and skip > 0 and len(df) > skip:
+        df_trim = df.iloc[:-skip].copy()
+        member_rows_trim = member_signal_rows[:-skip]
+    else:
+        df_trim = df.copy()
+        member_rows_trim = list(member_signal_rows)
+    df_trim["cumulative_capture_pct"] = (
+        df_trim["daily_capture_pct"].cumsum()
+    )
+
+    trigger_mask = df_trim["is_trigger_day"]
+    trigger_caps = df_trim.loc[trigger_mask, "daily_capture_pct"]
+    n_trigger = int(trigger_mask.sum())
+    if n_trigger > 0:
+        total_capture_pct = float(trigger_caps.sum())
+        avg_daily_capture_pct = float(trigger_caps.mean())
+        wins = int((trigger_caps > 0).sum())
+        losses = int((trigger_caps < 0).sum())
+    else:
+        total_capture_pct = 0.0
+        avg_daily_capture_pct = 0.0
+        wins = 0
+        losses = 0
+    if n_trigger > 1:
+        std_dev = float(trigger_caps.std(ddof=1))
+        sharpe_ratio = (
+            avg_daily_capture_pct / std_dev if std_dev > 0
+            else 0.0
+        )
+    else:
+        sharpe_ratio = 0.0
+
+    pressure_counts = {
+        "buy": int((df_trim["pressure_signal"] == "Buy").sum()),
+        "short": int((df_trim["pressure_signal"] == "Short").sum()),
+        "none": int((df_trim["pressure_signal"] == "None").sum()),
+    }
+
+    overrides = dict(summary_overrides or {})
+    summary: dict = {
+        "total_capture_pct": _safe_float(
+            overrides.get("total_capture_pct", total_capture_pct),
+        ),
+        "avg_daily_capture_pct": _safe_float(
+            overrides.get(
+                "avg_daily_capture_pct", avg_daily_capture_pct,
+            ),
+        ),
+        "sharpe_ratio": _safe_float(
+            overrides.get("sharpe_ratio", sharpe_ratio),
+        ),
+        "trigger_days": _safe_int(
+            overrides.get("trigger_days", n_trigger),
+        ),
+        "wins": _safe_int(overrides.get("wins", wins)),
+        "losses": _safe_int(overrides.get("losses", losses)),
+        "p_value": _safe_float(overrides.get("p_value")),
+        "significant_95": (
+            None if overrides.get("significant_95") is None
+            else bool(overrides.get("significant_95"))
+        ),
+        "rebuilt_total_capture_pct": total_capture_pct,
+        "rebuilt_sharpe_ratio": sharpe_ratio,
+        "rebuilt_trigger_days": n_trigger,
+        "pressure_counts": pressure_counts,
+    }
+
+    daily: list[dict] = []
+    for (_, row), member_row in zip(
+        df_trim.iterrows(), member_rows_trim,
+    ):
+        daily.append({
+            "date": _to_iso_date(row["date"]),
+            "target_close": _safe_float(row["target_close"]),
+            "target_return_pct": _safe_float(row["target_return_pct"]),
+            "member_signals": dict(member_row),
+            "pressure_signal": str(row["pressure_signal"]),
+            "buy_count": int(row["buy_count"]),
+            "short_count": int(row["short_count"]),
+            "none_count": int(row["none_count"]),
+            "missing_count": int(row["missing_count"]),
+            "active_count": int(row["active_count"]),
+            "daily_capture_pct": _safe_float(row["daily_capture_pct"]),
+            "cumulative_capture_pct": _safe_float(
+                row["cumulative_capture_pct"],
+            ),
+            "is_trigger_day": bool(row["is_trigger_day"]),
+        })
+
+    return ResearchDayArtifact(
+        artifact_version=ARTIFACT_VERSION,
+        engine="trafficflow",
+        target_ticker=str(target_ticker).strip().upper(),
+        signal_source="",
+        run_id=str(run_id),
+        metric_basis=str(metric_basis or "Close"),
+        persist_skip_bars=int(skip),
+        generated_at=datetime.now(timezone.utc).isoformat(
+            timespec="seconds",
+        ),
+        summary=summary,
+        daily=daily,
+        K=int(K) if K is not None else None,
+        members=list(members),
+        protocol_per_member={m: proto.get(m) for m in members},
+    )
+
+
+def build_trafficflow_day_artifact_from_local(
+    target_ticker: str,
+    run_id: str,
+    *,
+    members_str: str,
+    K: Optional[int] = None,
+    summary_overrides: Optional[Mapping[str, Any]] = None,
+    persist_skip_bars: Optional[int] = None,
+    cache_dir: Optional[Path] = None,
+) -> Optional[ResearchDayArtifact]:
+    """Read each member's local Spymaster cache PKL plus the target's
+    cache PKL, align dates, then build the TrafficFlow pressure
+    artifact.
+
+    Returns None when:
+      - the target cache PKL is missing/unreadable
+      - ``members_str`` parses to no usable members
+      - none of the members has a readable cache PKL
+
+    Members whose cache PKL is missing render in daily rows as
+    ``"missing"`` and are excluded from the unanimity check.
+    Strictly read-only and offline; never imports trafficflow /
+    spymaster / dash.
+    """
+    import pickle
+
+    if not target_ticker or not run_id or not members_str:
+        return None
+    safe_target = _normalize_ticker_for_filename(target_ticker)
+    if not safe_target:
+        return None
+    cache_base = (
+        Path(cache_dir) if cache_dir is not None
+        else _project_dir() / "cache" / "results"
+    )
+    # Real-form-first resolution: ``^GSPC_precomputed_results.pkl``
+    # before ``_GSPC_precomputed_results.pkl``. Production saved
+    # files retain the original symbol; the filename-safe form is
+    # the artifact-output form. Phase 6B-4 Amendment: the from-local
+    # builder previously only tried the safe form, which broke
+    # caret/index tickers like ^GSPC.
+    target_path, _target_form = _resolve_local_target_cache_path(
+        target_ticker, cache_base,
+    )
+    if target_path is None:
+        return None
+    try:
+        with target_path.open("rb") as fh:
+            target_obj = pickle.load(fh)
+    except Exception:
+        return None
+    if not isinstance(target_obj, dict):
+        return None
+    pre = target_obj.get("preprocessed_data")
+    if pre is None or not isinstance(pre, pd.DataFrame):
+        return None
+    if "Close" not in pre.columns:
+        return None
+    closes = pd.to_numeric(pre["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return None
+    closes_df = pd.DataFrame({
+        "date": pd.to_datetime(closes.index, errors="coerce"),
+        "close": closes.values,
+    }).dropna(subset=["date"]).sort_values("date").drop_duplicates(
+        subset=["date"], keep="last",
+    ).reset_index(drop=True)
+
+    parsed = parse_stack_members_with_protocol(members_str)
+    if not parsed:
+        return None
+    member_dfs: dict[str, Optional[pd.DataFrame]] = {}
+    protocol_per_member: dict[str, Optional[str]] = {}
+    for ticker, proto in parsed:
+        protocol_per_member[ticker] = proto
+        if not str(ticker).strip():
+            continue
+        # Same real-form-first resolution per member ticker so a
+        # caret-form member cache (e.g., ``^IXIC_precomputed_
+        # results.pkl``) is found alongside plain-name members.
+        m_path, _m_form = _resolve_local_target_cache_path(
+            ticker, cache_base,
+        )
+        if m_path is None:
+            member_dfs[ticker] = None
+            continue
+        try:
+            with m_path.open("rb") as fh:
+                m_obj = pickle.load(fh)
+        except Exception:
+            member_dfs[ticker] = None
+            continue
+        if not isinstance(m_obj, dict):
+            member_dfs[ticker] = None
+            continue
+        m_df = _extract_member_signals_from_spymaster_cache(m_obj)
+        if m_df is None or m_df.empty:
+            member_dfs[ticker] = None
+            continue
+        member_dfs[ticker] = m_df
+
+    have_any = any(df is not None for df in member_dfs.values())
+    if not have_any:
+        return None
+
+    aligned = closes_df.copy()
+    member_signal_columns: dict[str, list[str]] = {}
+    for ticker, m_df in member_dfs.items():
+        if m_df is None or m_df.empty:
+            member_signal_columns[ticker] = ["missing"] * len(aligned)
+            continue
+        merged = aligned.merge(m_df, on="date", how="left")
+        member_signal_columns[ticker] = (
+            merged["signal"].fillna("missing").tolist()
+        )
+
+    if aligned.empty:
+        return None
+
+    return build_trafficflow_day_artifact(
+        target_ticker,
+        run_id,
+        dates=aligned["date"].tolist(),
+        target_close=aligned["close"].tolist(),
+        member_signal_columns=member_signal_columns,
+        protocol_per_member=protocol_per_member,
+        K=K,
+        persist_skip_bars=persist_skip_bars,
+        summary_overrides=summary_overrides,
+    )
+
+
+# Phase 6C scope reminder kept in source so a future maintainer sees
+# the intended extension point.
 #
 #   TODO Phase 6C: public catalogue UX + server caching model. The
 #   catalogue index above is the seed.
