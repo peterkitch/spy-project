@@ -121,10 +121,14 @@ switch on them without translation:
     artifact represents TrafficFlow / K-build outputs projected
     onto the multi-timeframe set. **This is the architectural
     gap Section 2 describes; today every ticker carries this
-    issue code.** It does not by itself block leader eligibility
-    (Confluence still produces a usable agreement count from the
-    ticker-native multi-timeframe libraries), but it is the next
-    thing to build.
+    issue code.** Phase 6C-8 audit-tighten: this code now BLOCKS
+    leader eligibility. A ticker-native Confluence verdict is no
+    longer sufficient for a public podium spot - the public
+    pipeline must include the multi-timeframe TrafficFlow /
+    K-build bridge for the ticker to be a "current leader". Until
+    the bridge artifact contract ships, the public board awards
+    zero podium badges and surfaces the "no current leaders"
+    banner.
   - `missing_confluence_day_artifact`
   - `stale_confluence_day_artifact` — confluence exists but its
     last daily-row date is older than the current expected
@@ -170,6 +174,16 @@ A ticker is `leader_eligible` if and only if **all** of:
   4. The catalogue health report does **not** list the ticker
      under `engines_blocked` for any engine. Otherwise
      `health_report_blocked` is raised.
+  5. **(Audit-tighten 2026-05-11)** The multi-timeframe
+     TrafficFlow / K-build bridge is in place — at least one
+     saved TrafficFlow `research_day_v1` artifact for the ticker
+     declares a non-empty `timeframes` list with two or more
+     entries. Otherwise `missing_multitimeframe_trafficflow_bridge`
+     is raised and the gate fails.
+  6. **(Audit-tighten 2026-05-11)** TrafficFlow K-coverage spans
+     the documented K range (K=1..12). Otherwise
+     `insufficient_trafficflow_k_coverage` is raised and the
+     gate fails.
 
 The current-as-of date is resolved in this order:
 
@@ -186,6 +200,27 @@ Notably, a fresh TrafficFlow or StackBuilder artifact does **not**
 mask a stale Confluence artifact. The leader gate is on
 Confluence specifically; upstream freshness without aggregation
 is not a current verdict.
+
+## 6.1 Coverage reconciliation (Daily Signal Board)
+
+The visible `Coverage` column on the public board must not
+contradict the readiness verdict. The board applies the following
+overrides after computing the stand-alone
+`coverage_status_for_ticker` value:
+
+  | Blocked reason | Visible coverage |
+  | --- | --- |
+  | `health_report_blocked` | `Under review` |
+  | `stale_confluence_day_artifact` | `Stale` |
+  | `missing_multitimeframe_trafficflow_bridge` | `Pipeline incomplete` |
+  | `insufficient_trafficflow_k_coverage` | `Pipeline incomplete` |
+  | _(none)_ | _(no override)_ |
+
+`Pipeline incomplete` is a Phase 6C-8 addition to the documented
+coverage labels. It slots between `Stale` and `Full` in
+`COVERAGE_PRIORITY` so a row with a current confluence artifact
+but a missing bridge / incomplete K coverage is never visibly
+ranked "Full".
 
 ## 7. Out of scope for this PR
 

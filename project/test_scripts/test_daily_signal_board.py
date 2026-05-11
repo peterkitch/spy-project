@@ -306,10 +306,14 @@ def test_coverage_status_full_partial_stale_under_review():
         now=now,
     ) == board.COVERAGE_PARTIAL
 
-    # 6. Priority order is documented + canonical.
+    # 6. Priority order is documented + canonical. Phase 6C-8
+    #    audit-tighten: the new ``Pipeline incomplete`` label slots
+    #    between Stale and Full so a row blocked on a missing
+    #    bridge / K-coverage never reads as a Full-coverage row.
     assert board.COVERAGE_PRIORITY == (
         board.COVERAGE_UNDER_REVIEW,
         board.COVERAGE_STALE,
+        board.COVERAGE_PIPELINE_INCOMPLETE,
         board.COVERAGE_FULL,
         board.COVERAGE_PARTIAL,
     )
@@ -559,6 +563,110 @@ def test_board_renders_no_current_leaders_banner_when_zero_eligible(
     )
     text = _component_text(app.layout)
     assert board.BOARD_COPY["no_current_leaders"] in text
+
+
+def test_coverage_label_reconciles_with_readiness_blocked_reason():
+    """Phase 6C-8 audit-tighten: the visible Coverage column must
+    not contradict the readiness verdict. Stale-confluence forces
+    Stale; the bridge / K-coverage codes force ``Pipeline
+    incomplete``; the health-block code forces ``Under review``."""
+    overrides = {
+        "stale_confluence_day_artifact": board.COVERAGE_STALE,
+        "missing_multitimeframe_trafficflow_bridge": (
+            board.COVERAGE_PIPELINE_INCOMPLETE
+        ),
+        "insufficient_trafficflow_k_coverage": (
+            board.COVERAGE_PIPELINE_INCOMPLETE
+        ),
+        "health_report_blocked": board.COVERAGE_UNDER_REVIEW,
+    }
+    for code, expected in overrides.items():
+        assert board._reconcile_coverage_with_readiness(
+            board.COVERAGE_FULL, code,
+        ) == expected, (
+            f"reconciled coverage for {code} should be "
+            f"{expected!r}; got "
+            f"{board._reconcile_coverage_with_readiness(board.COVERAGE_FULL, code)!r}"
+        )
+    # No override -> original coverage is preserved.
+    assert board._reconcile_coverage_with_readiness(
+        board.COVERAGE_FULL, "",
+    ) == board.COVERAGE_FULL
+
+
+def test_board_row_with_missing_bridge_shows_pipeline_incomplete(
+    tmp_path: Path,
+):
+    """End-to-end: a ticker with a present + current confluence
+    artifact whose multi-timeframe TrafficFlow bridge is missing
+    renders ``Coverage = Pipeline incomplete`` AND never receives
+    a rank badge."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    target_dir = artifact_root / "confluence" / "SPY"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="confluence",
+        target_ticker="SPY",
+        signal_source="",
+        run_id="current",
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 12.0,
+            "sharpe_ratio": 0.2,
+            "trigger_days": 5,
+        },
+        daily=[{
+            "date": "2099-12-31",  # always-future -> always current
+            "target_close": 100.0,
+            "target_return_pct": 0.0,
+            "confluence_tier": "strong_buy",
+            "confluence_signal": "Buy",
+            "timeframe_signals": {},
+            "alignment_pct": 1.0,
+            "buy_count": 5,
+            "short_count": 0,
+            "none_count": 0,
+            "active_count": 5,
+            "available_count": 5,
+            "daily_capture_pct": 0.0,
+            "cumulative_capture_pct": 12.0,
+            "is_trigger_day": True,
+        }],
+        timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
+    )
+    ra.write_research_day_artifact(
+        art, target_dir / "SPY.research_day.json",
+    )
+    # NO multi-timeframe TrafficFlow artifact -> bridge missing.
+
+    rows = board.discover_board_catalogue(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+        use_cache=False,
+    )
+    spy = next(r for r in rows if r.ticker == "SPY")
+    # Confluence is current; agreement is 5/5; cache exists. The
+    # pre-readiness coverage_status_for_ticker would return Full.
+    # But the readiness layer blocks ranking on the missing
+    # bridge, and the board reconciles the visible coverage
+    # accordingly.
+    assert spy.leader_eligible is False
+    assert (
+        spy.ranking_blocked_reason
+        == "missing_multitimeframe_trafficflow_bridge"
+    )
+    assert spy.coverage == board.COVERAGE_PIPELINE_INCOMPLETE, (
+        f"expected Pipeline incomplete; got {spy.coverage!r}"
+    )
+    ranked = board.rank_board_rows(rows)
+    spy_ranked = next(r for r in ranked if r.ticker == "SPY")
+    assert spy_ranked.rank is None
 
 
 def test_spy_like_fixture_with_stale_confluence_is_not_rankable(

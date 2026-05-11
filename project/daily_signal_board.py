@@ -82,6 +82,13 @@ STALE_DAYS = 30
 # Order matters: each row carries one of these coverage labels.
 COVERAGE_UNDER_REVIEW = "Under review"
 COVERAGE_STALE = "Stale"
+# Phase 6C-8 audit-tighten: a row whose Confluence verdict is
+# present + current but whose readiness layer blocks ranking on
+# the missing multi-timeframe TrafficFlow / K-build bridge (or
+# the related insufficient_trafficflow_k_coverage issue) renders
+# this label so the Coverage column never contradicts the
+# leader-eligibility gate.
+COVERAGE_PIPELINE_INCOMPLETE = "Pipeline incomplete"
 COVERAGE_FULL = "Full"
 COVERAGE_PARTIAL = "Partial"
 
@@ -89,6 +96,7 @@ COVERAGE_PARTIAL = "Partial"
 COVERAGE_PRIORITY: tuple[str, ...] = (
     COVERAGE_UNDER_REVIEW,
     COVERAGE_STALE,
+    COVERAGE_PIPELINE_INCOMPLETE,
     COVERAGE_FULL,
     COVERAGE_PARTIAL,
 )
@@ -162,6 +170,7 @@ DESIGN_TOKENS: dict[str, str] = {
     "color_partial": "#ffb84d",
     "color_stale": "#888888",
     "color_under_review": "#ff5050",
+    "color_pipeline_incomplete": "#ffb84d",
     # Top-3 rank accents (placeholder, will be replaced by Claude Design).
     "color_rank_1": "#ffd166",
     "color_rank_2": "#cfd2cd",
@@ -255,6 +264,7 @@ BOARD_COPY: dict[str, Any] = {
     "coverage_partial": COVERAGE_PARTIAL,
     "coverage_stale": COVERAGE_STALE,
     "coverage_under_review": COVERAGE_UNDER_REVIEW,
+    "coverage_pipeline_incomplete": COVERAGE_PIPELINE_INCOMPLETE,
     # Section 4
     "what_prjct9_is": (
         "PRJCT9 is a pattern-discovery engine. It studies saved "
@@ -289,6 +299,13 @@ BOARD_COPY: dict[str, Any] = {
     ),
     "ranking_block_confluence_agreement_unavailable": (
         "Saved Confluence verdict is missing agreement fields."
+    ),
+    "ranking_block_missing_multitimeframe_trafficflow_bridge": (
+        "Multi-timeframe TrafficFlow / K-build bridge is not yet "
+        "built for this ticker."
+    ),
+    "ranking_block_insufficient_trafficflow_k_coverage": (
+        "TrafficFlow saved K-build coverage is incomplete."
     ),
     # Chart copy (Plotly trace names + axis titles). Centralized so
     # the copy-centralization test catches them along with section
@@ -946,6 +963,16 @@ def discover_board_catalogue(
                 _cpr.ISSUE_MISSING_CONFLUENCE_DAY_ARTIFACT
             )
 
+        # Phase 6C-8 audit-tighten: reconcile the Coverage label
+        # with the readiness verdict so the visible column never
+        # contradicts what the readiness layer is enforcing. A
+        # stale-confluence block forces Stale; a missing-bridge or
+        # K-coverage block forces Pipeline incomplete; a health
+        # block forces Under review.
+        coverage = _reconcile_coverage_with_readiness(
+            coverage, ranking_blocked_reason,
+        )
+
         rows.append(BoardRow(
             ticker=ticker,
             signal=signal,
@@ -974,7 +1001,36 @@ _RANKING_BLOCK_PRIORITY: tuple[str, ...] = (
     _cpr.ISSUE_MISSING_CONFLUENCE_DAY_ARTIFACT,
     _cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT,
     _cpr.ISSUE_CONFLUENCE_AGREEMENT_UNAVAILABLE,
+    _cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE,
+    _cpr.ISSUE_INSUFFICIENT_TRAFFICFLOW_K_COVERAGE,
 )
+
+
+# Phase 6C-8 audit-tighten: reconcile the visible Coverage label
+# with the readiness verdict so the scoreboard never shows a
+# row as "Full" while the readiness layer is blocking its rank.
+_COVERAGE_OVERRIDE_BY_BLOCKED_REASON: dict[str, str] = {
+    _cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT: COVERAGE_STALE,
+    _cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE: (
+        COVERAGE_PIPELINE_INCOMPLETE
+    ),
+    _cpr.ISSUE_INSUFFICIENT_TRAFFICFLOW_K_COVERAGE: (
+        COVERAGE_PIPELINE_INCOMPLETE
+    ),
+    _cpr.ISSUE_HEALTH_REPORT_BLOCKED: COVERAGE_UNDER_REVIEW,
+}
+
+
+def _reconcile_coverage_with_readiness(
+    coverage: str, ranking_blocked_reason: str,
+) -> str:
+    """Override the standalone coverage label when the readiness
+    layer has blocked ranking on a stronger signal. Returns the
+    original coverage when no override applies."""
+    override = _COVERAGE_OVERRIDE_BY_BLOCKED_REASON.get(
+        ranking_blocked_reason,
+    )
+    return override if override is not None else coverage
 
 
 def _primary_ranking_block_code(
@@ -1350,6 +1406,8 @@ def _coverage_color(coverage: str) -> str:
         return DESIGN_TOKENS["color_stale"]
     if coverage == COVERAGE_UNDER_REVIEW:
         return DESIGN_TOKENS["color_under_review"]
+    if coverage == COVERAGE_PIPELINE_INCOMPLETE:
+        return DESIGN_TOKENS["color_pipeline_incomplete"]
     return DESIGN_TOKENS["color_text"]
 
 

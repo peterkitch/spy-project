@@ -130,12 +130,26 @@ HEALTH_SCHEMA_VERSION = "catalogue_health_v1"
 
 @dataclass
 class StageStatus:
-    """One per pipeline stage. ``current`` reflects only whether
-    the stage's own ``last_date`` is at or after the resolved
-    current-as-of date; a stage with no extractable last_date is
-    reported as ``current=False``. ``detail`` is a short
-    operator-facing string the audit tooling can render alongside
-    the booleans."""
+    """One per pipeline stage.
+
+    ``current`` reflects ONLY whether the stage's own
+    ``last_date`` is at or after the resolved current-as-of date.
+    A stage with no extractable ``last_date`` is reported as
+    ``current=False`` - filename / directory presence does not
+    prove a stage carries current data.
+
+    Phase 6C-8 audit clarification: some stages can only be
+    inspected by presence (e.g. the cache PKL, signal-library
+    PKLs, leaderboard directories, the catalogue health report
+    itself). Those stages set ``presence_only=True`` so callers
+    can distinguish "we deliberately can't measure freshness here"
+    from "this stage failed a freshness check". A presence-only
+    stage is still ``current=False`` if it carries no
+    ``last_date``; the flag is informational, not a promotion.
+
+    ``detail`` is a short operator-facing string the audit tooling
+    can render alongside the booleans.
+    """
 
     stage: str
     label: str
@@ -144,6 +158,7 @@ class StageStatus:
     last_date: Optional[str]
     detail: str
     issue_codes: tuple[str, ...] = ()
+    presence_only: bool = False
 
 
 @dataclass
@@ -526,16 +541,17 @@ def _stage_signal_engine_cache(
         stage=STAGE_SIGNAL_ENGINE_CACHE,
         label=STAGE_LABELS[STAGE_SIGNAL_ENGINE_CACHE],
         present=present,
-        # The PKL is not opened during readiness inspection, so we
-        # cannot derive a last_date for it. Treat presence as
-        # "current=True" so the cache filename is not the gate -
-        # confluence is.
-        current=present,
+        # Presence-only stage: the PKL is not opened during
+        # readiness inspection, so we cannot derive a last_date.
+        # ``current`` stays False; ``presence_only`` flag tells
+        # callers this is by design, not a freshness failure.
+        current=False,
         last_date=None,
         detail=detail,
         issue_codes=(
             () if present else (ISSUE_MISSING_SIGNAL_ENGINE_CACHE,)
         ),
+        presence_only=True,
     )
 
 
@@ -623,16 +639,17 @@ def _stage_stackbuilder_leaderboard(
     return StageStatus(
         stage=STAGE_STACKBUILDER_LEADERBOARD, label=label,
         present=True,
-        # Leaderboard files do not embed a per-day date; presence
-        # is the contract. The downstream stackbuilder_day_artifact
-        # stage is the one with last_date.
-        current=True,
+        # Presence-only stage: leaderboard files do not embed a
+        # per-day date. The downstream stackbuilder_day_artifact
+        # stage is the one with last_date / current semantics.
+        current=False,
         last_date=None,
         detail=(
             f"{len(leaderboard_dirs)} leaderboard run dir(s) "
             f"under stackbuilder/<ticker>/"
         ),
         issue_codes=(),
+        presence_only=True,
     )
 
 
@@ -712,7 +729,9 @@ def _stage_multitimeframe_libraries(
     return StageStatus(
         stage=STAGE_MULTITIMEFRAME_LIBRARIES, label=label,
         present=present,
-        current=present,  # PKL mtime is not consulted
+        # Presence-only stage: filename-only inspection cannot
+        # prove the underlying PKL carries current data.
+        current=False,
         last_date=None,
         detail=(
             "saved intervals: " + (
@@ -724,6 +743,7 @@ def _stage_multitimeframe_libraries(
             () if present
             else (ISSUE_MISSING_MULTITIMEFRAME_LIBRARIES,)
         ),
+        presence_only=True,
     )
 
 
@@ -817,10 +837,15 @@ def _stage_catalogue_health(
     return StageStatus(
         stage=STAGE_CATALOGUE_HEALTH, label=label,
         present=True,
-        current=True,
+        # Presence-only stage: the report carries a
+        # ``generated_at`` we do not inspect for freshness in this
+        # PR (the doc-level guarantee is that the report is the
+        # source of truth at boot time).
+        current=False,
         last_date=None,
         detail=detail,
         issue_codes=issue_codes,
+        presence_only=True,
     )
 
 
@@ -993,11 +1018,20 @@ def inspect_ticker_pipeline(
             issues.append(ISSUE_CONFLUENCE_AGREEMENT_UNAVAILABLE)
 
     # Eligibility gate (see § 6 of the contract doc).
+    #
+    # Phase 6C-8 audit-tighten: the bridge-missing and
+    # K-coverage-insufficient codes now BLOCK eligibility. A
+    # ticker-native confluence verdict is no longer enough to be
+    # a public "current leader" - the multi-timeframe
+    # TrafficFlow / K-build to Confluence bridge must be in place.
     leader_eligible = (
         confluence_stage.present
         and confluence_stage.current
         and ISSUE_CONFLUENCE_AGREEMENT_UNAVAILABLE not in issues
         and ISSUE_HEALTH_REPORT_BLOCKED not in issues
+        and ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
+            not in issues
+        and ISSUE_INSUFFICIENT_TRAFFICFLOW_K_COVERAGE not in issues
     )
 
     latest_required_date = confluence_stage.last_date

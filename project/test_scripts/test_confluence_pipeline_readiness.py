@@ -143,6 +143,31 @@ def _write_artifact(
     return ra.write_research_day_artifact(artifact, out)
 
 
+def _write_full_trafficflow_pipeline(
+    artifact_root: Path,
+    ticker: str,
+    *,
+    last_date: str,
+    timeframes: Optional[list[str]] = None,
+) -> list[Path]:
+    """Write the full happy-path TrafficFlow fixture: one
+    multi-timeframe artifact per K in 1..12. This is the only way
+    a ticker can clear both the bridge gate
+    (``missing_multitimeframe_trafficflow_bridge``) and the
+    K-coverage gate (``insufficient_trafficflow_k_coverage``)
+    under the Phase 6C-8 tightened eligibility rules.
+    """
+    tfs = list(timeframes or ["1d", "1wk", "1mo", "3mo", "1y"])
+    out = []
+    for k in cpr.EXPECTED_TRAFFICFLOW_K_RANGE:
+        out.append(_write_artifact(
+            artifact_root, engine="trafficflow", ticker=ticker,
+            last_date=last_date, K=k, timeframes=tfs,
+            name_suffix=f"__K{k}",
+        ))
+    return out
+
+
 def _write_health_report(
     artifact_root: Path,
     *,
@@ -303,6 +328,81 @@ def test_missing_multitimeframe_trafficflow_bridge_is_surfaced(
         cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
         in r2.issue_codes
     )
+    # Phase 6C-8 audit-tighten: the bridge-missing code now BLOCKS
+    # leader eligibility, even with a present + current Confluence
+    # artifact.
+    assert r2.leader_eligible is False, r2.issue_codes
+
+
+def test_missing_bridge_blocks_eligibility_when_confluence_is_current(
+    tmp_path: Path,
+):
+    """Reproduces the audit finding: a current Confluence artifact
+    is NOT enough to grant leader eligibility when the multi-
+    timeframe TrafficFlow / K-build bridge is missing. Only the
+    pipeline as a whole earns a podium spot."""
+    dirs = _layout(tmp_path)
+    _write_cache_filename(dirs["cache_dir"], "SPY")
+    _write_artifact(
+        dirs["artifact_root"], engine="confluence", ticker="SPY",
+        last_date="2026-05-08",
+        timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
+    )
+    # Single-timeframe TrafficFlow only - the bridge isn't built.
+    _write_artifact(
+        dirs["artifact_root"], engine="trafficflow", ticker="SPY",
+        last_date="2026-05-08", K=1,
+    )
+    r = cpr.inspect_ticker_pipeline(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+        fast_path_when_no_confluence=False,
+    )
+    assert r.leader_eligible is False
+    assert r.ranking_allowed is False
+    assert (
+        cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
+        in r.issue_codes
+    )
+
+
+def test_insufficient_trafficflow_k_coverage_blocks_eligibility(
+    tmp_path: Path,
+):
+    """The audit specifies that
+    insufficient_trafficflow_k_coverage also blocks eligibility:
+    a single K-build is not the same pipeline as all 12. We use a
+    multi-timeframe TrafficFlow artifact to avoid raising the
+    bridge-missing code, isolating the K-coverage gate."""
+    dirs = _layout(tmp_path)
+    _write_cache_filename(dirs["cache_dir"], "SPY")
+    _write_artifact(
+        dirs["artifact_root"], engine="confluence", ticker="SPY",
+        last_date="2026-05-08",
+        timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
+    )
+    # ONE multi-timeframe TrafficFlow artifact, K=1 only. The
+    # bridge concept is satisfied (timeframes >= 2) but K coverage
+    # is not.
+    _write_artifact(
+        dirs["artifact_root"], engine="trafficflow", ticker="SPY",
+        last_date="2026-05-08", K=1,
+        timeframes=["1d", "1wk", "1mo"],
+    )
+    r = cpr.inspect_ticker_pipeline(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+        fast_path_when_no_confluence=False,
+    )
+    assert (
+        cpr.ISSUE_INSUFFICIENT_TRAFFICFLOW_K_COVERAGE
+        in r.issue_codes
+    )
+    assert r.leader_eligible is False
+    # Bridge issue should NOT be raised because at least one
+    # multi-timeframe TrafficFlow artifact exists.
+    assert (
+        cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
+        not in r.issue_codes
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,17 +411,21 @@ def test_missing_multitimeframe_trafficflow_bridge_is_surfaced(
 
 
 def test_under_review_health_blocks_leader_eligibility(tmp_path: Path):
+    """Health-blocked tickers fail the gate even when every
+    upstream stage is fresh + the multi-timeframe TrafficFlow
+    bridge is in place + every K=1..12 is covered. We build the
+    full happy-path fixture and then layer the health block on
+    top so the test isolates the health gate from the bridge /
+    K-coverage gates."""
     dirs = _layout(tmp_path)
     _write_cache_filename(dirs["cache_dir"], "SPY")
-    # All upstream + Confluence are fresh.
     _write_artifact(
         dirs["artifact_root"], engine="confluence", ticker="SPY",
         last_date="2026-05-08",
         timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
     )
-    _write_artifact(
-        dirs["artifact_root"], engine="trafficflow", ticker="SPY",
-        last_date="2026-05-08", K=1,
+    _write_full_trafficflow_pipeline(
+        dirs["artifact_root"], "SPY", last_date="2026-05-08",
     )
     _write_artifact(
         dirs["artifact_root"], engine="stackbuilder", ticker="SPY",
@@ -347,9 +451,13 @@ def test_under_review_health_blocks_leader_eligibility(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_ticker_with_current_confluence_is_leader_eligible(
+def test_ticker_with_full_pipeline_is_leader_eligible(
     tmp_path: Path,
 ):
+    """Happy path under the Phase 6C-8 tightened gate. Requires:
+    cache filename, ImpactSearch + StackBuilder + multi-timeframe
+    TrafficFlow per K=1..12 + Confluence artifacts all current,
+    multi-timeframe libraries, no health block."""
     dirs = _layout(tmp_path)
     _write_cache_filename(dirs["cache_dir"], "SPY")
     _write_artifact(
@@ -357,9 +465,8 @@ def test_ticker_with_current_confluence_is_leader_eligible(
         last_date="2026-05-08",
         timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
     )
-    _write_artifact(
-        dirs["artifact_root"], engine="trafficflow", ticker="SPY",
-        last_date="2026-05-08", K=1,
+    _write_full_trafficflow_pipeline(
+        dirs["artifact_root"], "SPY", last_date="2026-05-08",
     )
     _write_artifact(
         dirs["artifact_root"], engine="stackbuilder", ticker="SPY",
@@ -369,30 +476,26 @@ def test_ticker_with_current_confluence_is_leader_eligible(
         dirs["artifact_root"], engine="impactsearch", ticker="SPY",
         last_date="2026-05-08",
     )
-    # Multi-timeframe libraries (>=2).
     sig = dirs["signal_library_dir"]
     for interval in ("1wk", "1mo"):
         (sig / f"SPY_stable_v1_0_0_{interval}.pkl").write_bytes(b"x")
+
     r = cpr.inspect_ticker_pipeline(
         "SPY", current_as_of_date="2026-05-08", **dirs,
     )
     assert r.leader_eligible is True, r.issue_codes
     assert r.ranking_allowed is True
-    assert (
-        cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT
-        not in r.issue_codes
-    )
-    assert (
-        cpr.ISSUE_HEALTH_REPORT_BLOCKED
-        not in r.issue_codes
-    )
-    # The architectural-bridge issue code still applies (no
-    # multi-timeframe TrafficFlow artifact yet) but it does not
-    # gate eligibility.
-    assert (
-        cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
-        in r.issue_codes
-    )
+    for blocking_code in (
+        cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT,
+        cpr.ISSUE_HEALTH_REPORT_BLOCKED,
+        cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE,
+        cpr.ISSUE_INSUFFICIENT_TRAFFICFLOW_K_COVERAGE,
+        cpr.ISSUE_CONFLUENCE_AGREEMENT_UNAVAILABLE,
+    ):
+        assert blocking_code not in r.issue_codes, (
+            f"unexpected blocking issue code in happy-path "
+            f"verdict: {blocking_code}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +627,45 @@ def test_inspect_universe_walks_cache_filenames(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # 11. list_tickers_with_confluence_artifacts helper
 # ---------------------------------------------------------------------------
+
+
+def test_presence_only_stages_report_current_false_with_flag(
+    tmp_path: Path,
+):
+    """Phase 6C-8 StageStatus contract: stages that cannot derive
+    a last_date from filename / directory inspection must report
+    ``current=False`` and set ``presence_only=True`` so callers
+    can distinguish "no inspectable freshness signal" from "stage
+    failed a freshness check"."""
+    dirs = _layout(tmp_path)
+    _write_cache_filename(dirs["cache_dir"], "SPY")
+    sig = dirs["signal_library_dir"]
+    for interval in ("1wk", "1mo"):
+        (sig / f"SPY_stable_v1_0_0_{interval}.pkl").write_bytes(b"x")
+    _write_health_report(
+        dirs["artifact_root"], blocked_targets={},
+    )
+
+    r = cpr.inspect_ticker_pipeline(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+        fast_path_when_no_confluence=False,
+    )
+    presence_only_stages = {
+        cpr.STAGE_SIGNAL_ENGINE_CACHE,
+        cpr.STAGE_MULTITIMEFRAME_LIBRARIES,
+        cpr.STAGE_CATALOGUE_HEALTH,
+    }
+    for s in r.stages:
+        if s.stage in presence_only_stages and s.present:
+            assert s.presence_only is True, (
+                f"expected presence_only=True on {s.stage}; "
+                f"got {s}"
+            )
+            assert s.current is False, (
+                f"presence-only stage {s.stage} reported "
+                f"current=True; got {s}"
+            )
+            assert s.last_date is None
 
 
 def test_list_confluence_tickers_returns_uppercase_set(
