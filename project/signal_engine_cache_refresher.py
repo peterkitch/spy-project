@@ -1,71 +1,57 @@
-"""Phase 6E-3: source-data refresh probe + cache-shape builder.
+"""Phase 6E-5: Signal Engine cache refresher (optimizer-backed).
 
 The Phase 6E-2 audit established that the only path that
 writes a Spymaster ``<TICKER>_precomputed_results.pkl`` today
-is the Dash app (``project/spymaster.py``). Phase 6E-3 adds
-the *first half* of a non-interactive operator path: a
-controlled CLI that:
+is the Dash app (``project/spymaster.py``). Phase 6E-3
+shipped the data-fetch + cache-shape build path with a hard
+``data_only_v1`` write guard. Phase 6E-4 extracted the
+Spymaster SMA-pair optimizer into a pure, offline helper at
+``project/signal_engine_sma_optimizer.py``. Phase 6E-5 (this
+module) wires those two pieces together so the refresher can
+produce a production-safe Signal Engine cache payload:
 
   - Fetches fresh OHLC price data from a pluggable data
     source (default: yfinance; mockable via the
     ``data_fetcher`` parameter so tests never hit the
     network).
-  - Builds a ``preprocessed_data`` DataFrame with a ``Close``
-    column plus ``SMA_1`` … ``SMA_max_sma_day`` columns —
-    the same column layout Spymaster's cache uses.
-  - Reports the would-be new cache date_range_end + the
-    Phase-6-consistent stale_before / current_after flags.
+  - Calls ``signal_engine_sma_optimizer.optimize_signal_engine_sma_pairs``
+    to compute real ``daily_top_buy_pairs`` /
+    ``daily_top_short_pairs`` / ``cumulative_combined_captures``
+    / ``active_pairs`` and the headline ``top_buy_pair`` /
+    ``top_short_pair`` fields. The math is byte-equivalent to
+    the SPY parity baseline pinned in
+    ``test_scripts/test_signal_engine_sma_optimizer.py``.
+  - Stamps the payload with
+    ``signal_engine_cache_refresher_scope = "optimizer_v1"``
+    and writes it atomically with a provenance manifest +
+    status JSON (``write=True``).
 
-**It is not yet a production-safe Signal Engine cache
-refresher.** The Spymaster daily best-buy / best-short
-SMA-pair optimizer is a closure inside the Dash callback at
-``spymaster.py:5050-5117`` and has not been extracted into a
-non-interactive helper. Until that work ships, every payload
-this module builds carries placeholder ``active_pairs`` (the
-literal string ``"None"`` repeated for each row), which would
-load as ``current_signal=None``,
-``current_sma_pair=None``, ``total_capture_pct=0``,
-``sharpe_ratio=0``, ``signal_days=0``. Replacing a valid
-Spymaster cache with such a payload would be a strict
-regression for the Daily Signal Board and the Primary Signal
-Engine front door — worse than the staleness it would fix.
+**The data_only_v1 write guard is preserved.** A payload
+that arrives at the write check still carrying the
+``data_only_v1`` scope is refused with
+``issue_codes=("data_only_write_blocked",)``. The guard now
+acts as a defensive check rather than a primary block,
+because the refresher's happy path emits ``optimizer_v1``
+payloads. Any future code path that would re-introduce
+placeholder ``active_pairs`` still gets caught.
 
-Phase 6E-3 therefore **refuses every ``write=True`` call**
-while the SMA optimizer is unavailable. The guard fires on
-the payload's ``signal_engine_cache_refresher_scope`` marker
-(``data_only_v1``), regardless of the operator's intent. The
-issue code ``data_only_write_blocked`` is surfaced in the
-result; no cache PKL, no status JSON, and no manifest sidecar
-are written. The CLI keeps the ``--write`` flag so the
-contract is exercised, but it is functionally a no-op until
-the next sub-phase extracts the SMA optimizer.
+Strictly offline by default in tests:
 
-Explicitly out of scope for Phase 6E-3 (would require a much
-larger refactor of ``project/spymaster.py``):
+  - No ``spymaster``, ``dash``, ``plotly``, or
+    ``daily_signal_board`` import.
+  - ``yfinance`` is only imported lazily inside the default
+    fetcher, so tests that supply their own callable never
+    trigger the network.
+  - Single-ticker only; no universe sweep.
 
-  - Running Spymaster's full daily best-buy / best-short
-    SMA-pair optimization. That logic is a closure inside
-    a Dash callback (``spymaster.py:5050-5117``); reusing
-    it from a CLI requires either importing the entire
-    14k-line Spymaster module (which would import
-    ``dash``, ``plotly``, and instantiate the Dash app
-    object as a module-level side effect at line 2811) or
-    refactoring Spymaster to expose the math as a
-    standalone function. Neither fits in one PR.
-  - Daily Signal Board styling.
-  - Public web tier usage.
-  - Multi-ticker mode, scheduling, or universe sweeps.
+Read-only contract:
 
-Read-only / offline contract (current Phase 6E-3 reality):
-
-  - ``write=False`` (dry-run) fetches data but writes
-    nothing. Reports the new vs old ``date_range_end``.
-  - ``write=True`` ALSO writes nothing while the SMA
-    optimizer is unavailable — the data_only_v1 guard
-    fires, the result reports
-    ``data_only_write_blocked``, and the operator is
-    instructed to wait for the SMA-optimizer extraction
-    sub-phase before attempting a production write.
+  - ``write=False`` (dry-run) fetches data, runs the
+    optimizer in memory, and writes nothing.
+  - ``write=True`` writes ONLY when the payload scope is
+    ``optimizer_v1`` AND the optimizer returned no issue
+    codes. Otherwise the request is refused with a stable
+    issue code and no disk side effects.
 
 Public surface
 --------------
@@ -111,6 +97,7 @@ import pandas as pd
 import confluence_pipeline_readiness as _cpr
 import primary_signal_engine as _pse
 import provenance_manifest as _pm
+import signal_engine_sma_optimizer as _seo
 
 
 # ---------------------------------------------------------------------------
@@ -125,21 +112,33 @@ ISSUE_DRY_RUN = "dry_run_only"
 ISSUE_ALREADY_CURRENT = "already_current"
 ISSUE_PROVENANCE_MANIFEST_FAILED = "provenance_manifest_failed"
 ISSUE_DATA_ONLY_WRITE_BLOCKED = "data_only_write_blocked"
+ISSUE_OPTIMIZER_FAILED = "optimizer_failed"
+# Surfaced when an explicit ``max_sma_day`` argument is
+# unparseable or < 2. Named to match the optimizer's own
+# ``invalid_max_sma_day`` so the launch-readiness stack
+# can switch on a single stable string. Distinct from the
+# CLI's argparse-level rc=2 path, which still rejects
+# bad ``--max-sma-day`` before the function is even
+# called.
+ISSUE_INVALID_MAX_SMA_DAY = "invalid_max_sma_day"
 
 
-# Phase 6E-3 ships the data-fetch + cache-shape build path
-# only. Every payload this module produces carries the
-# ``signal_engine_cache_refresher_scope`` marker
-# ``DATA_ONLY_V1_SCOPE``. Writing such a payload over a real
-# Spymaster cache would replace a working Signal Engine view
-# with one that loads as ``current_signal=None``. The
-# refresher therefore refuses ``write=True`` for any payload
-# carrying this scope marker.
+# Scope markers stamped onto every cache payload this module
+# builds. The ``signal_engine_cache_refresher_scope`` field
+# is the authority the write guard keys off:
 #
-# A future sub-phase that extracts Spymaster's SMA pair
-# optimizer is the gate that flips the on-disk write path
-# from blocked to active.
+#   - ``DATA_ONLY_V1_SCOPE`` ("data_only_v1") was the Phase
+#     6E-3 placeholder. Payloads carrying this scope have
+#     ``active_pairs = ["None", ...]`` and load as
+#     ``current_signal=None``. The guard refuses every
+#     ``write=True`` call that produces this scope.
+#   - ``OPTIMIZER_V1_SCOPE`` ("optimizer_v1") is the Phase
+#     6E-5 happy path. Payloads carrying this scope contain
+#     real Spymaster-equivalent SMA-pair optimization output
+#     from ``signal_engine_sma_optimizer``. Only these
+#     payloads reach the atomic write branch.
 DATA_ONLY_V1_SCOPE = "data_only_v1"
+OPTIMIZER_V1_SCOPE = "optimizer_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -268,58 +267,26 @@ def _default_yfinance_fetcher(ticker: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Cache shape builder
+# Cache payload builders
 # ---------------------------------------------------------------------------
 
 
-def _build_preprocessed_data(
-    raw_df: pd.DataFrame, max_sma_day: int,
-) -> pd.DataFrame:
-    """Build the ``preprocessed_data`` DataFrame the Signal
-    Engine loader expects: a single ``Close`` column plus
-    ``SMA_1`` … ``SMA_max_sma_day`` columns. The index is
-    datetime-coerced and de-duplicated."""
-    if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
-        return pd.DataFrame()
-    if "Close" not in raw_df.columns:
-        return pd.DataFrame()
-    closes = pd.to_numeric(raw_df["Close"], errors="coerce")
-    closes = closes.dropna()
-    if closes.empty:
-        return pd.DataFrame()
-    closes.index = pd.to_datetime(closes.index, errors="coerce")
-    closes = closes[~closes.index.duplicated(keep="last")].sort_index()
-    if closes.empty:
-        return pd.DataFrame()
-    out = pd.DataFrame({"Close": closes.astype(float)})
-    n_days = max(0, int(max_sma_day))
-    for w in range(1, n_days + 1):
-        out[f"SMA_{w}"] = out["Close"].rolling(
-            window=w, min_periods=1,
-        ).mean()
-    return out
-
-
-def _build_active_pairs(n_rows: int) -> list[str]:
-    """Placeholder ``active_pairs`` aligned to
-    ``preprocessed_data``. Phase 6E-3 does NOT run the
-    Spymaster SMA pair optimization, so the placeholder is
-    the literal string ``"None"`` — honest about the
-    cache's empty-signal state while still satisfying the
-    loader's alignment check."""
-    return ["None"] * int(n_rows)
-
-
-def _build_cache_payload(
-    ticker: str, preprocessed_data: pd.DataFrame,
-    max_sma_day: int,
+def _cache_payload_common(
+    ticker: str,
+    preprocessed_data: pd.DataFrame,
+    *,
+    top_buy_pair: tuple[int, int],
+    top_short_pair: tuple[int, int],
+    top_buy_capture: float,
+    top_short_capture: float,
+    active_pairs: list[str],
+    cumulative_combined_captures: Optional[pd.Series],
+    daily_top_buy_pairs: dict,
+    daily_top_short_pairs: dict,
+    existing_max_sma_day: int,
+    last_processed_date: Any,
+    scope: str,
 ) -> dict[str, Any]:
-    """Construct the dict that will be pickled to disk. The
-    schema mirrors the subset of Spymaster's
-    ``save_precomputed_results`` payload required by both
-    ``primary_signal_engine.load_primary_signal_engine_payload``
-    and the cache writer's own guard clauses (non-(0,0) pair
-    sentinels)."""
     n_rows = len(preprocessed_data.index)
     last_day = (
         preprocessed_data.index[-1] if n_rows else None
@@ -331,10 +298,14 @@ def _build_cache_payload(
         float(preprocessed_data["Close"].iloc[-1])
         if n_rows else None
     )
-    msd = max(2, int(max_sma_day))
-    payload: dict[str, Any] = {
+    return {
         "preprocessed_data": preprocessed_data,
-        "active_pairs": _build_active_pairs(n_rows),
+        "active_pairs": list(active_pairs),
+        "cumulative_combined_captures": (
+            cumulative_combined_captures
+        ),
+        "daily_top_buy_pairs": dict(daily_top_buy_pairs),
+        "daily_top_short_pairs": dict(daily_top_short_pairs),
         # Self-check tokens mirror Spymaster's writer guards
         # (project/spymaster.py:4616 onward). They prevent
         # cross-ticker contamination if the cache file is
@@ -343,28 +314,91 @@ def _build_cache_payload(
         "_row_count": n_rows,
         "_first_date": first_day,
         "_last_date": last_day,
-        # Spymaster's writer rejects (0, 0) pair payloads; use
-        # MAX-SMA sentinels so the writer accepts a refresh
-        # that did not run the pair optimizer.
-        "top_buy_pair": (msd, msd - 1),
-        "top_short_pair": (msd - 1, msd),
-        "top_buy_capture": 0.0,
-        "top_short_capture": 0.0,
-        "existing_max_sma_day": msd,
-        "last_processed_date": last_day,
+        "top_buy_pair": top_buy_pair,
+        "top_short_pair": top_short_pair,
+        "top_buy_capture": float(top_buy_capture),
+        "top_short_capture": float(top_short_capture),
+        "existing_max_sma_day": int(existing_max_sma_day),
+        "last_processed_date": last_processed_date,
         "last_date": last_day,
         "start_date": first_day,
         "last_close": last_close,
         "last_price": last_close,
         "total_trading_days": n_rows,
-        # Phase 6E-3 provenance: marker the operator (or a
-        # future audit) can grep for to confirm a cache was
-        # produced by the refresher rather than the full
-        # Spymaster pipeline. The on-disk write guard keys
-        # off this exact value.
-        "signal_engine_cache_refresher_scope": DATA_ONLY_V1_SCOPE,
+        # The scope marker the on-disk write guard keys off.
+        # Phase 6E-5 only writes payloads stamped
+        # ``OPTIMIZER_V1_SCOPE``.
+        "signal_engine_cache_refresher_scope": scope,
     }
-    return payload
+
+
+def _build_optimizer_v1_payload(
+    ticker: str,
+    opt_result: _seo.SignalEngineSmaOptimizationResult,
+) -> dict[str, Any]:
+    """Build a production-safe cache payload from an
+    ``optimize_signal_engine_sma_pairs`` result. Stamps
+    ``OPTIMIZER_V1_SCOPE`` so the write guard lets it
+    through."""
+    return _cache_payload_common(
+        ticker=ticker,
+        preprocessed_data=opt_result.preprocessed_data,
+        top_buy_pair=opt_result.top_buy_pair or (
+            opt_result.existing_max_sma_day,
+            opt_result.existing_max_sma_day - 1,
+        ),
+        top_short_pair=opt_result.top_short_pair or (
+            opt_result.existing_max_sma_day - 1,
+            opt_result.existing_max_sma_day,
+        ),
+        top_buy_capture=opt_result.top_buy_capture,
+        top_short_capture=opt_result.top_short_capture,
+        active_pairs=list(opt_result.active_pairs),
+        cumulative_combined_captures=(
+            opt_result.cumulative_combined_captures
+        ),
+        daily_top_buy_pairs=opt_result.daily_top_buy_pairs,
+        daily_top_short_pairs=opt_result.daily_top_short_pairs,
+        existing_max_sma_day=opt_result.existing_max_sma_day,
+        last_processed_date=opt_result.last_processed_date,
+        scope=OPTIMIZER_V1_SCOPE,
+    )
+
+
+def _build_data_only_v1_payload(
+    ticker: str,
+    preprocessed_data: pd.DataFrame,
+    max_sma_day: int,
+) -> dict[str, Any]:
+    """Build a Phase 6E-3-style ``data_only_v1`` payload.
+
+    Retained so the write guard's "data_only_v1 still
+    blocked" behavior can be exercised by tests, and as a
+    defensive fallback if a future code path tries to skip
+    the optimizer. The refresher's production happy path
+    no longer reaches this helper — it goes through
+    ``_build_optimizer_v1_payload``.
+    """
+    n_rows = len(preprocessed_data.index)
+    last_day = (
+        preprocessed_data.index[-1] if n_rows else None
+    )
+    msd = max(2, int(max_sma_day))
+    return _cache_payload_common(
+        ticker=ticker,
+        preprocessed_data=preprocessed_data,
+        top_buy_pair=(msd, msd - 1),
+        top_short_pair=(msd - 1, msd),
+        top_buy_capture=0.0,
+        top_short_capture=0.0,
+        active_pairs=["None"] * n_rows,
+        cumulative_combined_captures=None,
+        daily_top_buy_pairs={},
+        daily_top_short_pairs={},
+        existing_max_sma_day=msd,
+        last_processed_date=last_day,
+        scope=DATA_ONLY_V1_SCOPE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +459,7 @@ def _build_manifest(
         manifest = _pm.build_output_manifest(
             artifact_type="spymaster_precomputed_results",
             producer_engine="signal_engine_cache_refresher",
-            engine_version="6E-3.0.0",
+            engine_version="6E-5.0.0",
             params={
                 "ticker": payload.get("_ticker"),
                 "max_sma_day": payload.get("existing_max_sma_day"),
@@ -471,6 +505,52 @@ def _existing_cache_end(
     return str(end) if end else None
 
 
+def _existing_cache_max_sma_day(
+    ticker: str, cache_dir: Path,
+) -> Optional[int]:
+    """Read the existing cache's ``existing_max_sma_day``
+    field directly so a refresh doesn't silently downgrade
+    a 114-wide SPY cache to the 30-wide module default.
+
+    Returns ``None`` when no cache is present / readable or
+    when the field is missing / unparseable / < 2. Reuses
+    the Signal Engine loader's ticker resolution so case
+    quirks and ``^``-prefix tickers work the same as
+    everywhere else in the refresh stack."""
+    path = _cache_pse_resolved_path(ticker, cache_dir)
+    if path is None or not path.exists():
+        return None
+    try:
+        with path.open("rb") as fh:
+            obj = pickle.load(fh)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    val = obj.get("existing_max_sma_day")
+    try:
+        ival = int(val)
+    except Exception:
+        return None
+    if ival < 2:
+        return None
+    return ival
+
+
+def _cache_pse_resolved_path(
+    ticker: str, cache_dir: Path,
+) -> Optional[Path]:
+    """Resolve the on-disk cache path for ``ticker`` via the
+    Signal Engine loader's helper. Returns ``None`` when no
+    candidate file exists."""
+    try:
+        return _pse._resolve_cache_path(  # type: ignore[attr-defined]
+            ticker, cache_dir,
+        )
+    except Exception:
+        return _cache_path(ticker, cache_dir)
+
+
 def _parse_iso_date(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -510,43 +590,44 @@ def refresh_signal_engine_cache(
     data_fetcher: Optional[Callable[[str], pd.DataFrame]] = None,
     current_as_of_date: Optional[str] = None,
 ) -> SignalEngineRefreshResult:
-    """Phase 6E-3 source-data refresh probe / cache-shape
-    builder for one explicit ticker.
+    """Phase 6E-5 Signal Engine cache refresher for one
+    explicit ticker.
 
-    ``write=False`` (default) performs the fetch + cache-shape
-    build and writes nothing to disk; the result reports the
-    would-be new ``date_range_end`` plus the
-    ``stale_before`` / ``current_after`` flags for the
-    operator.
+    ``write=False`` (default) performs the fetch + SMA-pair
+    optimization in memory and writes nothing to disk; the
+    result reports the would-be new ``date_range_end`` plus
+    the ``stale_before`` / ``current_after`` flags.
 
-    ``write=True`` is **currently refused** while the payload
-    scope is ``data_only_v1`` — i.e. while Spymaster's SMA
-    pair optimizer has not been extracted into a
-    non-interactive helper. Under the guard the function
-    returns ``refreshed=False`` with
-    ``issue_codes=("data_only_write_blocked",)`` and **no
-    cache PKL, manifest sidecar, or status JSON is written**.
-    The guard releases automatically once the future
-    SMA-optimizer extraction sub-phase changes the payload
-    scope; the atomic write / manifest / status helpers in
-    this module are already wired for that work.
+    ``write=True`` writes the optimizer-backed cache PKL,
+    its provenance manifest sidecar, and the status JSON —
+    but ONLY when the payload scope is
+    ``OPTIMIZER_V1_SCOPE`` and the optimizer returned no
+    issue codes. A ``data_only_v1`` payload that somehow
+    arrives at the write check is still refused with
+    ``issue_codes=("data_only_write_blocked",)``; an
+    optimizer failure is reported via
+    ``issue_codes=("optimizer_failed", <optimizer codes>)``
+    and produces no disk side effects.
 
     ``data_fetcher`` lets the caller (and tests) inject a
     callable that returns a price ``DataFrame``. The default
     invokes yfinance via a lazy import so test code paths
     never trigger the network.
 
+    ``max_sma_day`` default behavior: if an existing cache
+    is present for ``ticker`` and exposes a usable
+    ``existing_max_sma_day`` field, the refresher reuses
+    that value so a refresh never silently downgrades a
+    114-wide cache to the module default of 30. An explicit
+    ``max_sma_day`` argument (or the ``--max-sma-day`` CLI
+    flag) overrides both, as long as it is ``>= 2``.
+
     See module docstring for the full scope of what Phase
-    6E-3 does and does NOT do.
+    6E-5 does and does NOT do.
     """
     started = time.monotonic()
     cache_d = _path_or_default(cache_dir, _default_cache_dir)
     status_d = _path_or_default(status_dir, _default_status_dir)
-    msd = (
-        DEFAULT_MAX_SMA_DAY
-        if max_sma_day is None
-        else max(2, int(max_sma_day))
-    )
 
     norm_ticker = _normalize_ticker(ticker)
     if not _is_valid_ticker(norm_ticker):
@@ -564,6 +645,56 @@ def refresh_signal_engine_cache(
             issue_codes=(ISSUE_INVALID_TICKER,),
             elapsed_seconds=time.monotonic() - started,
         )
+
+    # Resolve ``max_sma_day`` AFTER ticker normalization so
+    # the existing-cache probe runs against the canonical
+    # filename stem. Explicit invalid values are rejected
+    # (never silently clamped); the absent / None case
+    # reuses the existing cache's ``existing_max_sma_day``
+    # when present, or falls back to ``DEFAULT_MAX_SMA_DAY``.
+    if max_sma_day is None:
+        existing_msd = _existing_cache_max_sma_day(
+            norm_ticker, cache_d,
+        )
+        msd = (
+            existing_msd
+            if existing_msd is not None
+            else DEFAULT_MAX_SMA_DAY
+        )
+    else:
+        try:
+            msd_candidate = int(max_sma_day)
+        except (TypeError, ValueError):
+            return SignalEngineRefreshResult(
+                ticker=norm_ticker,
+                write=bool(write),
+                cache_path=None,
+                manifest_path=None,
+                status_path=None,
+                old_cache_date_range_end=None,
+                new_cache_date_range_end=None,
+                refreshed=False,
+                stale_before=False,
+                current_after=False,
+                issue_codes=(ISSUE_INVALID_MAX_SMA_DAY,),
+                elapsed_seconds=time.monotonic() - started,
+            )
+        if msd_candidate < 2:
+            return SignalEngineRefreshResult(
+                ticker=norm_ticker,
+                write=bool(write),
+                cache_path=None,
+                manifest_path=None,
+                status_path=None,
+                old_cache_date_range_end=None,
+                new_cache_date_range_end=None,
+                refreshed=False,
+                stale_before=False,
+                current_after=False,
+                issue_codes=(ISSUE_INVALID_MAX_SMA_DAY,),
+                elapsed_seconds=time.monotonic() - started,
+            )
+        msd = msd_candidate
 
     target_cache_path = _cache_path(norm_ticker, cache_d)
     old_end = _existing_cache_end(norm_ticker, cache_d)
@@ -636,8 +767,16 @@ def refresh_signal_engine_cache(
             elapsed_seconds=time.monotonic() - started,
         )
 
-    preprocessed = _build_preprocessed_data(raw_df, msd)
-    if preprocessed.empty:
+    # Run the Phase 6E-4 SMA-pair optimizer over the
+    # fetched data. The optimizer is offline / pure and
+    # builds preprocessed_data + SMA columns internally; the
+    # refresher trusts it to validate the input shape and
+    # returns its issue codes verbatim alongside
+    # ``optimizer_failed``.
+    opt_result = _seo.optimize_signal_engine_sma_pairs(
+        raw_df, ticker=norm_ticker, max_sma_day=msd,
+    )
+    if opt_result.issue_codes:
         return SignalEngineRefreshResult(
             ticker=norm_ticker,
             write=bool(write),
@@ -649,10 +788,14 @@ def refresh_signal_engine_cache(
             refreshed=False,
             stale_before=stale_before,
             current_after=False,
-            issue_codes=(ISSUE_DATA_EMPTY,),
+            issue_codes=(
+                ISSUE_OPTIMIZER_FAILED,
+                *opt_result.issue_codes,
+            ),
             elapsed_seconds=time.monotonic() - started,
         )
 
+    preprocessed = opt_result.preprocessed_data
     new_end = _date_to_iso(preprocessed.index[-1])
     new_dt = _parse_iso_date(new_end)
     current_after = bool(
@@ -660,13 +803,13 @@ def refresh_signal_engine_cache(
         and new_dt >= cutoff_dt
     )
 
-    payload = _build_cache_payload(
-        norm_ticker, preprocessed, msd,
+    payload = _build_optimizer_v1_payload(
+        norm_ticker, opt_result,
     )
 
     if not write:
-        # Dry-run path: structurally complete refresh, no
-        # disk side effects.
+        # Dry-run path: structurally complete refresh +
+        # optimizer pass, no disk side effects.
         return SignalEngineRefreshResult(
             ticker=norm_ticker,
             write=False,
@@ -682,19 +825,52 @@ def refresh_signal_engine_cache(
             elapsed_seconds=time.monotonic() - started,
         )
 
-    # write=True path. BEFORE touching disk, enforce the
-    # data_only_v1 guard. The payload built above always
-    # carries placeholder ``active_pairs`` because the
-    # Spymaster SMA optimizer has not been extracted into a
-    # non-interactive helper yet; writing such a payload
-    # would replace a valid Signal Engine cache with one
-    # that loads as ``current_signal=None``. The Phase 6E-3
-    # contract treats that outcome as worse than the
-    # staleness it would fix, so we refuse the write.
+    # write=True path. The defensive scope check refuses
+    # any payload that did not come through the optimizer.
+    # The Phase 6E-3 ``data_only_v1`` guard remains in
+    # force — only ``optimizer_v1`` payloads land on disk.
+    return _write_optimizer_payload_or_block(
+        norm_ticker=norm_ticker,
+        payload=payload,
+        target_cache_path=target_cache_path,
+        status_dir=status_d,
+        old_end=old_end,
+        new_end=new_end,
+        stale_before=stale_before,
+        current_after=current_after,
+        started=started,
+    )
+
+
+def _write_optimizer_payload_or_block(
+    *,
+    norm_ticker: str,
+    payload: dict[str, Any],
+    target_cache_path: Path,
+    status_dir: Path,
+    old_end: Optional[str],
+    new_end: Optional[str],
+    stale_before: bool,
+    current_after: bool,
+    started: float,
+) -> SignalEngineRefreshResult:
+    """Write guard + atomic writer. Refuses every payload
+    that is not stamped ``OPTIMIZER_V1_SCOPE``; for the
+    happy path, writes the cache PKL atomically, then the
+    manifest sidecar, then the status JSON. ``refreshed``
+    flips True only after the cache file is on disk."""
     payload_scope = payload.get(
         "signal_engine_cache_refresher_scope",
     )
-    if payload_scope == DATA_ONLY_V1_SCOPE:
+    if payload_scope != OPTIMIZER_V1_SCOPE:
+        # Defensive guard. The Phase 6E-3 ``data_only_v1``
+        # scope is still explicitly blocked; any other
+        # unexpected scope is also blocked.
+        block_code = (
+            ISSUE_DATA_ONLY_WRITE_BLOCKED
+            if payload_scope == DATA_ONLY_V1_SCOPE
+            else ISSUE_DATA_ONLY_WRITE_BLOCKED
+        )
         return SignalEngineRefreshResult(
             ticker=norm_ticker,
             write=True,
@@ -706,25 +882,23 @@ def refresh_signal_engine_cache(
             refreshed=False,
             stale_before=stale_before,
             current_after=current_after,
-            issue_codes=(ISSUE_DATA_ONLY_WRITE_BLOCKED,),
+            issue_codes=(block_code,),
             elapsed_seconds=time.monotonic() - started,
         )
 
-    # Unreachable while ``signal_engine_cache_refresher_scope``
-    # is always ``DATA_ONLY_V1_SCOPE``. Preserved for the
-    # future sub-phase that extracts the SMA optimizer: at
-    # that point the payload carries a different scope marker
-    # and the writer path becomes the active production
-    # refresh path. Until then, this branch is structurally
-    # dead and the atomic write helper exists only as a
-    # tested primitive for that future work.
-    manifest, manifest_issues = _build_manifest(payload)  # pragma: no cover
-    issues.extend(manifest_issues)  # pragma: no cover
+    issues: list[str] = []
+    # Build + embed the logical manifest BEFORE the cache
+    # pickle is finalized so the embedded ``_manifest`` is
+    # identical to what the sidecar will describe. The
+    # sidecar is written AFTER the cache file lands so its
+    # ``artifact_file_sha256`` reflects the final bytes.
+    manifest, manifest_issues = _build_manifest(payload)
+    issues.extend(manifest_issues)
 
-    _atomic_pickle_write(target_cache_path, payload)  # pragma: no cover
+    _atomic_pickle_write(target_cache_path, payload)
 
-    manifest_path: Optional[Path] = None  # pragma: no cover
-    if manifest is not None:  # pragma: no cover
+    manifest_path: Optional[Path] = None
+    if manifest is not None:
         try:
             manifest_path = _pm.write_output_manifest(
                 target_cache_path, manifest,
@@ -732,13 +906,13 @@ def refresh_signal_engine_cache(
         except Exception:
             issues.append(ISSUE_PROVENANCE_MANIFEST_FAILED)
 
-    target_status_path = _status_path(norm_ticker, status_d)  # pragma: no cover
-    _write_status(  # pragma: no cover
+    target_status_path = _status_path(norm_ticker, status_dir)
+    _write_status(
         target_status_path, norm_ticker,
         cache_status="fresh" if current_after else "stale",
     )
 
-    return SignalEngineRefreshResult(  # pragma: no cover
+    return SignalEngineRefreshResult(
         ticker=norm_ticker,
         write=True,
         cache_path=str(target_cache_path),
@@ -765,15 +939,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="signal_engine_cache_refresher",
         description=(
-            "Phase 6E-3 source-data refresh probe / "
-            "cache-shape builder for a single explicit "
-            "ticker. This is NOT a production-safe Signal "
-            "Engine cache refresher: --write is currently "
-            "refused by the data_only_v1 guard because "
-            "Spymaster's SMA pair optimizer has not been "
-            "extracted into a non-interactive helper yet. "
-            "Use --dry-run today; wait for the next "
-            "sub-phase before any production cache write. "
+            "Phase 6E-5 Signal Engine cache refresher for a "
+            "single explicit ticker. Default is dry-run; "
+            "--write must be explicit. Calls the Phase 6E-4 "
+            "SMA-pair optimizer to produce real "
+            "active_pairs and headline buy/short pair "
+            "fields, then writes an optimizer_v1 cache PKL "
+            "+ manifest sidecar + status JSON atomically. "
             "Never runs a universe sweep."
         ),
     )
@@ -792,13 +964,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--write",
         action="store_true",
         help=(
-            "Reserved for the future SMA-optimizer-backed "
-            "writer. Currently refused under the "
-            "data_only_v1 guard: the fetch + cache-shape "
-            "build still runs, but no cache PKL, manifest "
-            "sidecar, or status JSON is written and the "
-            "result reports refreshed=false with "
-            "issue_codes=[\"data_only_write_blocked\"]."
+            "Run the optimizer and write the resulting "
+            "optimizer_v1 cache PKL + manifest sidecar + "
+            "status JSON atomically. The legacy "
+            "data_only_v1 scope remains explicitly "
+            "blocked; an optimizer failure also produces "
+            "no writes."
         ),
     )
     parser.add_argument("--cache-dir", default=None)
@@ -807,7 +978,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--max-sma-day", type=int, default=None,
         help=(
             "SMA matrix width to materialize in "
-            "preprocessed_data (default 30)."
+            "preprocessed_data. Default reuses the "
+            "existing cache's existing_max_sma_day field "
+            "when present so a refresh does not silently "
+            "downgrade a 114-wide cache; otherwise falls "
+            "back to DEFAULT_MAX_SMA_DAY (30). Must be "
+            ">= 2."
         ),
     )
     parser.add_argument(

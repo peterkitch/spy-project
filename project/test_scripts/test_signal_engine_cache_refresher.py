@@ -201,17 +201,243 @@ def test_dry_run_reports_old_and_new_end(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# write=True is guarded — Phase 6E-3 ships a data-only build
-# path; writing such a payload over a real Spymaster cache
-# would replace ``current_signal=Buy/Short`` with ``=None``.
-# Until the SMA optimizer is extracted, --write is refused.
+# Phase 6E-5 write path — optimizer_v1 writes; data_only_v1
+# is still defensively refused.
 # ---------------------------------------------------------------------------
 
 
-def test_write_is_refused_for_data_only_payload(tmp_path: Path):
+def test_write_with_optimizer_payload_writes_cache_manifest_status_to_temp_dirs(
+    tmp_path: Path,
+):
     dirs = _layout(tmp_path)
     fetcher = _make_fetcher(_make_synthetic_df(
-        last_date="2026-05-08", n=20,
+        last_date="2026-05-08", n=30,
+    ))
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=True,
+        data_fetcher=fetcher,
+        current_as_of_date="2026-05-08",
+        max_sma_day=5,
+    )
+    assert result.refreshed is True
+    assert result.issue_codes == ()
+    assert result.cache_path is not None
+    cache_p = Path(result.cache_path)
+    assert cache_p.exists()
+    assert cache_p.is_relative_to(dirs["cache_dir"])
+    manifest_p = Path(result.manifest_path)
+    assert manifest_p.exists()
+    assert manifest_p.is_relative_to(dirs["cache_dir"])
+    status_p = Path(result.status_path)
+    assert status_p.exists()
+    assert status_p.is_relative_to(dirs["status_dir"])
+    # Nothing outside the supplied dirs.
+    other_files = (
+        list(dirs["artifact_root"].rglob("*"))
+        + list(dirs["other_root"].rglob("*"))
+    )
+    assert other_files == [], (
+        f"unexpected writes outside temp dirs: {other_files}"
+    )
+    # Cache payload carries the optimizer_v1 scope marker.
+    with cache_p.open("rb") as fh:
+        on_disk = pickle.load(fh)
+    assert (
+        on_disk["signal_engine_cache_refresher_scope"]
+        == ser.OPTIMIZER_V1_SCOPE
+    )
+
+
+def test_data_only_scope_still_blocked(tmp_path: Path):
+    """The Phase 6E-3 data_only_v1 guard remains in force.
+    A payload that somehow carries the legacy scope marker
+    is refused even on the helper layer; no disk side
+    effects."""
+    dirs = _layout(tmp_path)
+    # Build a data_only_v1 payload directly via the helper
+    # so we can route it through the write guard without
+    # going through the optimizer path.
+    df = _make_synthetic_df(last_date="2026-05-08", n=20)
+    payload = ser._build_data_only_v1_payload(
+        "SPY", df, max_sma_day=5,
+    )
+    assert (
+        payload["signal_engine_cache_refresher_scope"]
+        == ser.DATA_ONLY_V1_SCOPE
+    )
+    target_cache_path = ser._cache_path(
+        "SPY", dirs["cache_dir"],
+    )
+    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    result = ser._write_optimizer_payload_or_block(
+        norm_ticker="SPY",
+        payload=payload,
+        target_cache_path=target_cache_path,
+        status_dir=dirs["status_dir"],
+        old_end=None,
+        new_end="2026-05-08",
+        stale_before=False,
+        current_after=True,
+        started=0.0,
+    )
+    assert result.refreshed is False
+    assert result.manifest_path is None
+    assert result.status_path is None
+    assert (
+        ser.ISSUE_DATA_ONLY_WRITE_BLOCKED in result.issue_codes
+    )
+    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    assert before == after, (
+        "data_only_v1 guard let a write through: "
+        f"added {set(after) - set(before)}"
+    )
+
+
+def test_blocked_write_does_not_overwrite_existing_valid_cache(
+    tmp_path: Path,
+):
+    """A defensively-blocked write (data_only_v1 scope)
+    must not overwrite an existing valid Spymaster cache.
+    Routes a data_only_v1 payload through the write guard
+    while a real cache PKL is already on disk."""
+    dirs = _layout(tmp_path)
+    seeded = _seed_existing_cache(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-04", n=20,
+    )
+    before_bytes = seeded.read_bytes()
+    df = _make_synthetic_df(last_date="2026-05-08", n=20)
+    payload = ser._build_data_only_v1_payload(
+        "SPY", df, max_sma_day=5,
+    )
+    result = ser._write_optimizer_payload_or_block(
+        norm_ticker="SPY",
+        payload=payload,
+        target_cache_path=seeded,
+        status_dir=dirs["status_dir"],
+        old_end="2026-05-04",
+        new_end="2026-05-08",
+        stale_before=True,
+        current_after=True,
+        started=0.0,
+    )
+    assert result.refreshed is False
+    assert (
+        ser.ISSUE_DATA_ONLY_WRITE_BLOCKED in result.issue_codes
+    )
+    assert seeded.exists()
+    assert seeded.read_bytes() == before_bytes, (
+        "data_only_v1 guard allowed overwrite of valid cache"
+    )
+
+
+def test_blocked_write_emits_no_status_or_manifest(tmp_path: Path):
+    dirs = _layout(tmp_path)
+    df = _make_synthetic_df(last_date="2026-05-08", n=20)
+    payload = ser._build_data_only_v1_payload(
+        "SPY", df, max_sma_day=5,
+    )
+    target_cache_path = ser._cache_path(
+        "SPY", dirs["cache_dir"],
+    )
+    result = ser._write_optimizer_payload_or_block(
+        norm_ticker="SPY",
+        payload=payload,
+        target_cache_path=target_cache_path,
+        status_dir=dirs["status_dir"],
+        old_end=None,
+        new_end="2026-05-08",
+        stale_before=False,
+        current_after=True,
+        started=0.0,
+    )
+    assert result.refreshed is False
+    assert result.status_path is None
+    assert result.manifest_path is None
+    json_files = list(dirs["status_dir"].rglob("*.json"))
+    manifest_files = list(dirs["cache_dir"].rglob("*.manifest.json"))
+    assert json_files == []
+    assert manifest_files == []
+
+
+def test_api_invalid_max_sma_day_returns_issue_and_writes_nothing(
+    tmp_path: Path,
+):
+    """The public API must reject explicit ``max_sma_day < 2``
+    rather than silently clamping. Verified for ``write=True``:
+    no cache PKL, no manifest sidecar, no status JSON is
+    written; ``invalid_max_sma_day`` is surfaced in
+    ``issue_codes``; ``new_cache_date_range_end`` is None
+    because the function never reaches the fetch path."""
+    dirs = _layout(tmp_path)
+    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=True,
+        max_sma_day=1,
+        data_fetcher=_make_fetcher(_make_synthetic_df(
+            last_date="2026-05-08", n=20,
+        )),
+        current_as_of_date="2026-05-08",
+    )
+    assert result.refreshed is False
+    assert ser.ISSUE_INVALID_MAX_SMA_DAY in result.issue_codes
+    assert result.cache_path is None
+    assert result.manifest_path is None
+    assert result.status_path is None
+    assert result.new_cache_date_range_end is None
+    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    assert before == after, (
+        "invalid max_sma_day reached disk: "
+        f"added {set(after) - set(before)}"
+    )
+
+
+def test_api_invalid_max_sma_day_dry_run_returns_issue_and_writes_nothing(
+    tmp_path: Path,
+):
+    """Same rejection contract under ``write=False``: an
+    invalid explicit ``max_sma_day`` short-circuits before
+    the fetch and reports the issue code with zero disk
+    side effects."""
+    dirs = _layout(tmp_path)
+    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=False,
+        max_sma_day=0,
+        data_fetcher=_make_fetcher(_make_synthetic_df(
+            last_date="2026-05-08", n=20,
+        )),
+        current_as_of_date="2026-05-08",
+    )
+    assert result.refreshed is False
+    assert ser.ISSUE_INVALID_MAX_SMA_DAY in result.issue_codes
+    assert result.new_cache_date_range_end is None
+    # No dry_run_only when the validation short-circuits;
+    # the rejection is more specific than the generic
+    # dry-run echo.
+    assert ser.ISSUE_DRY_RUN not in result.issue_codes
+    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    assert before == after
+
+
+def test_optimizer_issue_blocks_write(tmp_path: Path):
+    """An optimizer that returns issue codes must produce
+    no disk writes and surface ``optimizer_failed`` plus
+    the optimizer's own issue codes."""
+    dirs = _layout(tmp_path)
+    # Fetch a 1-row DataFrame: optimizer reports
+    # ``insufficient_history``.
+    fetcher = _make_fetcher(_make_synthetic_df(
+        last_date="2026-05-08", n=1,
     ))
     before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
     result = ser.refresh_signal_engine_cache(
@@ -221,79 +447,51 @@ def test_write_is_refused_for_data_only_payload(tmp_path: Path):
         write=True,
         data_fetcher=fetcher,
         current_as_of_date="2026-05-08",
+        max_sma_day=5,
     )
-    assert result.write is True
-    # Guard fires: the data_only_v1 payload must not land.
     assert result.refreshed is False
     assert (
-        ser.ISSUE_DATA_ONLY_WRITE_BLOCKED in result.issue_codes
+        ser.ISSUE_OPTIMIZER_FAILED in result.issue_codes
     )
-    # The result still reports the dates so the operator can
-    # see what a future write would have advanced to.
-    assert result.new_cache_date_range_end == "2026-05-08"
+    # Optimizer's own issue code is also surfaced.
+    assert any(
+        "insufficient_history" in code
+        or "invalid_preprocessed_data" in code
+        for code in result.issue_codes
+    )
     after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
-    assert before == after, (
-        f"blocked write touched disk: added {set(after) - set(before)}"
-    )
+    assert before == after
 
 
-def test_blocked_write_does_not_overwrite_existing_valid_cache(
+def test_dry_run_still_writes_nothing_even_with_optimizer(
     tmp_path: Path,
 ):
-    """An operator running --write against a ticker that
-    already has a real Spymaster cache must NOT lose that
-    cache. The Phase 6E-3 guard is the only thing standing
-    between this CLI and a public-board regression, so the
-    test pins the exact behavior."""
+    """Even after the Phase 6E-5 wiring, dry-run must
+    perform a complete optimizer pass in memory but leave
+    disk untouched."""
     dirs = _layout(tmp_path)
-    seeded = _seed_existing_cache(
-        dirs["cache_dir"], "SPY",
-        last_date="2026-05-04", n=20,
-    )
-    before_bytes = seeded.read_bytes()
     fetcher = _make_fetcher(_make_synthetic_df(
-        last_date="2026-05-08", n=20,
+        last_date="2026-05-08", n=30,
     ))
+    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
     result = ser.refresh_signal_engine_cache(
         "SPY",
         cache_dir=dirs["cache_dir"],
         status_dir=dirs["status_dir"],
-        write=True,
+        write=False,
         data_fetcher=fetcher,
         current_as_of_date="2026-05-08",
+        max_sma_day=5,
+    )
+    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    assert before == after, (
+        f"dry-run wrote files: added {set(after) - set(before)}"
     )
     assert result.refreshed is False
-    assert (
-        ser.ISSUE_DATA_ONLY_WRITE_BLOCKED in result.issue_codes
-    )
-    assert seeded.exists(), "existing cache file vanished"
-    assert seeded.read_bytes() == before_bytes, (
-        "existing valid cache was overwritten by blocked --write"
-    )
-
-
-def test_blocked_write_emits_no_status_or_manifest(tmp_path: Path):
-    dirs = _layout(tmp_path)
-    fetcher = _make_fetcher(_make_synthetic_df(
-        last_date="2026-05-08", n=20,
-    ))
-    result = ser.refresh_signal_engine_cache(
-        "SPY",
-        cache_dir=dirs["cache_dir"],
-        status_dir=dirs["status_dir"],
-        write=True,
-        data_fetcher=fetcher,
-        current_as_of_date="2026-05-08",
-    )
-    assert result.refreshed is False
-    assert result.status_path is None
-    assert result.manifest_path is None
-    # Confirm structurally: no JSON / manifest files were
-    # created anywhere under the supplied dirs.
-    json_files = list(dirs["status_dir"].rglob("*.json"))
-    manifest_files = list(dirs["cache_dir"].rglob("*.manifest.json"))
-    assert json_files == []
-    assert manifest_files == []
+    assert ser.ISSUE_DRY_RUN in result.issue_codes
+    # And the new_cache_date_range_end is reported from
+    # the optimizer pass.
+    assert result.new_cache_date_range_end == "2026-05-08"
 
 
 # ---------------------------------------------------------------------------
@@ -302,18 +500,17 @@ def test_blocked_write_emits_no_status_or_manifest(tmp_path: Path):
 
 
 def test_stale_before_current_after_when_fresh(tmp_path: Path):
-    """Stale-before / current-after reflect the fetched
-    data's date_range_end vs the resolved cutoff, NOT
-    whether the write actually landed. The Phase 6E-3
-    guard refuses the write but the result still surfaces
-    the staleness arithmetic so operators can plan."""
+    """A stale existing cache + a fresh fetch must report
+    ``stale_before=True`` AND ``current_after=True``. With
+    Phase 6E-5 wiring the write actually lands too, so
+    ``refreshed=True`` and ``issue_codes=()``."""
     dirs = _layout(tmp_path)
     _seed_existing_cache(
         dirs["cache_dir"], "SPY",
         last_date="2024-01-31", n=20,
     )
     fetcher = _make_fetcher(_make_synthetic_df(
-        last_date="2026-05-08", n=20,
+        last_date="2026-05-08", n=30,
     ))
     result = ser.refresh_signal_engine_cache(
         "SPY",
@@ -322,15 +519,12 @@ def test_stale_before_current_after_when_fresh(tmp_path: Path):
         write=True,
         data_fetcher=fetcher,
         current_as_of_date="2026-05-08",
+        max_sma_day=5,
     )
     assert result.stale_before is True
     assert result.current_after is True
-    # And the guard still fires under write=True so refreshed
-    # stays False even when the fetch was successful.
-    assert result.refreshed is False
-    assert (
-        ser.ISSUE_DATA_ONLY_WRITE_BLOCKED in result.issue_codes
-    )
+    assert result.refreshed is True
+    assert result.issue_codes == ()
 
 
 def test_current_after_false_when_fetch_does_not_advance(
@@ -517,15 +711,14 @@ def test_cli_default_is_dry_run(tmp_path: Path, capsys, monkeypatch):
     )
 
 
-def test_cli_write_flag_is_refused_under_data_only_guard(
+def test_cli_write_flag_writes_optimizer_v1_cache_to_temp_dirs(
     tmp_path: Path, capsys, monkeypatch,
 ):
-    """Phase 6E-3 keeps ``--write`` in the CLI but the
-    data-only guard refuses every actual write while the
-    SMA optimizer is unavailable. The CLI must report this
-    via the JSON result and write nothing."""
+    """Phase 6E-5 CLI --write happy path: optimizer succeeds,
+    cache PKL + manifest sidecar + status JSON land under
+    the supplied temp dirs, refreshed=true, no leakage."""
     dirs = _layout(tmp_path)
-    df = _make_synthetic_df(last_date="2026-05-08", n=20)
+    df = _make_synthetic_df(last_date="2026-05-08", n=30)
 
     def stub_fetch(*args, **kw):  # avoid yfinance entirely
         return df
@@ -534,25 +727,32 @@ def test_cli_write_flag_is_refused_under_data_only_guard(
         ser, "_default_yfinance_fetcher", stub_fetch,
     )
 
-    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
     argv = [
         "--ticker", "SPY",
         "--write",
         "--cache-dir", str(dirs["cache_dir"]),
         "--status-dir", str(dirs["status_dir"]),
+        "--max-sma-day", "5",
         "--current-as-of-date", "2026-05-08",
     ]
     rc = ser.main(argv)
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["write"] is True
-    assert payload["refreshed"] is False
-    assert "data_only_write_blocked" in payload["issue_codes"]
-    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
-    assert before == after, (
-        "CLI --write under guard touched disk; expected zero "
-        f"file changes, got {set(after) - set(before)}"
+    assert payload["refreshed"] is True
+    assert payload["issue_codes"] == []
+    cache_p = Path(payload["cache_path"])
+    status_p = Path(payload["status_path"])
+    manifest_p = Path(payload["manifest_path"])
+    assert cache_p.is_relative_to(dirs["cache_dir"])
+    assert status_p.is_relative_to(dirs["status_dir"])
+    assert manifest_p.is_relative_to(dirs["cache_dir"])
+    # No writes outside the supplied temp dirs.
+    stragglers = (
+        list(dirs["artifact_root"].rglob("*"))
+        + list(dirs["other_root"].rglob("*"))
     )
+    assert stragglers == []
 
 
 def test_cli_dry_run_emits_valid_json(
@@ -628,12 +828,194 @@ def test_cutoff_uses_resolve_current_as_of_date_monday_2026_05_11(
     )
 
 
+def test_written_optimizer_cache_loads_via_primary_signal_engine_with_real_signal_fields(
+    tmp_path: Path,
+):
+    """Round-trip: a write=True payload landed under temp
+    dirs must load via primary_signal_engine with REAL
+    signal fields. current_active_pair_raw is NOT the
+    placeholder ``"None"`` literal — it carries the optimizer's
+    actual ``"Buy a,b"`` / ``"Short a,b"`` verdict. The
+    smoke verifies the refresher → optimizer → loader
+    pipeline produces an end-to-end usable cache."""
+    import primary_signal_engine as pse
+    dirs = _layout(tmp_path)
+    # Strong monotonic uptrend so the optimizer produces a
+    # non-"None" last-day verdict the loader can surface.
+    df = pd.DataFrame(
+        {"Close": [100.0 + i * 0.5 for i in range(40)]},
+        index=pd.bdate_range(end="2026-05-08", periods=40),
+    )
+    fetcher = _make_fetcher(df)
+    result = ser.refresh_signal_engine_cache(
+        "SYN",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=True,
+        data_fetcher=fetcher,
+        current_as_of_date="2026-05-08",
+        max_sma_day=5,
+    )
+    assert result.refreshed is True
+    loaded = pse.load_primary_signal_engine_payload(
+        "SYN", cache_dir=dirs["cache_dir"],
+    )
+    assert loaded["available"] is True
+    assert loaded["date_range"]["end"] == "2026-05-08"
+    # Strong uptrend -> real Buy verdict, not the
+    # placeholder ``"None"`` string.
+    assert loaded["current_signal"] == "Buy"
+    assert (
+        loaded["current_active_pair_raw"]
+        and loaded["current_active_pair_raw"] != "None"
+    )
+    assert loaded["current_sma_pair"] is not None
+    # And the loader reports headline numbers the placeholder
+    # path could never have produced.
+    assert (
+        loaded["signal_days"] is not None
+        and loaded["signal_days"] > 0
+    )
+    assert (
+        loaded["total_capture_pct"] is not None
+        and abs(loaded["total_capture_pct"]) > 0
+    )
+
+
+def test_existing_cache_existing_max_sma_day_is_reused_by_default(
+    tmp_path: Path,
+):
+    """If an existing cache has ``existing_max_sma_day=114``,
+    a refresh without an explicit ``--max-sma-day`` must
+    reuse 114 — never silently downgrade to the module
+    default of 30."""
+    dirs = _layout(tmp_path)
+    # Seed with a manually-set existing_max_sma_day. The
+    # seeder helper writes a minimal cache but we mutate it
+    # to expose the field the refresher reads.
+    seeded = _seed_existing_cache(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-04", n=20,
+    )
+    with seeded.open("rb") as fh:
+        obj = pickle.load(fh)
+    obj["existing_max_sma_day"] = 114
+    with seeded.open("wb") as fh:
+        pickle.dump(obj, fh)
+
+    msd = ser._existing_cache_max_sma_day(
+        "SPY", dirs["cache_dir"],
+    )
+    assert msd == 114
+
+    # And the refresher's default-path resolution honors
+    # the existing value: a write=True run with an n=20
+    # synthetic feed against max_sma_day=114 produces an
+    # optimizer_v1 cache whose existing_max_sma_day field
+    # round-trips to 114.
+    fetcher = _make_fetcher(_make_synthetic_df(
+        last_date="2026-05-08", n=30,
+    ))
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=True,
+        data_fetcher=fetcher,
+        current_as_of_date="2026-05-08",
+    )
+    assert result.refreshed is True
+    with Path(result.cache_path).open("rb") as fh:
+        on_disk = pickle.load(fh)
+    assert on_disk["existing_max_sma_day"] == 114
+
+
+def test_max_sma_day_override_is_respected(tmp_path: Path):
+    """An explicit ``max_sma_day`` argument overrides the
+    existing cache's stored value."""
+    dirs = _layout(tmp_path)
+    seeded = _seed_existing_cache(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-04", n=20,
+    )
+    with seeded.open("rb") as fh:
+        obj = pickle.load(fh)
+    obj["existing_max_sma_day"] = 114
+    with seeded.open("wb") as fh:
+        pickle.dump(obj, fh)
+
+    fetcher = _make_fetcher(_make_synthetic_df(
+        last_date="2026-05-08", n=30,
+    ))
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=True,
+        data_fetcher=fetcher,
+        current_as_of_date="2026-05-08",
+        max_sma_day=5,  # explicit override
+    )
+    assert result.refreshed is True
+    with Path(result.cache_path).open("rb") as fh:
+        on_disk = pickle.load(fh)
+    assert on_disk["existing_max_sma_day"] == 5
+
+
+def test_current_as_of_resolver_still_used(
+    tmp_path: Path, monkeypatch,
+):
+    """Phase 6E-3's resolver alignment must survive the
+    Phase 6E-5 wiring: with no explicit cutoff, Monday
+    2026-05-11 must resolve to Friday 2026-05-08 (via
+    confluence_pipeline_readiness.resolve_current_as_of_date)
+    so a fresh 2026-05-08 fetch reports current_after=True."""
+    import confluence_pipeline_readiness as cpr
+    from datetime import datetime as _dt, timezone as _tz
+
+    monday = _dt(2026, 5, 11, 12, 0, tzinfo=_tz.utc)
+    resolved = cpr.resolve_current_as_of_date(None, now=monday)
+    assert resolved == "2026-05-08"
+
+    class _FixedDatetime(_dt):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return monday if tz is None else monday.astimezone(tz)
+
+    monkeypatch.setattr(cpr, "datetime", _FixedDatetime)
+    dirs = _layout(tmp_path)
+    fetcher = _make_fetcher(_make_synthetic_df(
+        last_date="2026-05-08", n=30,
+    ))
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=False,
+        data_fetcher=fetcher,
+        max_sma_day=5,
+    )
+    assert result.new_cache_date_range_end == "2026-05-08"
+    assert result.current_after is True
+
+
 def test_daily_signal_board_is_not_imported_by_refresher():
     """daily_signal_board must NOT be a transitive import of
     the refresher; that would break the read-only contract
-    of the public web tier."""
-    forbidden = "daily_signal_board"
-    text = Path(ser.__file__).read_text(encoding="utf-8")
-    assert forbidden not in text, (
-        f"refresher source mentions {forbidden}"
+    of the public web tier. AST-based check: docstrings or
+    comments that mention the module by name (e.g. listing
+    it as forbidden) do not count."""
+    tree = ast.parse(
+        Path(ser.__file__).read_text(encoding="utf-8"),
+    )
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                found.append(node.module)
+    assert "daily_signal_board" not in found, (
+        f"refresher imports daily_signal_board: {found}"
     )
