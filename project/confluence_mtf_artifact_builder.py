@@ -295,6 +295,37 @@ def artifact_run_id_for_mtf_consensus(
 # ---------------------------------------------------------------------------
 
 
+def _mtf_seed_prefix_from_filename(name: str) -> Optional[str]:
+    """Return the source seed-run prefix encoded into a Phase 6D-2
+    MTF filename. ``<prefix>__K<K>__MTF.research_day.json`` ->
+    ``<prefix>``. Returns ``None`` when the filename does not
+    match the Phase 6D-2 convention.
+
+    Used by ``build_confluence_from_mtf_trafficflow`` to group
+    candidate inputs by their source seed run; without it the
+    builder could silently mix K artifacts from two different
+    StackBuilder seed runs."""
+    if not name:
+        return None
+    match = MTF_FILENAME_RX.search(name)
+    if match is None:
+        return None
+    return name[: match.start()]
+
+
+def _parse_iso_date_to_ordinal(value: Any) -> int:
+    """Best-effort YYYY-MM-DD parse. Returns an ``int`` ordinal
+    suitable for max/min comparisons; unparseable input returns
+    ``0`` so groups without a usable last_date sort to the
+    bottom of the freshness ranking."""
+    if not value:
+        return 0
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").toordinal()
+    except Exception:
+        return 0
+
+
 def list_mtf_trafficflow_artifacts(
     artifact_root: Path, target: str,
 ) -> list[tuple[Path, int]]:
@@ -335,28 +366,40 @@ def _per_day_votes(
 ) -> tuple[
     list[str], dict[str, dict[str, Any]], list[str], list[int],
 ]:
-    """Aggregate every (K, timeframe) cell across the given MTF
-    artifacts onto a single per-day grid.
+    """Aggregate the vote grid K_in_inputs x expected_timeframes
+    across every date the MTF artifacts cover.
 
-    Returns ``(dates_in_order, per_date_record, timeframes_seen,
-    K_values_seen)``. ``per_date_record`` maps an ISO date string
-    to a dict the row builder consumes."""
-    timeframes_seen: list[str] = []
-    K_values_seen: list[int] = []
+    PR #198 audit fix (Issue 2): the vote grid is now strictly
+    ``len(K_used) * len(expected_timeframes)`` cells per day.
+    An expected timeframe absent from a given K artifact's
+    ``timeframes`` field still occupies a cell for that K -
+    counted as ``missing``. Previously the helper added one
+    "placeholder missing" per absent timeframe at the day level,
+    which under-counted by a factor of K (e.g. 12 K artifacts
+    each missing ``1y`` reported ``missing_votes = 1`` instead
+    of ``12``).
+
+    Returns ``(dates_in_order, per_date_record,
+    timeframes_returned, K_values_used)``.
+    """
+    expected_tfs = list(expected_timeframes)
+    K_values_used: list[int] = []
     target_close_by_date: dict[str, float] = {}
-    # cell_key -> {date -> raw signal value}
-    cells: list[tuple[int, str, dict[str, str]]] = []
+
+    # cells[(K, tf)] -> {date -> normalized signal string}. A
+    # missing entry means "that K artifact had no row for this
+    # date" and is treated as ``missing`` at lookup time.
+    cells: dict[tuple[int, str], dict[str, str]] = {}
 
     for K, artifact in mtf_inputs:
-        if isinstance(K, int) and K not in K_values_seen:
-            K_values_seen.append(K)
-        art_tfs = list(getattr(artifact, "timeframes", None) or [])
-        for tf in art_tfs:
-            if tf not in timeframes_seen:
-                timeframes_seen.append(tf)
-        per_tf_signals: dict[str, dict[str, str]] = {
-            tf: {} for tf in art_tfs
-        }
+        if isinstance(K, int) and K not in K_values_used:
+            K_values_used.append(K)
+        art_tfs = set(getattr(artifact, "timeframes", None) or [])
+        # Allocate one daymap per (K, expected_tf). Timeframes the
+        # artifact did NOT carry stay empty and resolve to
+        # ``missing`` at lookup.
+        for tf in expected_tfs:
+            cells.setdefault((K, tf), {})
         for row in artifact.daily or []:
             if not isinstance(row, Mapping):
                 continue
@@ -369,51 +412,44 @@ def _per_day_votes(
                 target_close_by_date[date_iso] = tc
             tf_map = row.get("timeframe_pressure_signals") or {}
             if not isinstance(tf_map, Mapping):
-                continue
-            for tf in art_tfs:
-                per_tf_signals[tf][date_iso] = _normalize_signal(
-                    tf_map.get(tf),
-                )
-        for tf in art_tfs:
-            cells.append((K, tf, per_tf_signals[tf]))
+                tf_map = {}
+            for tf in expected_tfs:
+                if tf in art_tfs:
+                    cells[(K, tf)][date_iso] = _normalize_signal(
+                        tf_map.get(tf),
+                    )
+                else:
+                    # Expected timeframe was not produced by this
+                    # K's MTF artifact at all - the cell is missing
+                    # for every date this artifact covers.
+                    cells[(K, tf)][date_iso] = PRESSURE_SIGNAL_MISSING
 
-    # Preserve the order timeframes appeared in inputs (1d first,
-    # etc.). When the expected list is provided, append any
-    # missing timeframes the inputs did NOT carry so the row
-    # record can mark them ``missing`` consistently.
-    for tf in expected_timeframes:
-        if tf not in timeframes_seen:
-            timeframes_seen.append(tf)
-
-    # Build the union of all dates encountered.
+    # Build the date union across every K artifact's rows.
     date_set: set[str] = set()
-    for _, _, daymap in cells:
+    for daymap in cells.values():
         date_set.update(daymap.keys())
     dates_in_order = sorted(date_set)
+
+    K_values_used = sorted(K_values_used)
 
     per_date_record: dict[str, dict[str, Any]] = {}
     for d in dates_in_order:
         buy = short = none = missing = 0
         per_cell: list[tuple[int, str, str]] = []
-        for K, tf, daymap in cells:
-            cell = daymap.get(d, PRESSURE_SIGNAL_MISSING)
-            if cell == PRESSURE_SIGNAL_BUY:
-                buy += 1
-            elif cell == PRESSURE_SIGNAL_SHORT:
-                short += 1
-            elif cell == PRESSURE_SIGNAL_NONE:
-                none += 1
-            else:
-                missing += 1
-            per_cell.append((K, tf, cell))
-        # Slots not represented by an input artifact at all
-        # (expected timeframes that no MTF carried) are counted
-        # as missing per the contract; they appear as additional
-        # placeholders so audit tooling can detect the gap.
-        for tf in expected_timeframes:
-            if not any(c[1] == tf for c in cells):
-                missing += 1
-                per_cell.append((0, tf, PRESSURE_SIGNAL_MISSING))
+        for K in K_values_used:
+            for tf in expected_tfs:
+                cell = cells.get((K, tf), {}).get(
+                    d, PRESSURE_SIGNAL_MISSING,
+                )
+                if cell == PRESSURE_SIGNAL_BUY:
+                    buy += 1
+                elif cell == PRESSURE_SIGNAL_SHORT:
+                    short += 1
+                elif cell == PRESSURE_SIGNAL_NONE:
+                    none += 1
+                else:
+                    missing += 1
+                per_cell.append((K, tf, cell))
         active_count = buy + short
         available_count = active_count + none
         per_date_record[d] = {
@@ -426,7 +462,10 @@ def _per_day_votes(
             "per_cell": per_cell,
             "target_close": target_close_by_date.get(d),
         }
-    return dates_in_order, per_date_record, timeframes_seen, K_values_seen
+    return (
+        dates_in_order, per_date_record,
+        list(expected_tfs), list(K_values_used),
+    )
 
 
 def _final_signal(buy: int, short: int) -> tuple[str, int]:
@@ -513,10 +552,20 @@ def build_confluence_from_mtf_trafficflow(
             elapsed_seconds=time.perf_counter() - t0,
         )
 
-    mtf_inputs: list[tuple[int, _ra.ResearchDayArtifact]] = []
-    seen_k: set[int] = set()
     wanted = set(expected_k_tuple)
+
+    # PR #198 audit fix (Issue 1): group candidates by source
+    # seed-run prefix. Each group is one coherent Phase 6D-2
+    # sweep; the builder must NOT mix K artifacts across two
+    # different seed runs (e.g. older alphabetic seed paired
+    # with newer one).
+    # Schema: groups[prefix] = {K: (path, artifact)}
+    groups: dict[str, dict[int, tuple[Path, _ra.ResearchDayArtifact]]] = {}
+    all_attempted_k: set[int] = set()
     for path, k_from_name in paths:
+        prefix = _mtf_seed_prefix_from_filename(path.name)
+        if prefix is None:
+            continue
         try:
             art = _ra.read_research_day_artifact(path)
         except Exception:
@@ -530,18 +579,30 @@ def build_confluence_from_mtf_trafficflow(
             continue
         if wanted and K not in wanted:
             continue
-        if K in seen_k:
-            # Duplicate seed-run for same K - first wins.
+        group = groups.setdefault(prefix, {})
+        # Within a single group, the filename uniqueness rule
+        # prevents real duplicates (one file per
+        # (target, run_id) per writer). Defensive: keep the
+        # first sorted-by-path entry for the same K so the
+        # selection is deterministic even on a fixture that
+        # forces a duplicate.
+        if K in group:
             continue
-        seen_k.add(K)
-        mtf_inputs.append((K, art))
+        group[K] = (path, art)
+        all_attempted_k.add(K)
 
-    attempted_k = tuple(sorted(seen_k))
-    if wanted and not wanted.issubset(seen_k):
+    # Refuse to write unless one coherent source group covers
+    # the full expected K range.
+    full_coverage_groups = [
+        (prefix, group_dict)
+        for prefix, group_dict in groups.items()
+        if wanted.issubset(set(group_dict.keys()))
+    ]
+    if not full_coverage_groups:
         _append_unique(issues, ISSUE_MISSING_MTF_K_COVERAGE)
         return ConfluenceBuildResult(
             target=target,
-            attempted_k=attempted_k,
+            attempted_k=tuple(sorted(all_attempted_k)),
             built=False,
             artifact_path=None,
             issue_codes=tuple(issues),
@@ -550,9 +611,46 @@ def build_confluence_from_mtf_trafficflow(
             elapsed_seconds=time.perf_counter() - t0,
         )
 
+    # Pick the freshest full-coverage group. Sort key, ascending:
+    #   1. ``-last_date_ordinal``  -> newest source data first
+    #   2. ``-max_file_mtime``     -> newest file on tie
+    #   3. ``prefix`` (asc)        -> alphabetic prefix on tie
+    def _group_sort_key(item):
+        _prefix, group_dict = item
+        last_ord = 0
+        max_mtime = 0.0
+        for K in expected_k_tuple:
+            path, art = group_dict[K]
+            ld = art.daily[-1].get("date") if art.daily else None
+            ord_value = _parse_iso_date_to_ordinal(ld)
+            if ord_value > last_ord:
+                last_ord = ord_value
+            try:
+                m = path.stat().st_mtime
+                if m > max_mtime:
+                    max_mtime = m
+            except Exception:
+                pass
+        return (-last_ord, -max_mtime, _prefix)
+
+    chosen_prefix, chosen_group = sorted(
+        full_coverage_groups, key=_group_sort_key,
+    )[0]
+
+    # Use ONLY the chosen group's artifacts. attempted_k now
+    # reflects the selected group's coverage (always == wanted
+    # at this point).
+    mtf_inputs: list[tuple[int, _ra.ResearchDayArtifact]] = [
+        (K, chosen_group[K][1]) for K in sorted(chosen_group)
+        if K in wanted
+    ]
+    attempted_k = tuple(sorted(chosen_group.keys() & wanted))
+
     # Partial timeframe coverage is a soft signal: warn but
     # continue. The aggregation marks missing cells per row so
-    # the final agreement counts stay honest.
+    # the final agreement counts stay honest. The check uses
+    # ONLY the selected group's artifacts so the issue reflects
+    # the actually-consulted sources.
     seen_tfs: set[str] = set()
     for _, art in mtf_inputs:
         for tf in (getattr(art, "timeframes", None) or []):

@@ -763,6 +763,308 @@ def test_stale_mtf_sources_produce_stale_confluence(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 12. Audit Issue 1: source seed-run group selection
+# ---------------------------------------------------------------------------
+
+
+def test_two_complete_source_groups_picks_freshest(tmp_path: Path):
+    """PR #198 audit (Issue 1): when two complete Phase 6D-2
+    seed-run groups exist for the same ticker, the builder
+    must pick the FRESHEST group by source last_date - not
+    the alphabetically-first prefix.
+
+    Fixture:
+      - Group ``aaa_old``: K=1..12, dates 2024-01..,
+        timeframe signals all "Short". Alphabetically FIRST
+        (would have won under the buggy implementation).
+      - Group ``zzz_new``: K=1..12, dates 2026-05..,
+        timeframe signals all "Buy". Alphabetically LAST
+        but freshest.
+
+    Expected: the resulting Confluence artifact carries the
+    fresh group's last_date and confluence_signal=Buy on the
+    final day.
+    """
+    dirs = _layout(tmp_path)
+    old_dates = _build_dates(10, end="2024-01-31")
+    new_dates = _build_dates(10, end="2026-05-08")
+    old_per_day = {
+        d: {tf: "Short" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in old_dates
+    }
+    new_per_day = {
+        d: {tf: "Buy" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in new_dates
+    }
+    for k in cmab.DEFAULT_EXPECTED_K:
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="aaa_old", K=k, dates=old_dates,
+            per_day_per_tf=old_per_day,
+            timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+        )
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="zzz_new", K=k, dates=new_dates,
+            per_day_per_tf=new_per_day,
+            timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+        )
+
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY",
+        artifact_root=dirs["artifact_root"],
+        write=True,
+    )
+    assert res.built, res.issue_codes
+    assert res.last_date == new_dates[-1], (
+        f"builder picked the older group; last_date={res.last_date!r} "
+        f"vs expected {new_dates[-1]!r}"
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    last = art.daily[-1]
+    assert last["date"] == new_dates[-1]
+    assert last["confluence_signal"] == "Buy", (
+        f"builder picked old (Short) group; got {last!r}"
+    )
+    assert last["buy_votes"] == 60
+    assert last["short_votes"] == 0
+    # source_trafficflow_mtf_run_ids must come ONLY from the
+    # selected (newer) group; no run id should start with the
+    # older "aaa_old" prefix.
+    src_ids = last["source_trafficflow_mtf_run_ids"]
+    assert all("aaa_old" not in s for s in src_ids), src_ids
+    assert all("zzz_new" in s for s in src_ids), src_ids
+    assert len(src_ids) == 12
+
+
+def test_split_k_across_groups_refuses_to_write(tmp_path: Path):
+    """PR #198 audit (Issue 1): K=1 exists only in an older
+    group; K=2..12 exist only in a newer group. No single
+    group has full K coverage, so the builder must return
+    ``missing_mtf_k_coverage`` and write nothing - even though
+    the UNION across groups would superficially cover K=1..12.
+    """
+    dirs = _layout(tmp_path)
+    old_dates = _build_dates(10, end="2024-01-31")
+    new_dates = _build_dates(10, end="2026-05-08")
+    per_day_old = {
+        d: {tf: "Short" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in old_dates
+    }
+    per_day_new = {
+        d: {tf: "Buy" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in new_dates
+    }
+    # Old group: K=1 only.
+    _write_mtf_artifact(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="old_seed", K=1, dates=old_dates,
+        per_day_per_tf=per_day_old,
+        timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+    )
+    # New group: K=2..12 only.
+    for k in range(2, 13):
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="new_seed", K=k, dates=new_dates,
+            per_day_per_tf=per_day_new,
+            timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+        )
+
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY",
+        artifact_root=dirs["artifact_root"],
+        write=True,
+    )
+    assert cmab.ISSUE_MISSING_MTF_K_COVERAGE in res.issue_codes
+    assert res.built is False
+    assert res.artifact_path is None
+    # No confluence file written.
+    conf_root = dirs["artifact_root"] / "confluence"
+    assert (
+        not conf_root.exists()
+        or not list(conf_root.rglob("*.research_day.json"))
+    )
+
+
+def test_duplicate_k_within_same_group_is_deterministic(
+    tmp_path: Path,
+):
+    """The Phase 6D-2 writer produces ``<prefix>__K<K>__MTF.research_day.json``
+    which is filename-unique per (prefix, K). A real intra-
+    group K duplicate cannot occur on disk through the
+    documented writer path. This test pins the deterministic
+    behavior on a contrived two-distinct-prefix-but-shared-K
+    fixture: each prefix represents one coherent group, and
+    the builder must pick exactly ONE group rather than
+    crossing them. The chosen group's source run ids must be
+    a single coherent set."""
+    dirs = _layout(tmp_path)
+    dates = _build_dates(10, end="2026-05-08")
+    per_day = {
+        d: {tf: "Buy" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in dates
+    }
+    # Two complete groups, identical freshness. Tie-breaker
+    # falls to alphabetic prefix (asc).
+    for k in cmab.DEFAULT_EXPECTED_K:
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="aa_first", K=k, dates=dates,
+            per_day_per_tf=per_day,
+            timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+        )
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="zz_second", K=k, dates=dates,
+            per_day_per_tf=per_day,
+            timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+        )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert res.built
+    art = ra.read_research_day_artifact(res.artifact_path)
+    last = art.daily[-1]
+    src_ids = last["source_trafficflow_mtf_run_ids"]
+    # All 12 run ids share a single prefix - never a mix.
+    prefixes = {s.rsplit("__K", 1)[0] for s in src_ids}
+    assert len(prefixes) == 1, (
+        f"selected group must be single-prefix; got {prefixes}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 13. Audit Issue 2: missing-vote count is per cell, not per timeframe
+# ---------------------------------------------------------------------------
+
+
+def test_all_k_omit_one_timeframe_records_k_missing_votes(
+    tmp_path: Path,
+):
+    """PR #198 audit (Issue 2): all 12 K artifacts omit a
+    single expected timeframe (e.g. ``1y``). The honest
+    missing-vote count is K=12 per day, not 1.
+    ``partial_timeframe_coverage`` must also surface."""
+    dirs = _layout(tmp_path)
+    dates = _build_dates(10)
+    # Each artifact only carries 4 of the 5 expected timeframes.
+    partial_tfs = ["1d", "1wk", "1mo", "3mo"]
+    per_day = {
+        d: {tf: "Buy" for tf in partial_tfs} for d in dates
+    }
+    for k in cmab.DEFAULT_EXPECTED_K:
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seed", K=k, dates=dates,
+            per_day_per_tf=per_day,
+            timeframes=list(partial_tfs),
+        )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert res.built
+    assert (
+        cmab.ISSUE_PARTIAL_TIMEFRAME_COVERAGE in res.issue_codes
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    last = art.daily[-1]
+    # 12 K * 4 buy-carrying timeframes = 48 Buy votes.
+    # 12 K * 1 missing timeframe (1y) = 12 missing votes.
+    assert last["buy_votes"] == 48
+    assert last["short_votes"] == 0
+    assert last["none_votes"] == 0
+    assert last["missing_votes"] == 12, (
+        "missing_votes must count cells, not timeframe labels; "
+        f"got {last['missing_votes']}"
+    )
+    assert last["active_count"] == 48
+    assert last["available_count"] == 48  # excludes 12 missing
+    assert last["agreement_total"] == 48
+
+
+def test_one_k_omits_one_timeframe_records_single_missing_vote(
+    tmp_path: Path,
+):
+    """PR #198 audit (Issue 2): exactly one K artifact omits a
+    timeframe; the rest carry it. The honest missing count is
+    1, not the K total."""
+    dirs = _layout(tmp_path)
+    dates = _build_dates(10)
+    per_day_partial = {
+        d: {tf: "Buy" for tf in ("1d", "1wk", "1mo", "3mo")}
+        for d in dates
+    }
+    per_day_full = {
+        d: {tf: "Buy" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in dates
+    }
+    # K=1 omits the 1y timeframe.
+    _write_mtf_artifact(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="seed", K=1, dates=dates,
+        per_day_per_tf=per_day_partial,
+        timeframes=["1d", "1wk", "1mo", "3mo"],
+    )
+    # K=2..12 carry all five timeframes.
+    for k in range(2, 13):
+        _write_mtf_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seed", K=k, dates=dates,
+            per_day_per_tf=per_day_full,
+            timeframes=list(cmab.DEFAULT_EXPECTED_TIMEFRAMES),
+        )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert res.built
+    # K=2..12 all carry 1y, so the union of seen timeframes
+    # covers the expected set and partial_timeframe_coverage
+    # should NOT fire.
+    assert (
+        cmab.ISSUE_PARTIAL_TIMEFRAME_COVERAGE
+        not in res.issue_codes
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    last = art.daily[-1]
+    # K=1: 4 Buy + 1 missing = 5 cells
+    # K=2..12: 5 Buy * 11 = 55 cells
+    # Total: 59 Buy, 1 missing.
+    assert last["buy_votes"] == 59
+    assert last["missing_votes"] == 1
+    assert last["available_count"] == 59  # active + none
+    assert last["agreement_total"] == 59
+
+
+def test_full_kxtf_happy_path_still_60_votes(tmp_path: Path):
+    """Regression guard: with all 12 K * 5 expected timeframes
+    present and all-Buy, the previous "60 votes total"
+    happy-path remains unchanged under the new
+    per-cell counting."""
+    dirs = _layout(tmp_path)
+    dates = _build_dates(10)
+    per_day = {
+        d: {tf: "Buy" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in dates
+    }
+    _write_full_mtf_pipeline(
+        dirs["artifact_root"], "SPY",
+        dates=dates, per_day_per_tf=per_day,
+    )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    last = art.daily[-1]
+    assert last["buy_votes"] == 60
+    assert last["short_votes"] == 0
+    assert last["none_votes"] == 0
+    assert last["missing_votes"] == 0
+    assert last["available_count"] == 60
+    assert last["agreement_total"] == 60
+
+
 def test_artifact_run_id_helper_defaults_and_overrides():
     assert cmab.artifact_run_id_for_mtf_consensus() == "mtf_consensus"
     assert cmab.artifact_run_id_for_mtf_consensus(
