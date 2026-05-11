@@ -925,8 +925,15 @@ def test_board_copy_dict_owns_visible_copy():
         "Evidence Trail",
         "What PRJCT9 Is",
         "What It Is Not",
-        "{active} of {total} timeframes agree",
+        # Phase 6G-1: confluence_status_fmt now reads
+        # "alignment checks active" so the count's units are
+        # honest (60 = K-builds x timeframes, not 60
+        # distinct timeframes).
+        "{active} of {total} alignment checks active",
         "Confluence data unavailable",
+        # Phase 6G-1 additions:
+        "Today's Board Status",
+        "Saved Research Archive",
         # Chart trace names + axis titles (Phase 6C-7 audit fix)
         "Engine cumulative capture",
         "{ticker} close price",
@@ -1519,6 +1526,432 @@ def test_no_current_leaders_banner_hidden_when_spy_is_eligible(
     props = _to_props(banner)
     assert props.get("data-leader-count") == "1"
     assert (props.get("style") or {}).get("display") == "none"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6G-1: public meaning + information hierarchy
+# ---------------------------------------------------------------------------
+
+
+def test_scoreboard_signal_cell_renders_public_friendly_label_for_none():
+    """The visible Consensus cell renders "No consensus" when
+    the underlying signal is "None"; the data-signal attribute
+    on the row is unchanged ("None") so audit / automation
+    still sees the canonical value."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    text = _component_text(wrapper)
+    # Public-friendly visible text.
+    assert "No consensus" in text, (
+        "scoreboard Consensus cell must show 'No consensus' "
+        "for signal=None; got text=" + repr(text[:200])
+    )
+    # Raw "None" must NOT leak into the visible cell text.
+    # (the data attribute below carries it instead).
+    body_rows = _tbody_tr_props(wrapper)
+    assert len(body_rows) == 1
+    assert body_rows[0].get("data-signal") == "None"
+    assert body_rows[0].get("data-signal-value") == "0"
+
+
+def test_scoreboard_consensus_cells_show_buy_and_short_unchanged():
+    """Buy / Short signals continue to render as 'Buy' / 'Short'
+    in the visible cell (public-friendly mapping only changes
+    the None case)."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="AAA", signal="Buy", signal_value=1,
+            agreement_active=5, agreement_total=5,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+        board.BoardRow(
+            ticker="BBB", signal="Short", signal_value=-1,
+            agreement_active=4, agreement_total=5,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=2,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows)
+    text = _component_text(wrapper)
+    assert "Buy" in text
+    assert "Short" in text
+    # And the data attributes match.
+    by_ticker = {
+        p.get("data-ticker"): p for p in _tbody_tr_props(wrapper)
+    }
+    assert by_ticker["AAA"].get("data-signal") == "Buy"
+    assert by_ticker["BBB"].get("data-signal") == "Short"
+
+
+def test_scoreboard_column_header_reads_consensus():
+    """The public column header is "Consensus", not the legacy
+    "Signal", so a first-time visitor doesn't conflate the
+    Confluence consensus with the Signal Engine's own current
+    signal in the Featured panel."""
+    pytest.importorskip("dash")
+    assert board.BOARD_COPY["col_signal"] == "Consensus"
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows)
+    text = _component_text(wrapper)
+    assert "Consensus" in text
+
+
+def test_featured_confluence_copy_no_longer_says_60_timeframes():
+    """Phase 6G-1: the agreement count is 12 K-builds x 5
+    timeframes = 60 alignment CHECKS, not 60 distinct
+    TIMEFRAMES. Old wording over-claimed the timeframe
+    dimension."""
+    fmt = board.BOARD_COPY["confluence_status_fmt"]
+    assert "timeframes agree" not in fmt, (
+        "Old over-claiming wording leaked: " + repr(fmt)
+    )
+    assert "alignment checks active" in fmt, (
+        "Expected new wording 'alignment checks active'; got "
+        + repr(fmt)
+    )
+
+
+def test_two_signal_explainer_is_sourced_from_board_copy(
+    tmp_path: Path,
+):
+    """The short explainer that defuses the
+    'scoreboard No consensus vs Featured Short' confusion
+    must live in BOARD_COPY and must render under the
+    Featured panel."""
+    pytest.importorskip("dash")
+    assert "two_signal_explainer" in board.BOARD_COPY
+    explainer = board.BOARD_COPY["two_signal_explainer"]
+    assert "Board consensus" in explainer
+    assert "Signal Engine" in explainer
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+    text = _component_text(app.layout)
+    assert explainer in text, (
+        "two_signal_explainer string must render somewhere in "
+        "the layout; it did not"
+    )
+
+
+def test_evidence_trail_intro_is_sourced_from_board_copy(
+    tmp_path: Path,
+):
+    """Phase 6G-1: the seven-station Evidence Trail now opens
+    with a short intro paragraph that frames how to read
+    'stale' upstream stations."""
+    pytest.importorskip("dash")
+    assert "evidence_trail_intro" in board.BOARD_COPY
+    intro = board.BOARD_COPY["evidence_trail_intro"]
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+    text = _component_text(app.layout)
+    assert intro in text
+
+
+def test_current_pilot_card_renders_when_leader_exists(
+    tmp_path: Path,
+):
+    """When at least one row is leader_eligible, the new
+    Today's Board Status panel renders a card with the
+    pilot ticker, consensus framing, Signal Engine state,
+    and an as-of stamp. Avoids any directional copy on
+    signal=None ('No directional consensus today')."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    card = board.render_current_pilot_card(
+        rows,
+        signal_engine_pair="Short 11,5",
+        signal_engine_as_of="2026-05-11",
+    )
+    props = card.to_plotly_json().get("props", {})
+    assert props.get("id") == "current-pilot-card"
+    assert (
+        props.get("data-current-pilot-ticker") == "SPY"
+    )
+    assert (
+        props.get("data-current-pilot-leader-eligible")
+        == "true"
+    )
+    assert (
+        props.get("data-current-pilot-consensus-signal")
+        == "None"
+    )
+    text = _component_text(card)
+    assert "SPY is the current full-pipeline pilot." in text
+    assert (
+        "No directional consensus today" in text
+    ), (
+        "card must use the non-directional copy when "
+        "Confluence consensus is None"
+    )
+    assert "Short 11,5" in text
+    assert "2026-05-08" in text
+    assert "2026-05-11" in text
+
+
+def test_current_pilot_card_uses_non_directional_copy_when_none():
+    """Even with a Buy / Short Confluence consensus elsewhere,
+    a signal='None' pilot row must never render 'Buy direction'
+    or 'Short direction'."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=1, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    card = board.render_current_pilot_card(rows)
+    text = _component_text(card)
+    assert "Buy direction" not in text
+    assert "Short direction" not in text
+
+
+def test_current_pilot_card_falls_back_when_no_leader_eligible():
+    """No leader-eligible rows -> the card stays in the DOM
+    with a clear "no current pilot" copy and
+    data-current-pilot-leader-eligible='false'."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="AAA", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+            rank=None,
+        ),
+    ]
+    card = board.render_current_pilot_card(rows)
+    props = card.to_plotly_json().get("props", {})
+    assert props.get("id") == "current-pilot-card"
+    assert (
+        props.get("data-current-pilot-leader-eligible")
+        == "false"
+    )
+    text = _component_text(card)
+    assert "No current pilot today" in text
+
+
+def test_spy_data_attributes_preserved_under_6g1(tmp_path: Path):
+    """Phase 6G-1 must not regress the public DOM contract:
+    when SPY is leader-eligible, the SPY scoreboard row keeps
+    data-rank='1', data-leader-eligible='true',
+    data-ranking-blocked-reason=''."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    body_rows = _tbody_tr_props(wrapper)
+    assert len(body_rows) == 1
+    p = body_rows[0]
+    assert p.get("data-ticker") == "SPY"
+    assert p.get("data-leader-eligible") == "true"
+    assert p.get("data-rank") == "1"
+    assert p.get("data-ranking-blocked-reason") == ""
+
+
+def test_partition_separates_current_from_archive():
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+        board.BoardRow(
+            ticker="AAA", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+            rank=None,
+        ),
+        board.BoardRow(
+            ticker="^GSPC", signal="None", signal_value=0,
+            agreement_active=1, agreement_total=1,
+            coverage=board.COVERAGE_STALE, as_of="2026-05-01",
+            rank=None,
+        ),
+    ]
+    current, archive = board._partition_rows_for_board(rows)
+    assert [r.ticker for r in current] == ["SPY"]
+    assert {r.ticker for r in archive} == {"AAA", "^GSPC"}
+
+
+def test_archive_section_collapses_partial_and_stale_rows(
+    tmp_path: Path,
+):
+    """When leader-eligible rows exist, the default
+    section-scoreboard contains only those rows; the
+    Partial / Stale / Under review / Pipeline incomplete
+    rows live in section-archive (collapsed by default).
+    """
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    # Three fixtures: SPY (will be leader-eligible after we
+    # write the Confluence artifact); AAA + BBB stay cache-
+    # only (Partial coverage).
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    _write_min_spymaster_cache(cache_dir, "AAA")
+    _write_min_spymaster_cache(cache_dir, "BBB")
+
+    # Monkey-patch discovery to inject a deterministic
+    # leader-eligible SPY plus two archive rows. Uses the
+    # public BoardRow contract.
+    real_discover = board.discover_board_catalogue
+
+    def _fake_discover(**kw):
+        return (
+            board.BoardRow(
+                ticker="SPY", signal="None", signal_value=0,
+                agreement_active=7, agreement_total=60,
+                coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+                leader_eligible=True, rank=1,
+            ),
+            board.BoardRow(
+                ticker="AAA", signal="None", signal_value=0,
+                agreement_active=None, agreement_total=None,
+                coverage=board.COVERAGE_PARTIAL, as_of=None,
+                rank=None,
+            ),
+            board.BoardRow(
+                ticker="BBB", signal="None", signal_value=0,
+                agreement_active=None, agreement_total=None,
+                coverage=board.COVERAGE_PARTIAL, as_of=None,
+                rank=None,
+            ),
+        )
+
+    import unittest.mock as mock
+    with mock.patch.object(
+        board, "discover_board_catalogue", _fake_discover,
+    ):
+        app = board.build_app(
+            cache_dir=cache_dir,
+            artifact_root=artifact_root,
+            sig_lib_dir=sig_lib_dir,
+        )
+
+    def _find(node, target_id):
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                r = _find(c, target_id)
+                if r is not None:
+                    return r
+            return None
+        if getattr(node, "id", None) == target_id:
+            return node
+        return _find(getattr(node, "children", None), target_id)
+
+    # section-archive exists and reports the row count.
+    archive_section = _find(app.layout, "section-archive")
+    assert archive_section is not None
+    arch_props = archive_section.to_plotly_json().get("props", {})
+    assert arch_props.get("data-archive-row-count") == "2"
+
+    # section-archive-details is collapsed (open=False).
+    details = _find(app.layout, "section-archive-details")
+    assert details is not None
+    details_props = details.to_plotly_json().get("props", {})
+    assert details_props.get("open") is False
+
+    # And the archive table carries the archive tickers.
+    archive_text = _component_text(archive_section)
+    assert "AAA" in archive_text
+    assert "BBB" in archive_text
+
+    # The MAIN scoreboard (section-scoreboard) does NOT
+    # carry the archive tickers.
+    main_scoreboard = _find(app.layout, "section-scoreboard")
+    assert main_scoreboard is not None
+    main_text = _component_text(main_scoreboard)
+    assert "SPY" in main_text
+    assert "AAA" not in main_text, (
+        "section-scoreboard must not include archive rows "
+        "when leader-eligible rows exist"
+    )
+    assert "BBB" not in main_text
+
+
+def test_no_current_leaders_banner_still_works_when_zero_eligible(
+    tmp_path: Path,
+):
+    """Phase 6G-1 partitioning must preserve the existing
+    Phase 6C-8 no-current-leaders banner: when no rows pass
+    the leader gate, the banner renders inside section-scoreboard
+    with data-leader-count='0'."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    _write_min_spymaster_cache(cache_dir, "AAA")
+
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+
+    def _find(node, target_id):
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                r = _find(c, target_id)
+                if r is not None:
+                    return r
+            return None
+        if getattr(node, "id", None) == target_id:
+            return node
+        return _find(getattr(node, "children", None), target_id)
+
+    banner = _find(app.layout, "scoreboard-no-current-leaders")
+    assert banner is not None
+    props = banner.to_plotly_json().get("props", {})
+    # Real cache-only fixtures -> zero leader-eligible rows
+    # -> the banner is visible and reports count 0.
+    assert props.get("data-leader-count") == "0"
+    style = props.get("style") or {}
+    assert style.get("display") != "none"
 
 
 # ---------------------------------------------------------------------------

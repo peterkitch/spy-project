@@ -202,13 +202,80 @@ BOARD_COPY: dict[str, Any] = {
     "section_what_it_is_not_title": "What It Is Not",
     # Section 1 - Scoreboard
     "col_ticker": "Ticker",
-    "col_signal": "Signal",
+    # Phase 6G-1: the visible header reads "Consensus" so a
+    # first-time visitor doesn't conflate the Confluence
+    # consensus (this column) with the Signal Engine's own
+    # current signal (rendered in the Featured panel).
+    # The underlying ``data-signal`` attribute on each row
+    # is unchanged ("None" / "Buy" / "Short") - only the
+    # visible cell text differs.
+    "col_signal": "Consensus",
     "col_agreement": "Agreement",
     "col_coverage": "Coverage",
     "col_as_of": "As of",
     "empty_scoreboard": "No saved tickers yet.",
     "agreement_unavailable": "Unavailable",
     "as_of_unavailable": "-",
+    # Phase 6G-1: public-friendly visible cell labels for the
+    # scoreboard Consensus column. data-signal on the Tr is
+    # still "Buy" / "Short" / "None" - these strings drive
+    # only the rendered cell text.
+    "scoreboard_consensus_buy": "Buy",
+    "scoreboard_consensus_short": "Short",
+    "scoreboard_consensus_none": "No consensus",
+    # Phase 6G-1: archive of saved-research-only rows
+    # (Partial / Stale / Under review / Pipeline incomplete
+    # coverage). Collapsed by default; not part of the
+    # current-leader board.
+    "section_archive_title": "Saved Research Archive",
+    "section_archive_intro": (
+        "Saved research that hasn't been promoted to a "
+        "current board pick. Browse for context; not a "
+        "current signal."
+    ),
+    "section_archive_summary_fmt": (
+        "Show {count} archived ticker(s)"
+    ),
+    "section_archive_empty": (
+        "No archived rows."
+    ),
+    # Phase 6G-1: "Today's Board Status" hero card. Pulls
+    # from the rank-1 leader-eligible row + the Signal
+    # Engine cache for the same ticker. Avoids any
+    # directional / investment-advice framing.
+    "section_current_pilot_title": "Today's Board Status",
+    "current_pilot_no_leader": (
+        "No current pilot today. Saved research is below; "
+        "leaderboard picks need a current Confluence verdict."
+    ),
+    "current_pilot_intro_fmt": (
+        "{ticker} is the current full-pipeline pilot."
+    ),
+    "current_pilot_consensus_buy": (
+        "Board consensus: Buy direction."
+    ),
+    "current_pilot_consensus_short": (
+        "Board consensus: Short direction."
+    ),
+    "current_pilot_consensus_none": (
+        "Board consensus: No directional consensus today."
+    ),
+    "current_pilot_signal_engine_fmt": (
+        "Signal Engine state: {pair}."
+    ),
+    "current_pilot_signal_engine_unavailable": (
+        "Signal Engine state: not available."
+    ),
+    "current_pilot_as_of_fmt": (
+        "As of {consensus_date} (board consensus) / "
+        "{se_date} (Signal Engine cache)."
+    ),
+    "current_pilot_as_of_partial_consensus_fmt": (
+        "As of {consensus_date} (board consensus)."
+    ),
+    "current_pilot_as_of_partial_se_fmt": (
+        "Signal Engine cache through {se_date}."
+    ),
     # Section 2 - Featured
     "featured_label_current_signal": "Current Signal",
     "featured_label_confluence": "Confluence",
@@ -228,8 +295,32 @@ BOARD_COPY: dict[str, Any] = {
         "Historical research output. Not investment advice. Not a live "
         "signal feed."
     ),
-    "confluence_status_fmt": "{active} of {total} timeframes agree",
+    # Phase 6G-1: ``total`` is K-builds (1..12) x timeframes
+    # (1d/1wk/1mo/3mo/1y) = 60 alignment checks, NOT 60
+    # distinct timeframes. The prior wording over-claimed
+    # the timeframe dimension; the new wording is honest
+    # about what the count measures.
+    "confluence_status_fmt": (
+        "{active} of {total} alignment checks active"
+    ),
     "confluence_status_unavailable": "Confluence data unavailable",
+    # Phase 6G-1: short explainer that defuses the two-signal
+    # confusion ("scoreboard says No consensus but Featured
+    # says Short"). Sourced from BOARD_COPY so the
+    # copy-centralization test catches it.
+    "two_signal_explainer": (
+        "Board consensus combines K-build and timeframe "
+        "alignment checks. Signal Engine state is the "
+        "ticker's standalone SMA engine readout. The two "
+        "can disagree."
+    ),
+    # Phase 6G-1: Evidence Trail intro framing.
+    "evidence_trail_intro": (
+        "How today's board pick was discovered. Stale "
+        "upstream stations are historical reference; they "
+        "do not block the current leader gate unless flagged "
+        "explicitly."
+    ),
     # Section 3 - Evidence Trail
     "station_label_seed_field": "Seed Field",
     "station_label_trading_post": "Trading Post",
@@ -1284,11 +1375,21 @@ def _fmt_metric(value: Any, kind: str) -> str:
 
 
 def render_scoreboard(
-    rows: Sequence[BoardRow], selected_ticker: Optional[str] = None,
+    rows: Sequence[BoardRow],
+    selected_ticker: Optional[str] = None,
+    *,
+    id_prefix: str = "",
 ) -> Any:
     """Build the Town Hall Scoreboard table. Each tr is clickable
     via a pattern-matching id ``{"type": "scoreboard-row", "ticker": ...}``.
     Empty state shows the BOARD_COPY ``empty_scoreboard`` string.
+
+    ``id_prefix`` (Phase 6G-1) lets the caller render a second
+    instance of this table in the same layout (e.g. the
+    Saved Research Archive section) without Dash's
+    ``DuplicateIdError`` — the wrapper Div and inner Table
+    pick up the prefix. The row Tr ids stay as pattern-
+    matching dicts which are unique per ticker regardless.
     """
     _, _, html = _dash_modules()
 
@@ -1371,7 +1472,16 @@ def render_scoreboard(
             style=_tr_style(is_selected),
             children=[
                 html.Td(r.ticker, style=_td_style(weight="bold")),
-                html.Td(r.signal, style=_td_style(color=signal_color)),
+                # Phase 6G-1: render a public-friendly
+                # consensus label ("No consensus") in place
+                # of the raw "None" string. ``data-signal``
+                # on the Tr above is still the canonical
+                # "None" / "Buy" / "Short" value, so the
+                # data contract is unchanged.
+                html.Td(
+                    _visible_consensus_label(r.signal),
+                    style=_td_style(color=signal_color),
+                ),
                 html.Td(agreement_text, style=_td_style()),
                 html.Td(r.coverage, style=_td_style(
                     color=_coverage_color(r.coverage),
@@ -1391,7 +1501,7 @@ def render_scoreboard(
     # horizontal scroll. ``data-mobile-overflow="contained"``
     # is the stable contract test_daily_signal_board pins.
     return html.Div(
-        id="scoreboard-table-wrapper",
+        id=f"{id_prefix}scoreboard-table-wrapper",
         **{"data-mobile-overflow": "contained"},
         style={
             "overflowX": "auto",
@@ -1399,7 +1509,7 @@ def render_scoreboard(
             "width": "100%",
         },
         children=html.Table(
-            id="scoreboard-table",
+            id=f"{id_prefix}scoreboard-table",
             style={
                 "width": "100%",
                 "borderCollapse": "collapse",
@@ -1420,6 +1530,249 @@ def _signal_color(signal: str) -> str:
     if signal == "Short":
         return DESIGN_TOKENS["color_short"]
     return DESIGN_TOKENS["color_none"]
+
+
+def _visible_consensus_label(signal: str) -> str:
+    """Phase 6G-1: map the canonical Confluence ``signal``
+    value to the public-friendly scoreboard cell text.
+
+    ``data-signal`` on the row stays as the canonical
+    ``Buy`` / ``Short`` / ``None`` string for any audit /
+    automation that switches on it; only the rendered cell
+    text changes."""
+    if signal == "Buy":
+        return BOARD_COPY["scoreboard_consensus_buy"]
+    if signal == "Short":
+        return BOARD_COPY["scoreboard_consensus_short"]
+    return BOARD_COPY["scoreboard_consensus_none"]
+
+
+def _partition_rows_for_board(
+    rows: Sequence["BoardRow"],
+) -> tuple[list["BoardRow"], list["BoardRow"]]:
+    """Phase 6G-1: split discovered rows into the
+    "current board" set (leader-eligible) and the
+    "archive" set (everything else - Partial / Stale /
+    Under review / Pipeline incomplete coverage).
+
+    Order is preserved from the input list so the existing
+    ranking call upstream still drives what's at the top
+    of each subset.
+    """
+    current: list[BoardRow] = []
+    archive: list[BoardRow] = []
+    for r in rows:
+        if r.leader_eligible:
+            current.append(r)
+        else:
+            archive.append(r)
+    return current, archive
+
+
+def render_archive_scoreboard(
+    rows: Sequence["BoardRow"], *,
+    selected_ticker: Optional[str] = None,
+) -> Any:
+    """Phase 6G-1: render the saved-research archive as a
+    ``<details>`` collapsible. The inner table reuses the
+    same row markup / data attributes the main scoreboard
+    uses, so any audit tool that walks ``[data-ticker]``
+    nodes still sees every row regardless of which section
+    it lives in.
+
+    Collapsed by default. The summary advertises the row
+    count so a visitor knows how much research is hiding.
+    """
+    _, _, html = _dash_modules()
+    if not rows:
+        return html.Div(
+            BOARD_COPY["section_archive_empty"],
+            id="section-archive-empty",
+            style={
+                "color": DESIGN_TOKENS["color_muted"],
+                "fontSize": "12px",
+                "padding": "8px 0",
+            },
+        )
+    inner_table = render_scoreboard(
+        rows, selected_ticker=selected_ticker,
+        # Phase 6G-1: distinct DOM ids so the archive
+        # table doesn't collide with the main scoreboard's
+        # ``scoreboard-table-wrapper`` / ``scoreboard-table``.
+        id_prefix="archive-",
+    )
+    summary_text = BOARD_COPY[
+        "section_archive_summary_fmt"
+    ].format(count=len(rows))
+    return html.Details(
+        id="section-archive-details",
+        **{"data-archive-row-count": str(len(rows))},
+        # Collapsed by default; visitors opt in to the long
+        # tail of saved-research rows.
+        open=False,
+        children=[
+            html.Summary(
+                summary_text,
+                id="section-archive-summary",
+                style={
+                    "cursor": "pointer",
+                    "color": DESIGN_TOKENS["color_muted"],
+                    "fontSize": "12px",
+                    "padding": "4px 0",
+                },
+            ),
+            html.Div(
+                BOARD_COPY["section_archive_intro"],
+                id="section-archive-intro",
+                style={
+                    "color": DESIGN_TOKENS["color_muted"],
+                    "fontSize": "12px",
+                    "marginBottom": "8px",
+                },
+            ),
+            inner_table,
+        ],
+    )
+
+
+def _row_consensus_copy(signal: str) -> str:
+    if signal == "Buy":
+        return BOARD_COPY["current_pilot_consensus_buy"]
+    if signal == "Short":
+        return BOARD_COPY["current_pilot_consensus_short"]
+    return BOARD_COPY["current_pilot_consensus_none"]
+
+
+def render_current_pilot_card(
+    rows: Sequence["BoardRow"],
+    *,
+    signal_engine_pair: Optional[str] = None,
+    signal_engine_as_of: Optional[str] = None,
+) -> Any:
+    """Phase 6G-1: render the "Today's Board Status" hero
+    card from the top leader-eligible row.
+
+    ``signal_engine_pair`` and ``signal_engine_as_of`` are
+    the caller-resolved Signal Engine state for the pilot
+    ticker (so the card shows both the Confluence consensus
+    and the standalone Signal Engine readout side-by-side).
+    Either can be ``None`` if the data isn't available;
+    the card falls back to honest "not available" copy.
+    """
+    _, _, html = _dash_modules()
+    leader = next((r for r in rows if r.leader_eligible), None)
+    if leader is None:
+        body = html.Div(
+            BOARD_COPY["current_pilot_no_leader"],
+            id="current-pilot-empty",
+            style={
+                "color": DESIGN_TOKENS["color_muted"],
+                "fontSize": "13px",
+            },
+        )
+        return html.Div(
+            id="current-pilot-card",
+            **{
+                "data-current-pilot-ticker": "",
+                "data-current-pilot-leader-eligible": "false",
+            },
+            children=body,
+            style={
+                "padding": "10px",
+                "marginBottom": "10px",
+                "border": (
+                    "1px dashed " + DESIGN_TOKENS["color_border"]
+                ),
+                "borderRadius": "4px",
+            },
+        )
+
+    intro = BOARD_COPY["current_pilot_intro_fmt"].format(
+        ticker=leader.ticker,
+    )
+    consensus = _row_consensus_copy(leader.signal)
+    if signal_engine_pair:
+        se_line = BOARD_COPY[
+            "current_pilot_signal_engine_fmt"
+        ].format(pair=signal_engine_pair)
+    else:
+        se_line = BOARD_COPY[
+            "current_pilot_signal_engine_unavailable"
+        ]
+    consensus_date = leader.as_of or ""
+    if consensus_date and signal_engine_as_of:
+        as_of_line = BOARD_COPY[
+            "current_pilot_as_of_fmt"
+        ].format(
+            consensus_date=consensus_date,
+            se_date=signal_engine_as_of,
+        )
+    elif consensus_date:
+        as_of_line = BOARD_COPY[
+            "current_pilot_as_of_partial_consensus_fmt"
+        ].format(consensus_date=consensus_date)
+    elif signal_engine_as_of:
+        as_of_line = BOARD_COPY[
+            "current_pilot_as_of_partial_se_fmt"
+        ].format(se_date=signal_engine_as_of)
+    else:
+        as_of_line = ""
+
+    return html.Div(
+        id="current-pilot-card",
+        **{
+            "data-current-pilot-ticker": leader.ticker,
+            "data-current-pilot-leader-eligible": "true",
+            "data-current-pilot-consensus-signal": leader.signal,
+        },
+        style={
+            "padding": "12px",
+            "marginBottom": "10px",
+            "border": (
+                "1px solid " + DESIGN_TOKENS["color_border"]
+            ),
+            "borderRadius": "4px",
+            "backgroundColor": DESIGN_TOKENS["color_dim"],
+        },
+        children=[
+            html.Div(
+                intro,
+                id="current-pilot-intro",
+                style={
+                    "color": DESIGN_TOKENS["color_text"],
+                    "fontSize": "14px",
+                    "fontWeight": "bold",
+                    "marginBottom": "4px",
+                },
+            ),
+            html.Div(
+                consensus,
+                id="current-pilot-consensus",
+                style={
+                    "color": _signal_color(leader.signal),
+                    "fontSize": "13px",
+                    "marginBottom": "2px",
+                },
+            ),
+            html.Div(
+                se_line,
+                id="current-pilot-signal-engine",
+                style={
+                    "color": DESIGN_TOKENS["color_text"],
+                    "fontSize": "13px",
+                    "marginBottom": "2px",
+                },
+            ),
+            html.Div(
+                as_of_line,
+                id="current-pilot-as-of",
+                style={
+                    "color": DESIGN_TOKENS["color_muted"],
+                    "fontSize": "12px",
+                },
+            ),
+        ],
+    )
 
 
 def _coverage_color(coverage: str) -> str:
@@ -1585,6 +1938,21 @@ def render_featured(
             style={
                 "color": DESIGN_TOKENS["color_muted"],
                 "fontSize": "12px",
+                "marginBottom": "4px",
+            },
+        ),
+        # Phase 6G-1: defuse the "scoreboard says No
+        # consensus but Featured says Short" first-time
+        # confusion in one line of plain text. Sourced from
+        # BOARD_COPY so the copy-centralization test catches
+        # any drift.
+        html.Div(
+            BOARD_COPY["two_signal_explainer"],
+            id="featured-two-signal-explainer",
+            style={
+                "color": DESIGN_TOKENS["color_muted"],
+                "fontSize": "11px",
+                "fontStyle": "italic",
                 "marginBottom": "8px",
             },
         ),
@@ -1880,12 +2248,33 @@ def render_evidence_trail(
             BOARD_COPY["station_label_watchtower"],
         ))
 
-    children = [_render_station(s) for s in stations]
-    return html.Div(children=children, style={
-        "display": "flex",
-        "flexDirection": "column",
-        "gap": "8px",
-    })
+    station_children = [_render_station(s) for s in stations]
+    # Phase 6G-1: prefix the seven station cards with a
+    # short intro that frames how to read upstream-station
+    # state. "Stale" rows are historical reference for the
+    # current Confluence-gated leader board; they don't
+    # block the leader gate unless explicitly flagged.
+    return html.Div(
+        children=[
+            html.Div(
+                BOARD_COPY["evidence_trail_intro"],
+                id="evidence-trail-intro",
+                style={
+                    "color": DESIGN_TOKENS["color_muted"],
+                    "fontSize": "12px",
+                    "marginBottom": "8px",
+                },
+            ),
+            html.Div(
+                children=station_children,
+                style={
+                    "display": "flex",
+                    "flexDirection": "column",
+                    "gap": "8px",
+                },
+            ),
+        ],
+    )
 
 
 def _station_from_ref(
@@ -2198,6 +2587,52 @@ def build_app(
             style={"display": "none"},
         )
 
+    # Phase 6G-1: partition the discovered rows into the
+    # current-leader board (default visible) and the
+    # saved-research archive (collapsed by default). The
+    # archive still contains the long alphabetical tail of
+    # bare-cache + partial-coverage tickers - it's just
+    # tucked under a <details> so the MVP doesn't appear
+    # empty when most rows are "Unavailable / Partial / -".
+    current_rows, archive_rows = _partition_rows_for_board(rows)
+
+    # Phase 6G-1: pull the Signal Engine state for the top
+    # leader-eligible row so the current-pilot card can show
+    # both the board consensus AND the standalone Signal
+    # Engine readout. Reuses the per-render payload cache so
+    # this is at most one extra PKL load when the leader
+    # differs from ``selected``.
+    pilot_pair: Optional[str] = None
+    pilot_se_as_of: Optional[str] = None
+    if current_rows:
+        leader = current_rows[0]
+        leader_payload = _ticker_payload(leader.ticker, state)
+        if isinstance(leader_payload, Mapping) and leader_payload.get(
+            "available"
+        ):
+            raw = leader_payload.get("current_active_pair_raw")
+            if raw:
+                pilot_pair = str(raw)
+            dr = leader_payload.get("date_range") or {}
+            if isinstance(dr, Mapping) and dr.get("end"):
+                pilot_se_as_of = str(dr.get("end"))
+
+    section_current_pilot = html.Section(
+        id="section-current-pilot",
+        children=[
+            html.H2(
+                BOARD_COPY["section_current_pilot_title"],
+                style=_section_heading_style(),
+            ),
+            render_current_pilot_card(
+                current_rows,
+                signal_engine_pair=pilot_pair,
+                signal_engine_as_of=pilot_se_as_of,
+            ),
+        ],
+        style=_section_style(),
+    )
+
     section_scoreboard = html.Section(
         id="section-scoreboard",
         **{
@@ -2216,7 +2651,33 @@ def build_app(
             no_leaders_banner,
             html.Div(
                 id="scoreboard-container",
-                children=render_scoreboard(rows, selected_ticker=selected),
+                # Phase 6G-1: the default-visible scoreboard
+                # carries ONLY leader-eligible rows. The
+                # saved-research archive (Partial / Stale /
+                # Under review / Pipeline incomplete) lives
+                # in section-archive below, collapsed by
+                # default.
+                children=render_scoreboard(
+                    current_rows, selected_ticker=selected,
+                ),
+            ),
+        ],
+        style=_section_style(),
+    )
+
+    section_archive = html.Section(
+        id="section-archive",
+        **{"data-archive-row-count": str(len(archive_rows))},
+        children=[
+            html.H2(
+                BOARD_COPY["section_archive_title"],
+                style=_section_heading_style(),
+            ),
+            html.Div(
+                id="section-archive-container",
+                children=render_archive_scoreboard(
+                    archive_rows, selected_ticker=selected,
+                ),
             ),
         ],
         style=_section_style(),
@@ -2310,7 +2771,9 @@ def build_app(
                 "marginBottom": "16px",
             }),
             dcc.Store(id="selected-ticker-store", data=selected),
+            section_current_pilot,
             section_scoreboard,
+            section_archive,
             section_featured,
             section_evidence,
             section_what_is,
