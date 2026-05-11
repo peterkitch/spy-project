@@ -438,27 +438,36 @@ refresh_signal_engine_cache(
      then `board_launch_readiness_audit --tickers SPY`
      confirms `already_leader_eligible`.
 
-### 6.5.8 Next required phase: SMA-optimizer extraction
+### 6.5.8 Next required phase: SMA-optimizer extraction (historical)
 
-The Phase 6E-3 data-only guard is a hold, not a fix. The
-next required sub-phase extracts Spymaster's daily best-buy
-/ best-short SMA-pair optimizer
-(`spymaster.py:5050-5117`) into a non-interactive helper
-that the refresher can call. At that point the payload
-scope marker flips off `data_only_v1`, the guard releases,
-and `--write` becomes the operator's production refresh
-path. The atomic-write helper, manifest sidecar, status
-JSON, and CLI surface in Phase 6E-3 are already in place
-for that work — the SMA extraction is the only blocking
-piece.
+*This section captures the Phase 6E-3 forward look. The
+follow-up phases have since landed — see § 6.6 (Phase 6E-4,
+the SMA optimizer extraction) and § 6.7 (Phase 6E-5, the
+wiring PR that makes `--write` produce real
+`optimizer_v1` caches). The data-only guard is preserved
+inside the new write helper as a defensive check; the
+refresher's happy path no longer hits it.*
+
+The original Phase 6E-3 callout: *"The Phase 6E-3
+data-only guard is a hold, not a fix. The next required
+sub-phase extracts Spymaster's daily best-buy / best-short
+SMA-pair optimizer (`spymaster.py:5050-5117`) into a
+non-interactive helper that the refresher can call. At
+that point the payload scope marker flips off
+`data_only_v1`, the guard releases, and `--write`
+becomes the operator's production refresh path. The
+atomic-write helper, manifest sidecar, status JSON, and
+CLI surface in Phase 6E-3 are already in place for that
+work — the SMA extraction is the only blocking piece."*
 
 ## 6.6 Phase 6E-4 — SMA optimizer extraction (isolated)
 
-Phase 6E-4 (PR pending) lifts the Spymaster daily best-buy
-/ best-short SMA-pair optimizer out of the Dash callback
-and into a pure, offline, importable helper at
+Phase 6E-4 lifts the Spymaster daily best-buy /
+best-short SMA-pair optimizer out of the Dash callback and
+into a pure, offline, importable helper at
 `project/signal_engine_sma_optimizer.py`. The test pin is
 `project/test_scripts/test_signal_engine_sma_optimizer.py`.
+The follow-up wiring sub-phase is § 6.7 (Phase 6E-5).
 
 **This PR does NOT release the Phase 6E-3 data_only_v1
 write guard.** It only extracts and validates the
@@ -478,9 +487,10 @@ optimize_signal_engine_sma_pairs(
 ) -> SignalEngineSmaOptimizationResult
 ```
 
-`SignalEngineSmaOptimizationResult` carries every field a
-future refresher-wiring PR needs to build a production-safe
-Signal Engine cache payload: `preprocessed_data`,
+`SignalEngineSmaOptimizationResult` carries every field
+the refresher-wiring sub-phase (§ 6.7, Phase 6E-5) uses to
+build a production-safe Signal Engine cache payload:
+`preprocessed_data`,
 `daily_top_buy_pairs`, `daily_top_short_pairs`,
 `cumulative_combined_captures`, `active_pairs`,
 `top_buy_pair` / `top_short_pair` /
@@ -538,24 +548,28 @@ reproduces Spymaster's published output:
 Runtime: about 2.5 seconds for the full SPY cache
 (8,372 days × 12,882 pairs at `max_sma_day=114`).
 
-### 6.6.4 Remaining gap
+### 6.6.4 Remaining gap (closed in Phase 6E-5)
 
-The Phase 6E-3 refresher's `--write` path is still
+*At Phase 6E-4 time this section described the still-open
+wiring work. Phase 6E-5 (§ 6.7) is that wiring PR; the
+gap is now closed. The historical text follows.*
+
+*"The Phase 6E-3 refresher's `--write` path is still
 refused under the `data_only_v1` guard. A follow-up PR
-will:
+will:*
 
-  1. Import and call `optimize_signal_engine_sma_pairs`
-     from inside `refresh_signal_engine_cache`.
-  2. Replace the placeholder `active_pairs = ["None", ...]`
+  1. *Import and call `optimize_signal_engine_sma_pairs`
+     from inside `refresh_signal_engine_cache`.*
+  2. *Replace the placeholder `active_pairs = ["None", ...]`
      with the optimizer's real
-     `result.active_pairs`.
-  3. Flip the payload scope marker off `data_only_v1`.
-  4. Re-enable the existing (currently dead) atomic-write
-     + manifest + status branch.
+     `result.active_pairs`.*
+  3. *Flip the payload scope marker off `data_only_v1`.*
+  4. *Re-enable the existing (currently dead) atomic-write
+     + manifest + status branch.*
 
-Phase 6E-4 deliberately stops short of that wiring so
+*Phase 6E-4 deliberately stops short of that wiring so
 the optimizer's parity and contract can be audited
-without changing any production-affecting behavior.
+without changing any production-affecting behavior."*
 
 ### 6.6.5 Hard rules pinned in Phase 6E-4 tests
 

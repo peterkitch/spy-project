@@ -363,6 +363,72 @@ def test_blocked_write_emits_no_status_or_manifest(tmp_path: Path):
     assert manifest_files == []
 
 
+def test_api_invalid_max_sma_day_returns_issue_and_writes_nothing(
+    tmp_path: Path,
+):
+    """The public API must reject explicit ``max_sma_day < 2``
+    rather than silently clamping. Verified for ``write=True``:
+    no cache PKL, no manifest sidecar, no status JSON is
+    written; ``invalid_max_sma_day`` is surfaced in
+    ``issue_codes``; ``new_cache_date_range_end`` is None
+    because the function never reaches the fetch path."""
+    dirs = _layout(tmp_path)
+    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=True,
+        max_sma_day=1,
+        data_fetcher=_make_fetcher(_make_synthetic_df(
+            last_date="2026-05-08", n=20,
+        )),
+        current_as_of_date="2026-05-08",
+    )
+    assert result.refreshed is False
+    assert ser.ISSUE_INVALID_MAX_SMA_DAY in result.issue_codes
+    assert result.cache_path is None
+    assert result.manifest_path is None
+    assert result.status_path is None
+    assert result.new_cache_date_range_end is None
+    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    assert before == after, (
+        "invalid max_sma_day reached disk: "
+        f"added {set(after) - set(before)}"
+    )
+
+
+def test_api_invalid_max_sma_day_dry_run_returns_issue_and_writes_nothing(
+    tmp_path: Path,
+):
+    """Same rejection contract under ``write=False``: an
+    invalid explicit ``max_sma_day`` short-circuits before
+    the fetch and reports the issue code with zero disk
+    side effects."""
+    dirs = _layout(tmp_path)
+    before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        status_dir=dirs["status_dir"],
+        write=False,
+        max_sma_day=0,
+        data_fetcher=_make_fetcher(_make_synthetic_df(
+            last_date="2026-05-08", n=20,
+        )),
+        current_as_of_date="2026-05-08",
+    )
+    assert result.refreshed is False
+    assert ser.ISSUE_INVALID_MAX_SMA_DAY in result.issue_codes
+    assert result.new_cache_date_range_end is None
+    # No dry_run_only when the validation short-circuits;
+    # the rejection is more specific than the generic
+    # dry-run echo.
+    assert ser.ISSUE_DRY_RUN not in result.issue_codes
+    after = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+    assert before == after
+
+
 def test_optimizer_issue_blocks_write(tmp_path: Path):
     """An optimizer that returns issue codes must produce
     no disk writes and surface ``optimizer_failed`` plus

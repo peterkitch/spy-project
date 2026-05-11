@@ -113,6 +113,14 @@ ISSUE_ALREADY_CURRENT = "already_current"
 ISSUE_PROVENANCE_MANIFEST_FAILED = "provenance_manifest_failed"
 ISSUE_DATA_ONLY_WRITE_BLOCKED = "data_only_write_blocked"
 ISSUE_OPTIMIZER_FAILED = "optimizer_failed"
+# Surfaced when an explicit ``max_sma_day`` argument is
+# unparseable or < 2. Named to match the optimizer's own
+# ``invalid_max_sma_day`` so the launch-readiness stack
+# can switch on a single stable string. Distinct from the
+# CLI's argparse-level rc=2 path, which still rejects
+# bad ``--max-sma-day`` before the function is even
+# called.
+ISSUE_INVALID_MAX_SMA_DAY = "invalid_max_sma_day"
 
 
 # Scope markers stamped onto every cache payload this module
@@ -640,7 +648,10 @@ def refresh_signal_engine_cache(
 
     # Resolve ``max_sma_day`` AFTER ticker normalization so
     # the existing-cache probe runs against the canonical
-    # filename stem.
+    # filename stem. Explicit invalid values are rejected
+    # (never silently clamped); the absent / None case
+    # reuses the existing cache's ``existing_max_sma_day``
+    # when present, or falls back to ``DEFAULT_MAX_SMA_DAY``.
     if max_sma_day is None:
         existing_msd = _existing_cache_max_sma_day(
             norm_ticker, cache_d,
@@ -651,7 +662,39 @@ def refresh_signal_engine_cache(
             else DEFAULT_MAX_SMA_DAY
         )
     else:
-        msd = max(2, int(max_sma_day))
+        try:
+            msd_candidate = int(max_sma_day)
+        except (TypeError, ValueError):
+            return SignalEngineRefreshResult(
+                ticker=norm_ticker,
+                write=bool(write),
+                cache_path=None,
+                manifest_path=None,
+                status_path=None,
+                old_cache_date_range_end=None,
+                new_cache_date_range_end=None,
+                refreshed=False,
+                stale_before=False,
+                current_after=False,
+                issue_codes=(ISSUE_INVALID_MAX_SMA_DAY,),
+                elapsed_seconds=time.monotonic() - started,
+            )
+        if msd_candidate < 2:
+            return SignalEngineRefreshResult(
+                ticker=norm_ticker,
+                write=bool(write),
+                cache_path=None,
+                manifest_path=None,
+                status_path=None,
+                old_cache_date_range_end=None,
+                new_cache_date_range_end=None,
+                refreshed=False,
+                stale_before=False,
+                current_after=False,
+                issue_codes=(ISSUE_INVALID_MAX_SMA_DAY,),
+                elapsed_seconds=time.monotonic() - started,
+            )
+        msd = msd_candidate
 
     target_cache_path = _cache_path(norm_ticker, cache_d)
     old_end = _existing_cache_end(norm_ticker, cache_d)
