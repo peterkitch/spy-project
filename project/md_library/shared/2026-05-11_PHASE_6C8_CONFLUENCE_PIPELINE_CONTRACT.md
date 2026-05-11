@@ -250,6 +250,79 @@ What this does NOT close:
 Public leaderboard eligibility therefore stays at zero until
 Phase 6D-2 ships, even after a Phase 6D-1 sweep across the cache.
 
+## 6.3 Phase 6D-3 progress note (2026-05-11)
+
+Phase 6D-3 added `project/confluence_mtf_artifact_builder.py`:
+a read-only / offline builder that consumes the Phase 6D-2
+`__K<K>__MTF.research_day.json` artifacts and aggregates them
+into a single Confluence `research_day_v1` artifact per target,
+written to the canonical confluence location used by the rest
+of the repo:
+
+    output/research_artifacts/confluence/<SAFE_TARGET>/<SAFE_TARGET>__<safe_run_id>.research_day.json
+
+Default run id is `mtf_consensus`. The resulting artifact is
+readable directly by `confluence_pipeline_readiness.py` and
+`daily_signal_board.py` without any consumer-side changes.
+
+Discovery contract:
+
+  - Strictly filters input filenames via the Phase 6D-2 regex
+    `__K(\d+)__MTF\.research_day\.json$`. Legacy unsuffixed
+    TrafficFlow files and Phase 6D-1 daily
+    `__K<K>.research_day.json` files are silently excluded.
+  - Verifies the filename `K` matches the artifact's internal
+    `K`; mismatches raise `input_artifact_k_mismatch` and the
+    file is skipped.
+
+K coverage gate (refuse to write partial):
+
+  - Requires full coverage of the expected K range (default
+    K=1..12). If any expected K is missing from the saved MTF
+    inputs, the builder reports `missing_mtf_k_coverage` and
+    does NOT write a Confluence artifact - partial confluence
+    rows would be misleading on the public board.
+
+Combine rule (per day, across every K × timeframe cell):
+
+  - Each cell is normalized to Buy / Short / None / missing.
+  - `buy_votes` / `short_votes` / `none_votes` / `missing_votes`
+    are preserved on every daily row.
+  - Final `confluence_signal`:
+      * No active votes -> None, `agreement_active=0`
+      * All-active Buy -> Buy, `agreement_active=buy_votes`
+      * All-active Short -> Short, `agreement_active=short_votes`
+      * Mixed Buy + Short -> None, `agreement_active=0`
+  - `agreement_total` = active + none (excludes missing); also
+    surfaced as `available_count` for compatibility with the
+    existing readiness consumer.
+
+Freshness:
+
+  - The artifact's `last_date` is taken from the actual source
+    MTF rows. The builder accepts a `research_as_of_date`
+    parameter for telemetry parity but never stamps a fresh
+    date onto a stale ticker - if the sources are stale, the
+    resulting Confluence artifact is stale under readiness,
+    and the leader gate fails on `stale_confluence_day_artifact`.
+
+What this closes:
+
+  - `missing_confluence_day_artifact` clears for targets whose
+    full 6D-1 + 6D-2 + 6D-3 sweep succeeded.
+  - When the source data is current with respect to the
+    resolved as-of date, `stale_confluence_day_artifact` also
+    stays absent, and a fixture-equivalent ticker becomes
+    `leader_eligible=True`.
+
+Out of scope for Phase 6D-3:
+
+  - Rewriting `confluence.py` / `confluence_analyzer.py`.
+  - Live engine execution / yfinance.
+  - Operator dashboard (`phase6_research_preview.py`) - untouched.
+  - Daily automation / scheduled jobs.
+  - Styling / design work.
+
 ## 7. Out of scope for this PR
 
 The following changes are **not** part of Phase 6C-8:
