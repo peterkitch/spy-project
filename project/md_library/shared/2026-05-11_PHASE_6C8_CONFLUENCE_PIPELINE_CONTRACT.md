@@ -323,6 +323,75 @@ Out of scope for Phase 6D-3:
   - Daily automation / scheduled jobs.
   - Styling / design work.
 
+## 6.4 Phase 6D-4 progress note (2026-05-11)
+
+Phase 6D-4 added `project/confluence_pipeline_runner.py`: an
+operator-facing offline orchestrator that chains the three
+Phase 6D builders plus a final readiness pass for one ticker
+or a small explicit ticker list.
+
+  Chain order:
+    6D-1  `trafficflow_k_artifact_builder.build_trafficflow_artifacts_for_stack_run`
+    6D-2  `trafficflow_multitimeframe_bridge.build_multitimeframe_bridge_artifacts_for_target`
+    6D-3  `confluence_mtf_artifact_builder.build_confluence_from_mtf_trafficflow`
+    final `confluence_pipeline_readiness.inspect_ticker_pipeline`
+
+Public surface:
+
+  - `PipelineStageOutcome` dataclass (one per stage; uniform
+    shape across the four stages so audit tooling can iterate).
+  - `PipelineRunResult` dataclass: stages tuple, readiness
+    verdict, rolled-up issue codes, `leader_eligible`,
+    `ranking_blocked_reason` (derived from readiness via the
+    same priority list the Daily Signal Board uses), total
+    elapsed, every artifact path produced. Carries a
+    `to_json_dict()` helper for CLI output.
+  - `run_confluence_pipeline_for_ticker(ticker, *, ...)`
+  - `run_confluence_pipeline_for_tickers(tickers, *, ...)`
+  - `main(argv=None)` CLI entry point.
+
+CLI contract:
+
+  - `python confluence_pipeline_runner.py --ticker SPY --write`
+  - `python confluence_pipeline_runner.py --tickers SPY,AAPL --dry-run`
+  - Default mode is dry-run / `write=False`.
+  - `--ticker` and `--tickers` are mutually exclusive.
+  - `--write` and `--dry-run` are mutually exclusive.
+  - Output: JSON list (one entry per ticker) to stdout.
+  - Exit codes:
+      0  runner completed; results emitted (regardless of
+         per-ticker stale / partial findings)
+      2  invalid CLI arguments
+      3  unexpected unhandled exception (defensive; each stage
+         already swallows builder errors into issue codes)
+
+Behavior:
+
+  - Each stage is invoked unconditionally; each builder is
+    individually safe with missing inputs and surfaces its own
+    issue codes. The runner rolls those up without flattening.
+  - `write=False` performs no disk writes anywhere in the
+    chain. `write=True` persists through the existing builder
+    modules; the runner never writes on its own.
+  - The final readiness call uses the same directory inputs
+    the stages used, so the verdict reflects either the
+    freshly written artifacts (`write=True`) or the
+    pre-existing tree (`write=False`).
+  - Stale source data produces a stale readiness verdict
+    (e.g. `stale_confluence_day_artifact`), not a false
+    success.
+
+Out of scope for Phase 6D-4:
+
+  - Universe sweep across the full cache.
+  - Daily automation / scheduled jobs.
+  - Operator dashboard (`phase6_research_preview.py`) changes.
+  - Styling / design work.
+
+The runner is intentionally a manual bridge: it proves the
+chain works end-to-end and supports per-ticker audit before
+the eventual Phase 6E scheduler runs the same code automatically.
+
 ## 7. Out of scope for this PR
 
 The following changes are **not** part of Phase 6C-8:
