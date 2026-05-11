@@ -353,6 +353,89 @@ def test_ranking_sorts_by_confluence_then_alphabetical():
     assert ranks == {"DDD": 1, "BBB": 2, "CCC": 3, "AAA": None}
 
 
+def test_ranking_skips_cache_only_rows_for_top_3_badges():
+    """Phase 6C-7 audit fix: only rows with ``agreement_active is not
+    None`` are eligible for a rank=1|2|3 badge. Cache-only rows
+    (no confluence agreement) never get a podium slot, even when
+    they happen to occupy the third visible row in the sort order.
+    """
+    rows = [
+        # Two rankable rows.
+        board.BoardRow(
+            ticker="SPY", signal="Buy", signal_value=1,
+            agreement_active=5, agreement_total=5,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-09",
+        ),
+        board.BoardRow(
+            ticker="GSPC_VARIANT", signal="None", signal_value=0,
+            agreement_active=1, agreement_total=1,
+            coverage=board.COVERAGE_PARTIAL, as_of="2026-05-09",
+        ),
+        # Three cache-only rows. Should never receive a rank.
+        board.BoardRow(
+            ticker="AAA", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+        ),
+        board.BoardRow(
+            ticker="BBB", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+        ),
+        board.BoardRow(
+            ticker="000157.KS", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+        ),
+    ]
+    ranked = board.rank_board_rows(rows)
+    ranks = {r.ticker: r.rank for r in ranked}
+    # Only the two agreement-bearing rows get podium badges. The
+    # third+ slots stay un-badged because no third rankable row
+    # exists.
+    assert ranks == {
+        "SPY": 1,
+        "GSPC_VARIANT": 2,
+        "AAA": None,
+        "BBB": None,
+        "000157.KS": None,
+    }, f"unexpected rank assignment: {ranks}"
+    # Total badge count under 3 when fewer than 3 rankable rows exist.
+    assigned = [r for r in ranked if r.rank is not None]
+    assert len(assigned) == 2, (
+        f"expected 2 rank badges; got {len(assigned)}"
+    )
+
+
+def test_scoreboard_renders_empty_data_rank_for_cache_only_rows():
+    """A cache-only row in the rendered scoreboard tr must carry
+    ``data-rank=""`` so the visual layer never paints a podium
+    badge onto it."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="Buy", signal_value=1,
+            agreement_active=5, agreement_total=5,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-09",
+            rank=1,
+        ),
+        board.BoardRow(
+            ticker="AAA", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+            rank=None,
+        ),
+    ]
+    table = board.render_scoreboard(rows, selected_ticker="SPY")
+    body_rows = _tbody_tr_props(table)
+    by_ticker = {props.get("data-ticker"): props for props in body_rows}
+    assert by_ticker["SPY"].get("data-rank") == "1"
+    assert by_ticker["AAA"].get("data-rank") == "", (
+        "cache-only row must render data-rank=\"\"; got "
+        + repr(by_ticker["AAA"].get("data-rank"))
+    )
+
+
 # ---------------------------------------------------------------------------
 # 4. Default selected ticker
 # ---------------------------------------------------------------------------
@@ -382,6 +465,14 @@ def test_default_selected_ticker_is_spy():
 def test_clicking_row_updates_featured_and_evidence_trail(
     monkeypatch, tmp_path: Path,
 ):
+    """Multi-output callback variant of the click-updates contract.
+
+    Phase 6C-7 audit fix: the two render callbacks were collapsed
+    into one multi-output callback so the selected ticker hydrates
+    exactly once per click instead of once per panel. This test
+    invokes the combined callback and asserts both outputs reflect
+    the new selection.
+    """
     pytest.importorskip("dash")
     cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
     _write_min_spymaster_cache(
@@ -396,27 +487,32 @@ def test_clicking_row_updates_featured_and_evidence_trail(
         artifact_root=artifact_root,
         sig_lib_dir=sig_lib_dir,
     )
-    feat_key = "section-featured-body.children"
-    evid_key = "section-evidence-trail-body.children"
     sel_key = "selected-ticker-store.data"
+    assert sel_key in app.callback_map, (
+        f"expected {sel_key} in app.callback_map; got "
+        f"{list(app.callback_map)[:8]}"
+    )
 
-    for key in (feat_key, evid_key, sel_key):
-        assert key in app.callback_map, (
-            f"expected {key} in app.callback_map; got "
-            f"{list(app.callback_map)[:8]}"
-        )
+    # The Featured + Evidence outputs are now wired by a single
+    # multi-output callback. Find it by substring match on the
+    # synthetic Dash key (e.g.
+    # "..section-featured-body.children...section-evidence-trail-body.children..").
+    combined_key = next(
+        (k for k in app.callback_map
+         if "section-featured-body.children" in k
+         and "section-evidence-trail-body.children" in k),
+        None,
+    )
+    assert combined_key is not None, (
+        "expected a single multi-output callback wiring both "
+        "section-featured-body and section-evidence-trail-body; "
+        f"got keys: {list(app.callback_map)[:8]}"
+    )
+    combined_cb = app.callback_map[combined_key]["callback"]
+    combined_inner = getattr(combined_cb, "__wrapped__", combined_cb)
 
-    # Peel off Dash's add_context wrapper so the callback body can be
-    # invoked directly; mirrors the existing preview suite's pattern.
-    feat_cb = app.callback_map[feat_key]["callback"]
-    evid_cb = app.callback_map[evid_key]["callback"]
-    feat_inner = getattr(feat_cb, "__wrapped__", feat_cb)
-    evid_inner = getattr(evid_cb, "__wrapped__", evid_cb)
-
-    feat_acme = feat_inner("ACME")
-    evid_acme = evid_inner("ACME")
-    feat_spy = feat_inner("SPY")
-    evid_spy = evid_inner("SPY")
+    feat_acme, evid_acme = combined_inner("ACME")
+    feat_spy, evid_spy = combined_inner("SPY")
 
     # The featured / evidence renders depend on the selected ticker -
     # the rendered tree must mention the new ticker name when the
@@ -957,6 +1053,53 @@ def _component_text(component: Any) -> str:
 
     _walk(component)
     return "\n".join(pieces)
+
+
+def _tbody_tr_props(table: Any) -> list[dict[str, Any]]:
+    """Walk an ``html.Table`` and return the ``props`` dict for every
+    ``Tr`` inside the ``Tbody`` (skips header rows). Surfaces
+    ``data-*`` attributes via ``to_plotly_json()['props']``."""
+    rows: list[dict[str, Any]] = []
+
+    def _walk_tbody(node: Any) -> None:
+        if node is None or isinstance(node, str):
+            return
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                _walk_tbody(child)
+            return
+        if type(node).__name__ == "Tr":
+            try:
+                props = node.to_plotly_json().get("props", {})
+            except Exception:
+                props = {}
+            rows.append(props)
+            return
+        children = getattr(node, "children", None)
+        if children is not None:
+            _walk_tbody(children)
+
+    def _find_tbody(node: Any) -> Any:
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                found = _find_tbody(child)
+                if found is not None:
+                    return found
+            return None
+        if type(node).__name__ == "Tbody":
+            return node
+        children = getattr(node, "children", None)
+        if children is not None:
+            return _find_tbody(children)
+        return None
+
+    tbody = _find_tbody(table)
+    if tbody is None:
+        return rows
+    _walk_tbody(getattr(tbody, "children", None))
+    return rows
 
 
 def _ordered_station_ids(component: Any) -> list[str]:

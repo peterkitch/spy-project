@@ -945,25 +945,48 @@ def _row_as_of_date(
 
 
 def rank_board_rows(rows: Sequence[BoardRow]) -> list[BoardRow]:
-    """Sort descending by confluence-agreement count when available
-    (``None`` -> -1), then alphabetically by ticker. The top three
-    rows get rank=1/2/3; everything else gets rank=None.
+    """Sort the scoreboard and assign top-3 rank badges.
+
+    Sort order (documented):
+      * Descending by confluence agreement count.
+      * Rows without an agreement count (``agreement_active is None``)
+        sort to the bottom.
+      * Alphabetical by ticker for tie-breaks at every level.
+
+    Rank badges (audit-driven contract):
+      * ``rank=1|2|3`` is assigned ONLY to rows whose
+        ``agreement_active`` is not ``None``. Cache-only / agreement-
+        less rows NEVER receive a top-3 badge, even when they
+        happen to occupy the third visible row.
+      * If fewer than three rankable rows exist, fewer than three
+        rows receive ``rank``. Empty board -> nobody gets a badge.
+
+    This keeps the "high score" semantics honest on the public board:
+    a row with no confluence evidence cannot win a podium spot.
     """
     def key(r: BoardRow) -> tuple[int, str]:
         agreement = (
             -int(r.agreement_active) if r.agreement_active is not None
-            else 1  # equivalent to agreement = -1 then negated
+            else 1  # rows without agreement sort last
         )
-        # Refine: we want a descending sort on agreement, so emit
-        # ``-active`` (None -> -1 then -(-1)=1). Tie-break alphabet.
         return (agreement, r.ticker)
 
     ordered = sorted(rows, key=key)
-    # Reset rank on every input row, then mark the top three.
     for r in ordered:
         r.rank = None
-    for idx, row in enumerate(ordered[:3]):
-        row.rank = idx + 1
+    next_rank = 1
+    for row in ordered:
+        if next_rank > 3:
+            break
+        if row.agreement_active is None:
+            # Honest podium: an unrankable row blocks neither itself
+            # nor any later row from being awarded a badge. The
+            # sort order already keeps agreement-bearing rows in
+            # front of agreement-less ones, so iterating in order
+            # is sufficient.
+            continue
+        row.rank = next_rank
+        next_rank += 1
     return list(ordered)
 
 
@@ -1907,8 +1930,14 @@ def build_app(
 
     Callbacks rebuild the state bundle on each fire, but the heavy
     discovery + artifact walk are memoized by ``discover_board_catalogue``
-    on the directory triple, so callback re-entry is cheap. The
-    callback also pays one PKL load for the newly-selected ticker.
+    on the directory triple, so callback re-entry is cheap.
+
+    Selection is wired through a SINGLE multi-output callback
+    (Featured + Evidence outputs share one ``_build_initial_state``
+    bundle per click), and the per-render ``payload_cache`` on that
+    bundle guarantees exactly one PKL load per selection - even
+    though two panels read the same payload. Splitting the two
+    panels across separate callbacks would double the read.
     """
     dash, dcc, html = _dash_modules()
     from dash import Input, Output, State
@@ -2056,31 +2085,29 @@ def build_app(
             return current
         return ticker
 
+    # One multi-output callback so Featured + Evidence render from
+    # a SINGLE state bundle. The per-render payload_cache on that
+    # bundle guarantees exactly one
+    # primary_signal_engine.load_primary_signal_engine_payload call
+    # per selection - if the two outputs were split across two
+    # callbacks, Dash would fire both on the same store change and
+    # each would hydrate independently, doubling the PKL read.
     @app.callback(
         Output("section-featured-body", "children"),
-        Input("selected-ticker-store", "data"),
-    )
-    def _on_select_for_featured(ticker):
-        live_state = _build_initial_state(
-            cache_dir=cache_dir,
-            artifact_root=artifact_root,
-            sig_lib_dir=sig_lib_dir,
-            use_cache=True,
-        )
-        return _render_featured_for(ticker or "", live_state)
-
-    @app.callback(
         Output("section-evidence-trail-body", "children"),
         Input("selected-ticker-store", "data"),
     )
-    def _on_select_for_evidence(ticker):
+    def _on_select_render_panels(ticker):
         live_state = _build_initial_state(
             cache_dir=cache_dir,
             artifact_root=artifact_root,
             sig_lib_dir=sig_lib_dir,
             use_cache=True,
         )
-        return _render_evidence_for(ticker or "", live_state)
+        normalized = ticker or ""
+        featured = _render_featured_for(normalized, live_state)
+        evidence = _render_evidence_for(normalized, live_state)
+        return featured, evidence
 
     return app
 
