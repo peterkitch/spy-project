@@ -154,6 +154,8 @@ ISSUE_INPUT_ARTIFACT_UNREADABLE = "input_artifact_unreadable"
 ISSUE_INPUT_ARTIFACT_K_MISMATCH = "input_artifact_k_mismatch"
 ISSUE_PARTIAL_TIMEFRAME_COVERAGE = "partial_timeframe_coverage"
 ISSUE_NO_USABLE_ROWS = "no_usable_rows"
+ISSUE_NO_COMMON_MTF_K_DATES = "no_common_mtf_k_dates"
+ISSUE_PARTIAL_MTF_DATE_COVERAGE = "partial_mtf_date_coverage"
 ISSUE_ARTIFACT_WRITE_FAILED = "artifact_write_failed"
 
 ARTIFACT_VERSION = "research_day_v1"
@@ -363,6 +365,8 @@ def list_mtf_trafficflow_artifacts(
 def _per_day_votes(
     mtf_inputs: Sequence[tuple[int, _ra.ResearchDayArtifact]],
     expected_timeframes: Sequence[str],
+    *,
+    allowed_dates: Optional[set[str]] = None,
 ) -> tuple[
     list[str], dict[str, dict[str, Any]], list[str], list[int],
 ]:
@@ -428,6 +432,12 @@ def _per_day_votes(
     date_set: set[str] = set()
     for daymap in cells.values():
         date_set.update(daymap.keys())
+    if allowed_dates is not None:
+        # PR #198 audit fix (Issue 3): restrict to the
+        # caller-supplied common-date set so a single fresh K
+        # artifact cannot promote the Confluence artifact past
+        # the newest date covered by EVERY expected K.
+        date_set &= allowed_dates
     dates_in_order = sorted(date_set)
 
     K_values_used = sorted(K_values_used)
@@ -592,12 +602,36 @@ def build_confluence_from_mtf_trafficflow(
         all_attempted_k.add(K)
 
     # Refuse to write unless one coherent source group covers
-    # the full expected K range.
-    full_coverage_groups = [
-        (prefix, group_dict)
-        for prefix, group_dict in groups.items()
-        if wanted.issubset(set(group_dict.keys()))
-    ]
+    # the full expected K range AND has at least one date where
+    # every expected K artifact has a row.
+    #
+    # PR #198 audit fix (Issue 3): the old logic ranked
+    # full-coverage groups by ``max(per-K last_date)``, which
+    # let a single fresh K artifact promote the Confluence
+    # artifact past the newest date covered by all expected K.
+    # The new ranking uses the freshest COMMON full-K date.
+    full_coverage_groups: list[tuple[str, dict, set[str]]] = []
+    for prefix, group_dict in groups.items():
+        if not wanted.issubset(set(group_dict.keys())):
+            continue
+        per_k_dates: list[set[str]] = []
+        for K in expected_k_tuple:
+            _path, art = group_dict[K]
+            k_dates: set[str] = set()
+            for row in (art.daily or []):
+                if not isinstance(row, Mapping):
+                    continue
+                d = row.get("date")
+                if d:
+                    k_dates.add(str(d)[:10])
+            per_k_dates.append(k_dates)
+        if not per_k_dates:
+            continue
+        common_dates = set.intersection(*per_k_dates)
+        full_coverage_groups.append(
+            (prefix, group_dict, common_dates),
+        )
+
     if not full_coverage_groups:
         _append_unique(issues, ISSUE_MISSING_MTF_K_COVERAGE)
         return ConfluenceBuildResult(
@@ -611,31 +645,65 @@ def build_confluence_from_mtf_trafficflow(
             elapsed_seconds=time.perf_counter() - t0,
         )
 
-    # Pick the freshest full-coverage group. Sort key, ascending:
-    #   1. ``-last_date_ordinal``  -> newest source data first
+    # Of the full-K groups, only those with a non-empty common
+    # date set are buildable.
+    buildable_groups = [
+        item for item in full_coverage_groups
+        if item[2]  # non-empty common_dates
+    ]
+    if not buildable_groups:
+        _append_unique(issues, ISSUE_NO_COMMON_MTF_K_DATES)
+        return ConfluenceBuildResult(
+            target=target,
+            attempted_k=tuple(sorted(all_attempted_k)),
+            built=False,
+            artifact_path=None,
+            issue_codes=tuple(issues),
+            row_count=0,
+            last_date=None,
+            elapsed_seconds=time.perf_counter() - t0,
+        )
+
+    # Pick the freshest buildable group. Sort key, ascending:
+    #   1. ``-max(common_dates)``  -> newest common full-K date first
     #   2. ``-max_file_mtime``     -> newest file on tie
     #   3. ``prefix`` (asc)        -> alphabetic prefix on tie
     def _group_sort_key(item):
-        _prefix, group_dict = item
-        last_ord = 0
+        _prefix, group_dict, common_dates = item
+        max_common_ord = max(
+            (_parse_iso_date_to_ordinal(d) for d in common_dates),
+            default=0,
+        )
         max_mtime = 0.0
         for K in expected_k_tuple:
-            path, art = group_dict[K]
-            ld = art.daily[-1].get("date") if art.daily else None
-            ord_value = _parse_iso_date_to_ordinal(ld)
-            if ord_value > last_ord:
-                last_ord = ord_value
+            path, _art = group_dict[K]
             try:
                 m = path.stat().st_mtime
                 if m > max_mtime:
                     max_mtime = m
             except Exception:
                 pass
-        return (-last_ord, -max_mtime, _prefix)
+        return (-max_common_ord, -max_mtime, _prefix)
 
-    chosen_prefix, chosen_group = sorted(
-        full_coverage_groups, key=_group_sort_key,
+    chosen_prefix, chosen_group, chosen_common_dates = sorted(
+        buildable_groups, key=_group_sort_key,
     )[0]
+
+    # If the chosen group has rows beyond the common-date set
+    # (e.g. one K artifact extended fresh while the others did
+    # not), surface a soft issue. The emitted artifact is still
+    # honest because the aggregation is restricted to
+    # ``chosen_common_dates``.
+    union_dates: set[str] = set()
+    for K in expected_k_tuple:
+        for row in (chosen_group[K][1].daily or []):
+            if not isinstance(row, Mapping):
+                continue
+            d = row.get("date")
+            if d:
+                union_dates.add(str(d)[:10])
+    if union_dates - chosen_common_dates:
+        _append_unique(issues, ISSUE_PARTIAL_MTF_DATE_COVERAGE)
 
     # Use ONLY the chosen group's artifacts. attempted_k now
     # reflects the selected group's coverage (always == wanted
@@ -659,7 +727,10 @@ def build_confluence_from_mtf_trafficflow(
         _append_unique(issues, ISSUE_PARTIAL_TIMEFRAME_COVERAGE)
 
     dates_in_order, per_date_record, _tfs_observed, K_values_seen = (
-        _per_day_votes(mtf_inputs, expected_tf_list)
+        _per_day_votes(
+            mtf_inputs, expected_tf_list,
+            allowed_dates=chosen_common_dates,
+        )
     )
     if not dates_in_order:
         _append_unique(issues, ISSUE_NO_USABLE_ROWS)

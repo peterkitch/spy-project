@@ -1065,6 +1065,215 @@ def test_full_kxtf_happy_path_still_60_votes(tmp_path: Path):
     assert last["agreement_total"] == 60
 
 
+# ---------------------------------------------------------------------------
+# 14. Audit Issue 3: common-date group selection
+# ---------------------------------------------------------------------------
+
+
+def _write_mtf_with_explicit_dates(
+    artifact_root: Path,
+    *,
+    target: str,
+    seed_run_id: str,
+    K: int,
+    dates: list[str],
+    signal: str = "Buy",
+    timeframes: Optional[list[str]] = None,
+) -> Path:
+    """Write a Phase 6D-2 MTF artifact whose daily rows cover an
+    explicit caller-supplied date list. Convenience wrapper
+    around ``_write_mtf_artifact``."""
+    tfs = list(timeframes or cmab.DEFAULT_EXPECTED_TIMEFRAMES)
+    per_day = {d: {tf: signal for tf in tfs} for d in dates}
+    return _write_mtf_artifact(
+        artifact_root,
+        target=target,
+        seed_run_id=seed_run_id,
+        K=K,
+        dates=dates,
+        per_day_per_tf=per_day,
+        timeframes=tfs,
+    )
+
+
+def test_one_fresh_k_does_not_make_group_current(tmp_path: Path):
+    """PR #198 audit Issue 3: K=1 has rows through 2026-05-08
+    while K=2..12 only have rows through 2024-01-31. The builder
+    must NOT use K=1's fresh-only dates; the artifact's
+    last_date is the newest date where every expected K has a
+    row (2024-01-31). ``partial_mtf_date_coverage`` should
+    surface since K=1 had rows beyond the common-date set."""
+    dirs = _layout(tmp_path)
+    short_dates = _build_dates(10, end="2024-01-31")
+    fresh_extension = _build_dates(8, end="2026-05-08")
+    # K=1: short_dates UNION fresh_extension (covers everything
+    # plus the 2026 dates).
+    k1_dates = sorted(set(short_dates) | set(fresh_extension))
+    _write_mtf_with_explicit_dates(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="seed", K=1, dates=k1_dates,
+    )
+    # K=2..12: only short_dates.
+    for k in range(2, 13):
+        _write_mtf_with_explicit_dates(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seed", K=k, dates=short_dates,
+        )
+
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert res.built
+    expected_last = short_dates[-1]
+    assert res.last_date == expected_last, (
+        "Confluence last_date must be the newest common full-K "
+        f"date ({expected_last}), not K=1's max ({k1_dates[-1]}); "
+        f"got {res.last_date}"
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    assert art.daily[-1]["date"] == expected_last
+    # K=1 had rows beyond the common date set -> soft issue must
+    # surface.
+    assert (
+        cmab.ISSUE_PARTIAL_MTF_DATE_COVERAGE in res.issue_codes
+    ), res.issue_codes
+    # Every emitted row has full K coverage (no per-row
+    # missing_votes from absent K rows).
+    last = art.daily[-1]
+    assert last["missing_votes"] == 0, last
+    assert last["buy_votes"] == 60  # 12 K * 5 tfs all Buy
+
+
+def test_group_with_no_common_k_dates_writes_nothing(tmp_path: Path):
+    """PR #198 audit Issue 3: a full-K group whose K artifacts
+    cover entirely disjoint date sets must NOT produce a
+    Confluence artifact. ``no_common_mtf_k_dates`` surfaces and
+    no file is written."""
+    dirs = _layout(tmp_path)
+    old_dates = _build_dates(10, end="2024-01-31")
+    new_dates = _build_dates(10, end="2026-05-08")
+    # K=1..6: old_dates only.
+    for k in (1, 2, 3, 4, 5, 6):
+        _write_mtf_with_explicit_dates(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seed", K=k, dates=old_dates,
+        )
+    # K=7..12: new_dates only.
+    for k in (7, 8, 9, 10, 11, 12):
+        _write_mtf_with_explicit_dates(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seed", K=k, dates=new_dates,
+        )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert cmab.ISSUE_NO_COMMON_MTF_K_DATES in res.issue_codes
+    assert res.built is False
+    assert res.artifact_path is None
+    conf_root = dirs["artifact_root"] / "confluence"
+    assert (
+        not conf_root.exists()
+        or not list(conf_root.rglob("*.research_day.json"))
+    )
+
+
+def test_group_selection_uses_freshest_common_full_k_date(
+    tmp_path: Path,
+):
+    """PR #198 audit Issue 3: group A has K=1 with a 2026 fresh
+    extension but K=2..12 only through 2024-01-31 (common date
+    max = 2024-01-31). Group B has K=1..12 all through 2024-03-15
+    (common date max = 2024-03-15). The builder must select
+    group B because its NEWEST COMMON full-K date is fresher,
+    NOT group A whose max per-K last_date is later but whose
+    common coverage is older."""
+    dirs = _layout(tmp_path)
+    a_short = _build_dates(10, end="2024-01-31")
+    a_fresh_ext = _build_dates(5, end="2026-05-08")
+    a_k1_dates = sorted(set(a_short) | set(a_fresh_ext))
+    b_dates = _build_dates(10, end="2024-03-15")
+
+    # Group A: K=1 fresh extension, K=2..12 short.
+    _write_mtf_with_explicit_dates(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="aa_groupA", K=1, dates=a_k1_dates,
+    )
+    for k in range(2, 13):
+        _write_mtf_with_explicit_dates(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="aa_groupA", K=k, dates=a_short,
+        )
+    # Group B: K=1..12 all cover b_dates (max common = 2024-03-15).
+    for k in range(1, 13):
+        _write_mtf_with_explicit_dates(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="bb_groupB", K=k, dates=b_dates,
+        )
+
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert res.built
+    # Group B's common max is 2024-03-15, beating group A's
+    # 2024-01-31. Builder must pick B.
+    expected = b_dates[-1]
+    assert res.last_date == expected, (
+        f"builder picked the group with the later single-K "
+        f"date instead of the freshest COMMON date; got "
+        f"{res.last_date!r}, expected {expected!r}"
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    src_ids = art.daily[-1]["source_trafficflow_mtf_run_ids"]
+    assert all("bb_groupB" in s for s in src_ids), src_ids
+    assert all("aa_groupA" not in s for s in src_ids), src_ids
+
+
+def test_partial_date_group_does_not_clear_stale_readiness(
+    tmp_path: Path,
+):
+    """Readiness integration: even though K=1 carries fresh
+    2026 rows, the Confluence artifact's last_date is clamped
+    to the common-full-K date (2024-01-31 in this fixture).
+    Readiness with the default cutoff therefore reports
+    stale_confluence_day_artifact - the partial-date group
+    cannot accidentally clear current-leader status."""
+    dirs = _layout(tmp_path)
+    (dirs["cache_dir"] / "SPY_precomputed_results.pkl").write_bytes(b"p")
+    short_dates = _build_dates(10, end="2024-01-31")
+    fresh_extension = _build_dates(5, end="2026-05-08")
+    k1_dates = sorted(set(short_dates) | set(fresh_extension))
+    _write_mtf_with_explicit_dates(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="seed", K=1, dates=k1_dates,
+    )
+    for k in range(2, 13):
+        _write_mtf_with_explicit_dates(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seed", K=k, dates=short_dates,
+        )
+    cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    # Readiness with default (today) cutoff: 2024-01-31 is far
+    # in the past -> stale_confluence_day_artifact must fire.
+    r = cpr.inspect_ticker_pipeline(
+        "SPY",
+        cache_dir=dirs["cache_dir"],
+        artifact_root=dirs["artifact_root"],
+        stackbuilder_root=dirs["stackbuilder_root"],
+        signal_library_dir=dirs["signal_library_dir"],
+        fast_path_when_no_confluence=False,
+    )
+    assert (
+        cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT in r.issue_codes
+    ), r.issue_codes
+    assert (
+        cpr.ISSUE_MISSING_CONFLUENCE_DAY_ARTIFACT
+        not in r.issue_codes
+    )
+    assert r.leader_eligible is False
+
+
 def test_artifact_run_id_helper_defaults_and_overrides():
     assert cmab.artifact_run_id_for_mtf_consensus() == "mtf_consensus"
     assert cmab.artifact_run_id_for_mtf_consensus(
