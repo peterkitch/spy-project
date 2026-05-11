@@ -1310,6 +1310,218 @@ def test_discovery_handles_200_fixtures_without_hydrating(
 
 
 # ---------------------------------------------------------------------------
+# Phase 6F-7: mobile launch polish
+# ---------------------------------------------------------------------------
+
+
+def _to_props(node: Any) -> dict[str, Any]:
+    try:
+        return node.to_plotly_json().get("props", {}) or {}
+    except Exception:
+        return {}
+
+
+def test_scoreboard_returns_horizontal_overflow_wrapper():
+    """Phase 6F-7: ``render_scoreboard`` must return a Div
+    keyed ``scoreboard-table-wrapper`` whose CSS allows
+    horizontal scroll INSIDE the wrapper (``overflowX: auto``).
+    Mobile viewports at 390x844 push the table past the page
+    width; this wrapper absorbs that overflow so the page
+    never grows a horizontal scrollbar."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    # Wrapper layer is now a Div with the stable contract id.
+    assert type(wrapper).__name__ == "Div"
+    props = _to_props(wrapper)
+    assert props.get("id") == "scoreboard-table-wrapper"
+    # The stable test-facing data attribute pins the
+    # behavior contract.
+    assert props.get("data-mobile-overflow") == "contained"
+    style = props.get("style") or {}
+    assert style.get("overflowX") == "auto", (
+        "scoreboard-table-wrapper must enable horizontal "
+        "overflow; got style="
+        + repr(style)
+    )
+    assert style.get("width") == "100%"
+
+
+def test_scoreboard_table_id_preserved_inside_wrapper():
+    """The wrapper Div must contain the existing
+    ``scoreboard-table`` Table — the existing id is part of
+    the stable DOM contract."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    inner = _to_props(wrapper).get("children")
+    assert inner is not None
+    assert type(inner).__name__ == "Table"
+    assert _to_props(inner).get("id") == "scoreboard-table"
+
+
+def test_scoreboard_as_of_header_is_nowrap():
+    """The ``AS OF`` header cell must carry
+    ``whiteSpace: nowrap`` so the column label never breaks
+    onto two lines on narrow viewports."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    table = _to_props(wrapper).get("children")
+    # Find the Thead -> Tr -> last Th
+    headers = _to_props(table).get("children")
+    thead = headers[0]
+    thead_tr = _to_props(thead).get("children")
+    th_list = _to_props(thead_tr).get("children")
+    as_of_th = th_list[-1]
+    as_of_style = _to_props(as_of_th).get("style") or {}
+    assert as_of_style.get("whiteSpace") == "nowrap", (
+        "AS OF header must be nowrap; got "
+        + repr(as_of_style)
+    )
+
+
+def test_scoreboard_as_of_cell_is_nowrap():
+    """The ``AS OF`` data cell on every body row must carry
+    ``whiteSpace: nowrap`` so ISO dates ("2026-05-08") never
+    break to fragments like ``202`` / ``05-``."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+        board.BoardRow(
+            ticker="AAA", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+            rank=None,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    table = _to_props(wrapper).get("children")
+    children = _to_props(table).get("children")
+    tbody = children[1]
+    body_tr_list = _to_props(tbody).get("children")
+    assert len(body_tr_list) == 2
+    for tr in body_tr_list:
+        td_list = _to_props(tr).get("children")
+        # AS OF is the last Td in each row.
+        as_of_td = td_list[-1]
+        as_of_style = _to_props(as_of_td).get("style") or {}
+        assert as_of_style.get("whiteSpace") == "nowrap", (
+            "AS OF cell must be nowrap; got "
+            + repr(as_of_style)
+        )
+
+
+def test_spy_row_data_attributes_preserved_after_polish():
+    """Phase 6F-7 must not regress the public-board data
+    contract: SPY's row attributes (data-ticker,
+    data-leader-eligible, data-rank, data-ranking-blocked-reason,
+    data-coverage, data-signal) must round-trip through the
+    new wrapper unchanged."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    body_rows = _tbody_tr_props(wrapper)
+    assert len(body_rows) == 1
+    p = body_rows[0]
+    assert p.get("data-ticker") == "SPY"
+    assert p.get("data-leader-eligible") == "true"
+    assert p.get("data-rank") == "1"
+    assert p.get("data-ranking-blocked-reason") == ""
+    assert p.get("data-coverage") == board.COVERAGE_FULL
+    assert p.get("data-signal") == "None"
+
+
+def test_no_current_leaders_banner_hidden_when_spy_is_eligible(
+    tmp_path: Path,
+):
+    """When the live state contains at least one leader-
+    eligible row, the ``scoreboard-no-current-leaders``
+    banner must remain hidden. Phase 6F-7 must not touch
+    that semantic."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    # Inject a leader-eligible BoardRow by monkeypatching
+    # the discovery helper so we don't need a full pipeline.
+    real_discover = board.discover_board_catalogue
+
+    def _fake_discover(**kw):
+        original = real_discover(**kw)
+        leader = board.BoardRow(
+            ticker="SPY", signal="Buy", signal_value=1,
+            agreement_active=5, agreement_total=5,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        )
+        return tuple([leader] + [
+            r for r in original if r.ticker != "SPY"
+        ])
+
+    import unittest.mock as mock
+    with mock.patch.object(
+        board, "discover_board_catalogue", _fake_discover,
+    ):
+        app = board.build_app(
+            cache_dir=cache_dir,
+            artifact_root=artifact_root,
+            sig_lib_dir=sig_lib_dir,
+        )
+
+    def _find(node, target_id):
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                r = _find(c, target_id)
+                if r is not None:
+                    return r
+            return None
+        if getattr(node, "id", None) == target_id:
+            return node
+        return _find(getattr(node, "children", None), target_id)
+
+    banner = _find(app.layout, "scoreboard-no-current-leaders")
+    assert banner is not None
+    props = _to_props(banner)
+    assert props.get("data-leader-count") == "1"
+    assert (props.get("style") or {}).get("display") == "none"
+
+
+# ---------------------------------------------------------------------------
 # Component traversal helpers
 # ---------------------------------------------------------------------------
 
