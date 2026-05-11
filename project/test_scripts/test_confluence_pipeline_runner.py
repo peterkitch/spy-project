@@ -271,6 +271,98 @@ def test_single_ticker_write_true_chains_three_builders(
     assert res.write is True
 
 
+def test_pipeline_preserves_input_last_date_end_to_end(
+    tmp_path: Path,
+):
+    """Phase 6F-4 contract: through the chain, MTF K and
+    Confluence must end on the SAME trading day as the
+    Phase 6D-1 daily K artifact. Phase 6D-1 owns its own
+    persist_skip_bars=1 trim (T-1 of the input cache); the
+    MTF bridge must not apply ANOTHER trim on top. Before
+    the fix this test would fail with MTF / Confluence one
+    day behind daily K, and the readiness verdict would
+    carry ``stale_confluence_day_artifact``.
+
+    Pipeline-style fixture: a target cache ending on
+    ``2026-05-11`` (Mon) + StackBuilder + multi-timeframe
+    libs. ``current_as_of_date=2026-05-08``. Phase 6D-1
+    trims the cache to daily K last_date=2026-05-08. After
+    the fix the rest of the chain holds that date.
+    """
+    dirs = _layout(tmp_path)
+    _write_full_phase_6d1_inputs(
+        dirs, "SPY", last_date="2026-05-11",
+    )
+    for interval in ("1wk", "1mo"):
+        (dirs["signal_library_dir"]
+         / f"SPY_stable_v1_0_0_{interval}.pkl").write_bytes(b"x")
+
+    res = runner.run_confluence_pipeline_for_ticker(
+        "SPY", write=True,
+        current_as_of_date="2026-05-08",
+        **dirs,
+    )
+    assert res.write is True
+    s1 = res.stage(runner.STAGE_ID_6D1)
+    s2 = res.stage(runner.STAGE_ID_6D2)
+    s3 = res.stage(runner.STAGE_ID_6D3)
+    assert s1 and len(s1.artifact_paths) == 12
+    assert s2 and len(s2.artifact_paths) == 12
+    assert s3 and len(s3.artifact_paths) == 1
+
+    def _last_date(path: Path) -> str:
+        art = ra.read_research_day_artifact(Path(path))
+        assert art is not None
+        assert art.daily
+        return str(art.daily[-1].get("date"))
+
+    # Step 1: read what Phase 6D-1 actually produced. That
+    # is the canonical date the rest of the chain must
+    # preserve. Phase 6D-1's own T-1 trim is owned by that
+    # stage and out of scope for this test.
+    daily_last_dates = {
+        _last_date(p) for p in s1.artifact_paths
+    }
+    assert len(daily_last_dates) == 1, (
+        "expected all daily K artifacts to end on the same "
+        f"date; got {sorted(daily_last_dates)}"
+    )
+    expected_last = daily_last_dates.pop()
+    # And that date must be >= the cutoff so the readiness
+    # gate can pass after the fix.
+    assert expected_last >= "2026-05-08", (
+        "daily K last_date drifted past the readiness "
+        f"cutoff; got {expected_last!r}"
+    )
+
+    # Step 2: MTF K and Confluence must inherit the daily K
+    # last_date (Phase 6F-4 contract).
+    for p in s2.artifact_paths:
+        assert _last_date(p) == expected_last, (
+            f"MTF K {Path(p).name} ended on "
+            f"{_last_date(p)!r}; expected {expected_last!r} "
+            "(daily K last_date). Phase 6F-4 default must "
+            "not double-trim."
+        )
+    for p in s3.artifact_paths:
+        assert _last_date(p) == expected_last, (
+            f"Confluence {Path(p).name} ended on "
+            f"{_last_date(p)!r}; expected {expected_last!r}"
+        )
+
+    # Step 3: readiness no longer carries the stale-
+    # Confluence blocker.
+    assert res.readiness is not None
+    assert (
+        cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT
+        not in res.readiness.issue_codes
+    ), (
+        "stale_confluence_day_artifact must clear after the "
+        "Phase 6F-4 fix; readiness reported: "
+        f"{sorted(res.readiness.issue_codes)}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 4. Stage issue codes roll up
 # ---------------------------------------------------------------------------

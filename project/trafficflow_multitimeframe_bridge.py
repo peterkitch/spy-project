@@ -82,6 +82,11 @@ Public surface
     DEFAULT_EXPECTED_K                          # tuple[int, ...]
     MTF_SUFFIX                                  # "__MTF"
     DEFAULT_PERSIST_SKIP_BARS                   # int = 1
+                                                # (kept for tests / explicit
+                                                # opt-in; the per-artifact
+                                                # builder no longer applies
+                                                # this skip by default - see
+                                                # Phase 6F-4 note below)
 
     PRESSURE_SIGNAL_BUY / SHORT / NONE / MISSING
 
@@ -92,12 +97,38 @@ Public surface
     project_signal_to_timeframes(daily_dates, daily_signals,
                                  timeframes) -> dict[str, list[str]]
     combine_timeframe_signals(per_tf_signals) -> str
+    list_daily_k_trafficflow_artifacts(artifact_root, ticker)
+        -> list[(Path, K_from_filename)]
     build_multitimeframe_bridge_for_artifact(artifact, *,
         timeframes=DEFAULT_TIMEFRAMES,
-        persist_skip_bars=DEFAULT_PERSIST_SKIP_BARS) -> ResearchDayArtifact
+        persist_skip_bars=None  # 0-skip by default; pass an int to opt in
+        ) -> ResearchDayArtifact
     build_multitimeframe_bridge_artifacts_for_target(target_ticker, *,
         artifact_root=None, expected_k=DEFAULT_EXPECTED_K,
-        timeframes=DEFAULT_TIMEFRAMES, write=False) -> BuildResult
+        timeframes=DEFAULT_TIMEFRAMES, write=False,
+        persist_skip_bars=None) -> BuildResult
+
+Phase 6F-4 persist-trim contract
+--------------------------------
+
+Phase 6D-1 (``trafficflow_k_artifact_builder``) owns the
+final persist_skip_bars trim for its daily-K artifacts.
+Phase 6D-2 (this module) used to apply ANOTHER default
+``persist_skip_bars=1`` on top, which dropped the input
+artifact's last date (e.g. ``2026-05-08 -> 2026-05-07``)
+and propagated that loss into Phase 6D-3 (Confluence).
+That made a freshly-refreshed SPY pipeline produce
+``stale_confluence_day_artifact`` for the very last
+trading day.
+
+Phase 6F-4 changes the default: when
+``persist_skip_bars`` is ``None``, the per-artifact
+builder applies **zero extra trim** and preserves the
+input's last date verbatim. Callers that want the legacy
+behavior pass ``persist_skip_bars=1`` (or another integer)
+explicitly. ``research_artifacts.DEFAULT_PERSIST_SKIP_BARS``
+is unchanged - it still controls the Phase 6D-1 / 6D-3 own
+persist behavior.
 """
 
 from __future__ import annotations
@@ -441,8 +472,15 @@ def build_multitimeframe_bridge_for_artifact(
     )
     df["is_trigger_day"] = sig_norm.isin({"buy", "short"})
 
+    # Phase 6F-4: Phase 6D-1 already applied its own
+    # persist_skip_bars trim before persisting the daily-K
+    # artifact. Applying another default skip here drops the
+    # last date and propagates the loss into the Confluence
+    # output. The per-artifact builder therefore defaults to
+    # 0 (no extra trim); explicit integer overrides remain
+    # honored for tests / callers that want a second skip.
     skip = (
-        DEFAULT_PERSIST_SKIP_BARS if persist_skip_bars is None
+        0 if persist_skip_bars is None
         else int(persist_skip_bars)
     )
     if skip and skip > 0 and len(df) > skip:
@@ -565,6 +603,22 @@ def _engine_artifact_dir(
         if p.exists() and p.is_dir():
             return p
     return None
+
+
+def list_daily_k_trafficflow_artifacts(
+    artifact_root: Path, ticker: str,
+) -> list[tuple[Path, int]]:
+    """Public wrapper for ``_list_daily_k_artifacts`` so
+    audit / readiness probes don't reach into this module's
+    private namespace.
+
+    Returns the Phase 6D-1 daily-K ``(path, K_from_filename)``
+    pairs the bridge accepts as valid inputs for ``ticker``:
+    only files matching ``<seed_run_id>__K<digits>.research_day.json``.
+    Legacy unsuffixed artifacts and ``__MTF`` outputs are
+    excluded.
+    """
+    return _list_daily_k_artifacts(artifact_root, ticker)
 
 
 def _list_daily_k_artifacts(
