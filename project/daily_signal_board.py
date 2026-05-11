@@ -1323,9 +1323,18 @@ def render_scoreboard(
             BOARD_COPY["col_coverage"], scope="col",
             style=_th_style(),
         ),
+        # Phase 6F-7: the AS OF column carries ISO dates
+        # (``2026-05-08``). On narrow viewports the column was
+        # being squeezed by the table-fit-to-width pass and the
+        # cell content wrapped to fragments like ``202`` / ``05-``.
+        # ``whiteSpace=nowrap`` keeps the date glyphs glued
+        # together; the parent scroll wrapper (see
+        # ``scoreboard-table-wrapper`` below) absorbs the
+        # resulting overflow so the page itself never grows
+        # horizontal scroll.
         html.Th(
             BOARD_COPY["col_as_of"], scope="col",
-            style=_th_style(),
+            style=_th_style(nowrap=True),
         ),
     ]
 
@@ -1369,23 +1378,39 @@ def render_scoreboard(
                 )),
                 html.Td(
                     r.as_of or BOARD_COPY["as_of_unavailable"],
-                    style=_td_style(),
+                    style=_td_style(nowrap=True),
                 ),
             ],
         ))
 
-    return html.Table(
-        id="scoreboard-table",
+    # Phase 6F-7: the table itself is unchanged
+    # (``width: 100%``), but we wrap it in a horizontally
+    # scrollable container so any overflow on narrow
+    # viewports (e.g. 390x844 mobile) is contained INSIDE
+    # the wrapper rather than producing page-level
+    # horizontal scroll. ``data-mobile-overflow="contained"``
+    # is the stable contract test_daily_signal_board pins.
+    return html.Div(
+        id="scoreboard-table-wrapper",
+        **{"data-mobile-overflow": "contained"},
         style={
+            "overflowX": "auto",
+            "WebkitOverflowScrolling": "touch",
             "width": "100%",
-            "borderCollapse": "collapse",
-            "backgroundColor": DESIGN_TOKENS["color_black"],
-            "color": DESIGN_TOKENS["color_text"],
         },
-        children=[
-            html.Thead(html.Tr(header_cells)),
-            html.Tbody(body_rows),
-        ],
+        children=html.Table(
+            id="scoreboard-table",
+            style={
+                "width": "100%",
+                "borderCollapse": "collapse",
+                "backgroundColor": DESIGN_TOKENS["color_black"],
+                "color": DESIGN_TOKENS["color_text"],
+            },
+            children=[
+                html.Thead(html.Tr(header_cells)),
+                html.Tbody(body_rows),
+            ],
+        ),
     )
 
 
@@ -1411,8 +1436,8 @@ def _coverage_color(coverage: str) -> str:
     return DESIGN_TOKENS["color_text"]
 
 
-def _th_style() -> dict:
-    return {
+def _th_style(*, nowrap: bool = False) -> dict:
+    style: dict[str, Any] = {
         "textAlign": "left",
         "padding": "8px 10px",
         "borderBottom": (
@@ -1424,10 +1449,19 @@ def _th_style() -> dict:
         "textTransform": "uppercase",
         "letterSpacing": "0.05em",
     }
+    if nowrap:
+        # Phase 6F-7: prevent multi-word headers (e.g. "AS OF")
+        # from wrapping on narrow viewports. The horizontal
+        # scroll wrapper (``scoreboard-table-wrapper``) absorbs
+        # any overflow this causes.
+        style["whiteSpace"] = "nowrap"
+    return style
 
 
 def _td_style(
-    *, color: Optional[str] = None, weight: Optional[str] = None,
+    *, color: Optional[str] = None,
+    weight: Optional[str] = None,
+    nowrap: bool = False,
 ) -> dict:
     style: dict[str, Any] = {
         "padding": "8px 10px",
@@ -1439,6 +1473,11 @@ def _td_style(
     }
     if weight:
         style["fontWeight"] = weight
+    if nowrap:
+        # Phase 6F-7: prevent ISO dates ("2026-05-08") from
+        # wrapping to broken fragments like ``202`` / ``05-``
+        # on narrow viewports.
+        style["whiteSpace"] = "nowrap"
     return style
 
 
