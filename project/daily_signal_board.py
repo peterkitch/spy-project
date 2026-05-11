@@ -65,6 +65,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+import confluence_pipeline_readiness as _cpr
 import primary_signal_engine as _pse
 import research_artifacts as _ra
 import research_catalogue_health as _rch
@@ -267,6 +268,28 @@ BOARD_COPY: dict[str, Any] = {
         "Not a guarantee of future performance.",
         "Saved research only.",
     ),
+    # Phase 6C-8 leader-eligibility banner. Shown above the
+    # scoreboard table when zero rows pass the leader gate.
+    "no_current_leaders": (
+        "No current leaderboard-qualified tickers are available "
+        "from saved research."
+    ),
+    # Human-readable mappings for ``ranking_blocked_reason`` codes.
+    # Visible in tooltips / audit tools; the data attribute itself
+    # stays as the stable issue code.
+    "ranking_block_health_report_blocked": (
+        "Catalogue health report flags this ticker as blocked."
+    ),
+    "ranking_block_missing_confluence": (
+        "No saved Confluence verdict for this ticker yet."
+    ),
+    "ranking_block_stale_confluence": (
+        "Confluence verdict is older than the current "
+        "leaderboard cutoff."
+    ),
+    "ranking_block_confluence_agreement_unavailable": (
+        "Saved Confluence verdict is missing agreement fields."
+    ),
     # Chart copy (Plotly trace names + axis titles). Centralized so
     # the copy-centralization test catches them along with section
     # copy. Trace name for the close-price line is a format string
@@ -293,6 +316,19 @@ class BoardRow:
     both stay ``None`` if no confluence artifact exists.
     ``coverage`` is one of the COVERAGE_* labels. ``rank`` is set to
     1 / 2 / 3 for the top three rows after ranking; otherwise ``None``.
+
+    Phase 6C-8 audit-gate fields:
+
+      * ``leader_eligible`` (bool) - the strict gate
+        ``confluence_pipeline_readiness.inspect_ticker_pipeline``
+        computes. Only ``True`` rows are eligible for a top-3 rank
+        badge. Defaults to ``False`` so callers building rows by
+        hand never accidentally promote an un-checked ticker.
+      * ``ranking_blocked_reason`` (str) - the single most
+        important issue code blocking eligibility, surfaced as
+        a ``data-ranking-blocked-reason`` attribute on the
+        rendered ``<tr>``. Empty string when the row is
+        eligible.
     """
 
     ticker: str
@@ -303,6 +339,8 @@ class BoardRow:
     coverage: str
     as_of: Optional[str]
     rank: Optional[int] = None
+    leader_eligible: bool = False
+    ranking_blocked_reason: str = ""
 
 
 @dataclass
@@ -825,6 +863,15 @@ def discover_board_catalogue(
         else _read_health_report(artifact_d)
     )
     blocked = _health_blocked_targets(report)
+    # Pre-compute the set of tickers with any confluence artifact
+    # on disk. The leader gate REQUIRES a confluence artifact, so
+    # any ticker outside this set is provably ineligible and the
+    # board can synthesize the verdict without calling the full
+    # readiness layer. With ~1,600 cached tickers and ~2 confluence
+    # artifacts on disk today, this is the dominant perf win.
+    confluence_tickers = _cpr.list_tickers_with_confluence_artifacts(
+        artifact_d,
+    )
 
     tickers_seen: set[str] = set()
     for entry in sorted(cache_d.iterdir()):
@@ -874,6 +921,31 @@ def discover_board_catalogue(
 
         as_of = _row_as_of_date(artifact_index, norm)
 
+        if norm in confluence_tickers or norm in blocked:
+            # The expensive readiness path is reserved for the
+            # tickers that could plausibly be leader-eligible
+            # (have a confluence artifact) and for tickers that
+            # are explicitly health-blocked (so the data attribute
+            # surfaces the right blocked_reason). Everything else
+            # short-circuits to "missing_confluence_day_artifact".
+            readiness = _cpr.inspect_ticker_pipeline(
+                ticker,
+                cache_dir=cache_d,
+                artifact_root=artifact_d,
+                signal_library_dir=sig_d,
+                health_report=report,
+                now=now,
+            )
+            leader_eligible = bool(readiness.leader_eligible)
+            ranking_blocked_reason = _primary_ranking_block_code(
+                readiness,
+            )
+        else:
+            leader_eligible = False
+            ranking_blocked_reason = (
+                _cpr.ISSUE_MISSING_CONFLUENCE_DAY_ARTIFACT
+            )
+
         rows.append(BoardRow(
             ticker=ticker,
             signal=signal,
@@ -882,6 +954,8 @@ def discover_board_catalogue(
             agreement_total=agreement_total,
             coverage=coverage,
             as_of=as_of,
+            leader_eligible=leader_eligible,
+            ranking_blocked_reason=ranking_blocked_reason,
         ))
 
     if use_cache:
@@ -889,6 +963,36 @@ def discover_board_catalogue(
             "rows": rows, "artifact_index": artifact_index,
         }
     return rows
+
+
+# Priority order for collapsing readiness.issue_codes into a single
+# ``data-ranking-blocked-reason`` string. The first matching code
+# wins. Codes not listed here never surface on the data attribute,
+# even when they appear in the readiness verdict.
+_RANKING_BLOCK_PRIORITY: tuple[str, ...] = (
+    _cpr.ISSUE_HEALTH_REPORT_BLOCKED,
+    _cpr.ISSUE_MISSING_CONFLUENCE_DAY_ARTIFACT,
+    _cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT,
+    _cpr.ISSUE_CONFLUENCE_AGREEMENT_UNAVAILABLE,
+)
+
+
+def _primary_ranking_block_code(
+    readiness: _cpr.TickerPipelineReadiness,
+) -> str:
+    """Return the single highest-priority issue code blocking
+    leader eligibility for this row, or ``""`` when the row is
+    eligible. Used to populate ``data-ranking-blocked-reason``."""
+    if readiness.leader_eligible:
+        return ""
+    codes = set(readiness.issue_codes)
+    for code in _RANKING_BLOCK_PRIORITY:
+        if code in codes:
+            return code
+    # No priority code matched but eligibility was still denied -
+    # fall back to the first issue code we did see so the data
+    # attribute is never silently empty when the row is blocked.
+    return readiness.issue_codes[0] if readiness.issue_codes else ""
 
 
 def _cached_artifact_index(
@@ -948,28 +1052,38 @@ def rank_board_rows(rows: Sequence[BoardRow]) -> list[BoardRow]:
     """Sort the scoreboard and assign top-3 rank badges.
 
     Sort order (documented):
-      * Descending by confluence agreement count.
-      * Rows without an agreement count (``agreement_active is None``)
-        sort to the bottom.
-      * Alphabetical by ticker for tie-breaks at every level.
+      * Leader-eligible rows first (see Phase 6C-8 readiness gate).
+      * Within leader-eligible rows, descending by confluence
+        agreement count, alphabetical ticker for ties.
+      * Within non-eligible rows, the same ordering with agreement-
+        less rows sinking last.
 
-    Rank badges (audit-driven contract):
+    Rank badges (Phase 6C-8 gate):
+
       * ``rank=1|2|3`` is assigned ONLY to rows whose
-        ``agreement_active`` is not ``None``. Cache-only / agreement-
-        less rows NEVER receive a top-3 badge, even when they
-        happen to occupy the third visible row.
+        ``leader_eligible`` is True AND ``agreement_active`` is not
+        ``None``. A leader-eligible row without a usable agreement
+        count is malformed and is therefore not awarded a rank.
+      * Stale / partial / under-review / cache-only / pipeline-
+        incomplete rows NEVER receive a top-3 badge, even when
+        their agreement count is the highest on the board.
       * If fewer than three rankable rows exist, fewer than three
         rows receive ``rank``. Empty board -> nobody gets a badge.
 
-    This keeps the "high score" semantics honest on the public board:
-    a row with no confluence evidence cannot win a podium spot.
+    This keeps the public "current leaders" semantics honest: only
+    tickers whose Confluence verdict is fresh, present, and
+    health-clean can sit on the podium.
     """
-    def key(r: BoardRow) -> tuple[int, str]:
+    def key(r: BoardRow) -> tuple[int, int, str]:
+        # 0 for eligible rows, 1 for ineligible. Lower wins under
+        # ascending sort, which gives eligible rows the front of
+        # the scoreboard.
+        eligibility_bucket = 0 if r.leader_eligible else 1
         agreement = (
             -int(r.agreement_active) if r.agreement_active is not None
             else 1  # rows without agreement sort last
         )
-        return (agreement, r.ticker)
+        return (eligibility_bucket, agreement, r.ticker)
 
     ordered = sorted(rows, key=key)
     for r in ordered:
@@ -978,12 +1092,13 @@ def rank_board_rows(rows: Sequence[BoardRow]) -> list[BoardRow]:
     for row in ordered:
         if next_rank > 3:
             break
+        if not row.leader_eligible:
+            # Sort order pushes ineligible rows to the back; once
+            # we hit one, no later row can be eligible.
+            break
         if row.agreement_active is None:
-            # Honest podium: an unrankable row blocks neither itself
-            # nor any later row from being awarded a badge. The
-            # sort order already keeps agreement-bearing rows in
-            # front of agreement-less ones, so iterating in order
-            # is sufficient.
+            # Defensive: an eligible row should always carry an
+            # agreement count. Skip the badge if not.
             continue
         row.rank = next_rank
         next_rank += 1
@@ -1181,6 +1296,12 @@ def render_scoreboard(
                 "data-signal-value": str(r.signal_value),
                 "data-coverage": r.coverage,
                 "data-rank": str(r.rank) if r.rank is not None else "",
+                "data-leader-eligible": (
+                    "true" if r.leader_eligible else "false"
+                ),
+                "data-ranking-blocked-reason": (
+                    r.ranking_blocked_reason or ""
+                ),
             },
             style=_tr_style(is_selected),
             children=[
@@ -1954,11 +2075,40 @@ def build_app(
 
     app = dash.Dash(__name__, title=BOARD_COPY["page_title"])
 
+    eligible_count = sum(1 for r in rows if r.leader_eligible)
+    no_leaders_banner: Any
+    if rows and eligible_count == 0:
+        no_leaders_banner = html.Div(
+            BOARD_COPY["no_current_leaders"],
+            id="scoreboard-no-current-leaders",
+            **{"data-leader-count": "0"},
+            style={
+                "padding": "8px 12px",
+                "marginBottom": "10px",
+                "border": (
+                    "1px dashed "
+                    + DESIGN_TOKENS["color_under_review"]
+                ),
+                "borderRadius": "4px",
+                "color": DESIGN_TOKENS["color_text"],
+                "fontSize": "12px",
+            },
+        )
+    else:
+        no_leaders_banner = html.Div(
+            id="scoreboard-no-current-leaders",
+            **{"data-leader-count": str(eligible_count)},
+            style={"display": "none"},
+        )
+
     section_scoreboard = html.Section(
         id="section-scoreboard",
         **{
+            # Phase 6C-8: the public board's ranking method is now
+            # gated on Confluence-current leaders only.
             "data-ranking-method": (
-                "confluence_agreement_desc_then_ticker_asc"
+                "current_confluence_leaders_only_then_"
+                "agreement_desc_then_ticker_asc"
             ),
         },
         children=[
@@ -1966,6 +2116,7 @@ def build_app(
                 BOARD_COPY["section_scoreboard_title"],
                 style=_section_heading_style(),
             ),
+            no_leaders_banner,
             html.Div(
                 id="scoreboard-container",
                 children=render_scoreboard(rows, selected_ticker=selected),

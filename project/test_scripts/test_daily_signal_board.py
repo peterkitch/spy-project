@@ -321,26 +321,37 @@ def test_coverage_status_full_partial_stale_under_review():
 
 
 def test_ranking_sorts_by_confluence_then_alphabetical():
+    """Phase 6C-8: ranking still sorts by agreement DESC then
+    ticker, but the rank BADGE is now gated on
+    ``leader_eligible=True`` per the audit. The four rows in
+    this fixture are marked leader_eligible to isolate the
+    sort-order assertion from the eligibility gate (which is
+    covered separately by
+    ``test_only_leader_eligible_rows_receive_rank_badges``)."""
     rows = [
         board.BoardRow(
             ticker="BBB", signal="Buy", signal_value=1,
             agreement_active=3, agreement_total=5,
             coverage=board.COVERAGE_PARTIAL, as_of="2026-05-09",
+            leader_eligible=True,
         ),
         board.BoardRow(
             ticker="AAA", signal="None", signal_value=0,
             agreement_active=None, agreement_total=None,
             coverage=board.COVERAGE_PARTIAL, as_of="2026-05-09",
+            leader_eligible=True,
         ),
         board.BoardRow(
             ticker="CCC", signal="Short", signal_value=-1,
             agreement_active=3, agreement_total=5,
             coverage=board.COVERAGE_PARTIAL, as_of="2026-05-09",
+            leader_eligible=True,
         ),
         board.BoardRow(
             ticker="DDD", signal="Buy", signal_value=1,
             agreement_active=5, agreement_total=5,
             coverage=board.COVERAGE_FULL, as_of="2026-05-09",
+            leader_eligible=True,
         ),
     ]
     ranked = board.rank_board_rows(rows)
@@ -354,24 +365,22 @@ def test_ranking_sorts_by_confluence_then_alphabetical():
 
 
 def test_ranking_skips_cache_only_rows_for_top_3_badges():
-    """Phase 6C-7 audit fix: only rows with ``agreement_active is not
-    None`` are eligible for a rank=1|2|3 badge. Cache-only rows
-    (no confluence agreement) never get a podium slot, even when
-    they happen to occupy the third visible row in the sort order.
-    """
+    """Phase 6C-7 audit fix carried forward: only rows with
+    ``agreement_active is not None`` AND ``leader_eligible=True``
+    are eligible for a rank=1|2|3 badge."""
     rows = [
-        # Two rankable rows.
         board.BoardRow(
             ticker="SPY", signal="Buy", signal_value=1,
             agreement_active=5, agreement_total=5,
             coverage=board.COVERAGE_FULL, as_of="2026-05-09",
+            leader_eligible=True,
         ),
         board.BoardRow(
             ticker="GSPC_VARIANT", signal="None", signal_value=0,
             agreement_active=1, agreement_total=1,
             coverage=board.COVERAGE_PARTIAL, as_of="2026-05-09",
+            leader_eligible=True,
         ),
-        # Three cache-only rows. Should never receive a rank.
         board.BoardRow(
             ticker="AAA", signal="None", signal_value=0,
             agreement_active=None, agreement_total=None,
@@ -390,9 +399,6 @@ def test_ranking_skips_cache_only_rows_for_top_3_badges():
     ]
     ranked = board.rank_board_rows(rows)
     ranks = {r.ticker: r.rank for r in ranked}
-    # Only the two agreement-bearing rows get podium badges. The
-    # third+ slots stay un-badged because no third rankable row
-    # exists.
     assert ranks == {
         "SPY": 1,
         "GSPC_VARIANT": 2,
@@ -400,11 +406,76 @@ def test_ranking_skips_cache_only_rows_for_top_3_badges():
         "BBB": None,
         "000157.KS": None,
     }, f"unexpected rank assignment: {ranks}"
-    # Total badge count under 3 when fewer than 3 rankable rows exist.
     assigned = [r for r in ranked if r.rank is not None]
-    assert len(assigned) == 2, (
-        f"expected 2 rank badges; got {len(assigned)}"
-    )
+    assert len(assigned) == 2
+
+
+def test_only_leader_eligible_rows_receive_rank_badges():
+    """Phase 6C-8 contract: a row may have a strong confluence
+    agreement count but still be ineligible (stale, partial,
+    under review, pipeline-incomplete). It MUST NOT receive a
+    podium badge in that case. This test fixes the audit finding
+    where SPY would otherwise rank #1 despite a stale Confluence
+    artifact."""
+    rows = [
+        # Ineligible row with the highest agreement (stale).
+        board.BoardRow(
+            ticker="SPY", signal="Buy", signal_value=1,
+            agreement_active=5, agreement_total=5,
+            coverage=board.COVERAGE_STALE, as_of="2026-01-21",
+            leader_eligible=False,
+            ranking_blocked_reason=(
+                "stale_confluence_day_artifact"
+            ),
+        ),
+        # Eligible row with a lower agreement.
+        board.BoardRow(
+            ticker="ACME", signal="Buy", signal_value=1,
+            agreement_active=2, agreement_total=5,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True,
+        ),
+        # Cache-only row.
+        board.BoardRow(
+            ticker="OTHER", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+            leader_eligible=False,
+            ranking_blocked_reason=(
+                "missing_confluence_day_artifact"
+            ),
+        ),
+    ]
+    ranked = board.rank_board_rows(rows)
+    ranks = {r.ticker: r.rank for r in ranked}
+    # Only ACME, the leader-eligible row, gets a badge - even
+    # though SPY has a higher raw agreement.
+    assert ranks == {"SPY": None, "ACME": 1, "OTHER": None}, ranks
+    # Sort order: ACME first (eligible), SPY second (ineligible
+    # with agreement), OTHER last (no agreement).
+    assert [r.ticker for r in ranked] == ["ACME", "SPY", "OTHER"]
+
+
+def test_no_podium_when_all_rows_are_stale_or_partial():
+    """A board with zero eligible rows must not award any rank
+    badges, even though every row may have a sortable agreement
+    count."""
+    rows = [
+        board.BoardRow(
+            ticker=t, signal="None", signal_value=0,
+            agreement_active=3, agreement_total=5,
+            coverage=board.COVERAGE_STALE, as_of="2026-01-01",
+            leader_eligible=False,
+            ranking_blocked_reason=(
+                "stale_confluence_day_artifact"
+            ),
+        )
+        for t in ("AAA", "BBB", "CCC", "DDD")
+    ]
+    ranked = board.rank_board_rows(rows)
+    assert all(r.rank is None for r in ranked), [
+        (r.ticker, r.rank) for r in ranked
+    ]
 
 
 def test_scoreboard_renders_empty_data_rank_for_cache_only_rows():
@@ -417,6 +488,7 @@ def test_scoreboard_renders_empty_data_rank_for_cache_only_rows():
             ticker="SPY", signal="Buy", signal_value=1,
             agreement_active=5, agreement_total=5,
             coverage=board.COVERAGE_FULL, as_of="2026-05-09",
+            leader_eligible=True,
             rank=1,
         ),
         board.BoardRow(
@@ -433,6 +505,136 @@ def test_scoreboard_renders_empty_data_rank_for_cache_only_rows():
     assert by_ticker["AAA"].get("data-rank") == "", (
         "cache-only row must render data-rank=\"\"; got "
         + repr(by_ticker["AAA"].get("data-rank"))
+    )
+    # New Phase 6C-8 data attrs.
+    assert (
+        by_ticker["SPY"].get("data-leader-eligible") == "true"
+    )
+    assert (
+        by_ticker["AAA"].get("data-leader-eligible") == "false"
+    )
+    # The blocked-reason attribute is present on both rows
+    # (empty string on the eligible one, populated on the
+    # ineligible one when the BoardRow carries a reason).
+    assert "data-ranking-blocked-reason" in by_ticker["SPY"]
+    assert "data-ranking-blocked-reason" in by_ticker["AAA"]
+
+
+def test_scoreboard_data_ranking_method_reflects_current_leader_gate(
+    tmp_path: Path,
+):
+    """``section-scoreboard``'s ``data-ranking-method`` attribute
+    advertises the Phase 6C-8 gate so audit tooling can detect
+    that the public board ranks only Confluence-current leaders."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+    method = _find_data_ranking_method(app.layout)
+    assert (
+        method
+        == "current_confluence_leaders_only_then_"
+           "agreement_desc_then_ticker_asc"
+    ), f"unexpected data-ranking-method: {method!r}"
+
+
+def test_board_renders_no_current_leaders_banner_when_zero_eligible(
+    tmp_path: Path,
+):
+    """When the cache holds saved research but zero tickers pass
+    the leader gate, the board must render the BOARD_COPY
+    ``no_current_leaders`` banner so the public surface stays
+    honest."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    _write_min_spymaster_cache(cache_dir, "ACME")
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+    text = _component_text(app.layout)
+    assert board.BOARD_COPY["no_current_leaders"] in text
+
+
+def test_spy_like_fixture_with_stale_confluence_is_not_rankable(
+    tmp_path: Path,
+):
+    """End-to-end product gate: an SPY-like ticker with a full
+    5/5 confluence verdict but a stale Confluence artifact date
+    must NOT be rankable on the public board. Reproduces the
+    audit finding."""
+    pytest.importorskip("dash")
+    pytest.importorskip("pandas")
+    import pandas as pd
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    # Stale confluence artifact (last_date 4 months ago).
+    target_dir = artifact_root / "confluence" / "SPY"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="confluence",
+        target_ticker="SPY",
+        signal_source="",
+        run_id="stale",
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-01-21T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 50.0,
+            "sharpe_ratio": 0.1,
+            "trigger_days": 5,
+        },
+        daily=[{
+            "date": "2026-01-21",
+            "target_close": 100.0,
+            "target_return_pct": 0.0,
+            "confluence_tier": "strong_buy",
+            "confluence_signal": "Buy",
+            "timeframe_signals": {},
+            "alignment_pct": 1.0,
+            "buy_count": 5,
+            "short_count": 0,
+            "none_count": 0,
+            "active_count": 5,
+            "available_count": 5,
+            "daily_capture_pct": 0.0,
+            "cumulative_capture_pct": 50.0,
+            "is_trigger_day": True,
+        }],
+        timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
+    )
+    ra.write_research_day_artifact(
+        art, target_dir / "SPY.research_day.json",
+    )
+    rows = board.discover_board_catalogue(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+        use_cache=False,
+    )
+    spy = next(r for r in rows if r.ticker == "SPY")
+    # Agreement is still discoverable from the saved artifact ...
+    assert spy.agreement_active == 5
+    assert spy.agreement_total == 5
+    # ... but the leader gate refuses to rank SPY because
+    # Confluence is stale relative to the resolved current-as-of
+    # date.
+    assert spy.leader_eligible is False
+    assert (
+        spy.ranking_blocked_reason
+        == "stale_confluence_day_artifact"
+    )
+    ranked = board.rank_board_rows(rows)
+    spy_ranked = next(r for r in ranked if r.ticker == "SPY")
+    assert spy_ranked.rank is None, (
+        f"SPY received rank {spy_ranked.rank} despite stale "
+        f"confluence"
     )
 
 
@@ -1053,6 +1255,35 @@ def _component_text(component: Any) -> str:
 
     _walk(component)
     return "\n".join(pieces)
+
+
+def _find_data_ranking_method(component: Any) -> Optional[str]:
+    """Walk the layout and return the ``data-ranking-method``
+    attribute on the ``section-scoreboard`` section, or ``None``
+    if no scoreboard section is found."""
+
+    def _walk(node: Any) -> Optional[str]:
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                found = _walk(child)
+                if found is not None:
+                    return found
+            return None
+        if getattr(node, "id", None) == "section-scoreboard":
+            try:
+                props = node.to_plotly_json().get("props", {})
+            except Exception:
+                props = {}
+            method = props.get("data-ranking-method")
+            return str(method) if method is not None else None
+        children = getattr(node, "children", None)
+        if children is not None:
+            return _walk(children)
+        return None
+
+    return _walk(component)
 
 
 def _tbody_tr_props(table: Any) -> list[dict[str, Any]]:
