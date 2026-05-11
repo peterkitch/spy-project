@@ -370,9 +370,15 @@ def test_insufficient_trafficflow_k_coverage_blocks_eligibility(
 ):
     """The audit specifies that
     insufficient_trafficflow_k_coverage also blocks eligibility:
-    a single K-build is not the same pipeline as all 12. We use a
-    multi-timeframe TrafficFlow artifact to avoid raising the
-    bridge-missing code, isolating the K-coverage gate."""
+    a single K-build is not the same pipeline as all 12.
+
+    Phase 6D-2 audit-tighten: the bridge check is now also gated
+    on full K coverage. A single MTF K=1 artifact no longer
+    clears the bridge for the whole ticker, so both
+    insufficient_trafficflow_k_coverage AND
+    missing_multitimeframe_trafficflow_bridge fire on this
+    fixture. Either one blocks eligibility independently.
+    """
     dirs = _layout(tmp_path)
     _write_cache_filename(dirs["cache_dir"], "SPY")
     _write_artifact(
@@ -380,9 +386,7 @@ def test_insufficient_trafficflow_k_coverage_blocks_eligibility(
         last_date="2026-05-08",
         timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
     )
-    # ONE multi-timeframe TrafficFlow artifact, K=1 only. The
-    # bridge concept is satisfied (timeframes >= 2) but K coverage
-    # is not.
+    # ONE multi-timeframe TrafficFlow artifact, K=1 only.
     _write_artifact(
         dirs["artifact_root"], engine="trafficflow", ticker="SPY",
         last_date="2026-05-08", K=1,
@@ -396,13 +400,13 @@ def test_insufficient_trafficflow_k_coverage_blocks_eligibility(
         cpr.ISSUE_INSUFFICIENT_TRAFFICFLOW_K_COVERAGE
         in r.issue_codes
     )
-    assert r.leader_eligible is False
-    # Bridge issue should NOT be raised because at least one
-    # multi-timeframe TrafficFlow artifact exists.
+    # Phase 6D-2: a single-K MTF artifact no longer clears the
+    # bridge for the ticker.
     assert (
         cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
-        not in r.issue_codes
+        in r.issue_codes
     )
+    assert r.leader_eligible is False
 
 
 # ---------------------------------------------------------------------------

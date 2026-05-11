@@ -854,6 +854,41 @@ def _stage_catalogue_health(
 # ---------------------------------------------------------------------------
 
 
+def _has_full_multitimeframe_k_coverage(
+    trafficflow_summaries: Sequence[Mapping[str, Any]],
+    expected_k: Sequence[int],
+) -> bool:
+    """Return True when the saved TrafficFlow artifacts carry
+    multi-timeframe data (``timeframes`` length >= 2) for every K
+    in ``expected_k``.
+
+    A daily-only artifact (Phase 6D-1) has ``timeframes == []``
+    and therefore does NOT contribute. A multi-timeframe artifact
+    (Phase 6D-2) with ``K=4`` contributes only K=4 to the
+    coverage set; tickers need MTF artifacts spanning the full
+    K range for the bridge to clear.
+    """
+    if not expected_k:
+        return True
+    wanted = set(int(k) for k in expected_k)
+    seen: set[int] = set()
+    for s in trafficflow_summaries:
+        if not isinstance(s, Mapping):
+            continue
+        tfs = s.get("timeframes") or []
+        try:
+            tfs_len = len(list(tfs))
+        except Exception:
+            tfs_len = 0
+        if tfs_len < 2:
+            continue
+        K = s.get("K")
+        if not isinstance(K, int):
+            continue
+        seen.add(K)
+    return wanted.issubset(seen)
+
+
 def _confluence_agreement_usable(
     confluence_summary: Mapping[str, Any],
 ) -> bool:
@@ -986,11 +1021,14 @@ def inspect_ticker_pipeline(
             if code not in issues:
                 issues.append(code)
 
-    # Architectural gap: TrafficFlow artifacts today do not embed a
-    # multi-timeframe projection, and confluence_analyzer consumes
-    # ticker-native interval libraries instead of TrafficFlow
-    # outputs. Surface this as a stable issue code so audit tooling
-    # can detect when the bridge ships.
+    # Phase 6D-2 audit-tighten: the bridge is satisfied only when
+    # the saved TrafficFlow artifacts that carry multi-timeframe
+    # data span the full expected K range. A single MTF artifact
+    # for K=1 - or a sweep of single-timeframe daily-K artifacts -
+    # is not enough; the public pipeline needs MTF coverage for
+    # every K=1..12. Until that holds for the ticker, the
+    # missing_multitimeframe_trafficflow_bridge issue code stays
+    # on the readiness verdict and the leader gate fails.
     trafficflow_summaries = [
         s for s in (
             _read_artifact_summary(p)
@@ -999,12 +1037,9 @@ def inspect_ticker_pipeline(
             )
         ) if s is not None
     ]
-    has_tf_multitimeframe_artifact = any(
-        s.get("timeframes")
-        and len(list(s.get("timeframes") or [])) >= 2
-        for s in trafficflow_summaries
-    )
-    if not has_tf_multitimeframe_artifact:
+    if not _has_full_multitimeframe_k_coverage(
+        trafficflow_summaries, EXPECTED_TRAFFICFLOW_K_RANGE,
+    ):
         if ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE not in issues:
             issues.append(
                 ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE,
@@ -1108,11 +1143,26 @@ def _fast_path_no_confluence_readiness(
             if code not in issues:
                 issues.append(code)
 
-    # The architectural-bridge issue code applies universally.
-    if ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE not in issues:
-        issues.append(
-            ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE,
-        )
+    # Phase 6D-2 audit-tighten: the bridge is only satisfied when
+    # MTF coverage spans the full expected K range. Read the
+    # TrafficFlow artifacts once and gate on the same helper the
+    # full path uses; the fast-path can't promote a ticker
+    # anyway (no confluence), but the issue code stays honest.
+    trafficflow_summaries = [
+        s for s in (
+            _read_artifact_summary(p)
+            for p in _list_research_day_artifacts(
+                artifact_root, "trafficflow", ticker,
+            )
+        ) if s is not None
+    ]
+    if not _has_full_multitimeframe_k_coverage(
+        trafficflow_summaries, EXPECTED_TRAFFICFLOW_K_RANGE,
+    ):
+        if ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE not in issues:
+            issues.append(
+                ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE,
+            )
 
     return TickerPipelineReadiness(
         ticker=ticker,
