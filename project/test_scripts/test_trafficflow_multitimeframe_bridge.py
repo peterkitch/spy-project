@@ -289,6 +289,122 @@ def test_combine_buy_with_none_filler_returns_buy():
 
 
 # ---------------------------------------------------------------------------
+# Phase 6F-4 persist-trim default contract
+# ---------------------------------------------------------------------------
+
+
+def test_mtf_bridge_default_preserves_input_last_date(
+    tmp_path: Path,
+):
+    """Phase 6F-4 default: the per-artifact bridge applies
+    NO extra persist_skip_bars trim. The output's last
+    daily-row date matches the input's last daily-row date
+    exactly, so a freshly refreshed Phase 6D-1 K=1..12 chain
+    ends on the same trading day as the source cache."""
+    import pandas as pd
+
+    dates = pd.bdate_range(end="2026-05-08", periods=20)
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), 100.0 + i, "Buy")
+        for i, d in enumerate(dates)
+    ]
+    daily_path = _write_daily_k_artifact(
+        tmp_path,
+        target="SPY",
+        seed_run_id="seedTC__AAA-D_BBB-D",
+        K=1,
+        daily_rows=rows,
+        members=["AAA", "BBB"],
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    art_in = ra.read_research_day_artifact(daily_path)
+    art_out = mtfb.build_multitimeframe_bridge_for_artifact(art_in)
+    assert art_out.daily, "expected non-empty daily output"
+    # Same row count as the input — no extra trim.
+    assert len(art_out.daily) == len(rows)
+    assert art_out.daily[-1]["date"] == rows[-1]["date"], (
+        "Phase 6F-4 default must preserve the input's last "
+        f"date; got {art_out.daily[-1]['date']!r}, expected "
+        f"{rows[-1]['date']!r}"
+    )
+    # And the on-disk metadata field records the actual skip used.
+    assert art_out.persist_skip_bars == 0
+
+
+def test_mtf_bridge_explicit_persist_skip_bars_still_trims(
+    tmp_path: Path,
+):
+    """Explicit ``persist_skip_bars=1`` opt-in still drops
+    the last row, preserving the legacy override path for
+    tests / callers that want the second skip."""
+    import pandas as pd
+
+    dates = pd.bdate_range(end="2026-05-08", periods=20)
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), 100.0 + i, "Buy")
+        for i, d in enumerate(dates)
+    ]
+    daily_path = _write_daily_k_artifact(
+        tmp_path,
+        target="SPY",
+        seed_run_id="seedTC__AAA-D_BBB-D",
+        K=1,
+        daily_rows=rows,
+        members=["AAA", "BBB"],
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    art_in = ra.read_research_day_artifact(daily_path)
+    art_out = mtfb.build_multitimeframe_bridge_for_artifact(
+        art_in, persist_skip_bars=1,
+    )
+    assert art_out.daily, "expected non-empty daily output"
+    # One row shorter than the input — explicit trim applied.
+    assert len(art_out.daily) == len(rows) - 1
+    assert art_out.daily[-1]["date"] == rows[-2]["date"]
+    assert art_out.persist_skip_bars == 1
+
+
+def test_mtf_bridge_target_sweep_default_preserves_last_date(
+    tmp_path: Path,
+):
+    """The per-target sweep inherits the per-artifact
+    default. A daily K=1..3 chain ending on a known date
+    produces MTF outputs that also end on that date when no
+    explicit ``persist_skip_bars`` is supplied."""
+    import pandas as pd
+
+    dirs = _layout(tmp_path)
+    dates = pd.bdate_range(end="2026-05-08", periods=20)
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), 100.0 + i, "Buy")
+        for i, d in enumerate(dates)
+    ]
+    for k in (1, 2, 3):
+        _write_daily_k_artifact(
+            dirs["artifact_root"], target="SPY",
+            seed_run_id="seedTC__AAA-D_BBB-D",
+            K=k, daily_rows=rows,
+        )
+    res = mtfb.build_multitimeframe_bridge_artifacts_for_target(
+        "SPY",
+        artifact_root=dirs["artifact_root"],
+        expected_k=(1, 2, 3),
+        write=True,
+    )
+    assert set(res.built_k) == {1, 2, 3}
+    last_date_expected = rows[-1]["date"]
+    for p in res.artifact_paths:
+        art = ra.read_research_day_artifact(p)
+        assert art is not None
+        assert art.daily, f"empty MTF daily for {p.name}"
+        assert art.daily[-1]["date"] == last_date_expected, (
+            f"MTF K={art.K} last date drifted: "
+            f"got {art.daily[-1]['date']!r}, expected "
+            f"{last_date_expected!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Per-artifact build
 # ---------------------------------------------------------------------------
 

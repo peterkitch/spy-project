@@ -64,6 +64,7 @@ import confluence_pipeline_readiness as _cpr
 import confluence_pipeline_runner as _cprun
 import primary_signal_engine as _pse
 import trafficflow_k_artifact_builder as _tkb
+import trafficflow_multitimeframe_bridge as _tfmb
 
 
 # ---------------------------------------------------------------------------
@@ -394,8 +395,21 @@ def _has_stackbuilder_run(
 def _has_daily_k_trafficflow_artifacts(
     ticker: str, artifact_root: Path,
 ) -> bool:
+    """Phase 6F-4 fix: the Phase 6D-1 daily-K listing helper
+    lives in ``trafficflow_multitimeframe_bridge``, not
+    ``trafficflow_k_artifact_builder``. The previous version
+    of this probe tried ``_tkb._list_daily_k_artifacts``,
+    which always raised ``AttributeError`` and silently fell
+    through to ``return False`` - so the audit reported
+    ``has_daily_k_trafficflow_artifacts=False`` even when
+    proper Phase 6D-1 ``*__K<K>.research_day.json`` files
+    were on disk. The probe now calls the bridge module's
+    public ``list_daily_k_trafficflow_artifacts`` wrapper,
+    which uses the strict Phase 6D-1 filename regex so
+    legacy unsuffixed artifacts and ``__MTF`` outputs are
+    correctly excluded."""
     try:
-        paths = _tkb._list_daily_k_artifacts(  # type: ignore[attr-defined]
+        paths = _tfmb.list_daily_k_trafficflow_artifacts(
             artifact_root, ticker,
         )
     except Exception:

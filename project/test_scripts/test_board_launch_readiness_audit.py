@@ -712,3 +712,172 @@ def test_likely_after_run_keeps_stale_when_source_is_stale(
         "the audit must predict stale_confluence after a "
         "would-be runner pass when the source is stale"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6F-4: daily-K trafficflow probe fix
+# ---------------------------------------------------------------------------
+
+
+def _write_daily_k_trafficflow_artifact(
+    artifact_root: Path, target: str, K: int, *,
+    seed_run_id: str = "seedTC__AAA-D_BBB-D",
+    last_date: str = "2026-05-08",
+) -> Path:
+    """Write a Phase 6D-1-shaped daily K trafficflow artifact at
+    ``trafficflow/<TARGET>/<seed>__K<K>.research_day.json`` so
+    the audit's daily-K probe can detect it."""
+    safe = target.replace("^", "_")
+    tf_dir = artifact_root / "trafficflow" / safe
+    tf_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="trafficflow",
+        target_ticker=target,
+        signal_source="",
+        run_id=f"{seed_run_id}__K{K}",
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 5.0,
+            "sharpe_ratio": 0.05,
+            "trigger_days": 3,
+        },
+        daily=[{
+            "date": last_date,
+            "target_close": 100.0,
+            "target_return_pct": 0.0,
+            "pressure_signal": "Buy",
+            "buy_count": 1,
+            "short_count": 0,
+            "none_count": 0,
+            "missing_count": 0,
+            "active_count": 1,
+            "available_count": 1,
+            "daily_capture_pct": 0.0,
+            "cumulative_capture_pct": 0.0,
+            "is_trigger_day": True,
+        }],
+        K=K,
+        members=["AAA", "BBB"],
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        timeframes=["1d"],
+    )
+    return ra.write_research_day_artifact(
+        art, tf_dir / f"{seed_run_id}__K{K}.research_day.json",
+    )
+
+
+def _write_legacy_unsuffixed_trafficflow_artifact(
+    artifact_root: Path, target: str, *,
+    run_id: str = "legacy_seed",
+    last_date: str = "2026-05-08",
+) -> Path:
+    """Write a pre-Phase-6D-1 TrafficFlow artifact whose
+    filename does NOT carry the ``__K<K>`` suffix. The
+    audit's daily-K probe must not count these."""
+    safe = target.replace("^", "_")
+    tf_dir = artifact_root / "trafficflow" / safe
+    tf_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="trafficflow",
+        target_ticker=target,
+        signal_source="",
+        run_id=run_id,
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 5.0,
+            "sharpe_ratio": 0.05,
+            "trigger_days": 3,
+        },
+        daily=[{
+            "date": last_date,
+            "target_close": 100.0,
+            "target_return_pct": 0.0,
+            "pressure_signal": "Buy",
+        }],
+        K=1,
+        members=["AAA", "BBB"],
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    return ra.write_research_day_artifact(
+        art, tf_dir / f"{run_id}.research_day.json",
+    )
+
+
+def test_audit_has_daily_k_returns_true_for_proper_phase_6d1_files(
+    tmp_path: Path,
+):
+    """The Phase 6F-4 fix points the audit probe at the
+    correct module's helper. A directory containing proper
+    ``*__K<K>.research_day.json`` files must now show up as
+    ``has_daily_k_trafficflow_artifacts=True``."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    for k in (1, 2, 3):
+        _write_daily_k_trafficflow_artifact(
+            dirs["artifact_root"], "SPY", k,
+        )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.has_daily_k_trafficflow_artifacts is True
+
+
+def test_audit_has_daily_k_returns_false_for_legacy_only_artifacts(
+    tmp_path: Path,
+):
+    """A trafficflow directory with only legacy unsuffixed
+    artifacts (no ``__K<K>`` suffix) must show up as
+    ``has_daily_k_trafficflow_artifacts=False`` — those are
+    not valid Phase 6D-1 inputs."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_legacy_unsuffixed_trafficflow_artifact(
+        dirs["artifact_root"], "SPY",
+    )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.has_daily_k_trafficflow_artifacts is False
+
+
+def test_audit_has_daily_k_returns_false_for_mtf_only_artifacts(
+    tmp_path: Path,
+):
+    """A trafficflow directory with only ``__K<K>__MTF``
+    bridge outputs must NOT count as daily-K coverage —
+    those are Phase 6D-2 outputs, not Phase 6D-1 inputs."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_full_mtf_pipeline_outputs(
+        dirs["artifact_root"], "SPY", last_date="2026-05-08",
+    )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    # MTF artifacts are present but no daily K files.
+    assert entry.has_mtf_k_trafficflow_artifacts is True
+    assert entry.has_daily_k_trafficflow_artifacts is False
