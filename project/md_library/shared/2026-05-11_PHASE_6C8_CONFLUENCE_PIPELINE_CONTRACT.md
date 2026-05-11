@@ -392,6 +392,117 @@ The runner is intentionally a manual bridge: it proves the
 chain works end-to-end and supports per-ticker audit before
 the eventual Phase 6E scheduler runs the same code automatically.
 
+## 6.5. Phase 6E-1 — Public Board Launch Readiness Audit
+
+Phase 6E-1 adds a read-only / offline launch-readiness layer
+between the Phase 6D-4 runner and any future automation. It
+answers the public-launch question:
+
+  "What exact tickers can become Daily Signal Board leaders
+   if the completed pipeline is run, and what blocks the rest?"
+
+It is **not** a universe sweep, an orchestrator, or a writer.
+The audit will never modify production state, will never
+call `yfinance`, will never import a live engine (`trafficflow`,
+`spymaster`, `impactsearch`, `confluence`, `onepass`, `dash`,
+`daily_signal_board`), and will not write to `artifact_root`.
+
+Module: `project/board_launch_readiness_audit.py`. Tests:
+`project/test_scripts/test_board_launch_readiness_audit.py`.
+
+### 6.5.1 Default ticker scope
+
+  - Default `max_tickers = 50` (`DEFAULT_MAX_TICKERS`). When
+    no explicit `--tickers` is supplied, the audit walks
+    `cache_dir` for `<TICKER>_precomputed_results.pkl`
+    filenames in sorted order and takes the first 50.
+  - An explicit `--tickers` list overrides discovery and is
+    itself capped at `max_tickers` so the launch audit never
+    silently turns into a universe sweep.
+
+### 6.5.2 Recommended-action vocabulary
+
+The audit collapses per-ticker readiness into a single
+stable string the operator can branch on:
+
+  - `already_leader_eligible` — current readiness already
+    awards leader eligibility (Confluence present + current +
+    not health-blocked + full K coverage + bridge present).
+  - `ready_for_pipeline_write` — every upstream input is
+    present and fresh; a `write=True` Phase 6D-4 runner pass
+    is expected to land the ticker on the board.
+  - `needs_fresh_source_cache` — Signal Engine cache is
+    older than `current_as_of_date`. The next operator action
+    is a Spymaster refresh, not the pipeline runner.
+  - `needs_stackbuilder_run` — Signal Engine cache is
+    present and fresh, but no StackBuilder run dir / combo
+    leaderboard exists for the target.
+  - `needs_multitimeframe_libraries` — Signal Engine cache
+    and StackBuilder run are present, but the
+    `multi_timeframe_builder.py` libraries are not on disk.
+  - `blocked_by_health_report` — catalogue health report
+    explicitly disables the Confluence engine for this target.
+  - `insufficient_saved_inputs` — no Signal Engine cache
+    available for the ticker at all.
+  - `under_review` — reserved sentinel for ambiguous states
+    that cannot be classified safely; not emitted by the
+    happy path.
+
+The pilot manifest (`recommended_pilot_tickers`) is the
+subset whose action is `ready_for_pipeline_write` or
+`already_leader_eligible`. That is the small set the
+operator should run a `write=True` Phase 6D-4 pass against
+first to verify the public board lights up before opening
+a wider rollout.
+
+### 6.5.3 Likely-after-run prediction
+
+For each ticker the audit also reports
+`likely_after_run_issue_codes`: the readiness issue codes
+expected to remain after a successful `write=True` runner
+pass under current inputs.
+
+  - The runner is documented to clear:
+    `insufficient_trafficflow_k_coverage`,
+    `missing_multitimeframe_trafficflow_bridge`,
+    `missing_confluence_day_artifact`,
+    `stale_confluence_day_artifact`.
+  - A stale source cache produces a stale Confluence
+    verdict even after the runner sweep, so the audit
+    forces `stale_confluence_day_artifact` to remain in
+    the post-run set when `stale == True`.
+  - Tickers with no Signal Engine cache or no StackBuilder
+    run have `can_run_pipeline_now == False`; their
+    `likely_after_run_issue_codes` is unchanged from the
+    current readiness verdict.
+
+### 6.5.4 CLI contract
+
+  - `python board_launch_readiness_audit.py --tickers SPY,AAPL,SNOW`
+  - `python board_launch_readiness_audit.py --max-tickers 50`
+  - `python board_launch_readiness_audit.py --no-dry-run`
+    (skip the per-ticker runner dry-run pass; faster but
+    drops `runner_dry_run_issue_codes`).
+  - JSON is the only output format; `--json` is accepted for
+    parity with the documented examples.
+  - Exit codes:
+      0  audit completed; report emitted
+      2  invalid CLI arguments (unknown flag, negative
+         `--max-tickers`, etc.) — `main()` never raises
+         `SystemExit` for arg-parse failures
+      3  unexpected unhandled exception
+
+### 6.5.5 Out of scope for Phase 6E-1
+
+  - Writing to `artifact_root` / mutating production state.
+  - Daily automation / scheduling.
+  - Universe-wide sweeps (capped at `DEFAULT_MAX_TICKERS`).
+  - Live engine invocation; the per-ticker dry-run uses the
+    Phase 6D-4 runner in `write=False` mode only.
+  - Operator dashboard changes (`phase6_research_preview.py`,
+    `daily_signal_board.py`).
+  - Styling / design work.
+
 ## 7. Out of scope for this PR
 
 The following changes are **not** part of Phase 6C-8:
@@ -420,3 +531,7 @@ The following changes are **not** part of Phase 6C-8:
     `project/test_scripts/test_confluence_pipeline_readiness.py`
   - Board tests:
     `project/test_scripts/test_daily_signal_board.py`
+  - Launch readiness audit:
+    `project/board_launch_readiness_audit.py`
+  - Launch readiness audit tests:
+    `project/test_scripts/test_board_launch_readiness_audit.py`
