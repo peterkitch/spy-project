@@ -222,6 +222,34 @@ coverage labels. It slots between `Stale` and `Full` in
 but a missing bridge / incomplete K coverage is never visibly
 ranked "Full".
 
+## 6.2 Phase 6D-1 progress note (2026-05-11)
+
+Phase 6D-1 added `project/trafficflow_k_artifact_builder.py`: a
+read-only / offline builder that walks a saved StackBuilder seed
+run, loads its `combo_leaderboard.xlsx`, and materializes one
+TrafficFlow `research_day_v1` artifact per K row (K=1..12 by
+default). Artifacts persist at the K-distinguished path
+`output/research_artifacts/trafficflow/<SAFE_TARGET>/<SAFE_RUN>__K<K>.research_day.json`
+so artifact-path uniqueness is guaranteed across K values for
+the same seed run.
+
+What this closes:
+
+  - `insufficient_trafficflow_k_coverage` clears for targets
+    whose builder pass succeeded for every K in the expected
+    range.
+
+What this does NOT close:
+
+  - `missing_multitimeframe_trafficflow_bridge`. The Phase 6D-1
+    artifacts are single-timeframe (`timeframes` field stays
+    empty). The multi-timeframe TrafficFlow / K-build projection
+    is Phase 6D-2 and remains the gating issue between
+    Confluence and public leader eligibility.
+
+Public leaderboard eligibility therefore stays at zero until
+Phase 6D-2 ships, even after a Phase 6D-1 sweep across the cache.
+
 ## 7. Out of scope for this PR
 
 The following changes are **not** part of Phase 6C-8:
