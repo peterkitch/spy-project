@@ -505,6 +505,41 @@ def test_cli_mutually_exclusive_ticker_and_tickers(capsys):
     assert rc == 2
 
 
+def test_cli_blank_ticker_returns_2_without_system_exit(capsys):
+    """PR #199 audit fix: ``main(["--ticker", "   "])`` parsed
+    cleanly through argparse but the post-parse empty-ticker
+    check used ``parser.error()`` which raises SystemExit. The
+    public ``main(argv=None) -> int`` contract requires a real
+    return value; this test pins that the audit fix holds."""
+    rc = None
+    try:
+        rc = runner.main(["--ticker", "   "])
+    except SystemExit as exc:
+        pytest.fail(
+            "main() raised SystemExit on a blank --ticker; "
+            f"contract requires return 2 (got SystemExit({exc.code}))"
+        )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "ticker" in err.lower()
+
+
+def test_cli_empty_tickers_returns_2_without_system_exit(capsys):
+    """Same contract for ``--tickers``: ``,,,`` (all-empty list)
+    must return 2 from main() without raising SystemExit."""
+    rc = None
+    try:
+        rc = runner.main(["--tickers", ",,,"])
+    except SystemExit as exc:
+        pytest.fail(
+            "main() raised SystemExit on an empty --tickers list; "
+            f"contract requires return 2 (got SystemExit({exc.code}))"
+        )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "ticker" in err.lower()
+
+
 def test_cli_dry_run_flag_is_synonym_for_default(
     tmp_path: Path, capsys,
 ):

@@ -657,8 +657,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     tickers = _parse_ticker_list(args)
     if not tickers:
-        parser.error("at least one ticker must be supplied")
-        return 2  # unreachable; argparse error() exits.
+        # PR #199 audit fix: keep the main(argv=None) -> int
+        # contract honest. parser.error() raises SystemExit
+        # which would bypass the documented return-code shape;
+        # emit the usage error directly and return 2 instead.
+        prog = parser.prog or "confluence_pipeline_runner"
+        sys.stderr.write(
+            f"{prog}: error: at least one ticker must be "
+            f"supplied (--ticker or --tickers)\n"
+        )
+        return 2
 
     write = bool(args.write)
     try:
