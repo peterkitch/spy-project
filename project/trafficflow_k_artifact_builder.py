@@ -569,14 +569,21 @@ def build_trafficflow_artifacts_for_stack_run(
         built.append(row.K)
         paths.append(Path(written_path))
 
-    # Partial coverage flag: anything in expected_k that did not
-    # appear as a leaderboard row (and therefore was never
-    # attempted) is a coverage gap. Anything attempted but
-    # skipped is already reflected via its specific issue code.
+    # Partial coverage flag: any expected K that did not appear
+    # as a leaderboard row (and therefore was never attempted)
+    # is a coverage gap. This fires even when ``attempted`` is
+    # empty - a leaderboard whose K values are entirely
+    # unparseable / outside the expected set must NOT look
+    # successful (PR #196 audit fix).
     wanted = set(int(k) for k in expected_k_tuple)
-    if not wanted.issubset(set(attempted)) and attempted:
+    if wanted and not wanted.issubset(set(attempted)):
         _append_unique(issues, ISSUE_PARTIAL_K_COVERAGE)
-    if attempted and skipped:
+    # Per-row build failures (skipped) are already reflected via
+    # their specific issue code (e.g. no_member_caches), but the
+    # coverage rollup still tags partial_k_coverage so audit
+    # tooling can branch on it without scanning the granular
+    # codes.
+    if skipped:
         _append_unique(issues, ISSUE_PARTIAL_K_COVERAGE)
 
     return BuildResult(

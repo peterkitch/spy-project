@@ -445,6 +445,129 @@ def test_build_skips_rows_without_member_caches(tmp_path: Path):
     assert set(res.skipped_k) == set(range(1, 13))
 
 
+def test_invalid_k_leaderboard_emits_partial_k_coverage(
+    tmp_path: Path,
+):
+    """Audit repro: K column exists but every value is
+    unparseable. The builder previously returned a clean
+    BuildResult; under the audit fix it must emit
+    partial_k_coverage so no audit tooling treats an empty K
+    set as a successful sweep."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(dirs["cache_dir"], "SPY")
+    _make_seed_run(
+        dirs["stackbuilder_root"], "SPY",
+        seed_name="seedTC__BADK",
+        rows=[
+            {"K": "bad", "Trigger Days": 1,
+             "Total Capture (%)": 0.0, "Sharpe Ratio": 0.0,
+             "p-Value": 1.0, "Members": "['AAA[D]']"},
+            {"K": "also-bad", "Trigger Days": 2,
+             "Total Capture (%)": 0.0, "Sharpe Ratio": 0.0,
+             "p-Value": 1.0, "Members": "['AAA[D]']"},
+        ],
+    )
+    res = tkb.build_trafficflow_artifacts_for_stack_run(
+        "SPY",
+        stackbuilder_root=dirs["stackbuilder_root"],
+        cache_dir=dirs["cache_dir"],
+        artifact_root=dirs["artifact_root"],
+    )
+    assert tkb.ISSUE_PARTIAL_K_COVERAGE in res.issue_codes
+    assert res.built_k == ()
+    assert res.attempted_k == ()
+
+
+def test_k_values_outside_expected_emit_partial_k_coverage(
+    tmp_path: Path,
+):
+    """Leaderboard parses cleanly but every K is outside the
+    requested expected_k range. The iter helper filters them
+    out, attempted_k stays empty - and the builder must still
+    flag partial_k_coverage rather than reporting silent
+    success."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(dirs["cache_dir"], "SPY")
+    _make_seed_run(
+        dirs["stackbuilder_root"], "SPY",
+        seed_name="seedTC__OUTSIDE",
+        rows=[
+            {"K": 42, "Trigger Days": 1,
+             "Total Capture (%)": 0.0, "Sharpe Ratio": 0.0,
+             "p-Value": 1.0, "Members": "['AAA[D]']"},
+            {"K": 99, "Trigger Days": 2,
+             "Total Capture (%)": 0.0, "Sharpe Ratio": 0.0,
+             "p-Value": 1.0, "Members": "['AAA[D]']"},
+        ],
+    )
+    res = tkb.build_trafficflow_artifacts_for_stack_run(
+        "SPY",
+        stackbuilder_root=dirs["stackbuilder_root"],
+        cache_dir=dirs["cache_dir"],
+        artifact_root=dirs["artifact_root"],
+    )
+    assert tkb.ISSUE_PARTIAL_K_COVERAGE in res.issue_codes
+    assert res.attempted_k == ()
+    assert res.built_k == ()
+
+
+def test_only_k1_with_expected_1_to_12_emits_partial_k_coverage(
+    tmp_path: Path,
+):
+    """A leaderboard that only carries K=1 against the default
+    expected_k=1..12 must surface partial_k_coverage even when
+    K=1 builds successfully."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(dirs["cache_dir"], "SPY")
+    _write_cache_pkl(dirs["cache_dir"], "AAA")
+    _write_cache_pkl(dirs["cache_dir"], "BBB")
+    _make_seed_run(
+        dirs["stackbuilder_root"], "SPY",
+        seed_name="seedTC__ONLY_K1",
+        rows=[{
+            "K": 1, "Trigger Days": 100,
+            "Total Capture (%)": 10.0, "Sharpe Ratio": 0.1,
+            "p-Value": 0.05,
+            "Members": "['AAA[D]', 'BBB[D]']",
+        }],
+    )
+    res = tkb.build_trafficflow_artifacts_for_stack_run(
+        "SPY",
+        stackbuilder_root=dirs["stackbuilder_root"],
+        cache_dir=dirs["cache_dir"],
+        artifact_root=dirs["artifact_root"],
+    )
+    assert tkb.ISSUE_PARTIAL_K_COVERAGE in res.issue_codes
+    # K=1 itself built successfully - the partial flag is about
+    # the K range, not about the row that did succeed.
+    assert res.attempted_k == (1,)
+    assert res.built_k == (1,)
+
+
+def test_full_k_pipeline_remains_clean_after_audit_fix(
+    tmp_path: Path,
+):
+    """Regression guard: the happy path that built K=1..12
+    cleanly under the original behavior must still report
+    zero issue codes after the partial_k_coverage detection
+    is tightened. This pairs with the audit fix above to make
+    sure we did not accidentally flag a successful sweep."""
+    dirs = _full_pipeline_fixtures(tmp_path)
+    res = tkb.build_trafficflow_artifacts_for_stack_run(
+        "SPY",
+        stackbuilder_root=dirs["stackbuilder_root"],
+        cache_dir=dirs["cache_dir"],
+        artifact_root=dirs["artifact_root"],
+        write=False,
+    )
+    assert set(res.built_k) == set(range(1, 13))
+    assert res.skipped_k == ()
+    assert res.issue_codes == (), (
+        "full K=1..12 happy path must stay clean; got "
+        + repr(res.issue_codes)
+    )
+
+
 def test_build_with_write_false_builds_in_memory_writes_nothing(
     tmp_path: Path,
 ):
