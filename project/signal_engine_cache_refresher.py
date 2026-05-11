@@ -1,34 +1,47 @@
-"""Phase 6E-3: Controlled Signal Engine cache refresh CLI.
+"""Phase 6E-3: source-data refresh probe + cache-shape builder.
 
 The Phase 6E-2 audit established that the only path that
 writes a Spymaster ``<TICKER>_precomputed_results.pkl`` today
-is the Dash app (``project/spymaster.py``). That blocks the
-pilot launch flow on browser interaction. This module is the
-operator-only, non-interactive bridge for a single explicit
-ticker.
+is the Dash app (``project/spymaster.py``). Phase 6E-3 adds
+the *first half* of a non-interactive operator path: a
+controlled CLI that:
 
-Scope (intentionally minimum-viable):
-
-  - Fetch fresh OHLC price data from a pluggable data
+  - Fetches fresh OHLC price data from a pluggable data
     source (default: yfinance; mockable via the
     ``data_fetcher`` parameter so tests never hit the
     network).
-  - Build a ``preprocessed_data`` DataFrame with a ``Close``
-    column plus ``SMA_1`` … ``SMA_max_sma_day`` columns so
-    the cache shape matches what the Signal Engine loader
-    and downstream engines expect.
-  - Populate ``active_pairs`` as a placeholder list of
-    ``"None"`` strings, one per row, so the resulting cache
-    is **loadable** by ``primary_signal_engine.load_primary_signal_engine_payload``
-    but honestly reports ``signal: None``.
-  - Write the cache atomically (temp file +
-    ``os.replace``) and emit the provenance manifest sidecar
-    using the central ``provenance_manifest`` helpers — the
-    same Phase 3 contract Spymaster uses.
-  - Write the corresponding status JSON.
+  - Builds a ``preprocessed_data`` DataFrame with a ``Close``
+    column plus ``SMA_1`` … ``SMA_max_sma_day`` columns —
+    the same column layout Spymaster's cache uses.
+  - Reports the would-be new cache date_range_end + the
+    Phase-6-consistent stale_before / current_after flags.
 
-Explicitly out of scope (would require a much larger
-refactor of ``project/spymaster.py``):
+**It is not yet a production-safe Signal Engine cache
+refresher.** The Spymaster daily best-buy / best-short
+SMA-pair optimizer is a closure inside the Dash callback at
+``spymaster.py:5050-5117`` and has not been extracted into a
+non-interactive helper. Until that work ships, every payload
+this module builds carries placeholder ``active_pairs`` (the
+literal string ``"None"`` repeated for each row), which would
+load as ``current_signal=None``,
+``current_sma_pair=None``, ``total_capture_pct=0``,
+``sharpe_ratio=0``, ``signal_days=0``. Replacing a valid
+Spymaster cache with such a payload would be a strict
+regression for the Daily Signal Board and the Primary Signal
+Engine front door — worse than the staleness it would fix.
+
+Phase 6E-3 therefore **refuses every ``write=True`` call**
+while the SMA optimizer is unavailable. The guard fires on
+the payload's ``signal_engine_cache_refresher_scope`` marker
+(``data_only_v1``), regardless of the operator's intent. The
+issue code ``data_only_write_blocked`` is surfaced in the
+result; no cache PKL, no status JSON, and no manifest sidecar
+are written. The CLI keeps the ``--write`` flag so the
+contract is exercised, but it is functionally a no-op until
+the next sub-phase extracts the SMA optimizer.
+
+Explicitly out of scope for Phase 6E-3 (would require a much
+larger refactor of ``project/spymaster.py``):
 
   - Running Spymaster's full daily best-buy / best-short
     SMA-pair optimization. That logic is a closure inside
@@ -43,14 +56,16 @@ refactor of ``project/spymaster.py``):
   - Public web tier usage.
   - Multi-ticker mode, scheduling, or universe sweeps.
 
-Read-only / offline contract (when ``write=False``):
+Read-only / offline contract (current Phase 6E-3 reality):
 
-  - No ``cache_dir`` writes.
-  - No ``status_dir`` writes.
-  - No provenance manifest writes.
-  - Same source-data fetch as ``write=True`` (so the
-    dry-run can honestly report the would-be new
-    ``date_range_end``).
+  - ``write=False`` (dry-run) fetches data but writes
+    nothing. Reports the new vs old ``date_range_end``.
+  - ``write=True`` ALSO writes nothing while the SMA
+    optimizer is unavailable — the data_only_v1 guard
+    fires, the result reports
+    ``data_only_write_blocked``, and the operator is
+    instructed to wait for the SMA-optimizer extraction
+    sub-phase before attempting a production write.
 
 Public surface
 --------------
@@ -93,6 +108,7 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+import confluence_pipeline_readiness as _cpr
 import primary_signal_engine as _pse
 import provenance_manifest as _pm
 
@@ -108,6 +124,22 @@ ISSUE_DATA_EMPTY = "data_empty"
 ISSUE_DRY_RUN = "dry_run_only"
 ISSUE_ALREADY_CURRENT = "already_current"
 ISSUE_PROVENANCE_MANIFEST_FAILED = "provenance_manifest_failed"
+ISSUE_DATA_ONLY_WRITE_BLOCKED = "data_only_write_blocked"
+
+
+# Phase 6E-3 ships the data-fetch + cache-shape build path
+# only. Every payload this module produces carries the
+# ``signal_engine_cache_refresher_scope`` marker
+# ``DATA_ONLY_V1_SCOPE``. Writing such a payload over a real
+# Spymaster cache would replace a working Signal Engine view
+# with one that loads as ``current_signal=None``. The
+# refresher therefore refuses ``write=True`` for any payload
+# carrying this scope marker.
+#
+# A future sub-phase that extracts Spymaster's SMA pair
+# optimizer is the gate that flips the on-disk write path
+# from blocked to active.
+DATA_ONLY_V1_SCOPE = "data_only_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -328,8 +360,9 @@ def _build_cache_payload(
         # Phase 6E-3 provenance: marker the operator (or a
         # future audit) can grep for to confirm a cache was
         # produced by the refresher rather than the full
-        # Spymaster pipeline.
-        "signal_engine_cache_refresher_scope": "data_only_v1",
+        # Spymaster pipeline. The on-disk write guard keys
+        # off this exact value.
+        "signal_engine_cache_refresher_scope": DATA_ONLY_V1_SCOPE,
     }
     return payload
 
@@ -521,9 +554,14 @@ def refresh_signal_engine_cache(
     target_cache_path = _cache_path(norm_ticker, cache_d)
     old_end = _existing_cache_end(norm_ticker, cache_d)
 
-    cutoff_iso = (
-        current_as_of_date if current_as_of_date
-        else _date_to_iso(datetime.now(timezone.utc))
+    # Use the same most-recent-weekday cutoff resolver the
+    # Phase 6 readiness / preflight tools use, so Phase 6E-3
+    # never drifts from the rest of the launch-readiness
+    # stack. ``resolve_current_as_of_date`` accepts an
+    # explicit override; absent that it falls back to the
+    # most recent weekday strictly before UTC now.
+    cutoff_iso = _cpr.resolve_current_as_of_date(
+        current_as_of_date,
     )
     cutoff_dt = _parse_iso_date(cutoff_iso)
     old_dt = _parse_iso_date(old_end)
@@ -630,18 +668,49 @@ def refresh_signal_engine_cache(
             elapsed_seconds=time.monotonic() - started,
         )
 
-    # write=True path. Build + embed the manifest first
-    # (the cache pickle includes the manifest field), write
-    # the cache atomically, then write the sidecar so its
-    # ``artifact_file_sha256`` reflects the final on-disk
-    # bytes.
-    manifest, manifest_issues = _build_manifest(payload)
-    issues.extend(manifest_issues)
+    # write=True path. BEFORE touching disk, enforce the
+    # data_only_v1 guard. The payload built above always
+    # carries placeholder ``active_pairs`` because the
+    # Spymaster SMA optimizer has not been extracted into a
+    # non-interactive helper yet; writing such a payload
+    # would replace a valid Signal Engine cache with one
+    # that loads as ``current_signal=None``. The Phase 6E-3
+    # contract treats that outcome as worse than the
+    # staleness it would fix, so we refuse the write.
+    payload_scope = payload.get(
+        "signal_engine_cache_refresher_scope",
+    )
+    if payload_scope == DATA_ONLY_V1_SCOPE:
+        return SignalEngineRefreshResult(
+            ticker=norm_ticker,
+            write=True,
+            cache_path=str(target_cache_path),
+            manifest_path=None,
+            status_path=None,
+            old_cache_date_range_end=old_end,
+            new_cache_date_range_end=new_end,
+            refreshed=False,
+            stale_before=stale_before,
+            current_after=current_after,
+            issue_codes=(ISSUE_DATA_ONLY_WRITE_BLOCKED,),
+            elapsed_seconds=time.monotonic() - started,
+        )
 
-    _atomic_pickle_write(target_cache_path, payload)
+    # Unreachable while ``signal_engine_cache_refresher_scope``
+    # is always ``DATA_ONLY_V1_SCOPE``. Preserved for the
+    # future sub-phase that extracts the SMA optimizer: at
+    # that point the payload carries a different scope marker
+    # and the writer path becomes the active production
+    # refresh path. Until then, this branch is structurally
+    # dead and the atomic write helper exists only as a
+    # tested primitive for that future work.
+    manifest, manifest_issues = _build_manifest(payload)  # pragma: no cover
+    issues.extend(manifest_issues)  # pragma: no cover
 
-    manifest_path: Optional[Path] = None
-    if manifest is not None:
+    _atomic_pickle_write(target_cache_path, payload)  # pragma: no cover
+
+    manifest_path: Optional[Path] = None  # pragma: no cover
+    if manifest is not None:  # pragma: no cover
         try:
             manifest_path = _pm.write_output_manifest(
                 target_cache_path, manifest,
@@ -649,13 +718,13 @@ def refresh_signal_engine_cache(
         except Exception:
             issues.append(ISSUE_PROVENANCE_MANIFEST_FAILED)
 
-    target_status_path = _status_path(norm_ticker, status_d)
-    _write_status(
+    target_status_path = _status_path(norm_ticker, status_d)  # pragma: no cover
+    _write_status(  # pragma: no cover
         target_status_path, norm_ticker,
         cache_status="fresh" if current_after else "stale",
     )
 
-    return SignalEngineRefreshResult(
+    return SignalEngineRefreshResult(  # pragma: no cover
         ticker=norm_ticker,
         write=True,
         cache_path=str(target_cache_path),

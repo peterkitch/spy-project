@@ -218,13 +218,14 @@ need to be acknowledged before any production write:
     by small amounts; this is in scope for Phase 5G data
     licensing.
   - **No non-interactive refresh tool**: Spymaster's
-    Dash app is the only writer (partially closed by
-    Phase 6E-3 — see § 6.5. The Phase 6E-3 CLI handles the
-    data-fetch + cache-write portion non-interactively
-    but does NOT run Spymaster's SMA-pair optimization, so
-    the resulting cache carries placeholder `active_pairs`.
-    A future sub-phase still needs to extract the SMA
-    optimizer for a full non-interactive pilot).
+    Dash app is the only writer. Phase 6E-3 (see § 6.5)
+    ships the data-fetch + cache-shape probe, but a hard
+    data-only write guard refuses every `--write` while
+    the Spymaster SMA pair optimizer remains
+    Dash-callback-only. So in practice the only path that
+    produces a fresh Spymaster cache is still the Dash
+    UI. The next required sub-phase (the SMA-optimizer
+    extraction) is the gate that releases the guard.
   - **`controlled_compute` cannot orchestrate Spymaster
     today**: it can run job specs, but Spymaster lacks
     the CLI surface it would call. Wiring this is a
@@ -239,20 +240,25 @@ need to be acknowledged before any production write:
     health-blocked ticker does nothing for the public
     board.
 
-## 6.5 Phase 6E-3 — Non-interactive Signal Engine cache
-       refresh CLI
+## 6.5 Phase 6E-3 — Source-data refresh probe +
+       cache-shape builder
 
-Phase 6E-3 adds the missing non-interactive operator CLI
-called out in § 6 as the "no non-interactive refresh tool"
-risk. The new module is
-`project/signal_engine_cache_refresher.py`; the test pin is
+**Phase 6E-3 is NOT a production-safe Signal Engine cache
+refresher.** It is the first half of the eventual operator
+path: the source-data fetch + cache-shape build, paired
+with a hard guard that refuses to write the resulting
+payload over a real Spymaster cache. The Codex audit on PR
+#202 flagged that an unguarded `--write` would have
+replaced `current_signal=Buy/Short` caches with
+`current_signal=None` caches — a strict regression for the
+Daily Signal Board and the Primary Signal Engine front
+door. The guard is the contract.
+
+The module is `project/signal_engine_cache_refresher.py`;
+the test pin is
 `project/test_scripts/test_signal_engine_cache_refresher.py`.
 
-### 6.5.1 Scope (intentionally minimum-viable)
-
-The Phase 6E-3 refresher is intentionally scoped to what
-can ship in one PR without refactoring the Spymaster Dash
-app. It:
+### 6.5.1 What this phase actually does
 
   - Fetches fresh OHLC price data from a pluggable data
     source (default: yfinance via a lazy import inside the
@@ -262,20 +268,60 @@ app. It:
     plus `SMA_1` … `SMA_<max_sma_day>` columns so the cache
     shape matches what the Signal Engine loader and
     downstream engines expect.
+  - Builds the rest of the Spymaster cache payload
+    structure (self-check tokens, MAX-SMA sentinel
+    `top_buy_pair`/`top_short_pair`, `last_close`, …).
   - Populates `active_pairs` as a placeholder list of
-    `"None"` strings, one per row, so the cache is
-    **loadable** by
-    `primary_signal_engine.load_primary_signal_engine_payload`
-    but honestly reports `signal: None`.
-  - Writes the cache atomically (temp file +
-    `os.replace`) and emits the provenance manifest sidecar
-    using the central `provenance_manifest` helpers — the
-    same Phase 3 contract Spymaster uses for its own
-    cache writes.
-  - Writes the corresponding status JSON only when
-    `write=True`.
+    `"None"` strings, one per row, because the Spymaster
+    SMA pair optimizer has not been extracted into a
+    non-interactive helper yet.
+  - Stamps the payload with the scope marker
+    `signal_engine_cache_refresher_scope = "data_only_v1"`.
+  - Reports `old_cache_date_range_end`,
+    `new_cache_date_range_end`,
+    `stale_before`, and `current_after` — the same
+    arithmetic the Phase 6E-2 preflight uses.
 
-### 6.5.2 Explicit non-goals
+### 6.5.2 The data-only write guard (Codex amendment)
+
+Before any disk write, the refresher checks the payload's
+`signal_engine_cache_refresher_scope` marker. While that
+marker is `data_only_v1` (i.e. until the SMA optimizer is
+extracted in a future sub-phase), every `write=True` call
+is refused:
+
+  - `refreshed = False`
+  - `issue_codes` contains
+    `"data_only_write_blocked"`
+  - No cache PKL is written.
+  - No status JSON is written.
+  - No provenance manifest sidecar is written.
+  - An existing valid Spymaster cache for the same ticker
+    is preserved byte-for-byte; nothing on disk changes.
+  - The result still reports `old_cache_date_range_end`,
+    `new_cache_date_range_end`, `stale_before`, and
+    `current_after` so the operator can see what a future
+    write would have advanced to.
+
+The CLI keeps `--write` so the contract is exercised end
+to end, but it is functionally a no-op until the next
+sub-phase ships. The atomic-write helper, manifest
+plumbing, and status-write helper are preserved in the
+module behind the guard for that future work.
+
+### 6.5.3 Cutoff resolver
+
+`current_as_of_date` is resolved through
+`confluence_pipeline_readiness.resolve_current_as_of_date`,
+the same helper the Phase 6 readiness / preflight tools
+use. Absent an explicit override, the cutoff is the most
+recent weekday strictly before UTC now (Monday
+`2026-05-11` resolves to Friday `2026-05-08`). This keeps
+the refresher's `stale_before` / `current_after` flags
+consistent with everything else in the launch-readiness
+stack.
+
+### 6.5.4 Explicit non-goals
 
 What Phase 6E-3 deliberately does **not** do:
 
@@ -288,10 +334,13 @@ What Phase 6E-3 deliberately does **not** do:
     `spymaster.py:2811` as a module-level side effect) or
     refactoring Spymaster to expose the math as a
     standalone function. Neither fits the Phase 6E-3 PR
-    scope. The refresher therefore writes placeholder
-    `active_pairs` and leaves signal computation to the
-    Spymaster Dash app (current operator practice) or to a
-    future sub-phase that extracts the SMA optimizer.
+    scope. **This extraction is the next required
+    sub-phase before production cache writes are allowed.**
+  - **Produce a production-safe refreshed Signal Engine
+    cache.** The data-only guard refuses every `--write`
+    while the SMA optimizer is unavailable, so the on-disk
+    state remains controlled by the Spymaster Dash app
+    (current operator practice).
   - **Reuse `spymaster.save_precomputed_results`
     directly.** Same reason: importing `spymaster` pulls in
     `dash` / `plotly` and instantiates the Dash app. The
@@ -299,19 +348,16 @@ What Phase 6E-3 deliberately does **not** do:
     semantics (`tempfile.NamedTemporaryFile` →
     `pickle.dump` → `flush` → `os.fsync` → `os.replace`)
     using stdlib only, plus the `provenance_manifest`
-    helpers for the sidecar.
+    helpers for the sidecar — but those helpers are
+    behind the data-only guard and unreachable while the
+    payload scope is `data_only_v1`.
   - **Multi-ticker mode.** The CLI has `--ticker`
-    (singular) only. A multi-ticker mode would require a
-    dedicated scheduler / rate-limit story and is out of
-    scope.
+    (singular) only.
   - **Web-tier callability.** The refresher must never be
     imported from `daily_signal_board.py` or any other
-    web-tier module. The test
-    `test_daily_signal_board_is_not_imported_by_refresher`
-    pins the absence of the relevant symbol in the
-    refresher's source.
+    web-tier module.
 
-### 6.5.3 Public API
+### 6.5.5 Public API
 
 ```python
 refresh_signal_engine_cache(
@@ -322,7 +368,8 @@ refresh_signal_engine_cache(
     write: bool = False,
     max_sma_day: int | None = None,           # default 30
     data_fetcher: Callable | None = None,     # default yfinance
-    current_as_of_date: str | None = None,    # default today UTC
+    current_as_of_date: str | None = None,    # default via
+                                              # resolve_current_as_of_date
 ) -> SignalEngineRefreshResult
 ```
 
@@ -333,19 +380,23 @@ refresh_signal_engine_cache(
   - `cache_path`, `manifest_path`, `status_path`
   - `old_cache_date_range_end`,
     `new_cache_date_range_end`
-  - `refreshed` (True only if `write=True` and the writer
-    landed)
+  - `refreshed` — True only if `write=True` AND the
+    data-only guard is no longer in force AND the writer
+    landed. While the SMA optimizer is unavailable, this
+    is always `False`.
   - `stale_before`, `current_after`
   - `issue_codes` — stable string set:
     `invalid_ticker`, `data_fetch_failed`,
     `data_no_close_column`, `data_empty`, `dry_run_only`,
-    `already_current`, `provenance_manifest_failed`
+    `already_current`, `provenance_manifest_failed`,
+    `data_only_write_blocked`.
   - `elapsed_seconds`
 
-### 6.5.4 CLI contract
+### 6.5.6 CLI contract
 
   - `python signal_engine_cache_refresher.py --ticker SPY --dry-run`
   - `python signal_engine_cache_refresher.py --ticker SPY --write`
+    (refused under the data-only guard; see § 6.5.2)
   - `--ticker` is required; no `--tickers` (multi-ticker)
     flag exists.
   - Default is dry-run (`--dry-run` and `--write` are
@@ -353,12 +404,12 @@ refresh_signal_engine_cache(
   - `--cache-dir` and `--status-dir` accepted for
     operator / test control.
   - JSON to stdout. Exit codes:
-      0  refresh completed (dry-run or write)
+      0  refresh completed (dry-run or guarded write)
       2  invalid CLI arguments (parser SystemExit is
          trapped and converted)
       3  unexpected unhandled exception
 
-### 6.5.5 Updated pilot ticker flow (replaces § 3, step 3)
+### 6.5.7 Updated pilot ticker flow (replaces § 3, step 3)
 
   1. `python source_freshness_preflight.py --ticker SPY` —
      confirm `recommended_next_action=refresh_source_cache`
@@ -366,44 +417,39 @@ refresh_signal_engine_cache(
   2. `python signal_engine_cache_refresher.py --ticker SPY
      --dry-run` — confirm the fetched
      `new_cache_date_range_end` advances past the existing
-     `old_cache_date_range_end`. **No writes.**
-  3. (Authorized only) `python
-     signal_engine_cache_refresher.py --ticker SPY --write`
-     — produces the fresh cache PKL, manifest sidecar, and
-     status JSON.
-  4. `python source_freshness_preflight.py --ticker SPY` —
-     confirm the recommendation now moves to
-     `run_pipeline_after_refresh` (no longer
-     `refresh_source_cache`).
-  5. (Authorized only) `python confluence_pipeline_runner.py
-     --ticker SPY --write` — Phase 6D-4 runner produces the
-     per-K and Confluence artifacts.
-  6. `python board_launch_readiness_audit.py --tickers SPY`
-     — verify SPY is now `already_leader_eligible`.
+     `old_cache_date_range_end`. **This is the only Phase
+     6E-3 invocation an operator should run today.** No
+     writes are produced; `--write` is refused under the
+     data-only guard.
+  3. **Wait for the next sub-phase: SMA-optimizer
+     extraction.** Spymaster's SMA pair optimization
+     (`spymaster.py:5050-5117`) must be extracted into a
+     non-interactive helper before a production cache
+     write is allowed. Until that ships, the only safe
+     path to refresh a Signal Engine cache remains the
+     Spymaster Dash app (the original Phase 6E-2 § 3
+     manual flow).
+  4. Once that sub-phase ships, the operator flow becomes:
+     `--write` produces the cache + manifest + status,
+     then `source_freshness_preflight --ticker SPY` flips
+     to `run_pipeline_after_refresh`, then
+     `confluence_pipeline_runner --ticker SPY --write`,
+     then `board_launch_readiness_audit --tickers SPY`
+     confirms `already_leader_eligible`.
 
-Step 4 is the explicit confirmation that the non-interactive
-refresh actually moved the ticker into a runnable state.
-**Do not skip Step 4.**
+### 6.5.8 Next required phase: SMA-optimizer extraction
 
-### 6.5.6 Residual gaps the refresher does NOT close
-
-Even after a `write=True` refresh, the cache produced by
-Phase 6E-3 carries:
-
-  - `active_pairs` = placeholder `"None"` strings (no
-    daily best buy / best short pair computed). The Signal
-    Engine view will show `signal: None`.
-  - `top_buy_pair` / `top_short_pair` set to MAX-SMA
-    sentinels so Spymaster's writer-guard convention is
-    satisfied but the cache carries no leader-pair
-    insight.
-
-For a full Spymaster-equivalent cache the operator still
-needs to run the Spymaster Dash app, OR a future
-Phase 6E-4 (or similar) sub-phase that extracts the
-SMA-pair optimizer as a non-interactive helper. The current
-phase deliberately leaves that work out so the refresh CLI
-can ship and be audited in isolation.
+The Phase 6E-3 data-only guard is a hold, not a fix. The
+next required sub-phase extracts Spymaster's daily best-buy
+/ best-short SMA-pair optimizer
+(`spymaster.py:5050-5117`) into a non-interactive helper
+that the refresher can call. At that point the payload
+scope marker flips off `data_only_v1`, the guard releases,
+and `--write` becomes the operator's production refresh
+path. The atomic-write helper, manifest sidecar, status
+JSON, and CLI surface in Phase 6E-3 are already in place
+for that work — the SMA extraction is the only blocking
+piece.
 
 ## 7. Out of scope for Phase 6E-2
 
