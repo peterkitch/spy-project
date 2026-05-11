@@ -267,6 +267,15 @@ BOARD_COPY: dict[str, Any] = {
         "Not a guarantee of future performance.",
         "Saved research only.",
     ),
+    # Chart copy (Plotly trace names + axis titles). Centralized so
+    # the copy-centralization test catches them along with section
+    # copy. Trace name for the close-price line is a format string
+    # because the ticker is interpolated.
+    "chart_trace_engine_capture": "Engine cumulative capture",
+    "chart_trace_close_price_fmt": "{ticker} close price",
+    "chart_axis_date": "Date",
+    "chart_axis_cumulative_capture": "Cumulative Capture (%)",
+    "chart_axis_close_price": "Close Price",
 }
 
 
@@ -493,6 +502,58 @@ def _ref_is_newer(a: _ArtifactRef, b: _ArtifactRef) -> bool:
     return a.mtime > b.mtime
 
 
+def _normalize_signal_label(value: Any) -> str:
+    """Coerce an artifact-stored signal label to one of the canonical
+    Buy / Short / None strings. Anything we don't recognize collapses
+    to None (signal_value 0)."""
+    if value is None:
+        return "None"
+    s = str(value).strip()
+    if not s:
+        return "None"
+    head = s.split()[0].lower()
+    if head == "buy":
+        return "Buy"
+    if head == "short":
+        return "Short"
+    return "None"
+
+
+def _signal_from_refs(
+    confluence_ref: Optional[_ArtifactRef],
+    impactsearch_ref: Optional[_ArtifactRef],
+) -> str:
+    """Derive a Buy/Short/None label for a scoreboard row from
+    saved artifacts only - never opens the Spymaster cache PKL.
+
+    Priority:
+      1. Confluence research_day_v1 artifact's last daily
+         ``confluence_signal`` (the engine that's already the
+         scoreboard's high-score signal).
+      2. ImpactSearch research_day_v1 artifact's last daily
+         ``signal`` (a single-source fallback when no confluence
+         artifact has been built for the ticker).
+      3. Otherwise ``"None"`` - the documented placeholder for
+         cache-only tickers that haven't been hydrated yet.
+    """
+    for ref, signal_field in (
+        (confluence_ref, "confluence_signal"),
+        (impactsearch_ref, "signal"),
+    ):
+        if ref is None or ref.artifact is None:
+            continue
+        daily = getattr(ref.artifact, "daily", None) or []
+        if not daily:
+            continue
+        row = daily[-1]
+        if not isinstance(row, dict):
+            continue
+        label = _normalize_signal_label(row.get(signal_field))
+        if label in {"Buy", "Short", "None"}:
+            return label
+    return "None"
+
+
 def _confluence_active_total(ref: Optional[_ArtifactRef]) -> tuple[
     Optional[int], Optional[int],
 ]:
@@ -605,7 +666,7 @@ def _is_stale_iso(date_iso: Optional[str], *, now: datetime) -> bool:
 def coverage_status_for_ticker(
     ticker: str,
     *,
-    payload: Mapping[str, Any],
+    has_engine_cache: bool,
     impactsearch_ref: Optional[_ArtifactRef],
     stackbuilder_ref: Optional[_ArtifactRef],
     trafficflow_ref: Optional[_ArtifactRef],
@@ -617,8 +678,16 @@ def coverage_status_for_ticker(
     """Resolve one of the four coverage labels for a ticker, applying
     the priority order under-review > stale > full > partial.
 
-    ``payload`` must be the dict returned by
-    ``primary_signal_engine.load_primary_signal_engine_payload``.
+    ``has_engine_cache`` reflects only whether the Spymaster cache
+    PKL file exists on disk (filename presence). The Spymaster PKL
+    is NOT opened during scoreboard discovery, so the cache's
+    ``date_range.end`` does not feed the staleness check; only
+    research_day_v1 artifact dates do.
+
+    Cache-only tickers (no saved research_day_v1 artifacts) therefore
+    cannot be flagged ``Stale`` from this entrypoint - they fall
+    through to ``Partial``. The Featured panel still hydrates the
+    selected ticker's PKL and surfaces fresh / stale numbers there.
     """
     now = now or datetime.now(timezone.utc)
     blocked = {str(t).strip().upper() for t in (health_blocked or [])}
@@ -626,14 +695,9 @@ def coverage_status_for_ticker(
     if ticker.strip().upper() in blocked:
         return COVERAGE_UNDER_REVIEW
 
-    # Collect every meaningful date seen for staleness checks.
+    # Staleness uses research_day_v1 artifact dates only. The cache
+    # PKL stays unopened during discovery (perf contract).
     candidate_dates: list[str] = []
-    if isinstance(payload, Mapping):
-        date_range = payload.get("date_range") or {}
-        if isinstance(date_range, Mapping):
-            end = date_range.get("end")
-            if end:
-                candidate_dates.append(str(end))
     for ref in (
         impactsearch_ref, stackbuilder_ref,
         trafficflow_ref, confluence_ref,
@@ -643,10 +707,6 @@ def coverage_status_for_ticker(
         if ref.last_date:
             candidate_dates.append(ref.last_date)
 
-    # Stale if every available meaningful date is older than
-    # STALE_DAYS. The "newest" date governs because stale evidence
-    # plus one fresh signal still leaves the bundle stale only when
-    # the *newest* date is past the threshold.
     if candidate_dates:
         parsed = [
             d for d in (_parse_iso_date(c) for c in candidate_dates)
@@ -660,9 +720,6 @@ def coverage_status_for_ticker(
             if delta > STALE_DAYS:
                 return COVERAGE_STALE
 
-    has_engine_cache = bool(
-        isinstance(payload, Mapping) and payload.get("available")
-    )
     has_is = impactsearch_ref is not None
     has_sb = stackbuilder_ref is not None
     has_tf = trafficflow_ref is not None
@@ -683,9 +740,9 @@ def coverage_status_for_ticker(
         return COVERAGE_FULL
     if has_engine_cache:
         return COVERAGE_PARTIAL
-    # Defensive: an entry made it onto the board with no engine cache.
-    # The discovery step filters these out, so this branch is a last
-    # resort for malformed payloads.
+    # Defensive: should not happen because discovery only emits rows
+    # for tickers whose cache filename exists. Leave as Partial so a
+    # caller-side bug never causes the row to silently disappear.
     return COVERAGE_PARTIAL
 
 
@@ -703,17 +760,41 @@ def discover_board_catalogue(
     use_cache: bool = True,
     now: Optional[datetime] = None,
 ) -> list[BoardRow]:
-    """Walk the cache directory, build a BoardRow per available ticker.
+    """Build a BoardRow per cached ticker from fast saved metadata.
 
-    Discovery rules:
-      * Only ``<TICKER>_precomputed_results.pkl`` filenames are
-        considered.
-      * Each ticker is passed through
-        ``primary_signal_engine.load_primary_signal_engine_payload``;
-        unavailable payloads are excluded.
-      * No live engine call. No yfinance.
-      * The result is process-lifetime cached when ``use_cache`` is
-        True. ``reset_board_cache()`` clears the cache.
+    Data contract (Phase 6C-7 perf amendment):
+
+      * The Spymaster cache PKL is NOT opened during discovery. The
+        cache contributes only its FILENAME presence; opening every
+        PKL through ``load_primary_signal_engine_payload`` on real
+        disk takes ~50 seconds for ~200 tickers and breaks the
+        public-MVP cold-boot contract.
+      * The selected ticker's PKL is still hydrated for the Featured
+        panel via ``_ticker_payload`` (one call per selection).
+      * Per-row ``signal`` is derived from saved research_day_v1
+        artifacts only - the latest confluence artifact's
+        ``confluence_signal`` (priority 1) then the latest
+        impactsearch artifact's ``signal`` (priority 2). Cache-only
+        tickers with no artifacts report ``signal="None"`` /
+        ``signal_value=0`` until either artifact lands. This is an
+        explicit limitation, not an error condition.
+      * ``agreement_active`` / ``agreement_total`` come from the
+        latest confluence artifact's last daily row when present.
+      * ``coverage`` follows ``coverage_status_for_ticker``; cache
+        staleness cannot be inferred without opening the PKL, so
+        cache-only tickers stay ``Partial`` regardless of cache
+        mtime.
+      * ``as_of`` is the newest research_day_v1 daily row date
+        across all engines for the ticker; falls back to ``None``
+        (rendered as ``"-"``) when no artifact has been built.
+
+      * No live engine call. No yfinance. No disk writes.
+      * Process-lifetime cached on ``(cache_dir, artifact_root,
+        sig_lib_dir)``. ``reset_board_cache()`` clears.
+
+    The cached entry also keeps the indexed artifact map so the
+    Featured / Evidence callbacks reuse it without re-walking
+    artifact JSON. ``reset_board_cache()`` busts both.
     """
     cache_d = Path(cache_dir) if cache_dir else _default_cache_dir()
     artifact_d = (
@@ -733,7 +814,9 @@ def discover_board_catalogue(
 
     if not cache_d.exists() or not cache_d.is_dir():
         if use_cache:
-            _BOARD_CACHE[key] = {"rows": rows}
+            _BOARD_CACHE[key] = {
+                "rows": rows, "artifact_index": {},
+            }
         return rows
 
     artifact_index = _index_artifacts_by_engine_target(artifact_d)
@@ -755,18 +838,6 @@ def discover_board_catalogue(
             continue
         tickers_seen.add(norm)
 
-        try:
-            payload = _pse.load_primary_signal_engine_payload(
-                ticker, cache_dir=cache_d,
-            )
-        except Exception:
-            continue
-        if not isinstance(payload, dict) or not payload.get("available"):
-            continue
-
-        signal = str(payload.get("current_signal") or "None") or "None"
-        signal_value = SIGNAL_TO_VALUE.get(signal, 0)
-
         impactsearch_ref = artifact_index.get(
             (ENGINE_IMPACTSEARCH, norm),
         )
@@ -780,6 +851,9 @@ def discover_board_catalogue(
             (ENGINE_CONFLUENCE, norm),
         )
 
+        signal = _signal_from_refs(confluence_ref, impactsearch_ref)
+        signal_value = SIGNAL_TO_VALUE.get(signal, 0)
+
         agreement_active, agreement_total = _confluence_active_total(
             confluence_ref,
         )
@@ -788,7 +862,7 @@ def discover_board_catalogue(
 
         coverage = coverage_status_for_ticker(
             ticker,
-            payload=payload,
+            has_engine_cache=True,
             impactsearch_ref=impactsearch_ref,
             stackbuilder_ref=stackbuilder_ref,
             trafficflow_ref=trafficflow_ref,
@@ -798,7 +872,7 @@ def discover_board_catalogue(
             now=now,
         )
 
-        as_of = _row_as_of_date(payload, artifact_index, norm)
+        as_of = _row_as_of_date(artifact_index, norm)
 
         rows.append(BoardRow(
             ticker=ticker,
@@ -811,20 +885,41 @@ def discover_board_catalogue(
         ))
 
     if use_cache:
-        _BOARD_CACHE[key] = {"rows": rows}
+        _BOARD_CACHE[key] = {
+            "rows": rows, "artifact_index": artifact_index,
+        }
     return rows
 
 
+def _cached_artifact_index(
+    cache_dir: Path, artifact_root: Path, sig_lib_dir: Path,
+) -> dict[tuple[str, str], _ArtifactRef]:
+    """Return the artifact index produced by the most recent
+    ``discover_board_catalogue`` call for the same directory triple,
+    or build one if discovery has not yet run for this triple.
+
+    Callbacks reuse this so per-click handlers never re-walk the
+    artifact tree.
+    """
+    key = _cache_key(cache_dir, artifact_root, sig_lib_dir)
+    entry = _BOARD_CACHE.get(key)
+    if entry and "artifact_index" in entry:
+        return entry["artifact_index"]
+    idx = _index_artifacts_by_engine_target(artifact_root)
+    _BOARD_CACHE.setdefault(key, {})["artifact_index"] = idx
+    return idx
+
+
 def _row_as_of_date(
-    payload: Mapping[str, Any],
     artifact_index: Mapping[tuple[str, str], _ArtifactRef],
     norm_ticker: str,
 ) -> Optional[str]:
-    date_range = payload.get("date_range") or {}
-    if isinstance(date_range, Mapping):
-        end = date_range.get("end")
-        if end:
-            return str(end)
+    """Scoreboard row as-of date. Sources research_day_v1 artifacts
+    only; cache-only tickers return ``None`` (rendered as ``"-"``).
+
+    The Spymaster cache's ``date_range.end`` is intentionally NOT
+    consulted here because that requires opening the PKL, which the
+    perf contract forbids during cold-boot discovery."""
     candidates: list[str] = []
     for engine in (
         ENGINE_IMPACTSEARCH, ENGINE_STACKBUILDER,
@@ -918,13 +1013,15 @@ def _build_signal_engine_figure(
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        name="Engine cumulative capture",
+        name=BOARD_COPY["chart_trace_engine_capture"],
         x=dates, y=cum, mode="lines", yaxis="y",
         line={"color": DESIGN_TOKENS["color_green"], "width": 1.6},
     ))
     if any(c is not None for c in closes):
         fig.add_trace(go.Scatter(
-            name=f"{ticker} close price",
+            name=BOARD_COPY["chart_trace_close_price_fmt"].format(
+                ticker=ticker,
+            ),
             x=dates, y=closes, mode="lines", yaxis="y2",
             line={
                 "color": DESIGN_TOKENS["color_text"],
@@ -939,18 +1036,18 @@ def _build_signal_engine_figure(
         font={"color": DESIGN_TOKENS["color_text"], "size": 11},
         xaxis={
             "gridcolor": DESIGN_TOKENS["color_border"],
-            "title": "Date",
+            "title": BOARD_COPY["chart_axis_date"],
         },
         yaxis={
             "gridcolor": DESIGN_TOKENS["color_border"],
-            "title": "Cumulative Capture (%)",
+            "title": BOARD_COPY["chart_axis_cumulative_capture"],
         },
         yaxis2={
             "overlaying": "y",
             "side": "right",
             "showgrid": False,
             "zeroline": False,
-            "title": "Close Price",
+            "title": BOARD_COPY["chart_axis_close_price"],
         },
         legend={
             "orientation": "h",
@@ -1660,9 +1757,14 @@ def _build_initial_state(
     use_cache: bool = True,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Common pre-render state: discovered rows, default selection,
-    artifact index, health report, etc. The callbacks reuse this
-    same shape for re-renders."""
+    """Build the per-render state bundle reused by the initial
+    layout build and every callback fire.
+
+    Heavy work (discovery + artifact-tree walk) is memoized via
+    ``_BOARD_CACHE`` keyed on the directory triple, so re-entry
+    from a callback is a dict lookup. Per-state ``payload_cache``
+    isolates one PKL hydration per selected ticker per render
+    bundle - featured + evidence panels share the same payload."""
     cache_d = Path(cache_dir) if cache_dir else _default_cache_dir()
     artifact_d = (
         Path(artifact_root) if artifact_root else _default_artifact_root()
@@ -1688,33 +1790,59 @@ def _build_initial_state(
         "artifact_root": artifact_d,
         "sig_lib_dir": sig_d,
         "health_report": health_report,
-        "artifact_index": _index_artifacts_by_engine_target(
-            artifact_d,
+        # Reuses the cached artifact index discovery built; falls
+        # back to a fresh walk only when discovery did not run
+        # (e.g. cache_dir missing).
+        "artifact_index": _cached_artifact_index(
+            cache_d, artifact_d, sig_d,
         ),
         "now": now or datetime.now(timezone.utc),
+        # Per-render payload cache. Featured and Evidence both call
+        # _ticker_payload for the same selected ticker; this shares
+        # the hydration so it costs one PKL load, not two.
+        "payload_cache": {},
     }
 
 
 def _ticker_payload(
-    ticker: str, cache_dir: Path,
+    ticker: str,
+    state: Optional[Mapping[str, Any]] = None,
+    *,
+    cache_dir: Optional[Path] = None,
 ) -> Optional[Mapping[str, Any]]:
+    """Hydrate a single ticker's Signal Engine payload, with a
+    per-state cache so the same ticker is loaded at most once per
+    render bundle. Pass ``state`` (preferred) when calling from
+    inside a callback; ``cache_dir`` is the standalone fallback for
+    tests / one-off lookups.
+    """
     if not ticker:
         return None
+    if state is not None:
+        cache = state.get("payload_cache")
+        if isinstance(cache, dict) and ticker in cache:
+            return cache[ticker]
+        cache_d = state.get("cache_dir")
+    else:
+        cache_d = cache_dir
     try:
         payload = _pse.load_primary_signal_engine_payload(
-            ticker, cache_dir=cache_dir,
+            ticker, cache_dir=cache_d,
         )
     except Exception:
-        return None
+        payload = None
     if not isinstance(payload, dict):
-        return None
+        payload = None
+    if state is not None:
+        cache = state.setdefault("payload_cache", {})
+        cache[ticker] = payload
     return payload
 
 
 def _render_featured_for(
     ticker: str, state: Mapping[str, Any],
 ) -> Any:
-    payload = _ticker_payload(ticker, state["cache_dir"])
+    payload = _ticker_payload(ticker, state)
     confluence_ref = state["artifact_index"].get(
         (ENGINE_CONFLUENCE, ticker.strip().upper()),
     )
@@ -1731,7 +1859,7 @@ def _render_evidence_for(
     ticker: str, state: Mapping[str, Any],
 ) -> Any:
     norm = ticker.strip().upper() if ticker else ""
-    payload = _ticker_payload(ticker, state["cache_dir"]) if ticker else None
+    payload = _ticker_payload(ticker, state) if ticker else None
     artifact_index = state["artifact_index"]
     impactsearch_ref = artifact_index.get((ENGINE_IMPACTSEARCH, norm))
     stackbuilder_ref = artifact_index.get((ENGINE_STACKBUILDER, norm))
@@ -1761,9 +1889,27 @@ def build_app(
     artifact_root: Optional[Path] = None,
     sig_lib_dir: Optional[Path] = None,
 ) -> Any:
-    """Construct the Dash app. All discovery is lazy at request time
-    via callbacks - module load does not require any cache or
-    artifact dir to exist."""
+    """Construct the Dash app.
+
+    Cold-boot work:
+
+      * Scoreboard rows are built from cache filenames + saved
+        research_day_v1 artifacts. The Spymaster cache PKL is NOT
+        hydrated during scoreboard construction.
+      * Confluence agreement / row signal / coverage all come from
+        the artifact tree (see ``discover_board_catalogue`` data
+        contract).
+      * The Featured + Evidence panels DO hydrate exactly one
+        ticker - the default selected ticker - so the first paint
+        carries real Signal Engine numbers. That single PKL load is
+        the only per-build call into
+        ``primary_signal_engine.load_primary_signal_engine_payload``.
+
+    Callbacks rebuild the state bundle on each fire, but the heavy
+    discovery + artifact walk are memoized by ``discover_board_catalogue``
+    on the directory triple, so callback re-entry is cheap. The
+    callback also pays one PKL load for the newly-selected ticker.
+    """
     dash, dcc, html = _dash_modules()
     from dash import Input, Output, State
     from dash.dependencies import ALL

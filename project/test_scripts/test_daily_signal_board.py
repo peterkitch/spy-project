@@ -157,13 +157,22 @@ def _reset_board_cache_each_test():
 
 
 def test_catalogue_discovery_returns_only_cached_tickers(tmp_path: Path):
+    """Discovery enumerates ``*_precomputed_results.pkl`` filenames.
+
+    Per the Phase 6C-7 perf amendment, the PKL is NOT opened during
+    discovery, so a malformed PKL still produces a row (the user
+    sees the cache-only fallback). Filename-pattern mismatches are
+    still excluded silently.
+    """
     cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
     _write_min_spymaster_cache(cache_dir, "SPY")
     _write_min_spymaster_cache(cache_dir, "ACME")
-    # Malformed cache file: should be excluded.
+    # Malformed file: filename matches the pattern, so it still
+    # appears as a row. The cached signal falls back to "None"
+    # because no research_day_v1 artifact exists for BAD.
     bad = cache_dir / "BAD_precomputed_results.pkl"
     bad.write_bytes(b"not a pickle")
-    # Filename pattern mismatch: should be skipped silently.
+    # Filename pattern mismatch: never enters the catalogue.
     (cache_dir / "ignore_me.txt").write_text("noop")
 
     rows = board.discover_board_catalogue(
@@ -175,11 +184,19 @@ def test_catalogue_discovery_returns_only_cached_tickers(tmp_path: Path):
     tickers = {r.ticker for r in rows}
     assert "SPY" in tickers
     assert "ACME" in tickers
-    assert "BAD" not in tickers
-    # And the payload semantics flow through.
-    spy = next(r for r in rows if r.ticker == "SPY")
-    assert spy.signal in {"Buy", "Short", "None"}
-    assert spy.signal_value in {-1, 0, 1}
+    assert "BAD" in tickers, (
+        "filename-pattern match must produce a row even when the "
+        "PKL is malformed; the PKL is not opened during discovery"
+    )
+    assert "ignore_me" not in tickers
+    # Cache-only ticker with no artifacts -> None / 0 / Partial.
+    for row in rows:
+        assert row.signal in {"Buy", "Short", "None"}
+        assert row.signal_value in {-1, 0, 1}
+        assert row.coverage == board.COVERAGE_PARTIAL, (
+            f"{row.ticker}: cache-only ticker should be Partial; "
+            f"got {row.coverage}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -200,14 +217,13 @@ def _make_ref(last_date: str, artifact: Any = None) -> Any:
 
 
 def test_coverage_status_full_partial_stale_under_review():
+    """Phase 6C-7 perf amendment: stale is driven by artifact dates
+    only (the cache PKL is never opened during scoreboard
+    discovery, so its date_range.end can't feed staleness)."""
     fresh = "2026-05-09"
     stale = (datetime(2026, 5, 9, tzinfo=timezone.utc)
              - timedelta(days=400)).strftime("%Y-%m-%d")
     now = datetime(2026, 5, 10, tzinfo=timezone.utc)
-    base_payload = {
-        "available": True,
-        "date_range": {"start": "2020-01-01", "end": fresh},
-    }
     fresh_ref = _make_ref(fresh, artifact=SimpleNamespace(
         timeframes=["1d", "1wk", "1mo"], daily=[
             {"active_count": 3, "available_count": 3},
@@ -218,7 +234,7 @@ def test_coverage_status_full_partial_stale_under_review():
     #    even with full + fresh evidence.
     coverage = board.coverage_status_for_ticker(
         "SPY",
-        payload=base_payload,
+        has_engine_cache=True,
         impactsearch_ref=fresh_ref,
         stackbuilder_ref=fresh_ref,
         trafficflow_ref=fresh_ref,
@@ -229,12 +245,8 @@ def test_coverage_status_full_partial_stale_under_review():
     )
     assert coverage == board.COVERAGE_UNDER_REVIEW
 
-    # 2. Stale beats Full when the newest evidence date is older than
-    #    STALE_DAYS, regardless of artifact completeness.
-    stale_payload = {
-        "available": True,
-        "date_range": {"start": "2018-01-01", "end": stale},
-    }
+    # 2. Stale beats Full when the newest artifact date is older
+    #    than STALE_DAYS, regardless of artifact completeness.
     stale_ref = _make_ref(stale, artifact=SimpleNamespace(
         timeframes=["1d", "1wk", "1mo"], daily=[
             {"active_count": 2, "available_count": 3},
@@ -242,7 +254,7 @@ def test_coverage_status_full_partial_stale_under_review():
     ))
     coverage = board.coverage_status_for_ticker(
         "SPY",
-        payload=stale_payload,
+        has_engine_cache=True,
         impactsearch_ref=stale_ref,
         stackbuilder_ref=stale_ref,
         trafficflow_ref=stale_ref,
@@ -256,7 +268,7 @@ def test_coverage_status_full_partial_stale_under_review():
     # 3. Full: fresh evidence in every engine + 2+ Calendar timeframes.
     coverage = board.coverage_status_for_ticker(
         "SPY",
-        payload=base_payload,
+        has_engine_cache=True,
         impactsearch_ref=fresh_ref,
         stackbuilder_ref=fresh_ref,
         trafficflow_ref=fresh_ref,
@@ -270,7 +282,7 @@ def test_coverage_status_full_partial_stale_under_review():
     # 4. Partial: only the engine cache is present.
     coverage = board.coverage_status_for_ticker(
         "SPY",
-        payload=base_payload,
+        has_engine_cache=True,
         impactsearch_ref=None,
         stackbuilder_ref=None,
         trafficflow_ref=None,
@@ -281,7 +293,20 @@ def test_coverage_status_full_partial_stale_under_review():
     )
     assert coverage == board.COVERAGE_PARTIAL
 
-    # 5. Priority order is documented + canonical.
+    # 5. Cache-only with no artifacts is NOT stale even when the
+    #    cache itself would be ancient on disk: staleness requires
+    #    an artifact-date signal under the perf contract.
+    assert board.coverage_status_for_ticker(
+        "SPY",
+        has_engine_cache=True,
+        impactsearch_ref=None, stackbuilder_ref=None,
+        trafficflow_ref=None, confluence_ref=None,
+        calendar_timeframes=[],
+        health_blocked=[],
+        now=now,
+    ) == board.COVERAGE_PARTIAL
+
+    # 6. Priority order is documented + canonical.
     assert board.COVERAGE_PRIORITY == (
         board.COVERAGE_UNDER_REVIEW,
         board.COVERAGE_STALE,
@@ -470,7 +495,12 @@ def test_missing_station_renders_placeholder_text(tmp_path: Path):
 
 
 def test_board_copy_dict_owns_visible_copy():
+    """Pins every visible string the public board renders. Phase
+    6C-7 audit extension: the Plotly chart's trace names and axis
+    titles are now included so a future tweak cannot drift outside
+    BOARD_COPY."""
     expected_visible = {
+        # Section + scoreboard copy
         "No saved tickers yet.",
         "Not yet built for this ticker.",
         "Historical research output. Not investment advice. Not a live "
@@ -491,11 +521,62 @@ def test_board_copy_dict_owns_visible_copy():
         "What It Is Not",
         "{active} of {total} timeframes agree",
         "Confluence data unavailable",
+        # Chart trace names + axis titles (Phase 6C-7 audit fix)
+        "Engine cumulative capture",
+        "{ticker} close price",
+        "Date",
+        "Cumulative Capture (%)",
+        "Close Price",
     }
     flat = _flatten_board_copy_values()
     missing = expected_visible - flat
     assert not missing, (
         "expected visible strings missing from BOARD_COPY: " + repr(missing)
+    )
+
+
+def test_chart_figure_strings_come_from_board_copy(tmp_path: Path):
+    """Build a chart figure and confirm every visible string on it
+    (trace names + axis titles) comes from ``BOARD_COPY`` rather
+    than a hardcoded literal."""
+    pytest.importorskip("plotly")
+    payload = {
+        "schema": "primary_signal_engine_payload_v1",
+        "ticker": "SPY",
+        "available": True,
+        "chart_rows": [
+            {"date": "2024-01-02", "close": 100.0,
+             "cumulative_capture_pct": 0.0},
+            {"date": "2024-01-03", "close": 120.0,
+             "cumulative_capture_pct": 5.0},
+            {"date": "2024-01-04", "close": 110.0,
+             "cumulative_capture_pct": 3.0},
+        ],
+    }
+    fig = board._build_signal_engine_figure("SPY", payload)
+    assert fig is not None
+    # Trace names
+    trace_names = [t.name for t in fig.data]
+    assert (
+        board.BOARD_COPY["chart_trace_engine_capture"] in trace_names
+    )
+    assert (
+        board.BOARD_COPY["chart_trace_close_price_fmt"].format(
+            ticker="SPY",
+        ) in trace_names
+    )
+    # Axis titles
+    assert (
+        fig.layout.xaxis.title.text
+        == board.BOARD_COPY["chart_axis_date"]
+    )
+    assert (
+        fig.layout.yaxis.title.text
+        == board.BOARD_COPY["chart_axis_cumulative_capture"]
+    )
+    assert (
+        fig.layout.yaxis2.title.text
+        == board.BOARD_COPY["chart_axis_close_price"]
     )
 
 
@@ -690,6 +771,136 @@ def test_app_boots_with_layout(tmp_path: Path):
         "section-what-it-is-not",
     ):
         assert _component_contains_id(app.layout, sid)
+
+
+# ---------------------------------------------------------------------------
+# 15. Cold-boot does not hydrate every cached ticker (Phase 6C-7 audit)
+# ---------------------------------------------------------------------------
+
+
+def test_cold_boot_does_not_call_payload_loader_per_ticker(
+    monkeypatch, tmp_path: Path,
+):
+    """Phase 6C-7 audit: ``build_app()`` must not open every cache
+    PKL on cold boot. The scoreboard is built from filenames +
+    saved artifacts; the only payload load allowed at cold boot is
+    the single hydration for the default selected ticker (shared
+    by Featured + Evidence via the per-state payload cache)."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    # 12 fake cache filenames; one is SPY so the default selector
+    # finds a meaningful seed without alphabetical drift.
+    fake_tickers = [
+        "SPY", "AAA", "BBB", "CCC", "DDD", "EEE",
+        "FFF", "GGG", "HHH", "III", "JJJ", "KKK",
+    ]
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    for t in fake_tickers:
+        if t == "SPY":
+            continue
+        # The other 11 are just touched empty - discovery must not
+        # try to open them.
+        (cache_dir / f"{t}_precomputed_results.pkl").write_bytes(b"")
+
+    real_loader = pse.load_primary_signal_engine_payload
+    call_log: list[str] = []
+
+    def _spy_loader(ticker, *args, **kwargs):
+        call_log.append(str(ticker))
+        return real_loader(ticker, *args, **kwargs)
+
+    monkeypatch.setattr(
+        pse, "load_primary_signal_engine_payload", _spy_loader,
+    )
+    # daily_signal_board.py imports pse as `_pse`; rebinding the
+    # attribute on the original module is enough because the import
+    # is `import primary_signal_engine as _pse` (module reference).
+    monkeypatch.setattr(
+        board._pse, "load_primary_signal_engine_payload", _spy_loader,
+        raising=False,
+    )
+
+    board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+    # The contract: at most ONE hydration call (the default selected
+    # ticker, shared by Featured + Evidence via the per-state cache).
+    # The other 11 tickers must never be opened.
+    assert len(call_log) <= 1, (
+        f"build_app() hydrated {len(call_log)} tickers on cold "
+        f"boot; expected <=1: {call_log[:8]}"
+    )
+    # And whatever was hydrated must be the default selected ticker
+    # (SPY here), never a random other entry.
+    if call_log:
+        assert call_log[0] == "SPY"
+    # The other cache filenames must not have been opened.
+    for t in fake_tickers:
+        if t == "SPY":
+            continue
+        assert t not in call_log, (
+            f"build_app() opened non-selected ticker {t!r} "
+            f"during cold boot"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 16. Perf: 200 fake cached filenames -> fast discovery, no hydration
+# ---------------------------------------------------------------------------
+
+
+def test_discovery_handles_200_fixtures_without_hydrating(
+    monkeypatch, tmp_path: Path,
+):
+    """Phase 6C-7 audit: 200 fake cache filenames must not produce
+    200 PKL hydrations during discovery, and discovery itself must
+    finish well under the documented 2-second budget on Peter's
+    hardware. We measure wall time and the payload-loader call
+    count."""
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    for i in range(200):
+        (cache_dir / f"FAKE{i:03d}_precomputed_results.pkl").write_bytes(b"")
+
+    call_log: list[str] = []
+
+    def _spy_loader(ticker, *args, **kwargs):
+        call_log.append(str(ticker))
+        return {"available": False, "ticker": ticker, "reason": "no_data"}
+
+    monkeypatch.setattr(
+        pse, "load_primary_signal_engine_payload", _spy_loader,
+    )
+    monkeypatch.setattr(
+        board._pse, "load_primary_signal_engine_payload", _spy_loader,
+        raising=False,
+    )
+
+    t0 = time.perf_counter()
+    rows = board.discover_board_catalogue(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+        use_cache=False,
+    )
+    elapsed = time.perf_counter() - t0
+
+    assert len(rows) == 200, (
+        f"expected 200 BoardRows for 200 fixtures; got {len(rows)}"
+    )
+    assert not call_log, (
+        f"discover_board_catalogue called the payload loader "
+        f"{len(call_log)} times; expected 0: {call_log[:8]}"
+    )
+    # 2-second budget per the Phase 6C-7 spec on Peter's hardware.
+    # Empty fake files + no artifacts is the fastest case; the real
+    # bound is set generously here so the test stays stable across
+    # CI hardware while still catching catastrophic regressions.
+    assert elapsed < 5.0, (
+        f"discover_board_catalogue took {elapsed:.2f}s on 200 fake "
+        f"filenames; expected < 5s (2s target on Peter's hardware)"
+    )
 
 
 # ---------------------------------------------------------------------------
