@@ -218,11 +218,13 @@ need to be acknowledged before any production write:
     by small amounts; this is in scope for Phase 5G data
     licensing.
   - **No non-interactive refresh tool**: Spymaster's
-    Dash app is the only writer. A future Phase 6E-3 (or
-    similar) sub-phase needs to extract a non-interactive
-    `refresh_signal_engine_cache(ticker)` helper and a
-    CLI that calls it, so the pilot flow can be audited
-    end-to-end without browser interaction.
+    Dash app is the only writer (partially closed by
+    Phase 6E-3 — see § 6.5. The Phase 6E-3 CLI handles the
+    data-fetch + cache-write portion non-interactively
+    but does NOT run Spymaster's SMA-pair optimization, so
+    the resulting cache carries placeholder `active_pairs`.
+    A future sub-phase still needs to extract the SMA
+    optimizer for a full non-interactive pilot).
   - **`controlled_compute` cannot orchestrate Spymaster
     today**: it can run job specs, but Spymaster lacks
     the CLI surface it would call. Wiring this is a
@@ -236,6 +238,172 @@ need to be acknowledged before any production write:
     resolved upstream; refreshing source for a
     health-blocked ticker does nothing for the public
     board.
+
+## 6.5 Phase 6E-3 — Non-interactive Signal Engine cache
+       refresh CLI
+
+Phase 6E-3 adds the missing non-interactive operator CLI
+called out in § 6 as the "no non-interactive refresh tool"
+risk. The new module is
+`project/signal_engine_cache_refresher.py`; the test pin is
+`project/test_scripts/test_signal_engine_cache_refresher.py`.
+
+### 6.5.1 Scope (intentionally minimum-viable)
+
+The Phase 6E-3 refresher is intentionally scoped to what
+can ship in one PR without refactoring the Spymaster Dash
+app. It:
+
+  - Fetches fresh OHLC price data from a pluggable data
+    source (default: yfinance via a lazy import inside the
+    default fetcher; tests inject their own callable so the
+    network is never touched).
+  - Builds a `preprocessed_data` DataFrame with `Close`
+    plus `SMA_1` … `SMA_<max_sma_day>` columns so the cache
+    shape matches what the Signal Engine loader and
+    downstream engines expect.
+  - Populates `active_pairs` as a placeholder list of
+    `"None"` strings, one per row, so the cache is
+    **loadable** by
+    `primary_signal_engine.load_primary_signal_engine_payload`
+    but honestly reports `signal: None`.
+  - Writes the cache atomically (temp file +
+    `os.replace`) and emits the provenance manifest sidecar
+    using the central `provenance_manifest` helpers — the
+    same Phase 3 contract Spymaster uses for its own
+    cache writes.
+  - Writes the corresponding status JSON only when
+    `write=True`.
+
+### 6.5.2 Explicit non-goals
+
+What Phase 6E-3 deliberately does **not** do:
+
+  - **Run Spymaster's daily best-buy / best-short SMA-pair
+    optimization.** That logic is a closure inside a Dash
+    callback at `project/spymaster.py:5050-5117`. Reusing it
+    from a CLI would require either importing the entire
+    14k-line Spymaster module (which would import `dash` /
+    `plotly` / instantiate the Dash app object at
+    `spymaster.py:2811` as a module-level side effect) or
+    refactoring Spymaster to expose the math as a
+    standalone function. Neither fits the Phase 6E-3 PR
+    scope. The refresher therefore writes placeholder
+    `active_pairs` and leaves signal computation to the
+    Spymaster Dash app (current operator practice) or to a
+    future sub-phase that extracts the SMA optimizer.
+  - **Reuse `spymaster.save_precomputed_results`
+    directly.** Same reason: importing `spymaster` pulls in
+    `dash` / `plotly` and instantiates the Dash app. The
+    refresher reproduces the writer's atomic-write
+    semantics (`tempfile.NamedTemporaryFile` →
+    `pickle.dump` → `flush` → `os.fsync` → `os.replace`)
+    using stdlib only, plus the `provenance_manifest`
+    helpers for the sidecar.
+  - **Multi-ticker mode.** The CLI has `--ticker`
+    (singular) only. A multi-ticker mode would require a
+    dedicated scheduler / rate-limit story and is out of
+    scope.
+  - **Web-tier callability.** The refresher must never be
+    imported from `daily_signal_board.py` or any other
+    web-tier module. The test
+    `test_daily_signal_board_is_not_imported_by_refresher`
+    pins the absence of the relevant symbol in the
+    refresher's source.
+
+### 6.5.3 Public API
+
+```python
+refresh_signal_engine_cache(
+    ticker: str,
+    *,
+    cache_dir: Path | str | None = None,
+    status_dir: Path | str | None = None,
+    write: bool = False,
+    max_sma_day: int | None = None,           # default 30
+    data_fetcher: Callable | None = None,     # default yfinance
+    current_as_of_date: str | None = None,    # default today UTC
+) -> SignalEngineRefreshResult
+```
+
+`SignalEngineRefreshResult` fields (also exposed via
+`to_json_dict()` for the CLI):
+
+  - `ticker`, `write`
+  - `cache_path`, `manifest_path`, `status_path`
+  - `old_cache_date_range_end`,
+    `new_cache_date_range_end`
+  - `refreshed` (True only if `write=True` and the writer
+    landed)
+  - `stale_before`, `current_after`
+  - `issue_codes` — stable string set:
+    `invalid_ticker`, `data_fetch_failed`,
+    `data_no_close_column`, `data_empty`, `dry_run_only`,
+    `already_current`, `provenance_manifest_failed`
+  - `elapsed_seconds`
+
+### 6.5.4 CLI contract
+
+  - `python signal_engine_cache_refresher.py --ticker SPY --dry-run`
+  - `python signal_engine_cache_refresher.py --ticker SPY --write`
+  - `--ticker` is required; no `--tickers` (multi-ticker)
+    flag exists.
+  - Default is dry-run (`--dry-run` and `--write` are
+    mutually exclusive; absent both = dry-run).
+  - `--cache-dir` and `--status-dir` accepted for
+    operator / test control.
+  - JSON to stdout. Exit codes:
+      0  refresh completed (dry-run or write)
+      2  invalid CLI arguments (parser SystemExit is
+         trapped and converted)
+      3  unexpected unhandled exception
+
+### 6.5.5 Updated pilot ticker flow (replaces § 3, step 3)
+
+  1. `python source_freshness_preflight.py --ticker SPY` —
+     confirm `recommended_next_action=refresh_source_cache`
+     and `safe_to_attempt_refresh=True`.
+  2. `python signal_engine_cache_refresher.py --ticker SPY
+     --dry-run` — confirm the fetched
+     `new_cache_date_range_end` advances past the existing
+     `old_cache_date_range_end`. **No writes.**
+  3. (Authorized only) `python
+     signal_engine_cache_refresher.py --ticker SPY --write`
+     — produces the fresh cache PKL, manifest sidecar, and
+     status JSON.
+  4. `python source_freshness_preflight.py --ticker SPY` —
+     confirm the recommendation now moves to
+     `run_pipeline_after_refresh` (no longer
+     `refresh_source_cache`).
+  5. (Authorized only) `python confluence_pipeline_runner.py
+     --ticker SPY --write` — Phase 6D-4 runner produces the
+     per-K and Confluence artifacts.
+  6. `python board_launch_readiness_audit.py --tickers SPY`
+     — verify SPY is now `already_leader_eligible`.
+
+Step 4 is the explicit confirmation that the non-interactive
+refresh actually moved the ticker into a runnable state.
+**Do not skip Step 4.**
+
+### 6.5.6 Residual gaps the refresher does NOT close
+
+Even after a `write=True` refresh, the cache produced by
+Phase 6E-3 carries:
+
+  - `active_pairs` = placeholder `"None"` strings (no
+    daily best buy / best short pair computed). The Signal
+    Engine view will show `signal: None`.
+  - `top_buy_pair` / `top_short_pair` set to MAX-SMA
+    sentinels so Spymaster's writer-guard convention is
+    satisfied but the cache carries no leader-pair
+    insight.
+
+For a full Spymaster-equivalent cache the operator still
+needs to run the Spymaster Dash app, OR a future
+Phase 6E-4 (or similar) sub-phase that extracts the
+SMA-pair optimizer as a non-interactive helper. The current
+phase deliberately leaves that work out so the refresh CLI
+can ship and be audited in isolation.
 
 ## 7. Out of scope for Phase 6E-2
 
@@ -268,3 +436,7 @@ need to be acknowledged before any production write:
     `project/source_freshness_preflight.py`.
   - Preflight tests:
     `project/test_scripts/test_source_freshness_preflight.py`.
+  - Phase 6E-3 refresher:
+    `project/signal_engine_cache_refresher.py`.
+  - Phase 6E-3 refresher tests:
+    `project/test_scripts/test_signal_engine_cache_refresher.py`.
