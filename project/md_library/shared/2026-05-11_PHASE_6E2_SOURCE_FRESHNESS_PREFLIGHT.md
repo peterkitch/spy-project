@@ -451,6 +451,123 @@ JSON, and CLI surface in Phase 6E-3 are already in place
 for that work — the SMA extraction is the only blocking
 piece.
 
+## 6.6 Phase 6E-4 — SMA optimizer extraction (isolated)
+
+Phase 6E-4 (PR pending) lifts the Spymaster daily best-buy
+/ best-short SMA-pair optimizer out of the Dash callback
+and into a pure, offline, importable helper at
+`project/signal_engine_sma_optimizer.py`. The test pin is
+`project/test_scripts/test_signal_engine_sma_optimizer.py`.
+
+**This PR does NOT release the Phase 6E-3 data_only_v1
+write guard.** It only extracts and validates the
+optimizer. Wiring the optimizer into
+`signal_engine_cache_refresher.py` (and thereby releasing
+the `--write` guard) is left to a follow-up PR so the
+extraction can be audited in isolation.
+
+### 6.6.1 Public surface
+
+```python
+optimize_signal_engine_sma_pairs(
+    preprocessed_data: pd.DataFrame,
+    *,
+    ticker: Optional[str] = None,
+    max_sma_day: int = 30,
+) -> SignalEngineSmaOptimizationResult
+```
+
+`SignalEngineSmaOptimizationResult` carries every field a
+future refresher-wiring PR needs to build a production-safe
+Signal Engine cache payload: `preprocessed_data`,
+`daily_top_buy_pairs`, `daily_top_short_pairs`,
+`cumulative_combined_captures`, `active_pairs`,
+`top_buy_pair` / `top_short_pair` /
+`top_buy_capture` / `top_short_capture`,
+`last_processed_date`, `existing_max_sma_day`,
+`issue_codes`.
+
+Stable issue codes:
+`invalid_preprocessed_data`,
+`insufficient_history`,
+`invalid_max_sma_day`.
+
+### 6.6.2 Spymaster behaviors preserved
+
+The optimizer is a port — not a rewrite — of the math
+that has been Spymaster's regression baseline since the
+Phase 1 baseline lock. Each preserved behavior cites the
+exact Spymaster source line(s) so a future audit can
+follow the trail:
+
+  - **SMA construction**:
+    `Close.rolling(window=j, min_periods=j, center=False).mean()`
+    (`spymaster.py:4929`).
+  - **Returns vector**:
+    `Close.pct_change(fill_method=None)` with `±inf -> NaN
+    -> 0` (`spymaster.py:4972-4976`).
+  - **Pair enumeration order**: every ordered `(i, j)` with
+    `1 <= i, j <= max_sma_day` and `i != j`, in the
+    exact `pc_global` walk Spymaster uses
+    (`spymaster.py:5036-5042`).
+  - **Right-most tie-break on equal cumulative capture**
+    (`spymaster.py:5076-5092`).
+  - **`(0, 0)` -> MAX-SMA sentinel back-fill**
+    (`spymaster.py:5100-5111`).
+  - **`_align_pairs_to_calendar` semantics**
+    (`spymaster.py:7576`).
+  - **`calculate_cumulative_combined_capture` per-day
+    rule** (`spymaster.py:7649-7710`).
+
+### 6.6.3 Parity result (SPY)
+
+Refitting the optimizer against the existing saved SPY
+cache (`project/cache/results/SPY_precomputed_results.pkl`)
+reproduces Spymaster's published output:
+
+  - `top_buy_pair`: `(11, 5)` — exact match.
+  - `top_short_pair`: `(11, 5)` — exact match.
+  - last `active_pair`: `"Short 11,5"` — exact match.
+  - final `cumulative_combined_capture`: `201.1422` —
+    matches Spymaster's cached value within
+    `1e-9` rel-tol / `1e-6` abs-tol.
+  - full `active_pairs` sequence: `8372/8372` positions
+    match exactly.
+
+Runtime: about 2.5 seconds for the full SPY cache
+(8,372 days × 12,882 pairs at `max_sma_day=114`).
+
+### 6.6.4 Remaining gap
+
+The Phase 6E-3 refresher's `--write` path is still
+refused under the `data_only_v1` guard. A follow-up PR
+will:
+
+  1. Import and call `optimize_signal_engine_sma_pairs`
+     from inside `refresh_signal_engine_cache`.
+  2. Replace the placeholder `active_pairs = ["None", ...]`
+     with the optimizer's real
+     `result.active_pairs`.
+  3. Flip the payload scope marker off `data_only_v1`.
+  4. Re-enable the existing (currently dead) atomic-write
+     + manifest + status branch.
+
+Phase 6E-4 deliberately stops short of that wiring so
+the optimizer's parity and contract can be audited
+without changing any production-affecting behavior.
+
+### 6.6.5 Hard rules pinned in Phase 6E-4 tests
+
+  - No `spymaster`, `dash`, `plotly`, `yfinance`,
+    `daily_signal_board`, or other web-tier import in
+    `signal_engine_sma_optimizer.py`.
+  - The optimizer runs without network and without
+    writing to `cache/results/` or
+    `output/research_artifacts/`.
+  - A negative-control test snapshots the production
+    cache directory before and after the call and
+    asserts byte-identical state.
+
 ## 7. Out of scope for Phase 6E-2
 
   - Writing a non-interactive Spymaster refresh CLI.
@@ -486,3 +603,7 @@ piece.
     `project/signal_engine_cache_refresher.py`.
   - Phase 6E-3 refresher tests:
     `project/test_scripts/test_signal_engine_cache_refresher.py`.
+  - Phase 6E-4 optimizer:
+    `project/signal_engine_sma_optimizer.py`.
+  - Phase 6E-4 optimizer tests:
+    `project/test_scripts/test_signal_engine_sma_optimizer.py`.
