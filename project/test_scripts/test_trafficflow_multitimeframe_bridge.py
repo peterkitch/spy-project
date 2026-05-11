@@ -341,6 +341,207 @@ def test_build_per_artifact_preserves_k_and_timeframes(
 # ---------------------------------------------------------------------------
 
 
+def _write_legacy_unsuffixed_trafficflow_artifact(
+    artifact_root: Path,
+    *,
+    target: str,
+    run_id: str,
+    K: Optional[int],
+    daily_rows: list[dict[str, Any]],
+) -> Path:
+    """Write a legacy-shaped TrafficFlow artifact whose filename
+    does NOT carry the Phase 6D-1 ``__K<K>`` suffix. Used by the
+    PR #197 audit tests to prove the bridge filter rejects such
+    inputs."""
+    safe = target.replace("^", "_")
+    engine_dir = artifact_root / "trafficflow" / safe
+    engine_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="trafficflow",
+        target_ticker=target,
+        signal_source="",
+        run_id=run_id,
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 5.0,
+            "sharpe_ratio": 0.05,
+            "trigger_days": 1,
+        },
+        daily=list(daily_rows),
+        K=K,
+        members=["AAA", "BBB"],
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    return ra.write_research_day_artifact(
+        art, engine_dir / f"{run_id}.research_day.json",
+    )
+
+
+def _write_mismatched_k_artifact(
+    artifact_root: Path,
+    *,
+    target: str,
+    seed_run_id: str,
+    filename_K: int,
+    artifact_K: int,
+    daily_rows: list[dict[str, Any]],
+) -> Path:
+    """Write an artifact whose filename suffix declares one K but
+    whose internal ``K`` field declares another. Audit tests use
+    this to prove the bridge skips conflicting inputs."""
+    safe = target.replace("^", "_")
+    engine_dir = artifact_root / "trafficflow" / safe
+    engine_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="trafficflow",
+        target_ticker=target,
+        signal_source="",
+        run_id=f"{seed_run_id}__K{filename_K}",
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 7.0,
+            "sharpe_ratio": 0.05,
+            "trigger_days": 1,
+        },
+        daily=list(daily_rows),
+        K=artifact_K,
+        members=["AAA", "BBB"],
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+    )
+    return ra.write_research_day_artifact(
+        art,
+        engine_dir / f"{seed_run_id}__K{filename_K}.research_day.json",
+    )
+
+
+def test_legacy_unsuffixed_artifact_is_ignored_as_mtf_input(
+    tmp_path: Path,
+):
+    """PR #197 audit fix: a legacy TrafficFlow artifact named
+    ``<seed>.research_day.json`` (no ``__K<K>`` suffix) must NOT
+    be treated as a Phase 6D-2 input, even if it has ``K`` set
+    internally. Builders must report
+    ``no_daily_k_artifacts`` in that case."""
+    import pandas as pd
+    dirs = _layout(tmp_path)
+    dates = pd.bdate_range(end="2026-05-08", periods=10)
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), 100.0 + i, "Buy")
+        for i, d in enumerate(dates)
+    ]
+    _write_legacy_unsuffixed_trafficflow_artifact(
+        dirs["artifact_root"],
+        target="SPY",
+        run_id="legacy_seed",  # NB: no __K1 suffix on filename
+        K=1,
+        daily_rows=rows,
+    )
+    res = mtfb.build_multitimeframe_bridge_artifacts_for_target(
+        "SPY",
+        artifact_root=dirs["artifact_root"],
+    )
+    assert res.issue_codes == (mtfb.ISSUE_NO_DAILY_K_ARTIFACTS,), (
+        "legacy unsuffixed artifact must not satisfy the bridge "
+        "input filter; got " + repr(res.issue_codes)
+    )
+    assert res.attempted_k == ()
+    assert res.built_k == ()
+
+
+def test_legacy_artifact_plus_proper_k_uses_proper_k_source(
+    tmp_path: Path,
+):
+    """When both a legacy unsuffixed K=1 artifact and a proper
+    Phase 6D-1 ``__K1`` artifact exist, the bridge must use the
+    proper one. The legacy artifact is filtered out before the
+    builder even reads it. Adding ``__K2`` keeps the test honest
+    about partial-K coverage messaging."""
+    import pandas as pd
+    dirs = _layout(tmp_path)
+    dates = pd.bdate_range(end="2026-05-08", periods=20)
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), 100.0 + i, "Buy")
+        for i, d in enumerate(dates)
+    ]
+    # The legacy artifact is sorted BEFORE the proper one because
+    # ``legacy_seed.research_day.json`` < ``proper_seed__K1...`` in
+    # filename order. Under the audit fix the legacy file is
+    # filtered out by the regex.
+    _write_legacy_unsuffixed_trafficflow_artifact(
+        dirs["artifact_root"], target="SPY",
+        run_id="aaa_legacy_seed", K=1, daily_rows=rows,
+    )
+    _write_daily_k_artifact(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="zzz_proper_seed", K=1, daily_rows=rows,
+    )
+    _write_daily_k_artifact(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="zzz_proper_seed", K=2, daily_rows=rows,
+    )
+
+    res = mtfb.build_multitimeframe_bridge_artifacts_for_target(
+        "SPY",
+        artifact_root=dirs["artifact_root"],
+        write=True,
+    )
+    # Built K should be {1, 2} from the proper __K1 / __K2 files;
+    # the legacy file never reaches the builder loop.
+    assert set(res.built_k) == {1, 2}
+    # Partial coverage flag is correct given expected_k = 1..12.
+    assert mtfb.ISSUE_PARTIAL_K_COVERAGE in res.issue_codes
+    # No K-mismatch issue from any input.
+    assert (
+        mtfb.ISSUE_INPUT_ARTIFACT_K_MISMATCH not in res.issue_codes
+    )
+    # And the persisted MTF artifacts trace back to the PROPER
+    # seed run id, not the legacy one.
+    for p in res.artifact_paths:
+        art = ra.read_research_day_artifact(p)
+        assert art is not None
+        assert art.run_id.startswith("zzz_proper_seed"), (
+            "MTF artifact must derive from the proper Phase 6D-1 "
+            f"source; got run_id={art.run_id!r}"
+        )
+
+
+def test_k_metadata_mismatch_is_ignored_and_reported(
+    tmp_path: Path,
+):
+    """A file whose filename suffix says ``__K3`` but whose
+    artifact ``K`` field says 5 must NOT contribute to coverage
+    AND must surface the mismatch issue code."""
+    import pandas as pd
+    dirs = _layout(tmp_path)
+    dates = pd.bdate_range(end="2026-05-08", periods=20)
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), 100.0 + i, "Buy")
+        for i, d in enumerate(dates)
+    ]
+    _write_mismatched_k_artifact(
+        dirs["artifact_root"], target="SPY",
+        seed_run_id="seed", filename_K=3, artifact_K=5,
+        daily_rows=rows,
+    )
+
+    res = mtfb.build_multitimeframe_bridge_artifacts_for_target(
+        "SPY",
+        artifact_root=dirs["artifact_root"],
+        write=False,
+    )
+    assert mtfb.ISSUE_INPUT_ARTIFACT_K_MISMATCH in res.issue_codes
+    # Neither K=3 (filename) nor K=5 (artifact) should count as
+    # built coverage.
+    assert res.attempted_k == ()
+    assert res.built_k == ()
+
+
 def test_target_sweep_returns_no_daily_k_when_input_absent(
     tmp_path: Path,
 ):

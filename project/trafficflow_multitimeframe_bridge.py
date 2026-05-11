@@ -103,6 +103,7 @@ Public surface
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -110,6 +111,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import research_artifacts as _ra
+
+
+# Matches the Phase 6D-1 daily-K artifact filename suffix:
+# ``<seed_run_id>__K<digits>.research_day.json``. The ``__MTF``
+# bridge outputs do not match this regex (their suffix is
+# ``__MTF.research_day.json``), and neither do legacy unsuffixed
+# TrafficFlow artifacts (e.g. ``<seed_run_id>.research_day.json``).
+DAILY_K_FILENAME_RX = re.compile(r"__K(\d+)\.research_day\.json$")
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +150,7 @@ _TIMEFRAME_TO_FREQ: dict[str, Optional[str]] = {
 ISSUE_NO_DAILY_K_ARTIFACTS = "no_daily_k_artifacts"
 ISSUE_INPUT_ARTIFACT_UNREADABLE = "input_artifact_unreadable"
 ISSUE_INPUT_ARTIFACT_NO_DAILY = "input_artifact_no_daily"
+ISSUE_INPUT_ARTIFACT_K_MISMATCH = "input_artifact_k_mismatch"
 ISSUE_PARTIAL_K_COVERAGE = "partial_k_coverage"
 ISSUE_ARTIFACT_WRITE_FAILED = "artifact_write_failed"
 
@@ -559,23 +569,37 @@ def _engine_artifact_dir(
 
 def _list_daily_k_artifacts(
     artifact_root: Path, ticker: str,
-) -> list[Path]:
-    """Find every saved daily-K TrafficFlow artifact for the
-    ticker. Daily-K artifacts are produced by Phase 6D-1; their
-    ``run_id`` matches the seed-run dir name with a ``__K<K>``
-    suffix and they do NOT carry an ``__MTF`` suffix on disk.
+) -> list[tuple[Path, int]]:
+    """Return Phase 6D-1 daily-K artifact ``(path, K_from_filename)``
+    pairs for the ticker.
+
+    PR #197 audit-tighten: strictly filter by the Phase 6D-1
+    filename convention ``<seed_run_id>__K<digits>.research_day.json``.
+    Anything that does not match - legacy unsuffixed artifacts,
+    ``__MTF`` bridge outputs, hand-named files - is **silently
+    excluded** here. The Phase 6D-2 bridge must consume only
+    proper Phase 6D-1 inputs; legacy K=1 artifacts from before
+    the suffix convention must not be used as MTF source rows.
+    The artifact's internal ``K`` is verified against the
+    filename ``K`` upstream and an
+    ``input_artifact_k_mismatch`` issue code is raised when they
+    disagree.
     """
     ticker_dir = _engine_artifact_dir(
         artifact_root, "trafficflow", ticker,
     )
     if ticker_dir is None:
         return []
-    out: list[Path] = []
+    out: list[tuple[Path, int]] = []
     for p in sorted(ticker_dir.glob("*.research_day.json")):
-        if MTF_SUFFIX in p.name:
-            # Already an MTF artifact - skip as an input.
+        match = DAILY_K_FILENAME_RX.search(p.name)
+        if match is None:
             continue
-        out.append(p)
+        try:
+            k_from_name = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        out.append((p, k_from_name))
     return out
 
 
@@ -634,7 +658,7 @@ def build_multitimeframe_bridge_artifacts_for_target(
 
     wanted = set(expected_k_tuple)
 
-    for path in daily_paths:
+    for path, k_from_name in daily_paths:
         try:
             artifact_in = _ra.read_research_day_artifact(path)
         except Exception:
@@ -644,9 +668,16 @@ def build_multitimeframe_bridge_artifacts_for_target(
             continue
         K = artifact_in.K
         if not isinstance(K, int):
-            # Daily TrafficFlow artifacts ought to carry K; skip
-            # the input silently if not - the readiness layer
-            # surfaces the gap separately.
+            # Filename matched __K<K> but the artifact has no K
+            # metadata. Treat as a mismatch rather than trusting
+            # the filename alone.
+            _append_unique(issues, ISSUE_INPUT_ARTIFACT_K_MISMATCH)
+            continue
+        if K != k_from_name:
+            # Filename declares one K, artifact records another.
+            # Never trust the filename - skip the input AND
+            # surface the conflict so the operator can clean up.
+            _append_unique(issues, ISSUE_INPUT_ARTIFACT_K_MISMATCH)
             continue
         if wanted and K not in wanted:
             continue
