@@ -510,20 +510,34 @@ def refresh_signal_engine_cache(
     data_fetcher: Optional[Callable[[str], pd.DataFrame]] = None,
     current_as_of_date: Optional[str] = None,
 ) -> SignalEngineRefreshResult:
-    """Refresh one explicit ticker's Signal Engine cache.
+    """Phase 6E-3 source-data refresh probe / cache-shape
+    builder for one explicit ticker.
 
     ``write=False`` (default) performs the fetch + cache-shape
-    build but writes nothing to disk. ``write=True`` writes
-    the cache, the provenance manifest sidecar, and the
-    status JSON.
+    build and writes nothing to disk; the result reports the
+    would-be new ``date_range_end`` plus the
+    ``stale_before`` / ``current_after`` flags for the
+    operator.
+
+    ``write=True`` is **currently refused** while the payload
+    scope is ``data_only_v1`` — i.e. while Spymaster's SMA
+    pair optimizer has not been extracted into a
+    non-interactive helper. Under the guard the function
+    returns ``refreshed=False`` with
+    ``issue_codes=("data_only_write_blocked",)`` and **no
+    cache PKL, manifest sidecar, or status JSON is written**.
+    The guard releases automatically once the future
+    SMA-optimizer extraction sub-phase changes the payload
+    scope; the atomic write / manifest / status helpers in
+    this module are already wired for that work.
 
     ``data_fetcher`` lets the caller (and tests) inject a
     callable that returns a price ``DataFrame``. The default
     invokes yfinance via a lazy import so test code paths
     never trigger the network.
 
-    See module docstring for the explicit scope of what this
-    refresh does and does NOT do.
+    See module docstring for the full scope of what Phase
+    6E-3 does and does NOT do.
     """
     started = time.monotonic()
     cache_d = _path_or_default(cache_dir, _default_cache_dir)
@@ -751,10 +765,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="signal_engine_cache_refresher",
         description=(
-            "Phase 6E-3 operator-only CLI: refresh a single "
-            "explicit ticker's Signal Engine cache "
-            "non-interactively. Default is dry-run; --write "
-            "must be explicit. Never runs a universe sweep."
+            "Phase 6E-3 source-data refresh probe / "
+            "cache-shape builder for a single explicit "
+            "ticker. This is NOT a production-safe Signal "
+            "Engine cache refresher: --write is currently "
+            "refused by the data_only_v1 guard because "
+            "Spymaster's SMA pair optimizer has not been "
+            "extracted into a non-interactive helper yet. "
+            "Use --dry-run today; wait for the next "
+            "sub-phase before any production cache write. "
+            "Never runs a universe sweep."
         ),
     )
     parser.add_argument(
@@ -771,7 +791,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     write_group.add_argument(
         "--write",
         action="store_true",
-        help="Explicit opt-in to write the cache + manifest + status.",
+        help=(
+            "Reserved for the future SMA-optimizer-backed "
+            "writer. Currently refused under the "
+            "data_only_v1 guard: the fetch + cache-shape "
+            "build still runs, but no cache PKL, manifest "
+            "sidecar, or status JSON is written and the "
+            "result reports refreshed=false with "
+            "issue_codes=[\"data_only_write_blocked\"]."
+        ),
     )
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--status-dir", default=None)
@@ -786,7 +814,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--current-as-of-date", default=None,
         help=(
             "Override the cutoff used for stale_before / "
-            "current_after; defaults to today's UTC date."
+            "current_after. Default comes from "
+            "confluence_pipeline_readiness."
+            "resolve_current_as_of_date (the most recent "
+            "weekday strictly before UTC now), so the "
+            "refresher stays aligned with the rest of the "
+            "Phase 6 readiness / preflight stack."
         ),
     )
     return parser
