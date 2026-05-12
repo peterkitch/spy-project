@@ -155,7 +155,57 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-10
+### 6. Current Sprint State as of 2026-05-11 (Phase 6G-1; design-review baseline frozen)
+
+**main / origin/main HEAD:** `24990f0` — `Phase 6G-1: Daily Signal Board public meaning + information hierarchy (#207)`.
+
+**Design-review baseline:** frozen at `24990f0`. The next deliverable is a design/product review against the live screenshots captured during Phase 6G-2 (paths in the baseline doc — § "Reference paths" below). No further pipeline writes are currently authorized.
+
+**Testing root:** `C:\Users\sport\Documents\PythonProjects\spy-project` (the primary repo on `main`). The stale emdash worktree at `C:\Users\sport\emdash\worktrees\spy-project\emdash\sprint-continued-qlpvw` is many phases behind and is NOT a valid test target.
+
+**PRJCT9 north star:** "PRJCT9 is a pattern-discovery engine. The MVP front door is the Daily Signal Board — a public read-only leaderboard of saved-research alignment by ticker."
+
+**Daily Signal Board front-door sections (top-to-bottom):**
+
+  1. **Today's Board Status** (`section-current-pilot`) — the hero card for the current full-pipeline pilot ticker. Non-directional copy when consensus is None.
+  2. **Town Hall Scoreboard** (`section-scoreboard`) — only leader-eligible rows. Column header reads "Consensus" (was "Signal"). Visible cell for `signal=None` renders "No consensus"; the `data-signal` attribute keeps the canonical `"None"`/`"Buy"`/`"Short"` value.
+  3. **Saved Research Archive** (`section-archive` / `section-archive-details`) — `<details>` collapsible (open=false), holds the long alphabetical tail of Partial/Stale rows (currently ~1,628).
+  4. **Featured High Score** (`section-featured`) — Signal Engine chart + headline numbers, plus a one-line two-signal explainer (`featured-two-signal-explainer`). Featured `confluence_status_fmt` reads `"{active} of {total} alignment checks active"` (60 = 12 K × 5 timeframes, not 60 timeframes).
+  5. **Evidence Trail** (`section-evidence-trail`) — seven illustrated stations: Seed Field / Trading Post / Workshop / Rail Yard / Calendar House / Town Hall / Watchtower. Prefixed by `evidence-trail-intro` explaining that stale upstream stations are historical reference and don't block the current leader gate unless flagged.
+  6. **What PRJCT9 Is** (`section-what-prjct9-is`).
+  7. **What It Is Not** (`section-what-it-is-not`).
+
+**SPY live pilot state (as of `2026-05-11`):**
+
+  - Signal Engine cache `date_range.end` = `2026-05-11` (post Phase 6F-2 authorized refresh).
+  - Confluence MTF consensus `last_date` = `2026-05-08` (post Phase 6F-5 authorized pipeline write).
+  - `data-rank="1"`, `data-leader-eligible="true"`, `data-ranking-blocked-reason=""`, `data-signal="None"`.
+  - Board consensus: **No directional consensus today** (7 of 60 alignment checks active).
+  - Signal Engine state: **Short 11,5**.
+  - Visible scoreboard row: `SPY / No consensus / 7/60 / Full / 2026-05-08`.
+
+**Known limitations under the current baseline:**
+
+  - Only SPY is production-pilot current. Every other ticker in the discovered universe is `coverage=Partial / signal=None` (saved-research-only).
+  - Broader-universe refresh + pipeline automation is unbuilt; the single-ticker tooling exists (`signal_engine_cache_refresher.py`, `confluence_pipeline_runner.py`) but there is no scheduler / orchestrator.
+  - ImpactSearch / StackBuilder day artifacts can remain legacy / stale; under the Phase 6C-8 readiness contract they are **presence-only** stages and do not block the current leader gate.
+  - Mobile (≤ ~390 px wide) scoreboard table uses contained internal horizontal scroll inside `scoreboard-table-wrapper`. The page itself never grows horizontal scroll; the COVERAGE and AS OF columns are one swipe away.
+
+**Next recommended work (no more data writes unless explicitly authorized):**
+
+  - Design / product review against the Phase 6G-2 baseline screenshots.
+  - Optional visual / cozy notice-board polish after a design direction is chosen.
+  - Universe-automation scoping (out of band of the current MVP polish track).
+
+**Test baseline:** full regression **1,192 passed, 60 pre-existing pandas fragmentation warnings**. No new warnings since Phase 6C-5.
+
+**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a 6G-2 (or later) PR landed without a refresh.
+
+**Phase 6G baseline doc:** `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md`.
+
+---
+
+### 6. (Historical — superseded by 2026-05-11 / Phase 6G-1 baseline above) Sprint state (as of 2026-05-10)
 
 **main / origin/main HEAD:** `d4ee3a8` — `Phase 6C-5: Primary Signal Engine MVP reset (#191)`.
 
@@ -179,8 +229,6 @@ is pinned to `8081f73` (Phase 3 close, PR #144 from 2026-05-03) and is **47 comm
   - `catalogue-snapshot-store` and `catalogue-health-store` require explicit Refresh clicks (`prevent_initial_call=True`). The heavy `_real_confluence_snapshot_for_target` only runs after the user explicitly loads cross-ticker from Advanced.
 
 **Phase 6C-5 test baseline:** full regression **954 passed, 0 failed, 60 pre-existing pandas fragmentation warnings**. 21 new in `test_primary_signal_engine.py`; +26 in `test_phase6_research_preview.py`.
-
-**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a 6C-6 (or later) PR landed without a refresh.
 
 ---
 
