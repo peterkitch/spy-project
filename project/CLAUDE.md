@@ -203,6 +203,8 @@ an explicit ledger entry classifies the divergence.
 
 **Phase 6G baseline doc:** `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md`.
 
+**Phase 6G-5 cutoff caveat (added after the design-review baseline froze):** The SPY leader-eligible state captured above describes the live board at the moment the design-review screenshots were taken, when `current_as_of_date=2026-05-08` and the saved Confluence artifact matched. Once UTC rolled past 2026-05-08, the resolver advances `current_as_of_date` to the next weekday while the saved Confluence stays at 2026-05-08, because the Phase 6D-1 `persist_skip_bars=1` safety keeps every persisted artifact one trading bar behind the source cache. A bare production boot today therefore renders SPY as **not leader-eligible** (`data-leader-eligible="false"`, `data-ranking-blocked-reason="stale_confluence_day_artifact"`, demoted to the Saved Research Archive) — this is the honest behavior of the existing contract, not a regression. To reproduce the frozen design-review baseline against the on-disk artifacts, pin `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` (the same env var `confluence_pipeline_readiness.resolve_current_as_of_date` already honors); the Phase 6G-5 baseline-doc § 7 walks through this. The correct unpinned audit/preflight recommendation for SPY today is `pipeline_output_lags_persist_skip`, not `ready_for_pipeline_write`; see Phase 6E-2 preflight doc § 6.8 for the full contract on the new action.
+
 ---
 
 ### 6. (Historical — superseded by 2026-05-11 / Phase 6G-1 baseline above) Sprint state (as of 2026-05-10)
