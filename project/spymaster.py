@@ -87,6 +87,20 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 # --- Lightweight central job pool for background work (precompute, refresh) ---
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
+
+# Phase 6I-7: read-only master-audit surface helper.
+# Defensively imported so Spymaster boots even when the
+# helper or its downstream planner stack is unavailable.
+# The audit section is rendered as "unavailable" in that
+# case rather than crashing the app.
+try:
+    import spymaster_master_audit as _spymaster_master_audit
+    _MASTER_AUDIT_IMPORT_ERROR: Optional[str] = None
+except Exception as _master_audit_exc:  # pragma: no cover - defensive
+    _spymaster_master_audit = None  # type: ignore[assignment]
+    _MASTER_AUDIT_IMPORT_ERROR = (
+        f"master_audit_helper_import_failed: {_master_audit_exc!r}"
+    )
 _job_pool = ThreadPoolExecutor(max_workers=int(os.getenv("SPYMASTER_BG_WORKERS", "2")))
 
 def submit_bg(fn, *args, **kwargs):
@@ -6876,6 +6890,32 @@ app.layout = dbc.Container(
             "zIndex": "1001",
             "maxWidth": "400px"
         }),
+        # Phase 6I-7: master-audit surface (read-only).
+        # The helper module owns the section's layout +
+        # IDs. Spymaster registers the load callback
+        # below; the callback only invokes the helper's
+        # read-only ``load_audit_report`` +
+        # ``render_audit_panel`` functions. No writer
+        # callback is introduced.
+        (
+            _spymaster_master_audit.build_audit_layout_section()
+            if _spymaster_master_audit is not None
+            else html.Div(
+                id="section-master-audit",
+                children=html.P(
+                    (
+                        "Master audit unavailable: "
+                        "helper module import failed. "
+                        "Spymaster continues to function."
+                    ),
+                    style={
+                        "color": "#ff9900",
+                        "fontSize": "12px",
+                        "padding": "8px",
+                    },
+                ),
+            )
+        ),
         # Enhanced Footer
         html.Hr(style={"borderColor": "#80ff00", "borderWidth": "2px", "opacity": "0.5", "marginTop": "50px"}),
         html.Div([
@@ -6896,6 +6936,71 @@ app.layout = dbc.Container(
 # ============================================================================
 # CALLBACKS - UI INTERACTION HANDLERS
 # ============================================================================
+
+# -----------------------------------------------------------------------------
+# Phase 6I-7: master-audit load callback (read-only).
+# The callback exists only when the helper module
+# imported successfully. It calls
+# ``load_audit_report`` + ``render_audit_panel`` from
+# the helper -- both read-only. No writer is invoked.
+# -----------------------------------------------------------------------------
+
+if _spymaster_master_audit is not None:
+    @app.callback(
+        [
+            Output(
+                _spymaster_master_audit.MASTER_AUDIT_PANEL_ID,
+                'children',
+            ),
+            Output(
+                _spymaster_master_audit.MASTER_AUDIT_STATUS_ID,
+                'children',
+            ),
+        ],
+        [
+            Input(
+                _spymaster_master_audit.MASTER_AUDIT_LOAD_BUTTON_ID,
+                'n_clicks',
+            ),
+        ],
+        prevent_initial_call=True,
+    )
+    def _on_master_audit_load(n_clicks):
+        """Load the Phase 6I-6 execution-queue report
+        read-only and render the panel. Defensive
+        try/except so a planner failure surfaces as an
+        unavailable-state message rather than crashing
+        the Dash callback graph."""
+        if not n_clicks:
+            raise PreventUpdate
+        try:
+            report, error = (
+                _spymaster_master_audit.load_audit_report(
+                    from_stackbuilder_universe=True,
+                    max_refresh=10,
+                    max_pipeline=10,
+                    include_blocked=True,
+                    top_n=5,
+                )
+            )
+            panel = (
+                _spymaster_master_audit.render_audit_panel(
+                    report, error,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            panel = (
+                _spymaster_master_audit.render_audit_panel(
+                    None,
+                    f"unexpected_callback_failure: {exc!r}",
+                )
+            )
+            return panel, "Audit load failed (see panel)."
+        status = (
+            "Audit loaded." if error is None
+            else "Audit unavailable (see panel)."
+        )
+        return panel, status
 
 # -----------------------------------------------------------------------------
 # Browser TAB TITLE: aggregate in-flight work across the app
