@@ -152,26 +152,72 @@ STATION_IDS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 DESIGN_TOKENS: dict[str, str] = {
-    # PRJCT9 baseline palette, re-exported so existing styling can
-    # find these by their well-known names.
-    "color_green": "#80ff00",
-    "color_black": "#000000",
-    "color_text": "#e6e6e6",
-    "color_muted": "#888888",
-    "color_border": "#2a2a2a",
-    "color_red": "#ff5050",
-    "color_dim": "#1a1a1a",
-    # Signal-state accents (Claude Design may replace these wholesale).
-    "color_buy": "#80ff00",
-    "color_short": "#ff5050",
-    "color_none": "#888888",
-    # Coverage label accents.
-    "color_full": "#80ff00",
-    "color_partial": "#ffb84d",
-    "color_stale": "#888888",
-    "color_under_review": "#ff5050",
-    "color_pipeline_incomplete": "#ffb84d",
-    # Top-3 rank accents (placeholder, will be replaced by Claude Design).
+    # ------------------------------------------------------------------
+    # Phase 6G-4 - "Town Notice Board" palette.
+    # ------------------------------------------------------------------
+    # The page is a warm-dark notice board with pinned-paper
+    # section cards. ``color_green`` is the everyday brand
+    # sage/moss; the legacy neon green moves to its own
+    # ``color_leader_highlight`` token reserved for the
+    # current-leader accent (SPY row highlight + Today's
+    # Board Status pilot chip). Nothing else on the page
+    # should use the neon - brightness now consistently
+    # signals "this is the current pick".
+    # ------------------------------------------------------------------
+
+    # Page surface (warm dark, replaces the legacy pure
+    # black). ``color_black`` is aliased to this so any
+    # caller still passing the legacy token sits on the
+    # same surface and we don't get a hard contrast jump.
+    "color_warm_dark": "#1c1814",
+    "color_black": "#1c1814",
+    # Paper / card surface (sections sit on this; slightly
+    # warmer than ``color_warm_dark`` so cards read as
+    # papers pinned to the board).
+    "color_paper": "#23201a",
+    # Warm dim used for hover / selected row bg.
+    "color_dim": "#26211a",
+    # Wood-grain border for sections + scoreboard / archive
+    # dividers.
+    "color_border": "#3a322a",
+    # Mustard wood-tone used for the small "pin" / wax-seal
+    # accents (the pin glyph at the top of the Today's
+    # Board Status card and the row-rank chip).
+    "color_pin": "#c9a86a",
+    # ------------------------------------------------------------------
+    # Brand colors
+    # ------------------------------------------------------------------
+    # Primary sage / moss - the everyday brand green.
+    "color_green": "#8fbf6f",
+    # Legacy neon green, NOW SCOPED to the current-leader
+    # accent only (SPY row highlight + Today's Pilot chip).
+    # Tests pin that this token is distinct from
+    # ``color_green``.
+    "color_leader_highlight": "#80ff00",
+    # ------------------------------------------------------------------
+    # Text
+    # ------------------------------------------------------------------
+    "color_text": "#e6e0d0",
+    "color_muted": "#9b9388",
+    # Legacy red token, softened to a warm rust.
+    "color_red": "#c46a4d",
+    # ------------------------------------------------------------------
+    # Signal-state accents (Confluence consensus + Signal Engine)
+    # ------------------------------------------------------------------
+    "color_buy": "#8fbf6f",
+    "color_short": "#c46a4d",
+    "color_none": "#9b9388",
+    # ------------------------------------------------------------------
+    # Coverage wax-seal pill accents
+    # ------------------------------------------------------------------
+    "color_full": "#7fa766",
+    "color_partial": "#c89b3e",
+    "color_stale": "#9b9388",
+    "color_under_review": "#4f6b8a",
+    "color_pipeline_incomplete": "#c89b3e",
+    # ------------------------------------------------------------------
+    # Top-3 rank accents (unchanged).
+    # ------------------------------------------------------------------
     "color_rank_1": "#ffd166",
     "color_rank_2": "#cfd2cd",
     "color_rank_3": "#c08552",
@@ -233,8 +279,10 @@ BOARD_COPY: dict[str, Any] = {
         "current board pick. Browse for context; not a "
         "current signal."
     ),
+    # Phase 6G-4: warmer notice-board phrasing for the
+    # archive disclosure.
     "section_archive_summary_fmt": (
-        "Show {count} archived ticker(s)"
+        "Open the saved-research drawer ({count} tickers)"
     ),
     "section_archive_empty": (
         "No archived rows."
@@ -277,6 +325,12 @@ BOARD_COPY: dict[str, Any] = {
         "Signal Engine cache through {se_date}."
     ),
     # Section 2 - Featured
+    # Phase 6G-4: short prefix that demotes the giant
+    # ticker glyph - shipped above ``featured-ticker-name``
+    # so the panel reads "Today's pilot - SPY" instead of
+    # a Bloomberg ticker block. Stable id:
+    # ``featured-pilot-prefix``.
+    "featured_pilot_prefix": "Today's pilot",
     "featured_label_current_signal": "Current Signal",
     "featured_label_confluence": "Confluence",
     "featured_label_total_capture": "Total Capture (%)",
@@ -291,9 +345,13 @@ BOARD_COPY: dict[str, Any] = {
         "return. Dotted line is the ticker's raw historical close on the "
         "right axis."
     ),
+    # Phase 6G-4: disclaimer reads less like legal boilerplate
+    # without losing the "not investment advice / not a live
+    # feed" meaning. ASCII semicolon used (not em dash) so the
+    # exact-string test stays portable.
     "featured_disclaimer": (
-        "Historical research output. Not investment advice. Not a live "
-        "signal feed."
+        "Historical research output. Not investment advice; "
+        "saved research, not a live signal feed."
     ),
     # Phase 6G-1: ``total`` is K-builds (1..12) x timeframes
     # (1d/1wk/1mo/3mo/1y) = 60 alignment checks, NOT 60
@@ -402,8 +460,14 @@ BOARD_COPY: dict[str, Any] = {
     # the copy-centralization test catches them along with section
     # copy. Trace name for the close-price line is a format string
     # because the ticker is interpolated.
-    "chart_trace_engine_capture": "Engine cumulative capture",
-    "chart_trace_close_price_fmt": "{ticker} close price",
+    # Phase 6G-4: trace labels read as "research" rather
+    # than terminal cockpit. The ticker is already
+    # established by the Featured panel scope so the close
+    # price line drops the {ticker} placeholder.
+    "chart_trace_engine_capture": (
+        "Saved cumulative capture (research)"
+    ),
+    "chart_trace_close_price_fmt": "Close price",
     "chart_axis_date": "Date",
     "chart_axis_cumulative_capture": "Cumulative Capture (%)",
     "chart_axis_close_price": "Close Price",
@@ -1469,7 +1533,9 @@ def render_scoreboard(
                     r.ranking_blocked_reason or ""
                 ),
             },
-            style=_tr_style(is_selected),
+            style=_tr_style(
+                is_selected, leader_eligible=r.leader_eligible,
+            ),
             children=[
                 html.Td(r.ticker, style=_td_style(weight="bold")),
                 # Phase 6G-1: render a public-friendly
@@ -1483,9 +1549,18 @@ def render_scoreboard(
                     style=_td_style(color=signal_color),
                 ),
                 html.Td(agreement_text, style=_td_style()),
-                html.Td(r.coverage, style=_td_style(
-                    color=_coverage_color(r.coverage),
-                )),
+                # Phase 6G-4: render coverage as a wax-seal
+                # style pill (rounded filled badge with a
+                # leading dot) so first-time visitors read
+                # it as a stamped status rather than a bare
+                # colored word. The underlying ``r.coverage``
+                # text and ``data-coverage`` attribute on
+                # the Tr are unchanged - only the cell's
+                # presentation differs.
+                html.Td(
+                    _render_coverage_pill(r.coverage),
+                    style=_td_style(),
+                ),
                 html.Td(
                     r.as_of or BOARD_COPY["as_of_unavailable"],
                     style=_td_style(nowrap=True),
@@ -1718,6 +1793,14 @@ def render_current_pilot_card(
     else:
         as_of_line = ""
 
+    # Phase 6G-4: render the current-pilot card with a
+    # pinned-paper feel - a small CSS-drawn "pin" disc at
+    # the top-left of the card and a leader-highlight
+    # pilot chip at the top-right carrying the ticker
+    # symbol. Both are pure CSS / HTML; no image assets
+    # introduced. The existing
+    # ``data-current-pilot-*`` attributes are preserved
+    # verbatim.
     return html.Div(
         id="current-pilot-card",
         **{
@@ -1726,15 +1809,60 @@ def render_current_pilot_card(
             "data-current-pilot-consensus-signal": leader.signal,
         },
         style={
-            "padding": "12px",
+            "position": "relative",
+            "padding": "18px 12px 12px 12px",
             "marginBottom": "10px",
             "border": (
                 "1px solid " + DESIGN_TOKENS["color_border"]
             ),
-            "borderRadius": "4px",
-            "backgroundColor": DESIGN_TOKENS["color_dim"],
+            "borderRadius": "6px",
+            "backgroundColor": DESIGN_TOKENS["color_paper"],
+            "boxShadow": (
+                "inset 0 1px 0 0 " + DESIGN_TOKENS["color_dim"]
+            ),
         },
         children=[
+            # CSS-drawn "pin" disc anchoring the paper to
+            # the notice board.
+            html.Span(
+                id="current-pilot-pin",
+                **{"aria-hidden": "true"},
+                style={
+                    "position": "absolute",
+                    "top": "-6px",
+                    "left": "16px",
+                    "width": "12px",
+                    "height": "12px",
+                    "borderRadius": "50%",
+                    "backgroundColor": DESIGN_TOKENS["color_pin"],
+                    "boxShadow": (
+                        "0 0 0 2px " + DESIGN_TOKENS["color_warm_dark"]
+                    ),
+                },
+            ),
+            # Leader-highlight pilot chip in the top-right
+            # corner; the only place on the page (besides
+            # the SPY scoreboard row's left-edge accent)
+            # that uses the legacy neon green.
+            html.Span(
+                leader.ticker,
+                id="current-pilot-chip",
+                **{"data-pilot-chip-ticker": leader.ticker},
+                style={
+                    "position": "absolute",
+                    "top": "10px",
+                    "right": "12px",
+                    "padding": "2px 8px",
+                    "borderRadius": "10px",
+                    "backgroundColor": DESIGN_TOKENS[
+                        "color_leader_highlight"
+                    ],
+                    "color": DESIGN_TOKENS["color_warm_dark"],
+                    "fontSize": "11px",
+                    "fontWeight": "bold",
+                    "letterSpacing": "0.05em",
+                },
+            ),
             html.Div(
                 intro,
                 id="current-pilot-intro",
@@ -1834,15 +1962,72 @@ def _td_style(
     return style
 
 
-def _tr_style(is_selected: bool) -> dict:
+def _tr_style(
+    is_selected: bool, *, leader_eligible: bool = False,
+) -> dict:
+    """Scoreboard row style. Selected rows get a dim
+    background; the *current leader* row additionally gets
+    a left-border accent in the leader-highlight (neon)
+    token so brightness consistently signals "this is
+    today's pilot" everywhere it appears."""
     bg = (
         DESIGN_TOKENS["color_dim"] if is_selected
-        else DESIGN_TOKENS["color_black"]
+        else DESIGN_TOKENS["color_paper"]
     )
-    return {
+    style: dict[str, Any] = {
         "cursor": "pointer",
         "backgroundColor": bg,
     }
+    if leader_eligible:
+        # Phase 6G-4: a 3-px leader-highlight accent on the
+        # row's left edge. The brightness is now exclusively
+        # tied to "this row is today's full-pipeline pilot",
+        # so a Bloomberg-trained eye still spots the active
+        # row instantly without the rest of the page
+        # carrying that color.
+        style["borderLeft"] = (
+            "3px solid " + DESIGN_TOKENS["color_leader_highlight"]
+        )
+    return style
+
+
+def _render_coverage_pill(coverage: str) -> Any:
+    """Phase 6G-4: render the scoreboard Coverage cell as a
+    small wax-seal style pill (rounded filled badge with a
+    leading dot) instead of a bare colored word. The
+    underlying coverage string is unchanged; the row's
+    ``data-coverage`` attribute is still the canonical
+    ``Full`` / ``Partial`` / ``Stale`` / ``Under review`` /
+    ``Pipeline incomplete``."""
+    _, _, html = _dash_modules()
+    accent = _coverage_color(coverage)
+    return html.Span(
+        children=[
+            # Leading dot.
+            html.Span(style={
+                "display": "inline-block",
+                "width": "8px",
+                "height": "8px",
+                "borderRadius": "50%",
+                "backgroundColor": accent,
+                "marginRight": "6px",
+                "verticalAlign": "middle",
+            }),
+            html.Span(coverage, style={
+                "color": accent,
+                "verticalAlign": "middle",
+            }),
+        ],
+        style={
+            "display": "inline-flex",
+            "alignItems": "center",
+            "padding": "2px 8px",
+            "borderRadius": "10px",
+            "border": "1px solid " + DESIGN_TOKENS["color_border"],
+            "backgroundColor": DESIGN_TOKENS["color_paper"],
+            "fontSize": "12px",
+        },
+    )
 
 
 def render_featured(
@@ -1911,13 +2096,31 @@ def render_featured(
     )
 
     return html.Div(children=[
+        # Phase 6G-4: small muted "Today's pilot" prefix
+        # so the panel reads as "Today's pilot - SPY"
+        # rather than a Bloomberg ticker glyph in giant
+        # neon green. ``featured-ticker-name`` retains its
+        # stable id; the styling demotes the glyph from
+        # neon to brand sage and shrinks the size.
+        html.Div(
+            BOARD_COPY["featured_pilot_prefix"],
+            id="featured-pilot-prefix",
+            style={
+                "color": DESIGN_TOKENS["color_muted"],
+                "fontSize": "11px",
+                "textTransform": "uppercase",
+                "letterSpacing": "0.08em",
+                "marginBottom": "2px",
+            },
+        ),
         html.H3(
             ticker,
             id="featured-ticker-name",
             style={
                 "color": DESIGN_TOKENS["color_green"],
                 "marginBottom": "4px",
-                "fontSize": "18px",
+                "fontSize": "16px",
+                "letterSpacing": "0.02em",
             },
         ),
         html.Div([
@@ -2321,6 +2524,21 @@ def _missing_station(station_id: str, label: str) -> EvidenceStation:
     )
 
 
+_STATION_GLYPH: dict[str, str] = {
+    # Phase 6G-4: two-letter notice-board "stamp" prefixes
+    # for each Evidence Trail station. Pure text, no image
+    # assets, no emoji (emoji rendering is unpredictable
+    # across the user-agent matrix).
+    STATION_ID_SEED_FIELD: "SF",
+    STATION_ID_TRADING_POST: "TP",
+    STATION_ID_WORKSHOP: "WK",
+    STATION_ID_RAIL_YARD: "RY",
+    STATION_ID_CALENDAR_HOUSE: "CH",
+    STATION_ID_TOWN_HALL: "TH",
+    STATION_ID_WATCHTOWER: "WT",
+}
+
+
 def _render_station(s: EvidenceStation) -> Any:
     _, _, html = _dash_modules()
     presence_label = {
@@ -2337,6 +2555,7 @@ def _render_station(s: EvidenceStation) -> Any:
         PRESENCE_STALE: DESIGN_TOKENS["color_stale"],
         PRESENCE_UNDER_REVIEW: DESIGN_TOKENS["color_under_review"],
     }.get(s.presence, DESIGN_TOKENS["color_text"])
+    glyph = _STATION_GLYPH.get(s.station_id, "")
     return html.Div(
         id=s.station_id,
         **{
@@ -2348,23 +2567,56 @@ def _render_station(s: EvidenceStation) -> Any:
             "border": (
                 "1px solid " + DESIGN_TOKENS["color_border"]
             ),
-            "borderRadius": "4px",
-            "backgroundColor": DESIGN_TOKENS["color_black"],
+            "borderRadius": "6px",
+            "backgroundColor": DESIGN_TOKENS["color_paper"],
         },
         children=[
-            html.Div([
-                html.Span(s.label, style={
-                    "color": DESIGN_TOKENS["color_text"],
-                    "fontWeight": "bold",
-                    "marginRight": "8px",
-                }),
-                html.Span(presence_label, style={
-                    "color": presence_color,
-                    "fontSize": "11px",
-                    "textTransform": "uppercase",
-                    "letterSpacing": "0.06em",
-                }),
-            ]),
+            html.Div(
+                style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "gap": "8px",
+                },
+                children=[
+                    # Phase 6G-4: leading two-letter station
+                    # stamp ("SF", "TP", ...). Color-tinted
+                    # by the station's presence so a quick
+                    # scan still telegraphs current / stale /
+                    # missing without reading labels.
+                    html.Span(
+                        glyph,
+                        **{
+                            "data-station-glyph": glyph,
+                            "aria-hidden": "true",
+                        },
+                        style={
+                            "display": "inline-block",
+                            "minWidth": "24px",
+                            "padding": "2px 6px",
+                            "borderRadius": "6px",
+                            "backgroundColor": DESIGN_TOKENS[
+                                "color_dim"
+                            ],
+                            "color": presence_color,
+                            "fontFamily": "monospace",
+                            "fontSize": "11px",
+                            "fontWeight": "bold",
+                            "textAlign": "center",
+                            "letterSpacing": "0.05em",
+                        },
+                    ),
+                    html.Span(s.label, style={
+                        "color": DESIGN_TOKENS["color_text"],
+                        "fontWeight": "bold",
+                    }),
+                    html.Span(presence_label, style={
+                        "color": presence_color,
+                        "fontSize": "11px",
+                        "textTransform": "uppercase",
+                        "letterSpacing": "0.06em",
+                    }),
+                ],
+            ),
             html.Div(s.summary or BOARD_COPY["station_missing"], style={
                 "color": DESIGN_TOKENS["color_muted"],
                 "fontSize": "12px",
@@ -2750,16 +3002,26 @@ def build_app(
 
     app.layout = html.Div(
         style={
-            "backgroundColor": DESIGN_TOKENS["color_black"],
+            # Phase 6G-4: warm-dark page surface (was pure
+            # #000). ``color_black`` is aliased to the same
+            # warm dark for backwards compatibility.
+            "backgroundColor": DESIGN_TOKENS["color_warm_dark"],
             "color": DESIGN_TOKENS["color_text"],
             "minHeight": "100vh",
             "padding": "24px",
+            # Keep monospace as the brand font family for
+            # the wordmark + raw data values; the cozy /
+            # humanist body type lands in a later sprint.
             "fontFamily": "monospace, sans-serif",
         },
         children=[
             html.H1(
                 BOARD_COPY["page_title"],
                 style={
+                    # Brand sage now (was the neon
+                    # green); the legacy neon stays
+                    # exclusively on the leader-highlight
+                    # accents.
                     "color": DESIGN_TOKENS["color_green"],
                     "fontSize": "22px",
                     "marginBottom": "4px",
@@ -2824,12 +3086,21 @@ def build_app(
 
 
 def _section_style() -> dict:
+    # Phase 6G-4: section cards sit on the warm-paper
+    # surface with rounded corners and a subtle inset
+    # highlight so they read as papers pinned to the
+    # notice board. ``color_black`` is now aliased to
+    # ``color_warm_dark`` so legacy callers still resolve
+    # to a coherent surface.
     return {
         "border": "1px solid " + DESIGN_TOKENS["color_border"],
-        "borderRadius": "6px",
-        "padding": "12px",
+        "borderRadius": "8px",
+        "padding": "14px",
         "marginBottom": "16px",
-        "backgroundColor": DESIGN_TOKENS["color_black"],
+        "backgroundColor": DESIGN_TOKENS["color_paper"],
+        "boxShadow": (
+            "inset 0 1px 0 0 " + DESIGN_TOKENS["color_dim"]
+        ),
     }
 
 

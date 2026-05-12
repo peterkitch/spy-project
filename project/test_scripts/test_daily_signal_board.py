@@ -909,8 +909,9 @@ def test_board_copy_dict_owns_visible_copy():
         # Section + scoreboard copy
         "No saved tickers yet.",
         "Not yet built for this ticker.",
-        "Historical research output. Not investment advice. Not a live "
-        "signal feed.",
+        # Phase 6G-4: softened disclaimer cadence.
+        "Historical research output. Not investment advice; "
+        "saved research, not a live signal feed.",
         (
             "PRJCT9 is a pattern-discovery engine. It studies saved "
             "historical signal behavior, ranks current signal alignment, "
@@ -934,9 +935,12 @@ def test_board_copy_dict_owns_visible_copy():
         # Phase 6G-1 additions:
         "Today's Board Status",
         "Saved Research Archive",
-        # Chart trace names + axis titles (Phase 6C-7 audit fix)
-        "Engine cumulative capture",
-        "{ticker} close price",
+        # Phase 6G-4: chart trace labels read as "research"
+        # rather than "engine cockpit"; the close-price line
+        # no longer interpolates the ticker (it's already in
+        # the Featured panel scope).
+        "Saved cumulative capture (research)",
+        "Close price",
         "Date",
         "Cumulative Capture (%)",
         "Close Price",
@@ -1095,9 +1099,13 @@ def test_no_live_engine_or_yfinance_imports():
 
 
 def test_disclaimer_string_is_present_and_exact():
+    # Phase 6G-4: softened to a notice-board cadence without
+    # losing the "not investment advice / saved research /
+    # not a live signal feed" meaning. ASCII semicolon used
+    # for portability (no em dash).
     expected = (
-        "Historical research output. Not investment advice. Not a live "
-        "signal feed."
+        "Historical research output. Not investment advice; "
+        "saved research, not a live signal feed."
     )
     assert board.BOARD_COPY["featured_disclaimer"] == expected
 
@@ -1952,6 +1960,316 @@ def test_no_current_leaders_banner_still_works_when_zero_eligible(
     assert props.get("data-leader-count") == "0"
     style = props.get("style") or {}
     assert style.get("display") != "none"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6G-4: Town Notice Board visual polish
+# ---------------------------------------------------------------------------
+
+
+def test_design_tokens_have_leader_highlight_distinct_from_brand_green():
+    """Phase 6G-4: the legacy neon green moves into its own
+    ``color_leader_highlight`` token, while ``color_green``
+    is re-anchored to a sage / moss brand color. The two
+    must be different values so brightness consistently
+    signals "this is the current pick" rather than leaking
+    everywhere on the page."""
+    assert "color_leader_highlight" in board.DESIGN_TOKENS
+    assert "color_green" in board.DESIGN_TOKENS
+    assert (
+        board.DESIGN_TOKENS["color_leader_highlight"]
+        != board.DESIGN_TOKENS["color_green"]
+    ), (
+        "leader-highlight token must be distinct from the "
+        "everyday brand green; both currently resolve to "
+        + repr(board.DESIGN_TOKENS["color_green"])
+    )
+
+
+def test_design_tokens_include_notice_board_palette():
+    """The Town Notice Board palette additions
+    (``color_warm_dark`` / ``color_paper`` / ``color_pin``)
+    must be available so callers don't need to hand-roll
+    these literals outside the DESIGN_TOKENS block."""
+    for key in (
+        "color_warm_dark", "color_paper", "color_pin",
+        "color_leader_highlight",
+    ):
+        assert key in board.DESIGN_TOKENS, (
+            f"missing Phase 6G-4 palette token {key!r}"
+        )
+
+
+def test_current_pilot_card_retains_data_attributes_under_6g4(
+    tmp_path: Path,
+):
+    """Phase 6G-4 layout polish must not regress the
+    ``data-current-pilot-*`` contract."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    card = board.render_current_pilot_card(
+        rows,
+        signal_engine_pair="Short 11,5",
+        signal_engine_as_of="2026-05-11",
+    )
+    props = card.to_plotly_json().get("props", {})
+    assert props.get("id") == "current-pilot-card"
+    assert props.get("data-current-pilot-ticker") == "SPY"
+    assert (
+        props.get("data-current-pilot-leader-eligible")
+        == "true"
+    )
+    assert (
+        props.get("data-current-pilot-consensus-signal")
+        == "None"
+    )
+
+
+def test_current_pilot_card_has_pin_and_chip(tmp_path: Path):
+    """Phase 6G-4: the pinned-paper feel requires a small
+    CSS-drawn pin (``current-pilot-pin``) and a leader-
+    highlight pilot chip (``current-pilot-chip``) carrying
+    the ticker symbol. Both are pure HTML/CSS - no image
+    assets - and live alongside the existing
+    ``data-current-pilot-*`` attributes."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    card = board.render_current_pilot_card(rows)
+
+    def _find(node, target_id):
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                r = _find(c, target_id)
+                if r is not None:
+                    return r
+            return None
+        if getattr(node, "id", None) == target_id:
+            return node
+        return _find(getattr(node, "children", None), target_id)
+
+    pin = _find(card, "current-pilot-pin")
+    chip = _find(card, "current-pilot-chip")
+    assert pin is not None, "current-pilot-pin is missing"
+    assert chip is not None, "current-pilot-chip is missing"
+    chip_props = chip.to_plotly_json().get("props", {})
+    # Chip carries the ticker symbol both as its visible
+    # text and as a data attribute.
+    assert chip_props.get("children") == "SPY"
+    assert chip_props.get("data-pilot-chip-ticker") == "SPY"
+
+
+def test_spy_row_data_attributes_preserved_under_6g4():
+    """Phase 6G-4 must not regress the SPY scoreboard row
+    data contract."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows, selected_ticker="SPY")
+    body_rows = _tbody_tr_props(wrapper)
+    assert len(body_rows) == 1
+    p = body_rows[0]
+    assert p.get("data-ticker") == "SPY"
+    assert p.get("data-leader-eligible") == "true"
+    assert p.get("data-rank") == "1"
+    assert p.get("data-ranking-blocked-reason") == ""
+    assert p.get("data-signal") == "None"
+    assert p.get("data-signal-value") == "0"
+    assert p.get("data-coverage") == board.COVERAGE_FULL
+
+
+def test_leader_row_carries_leader_highlight_accent():
+    """The current-leader row must visually announce
+    itself with the ``color_leader_highlight`` token (a
+    left-border accent in the legacy neon). This is the
+    only place on the page that uses that token in the
+    scoreboard."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+        board.BoardRow(
+            ticker="AAA", signal="None", signal_value=0,
+            agreement_active=None, agreement_total=None,
+            coverage=board.COVERAGE_PARTIAL, as_of=None,
+            rank=None,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows)
+    body_rows = _tbody_tr_props(wrapper)
+    by_ticker = {
+        p.get("data-ticker"): p for p in body_rows
+    }
+    spy_style = by_ticker["SPY"].get("style") or {}
+    aaa_style = by_ticker["AAA"].get("style") or {}
+    leader = board.DESIGN_TOKENS["color_leader_highlight"]
+    assert leader in str(spy_style.get("borderLeft", "")), (
+        "SPY row must carry a left-border accent in the "
+        "leader-highlight token; got "
+        + repr(spy_style)
+    )
+    assert "borderLeft" not in aaa_style, (
+        "Non-leader row must NOT receive the leader-highlight "
+        "accent; got " + repr(aaa_style)
+    )
+
+
+def test_scoreboard_coverage_cell_renders_as_pill_with_dot():
+    """Phase 6G-4: the Coverage cell renders a small
+    wax-seal pill (rounded filled badge with a leading
+    dot) instead of a bare colored word. The underlying
+    coverage text is unchanged."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows)
+    body_rows = _tbody_tr_props(wrapper)
+    # Find the Coverage Td (index 3 of 5).
+    row_children = body_rows[0].get("children")
+    coverage_td = row_children[3]
+    # The cell's children is the pill Span.
+    pill = coverage_td.to_plotly_json().get(
+        "props", {},
+    ).get("children")
+    pill_props = pill.to_plotly_json().get("props", {})
+    pill_style = pill_props.get("style") or {}
+    # The pill is a rounded inline-flex badge sitting on
+    # the paper surface.
+    assert "borderRadius" in pill_style
+    assert pill_style.get("display") == "inline-flex"
+    # Its children are a leading colored dot + the
+    # coverage label text.
+    pill_children = pill_props.get("children")
+    assert isinstance(pill_children, list)
+    assert len(pill_children) == 2
+    dot_style = pill_children[0].to_plotly_json().get(
+        "props", {},
+    ).get("style") or {}
+    assert dot_style.get("borderRadius") == "50%"
+    label_text = pill_children[1].to_plotly_json().get(
+        "props", {},
+    ).get("children")
+    assert label_text == board.COVERAGE_FULL
+
+
+def test_archive_summary_uses_notice_board_drawer_copy():
+    """Phase 6G-4: archive disclosure copy reads as a
+    notice-board drawer rather than a database row count.
+    Sourced from BOARD_COPY so the copy-centralization
+    test still catches it."""
+    fmt = board.BOARD_COPY["section_archive_summary_fmt"]
+    assert "saved-research drawer" in fmt
+    assert "{count}" in fmt
+    assert "Show " not in fmt
+
+
+def test_featured_pilot_prefix_is_sourced_from_board_copy(
+    tmp_path: Path,
+):
+    """The Featured panel now leads with a small muted
+    "Today's pilot" prefix above the ticker glyph, so the
+    panel reads as 'Today's pilot - SPY' instead of a
+    Bloomberg ticker block."""
+    pytest.importorskip("dash")
+    assert "featured_pilot_prefix" in board.BOARD_COPY
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+
+    def _find(node, target_id):
+        if node is None or isinstance(node, str):
+            return None
+        if isinstance(node, (list, tuple)):
+            for c in node:
+                r = _find(c, target_id)
+                if r is not None:
+                    return r
+            return None
+        if getattr(node, "id", None) == target_id:
+            return node
+        return _find(getattr(node, "children", None), target_id)
+
+    prefix = _find(app.layout, "featured-pilot-prefix")
+    assert prefix is not None
+    text = prefix.to_plotly_json().get("props", {}).get("children")
+    assert text == board.BOARD_COPY["featured_pilot_prefix"]
+
+
+def test_evidence_trail_station_glyphs_render(tmp_path: Path):
+    """Phase 6G-4: each Evidence Trail station card now
+    carries a small two-letter "stamp" prefix (SF / TP /
+    WK / RY / CH / TH / WT) sourced from the
+    station-id -> glyph map. No emoji and no external
+    image assets."""
+    pytest.importorskip("dash")
+    cache_dir, artifact_root, sig_lib_dir = _empty_dirs(tmp_path)
+    _write_min_spymaster_cache(cache_dir, "SPY")
+    app = board.build_app(
+        cache_dir=cache_dir,
+        artifact_root=artifact_root,
+        sig_lib_dir=sig_lib_dir,
+    )
+    text = _component_text(app.layout)
+    for glyph in ("SF", "TP", "WK", "RY", "CH", "TH", "WT"):
+        assert glyph in text, (
+            f"missing station glyph {glyph!r} in rendered layout"
+        )
+
+
+def test_scoreboard_table_wrapper_preserves_mobile_overflow_contract():
+    """Phase 6G-4 must not regress the Phase 6F-7 mobile
+    contained-scroll contract: the scoreboard wrapper still
+    declares ``data-mobile-overflow="contained"`` and an
+    ``overflowX: auto`` style."""
+    pytest.importorskip("dash")
+    rows = [
+        board.BoardRow(
+            ticker="SPY", signal="None", signal_value=0,
+            agreement_active=7, agreement_total=60,
+            coverage=board.COVERAGE_FULL, as_of="2026-05-08",
+            leader_eligible=True, rank=1,
+        ),
+    ]
+    wrapper = board.render_scoreboard(rows)
+    props = wrapper.to_plotly_json().get("props", {})
+    assert props.get("id") == "scoreboard-table-wrapper"
+    assert props.get("data-mobile-overflow") == "contained"
+    assert (props.get("style") or {}).get("overflowX") == "auto"
 
 
 # ---------------------------------------------------------------------------
