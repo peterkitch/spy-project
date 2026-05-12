@@ -70,6 +70,12 @@ misc.xml
 !CLAUDE.md
 !md_library/
 !md_library/**/*.md
+# Phase 6H-7: machine-readable operator command manifest lives
+# under md_library/ as a JSON sibling to the runbook .md. Allow
+# tracking JSON files under md_library specifically (operator
+# documentation, not generated data); the global *.json ignore
+# rule still catches everything else.
+!md_library/**/*.json
 
 # Global Ticker Library data files
 global_ticker_library/data/*.db
