@@ -732,29 +732,38 @@ scanning either tool's JSON sees the same answer.
 
 ### 6.8.2 Meaning
 
-The source cache is **not stale** (`cache.last_date >=
-current_as_of_date`), the full upstream chain is in place
-(Spymaster cache + StackBuilder leaderboard + multi-timeframe
-libraries), and at least one daily K TrafficFlow artifact has
-been written. The only thing keeping Confluence from being
-"current" by the strict `last_date >= current_as_of_date`
-contract is the Phase 6D-1 `persist_skip_bars=1` trim — and
-that trim is a load-bearing safety policy, not a bug. A
-pipeline write today will reproduce the same one-trading-bar
-lag.
+The source cache is **not stale**
+(`cache.last_date >= current_as_of_date`) and the full
+upstream chain is in place (Spymaster cache + StackBuilder
+leaderboard + multi-timeframe libraries). The only thing
+keeping Confluence from being "current" by the strict
+`last_date >= current_as_of_date` contract is the Phase 6D-1
+`persist_skip_bars=1` trim — and that trim is a load-bearing
+safety policy, not a bug. A pipeline write today will
+reproduce the same one-trading-bar lag. The verdict fires
+whether daily K / MTF K / Confluence artifacts already exist
+or not; the point is that any FUTURE pipeline write would
+still persist-skip behind the cutoff.
 
 Concretely, the audit fires this verdict when all of these
 hold for the ticker:
 
-  - `has_signal_engine_cache=True`,
-  - `has_stackbuilder_run=True`,
-  - `has_multitimeframe_libraries=True`,
-  - `stale=False` (source cache is fresh),
+  - `has_signal_engine_cache=True`
+  - `has_stackbuilder_run=True`
+  - `has_multitimeframe_libraries=True`
+  - `stale=False` (source cache is fresh)
   - `parsed(cache.last_date) == parsed(current_as_of_date)`
     (the source cache equals the resolver's cutoff exactly,
     i.e. the cache has no trading day strictly past the
     cutoff that would allow the persist trim to leave
     Confluence at-cutoff).
+
+Daily K, MTF K, and Confluence artifact presence are NOT
+part of the predicate. The new verdict is about what a
+hypothetical pipeline write would produce; it intentionally
+fires even on a ticker that has never had the Phase 6D
+chain run, so the operator does not waste a write cycle on
+a structurally-blocked ticker.
 
 Under those conditions, the audit overrides what would have
 been `RECOMMENDED_READY_FOR_PIPELINE_WRITE` and emits the new
@@ -778,29 +787,53 @@ cutoff.
 
 ### 6.8.4 Operator action
 
-The correct operator response under
-`pipeline_output_lags_persist_skip` is:
+The verdict closes when the source cache acquires a trading
+day **strictly after** `current_as_of_date`. The correct
+gate is therefore a cache-vs-cutoff inequality check, not a
+wall-clock event.
 
-  1. **Wait** for the next trading-day market close. (For
-     SPY that is the next weekday's Yahoo / NYSE close.)
-  2. **Wait** for UTC to roll past that close.
-     `confluence_pipeline_readiness.resolve_current_as_of_date`
-     uses UTC, not US/Eastern, so the cutoff does not move
-     immediately at market close.
-  3. Once the cache has a trading day strictly after
-     `current_as_of_date`, refresh the Signal Engine cache
-     if not already current (Phase 6E-5 refresher,
-     `--write`), then rerun the pipeline
-     (`confluence_pipeline_runner --ticker <T> --write`).
-     The persist trim now leaves Confluence at the cutoff
-     exactly, so the recommendation flips back to
-     `run_pipeline_after_refresh` and then to
-     `already_leader_eligible` after the rerun.
+  1. Probe the cache against the cutoff. The cheapest read
+     is the existing dry-run:
+     `python signal_engine_cache_refresher.py --ticker <T>
+     --dry-run`. The result reports
+     `old_cache_date_range_end`,
+     `new_cache_date_range_end`, and
+     `current_after`. The operator wants
+     `new_cache_date_range_end > current_as_of_date`
+     (strict inequality, not `==`). A direct
+     `pickle.loads` of
+     `cache/results/<T>_precomputed_results.pkl` comparing
+     `_last_date` against
+     `confluence_pipeline_readiness.resolve_current_as_of_date()`
+     is the equivalent inspection and does not touch the
+     network.
+  2. Once the strict inequality holds, run the authorized
+     refresh + pipeline cycle. The persist-skip trim now
+     leaves Confluence at-cutoff and the gap closes.
+       - `python signal_engine_cache_refresher.py
+         --ticker <T> --write` (if the cache itself needs
+         to be re-stamped first).
+       - `python confluence_pipeline_runner.py
+         --ticker <T> --write`.
+       - `python board_launch_readiness_audit.py
+         --tickers <T>` should now report
+         `already_leader_eligible`.
+
+The original prompt-level guidance "wait for UTC rollover"
+is **incorrect** for this contract and should not appear in
+operator-facing documentation. In the common SPY case the
+strict inequality typically opens after the next NY market
+close IF the cache is refreshed before UTC rolls the cutoff
+forward. If UTC rolls forward first (cache still equals the
+previous cutoff while the resolver advances to the new
+one), the equal-cache/cutoff lag simply recreates and
+`pipeline_output_lags_persist_skip` stays in force. The
+predicate to watch is `cache.last_date > current_as_of_date`,
+not any wall-clock event.
 
 No production cache write and no pipeline rerun will close
-the gap until step 3's "trading day strictly after cutoff"
-condition holds. Attempting them earlier produces
-byte-identical persist-trimmed output.
+the gap until that strict inequality holds. Attempting them
+earlier produces byte-identical persist-trimmed output.
 
 ### 6.8.5 Safety flag contract
 

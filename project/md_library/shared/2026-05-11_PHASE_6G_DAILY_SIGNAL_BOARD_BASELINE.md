@@ -237,13 +237,16 @@ working as designed.
 
 To re-show the SPY-as-rank-#1 / leader-eligible state from
 the screenshots in § 4 against the on-disk artifacts, pin
-the readiness cutoff to the day the artifacts were written:
+the readiness cutoff to the day the artifacts were written.
+The operator environment for this repo is Windows + the
+pinned `spyproject2` conda interpreter; the canonical
+PowerShell incantation is:
 
-```
-PRJCT9_PUBLIC_READ_ONLY=1 \
-  PRJCT9_BOARD_PORT=8061 \
-  PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08 \
-  python daily_signal_board.py
+```powershell
+$env:PRJCT9_PUBLIC_READ_ONLY = '1'
+$env:PRJCT9_BOARD_PORT = '8061'
+$env:PRJCT9_RESEARCH_AS_OF_DATE = '2026-05-08'
+& 'C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe' daily_signal_board.py
 ```
 
 `confluence_pipeline_readiness.resolve_current_as_of_date`
@@ -278,23 +281,51 @@ for the full preflight contract under the new action.
 
 ### 7.4 What the operator should do
 
-Until the cache carries a trading day strictly past
-`current_as_of_date`, no refresh + rerun cycle will produce
-a current Confluence verdict. The correct operator response
-is simply to wait for the next trading-day rollover:
+The action `pipeline_output_lags_persist_skip` becomes
+useful again only when the source cache acquires a trading
+day strictly after `current_as_of_date`. The persist-skip
+trim then leaves Confluence at-cutoff and a rerun makes it
+current. The correct gate to wait for is therefore a
+**cache-vs-cutoff inequality**, not a clock event:
 
-  1. Wait for the next NY market close (so the cache picks
-     up that day's bar; SPY's Spymaster refresh path will
-     populate this).
-  2. Wait for UTC to roll past that close (the resolver
-     uses UTC, not US/Eastern, so a market-close-time refresh
-     does NOT immediately move the cutoff).
-  3. Once the cache has a trading day strictly after
-     `current_as_of_date`, the Phase 6D-1 trim drops back
-     to the cutoff and a pipeline rerun produces a current
-     Confluence verdict. The recommendation flips from
-     `pipeline_output_lags_persist_skip` back to
-     `ready_for_pipeline_write`.
+  1. Probe the cache against the cutoff. The cheapest
+     check is the existing dry-run path:
+     `python signal_engine_cache_refresher.py --ticker <T>
+     --dry-run`. The result reports
+     `old_cache_date_range_end`,
+     `new_cache_date_range_end`, and
+     `current_after`. The operator wants to see
+     `new_cache_date_range_end > current_as_of_date`
+     (strict inequality, not `==`). A direct
+     `pickle.loads` of `cache/results/<T>_precomputed_results.pkl`
+     comparing `_last_date` against
+     `confluence_pipeline_readiness.resolve_current_as_of_date()`
+     is the equivalent inspection.
+  2. Once the strict inequality holds, the gap is closable.
+     Run the authorized cache write
+     (`signal_engine_cache_refresher.py --ticker <T> --write`
+     if the cache needs to be re-stamped) followed by the
+     authorized pipeline write
+     (`confluence_pipeline_runner.py --ticker <T> --write`).
+     The recommendation flips back through
+     `run_pipeline_after_refresh` and lands on
+     `already_leader_eligible` once the pipeline write
+     completes.
 
-Until then, nothing actionable. No production write is
-authorized to "fix" the gap; the gap is the contract.
+Notes on timing (informational, not the required gate):
+
+  - In the common SPY case, the strict inequality typically
+    opens after the next NY market close, IF the Signal
+    Engine cache is refreshed before UTC moves the cutoff
+    forward. SPY closes at ~21:00 UTC; UTC midnight is a
+    few hours later. A cache refresh inside that window
+    leaves the cache one trading day ahead of the cutoff.
+  - If UTC rolls forward first (cache still equals the
+    prior cutoff while the resolver advances to the new
+    one), the equal-cache/cutoff lag simply recreates and
+    `pipeline_output_lags_persist_skip` stays in force.
+    This is not a regression; it is the same contract.
+
+Until the strict inequality opens, nothing operator-side
+will move the verdict. No production write is authorized
+to "fix" the gap; the gap is the contract.
