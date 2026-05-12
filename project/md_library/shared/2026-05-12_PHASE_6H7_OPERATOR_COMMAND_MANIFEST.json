@@ -1,0 +1,232 @@
+{
+  "schema": "phase_6h7_operator_command_manifest_v1",
+  "generated_for_main_head": "5c55dad",
+  "last_updated": "2026-05-12",
+  "description": "Static, machine-readable manifest of the authorized PRJCT9 Daily Signal Board operator commands as of Phase 6H-6. Describes commands; does not execute them. The accompanying runbook at md_library/shared/2026-05-12_PHASE_6H7_PRODUCTION_RUNBOOK.md is the human-readable companion.",
+  "required_env_var": {
+    "name": "PRJCT9_AUTOMATION_WRITE_AUTH",
+    "required_value": "phase_6h5_explicit",
+    "purpose": "Second key of the Phase 6H-5 two-key write authorization. Required IN ADDITION to the CLI --write flag before any live refresher / pipeline write fires."
+  },
+  "required_root_flags_for_authorized_writes": [
+    "--cache-dir",
+    "--status-dir",
+    "--artifact-root",
+    "--stackbuilder-root",
+    "--signal-library-dir",
+    "--execution-log"
+  ],
+  "read_only_commands": [
+    {
+      "label": "cache_cutoff_watcher",
+      "phase": "6H-2",
+      "purpose": "Read cache.last_date and compare to current_as_of_date. Reports recommended_operator_action.",
+      "command_template": "python cache_cutoff_watcher.py --ticker <TICKER>",
+      "writes": false,
+      "touches_yfinance": false
+    },
+    {
+      "label": "automation_preflight",
+      "phase": "6H-3",
+      "purpose": "Per-ticker orchestration plan with StackBuilder inventory + selected variant + advisory would_run_commands.",
+      "command_template": "python daily_board_automation_preflight.py --ticker <TICKER>",
+      "writes": false,
+      "touches_yfinance": false
+    },
+    {
+      "label": "source_freshness_preflight",
+      "phase": "6E-2 + 6G-5",
+      "purpose": "Refresh-focused per-ticker classification (refresh_source_cache / run_pipeline_after_refresh / pipeline_output_lags_persist_skip / etc.).",
+      "command_template": "python source_freshness_preflight.py --ticker <TICKER>",
+      "writes": false,
+      "touches_yfinance": false
+    },
+    {
+      "label": "launch_readiness_audit",
+      "phase": "6E-1 + 6F-4 + 6G-5",
+      "purpose": "Full per-stage readiness verdict with optional pipeline-runner dry-run.",
+      "command_template": "python board_launch_readiness_audit.py --tickers <TICKER> --no-dry-run",
+      "writes": false,
+      "touches_yfinance": false
+    },
+    {
+      "label": "refresher_dry_run",
+      "phase": "6E-3 + 6E-5",
+      "purpose": "Heaviest read-only probe. Touches yfinance to peek at the next available trading-day close without writing.",
+      "command_template": "python signal_engine_cache_refresher.py --ticker <TICKER> --dry-run",
+      "writes": false,
+      "touches_yfinance": true
+    }
+  ],
+  "dry_run_commands": [
+    {
+      "label": "automation_executor_dry_run",
+      "phase": "6H-4",
+      "purpose": "Dry-run executor with refresh -> recheck -> pipeline sequencing. Pipeline write command intentionally withheld until watcher recheck passes. --write is rejected with rc=2.",
+      "command_template": "python daily_board_automation_executor.py --ticker <TICKER>",
+      "writes": false,
+      "touches_yfinance": false
+    },
+    {
+      "label": "automation_writer_dry_run",
+      "phase": "6H-5 + 6H-6",
+      "purpose": "Guarded write-capable executor running in default dry-run mode. No --write, no env var. No writes.",
+      "command_template": "python daily_board_automation_writer.py --ticker <TICKER>",
+      "writes": false,
+      "touches_yfinance": false
+    },
+    {
+      "label": "automation_writer_explicit_dry_run",
+      "phase": "6H-5 + 6H-6",
+      "purpose": "Same as above with the explicit --dry-run flag. Identical behavior; flag exists for operator clarity.",
+      "command_template": "python daily_board_automation_writer.py --ticker <TICKER> --dry-run",
+      "writes": false,
+      "touches_yfinance": false
+    }
+  ],
+  "authorized_writer_command": {
+    "label": "authorized_writer",
+    "phase": "6H-5 + 6H-6",
+    "purpose": "The one path to authorized live writes. Refresh -> watcher recheck -> pipeline (only if watcher returns ready_for_pipeline_write). Writes a status JSON to <STATUS_DIR>, a cache PKL + manifest sidecar to <CACHE_DIR>, and a Phase 6D Confluence artifact to <ARTIFACT_ROOT>. Appends one row to <EXECUTION_LOG_PATH>.",
+    "command_template": "PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit python daily_board_automation_writer.py --ticker <TICKER> --write --cache-dir <CACHE_DIR> --status-dir <STATUS_DIR> --artifact-root <ARTIFACT_ROOT> --stackbuilder-root <STACKBUILDER_ROOT> --signal-library-dir <SIGNAL_LIBRARY_DIR> --execution-log <EXECUTION_LOG_PATH> --current-as-of-date <YYYY-MM-DD>",
+    "powershell_template": "$env:PRJCT9_AUTOMATION_WRITE_AUTH = 'phase_6h5_explicit'; & 'C:\\Users\\sport\\AppData\\Local\\NVIDIA\\MiniConda\\envs\\spyproject2\\python.exe' daily_board_automation_writer.py --ticker <TICKER> --write --cache-dir <CACHE_DIR> --status-dir <STATUS_DIR> --artifact-root <ARTIFACT_ROOT> --stackbuilder-root <STACKBUILDER_ROOT> --signal-library-dir <SIGNAL_LIBRARY_DIR> --execution-log <EXECUTION_LOG_PATH> --current-as-of-date <YYYY-MM-DD>",
+    "writes": true,
+    "required_env_vars": ["PRJCT9_AUTOMATION_WRITE_AUTH"],
+    "required_flags": [
+      "--ticker",
+      "--write",
+      "--cache-dir",
+      "--status-dir",
+      "--artifact-root",
+      "--stackbuilder-root",
+      "--signal-library-dir",
+      "--execution-log"
+    ],
+    "expected_outputs": [
+      "<CACHE_DIR>/<TICKER>_precomputed_results.pkl",
+      "<CACHE_DIR>/<TICKER>_precomputed_results.pkl.manifest.json",
+      "<STATUS_DIR>/<TICKER>_status.json",
+      "<ARTIFACT_ROOT>/confluence/<TICKER>/<TICKER>__MTF_CONSENSUS.research_day.json",
+      "<ARTIFACT_ROOT>/trafficflow/<TICKER>/<seed_run>__K<K>.research_day.json (K=1..12)",
+      "<ARTIFACT_ROOT>/trafficflow/<TICKER>/<seed_run>__K<K>__MTF.research_day.json (K=1..12)",
+      "Appended JSONL row at <EXECUTION_LOG_PATH>"
+    ],
+    "read_only_inputs": [
+      "<STACKBUILDER_ROOT>/<TICKER>/<seed_run>/combo_leaderboard.xlsx",
+      "<SIGNAL_LIBRARY_DIR>/<TICKER>_stable_v1_0_0_<INTERVAL>.pkl"
+    ],
+    "exit_codes": {
+      "0": "execution completed; report emitted to stdout",
+      "2": "invalid CLI arguments OR --write requested without the matching env-var value",
+      "3": "unexpected unhandled exception"
+    }
+  },
+  "prohibited_commands": [
+    {
+      "label": "universe_sweep",
+      "reason": "Daily automation runs against an explicit operator-named ticker list. There is no production scheduler today; a universe sweep would silently amplify any error across the entire saved catalogue. Never invoke any writer with a wildcard or --all-tickers / --universe flag.",
+      "example_patterns": [
+        "--all-tickers",
+        "--universe",
+        "--every-ticker",
+        "--wildcard"
+      ]
+    },
+    {
+      "label": "stackbuilder_execution",
+      "reason": "StackBuilder is a manual research workflow. Saved stack variants are durable inputs to the daily automation, not daily-rebuilt outputs. The Phase 6H automation chain explicitly forbids invoking StackBuilder.",
+      "example_patterns": [
+        "python stackbuilder.py",
+        "stackbuilder.run_*"
+      ]
+    },
+    {
+      "label": "onepass_execution",
+      "reason": "OnePass is a research workflow that produces signal-library inputs. It is a stable manual input to StackBuilder, not a daily automation step.",
+      "example_patterns": [
+        "python onepass.py",
+        "onepass.run_*"
+      ]
+    },
+    {
+      "label": "multitimeframe_library_rebuild",
+      "reason": "Multi-timeframe libraries are stable / manual inputs. The daily automation blocks with refresh_multitimeframe_libraries_manual rather than rebuilding them itself.",
+      "example_patterns": [
+        "python signal_library/multi_timeframe_builder.py"
+      ]
+    },
+    {
+      "label": "writer_with_only_cli_flag_no_env",
+      "reason": "The two-key authorization requires both --write AND the env var. --write alone returns rc=2 and writes nothing; that is by design. Do not work around it.",
+      "example_patterns": [
+        "python daily_board_automation_writer.py --ticker <TICKER> --write"
+      ]
+    },
+    {
+      "label": "writer_against_production_without_status_dir_override",
+      "reason": "Authorized writes MUST supply --status-dir explicitly. Omitting it (or pointing it at the production project/cache/status/ during a temp-dir rehearsal) leaks the per-ticker status JSON outside the operator-controlled root. The Phase 6H-6 plumbing was added specifically to close this gap.",
+      "example_patterns": [
+        "python daily_board_automation_writer.py --write --cache-dir /tmp/... (no --status-dir)"
+      ]
+    }
+  ],
+  "decision_tree": [
+    {
+      "watcher_or_planner_verdict": "no_action_already_current",
+      "operator_action": "no_op",
+      "use_command": null
+    },
+    {
+      "watcher_or_planner_verdict": "wait_for_cache_ahead_of_cutoff",
+      "operator_action": "wait_for_next_trading_day_close_then_recheck",
+      "use_command": "cache_cutoff_watcher (re-probe later)"
+    },
+    {
+      "watcher_or_planner_verdict": "select_or_create_stackbuilder_stack_manual",
+      "operator_action": "manual_research_review",
+      "use_command": null
+    },
+    {
+      "watcher_or_planner_verdict": "refresh_multitimeframe_libraries_manual",
+      "operator_action": "manual_research_review",
+      "use_command": null
+    },
+    {
+      "watcher_or_planner_verdict": "blocked_manual_review",
+      "operator_action": "manual_review",
+      "use_command": null
+    },
+    {
+      "watcher_or_planner_verdict": "refresh_source_cache_then_pipeline",
+      "operator_action": "authorized_refresh_then_watcher_recheck_then_pipeline",
+      "use_command": "authorized_writer (refresher runs; watcher rechecks; pipeline only if watcher returns ready_for_pipeline_write)"
+    },
+    {
+      "watcher_or_planner_verdict": "run_pipeline_only",
+      "operator_action": "authorized_pipeline_only",
+      "use_command": "authorized_writer (pipeline runs directly; no refresh needed)"
+    }
+  ],
+  "safety_contract_summary": {
+    "two_key_write_authorization": "Both --write AND PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit are required. Either missing -> rc=2, no writes.",
+    "refresh_recheck_pipeline_sequencing": "Under authorized writes for the refresh-then-pipeline branch, the refresher runs first, then cache_cutoff_watcher rechecks against the post-refresh cache, then the pipeline runner runs ONLY when the watcher returns ready_for_pipeline_write. Any other watcher verdict (including pipeline_output_lags_persist_skip) withholds the pipeline write.",
+    "persist_skip_lag_rule": "After a refresh, the cache_date_range_end MUST be strictly greater than current_as_of_date for the watcher to return ready_for_pipeline_write. If they are equal, Phase 6D-1's persist_skip_bars=1 trim would land Confluence one trading bar behind the cutoff and the pipeline write is correctly withheld.",
+    "stackbuilder_policy": "Saved stack variants are durable inputs. The automation preserves the existing pipeline default (newest-mtime under stackbuilder/<TICKER>/) and surfaces the selected run via stackbuilder_selection_policy=latest_mtime_existing_pipeline_default. A single saved variant is OK. Multi-variant with a clear newest mtime is OK and the latest-mtime default applies. Tied newest-mtime is ambiguous_tied_mtime and blocks automation; the operator must pick. No 30-day stale window; stack age alone is never a block.",
+    "watcher_exception_handling": "If the post-refresh watcher itself raises, the executor returns a structured TickerWriteExecution with refresh_result preserved, pipeline_result=None, issue_codes=('watcher_exception',), final_recommended_action=refresh_executed_pipeline_withheld, and one row appended to the execution log. The refresh side effect is captured; the pipeline write is withheld.",
+    "execution_log_contract": "When --execution-log <path> is supplied, the writer appends one JSON object per ticker per invocation with logged_at UTC timestamp + full per-execution payload. Append-only; never truncates."
+  },
+  "rollback_recovery": {
+    "git_does_not_track_production_cache_or_output": "Production cache/, output/research_artifacts/, output/stackbuilder/, signal_library/data/stable/ are gitignored. git checkout, git reset, and git revert do NOT recover from a bad write. Rollback requires restoring files from operator-managed backups or from previous artifact copies retained outside the repo.",
+    "before_any_authorized_run": "Snapshot the four operator output roots that the authorized writer can modify: <CACHE_DIR>, <STATUS_DIR>, <ARTIFACT_ROOT>, plus the <EXECUTION_LOG_PATH> file. A simple file copy or tarball is sufficient. Keep the snapshot until the run's verdict has been audited.",
+    "after_any_authorized_run": "Read the execution log JSONL row for the ticker. Confirm refresh_result.succeeded=True, post_refresh_watcher_action=ready_for_pipeline_write (or absent for run_pipeline_only), and pipeline_result.leader_eligible=True. Compare the new artifact's last_date against the expected cutoff. If anything looks wrong, restore the snapshot before any further write attempts.",
+    "do_not_attempt_universe_rollback": "Even a small wildcard rerun can rewrite dozens of artifacts. There is no batch rollback. Operate one ticker at a time."
+  },
+  "do_not_run_warnings": [
+    "Never invoke any automation command with --all-tickers, --universe, or any wildcard pattern.",
+    "Never invoke daily_board_automation_writer.py with --write against production paths without the corresponding env var. The CLI will refuse with rc=2, but treat the prompt itself as suspect if you find yourself trying.",
+    "Never invoke daily_board_automation_writer.py --write without --status-dir, --cache-dir, --artifact-root, --execution-log all explicitly supplied. Default paths point at production; the Phase 6H-6 plumbing exists precisely so they can be operator-named.",
+    "Never run StackBuilder or OnePass as part of the daily automation. They are stable manual research inputs. Re-running them silently rewrites operator-pinned research stacks.",
+    "Never rebuild multi-timeframe libraries from the automation chain. The planner reports refresh_multitimeframe_libraries_manual when they are missing; the operator handles that out-of-band.",
+    "Never schedule automated daily writes without first wiring the Phase 5C validation_contract_v1 sidecar integration. Phase 6H-6 doc § 8 names this as a remaining blocker."
+  ]
+}
