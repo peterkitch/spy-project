@@ -397,6 +397,144 @@ def _write_confluence_artifact(
     )
 
 
+def _write_confluence_with_count_drift(
+    artifact_root: Path,
+    target: str,
+    *,
+    last_date: str = "2026-05-08",
+    seed_run_id: str = "seedTC__AAA-D_BBB-D",
+    confluence_signal: str = "None",
+    signal_value: int | None = None,
+    buy_votes: int = 0,
+    short_votes: int = 0,
+    none_votes: int | None = None,
+    missing_votes: int = 0,
+    K_values: list[int] | None = None,
+    timeframes: list[str] | None = None,
+    # Phase 6I-1 amendment overrides: any field below
+    # defaults to a value consistent with the rest of the
+    # artifact when ``None``; pass an explicit integer to
+    # inject drift.
+    active_count_override: int | None = None,
+    available_count_override: int | None = None,
+    agreement_total_override: int | None = None,
+    agreement_active_override: int | None = None,
+    confluence_signal_alias_override: str | None = None,
+) -> Path:
+    """Write a Confluence artifact with explicit overrides
+    for every count field the Phase 6I-1 amendment
+    validates. Defaults match the canonical
+    Phase 6D-3 builder formulas; tests pass overrides to
+    inject specific drifts."""
+    import json
+
+    safe = target.upper().replace("^", "_")
+    conf_dir = artifact_root / "confluence" / safe
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    K_values = (
+        list(K_values) if K_values is not None
+        else list(range(1, 13))
+    )
+    timeframes = (
+        list(timeframes) if timeframes is not None
+        else ["1d", "1wk", "1mo", "3mo", "1y"]
+    )
+    expected_cells = len(K_values) * len(timeframes)
+    if signal_value is None:
+        signal_value = {
+            "Buy": 1, "Short": -1, "None": 0,
+        }.get(confluence_signal, 0)
+    if none_votes is None:
+        none_votes = (
+            expected_cells - buy_votes - short_votes - missing_votes
+        )
+    # Canonical formulas (the values the validator EXPECTS
+    # when no override is supplied).
+    active_count = (
+        active_count_override
+        if active_count_override is not None
+        else (buy_votes + short_votes)
+    )
+    available_count = (
+        available_count_override
+        if available_count_override is not None
+        else (
+            (active_count_override or (buy_votes + short_votes))
+            + none_votes
+        )
+    )
+    agreement_total = (
+        agreement_total_override
+        if agreement_total_override is not None
+        else available_count
+    )
+    if agreement_active_override is not None:
+        agreement_active = agreement_active_override
+    else:
+        # Strict-unanimity rule.
+        if buy_votes == 0 and short_votes == 0:
+            agreement_active = 0
+        elif buy_votes > 0 and short_votes == 0:
+            agreement_active = buy_votes
+        elif buy_votes == 0 and short_votes > 0:
+            agreement_active = short_votes
+        else:
+            agreement_active = 0
+    run_ids = [
+        f"{seed_run_id}__K{k}__MTF" for k in K_values
+    ]
+    row = {
+        "date": last_date,
+        "target": target,
+        "target_ticker": target,
+        "target_close": 100.0,
+        "target_return_pct": 0.0,
+        "confluence_signal": (
+            confluence_signal_alias_override
+            if confluence_signal_alias_override is not None
+            else confluence_signal
+        ),
+        "signal": confluence_signal,
+        "signal_value": signal_value,
+        "agreement_active": agreement_active,
+        "agreement_total": agreement_total,
+        "active_count": active_count,
+        "available_count": available_count,
+        "buy_votes": buy_votes,
+        "short_votes": short_votes,
+        "none_votes": none_votes,
+        "missing_votes": missing_votes,
+        "K_values": K_values,
+        "timeframes": timeframes,
+        "source_trafficflow_mtf_run_ids": run_ids,
+        "daily_capture_pct": 0.0,
+        "is_trigger_day": False,
+        "cumulative_capture_pct": 0.0,
+    }
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="confluence",
+        target_ticker=target,
+        signal_source="",
+        run_id="mtf_consensus",
+        metric_basis="Close",
+        persist_skip_bars=1,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 50.0,
+            "sharpe_ratio": 0.1,
+            "trigger_days": 5,
+        },
+        daily=[row],
+        timeframes=timeframes,
+        min_active=1,
+    )
+    return ra.write_research_day_artifact(
+        art,
+        conf_dir / f"{safe}__MTF_CONSENSUS.research_day.json",
+    )
+
+
 def _write_full_valid_artifacts(
     dirs: dict[str, Path],
     target: str = "SPY",
@@ -970,6 +1108,216 @@ def test_confluence_signal_value_alias_mismatch_fails(
     )
 
 
+def test_active_count_must_equal_buy_plus_short(
+    tmp_path: Path,
+):
+    """Phase 6I-1 amendment: active_count == buy + short.
+    Inconsistency flags confluence_count_incoherent. Board
+    derives its agreement display from active_count, so
+    drift here is operator-visible."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    # K=12, timeframes=5 -> 60 cells. Buy=5, Short=2, but
+    # write active_count=10 (should be 7).
+    _write_confluence_artifact(
+        dirs["artifact_root"], "SPY",
+        buy_votes=5, short_votes=2,
+        none_votes=53, missing_votes=0,
+    )
+    # Override the active_count after the fact: easiest path
+    # is to write a custom artifact via a tiny patch helper.
+    # Re-emit with an explicit active_count drift instead.
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=5, short_votes=2,
+        none_votes=53, missing_votes=0,
+        active_count_override=10,  # wrong (should be 7)
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is False
+    assert (
+        crcv.ISSUE_CONFLUENCE_COUNT_INCOHERENT
+        in v.issue_codes
+    )
+
+
+def test_available_count_must_equal_active_plus_none(
+    tmp_path: Path,
+):
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=5, short_votes=2,
+        none_votes=53, missing_votes=0,
+        # active_count correct (7), but available_count
+        # wrong (should be 7+53=60; we pin 50).
+        available_count_override=50,
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is False
+    assert (
+        crcv.ISSUE_CONFLUENCE_COUNT_INCOHERENT
+        in v.issue_codes
+    )
+
+
+def test_agreement_total_must_equal_available_count(
+    tmp_path: Path,
+):
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=5, short_votes=2,
+        none_votes=53, missing_votes=0,
+        # active_count + available_count correct (7, 60);
+        # agreement_total drifts (should be 60; we pin 45).
+        agreement_total_override=45,
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is False
+    assert (
+        crcv.ISSUE_CONFLUENCE_COUNT_INCOHERENT
+        in v.issue_codes
+    )
+
+
+def test_agreement_active_strict_unanimity_mixed_must_be_zero(
+    tmp_path: Path,
+):
+    """Strict-unanimity rule: when buy>0 AND short>0, the
+    artifact's agreement_active MUST be 0. Anything else
+    flags confluence_agreement_active_inconsistent."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=5, short_votes=2,
+        none_votes=53, missing_votes=0,
+        # Mixed (5 buy, 2 short) -> rule says
+        # agreement_active=0; we pin it to 7 (the
+        # active_count) which is the easy-to-make mistake.
+        agreement_active_override=7,
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is False
+    assert (
+        crcv.ISSUE_CONFLUENCE_AGREEMENT_ACTIVE_INCONSISTENT
+        in v.issue_codes
+    )
+
+
+def test_agreement_active_strict_unanimity_unanimous_buy(
+    tmp_path: Path,
+):
+    """Strict-unanimity rule: when buy>0 AND short==0,
+    agreement_active MUST equal buy_votes. An artifact that
+    pins agreement_active=0 here is inconsistent."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=12, short_votes=0,
+        none_votes=48, missing_votes=0,
+        confluence_signal="Buy", signal_value=1,
+        agreement_active_override=0,  # should be 12
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is False
+    assert (
+        crcv.ISSUE_CONFLUENCE_AGREEMENT_ACTIVE_INCONSISTENT
+        in v.issue_codes
+    )
+
+
+def test_invalid_signal_vocabulary_fails(tmp_path: Path):
+    """signal must be one of {"Buy", "Short", "None"}.
+    Anything else flags confluence_invalid_signal_vocabulary."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=0, short_votes=0,
+        none_votes=60, missing_votes=0,
+        confluence_signal="Maybe",  # not in the vocabulary
+        confluence_signal_alias_override="Maybe",
+        signal_value=0,
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is False
+    assert (
+        crcv.ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY
+        in v.issue_codes
+    )
+
+
+def test_board_row_preview_uses_active_count_not_alias_fields(
+    tmp_path: Path,
+):
+    """Phase 6I-1 amendment: the preview's
+    agreement_active / agreement_total must come from
+    active_count / available_count (matching
+    daily_signal_board._confluence_active_total), NOT from
+    the artifact's separate agreement_active /
+    agreement_total fields.
+
+    We can verify by writing a SPY-shaped artifact where
+    those four fields all carry DIFFERENT values, all
+    individually internally consistent, then asserting the
+    preview reflects the active_count/available_count
+    pair.
+    """
+    dirs = _layout(tmp_path)
+    _write_full_valid_artifacts(dirs)
+    # buy=5, short=2 -> active_count = 7
+    # available_count = active_count + none = 7 + 53 = 60
+    # agreement_total = available_count = 60
+    # agreement_active (mixed) = 0
+    # These are the canonical values; the SPY-shape default
+    # is correct. We write them explicitly here so the
+    # test reads as a clear contract assertion.
+    _write_confluence_with_count_drift(
+        dirs["artifact_root"], "SPY",
+        buy_votes=5, short_votes=2,
+        none_votes=53, missing_votes=0,
+        active_count_override=7,
+        available_count_override=60,
+        agreement_total_override=60,
+        agreement_active_override=0,
+        confluence_signal="None", signal_value=0,
+    )
+    v = crcv.validate_confluence_ranking_contract(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert v.confluence_contract_ok is True
+    preview = v.board_row_preview
+    assert preview is not None
+    # The preview's agreement_active MUST come from
+    # active_count (7), NOT from the artifact's
+    # agreement_active (0).
+    assert preview["agreement_active"] == 7
+    assert preview["agreement_total"] == 60
+    # The agreement_ratio MUST be active_count /
+    # available_count, NOT agreement_active /
+    # agreement_total.
+    assert preview["agreement_ratio"] == pytest.approx(
+        7 / 60,
+    )
+
+
 def test_confluence_vote_total_mismatch_fails(tmp_path: Path):
     """buy + short + none + missing must equal
     len(K_values) * len(timeframes). missing_votes are
@@ -1261,6 +1609,9 @@ def test_all_issue_codes_listed():
         crcv.ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH,
         crcv.ISSUE_CONFLUENCE_VOTE_TOTAL_MISMATCH,
         crcv.ISSUE_CONFLUENCE_CROSS_SEED_K_MIXING,
+        crcv.ISSUE_CONFLUENCE_COUNT_INCOHERENT,
+        crcv.ISSUE_CONFLUENCE_AGREEMENT_ACTIVE_INCONSISTENT,
+        crcv.ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY,
         crcv.ISSUE_READINESS_VERDICT_DRIFT,
         crcv.ISSUE_BOARD_ROW_INCOMPUTABLE,
     }

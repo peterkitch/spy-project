@@ -160,6 +160,28 @@ ISSUE_CONFLUENCE_VOTE_TOTAL_MISMATCH = (
 ISSUE_CONFLUENCE_CROSS_SEED_K_MIXING = (
     "confluence_cross_seed_k_mixing"
 )
+# Phase 6I-1 amendment: full count-coherence between
+# active_count / available_count / agreement_total /
+# (buy + short + none + missing) / expected_cells.
+# Covers the relationships:
+#   active_count    == buy_votes + short_votes
+#   available_count == active_count + none_votes
+#   agreement_total == available_count
+#   available_count + missing_votes == expected_cells
+ISSUE_CONFLUENCE_COUNT_INCOHERENT = (
+    "confluence_count_incoherent"
+)
+# Phase 6I-1 amendment: agreement_active follows the
+# strict-unanimity rule (0 when no signal or mixed signal;
+# the matching count when one side is unanimous).
+ISSUE_CONFLUENCE_AGREEMENT_ACTIVE_INCONSISTENT = (
+    "confluence_agreement_active_inconsistent"
+)
+# Phase 6I-1 amendment: signal/confluence_signal must be
+# one of "Buy", "Short", "None".
+ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY = (
+    "confluence_invalid_signal_vocabulary"
+)
 
 # Readiness contract
 ISSUE_READINESS_VERDICT_DRIFT = "readiness_verdict_drift"
@@ -187,6 +209,9 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH,
     ISSUE_CONFLUENCE_VOTE_TOTAL_MISMATCH,
     ISSUE_CONFLUENCE_CROSS_SEED_K_MIXING,
+    ISSUE_CONFLUENCE_COUNT_INCOHERENT,
+    ISSUE_CONFLUENCE_AGREEMENT_ACTIVE_INCONSISTENT,
+    ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY,
     ISSUE_READINESS_VERDICT_DRIFT,
     ISSUE_BOARD_ROW_INCOMPUTABLE,
 )
@@ -611,6 +636,30 @@ _SIGNAL_VALUE_LOOKUP: dict[str, int] = {
 }
 
 
+_VALID_CONFLUENCE_SIGNALS: frozenset[str] = frozenset({
+    "Buy", "Short", "None",
+})
+
+
+def _expected_agreement_active(
+    buy: int, short: int,
+) -> int:
+    """Strict-unanimity rule from the Phase 6D-3 builder:
+
+      - 0 when neither side voted (no consensus),
+      - the buy-vote count when only buy voted,
+      - the short-vote count when only short voted,
+      - 0 when both sides voted (mixed -> no consensus).
+    """
+    if buy == 0 and short == 0:
+        return 0
+    if buy > 0 and short == 0:
+        return buy
+    if buy == 0 and short > 0:
+        return short
+    return 0
+
+
 def _check_confluence_contract(
     ticker: str, artifact_root: Path,
 ) -> tuple[
@@ -630,12 +679,24 @@ def _check_confluence_contract(
         ``research_day_v1`` file exists,
       - latest artifact picked by last daily-row date,
       - required last-row fields all present,
-      - confluence_signal / signal aliases agree, and
-        signal_value is the canonical
-        ``{Buy=1, Short=-1, None=0}`` mapping,
+      - confluence_signal / signal aliases agree; signal
+        and confluence_signal MUST be one of
+        ``{"Buy", "Short", "None"}``; signal_value is the
+        canonical ``{Buy=1, Short=-1, None=0}`` mapping,
       - vote tally (buy+short+none+missing) equals
         ``len(K_values) * len(timeframes)`` -- missing_votes
         are per-CELL, not per-LABEL,
+      - full count coherence between the per-row fields the
+        Daily Signal Board consumes:
+            active_count == buy_votes + short_votes
+            available_count == active_count + none_votes
+            agreement_total == available_count
+            available_count + missing_votes == expected_cells
+      - agreement_active follows the strict-unanimity rule:
+            buy=0, short=0          -> 0
+            buy>0, short=0          -> buy_votes
+            buy=0, short>0          -> short_votes
+            buy>0, short>0 (mixed)  -> 0
       - source_trafficflow_mtf_run_ids all share the same
         seed prefix (no cross-seed K mixing).
     """
@@ -683,53 +744,128 @@ def _check_confluence_contract(
                 ISSUE_CONFLUENCE_LAST_ROW_INCOMPLETE,
             )
             break
-    # Alias coherence.
+    # Signal vocabulary: signal and confluence_signal must
+    # both be in {"Buy", "Short", "None"}.
     confluence_signal = last_row.get("confluence_signal")
     signal = last_row.get("signal")
     signal_value = last_row.get("signal_value")
-    if confluence_signal is not None and signal is not None:
-        if confluence_signal != signal:
-            issues.append(
-                ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH,
-            )
-    if signal is not None:
-        expected_value = _SIGNAL_VALUE_LOOKUP.get(str(signal))
-        if (
-            expected_value is not None
-            and signal_value is not None
-            and signal_value != expected_value
-        ):
+    for candidate in (signal, confluence_signal):
+        if candidate is None:
+            continue
+        if str(candidate) not in _VALID_CONFLUENCE_SIGNALS:
             if (
-                ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH
+                ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY
                 not in issues
             ):
                 issues.append(
+                    ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY,
+                )
+            break
+    # Alias coherence (confluence_signal == signal AND
+    # signal_value follows the canonical mapping). Only run
+    # when both alias fields use valid vocabulary so the
+    # alias-mismatch and invalid-vocab codes do not stack
+    # for the same root cause.
+    if (
+        ISSUE_CONFLUENCE_INVALID_SIGNAL_VOCABULARY
+        not in issues
+    ):
+        if confluence_signal is not None and signal is not None:
+            if confluence_signal != signal:
+                issues.append(
                     ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH,
                 )
-    # Vote-tally per-cell check.
+        if signal is not None:
+            expected_value = _SIGNAL_VALUE_LOOKUP.get(
+                str(signal),
+            )
+            if (
+                expected_value is not None
+                and signal_value is not None
+                and signal_value != expected_value
+            ):
+                if (
+                    ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH
+                    not in issues
+                ):
+                    issues.append(
+                        ISSUE_CONFLUENCE_SIGNAL_ALIAS_MISMATCH,
+                    )
+    # Per-cell vote counts.
     K_values = last_row.get("K_values") or []
     timeframes = last_row.get("timeframes") or []
     try:
-        expected_cells = len(list(K_values)) * len(list(timeframes))
+        expected_cells = (
+            len(list(K_values)) * len(list(timeframes))
+        )
     except Exception:
         expected_cells = 0
-    if expected_cells > 0:
+
+    def _as_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
         try:
-            total_votes = (
-                int(last_row.get("buy_votes") or 0)
-                + int(last_row.get("short_votes") or 0)
-                + int(last_row.get("none_votes") or 0)
-                + int(last_row.get("missing_votes") or 0)
-            )
+            return int(value)
         except (TypeError, ValueError):
-            total_votes = None
-        if (
-            total_votes is not None
-            and total_votes != expected_cells
-        ):
+            return None
+
+    buy = _as_int(last_row.get("buy_votes"))
+    short_v = _as_int(last_row.get("short_votes"))
+    none_v = _as_int(last_row.get("none_votes"))
+    missing_v = _as_int(last_row.get("missing_votes"))
+    active_count = _as_int(last_row.get("active_count"))
+    available_count = _as_int(last_row.get("available_count"))
+    agreement_active = _as_int(last_row.get("agreement_active"))
+    agreement_total = _as_int(last_row.get("agreement_total"))
+
+    counts_present = (
+        buy is not None
+        and short_v is not None
+        and none_v is not None
+        and missing_v is not None
+        and active_count is not None
+        and available_count is not None
+        and agreement_total is not None
+    )
+    if expected_cells > 0 and counts_present:
+        # buy + short + none + missing == expected_cells
+        if (buy + short_v + none_v + missing_v) != expected_cells:
             issues.append(
                 ISSUE_CONFLUENCE_VOTE_TOTAL_MISMATCH,
             )
+        # Phase 6I-1 amendment: full count coherence so the
+        # Daily Signal Board's agreement display (rooted in
+        # active_count / available_count) cannot drift from
+        # the artifact's own count fields.
+        count_coherent = True
+        if active_count != (buy + short_v):
+            count_coherent = False
+        if available_count != (active_count + none_v):
+            count_coherent = False
+        if agreement_total != available_count:
+            count_coherent = False
+        if (available_count + missing_v) != expected_cells:
+            count_coherent = False
+        if not count_coherent:
+            issues.append(ISSUE_CONFLUENCE_COUNT_INCOHERENT)
+
+    # Phase 6I-1 amendment: agreement_active must follow the
+    # strict-unanimity rule. This is checked independently of
+    # ``expected_cells`` so the rule pins even when the
+    # K_values / timeframes lists are unavailable.
+    if (
+        buy is not None
+        and short_v is not None
+        and agreement_active is not None
+    ):
+        expected_agreement = _expected_agreement_active(
+            buy, short_v,
+        )
+        if agreement_active != expected_agreement:
+            issues.append(
+                ISSUE_CONFLUENCE_AGREEMENT_ACTIVE_INCONSISTENT,
+            )
+
     # Cross-seed K mixing: source_trafficflow_mtf_run_ids
     # should all share the same seed prefix.
     run_ids = last_row.get("source_trafficflow_mtf_run_ids") or []
@@ -864,6 +1000,18 @@ def _check_board_row_contract(
     ``coverage`` is ``Full`` when every contract check above
     passes; ``Partial`` otherwise.
 
+    Phase 6I-1 amendment: the preview's
+    ``agreement_active`` and ``agreement_total`` values
+    are sourced from the artifact's ``active_count`` and
+    ``available_count`` -- the same pair
+    ``daily_signal_board._confluence_active_total`` reads
+    to render the board's "X of Y" agreement display. The
+    artifact's own ``agreement_active`` / ``agreement_total``
+    fields are validated separately by the confluence
+    contract; preserving them as the preview's display
+    source would risk drift from what the board actually
+    shows.
+
     A deterministic preview requires confluence_last_row +
     readiness; either missing forces a board-row-incomputable
     finding.
@@ -872,12 +1020,31 @@ def _check_board_row_contract(
         return False, (ISSUE_BOARD_ROW_INCOMPUTABLE,), None
     signal = confluence_last_row.get("signal")
     signal_value = confluence_last_row.get("signal_value")
-    active = confluence_last_row.get("agreement_active")
-    total = confluence_last_row.get("agreement_total")
+    # Source the preview's agreement display from
+    # active_count / available_count -- matches
+    # daily_signal_board._confluence_active_total.
+    active_count = confluence_last_row.get("active_count")
+    available_count = confluence_last_row.get(
+        "available_count",
+    )
+    if available_count is None:
+        # Mirror the board's fallback: available_count ->
+        # total_count -> len(timeframes).
+        available_count = confluence_last_row.get(
+            "total_count",
+        )
+    if available_count is None:
+        timeframes = confluence_last_row.get(
+            "timeframes",
+        ) or []
+        if timeframes:
+            available_count = len(timeframes)
     try:
         ratio = (
-            float(active) / float(total)
-            if total and float(total) > 0
+            float(active_count) / float(available_count)
+            if available_count
+            and float(available_count) > 0
+            and active_count is not None
             else None
         )
     except (TypeError, ValueError):
@@ -890,8 +1057,8 @@ def _check_board_row_contract(
         "ticker": str(ticker or "").strip().upper(),
         "consensus_signal": signal,
         "consensus_signal_value": signal_value,
-        "agreement_active": active,
-        "agreement_total": total,
+        "agreement_active": active_count,
+        "agreement_total": available_count,
         "agreement_ratio": ratio,
         "coverage": "Full" if full_coverage else "Partial",
         "as_of_date": confluence_last_date,
