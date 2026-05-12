@@ -634,6 +634,156 @@ def test_refresh_then_pipeline_withholds_pipeline_when_watcher_blocks(
     assert call_names == ["refresher", "watcher"]
 
 
+def test_refresh_then_watcher_exception_returns_structured_outcome(
+    tmp_path: Path,
+):
+    """Codex amendment for PR #215.
+
+    If the post-refresh watcher raises after the refresher
+    has already executed, the executor MUST:
+      - not propagate the exception,
+      - return a structured TickerWriteExecution,
+      - preserve refresh_result so the audit captures the
+        write side effect,
+      - set pipeline_result=None and final_readiness=None,
+      - record commands_executed with only the refresh
+        command,
+      - record functions_executed including both refresher
+        and the attempted watcher,
+      - add the ``watcher_exception`` issue code,
+      - set final_recommended_action to
+        ``refresh_executed_pipeline_withheld`` and
+        skipped_reason to
+        ``watcher_blocked_pipeline_after_refresh``,
+      - append exactly one JSONL row to the execution log
+        carrying all of the above.
+
+    This prevents the failure mode where the refresher
+    writes but the watcher raises, leaving a production
+    side effect with no Phase 6H-5 audit record."""
+    dirs = _layout(tmp_path)
+    log = tmp_path / "exec_log.jsonl"
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    refresh_recorder = _CallRecorder()
+    refresher = _refresher_factory(
+        refresh_recorder,
+        _FakeRefreshResult(
+            refreshed=True,
+            old="2024-01-31",
+            new="2026-05-12",
+            issue_codes=(),
+        ),
+    )
+    watcher_calls: list[dict] = []
+
+    def raising_watcher(ticker, **kwargs):
+        watcher_calls.append({"ticker": ticker, **kwargs})
+        raise RuntimeError(
+            "watcher simulated structural failure"
+        )
+
+    def _no_call_pipeline(*a, **k):
+        pytest.fail(
+            "pipeline must NOT run when post-refresh "
+            "watcher raises"
+        )
+
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        refresher=refresher,
+        watcher=raising_watcher,
+        pipeline_runner=_no_call_pipeline,
+        execution_log_path=log,
+        **dirs,
+    )
+
+    # Report returns normally.
+    assert report is not None
+    assert report.inspected_count == 1
+    exec_state = report.executions[0]
+
+    # Refresh executed and is preserved in the record.
+    assert exec_state.refresh_result is not None
+    assert exec_state.refresh_result.attempted is True
+    assert exec_state.refresh_result.succeeded is True
+    assert exec_state.refresh_result.new_cache_date_range_end == (
+        "2026-05-12"
+    )
+
+    # Watcher was called exactly once and raised; no
+    # structured recheck result survives.
+    assert len(watcher_calls) == 1
+    assert exec_state.post_refresh_watcher_result is None
+    assert exec_state.post_refresh_watcher_action is None
+
+    # Pipeline was NOT called.
+    assert exec_state.pipeline_result is None
+    assert exec_state.final_readiness is None
+
+    # Issue code records the cause.
+    assert "watcher_exception" in exec_state.issue_codes
+
+    # Operator-facing outcome.
+    assert exec_state.final_recommended_action == (
+        dbw.FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD
+    )
+    assert exec_state.skipped_reason == (
+        dbw.SKIP_WATCHER_BLOCKED_AFTER_REFRESH
+    )
+
+    # Commands: only the refresh command (no pipeline).
+    assert exec_state.commands_executed == (
+        "python signal_engine_cache_refresher.py "
+        "--ticker SPY --write",
+    )
+    # Functions: refresher + watcher (both were attempted).
+    assert exec_state.functions_executed == (
+        "signal_engine_cache_refresher.refresh_signal_engine_cache",
+        "cache_cutoff_watcher.evaluate_cache_cutoff_state",
+    )
+
+    # Report-level aggregates also reflect the partial
+    # outcome.
+    assert report.refreshed_tickers == ("SPY",)
+    assert report.pipeline_ran_tickers == ()
+    assert "SPY" in report.skipped_pipeline_after_refresh_tickers
+    assert "SPY" in report.blocked_tickers
+
+    # Execution log has exactly one JSONL row with the same
+    # issue code and stage/function sequence.
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["ticker"] == "SPY"
+    assert "watcher_exception" in record["issue_codes"]
+    assert record["functions_executed"] == [
+        "signal_engine_cache_refresher.refresh_signal_engine_cache",
+        "cache_cutoff_watcher.evaluate_cache_cutoff_state",
+    ]
+    assert record["commands_executed"] == [
+        "python signal_engine_cache_refresher.py "
+        "--ticker SPY --write",
+    ]
+    assert record["pipeline_result"] is None
+    assert record["final_readiness"] is None
+    assert record["refresh_result"] is not None
+    assert record["final_recommended_action"] == (
+        dbw.FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD
+    )
+    assert record["skipped_reason"] == (
+        dbw.SKIP_WATCHER_BLOCKED_AFTER_REFRESH
+    )
+
+
 def test_refresh_then_pipeline_withholds_when_watcher_says_refresh_again(
     tmp_path: Path,
 ):

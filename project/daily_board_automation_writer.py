@@ -731,14 +731,41 @@ def _execute_ticker(
         base.refresh_result = refresh_outcome
 
         # 2. Re-run cache-vs-cutoff watcher.
+        # The refresher above may have already written to
+        # disk. If the watcher itself raises here, the
+        # pipeline MUST NOT run AND the executor MUST still
+        # return a structured TickerWriteExecution so the
+        # execution log captures the partial outcome.
         functions.append(
             "cache_cutoff_watcher.evaluate_cache_cutoff_state",
         )
-        watcher_state = watcher(
-            ticker,
-            cache_dir=cache_dir,
-            current_as_of_date=current_as_of_date,
-        )
+        try:
+            watcher_state = watcher(
+                ticker,
+                cache_dir=cache_dir,
+                current_as_of_date=current_as_of_date,
+            )
+        except Exception:
+            # Watcher recheck failed structurally. The
+            # refresh side effect (if any) is preserved in
+            # refresh_result; the pipeline write is
+            # withheld; the operator-facing outcome mirrors
+            # the standard watcher-blocked-after-refresh
+            # case with an additional ``watcher_exception``
+            # issue code naming the cause.
+            base.issue_codes = tuple(
+                list(base.issue_codes) + ["watcher_exception"],
+            )
+            base.final_recommended_action = (
+                FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD
+            )
+            base.skipped_reason = (
+                SKIP_WATCHER_BLOCKED_AFTER_REFRESH
+            )
+            base.commands_executed = tuple(commands)
+            base.functions_executed = tuple(functions)
+            base.elapsed_seconds = time.monotonic() - started
+            return base
         ready_for_pipeline = (
             watcher_state.recommended_operator_action
             == _ccw.ACTION_READY_FOR_PIPELINE_WRITE
