@@ -16,7 +16,7 @@ further pipeline writes are currently authorized.
 | Branch | `main` |
 | HEAD | `24990f0` |
 | Title | *Phase 6G-1: Daily Signal Board public meaning + information hierarchy (#207)* |
-| Smoke / freeze | Phase 6G-2 (read-only). 104/104 focused tests, 1,192/1,192 full regression, 0 console errors, 0 server errors, no production writes. |
+| Smoke / freeze | Phase 6G-2 read-only smoke: 104/104 focused tests, 0 console errors, 0 server errors, no production writes. PR #207 audit baseline: 1,192/1,192 full regression, 60 pre-existing pandas fragmentation warnings. |
 
 Re-confirm before assuming this baseline is still live:
 
@@ -62,7 +62,7 @@ top-to-bottom:
      checks active"` (60 = 12 K-builds × 5 timeframes,
      not 60 timeframes).
   5. **Evidence Trail** — `section-evidence-trail`.
-     Seven illustrated stations: **Seed Field /
+     Seven station cards: **Seed Field /
      Trading Post / Workshop / Rail Yard /
      Calendar House / Town Hall / Watchtower**. Prefixed
      by `evidence-trail-intro` explaining that stale
@@ -104,7 +104,7 @@ Live state at the baseline:
 | Featured confluence status | `"7 of 60 alignment checks active"` |
 | Today's Board Status copy | "SPY is the current full-pipeline pilot." / "Board consensus: No directional consensus today." / "Signal Engine state: Short 11,5." / "As of 2026-05-08 (board consensus) / 2026-05-11 (Signal Engine cache)." |
 | Town Hall (Evidence Trail) station | `present`, `data-as-of="2026-05-08"` |
-| Trading Post (Evidence Trail) station | `stale`, `data-as-of="2026-01-21"` (legacy ImpactSearch artifact; presence-only stage; does not block the leader gate) |
+| Trading Post (Evidence Trail) station | `stale`, `data-as-of="2026-01-21"` (legacy ImpactSearch research_day artifact; shown as stale evidence; does not block the current Phase 6C-8 leader gate) |
 
 The scoreboard cell and the Featured panel reflect two
 distinct signal contracts:
@@ -151,9 +151,13 @@ Featured chart names both contracts explicitly.
     needs a scheduler / orchestrator before more tickers
     can join SPY on the board.
   - **ImpactSearch / StackBuilder day artifacts may
-    remain legacy / stale.** Under the Phase 6C-8
-    readiness contract they are presence-only stages and
-    do not block the current Confluence-leader gate.
+    remain legacy / stale.** They are dated
+    `research_day` evidence stations and may render
+    stale or current. Under the current Phase 6C-8
+    leader gate, their staleness does not block the
+    Confluence leader verdict. (The StackBuilder
+    *leaderboard directory* is presence-only; the
+    research_day day artifact is not.)
   - **Mobile scoreboard uses contained internal
     horizontal scroll.** Page-level horizontal scroll is
     impossible on the board; the table content scrolls

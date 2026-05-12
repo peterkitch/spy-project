@@ -171,7 +171,7 @@ an explicit ledger entry classifies the divergence.
   2. **Town Hall Scoreboard** (`section-scoreboard`) — only leader-eligible rows. Column header reads "Consensus" (was "Signal"). Visible cell for `signal=None` renders "No consensus"; the `data-signal` attribute keeps the canonical `"None"`/`"Buy"`/`"Short"` value.
   3. **Saved Research Archive** (`section-archive` / `section-archive-details`) — `<details>` collapsible (open=false), holds the long alphabetical tail of Partial/Stale rows (currently ~1,628).
   4. **Featured High Score** (`section-featured`) — Signal Engine chart + headline numbers, plus a one-line two-signal explainer (`featured-two-signal-explainer`). Featured `confluence_status_fmt` reads `"{active} of {total} alignment checks active"` (60 = 12 K × 5 timeframes, not 60 timeframes).
-  5. **Evidence Trail** (`section-evidence-trail`) — seven illustrated stations: Seed Field / Trading Post / Workshop / Rail Yard / Calendar House / Town Hall / Watchtower. Prefixed by `evidence-trail-intro` explaining that stale upstream stations are historical reference and don't block the current leader gate unless flagged.
+  5. **Evidence Trail** (`section-evidence-trail`) — seven station cards: Seed Field / Trading Post / Workshop / Rail Yard / Calendar House / Town Hall / Watchtower. Prefixed by `evidence-trail-intro` explaining that stale upstream stations are historical reference and don't block the current leader gate unless flagged.
   6. **What PRJCT9 Is** (`section-what-prjct9-is`).
   7. **What It Is Not** (`section-what-it-is-not`).
 
@@ -188,7 +188,7 @@ an explicit ledger entry classifies the divergence.
 
   - Only SPY is production-pilot current. Every other ticker in the discovered universe is `coverage=Partial / signal=None` (saved-research-only).
   - Broader-universe refresh + pipeline automation is unbuilt; the single-ticker tooling exists (`signal_engine_cache_refresher.py`, `confluence_pipeline_runner.py`) but there is no scheduler / orchestrator.
-  - ImpactSearch / StackBuilder day artifacts can remain legacy / stale; under the Phase 6C-8 readiness contract they are **presence-only** stages and do not block the current leader gate.
+  - ImpactSearch / StackBuilder day artifacts can remain legacy / stale. They are dated `research_day` evidence stations and may render stale or current; under the current Phase 6C-8 leader gate, their staleness does not block the Confluence leader verdict. (The StackBuilder *leaderboard directory* is presence-only; the day artifact is not.)
   - Mobile (≤ ~390 px wide) scoreboard table uses contained internal horizontal scroll inside `scoreboard-table-wrapper`. The page itself never grows horizontal scroll; the COVERAGE and AS OF columns are one swipe away.
 
 **Next recommended work (no more data writes unless explicitly authorized):**
