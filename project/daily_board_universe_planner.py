@@ -434,6 +434,30 @@ def discover_stackbuilder_universe(
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_upstream_primary_blocker(
+    audit_primary_blocker: str,
+) -> str:
+    """Strip ``downstream_artifact_gap`` from the audit's
+    raw primary blocker so the planner's
+    ``upstream_primary_blocker`` represents only
+    upstream / input concerns.
+
+    Phase 6I-4's own cascade folds the downstream contract
+    verdict into its primary blocker (the last cascade
+    step is ``downstream_contract_invalid ->
+    downstream_artifact_gap``). The universe planner
+    separates those two concepts so an aggregate bucket
+    keyed on "is upstream blocked?" cannot accidentally
+    include rows whose only failure is the downstream
+    chain. The composite ``primary_blocker`` continues
+    to surface ``downstream_artifact_gap`` when
+    applicable (see ``_derive_composite_primary_blocker``).
+    """
+    if audit_primary_blocker == BLOCKER_DOWNSTREAM_ARTIFACT_GAP:
+        return ""
+    return audit_primary_blocker
+
+
 def _derive_composite_primary_blocker(
     *,
     upstream_primary_blocker: str,
@@ -441,7 +465,11 @@ def _derive_composite_primary_blocker(
 ) -> str:
     """Composite blocker: upstream wins when present;
     otherwise a downstream gap downgrades the row to
-    ``downstream_artifact_gap``; otherwise empty."""
+    ``downstream_artifact_gap``; otherwise empty.
+
+    The ``upstream_primary_blocker`` passed in is the
+    sanitized form (downstream-gap stripped); see
+    ``_sanitize_upstream_primary_blocker``."""
     if upstream_primary_blocker:
         return upstream_primary_blocker
     if not downstream_contract_valid:
@@ -494,8 +522,20 @@ def _build_state(
         ranking_blocked_reason = (
             ranking_row.ranking_blocked_reason or ""
         )
+    # Codex amendment: sanitize the audit's primary
+    # blocker so ``upstream_primary_blocker`` is strictly
+    # upstream/input -- the audit's own cascade folds
+    # ``downstream_contract_invalid`` into its primary
+    # blocker as ``downstream_artifact_gap``; the
+    # planner separates the two concepts so an aggregate
+    # bucket keyed on "is upstream blocked?" cannot
+    # mistakenly include rows whose only failure is the
+    # downstream chain.
+    sanitized_upstream = _sanitize_upstream_primary_blocker(
+        audit_state.primary_blocker,
+    )
     primary_blocker = _derive_composite_primary_blocker(
-        upstream_primary_blocker=audit_state.primary_blocker,
+        upstream_primary_blocker=sanitized_upstream,
         downstream_contract_valid=(
             audit_state.downstream_contract_valid
         ),
@@ -504,7 +544,7 @@ def _build_state(
         ticker=ticker,
         current_as_of_date=current_as_of_date,
         upstream_trio_ready=bool(audit_state.upstream_trio_ready),
-        upstream_primary_blocker=audit_state.primary_blocker,
+        upstream_primary_blocker=sanitized_upstream,
         upstream_issue_codes=tuple(audit_state.issue_codes),
         stackbuilder_run_count=int(
             audit_state.stackbuilder_run_count,
@@ -593,12 +633,18 @@ def _classify_buckets(
             _dap.RECOMMENDED_SELECT_OR_CREATE_STACKBUILDER_STACK_MANUAL
         ):
             stackbuilder_manual.append(s.ticker)
-        if not s.upstream_trio_ready:
+        # Codex amendment: bucket membership uses the
+        # sanitized upstream blocker and the composite
+        # blocker -- NOT the raw Phase 6I-4 narrow trio
+        # flag. A ticker with missing target / member
+        # cache or missing member OnePass library has
+        # ``upstream_trio_ready=True`` per Phase 6I-4's
+        # narrow definition but still has a real upstream
+        # blocker; it must land in upstream_blocked
+        # (not downstream_gap).
+        if s.upstream_primary_blocker:
             upstream_blocked.append(s.ticker)
-        if (
-            s.upstream_trio_ready
-            and not s.downstream_contract_valid
-        ):
+        if s.primary_blocker == BLOCKER_DOWNSTREAM_ARTIFACT_GAP:
             downstream_gap.append(s.ticker)
         if s.current_leader_eligible:
             leader_eligible.append(s.ticker)

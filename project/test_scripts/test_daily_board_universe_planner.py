@@ -722,10 +722,111 @@ def test_upstream_ready_downstream_missing_is_downstream_gap(
     spy = report.states[0]
     assert spy.upstream_trio_ready is True
     assert spy.downstream_contract_valid is False
+    # Codex amendment: upstream_primary_blocker is the
+    # SANITIZED form (downstream-gap stripped) so this
+    # ticker reports an empty upstream blocker; the
+    # composite primary_blocker still surfaces the gap.
+    assert spy.upstream_primary_blocker == ""
     assert spy.primary_blocker == (
         planner.BLOCKER_DOWNSTREAM_ARTIFACT_GAP
     )
     assert "SPY" in report.downstream_gap_tickers
+    # And NOT in upstream_blocked (sanitized blocker is
+    # empty).
+    assert "SPY" not in report.upstream_blocked_tickers
+
+
+# ---------------------------------------------------------------------------
+# 7a / 7b / 7c -- Codex amendment: non-trio upstream
+# blockers (missing target cache / missing member cache /
+# missing member OnePass library) must NOT pollute
+# downstream_gap_tickers.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_target_cache_is_upstream_blocked_not_downstream_gap(
+    tmp_path: Path,
+):
+    """A ticker with missing target Signal Engine cache
+    must land in ``upstream_blocked_tickers`` and NOT in
+    ``downstream_gap_tickers``. Phase 6I-4 keeps
+    ``upstream_trio_ready=True`` (the narrow trio --
+    OnePass + StackBuilder + leaderboard -- is intact),
+    but the audit's primary blocker is
+    ``missing_target_signal_engine_cache``; the planner
+    must classify by the sanitized upstream blocker,
+    NOT by the narrow trio flag."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(dirs, "SPY")
+    (dirs["cache_dir"]
+     / "SPY_precomputed_results.pkl").unlink()
+    report = planner.plan_daily_board_universe(
+        tickers=["SPY"], current_as_of_date="2026-05-08",
+        **dirs,
+    )
+    spy = report.states[0]
+    assert spy.upstream_primary_blocker == (
+        "missing_target_signal_engine_cache"
+    )
+    assert spy.primary_blocker == (
+        "missing_target_signal_engine_cache"
+    )
+    assert "SPY" in report.upstream_blocked_tickers
+    # The bug fix: SPY must NOT be classified as a
+    # downstream gap when the real blocker is a cache
+    # miss.
+    assert "SPY" not in report.downstream_gap_tickers
+
+
+def test_missing_member_cache_is_upstream_blocked(
+    tmp_path: Path,
+):
+    """Same separation for missing member cache."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY", members=["AAA", "BBB"],
+    )
+    (dirs["cache_dir"]
+     / "AAA_precomputed_results.pkl").unlink()
+    report = planner.plan_daily_board_universe(
+        tickers=["SPY"], current_as_of_date="2026-05-08",
+        **dirs,
+    )
+    spy = report.states[0]
+    assert spy.upstream_primary_blocker == (
+        "missing_member_signal_engine_cache"
+    )
+    assert spy.primary_blocker == (
+        "missing_member_signal_engine_cache"
+    )
+    assert "SPY" in report.upstream_blocked_tickers
+    assert "SPY" not in report.downstream_gap_tickers
+
+
+def test_missing_member_onepass_library_is_upstream_blocked(
+    tmp_path: Path,
+):
+    """Same separation for missing member OnePass
+    library."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY", members=["AAA", "BBB"],
+    )
+    (dirs["signal_library_dir"]
+     / "AAA_stable_v1_0_0.pkl").unlink()
+    report = planner.plan_daily_board_universe(
+        tickers=["SPY"], current_as_of_date="2026-05-08",
+        **dirs,
+    )
+    spy = report.states[0]
+    assert spy.upstream_primary_blocker == (
+        "missing_member_onepass_library"
+    )
+    assert spy.primary_blocker == (
+        "missing_member_onepass_library"
+    )
+    assert "SPY" in report.upstream_blocked_tickers
+    assert "SPY" not in report.downstream_gap_tickers
 
 
 # ---------------------------------------------------------------------------

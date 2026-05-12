@@ -114,9 +114,28 @@ does not add a `--output-file` flag.
 ticker):
 
 ### 3.1 Upstream verdict (Phase 6I-4)
-  - `upstream_trio_ready` — bool.
+  - `upstream_trio_ready` — bool. **Narrow Phase 6I-4
+    trio flag only:** True when OnePass target library
+    + StackBuilder selection + leaderboard validity are
+    all OK. **Does NOT include** target-cache /
+    member-cache / member-library / downstream-contract
+    concerns; those have their own codes and surface
+    via `upstream_primary_blocker` / `primary_blocker`
+    instead. Bucket classifications never key on
+    `upstream_trio_ready` directly.
   - `upstream_primary_blocker` — the Phase 6I-4
-    cascade verdict (empty string when healthy).
+    cascade verdict **sanitized to exclude downstream
+    gaps**. When the audit's raw cascade returns
+    `downstream_artifact_gap` (i.e. every upstream /
+    input check passed but the Confluence chain has not
+    been built yet), the planner replaces it with `""`
+    here. Composite downstream-gap surfacing happens via
+    `primary_blocker` (§ 3.8). For every other audit
+    blocker (`missing_target_signal_engine_cache`,
+    `missing_member_signal_engine_cache`,
+    `missing_member_onepass_library`,
+    `upstream_trio_*`), the audit's string is passed
+    through verbatim.
   - `upstream_issue_codes` — tuple of stable issue
     codes from the upstream audit.
 
@@ -178,10 +197,14 @@ not been built yet:
     `p_value`.
 
 ### 3.8 Composite primary blocker
-  - `primary_blocker` — upstream primary blocker when
-    present; otherwise `downstream_artifact_gap` when
-    the downstream contract is invalid; otherwise `""`
-    (healthy at every layer).
+  - `primary_blocker` — **composite blocker used for
+    routing.** Returns the sanitized
+    `upstream_primary_blocker` when non-empty; otherwise
+    `downstream_artifact_gap` when the downstream
+    contract is invalid; otherwise `""` (healthy at
+    every layer). This is the field bucket
+    classification (§ 4) keys on, NOT
+    `upstream_trio_ready` (which is too narrow).
 
 ## 4. Aggregate report schema
 
@@ -214,10 +237,27 @@ not been built yet:
     - `stackbuilder_manual_tickers` — action ==
       `select_or_create_stackbuilder_stack_manual`.
     - `upstream_blocked_tickers` —
-      `upstream_trio_ready == False`.
+      `upstream_primary_blocker != ""` (i.e. any
+      non-empty sanitized upstream/input blocker fires,
+      including `missing_target_signal_engine_cache`,
+      `missing_member_signal_engine_cache`,
+      `missing_member_onepass_library`, every
+      `upstream_trio_*` cascade verdict). **Codex
+      amendment:** the previous selector
+      (`upstream_trio_ready == False`) was too narrow
+      and incorrectly excluded rows with target-cache /
+      member-cache / member-library gaps.
     - `downstream_gap_tickers` —
-      `upstream_trio_ready == True` AND
-      `downstream_contract_valid == False`.
+      `primary_blocker == "downstream_artifact_gap"`.
+      A ticker only lands here when every upstream /
+      input check passes AND the downstream contract
+      reports invalid. **Codex amendment:** the
+      previous selector
+      (`upstream_trio_ready == True AND
+      downstream_contract_valid == False`) wrongly
+      classified target-cache-missing rows here
+      because Phase 6I-4 keeps the narrow trio flag
+      `True` even when cache / library gaps exist.
     - `current_leader_eligible_tickers` —
       `current_leader_eligible == True`.
   - **Ranking tails** (full Phase 6I-3 row JSON dicts):
@@ -290,7 +330,7 @@ future import whose top-level package matches:
 ## 8. Test coverage
 
 `project/test_scripts/test_daily_board_universe_planner.py`
-ships 19 tests:
+ships 22 tests (19 base + 3 Codex-amendment additions):
 
   1. Forbidden-imports static guard.
   2. Empty universe + no `--from-universe` → empty
@@ -341,13 +381,32 @@ ships 19 tests:
       (NEWBIE + universe `{SPY, AAPL}` →
       `{NEWBIE, AAPL, SPY}`; discovered count = 2).
 
+  Codex-amendment additions:
+
+  20. Missing target Signal Engine cache → SPY's
+      `upstream_primary_blocker = "missing_target_signal_engine_cache"`,
+      `primary_blocker = "missing_target_signal_engine_cache"`,
+      SPY appears in `upstream_blocked_tickers`, SPY
+      does NOT appear in `downstream_gap_tickers`.
+  21. Missing member Signal Engine cache → same
+      `upstream_blocked` classification (does NOT
+      pollute `downstream_gap_tickers`).
+  22. Missing member OnePass library → same
+      `upstream_blocked` classification.
+
+  Existing test 7 also tightened to assert
+  `upstream_primary_blocker == ""` when the row is
+  classified as a pure downstream gap (the sanitization
+  is observable from the dataclass).
+
 ## 9. Validation captured at module land
 
-  - `py_compile` clean on both new files.
-  - `test_daily_board_universe_planner.py`: 19 passed
-    in 3.06 s.
+  - `py_compile` clean on both files (post Codex
+    amendment).
+  - `test_daily_board_universe_planner.py`: 22 passed
+    in 3.29 s.
   - Focused 5-way (planner + audit + emitter +
-    validator + preflight): 128 passed in 9.57 s.
+    validator + preflight): 131 passed in 9.74 s.
   - `git diff --check` clean (LF→CRLF normalization
     warnings only; identical to every other repo
     pattern).
