@@ -46,6 +46,7 @@ import sys
 import time
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -137,6 +138,59 @@ def _write_onepass_interval_libraries(
     for interval in intervals:
         (sig_dir / f"{safe}_stable_v1_0_0_{interval}.pkl"
          ).write_bytes(b"placeholder")
+
+
+def _write_impactsearch_research_day_artifact(
+    artifact_root: Path,
+    target: str,
+    *,
+    last_date: str = "2026-05-08",
+    primary_ticker: str = "HRNNF",
+) -> Path:
+    """Write a Phase 6I-4-shaped ImpactSearch
+    ``research_day_v1`` artifact under
+    ``output/research_artifacts/impactsearch/<TARGET>/``
+    so the audit's research_day inspector finds it. The
+    inspector only reads ``daily[-1].date``; the rest of
+    the artifact can be minimal."""
+    safe = target.upper().replace("^", "_")
+    is_dir = artifact_root / "impactsearch" / safe
+    is_dir.mkdir(parents=True, exist_ok=True)
+    art = ra.ResearchDayArtifact(
+        artifact_version=ra.ARTIFACT_VERSION,
+        engine="impactsearch",
+        target_ticker=target,
+        signal_source=primary_ticker,
+        run_id=f"impactsearch_{primary_ticker}",
+        metric_basis="Close",
+        persist_skip_bars=0,
+        generated_at="2026-05-08T00:00:00+00:00",
+        summary={
+            "total_capture_pct": 1.0,
+            "sharpe_ratio": 0.0,
+            "trigger_days": 1,
+        },
+        daily=[{
+            "date": last_date,
+            "target_close": 100.0,
+            "target_return_pct": 0.0,
+            "pressure_signal": "Buy",
+            "buy_count": 1,
+            "short_count": 0,
+            "none_count": 0,
+            "missing_count": 0,
+            "active_count": 1,
+            "available_count": 1,
+            "daily_capture_pct": 0.0,
+            "cumulative_capture_pct": 0.0,
+            "is_trigger_day": True,
+        }],
+        timeframes=["1d"],
+    )
+    return ra.write_research_day_artifact(
+        art,
+        is_dir / f"{primary_ticker}.research_day.json",
+    )
 
 
 def _write_impactsearch_xlsx(
@@ -378,6 +432,8 @@ def _write_full_valid_fixture(
     members: list[str] = ["AAA", "BBB"],
     last_date: str = "2026-05-08",
     include_impactsearch: bool = True,
+    include_impactsearch_research_day: Optional[bool] = None,
+    include_impactsearch_xlsx: Optional[bool] = None,
     include_downstream: bool = True,
 ) -> None:
     """Build the full upstream + downstream artifact chain
@@ -403,8 +459,27 @@ def _write_full_valid_fixture(
         _write_onepass_daily_library(
             dirs["signal_library_dir"], m,
         )
-    # ImpactSearch.
-    if include_impactsearch:
+    # ImpactSearch. Phase 6I-4 amendment: the research_day
+    # artifact + the legacy XLSX are independent surfaces.
+    # ``include_impactsearch`` governs both by default; the
+    # per-surface flags override when a test wants to
+    # isolate one or the other.
+    write_rd = (
+        include_impactsearch_research_day
+        if include_impactsearch_research_day is not None
+        else include_impactsearch
+    )
+    write_xlsx = (
+        include_impactsearch_xlsx
+        if include_impactsearch_xlsx is not None
+        else include_impactsearch
+    )
+    if write_rd:
+        _write_impactsearch_research_day_artifact(
+            dirs["artifact_root"], target,
+            last_date=last_date,
+        )
+    if write_xlsx:
         _write_impactsearch_xlsx(
             dirs["impactsearch_output_dir"], target,
         )
@@ -771,14 +846,15 @@ def test_missing_target_signal_engine_cache_surfaces(
 # ---------------------------------------------------------------------------
 
 
-def test_impactsearch_missing_reports_but_does_not_fake_confluence(
+def test_impactsearch_both_surfaces_missing_does_not_fake_confluence(
     tmp_path: Path,
 ):
-    """The audit's downstream contract verdict must come
-    from the Phase 6I-1 validator -- NOT from ImpactSearch
-    presence. A missing ImpactSearch artifact emits its
-    own issue code but the downstream chain stays valid
-    if every Phase 6D artifact is present."""
+    """Codex amendment: both ImpactSearch surfaces
+    (research_day_v1 artifact AND legacy XLSX) missing
+    emits BOTH split issue codes. Downstream contract
+    verdict still comes from the Phase 6I-1 validator;
+    ImpactSearch presence is NOT promoted into a fake
+    Confluence failure."""
     dirs = _layout(tmp_path)
     _write_full_valid_fixture(
         dirs, target="SPY", include_impactsearch=False,
@@ -786,21 +862,187 @@ def test_impactsearch_missing_reports_but_does_not_fake_confluence(
     state = urai.audit_upstream_research_inputs(
         "SPY", current_as_of_date="2026-05-08", **dirs,
     )
+    assert state.impactsearch_research_day_present is False
     assert state.impactsearch_xlsx_present is False
     assert (
-        urai.ISSUE_MISSING_IMPACTSEARCH_ARTIFACT
+        urai.ISSUE_MISSING_IMPACTSEARCH_RESEARCH_DAY_ARTIFACT
         in state.issue_codes
     )
-    # But the downstream contract is still valid because
-    # the Confluence artifact + chain are present.
+    assert (
+        urai.ISSUE_MISSING_IMPACTSEARCH_XLSX_OUTPUT
+        in state.issue_codes
+    )
+    # Downstream contract still valid: ImpactSearch
+    # presence is NOT a downstream-contract input.
     assert state.downstream_contract_valid is True
     assert (
         urai.ISSUE_DOWNSTREAM_CONTRACT_INVALID
         not in state.issue_codes
     )
-    # Trio upstream readiness is also true -- ImpactSearch
-    # is not in the upstream-trio-blocking set.
+    # Trio upstream readiness is also true -- neither
+    # ImpactSearch code is in the trio-blocking set.
     assert state.upstream_trio_ready is True
+    # And NEITHER ImpactSearch issue promotes itself to
+    # primary_blocker (downstream chain is intact; no
+    # other issues fired).
+    assert state.primary_blocker == urai.BLOCKER_NONE
+
+
+def test_impactsearch_research_day_missing_xlsx_present(
+    tmp_path: Path,
+):
+    """Only the research_day artifact missing (XLSX
+    present) -> only the research_day code fires."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, target="SPY",
+        include_impactsearch_research_day=False,
+        include_impactsearch_xlsx=True,
+    )
+    state = urai.audit_upstream_research_inputs(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert state.impactsearch_research_day_present is False
+    assert state.impactsearch_xlsx_present is True
+    assert (
+        urai.ISSUE_MISSING_IMPACTSEARCH_RESEARCH_DAY_ARTIFACT
+        in state.issue_codes
+    )
+    assert (
+        urai.ISSUE_MISSING_IMPACTSEARCH_XLSX_OUTPUT
+        not in state.issue_codes
+    )
+    # Still does not fake a Confluence failure.
+    assert state.downstream_contract_valid is True
+    assert state.upstream_trio_ready is True
+    assert state.primary_blocker == urai.BLOCKER_NONE
+
+
+def test_impactsearch_xlsx_missing_research_day_present(
+    tmp_path: Path,
+):
+    """Only the legacy XLSX missing (research_day present)
+    -> only the XLSX code fires."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, target="SPY",
+        include_impactsearch_research_day=True,
+        include_impactsearch_xlsx=False,
+    )
+    state = urai.audit_upstream_research_inputs(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert state.impactsearch_research_day_present is True
+    assert state.impactsearch_xlsx_present is False
+    assert (
+        urai.ISSUE_MISSING_IMPACTSEARCH_XLSX_OUTPUT
+        in state.issue_codes
+    )
+    assert (
+        urai.ISSUE_MISSING_IMPACTSEARCH_RESEARCH_DAY_ARTIFACT
+        not in state.issue_codes
+    )
+    # Research_day last_date is surfaced.
+    assert (
+        state.impactsearch_research_day_last_date
+        == "2026-05-08"
+    )
+    assert state.downstream_contract_valid is True
+    assert state.upstream_trio_ready is True
+    assert state.primary_blocker == urai.BLOCKER_NONE
+
+
+def test_only_one_interval_library_blocks_mtf_projection(
+    tmp_path: Path,
+):
+    """Codex amendment: the MTF predicate must use
+    confluence_pipeline_readiness.MIN_MULTITIMEFRAME_LIBRARIES_FOR_PRESENT
+    (2). A single interval library is not enough."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(dirs, target="SPY")
+    # Wipe every interval library, then write exactly one.
+    sig = dirs["signal_library_dir"]
+    for interval in ("1wk", "1mo", "3mo", "1y"):
+        candidate = (
+            sig / f"SPY_stable_v1_0_0_{interval}.pkl"
+        )
+        if candidate.exists():
+            candidate.unlink()
+    # Re-add ONE.
+    (sig / "SPY_stable_v1_0_0_1wk.pkl"
+     ).write_bytes(b"placeholder")
+    state = urai.audit_upstream_research_inputs(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert tuple(
+        state.onepass_target_interval_libraries_present,
+    ) == ("1wk",)
+    assert state.can_build_daily_trafficflow_k is True
+    # Single interval library is below the threshold
+    # MIN_MULTITIMEFRAME_LIBRARIES_FOR_PRESENT = 2.
+    assert state.can_project_multitimeframe is False
+    assert state.can_build_confluence is False
+
+
+def test_leaderboard_with_unparseable_members_emits_issue(
+    tmp_path: Path,
+):
+    """Codex amendment: a readable leaderboard whose
+    Members column yields no parseable ``ticker[protocol]``
+    tokens emits ``unparseable_stackbuilder_members`` +
+    blocker; downstream flags all False."""
+    import pandas as pd
+
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(dirs, target="SPY")
+    # Overwrite the StackBuilder leaderboard with a file
+    # that parses (valid XLSX, K + Members columns
+    # present) but whose Members cells have no extractable
+    # ticker[protocol] tokens.
+    lb_path = (
+        dirs["stackbuilder_root"]
+        / "SPY"
+        / "seedTC__AAA-D_BBB-D"
+        / "combo_leaderboard.xlsx"
+    )
+    rows = [{
+        "K": k,
+        "Trigger Days": 100 + k,
+        "Total Capture (%)": 10.0 + k,
+        "Sharpe Ratio": 0.1,
+        "p-Value": 0.05,
+        # Members cell that parses to nothing (no
+        # 'ticker[protocol]' tokens).
+        "Members": "[]",
+    } for k in range(1, 13)]
+    pd.DataFrame(rows, columns=[
+        "K", "Trigger Days", "Total Capture (%)",
+        "Sharpe Ratio", "p-Value", "Members",
+    ]).to_excel(lb_path, index=False)
+    state = urai.audit_upstream_research_inputs(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    # Leaderboard IS readable (the file parses cleanly).
+    assert state.leaderboard_readable is True
+    # K coverage is still 1..12.
+    assert tuple(state.leaderboard_k_coverage) == tuple(
+        range(1, 13),
+    )
+    # But no members were parseable.
+    assert state.leaderboard_members == ()
+    # The new issue code + blocker fire.
+    assert (
+        urai.ISSUE_UNPARSEABLE_STACKBUILDER_MEMBERS
+        in state.issue_codes
+    )
+    assert state.upstream_trio_ready is False
+    assert state.primary_blocker == (
+        urai.BLOCKER_UPSTREAM_UNPARSEABLE_STACKBUILDER_MEMBERS
+    )
+    # Downstream predictions all False.
+    assert state.can_build_daily_trafficflow_k is False
+    assert state.can_project_multitimeframe is False
+    assert state.can_build_confluence is False
 
 
 # ---------------------------------------------------------------------------

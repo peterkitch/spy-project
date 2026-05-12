@@ -146,9 +146,36 @@ errors are converted to `rc=2`.
     complement of the above.
 
 ### 3.2 ImpactSearch saved outputs
-  - `impactsearch_xlsx_present` — `{TICKER}_analysis.xlsx` under `output/impactsearch/`.
-  - `impactsearch_xlsx_path` — absolute path or `None`.
-  - `impactsearch_manifest_sidecar_present` — `<XLSX>.manifest.json` adjacent to the workbook.
+
+The audit reports two **independent** ImpactSearch
+surfaces. They are saved at different roots and consumed
+by different parts of the stack; collapsing them into one
+field would lie about what is or isn't present.
+
+  - **Research-day artifact** (the board-consumed
+    surface; Daily Signal Board / readiness Evidence
+    Trail "Trading Post" station):
+    - `impactsearch_research_day_present` —
+      `*.research_day.json` under
+      `output/research_artifacts/impactsearch/<TARGET>/`.
+    - `impactsearch_research_day_path` — absolute path of
+      the artifact with the most recent last daily-row
+      date, or `None`.
+    - `impactsearch_research_day_last_date` — that
+      artifact's `daily[-1].date`, or `None` when the
+      artifact carries no daily rows.
+  - **Legacy XLSX output** (operator-facing summary tier,
+    separately saved by the ImpactSearch engine):
+    - `impactsearch_xlsx_present` —
+      `{TARGET}_analysis.xlsx` under
+      `output/impactsearch/`.
+    - `impactsearch_xlsx_path` — absolute path or `None`.
+    - `impactsearch_manifest_sidecar_present` —
+      `<XLSX>.manifest.json` adjacent to the workbook.
+
+Neither surface promotes itself to a `primary_blocker`.
+Both fire their own stable issue codes (§ 4) so an
+operator can tell at a glance which surface is missing.
 
 ### 3.3 StackBuilder run discovery + selection
   - `stackbuilder_run_count` — number of saved seed-run directories under `output/stackbuilder/<TARGET>/`.
@@ -169,7 +196,7 @@ errors are converted to `rc=2`.
 
 ### 3.6 Downstream handoff readiness (predictive)
   - `can_build_daily_trafficflow_k` — true iff selection unambiguous + leaderboard readable + K coverage non-empty + target cache present + every leaderboard member cache present + member list non-empty.
-  - `can_project_multitimeframe` — `can_build_daily_trafficflow_k` AND OnePass daily library present AND ≥ 1 interval library present.
+  - `can_project_multitimeframe` — `can_build_daily_trafficflow_k` AND OnePass daily library present AND `len(interval libraries present) >= confluence_pipeline_readiness.MIN_MULTITIMEFRAME_LIBRARIES_FOR_PRESENT`. **The threshold is sourced from the readiness layer's constant (currently 2)** so the audit's predictive verdict cannot drift from the readiness layer's actual requirement. A single interval library is NOT enough.
   - `can_build_confluence` — `can_project_multitimeframe` AND leaderboard K coverage == `set(1..12)`.
 
 ### 3.7 Downstream contract verdict
@@ -187,11 +214,13 @@ errors are converted to `rc=2`.
 |---|---|
 | `missing_onepass_target_library` | Target's OnePass daily library absent. |
 | `missing_onepass_member_library` | One or more StackBuilder member tickers lack a daily OnePass library (members listed in `members_missing_onepass_library`). |
-| `missing_impactsearch_artifact` | Target's ImpactSearch XLSX absent. **Not promoted into a fake downstream Confluence failure.** Reported as an input gap. |
+| `missing_impactsearch_research_day_artifact` | Target's ImpactSearch `*.research_day.json` artifact absent under `output/research_artifacts/impactsearch/<TARGET>/`. **This is the artifact the Daily Signal Board / readiness Evidence Trail "Trading Post" station consumes.** Not promoted into a fake downstream Confluence failure. |
+| `missing_impactsearch_xlsx_output` | Target's ImpactSearch `{TARGET}_analysis.xlsx` absent under `output/impactsearch/`. Legacy operator-facing summary tier, separately saved from the research_day artifact. Not promoted into a fake downstream Confluence failure. |
 | `missing_stackbuilder_run` | Zero saved StackBuilder seed-run directories for the target. |
 | `ambiguous_stackbuilder_selection` | Newest-mtime tied across multiple variants → Phase 6H-3 policy blocks (operator must pick a variant out of band). |
-| `unreadable_stackbuilder_leaderboard` | `combo_leaderboard.xlsx` failed to parse, missing required columns, or all rows had unparseable Members. |
+| `unreadable_stackbuilder_leaderboard` | `combo_leaderboard.xlsx` failed to load, was the wrong type, or its required `K` / `Members` columns were missing. |
 | `insufficient_stackbuilder_k_coverage` | Leaderboard parsed but K coverage ≠ `set(1..12)`. |
+| `unparseable_stackbuilder_members` | Leaderboard parsed AND K coverage non-empty, but every row's `Members` cell yielded zero extractable `ticker[protocol]` tokens. Distinct from `unreadable_stackbuilder_leaderboard` (which means the file failed to load or the required columns are missing). |
 | `missing_member_signal_engine_cache` | One or more leaderboard members lack a Spymaster cache PKL. Listed in `members_missing_signal_engine_cache`. |
 | `missing_target_signal_engine_cache` | Target's own Spymaster cache PKL absent. Separate from member-cache code. |
 | `downstream_contract_invalid` | Phase 6I-1 validator reports at least one downstream contract `False`. The audit's predictive flags may still be `True` (the upstream trio can be ready while the downstream artifacts haven't been built yet). |
@@ -213,22 +242,26 @@ operator audit):
      `upstream_trio_unreadable_stackbuilder_leaderboard`.
   5. `insufficient_stackbuilder_k_coverage` →
      `upstream_trio_insufficient_stackbuilder_k_coverage`.
-  6. `missing_target_signal_engine_cache` →
+  6. `unparseable_stackbuilder_members` →
+     `upstream_trio_unparseable_stackbuilder_members`.
+  7. `missing_target_signal_engine_cache` →
      `missing_target_signal_engine_cache`.
-  7. `missing_member_signal_engine_cache` →
+  8. `missing_member_signal_engine_cache` →
      `missing_member_signal_engine_cache`.
-  8. `missing_onepass_member_library` →
+  9. `missing_onepass_member_library` →
      `missing_member_onepass_library`.
-  9. `downstream_contract_invalid` →
-     `downstream_artifact_gap`.
-  10. (no match) → `""` (empty string).
+  10. `downstream_contract_invalid` →
+      `downstream_artifact_gap`.
+  11. (no match) → `""` (empty string).
 
 The cascade mirrors the Phase 6H runbook's "fix upstream
-before downstream" decision flow. `missing_impactsearch_artifact`
-is deliberately absent from the cascade: it appears in
-`issue_codes` for operator review but does NOT promote
-itself to a `primary_blocker`. ImpactSearch presence is an
-input-state observation, not a downstream-chain prereq.
+before downstream" decision flow. **Both ImpactSearch
+codes** (`missing_impactsearch_research_day_artifact`
+and `missing_impactsearch_xlsx_output`) are deliberately
+absent from the cascade: they appear in `issue_codes` for
+operator review but do NOT promote themselves to a
+`primary_blocker`. ImpactSearch presence is an input-
+state observation, not a downstream-chain prereq.
 
 ## 6. StackBuilder durability contract (carried forward)
 
@@ -291,7 +324,7 @@ import whose top-level package matches: `yfinance`,
 ## 8. Test coverage
 
 `project/test_scripts/test_upstream_research_input_audit.py`
-ships 21 tests:
+ships 25 tests (21 base + 4 Codex-amendment additions):
 
   1. Forbidden-imports static guard.
   2. No-age-window static guard (audit's own source
@@ -315,10 +348,18 @@ ships 21 tests:
   9. Missing target Signal Engine cache → issue +
      `primary_blocker = missing_target_signal_engine_cache`;
      `can_build_daily_trafficflow_k = False`.
-  10. ImpactSearch missing → issue, but
+  10. ImpactSearch BOTH surfaces missing → both split
+      codes emitted (`missing_impactsearch_research_day_artifact`
+      AND `missing_impactsearch_xlsx_output`);
       `downstream_contract_valid = True` (the audit does
       NOT fake a Confluence failure); `upstream_trio_ready
-      = True` (ImpactSearch not in trio-blocking set).
+      = True` (neither ImpactSearch code is in the
+      trio-blocking set); `primary_blocker = ""`.
+  10a. ImpactSearch research_day missing / XLSX present →
+       only the research_day code fires.
+  10b. ImpactSearch XLSX missing / research_day present →
+       only the XLSX code fires; `impactsearch_research_day_last_date`
+       is surfaced.
   11. Downstream chain entirely missing →
       `downstream_contract_invalid` + `primary_blocker =
       downstream_artifact_gap`; upstream trio still ready.
@@ -338,13 +379,27 @@ ships 21 tests:
   21. `to_json_dict()` round-trips through `json.dumps /
       loads`.
 
+  Codex-amendment additions:
+
+  22. Exactly one OnePass interval library →
+      `can_project_multitimeframe = False`
+      (`MIN_MULTITIMEFRAME_LIBRARIES_FOR_PRESENT = 2`).
+  23. Leaderboard with K coverage but unparseable
+      `Members` cells → `unparseable_stackbuilder_members`
+      issue + `upstream_trio_unparseable_stackbuilder_members`
+      blocker + every downstream flag `False`. The file
+      is still `leaderboard_readable = True` (it
+      parsed); the distinct code separates
+      file-corruption from members-format failure.
+
 ## 9. Validation captured at module land
 
-  - `py_compile` clean on both new files.
-  - `test_upstream_research_input_audit.py`: 21 passed
-    in 2.38 s.
+  - `py_compile` clean on both files (post Codex
+    amendment).
+  - `test_upstream_research_input_audit.py`: 25 passed
+    in 2.79 s.
   - Focused 4-way (audit + emitter + validator +
-    preflight): 105 passed in 7.51 s.
+    preflight): 109 passed in 7.77 s.
   - `git diff --check` clean (LF→CRLF normalization
     warnings only; identical to every other repo
     pattern).
@@ -364,6 +419,9 @@ states[0]:
   onepass_target_interval_libraries_present
                                          ["1wk","1mo","3mo","1y"]
   onepass_target_interval_libraries_missing  []
+  impactsearch_research_day_present      true
+  impactsearch_research_day_path         ".../impactsearch/SPY/HRNNF.research_day.json"
+  impactsearch_research_day_last_date    "2026-01-21"
   impactsearch_xlsx_present              true
   impactsearch_manifest_sidecar_present  false
   stackbuilder_run_count                 1

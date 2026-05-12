@@ -36,11 +36,17 @@ For each ticker in an explicit operator-supplied list:
   2. Records OnePass *interval* libraries (``1wk``,
      ``1mo``, ``3mo``, ``1y`` by default) -- the MTF
      projection stage needs these.
-  3. Looks up the per-ticker ImpactSearch XLSX
-     (``{TICKER}_analysis.xlsx``) under
-     ``output/impactsearch/`` and the sidecar manifest.
-     A missing ImpactSearch artifact is reported but does
-     NOT by itself fake a downstream Confluence failure.
+  3. Looks up the per-ticker ImpactSearch saved outputs.
+     The board / readiness Evidence Trail "Trading Post"
+     station consumes the ``research_day_v1`` artifact
+     under ``output/research_artifacts/impactsearch/<TARGET>/``;
+     the legacy XLSX under
+     ``output/impactsearch/{TARGET}_analysis.xlsx``
+     remains a separately-saved source output. Both
+     surfaces are reported independently (with separate
+     stable issue codes); a missing ImpactSearch artifact
+     is an upstream / evidence observation and is NOT
+     promoted into a fake downstream Confluence failure.
   4. Enumerates every saved StackBuilder variant under
      ``output/stackbuilder/<TARGET>/<seed_run_id>/`` via
      the Phase 6H-3 ``_discover_stackbuilder_runs`` /
@@ -74,6 +80,7 @@ For each ticker in an explicit operator-supplied list:
        upstream_trio_ambiguous_stackbuilder_selection /
        upstream_trio_unreadable_stackbuilder_leaderboard /
        upstream_trio_insufficient_stackbuilder_k_coverage /
+       upstream_trio_unparseable_stackbuilder_members /
        missing_target_signal_engine_cache /
        missing_member_signal_engine_cache /
        missing_member_onepass_library /
@@ -177,8 +184,21 @@ ISSUE_MISSING_ONEPASS_TARGET_LIBRARY = (
 ISSUE_MISSING_ONEPASS_MEMBER_LIBRARY = (
     "missing_onepass_member_library"
 )
-ISSUE_MISSING_IMPACTSEARCH_ARTIFACT = (
-    "missing_impactsearch_artifact"
+# Codex amendment: ImpactSearch surfaces split into two
+# orthogonal codes. The research_day artifact under
+# output/research_artifacts/impactsearch/<TARGET>/ is the
+# board / readiness Evidence Trail "Trading Post"
+# artifact -- this is what the public Daily Signal Board
+# consumes. The legacy {TARGET}_analysis.xlsx under
+# output/impactsearch/ is a separately-saved source
+# output (operator-facing summary tier). Both are
+# reported independently so an operator can tell which
+# surface is missing without re-deriving.
+ISSUE_MISSING_IMPACTSEARCH_RESEARCH_DAY_ARTIFACT = (
+    "missing_impactsearch_research_day_artifact"
+)
+ISSUE_MISSING_IMPACTSEARCH_XLSX_OUTPUT = (
+    "missing_impactsearch_xlsx_output"
 )
 ISSUE_MISSING_STACKBUILDER_RUN = "missing_stackbuilder_run"
 ISSUE_AMBIGUOUS_STACKBUILDER_SELECTION = (
@@ -189,6 +209,15 @@ ISSUE_UNREADABLE_STACKBUILDER_LEADERBOARD = (
 )
 ISSUE_INSUFFICIENT_STACKBUILDER_K_COVERAGE = (
     "insufficient_stackbuilder_k_coverage"
+)
+# Codex amendment: leaderboard parsed cleanly + K coverage
+# present BUT every row's Members cell was unparseable, so
+# the audit cannot enumerate any member ticker. This is a
+# distinct failure from an unreadable leaderboard: the
+# file is valid, the Members column just has no
+# extractable ``ticker[protocol]`` tokens.
+ISSUE_UNPARSEABLE_STACKBUILDER_MEMBERS = (
+    "unparseable_stackbuilder_members"
 )
 ISSUE_MISSING_MEMBER_SIGNAL_ENGINE_CACHE = (
     "missing_member_signal_engine_cache"
@@ -206,11 +235,13 @@ ISSUE_DOWNSTREAM_CONTRACT_INVALID = (
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_MISSING_ONEPASS_TARGET_LIBRARY,
     ISSUE_MISSING_ONEPASS_MEMBER_LIBRARY,
-    ISSUE_MISSING_IMPACTSEARCH_ARTIFACT,
+    ISSUE_MISSING_IMPACTSEARCH_RESEARCH_DAY_ARTIFACT,
+    ISSUE_MISSING_IMPACTSEARCH_XLSX_OUTPUT,
     ISSUE_MISSING_STACKBUILDER_RUN,
     ISSUE_AMBIGUOUS_STACKBUILDER_SELECTION,
     ISSUE_UNREADABLE_STACKBUILDER_LEADERBOARD,
     ISSUE_INSUFFICIENT_STACKBUILDER_K_COVERAGE,
+    ISSUE_UNPARSEABLE_STACKBUILDER_MEMBERS,
     ISSUE_MISSING_MEMBER_SIGNAL_ENGINE_CACHE,
     ISSUE_MISSING_TARGET_SIGNAL_ENGINE_CACHE,
     ISSUE_DOWNSTREAM_CONTRACT_INVALID,
@@ -237,6 +268,9 @@ BLOCKER_UPSTREAM_UNREADABLE_STACKBUILDER_LEADERBOARD = (
 BLOCKER_UPSTREAM_INSUFFICIENT_STACKBUILDER_K_COVERAGE = (
     "upstream_trio_insufficient_stackbuilder_k_coverage"
 )
+BLOCKER_UPSTREAM_UNPARSEABLE_STACKBUILDER_MEMBERS = (
+    "upstream_trio_unparseable_stackbuilder_members"
+)
 BLOCKER_MISSING_TARGET_SIGNAL_ENGINE_CACHE = (
     "missing_target_signal_engine_cache"
 )
@@ -257,6 +291,7 @@ ALL_PRIMARY_BLOCKERS: tuple[str, ...] = (
     BLOCKER_UPSTREAM_AMBIGUOUS_STACKBUILDER_SELECTION,
     BLOCKER_UPSTREAM_UNREADABLE_STACKBUILDER_LEADERBOARD,
     BLOCKER_UPSTREAM_INSUFFICIENT_STACKBUILDER_K_COVERAGE,
+    BLOCKER_UPSTREAM_UNPARSEABLE_STACKBUILDER_MEMBERS,
     BLOCKER_MISSING_TARGET_SIGNAL_ENGINE_CACHE,
     BLOCKER_MISSING_MEMBER_SIGNAL_ENGINE_CACHE,
     BLOCKER_MISSING_MEMBER_ONEPASS_LIBRARY,
@@ -315,7 +350,13 @@ class UpstreamResearchInputAuditState:
     onepass_target_interval_libraries_present: tuple[str, ...]
     onepass_target_interval_libraries_missing: tuple[str, ...]
 
-    # ImpactSearch saved outputs
+    # ImpactSearch saved outputs -- Codex amendment splits
+    # the surface so the board-consumed research_day_v1
+    # artifact and the legacy operator XLSX are reported
+    # independently.
+    impactsearch_research_day_present: bool
+    impactsearch_research_day_path: Optional[str]
+    impactsearch_research_day_last_date: Optional[str]
     impactsearch_xlsx_present: bool
     impactsearch_xlsx_path: Optional[str]
     impactsearch_manifest_sidecar_present: bool
@@ -386,6 +427,15 @@ def _state_to_json_dict(
         ),
         "onepass_target_interval_libraries_missing": list(
             s.onepass_target_interval_libraries_missing,
+        ),
+        "impactsearch_research_day_present": bool(
+            s.impactsearch_research_day_present,
+        ),
+        "impactsearch_research_day_path": (
+            s.impactsearch_research_day_path
+        ),
+        "impactsearch_research_day_last_date": (
+            s.impactsearch_research_day_last_date
         ),
         "impactsearch_xlsx_present": bool(
             s.impactsearch_xlsx_present,
@@ -567,6 +617,88 @@ def _impactsearch_xlsx_path(
     )
 
 
+def _impactsearch_research_day_dir(
+    artifact_root: Path, ticker: str,
+) -> Optional[Path]:
+    """Return ``output/research_artifacts/impactsearch/<TARGET>/``
+    for the resolved ticker form, or ``None`` when the
+    directory is absent. Mirrors the same real-form /
+    safe-form fallback the Phase 6I-1 validator uses for
+    Confluence artifacts."""
+    if (
+        not artifact_root.exists()
+        or not artifact_root.is_dir()
+    ):
+        return None
+    base = artifact_root / "impactsearch"
+    if not base.exists() or not base.is_dir():
+        return None
+    for form in _ticker_form_candidates(ticker):
+        p = base / form
+        if p.exists() and p.is_dir():
+            return p
+    return None
+
+
+def _inspect_impactsearch_research_day(
+    artifact_root: Path, ticker: str,
+) -> tuple[bool, Optional[Path], Optional[str]]:
+    """Return ``(present, latest_path, latest_last_date)``.
+
+    Walks every ``*.research_day.json`` under the
+    per-target ImpactSearch directory, picks the artifact
+    whose last daily-row date is most recent, and returns
+    its path + last_date. ``last_date`` may be ``None``
+    when the artifact carries no ``daily`` rows (the audit
+    still reports ``present=True`` so the operator can
+    distinguish "no artifact" from "artifact with empty
+    daily")."""
+    ticker_dir = _impactsearch_research_day_dir(
+        artifact_root, ticker,
+    )
+    if ticker_dir is None:
+        return False, None, None
+    paths = sorted(ticker_dir.glob("*.research_day.json"))
+    if not paths:
+        return False, None, None
+    # Pick the artifact with the most recent last daily-row
+    # date. Tied dates fall back to filename for
+    # determinism.
+    candidates: list[tuple[Optional[str], Path]] = []
+    for path in paths:
+        last_date = _read_last_daily_row_date(path)
+        candidates.append((last_date, path))
+    candidates.sort(
+        key=lambda x: (str(x[0] or ""), str(x[1])),
+        reverse=True,
+    )
+    latest_last_date, latest_path = candidates[0]
+    return True, latest_path, latest_last_date
+
+
+def _read_last_daily_row_date(
+    path: Path,
+) -> Optional[str]:
+    """Light-touch JSON read returning ``daily[-1].date``
+    or ``None``. Failures collapse to ``None`` so a
+    malformed artifact does not raise out of the audit."""
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    daily = payload.get("daily") or []
+    if not isinstance(daily, list) or not daily:
+        return None
+    row = daily[-1]
+    if not isinstance(row, dict):
+        return None
+    d = row.get("date")
+    return str(d)[:10] if d else None
+
+
 def _impactsearch_manifest_sidecar_present(
     xlsx_path: Optional[Path],
 ) -> bool:
@@ -736,14 +868,24 @@ def _predict_can_project_multitimeframe(
     target_interval_libraries_present: tuple[str, ...],
 ) -> bool:
     """MTF projection requires daily K (or the ability to
-    build it) + the target's OnePass daily library + at
-    least one interval library (so projection has
-    something to align)."""
+    build it) + the target's OnePass daily library +
+    enough interval libraries to satisfy the readiness
+    layer's minimum-coverage threshold.
+
+    Codex amendment: the threshold is sourced from
+    ``confluence_pipeline_readiness.MIN_MULTITIMEFRAME_LIBRARIES_FOR_PRESENT``
+    (currently 2) so the audit's predictive verdict
+    cannot drift from the readiness layer's actual
+    requirement. A single interval library is NOT enough
+    to satisfy the bridge."""
     if not can_build_daily_trafficflow_k:
         return False
     if not onepass_target_library_present:
         return False
-    if not target_interval_libraries_present:
+    if (
+        len(target_interval_libraries_present)
+        < _cpr.MIN_MULTITIMEFRAME_LIBRARIES_FOR_PRESENT
+    ):
         return False
     return True
 
@@ -797,6 +939,10 @@ def _derive_primary_blocker(
             BLOCKER_UPSTREAM_INSUFFICIENT_STACKBUILDER_K_COVERAGE,
         ),
         (
+            ISSUE_UNPARSEABLE_STACKBUILDER_MEMBERS,
+            BLOCKER_UPSTREAM_UNPARSEABLE_STACKBUILDER_MEMBERS,
+        ),
+        (
             ISSUE_MISSING_TARGET_SIGNAL_ENGINE_CACHE,
             BLOCKER_MISSING_TARGET_SIGNAL_ENGINE_CACHE,
         ),
@@ -830,6 +976,7 @@ _UPSTREAM_TRIO_BLOCKING_CODES: frozenset[str] = frozenset({
     ISSUE_AMBIGUOUS_STACKBUILDER_SELECTION,
     ISSUE_UNREADABLE_STACKBUILDER_LEADERBOARD,
     ISSUE_INSUFFICIENT_STACKBUILDER_K_COVERAGE,
+    ISSUE_UNPARSEABLE_STACKBUILDER_MEMBERS,
 })
 
 
@@ -893,16 +1040,35 @@ def audit_upstream_research_inputs(
         intervals_present, intervals_missing,
     ) = _onepass_interval_coverage(sig_d, ticker_clean)
 
-    # 3. ImpactSearch XLSX + manifest sidecar.
-    impactsearch_path = _impactsearch_xlsx_path(
+    # 3a. ImpactSearch research_day_v1 artifact (the
+    # board / readiness Evidence Trail "Trading Post"
+    # surface). This is the primary ImpactSearch artifact
+    # the public Daily Signal Board consumes.
+    (
+        impactsearch_rd_present,
+        impactsearch_rd_path,
+        impactsearch_rd_last_date,
+    ) = _inspect_impactsearch_research_day(
+        artifact_d, ticker_clean,
+    )
+    if not impactsearch_rd_present:
+        issues.append(
+            ISSUE_MISSING_IMPACTSEARCH_RESEARCH_DAY_ARTIFACT,
+        )
+
+    # 3b. ImpactSearch legacy XLSX output (operator-facing
+    # summary tier; separately saved from the research_day
+    # artifact). Reported independently so an operator can
+    # see which surface is missing.
+    impactsearch_xlsx = _impactsearch_xlsx_path(
         impact_d, ticker_clean,
     )
-    impactsearch_present = impactsearch_path is not None
-    if not impactsearch_present:
-        issues.append(ISSUE_MISSING_IMPACTSEARCH_ARTIFACT)
+    impactsearch_xlsx_present = impactsearch_xlsx is not None
+    if not impactsearch_xlsx_present:
+        issues.append(ISSUE_MISSING_IMPACTSEARCH_XLSX_OUTPUT)
     impactsearch_manifest = (
         _impactsearch_manifest_sidecar_present(
-            impactsearch_path,
+            impactsearch_xlsx,
         )
     )
 
@@ -927,10 +1093,22 @@ def audit_upstream_research_inputs(
             issues.append(
                 ISSUE_UNREADABLE_STACKBUILDER_LEADERBOARD,
             )
-        elif set(k_coverage) != set(EXPECTED_K_RANGE):
-            issues.append(
-                ISSUE_INSUFFICIENT_STACKBUILDER_K_COVERAGE,
-            )
+        else:
+            if set(k_coverage) != set(EXPECTED_K_RANGE):
+                issues.append(
+                    ISSUE_INSUFFICIENT_STACKBUILDER_K_COVERAGE,
+                )
+            # Codex amendment: a readable leaderboard with
+            # at least one K row but zero parseable
+            # members is its own distinct failure. The file
+            # parsed (so it is NOT
+            # ``unreadable_stackbuilder_leaderboard``); the
+            # Members column just yielded no extractable
+            # ``ticker[protocol]`` tokens.
+            if k_coverage and not members_union:
+                issues.append(
+                    ISSUE_UNPARSEABLE_STACKBUILDER_MEMBERS,
+                )
     else:
         leaderboard_readable = False
         k_coverage = ()
@@ -1031,10 +1209,20 @@ def audit_upstream_research_inputs(
         onepass_target_interval_libraries_missing=(
             intervals_missing
         ),
-        impactsearch_xlsx_present=impactsearch_present,
+        impactsearch_research_day_present=(
+            impactsearch_rd_present
+        ),
+        impactsearch_research_day_path=(
+            str(impactsearch_rd_path)
+            if impactsearch_rd_path else None
+        ),
+        impactsearch_research_day_last_date=(
+            impactsearch_rd_last_date
+        ),
+        impactsearch_xlsx_present=impactsearch_xlsx_present,
         impactsearch_xlsx_path=(
-            str(impactsearch_path)
-            if impactsearch_path else None
+            str(impactsearch_xlsx)
+            if impactsearch_xlsx else None
         ),
         impactsearch_manifest_sidecar_present=(
             impactsearch_manifest
