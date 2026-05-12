@@ -154,17 +154,27 @@ That is what the audit and the preflight now say:
 > + pipeline cycle.
 
 The gate to watch is therefore the strict inequality
-`new_cache_date_range_end > current_as_of_date`, not "wait
-for UTC midnight" or any clock event. The cheapest
-read-only probe is:
+`cache.last_date > current_as_of_date`, not "wait for UTC
+midnight" or any clock event. The cheapest read-only probe
+is the Phase 6H-2 watcher (added in #212), which neither
+fetches yfinance nor touches the pipeline runner:
 
 ```powershell
-& 'C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe' signal_engine_cache_refresher.py --ticker SPY --dry-run
+& 'C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe' cache_cutoff_watcher.py --ticker SPY
 ```
 
-The result's `new_cache_date_range_end` vs
-`current_as_of_date` tells the operator whether the gap is
-closable today.
+The watcher emits a JSON `CacheCutoffWatchReport` with
+`cache_ahead_of_cutoff` / `cache_equal_to_cutoff` /
+`cache_behind_cutoff` flags, the same
+`pipeline_output_lags_persist_skip` action constant the
+launch audit + freshness preflight use, and a top-level
+`ready_tickers` list scoped to the strict-inequality wins
+only. That `ready_tickers` list is the gate a future daily
+automation can hang off without producing a persist-skip-lag
+verdict. If a fresh yfinance peek is also desired (it
+fetches network data), the older heavier probe is still
+available via `signal_engine_cache_refresher.py
+--ticker SPY --dry-run`.
 
 ## 5. What is safe to review now
 
@@ -354,14 +364,21 @@ writes**:
      (scheduler + post-market-close refresher + pipeline
      runner). The persist-skip-lag contract makes the
      trade-off explicit.
-  4. **Phase 6H-2 (potential): cache-vs-cutoff inequality
-     watcher.** A lightweight read-only daily probe that
-     emits a single status JSON: "today's
-     `cache.last_date > current_as_of_date` for SPY: yes/no"
-     and optionally a notification when the inequality
-     opens. This is the gate the launch automation would
-     hang off, and it can be built without any new
-     production write code.
+  4. **Phase 6H-2 (delivered, #212): cache-vs-cutoff
+     inequality watcher.** The read-only watcher lives at
+     `project/cache_cutoff_watcher.py`. It emits a
+     `CacheCutoffWatchReport` JSON with per-ticker
+     `cache_ahead_of_cutoff` / `cache_equal_to_cutoff` /
+     `cache_behind_cutoff` flags, a stable
+     `recommended_operator_action` string drawn from the
+     same namespace the launch audit + preflight use, and a
+     top-level `ready_tickers` list scoped to the
+     strict-inequality wins only. The watcher imports
+     neither yfinance, dash, the Phase 6D pipeline runner,
+     nor any artifact writer; it reads only the saved
+     Signal Engine cache PKL's date metadata. This is the
+     gate a future daily automation can hang off, and it
+     ships with zero production write surface.
   5. **Data licensing (Phase 5G).** Pre-launch gate.
      Currently parked; required before a commercial
      framing of "current leader."
@@ -384,6 +401,10 @@ board.
     `project/board_launch_readiness_audit.py`
   - Source freshness preflight:
     `project/source_freshness_preflight.py`
+  - Cache-vs-cutoff watcher (Phase 6H-2):
+    `project/cache_cutoff_watcher.py`
+  - Cache-vs-cutoff watcher tests:
+    `project/test_scripts/test_cache_cutoff_watcher.py`
   - Phase 6G semantic / public-meaning baseline doc:
     `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md`
     (the historical Phase 6G-1 anchor; § 7 is the
