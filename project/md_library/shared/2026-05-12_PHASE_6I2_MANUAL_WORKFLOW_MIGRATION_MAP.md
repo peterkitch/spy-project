@@ -86,6 +86,13 @@ or the planned gap if one is still open.
 
 `project/trafficflow.py`:
 
+  - `_classify_pkl_freshness(ticker, *, verbose=True) ->
+    tuple[bool, str, dict]` (line 473) — per-ticker
+    freshness rule used by every discovery helper below.
+  - `scan_missing_stale_pkls(secs, k_limit, include_stale,
+    verbose)` (line 533) — internal helper that builds a
+    `{ticker: reason}` map for UI display inside the
+    TrafficFlow Dash app.
   - `get_all_missing_pkls_all(secs: list[str]) -> list[str]`
     (line 2933) — scans every secondary's combo leaderboard
     (`_find_latest_combo_table`), walks every K row, parses
@@ -93,14 +100,11 @@ or the planned gap if one is still open.
     per member. Returns the sorted union of tickers
     flagged not-fresh. This is the "auto-discover the work
     list" step.
-  - `scan_missing_stale_pkls(secs, k_limit, include_stale,
-    verbose)` (line 533) — internal helper that builds the
-    same set as a `{ticker: reason}` map for UI display
-    inside the TrafficFlow Dash app.
-  - Dash surface: the `missing-pkls` Div
-    (`spymaster.py:3097` analogue inside trafficflow.py
-    around line 3097) renders the missing/stale summary
-    string when the operator clicks Refresh.
+  - Dash surface: the `missing-pkls` Div is defined inside
+    `trafficflow.py` at line 3097; the layout block
+    renders the missing/stale summary string when the
+    operator clicks Refresh (with Output bindings at
+    `trafficflow.py:3159–3160`).
 
 ### 2.2 TrafficFlow K-metric table
 
@@ -136,8 +140,8 @@ or the planned gap if one is still open.
 
 `project/spymaster.py`:
 
-  - Dash UI: `batch-ticker-input` textarea +
-    `batch-process-button` (~line 6403). Operator
+  - Dash UI: `batch-ticker-input` textarea (line 6429) +
+    `batch-process-button` (line 6436). Operator
     comma-pasted the discovery list.
   - `batch_process_tickers` callback (line 11823) —
     parses the input, queues into `ticker_queue`, primes
@@ -234,21 +238,50 @@ ticker SPY, current_as_of_date 2026-05-08
 
 The validator's `board_row_preview` collapses the 60-cell
 grid into the structured ranking row the public board
-consumes. Each ticker's `agreement_ratio = active_count /
-available_count` is the natural successor to the old
-`Sharpe` column — a normalized, per-ticker "how strong is
-the saved-research evidence?" score that already
-incorporates K-aggregate and multi-timeframe input.
+consumes.
+
+**Two ranking inputs, not one.** The new contract exposes
+two orthogonal ranking inputs per ticker, and the old
+manual workflow used both — they must NOT be conflated:
+
+  1. **Signal breadth / agreement.** `agreement_ratio =
+     active_count / available_count` is the successor to
+     the old workflow's "how many K × timeframe cells
+     agree?" notion of *signal breadth*. It is NOT the
+     successor to the old Sharpe column. The old TrafficFlow
+     K-metric table sorted by Sharpe descending; the AI
+     summarization step weighted Sharpe, p-value, trigger
+     count, and capture quality together. None of that is
+     captured by `agreement_ratio` alone.
+  2. **Performance quality.** Sharpe, p-value, trigger
+     count, capture, and win/loss remain a SEPARATE ranking
+     input. These live on the Confluence artifact's
+     `summary` block (see § 4.3) and must be consumed
+     independently by the future cross-ticker emitter.
+
+The Phase 6I-1 validator's `board_row_preview` exposes the
+breadth side; the Confluence artifact's `summary` block
+exposes the performance side. A correct cross-ticker
+ranker (Phase 6I-3) consumes BOTH.
 
 ### 4.3 Ranking inputs the new contract exposes per ticker
+
+The future cross-ticker ranking emitter (Phase 6I-3, see
+§ 6.2) consumes two field groups per ticker, NOT one:
+
+**Group A — `board_row_preview` fields (signal-breadth
+side, sourced from the Phase 6I-1 validator):**
 
   - `consensus_signal` ∈ `{"Buy", "Short", "None"}` and
     `consensus_signal_value` ∈ `{1, -1, 0}` (Phase 6I-1
     enforces the alias coherence).
-  - `agreement_active` (strict-unanimity count) and
-    `agreement_total` (available_count).
-  - `agreement_ratio` (= `active_count / available_count`,
-    matches `daily_signal_board._confluence_active_total`).
+  - `agreement_active` (= `active_count`, sourced from the
+    artifact's `active_count` field; matches
+    `daily_signal_board._confluence_active_total`).
+  - `agreement_total` (= `available_count`).
+  - `agreement_ratio` (= `active_count / available_count`).
+    This is the successor to "agreement / signal breadth",
+    NOT to Sharpe.
   - `coverage` = `"Full"` only when every contract from
     cache → Confluence passes.
   - `rank_eligible` mirrors
@@ -261,10 +294,33 @@ incorporates K-aggregate and multi-timeframe input.
     `health_report_blocked`,
     `confluence_agreement_unavailable`}.
 
-These are the explicit fields a future cross-ticker
-ranking layer (Phase 6I-3, see § 6) can sort on, replacing
-the manual "paste into AI and ask it to weight Sharpe and
-p-value" step.
+**Group B — Confluence artifact `summary` fields
+(performance-quality side, sourced from the per-ticker
+Confluence MTF artifact's `summary` block):**
+
+  - `total_capture_pct` — cumulative captured return
+    across all trigger days (the closest analogue to the
+    old `Total %` column).
+  - `avg_daily_capture_pct` — per-trigger average capture
+    (analogue to the old `Avg %` column).
+  - `sharpe_ratio` — analogue to the old `Sharpe` column.
+  - `trigger_days` — analogue to the old `Trigs` column.
+  - `wins` / `losses` — analogue to the old `Wins` /
+    `Losses` columns.
+  - `p_value` — **currently `None` in the live SPY
+    Confluence summary** (Phase 6D-3 emits the shape but
+    does not yet aggregate the per-K/timeframe p-values
+    into a Confluence-level p-value). Cross-ticker
+    aggregate p-value across K × timeframe Confluence
+    remains an explicit future gap. Phase 6I-3 should
+    consume `p_value` defensively (skip when `None`).
+
+These two groups together replace the manual "paste the
+K=6 TrafficFlow table into an external AI and ask it to
+weight Sharpe, p-value, trigger count, and capture
+quality" step. A Phase 6I-3 emitter that sorts on
+`agreement_ratio` alone is **insufficient** — it would
+lose the performance-quality axis the old workflow had.
 
 ## 5. What is already automated today (post Phase 6H / 6I-1)
 
@@ -322,20 +378,48 @@ universe-sweep writer. The two-key gate stays.
 ### 6.2 Cross-ticker ranking + sort (replacement for old step 6)
 
 The Phase 6I-1 validator produces a `board_row_preview`
-per ticker. There is no module that:
+per ticker, AND the Phase 6D-3 Confluence MTF artifact
+carries a per-ticker `summary` block with the
+performance-quality fields. There is no module that:
 
-  - Loads the per-ticker board_row_preview set,
-  - Sorts by a composite score (e.g. `(rank_eligible,
-    agreement_ratio, abs(consensus_signal_value),
-    coverage == "Full")` with deterministic tie-breaks),
-  - Emits the top-N (or full) ranking as a structured
-    JSONL / Markdown table the operator (or an AI
-    assistant) can read directly.
+  - Loads the per-ticker `board_row_preview` set (Group A:
+    `consensus_signal`, `agreement_ratio`, `coverage`,
+    `rank_eligible`, `ranking_blocked_reason`) AND the
+    per-ticker Confluence `summary` block (Group B:
+    `total_capture_pct`, `avg_daily_capture_pct`,
+    `sharpe_ratio`, `trigger_days`, `wins`, `losses`,
+    `p_value`).
+  - Sorts using BOTH groups together. The old manual
+    workflow weighted Sharpe, p-value, trigger count, and
+    capture quality alongside signal alignment; an
+    `agreement_ratio`-only sort would lose the
+    performance-quality axis and is **not** a faithful
+    replacement for the old AI summarization step.
+  - Emits the ranking as a structured JSONL / Markdown
+    table the operator (or an AI assistant) can read
+    directly, with both groups visible per row.
 
 This is the natural Phase 6I-3 module: **cross-ticker
 ranking emitter**. It would be read-only (no writes),
 take an explicit ticker list, call the validator per
-ticker, and emit the sorted output.
+ticker for Group A, load the Confluence artifact's
+`summary` block per ticker for Group B, and emit the
+sorted output. The specific weighting / sort key is a
+separate design decision deferred to Phase 6I-3 itself
+(the migration map does NOT prescribe `agreement_ratio`
+as the sole sort key).
+
+Two notes for the Phase 6I-3 designer:
+
+  - `summary.p_value` is currently `None` in the live SPY
+    Confluence artifact (Phase 6D-3 shape only; no
+    cross-K/timeframe aggregation yet). The emitter must
+    consume `p_value` defensively. Aggregate Confluence
+    p-value is an explicit future gap.
+  - Tie-breaks should be deterministic (ticker
+    alphabetical at minimum) so the JSONL / Markdown
+    output is stable across runs against an unchanged
+    artifact tree.
 
 ### 6.3 Persistent execution log audit dashboard
 
@@ -506,12 +590,14 @@ deltas the map exposes.**
 ### Old workflow surfaces (audited; unchanged)
 
   - `project/trafficflow.py`:
-      - `get_all_missing_pkls_all` (line 2933) — missing-PKL discovery.
+      - `_classify_pkl_freshness` (line 473) — per-ticker freshness rule.
       - `scan_missing_stale_pkls` (line 533) — UI summary helper.
       - `build_board_rows` (line 2956) — single-K metric table.
-      - `_classify_pkl_freshness` (around line 836) — per-ticker freshness rule.
+      - `get_all_missing_pkls_all` (line 2933) — missing-PKL discovery.
+      - `missing-pkls` Dash Div (line 3097) — missing/stale summary surface.
   - `project/spymaster.py`:
-      - `batch-ticker-input` textarea + `batch-process-button` (lines 6429-6442).
+      - `batch-ticker-input` textarea (line 6429).
+      - `batch-process-button` (line 6436).
       - `batch_process_tickers` callback (line 11823).
       - `process_ticker_queue` background worker.
       - `save_precomputed_results` (line 4607) — atomic cache writer.
