@@ -155,11 +155,11 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-11 (Phase 6G-1; design-review baseline frozen)
+### 6. Current Sprint State as of 2026-05-12 (Phase 6G-5; persist-skip-lag honesty layered on frozen design baseline)
 
-**main / origin/main HEAD:** `24990f0` — `Phase 6G-1: Daily Signal Board public meaning + information hierarchy (#207)`.
+**main / origin/main HEAD:** `576b676` — `Phase 6G-5: SPY currentness gap audit + persist-skip-lag honest recommendation (#210)`.
 
-**Design-review baseline:** frozen at `24990f0`. The next deliverable is a design/product review against the live screenshots captured during Phase 6G-2 (paths in the baseline doc — § "Reference paths" below). No further pipeline writes are currently authorized.
+**Design-review baseline:** still frozen at `24990f0` (Phase 6G-1). Phase 6G-3 (#208) refreshed the sprint-state docs; Phase 6G-4 (#209) shipped the Town Notice Board visual polish (warm-dark page, paper section cards, sage primary, neon `#80ff00` reserved for the current-leader accent); Phase 6G-5 (#210) added the persist-skip-lag honest recommendation in the launch audit + freshness preflight. None of those moved the product baseline. The next deliverable is the design/product review against the Phase 6G-2 screenshots, now planned with the Phase 6G-5 currentness contract documented as part of the handoff. **No production data writes are currently authorized.**
 
 **Testing root:** `C:\Users\sport\Documents\PythonProjects\spy-project` (the primary repo on `main`). The stale emdash worktree at `C:\Users\sport\emdash\worktrees\spy-project\emdash\sprint-continued-qlpvw` is many phases behind and is NOT a valid test target.
 
@@ -167,43 +167,54 @@ an explicit ledger entry classifies the divergence.
 
 **Daily Signal Board front-door sections (top-to-bottom):**
 
-  1. **Today's Board Status** (`section-current-pilot`) — the hero card for the current full-pipeline pilot ticker. Non-directional copy when consensus is None.
-  2. **Town Hall Scoreboard** (`section-scoreboard`) — only leader-eligible rows. Column header reads "Consensus" (was "Signal"). Visible cell for `signal=None` renders "No consensus"; the `data-signal` attribute keeps the canonical `"None"`/`"Buy"`/`"Short"` value.
-  3. **Saved Research Archive** (`section-archive` / `section-archive-details`) — `<details>` collapsible (open=false), holds the long alphabetical tail of Partial/Stale rows (currently ~1,628).
-  4. **Featured High Score** (`section-featured`) — Signal Engine chart + headline numbers, plus a one-line two-signal explainer (`featured-two-signal-explainer`). Featured `confluence_status_fmt` reads `"{active} of {total} alignment checks active"` (60 = 12 K × 5 timeframes, not 60 timeframes).
-  5. **Evidence Trail** (`section-evidence-trail`) — seven station cards: Seed Field / Trading Post / Workshop / Rail Yard / Calendar House / Town Hall / Watchtower. Prefixed by `evidence-trail-intro` explaining that stale upstream stations are historical reference and don't block the current leader gate unless flagged.
+  1. **Today's Board Status** (`section-current-pilot`) — the hero card for the current full-pipeline pilot ticker. Non-directional copy when consensus is None. Carries the Phase 6G-4 CSS-drawn pin + `current-pilot-chip` (leader-highlight neon, the only place the legacy `#80ff00` survives on the page along with the leader row's 3px borderLeft).
+  2. **Town Hall Scoreboard** (`section-scoreboard`) — only leader-eligible rows. Column header reads "Consensus" (was "Signal"). Visible cell for `signal=None` renders "No consensus"; the `data-signal` attribute keeps the canonical `"None"`/`"Buy"`/`"Short"` value. Coverage cells render as wax-seal pills (Phase 6G-4).
+  3. **Saved Research Archive** (`section-archive` / `section-archive-details`) — `<details>` collapsible (open=false), holds the long alphabetical tail of Partial/Stale rows (currently ~1,628). Disclosure copy "Open the saved-research drawer ({count} tickers)" (Phase 6G-4).
+  4. **Featured High Score** (`section-featured`) — Signal Engine chart + headline numbers, plus a one-line two-signal explainer (`featured-two-signal-explainer`). Featured `confluence_status_fmt` reads `"{active} of {total} alignment checks active"` (60 = 12 K × 5 timeframes, not 60 timeframes). "Today's pilot" prefix above the demoted ticker glyph (Phase 6G-4).
+  5. **Evidence Trail** (`section-evidence-trail`) — seven station cards: Seed Field / Trading Post / Workshop / Rail Yard / Calendar House / Town Hall / Watchtower. Each card carries a two-letter stamp glyph (SF/TP/WK/RY/CH/TH/WT) tinted by presence state (Phase 6G-4). Prefixed by `evidence-trail-intro` explaining that stale upstream stations are historical reference and don't block the current leader gate unless flagged.
   6. **What PRJCT9 Is** (`section-what-prjct9-is`).
   7. **What It Is Not** (`section-what-it-is-not`).
 
-**SPY live pilot state (as of `2026-05-11`):**
+**SPY pilot state — pinned design-review baseline (`PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08`):**
 
   - Signal Engine cache `date_range.end` = `2026-05-11` (post Phase 6F-2 authorized refresh).
   - Confluence MTF consensus `last_date` = `2026-05-08` (post Phase 6F-5 authorized pipeline write).
-  - `data-rank="1"`, `data-leader-eligible="true"`, `data-ranking-blocked-reason=""`, `data-signal="None"`.
+  - Resolved `current_as_of_date` = `2026-05-08`.
+  - Readiness: `leader_eligible=True`, `issue_codes=()`, `data-rank="1"`, `data-leader-eligible="true"`, `data-ranking-blocked-reason=""`, `data-signal="None"`.
   - Board consensus: **No directional consensus today** (7 of 60 alignment checks active).
   - Signal Engine state: **Short 11,5**.
   - Visible scoreboard row: `SPY / No consensus / 7/60 / Full / 2026-05-08`.
 
-**Known limitations under the current baseline:**
+**SPY pilot state — unpinned production boot (current behavior, by design):**
 
-  - Only SPY is production-pilot current. Every other ticker in the discovered universe is `coverage=Partial / signal=None` (saved-research-only).
+  - Cache last_date `2026-05-11`; pipeline tree (daily K / MTF K / Confluence) trimmed to `2026-05-08` by Phase 6D-1 `persist_skip_bars=1` safety.
+  - Resolved `current_as_of_date` = `2026-05-11` (UTC has advanced past the trading day the pipeline tree was written for).
+  - Readiness: `leader_eligible=False`, `ranking_blocked_reason="stale_confluence_day_artifact"`. SPY demotes to the Saved Research Archive on a bare boot.
+  - Launch audit + freshness preflight: `recommended_action = recommended_next_action = "pipeline_output_lags_persist_skip"`; `safe_to_attempt_refresh=False`; `safe_to_run_pipeline_after_refresh=False`; pilot manifest excludes SPY. **This is the honest behavior of the existing contract, not a regression.**
+  - The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until then no operator action will move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` is the only way to reproduce the design-review baseline today.
+
+**Known limitations:**
+
+  - Only SPY is production-pilot current at all (pinned). Every other ticker in the discovered universe is `coverage=Partial / signal=None` (saved-research-only).
   - Broader-universe refresh + pipeline automation is unbuilt; the single-ticker tooling exists (`signal_engine_cache_refresher.py`, `confluence_pipeline_runner.py`) but there is no scheduler / orchestrator.
   - ImpactSearch / StackBuilder day artifacts can remain legacy / stale. They are dated `research_day` evidence stations and may render stale or current; under the current Phase 6C-8 leader gate, their staleness does not block the Confluence leader verdict. (The StackBuilder *leaderboard directory* is presence-only; the day artifact is not.)
-  - Mobile (≤ ~390 px wide) scoreboard table uses contained internal horizontal scroll inside `scoreboard-table-wrapper`. The page itself never grows horizontal scroll; the COVERAGE and AS OF columns are one swipe away.
+  - Mobile (≤ ~390 px wide) scoreboard table uses contained internal horizontal scroll inside `scoreboard-table-wrapper` (Phase 6F-7). The page itself never grows horizontal scroll.
 
 **Next recommended work (no more data writes unless explicitly authorized):**
 
-  - Design / product review against the Phase 6G-2 baseline screenshots.
-  - Optional visual / cozy notice-board polish after a design direction is chosen.
-  - Universe-automation scoping (out of band of the current MVP polish track).
+  - Design / product review against the Phase 6G-2 baseline screenshots, run with the pin so SPY reproduces as rank 1. See `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` for the operator handoff.
+  - Optional public-copy polish iteration (all visible strings still route through `BOARD_COPY`; the centralization test catches them).
+  - Universe-automation scoping is out of band of the current MVP polish track; Phase 5D-2 / 5D-3 territory.
 
-**Test baseline:** full regression **1,192 passed, 60 pre-existing pandas fragmentation warnings**. No new warnings since Phase 6C-5.
+**Test baseline:** full regression **1,213 passed, 60 pre-existing pandas fragmentation warnings**. No new warnings since Phase 6C-5.
 
-**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a 6G-2 (or later) PR landed without a refresh.
+**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a 6H-2 (or later) PR landed without a refresh.
 
-**Phase 6G baseline doc:** `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md`.
+**Phase 6G baseline doc:** `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md` (§ 7 details the persist-skip-lag contract).
 
-**Phase 6G-5 cutoff caveat (added after the design-review baseline froze):** The SPY leader-eligible state captured above describes the live board at the moment the design-review screenshots were taken, when `current_as_of_date=2026-05-08` and the saved Confluence artifact matched. Once UTC rolled past 2026-05-08, the resolver advances `current_as_of_date` to the next weekday while the saved Confluence stays at 2026-05-08, because the Phase 6D-1 `persist_skip_bars=1` safety keeps every persisted artifact one trading bar behind the source cache. A bare production boot today therefore renders SPY as **not leader-eligible** (`data-leader-eligible="false"`, `data-ranking-blocked-reason="stale_confluence_day_artifact"`, demoted to the Saved Research Archive) — this is the honest behavior of the existing contract, not a regression. To reproduce the frozen design-review baseline against the on-disk artifacts, pin `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` (the same env var `confluence_pipeline_readiness.resolve_current_as_of_date` already honors); the Phase 6G-5 baseline-doc § 7 walks through this. The correct unpinned audit/preflight recommendation for SPY today is `pipeline_output_lags_persist_skip`, not `ready_for_pipeline_write`; see Phase 6E-2 preflight doc § 6.8 for the full contract on the new action.
+**Phase 6E-2 preflight doc:** `project/md_library/shared/2026-05-11_PHASE_6E2_SOURCE_FRESHNESS_PREFLIGHT.md` (§ 6.8 details the new `pipeline_output_lags_persist_skip` action).
+
+**Phase 6H-1 launch / design handoff doc:** `project/md_library/shared/2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md`.
 
 ---
 
