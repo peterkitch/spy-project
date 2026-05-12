@@ -155,11 +155,23 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-12 (Phase 6G-5; persist-skip-lag honesty layered on frozen design baseline)
+### 6. Current Sprint State as of 2026-05-12 (Phase 6G-5; Town Notice Board visual baseline live on current main)
 
 **main / origin/main HEAD:** `576b676` — `Phase 6G-5: SPY currentness gap audit + persist-skip-lag honest recommendation (#210)`.
 
-**Design-review baseline:** still frozen at `24990f0` (Phase 6G-1). Phase 6G-3 (#208) refreshed the sprint-state docs; Phase 6G-4 (#209) shipped the Town Notice Board visual polish (warm-dark page, paper section cards, sage primary, neon `#80ff00` reserved for the current-leader accent); Phase 6G-5 (#210) added the persist-skip-lag honest recommendation in the launch audit + freshness preflight. None of those moved the product baseline. The next deliverable is the design/product review against the Phase 6G-2 screenshots, now planned with the Phase 6G-5 currentness contract documented as part of the handoff. **No production data writes are currently authorized.**
+**Two baselines, separated:**
+
+  - **Semantic / public-meaning baseline:** anchored at `24990f0` (Phase 6G-1). This is when the seven-section hierarchy and "Consensus / No consensus / Saved Research Archive" public framing locked in. The framing has been stable since.
+  - **Current visual review baseline:** **current main `576b676`**. Phase 6G-4 (#209) reskinned the board to the Town Notice Board direction (warm-dark page, paper section cards, sage primary, neon `#80ff00` reserved for the current-leader accent + CSS-drawn pin/chip + Evidence Trail stamp glyphs). Phase 6G-5 (#210) layered the persist-skip-lag honest recommendation onto the launch audit + freshness preflight. Phase 6G-3 (#208) was docs-only.
+
+**How to review the current UI:** run **current main** with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` pinned (Windows + spyproject2 interpreter; recipe in `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` § 2). The pinned env reproduces SPY as rank-1 leader-eligible against the on-disk artifacts; the live code paths render the Town Notice Board polish.
+
+**Screenshot references:**
+
+  - Phase 6G-2 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_2_audit\`) are **historical / pre-polish** — captured before #209 — and are NOT the current visual target.
+  - Phase 6G-4 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`) are the closest existing screenshot reference for the current Town Notice Board direction, **but current main is the source of truth.** Refresh screenshots from a pinned-cutoff boot if a static reference is needed.
+
+**No production data writes are currently authorized.**
 
 **Testing root:** `C:\Users\sport\Documents\PythonProjects\spy-project` (the primary repo on `main`). The stale emdash worktree at `C:\Users\sport\emdash\worktrees\spy-project\emdash\sprint-continued-qlpvw` is many phases behind and is NOT a valid test target.
 
@@ -175,7 +187,7 @@ an explicit ledger entry classifies the divergence.
   6. **What PRJCT9 Is** (`section-what-prjct9-is`).
   7. **What It Is Not** (`section-what-it-is-not`).
 
-**SPY pilot state — pinned design-review baseline (`PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08`):**
+**SPY pilot state — pinned cutoff (current main as the visual review target, `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08`):**
 
   - Signal Engine cache `date_range.end` = `2026-05-11` (post Phase 6F-2 authorized refresh).
   - Confluence MTF consensus `last_date` = `2026-05-08` (post Phase 6F-5 authorized pipeline write).
@@ -191,7 +203,7 @@ an explicit ledger entry classifies the divergence.
   - Resolved `current_as_of_date` = `2026-05-11` (UTC has advanced past the trading day the pipeline tree was written for).
   - Readiness: `leader_eligible=False`, `ranking_blocked_reason="stale_confluence_day_artifact"`. SPY demotes to the Saved Research Archive on a bare boot.
   - Launch audit + freshness preflight: `recommended_action = recommended_next_action = "pipeline_output_lags_persist_skip"`; `safe_to_attempt_refresh=False`; `safe_to_run_pipeline_after_refresh=False`; pilot manifest excludes SPY. **This is the honest behavior of the existing contract, not a regression.**
-  - The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until then no operator action will move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` is the only way to reproduce the design-review baseline today.
+  - The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until then no operator action will move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` against current main is the only way to reproduce SPY as rank-1 against the on-disk artifacts today.
 
 **Known limitations:**
 
@@ -202,7 +214,7 @@ an explicit ledger entry classifies the divergence.
 
 **Next recommended work (no more data writes unless explicitly authorized):**
 
-  - Design / product review against the Phase 6G-2 baseline screenshots, run with the pin so SPY reproduces as rank 1. See `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` for the operator handoff.
+  - Design / product review against **current main `576b676`** booted with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08`. Current main is the authoritative review target; Phase 6G-4 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`) are the closest existing screenshot reference if a static artifact is needed, and Phase 6G-2 screenshots are historical / pre-polish. See `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` for the full operator handoff.
   - Optional public-copy polish iteration (all visible strings still route through `BOARD_COPY`; the centralization test catches them).
   - Universe-automation scoping is out of band of the current MVP polish track; Phase 5D-2 / 5D-3 territory.
 

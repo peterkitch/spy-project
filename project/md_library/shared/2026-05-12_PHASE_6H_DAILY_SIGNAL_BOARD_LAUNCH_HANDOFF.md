@@ -8,7 +8,7 @@ production data writes are authorized in this phase.
 **Last updated:** 2026-05-12.
 
 This doc is the one-page-ish operator handoff that pairs
-with the frozen Phase 6G design-review baseline. It tells a
+with the current Daily Signal Board on `main`. It tells a
 reviewer (or a future agent) how to run the board, what to
 expect, what is safe to ship a review against, and what is
 not yet launch-safe.
@@ -20,7 +20,10 @@ not yet launch-safe.
 | Repository | `C:\Users\sport\Documents\PythonProjects\spy-project` |
 | Branch | `main` |
 | HEAD | `576b676` — *Phase 6G-5: SPY currentness gap audit + persist-skip-lag honest recommendation (#210)* |
-| Frozen design-review baseline | `24990f0` (Phase 6G-1 merge; visual polish layered on top in #209, persist-skip honesty in #210). The product design baseline did not move. |
+| Code baseline / handoff baseline | **current `main` at `576b676`** — this is the authoritative review target for both UI and operator-tool surfaces. |
+| Visual review baseline | **current `main` at `576b676`** (the Phase 6G-4 Town Notice Board polish + the Phase 6G-5 persist-skip-lag honesty are both live). Phase 6G-2 screenshots are historical / pre-polish; Phase 6G-4 screenshots are the closest existing screenshot reference for the current visual direction; current `main` booted with the pinned cutoff is the source of truth. |
+| Semantic / public-meaning baseline | `24990f0` (Phase 6G-1 merge) — the seven-section hierarchy and "Consensus / No consensus / Saved Research Archive" public framing locked in here. This is the **historical** semantic anchor, not the current visual review target. |
+| Data cutoff for reproducing SPY rank-1 | `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` (against the on-disk artifacts; see § 2). |
 | Full regression | **1,213 passed**, 60 pre-existing pandas fragmentation warnings only. |
 | Pinned Python | `C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe` |
 
@@ -30,12 +33,15 @@ Re-confirm before assuming this is still current:
 git log -10 --oneline main
 ```
 
-## 2. How to run the board in frozen design-review mode
+## 2. How to run the current UI review baseline (pinned cutoff)
 
-The frozen baseline reproduces only when readiness is
-pinned to the trading day the SPY pipeline tree was written
-for (`2026-05-08`). Use the pinned interpreter and a
-read-only env:
+The current visual review baseline is **current `main` at
+`576b676`** — the Phase 6G-4 Town Notice Board polish and
+the Phase 6G-5 persist-skip-lag honesty are both live on
+this commit. SPY reproduces as the rank-1 leader-eligible
+row only when readiness is pinned to the trading day the
+SPY pipeline tree was written for (`2026-05-08`). Use the
+pinned interpreter and a read-only env:
 
 ```powershell
 $env:PRJCT9_PUBLIC_READ_ONLY = '1'
@@ -58,7 +64,15 @@ Then open `http://127.0.0.1:8061`. Expected:
   - Evidence Trail station glyphs render
     (SF/TP/WK/RY/CH/TH/WT).
 
-This is the state the design-review screenshots captured.
+This is the current UI review baseline: live code from
+current `main` rendered against the on-disk artifacts under
+the pinned cutoff. The closest existing screenshot
+reference is the Phase 6G-4 audit set
+(`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`),
+but those are an audit-time snapshot; the rendered board on
+current `main` is the source of truth. Phase 6G-2
+screenshots are pre-polish and are NOT the current visual
+target.
 
 A read-only verification (no Dash boot) reproduces the
 pinned verdict directly through the readiness layer:
@@ -314,10 +328,19 @@ only the cutoff differs.
 In rough priority order, **none of which require data
 writes**:
 
-  1. **Design / product review.** Pinned-cutoff boot
-     against the Phase 6G-2 screenshots. Output: chosen
-     visual direction confirmation (or change request) +
-     prioritized polish backlog. Owner: design lead.
+  1. **Design / product review.** Pinned-cutoff boot of
+     **current `main` (`576b676`)** is the authoritative
+     review target. Run the board with
+     `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` (recipe in
+     § 2) and review the live UI. Phase 6G-4 screenshots
+     (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`)
+     are the closest existing screenshot reference for the
+     current Town Notice Board visual direction if a
+     static artifact is needed; Phase 6G-2 screenshots are
+     pre-polish historical and should not be used as the
+     visual target. Output: chosen visual direction
+     confirmation (or change request against current main)
+     + prioritized polish backlog. Owner: design lead.
   2. **Public-copy polish (optional).** All visible
      strings route through `BOARD_COPY`. A copywriter pass
      can ship as one focused PR with the centralization
@@ -361,16 +384,23 @@ board.
     `project/board_launch_readiness_audit.py`
   - Source freshness preflight:
     `project/source_freshness_preflight.py`
-  - Phase 6G design-review baseline doc:
+  - Phase 6G semantic / public-meaning baseline doc:
     `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md`
-    (§ 7 is the persist-skip-lag contract.)
+    (the historical Phase 6G-1 anchor; § 7 is the
+    persist-skip-lag contract that is still in effect on
+    current main).
   - Phase 6E-2 preflight doc:
     `project/md_library/shared/2026-05-11_PHASE_6E2_SOURCE_FRESHNESS_PREFLIGHT.md`
     (§ 6.8 documents the new
     `pipeline_output_lags_persist_skip` action.)
-  - Phase 6G-2 screenshots:
+  - Phase 6G-2 audit screenshots (historical /
+    pre-Town-Notice-Board polish; NOT the current visual
+    target):
     `C:\Users\sport\AppData\Local\Temp\phase_6g_2_audit\`
-  - Phase 6G-4 screenshots:
+  - Phase 6G-4 audit screenshots (closest existing
+    screenshot reference for the current Town Notice
+    Board visual direction; current main is the source
+    of truth):
     `C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`
   - Phase 6C-8 leader-gate contract:
     `project/md_library/shared/2026-05-11_PHASE_6C8_CONFLUENCE_PIPELINE_CONTRACT.md`
