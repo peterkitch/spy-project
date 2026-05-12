@@ -590,6 +590,7 @@ def _execute_ticker(
     artifact_root: Optional[Any],
     stackbuilder_root: Optional[Any],
     signal_library_dir: Optional[Any],
+    status_dir: Optional[Any],
     current_as_of_date: Optional[str],
     write_authorized: bool,
     planner: Callable[..., Any],
@@ -599,7 +600,13 @@ def _execute_ticker(
 ) -> TickerWriteExecution:
     """Translate one ticker's plan into either a dry-run
     record or a sequenced live execution, honoring the
-    Phase 6H-4 refresh -> recheck -> pipeline contract."""
+    Phase 6H-4 refresh -> recheck -> pipeline contract.
+
+    Phase 6H-6: ``status_dir`` is threaded through to the
+    refresher so the status JSON output root is redirectable
+    in temp-dir authorized rehearsals. ``None`` preserves the
+    refresher's existing default of
+    ``project/cache/status/``."""
     started = time.monotonic()
     plan = planner(
         ticker,
@@ -705,11 +712,17 @@ def _execute_ticker(
             "signal_engine_cache_refresher.refresh_signal_engine_cache",
         ]
         # 1. Refresh.
+        # Phase 6H-6: ``status_dir`` is forwarded so the
+        # refresher's status JSON lands in the operator-chosen
+        # root (or the production default when ``None``).
+        # ``cache_dir`` covers both the cache PKL and its
+        # co-located ``.manifest.json`` sidecar.
         refresh_started = time.monotonic()
         try:
             refresh_result = refresher(
                 ticker,
                 cache_dir=cache_dir,
+                status_dir=status_dir,
                 write=True,
                 current_as_of_date=current_as_of_date,
             )
@@ -869,6 +882,7 @@ def execute_daily_board_automation(
     artifact_root: Optional[Any] = None,
     stackbuilder_root: Optional[Any] = None,
     signal_library_dir: Optional[Any] = None,
+    status_dir: Optional[Any] = None,
     current_as_of_date: Optional[str] = None,
     write_authorized: bool = False,
     planner: Optional[Callable[..., Any]] = None,
@@ -894,6 +908,18 @@ def execute_daily_board_automation(
     the pipeline runner executes ``write=True`` ONLY when
     the watcher returns
     ``cache_cutoff_watcher.ACTION_READY_FOR_PIPELINE_WRITE``.
+
+    Phase 6H-6 adds ``status_dir`` to the redirectable-roots
+    set. It is forwarded to the refresher so the per-ticker
+    status JSON output root can be redirected into a temp
+    directory for authorized integration rehearsals. Passing
+    ``None`` (default) preserves the refresher's existing
+    production default of ``project/cache/status/``. The
+    manifest sidecar is co-located with the cache PKL and
+    therefore follows ``cache_dir``; the pipeline runner's
+    only write target is ``artifact_root`` (its
+    ``stackbuilder_root`` and ``signal_library_dir`` inputs
+    are read-only).
 
     All four executable callables are dependency-injected.
     Defaults resolve to the real production entry points
@@ -930,6 +956,7 @@ def execute_daily_board_automation(
             artifact_root=artifact_root,
             stackbuilder_root=stackbuilder_root,
             signal_library_dir=signal_library_dir,
+            status_dir=status_dir,
             current_as_of_date=resolved_cutoff,
             write_authorized=bool(write_authorized),
             planner=planner_fn,
@@ -1028,6 +1055,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--stackbuilder-root", default=None)
     parser.add_argument("--signal-library-dir", default=None)
+    parser.add_argument(
+        "--status-dir",
+        default=None,
+        help=(
+            "Phase 6H-6: override the refresher's status-JSON "
+            "output root. Defaults to the refresher's own "
+            "default (project/cache/status/) when omitted. "
+            "Required for temp-dir authorized rehearsals."
+        ),
+    )
     parser.add_argument("--current-as-of-date", default=None)
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -1110,6 +1147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             artifact_root=args.artifact_root,
             stackbuilder_root=args.stackbuilder_root,
             signal_library_dir=args.signal_library_dir,
+            status_dir=args.status_dir,
             current_as_of_date=args.current_as_of_date,
             write_authorized=auth.authorized,
             execution_log_path=args.execution_log,
