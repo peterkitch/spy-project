@@ -288,6 +288,14 @@ def test_stale_cache_recommends_refresh_source_cache(tmp_path: Path):
 def test_current_cache_with_stackbuilder_recommends_pipeline(
     tmp_path: Path,
 ):
+    """Cache last_date is one trading day past the cutoff (the
+    realistic "right after market close, UTC has not yet
+    rolled" window). The Phase 6D-1 persist_skip_bars=1 trim
+    will land Confluence at the cutoff exactly, so a pipeline
+    rerun WILL make this ticker leader-eligible. The preflight
+    must recommend ``run_pipeline_after_refresh`` here -
+    Phase 6G-5's persist-skip-lag override only fires when the
+    cache equals the cutoff."""
     dirs = _layout(tmp_path)
     _write_cache_pkl(
         dirs["cache_dir"], "SPY",
@@ -300,7 +308,7 @@ def test_current_cache_with_stackbuilder_recommends_pipeline(
         dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
     )
     entry = sfp.evaluate_ticker_freshness(
-        "SPY", current_as_of_date="2026-05-08", **dirs,
+        "SPY", current_as_of_date="2026-05-07", **dirs,
     )
     assert entry.stale is False
     assert entry.has_stackbuilder_run is True
@@ -310,6 +318,86 @@ def test_current_cache_with_stackbuilder_recommends_pipeline(
     )
     assert entry.safe_to_attempt_refresh is True
     assert entry.safe_to_run_pipeline_after_refresh is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 6G-5: persist_skip_bars structural-lag pass-through
+# ---------------------------------------------------------------------------
+
+
+def test_persist_skip_lag_recommends_pipeline_output_lags_action(
+    tmp_path: Path,
+):
+    """SPY-shape: cache last_date equals the as-of cutoff and
+    the full upstream chain is in place. The launch audit emits
+    ``RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP``. The
+    preflight must mirror that verdict via its own action
+    constant so an operator scanning the freshness preflight
+    sees the same structural-lag answer."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    entry = sfp.evaluate_ticker_freshness(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert entry.stale is False
+    assert (
+        entry.board_launch_recommended_action
+        == bla.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    )
+    assert (
+        entry.recommended_next_action
+        == sfp.ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    )
+
+
+def test_persist_skip_lag_action_is_not_safe_to_refresh_or_pipeline(
+    tmp_path: Path,
+):
+    """Neither attempting a refresh nor running the pipeline
+    today will close the persist-skip lag. The preflight's
+    safety flags must reflect that honestly: both must be
+    ``False`` so the operator knows the structural-lag verdict
+    is not a "rerun the pipeline" suggestion."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    entry = sfp.evaluate_ticker_freshness(
+        "SPY", current_as_of_date="2026-05-08", **dirs,
+    )
+    assert (
+        entry.recommended_next_action
+        == sfp.ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    )
+    assert entry.safe_to_attempt_refresh is False
+    assert entry.safe_to_run_pipeline_after_refresh is False
+
+
+def test_persist_skip_lag_action_constant_is_in_preflight_actions(
+):
+    """The new pass-through constant must register in the
+    ``PREFLIGHT_ACTIONS`` namespace so consumers that enumerate
+    the preflight's action set see it."""
+    assert (
+        sfp.ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+        in sfp.PREFLIGHT_ACTIONS
+    )
+    assert (
+        sfp.ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+        == "pipeline_output_lags_persist_skip"
+    )
 
 
 def test_full_pipeline_outputs_already_current(tmp_path: Path):

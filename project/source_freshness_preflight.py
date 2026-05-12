@@ -76,6 +76,18 @@ ACTION_MISSING_CACHE = "missing_cache"
 ACTION_BLOCKED_BY_HEALTH_REPORT = "blocked_by_health_report"
 ACTION_INSUFFICIENT_SAVED_INPUTS = "insufficient_saved_inputs"
 ACTION_MANUAL_REVIEW = "manual_review"
+# Phase 6G-5: structural persist-skip lag mirror of the launch
+# audit's RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP. Surfaces
+# the same operator-facing fact in refresh-focused language:
+# refreshing the source cache + rerunning the pipeline today
+# cannot make this ticker leader-eligible because Phase 6D-1's
+# persist_skip_bars=1 trim places Confluence one trading bar
+# behind the cache, and the cache is already at cutoff. The
+# only way to close the gap is the next trading-day's market
+# close + cache refresh + pipeline rerun.
+ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP = (
+    "pipeline_output_lags_persist_skip"
+)
 
 PREFLIGHT_ACTIONS: tuple[str, ...] = (
     ACTION_REFRESH_SOURCE_CACHE,
@@ -86,6 +98,7 @@ PREFLIGHT_ACTIONS: tuple[str, ...] = (
     ACTION_BLOCKED_BY_HEALTH_REPORT,
     ACTION_INSUFFICIENT_SAVED_INPUTS,
     ACTION_MANUAL_REVIEW,
+    ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP,
 )
 
 
@@ -243,6 +256,17 @@ def _classify_next_action(
         == _bla.RECOMMENDED_BLOCKED_BY_HEALTH_REPORT
     ):
         return ACTION_BLOCKED_BY_HEALTH_REPORT
+    if (
+        launch_entry.recommended_action
+        == _bla.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    ):
+        # Phase 6G-5: pass through the launch audit's structural
+        # persist-skip-lag verdict. Refreshing the cache or
+        # running the pipeline today will not advance the saved
+        # tree to current_as_of_date; the operator must wait for
+        # the next trading-day rollover before either action
+        # becomes meaningful.
+        return ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
     if not launch_entry.has_signal_engine_cache:
         return (
             ACTION_MISSING_CACHE

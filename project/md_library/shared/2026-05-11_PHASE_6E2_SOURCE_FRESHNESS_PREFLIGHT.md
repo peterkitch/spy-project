@@ -700,6 +700,184 @@ the real yfinance feed returns:
   - Zero changes to `cache/results/` or `cache/status/`
     (verified by `git status` after the smoke).
 
+## 6.8 Phase 6G-5 — persist-skip-lag honest recommendation
+
+Phase 6G-5 closes the operator-honesty gap exposed when SPY's
+saved pipeline tree advanced to `last_date=2026-05-08` (the
+Phase 6F-5 production write) while the readiness resolver
+later rolled forward to `current_as_of_date=2026-05-11`. The
+saved tree did not regress; the Phase 6D-1
+`persist_skip_bars=1` safety means Confluence is structurally
+one trading bar behind the source cache, so once the cache
+caught up to the resolver's cutoff, Confluence stayed
+one bar shy. A pipeline rerun cannot close that gap until the
+cache acquires a trading day strictly past `current_as_of_date`.
+
+Pre-Phase-6G-5 the launch audit and the preflight both still
+claimed an operator action would clear the staleness, which
+was misleading. Phase 6G-5 adds a stable verdict that names
+the structural lag explicitly.
+
+### 6.8.1 New stable action constant
+
+`pipeline_output_lags_persist_skip` — added to both:
+
+  - `board_launch_readiness_audit.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP`
+    (also in `RECOMMENDED_ACTIONS`).
+  - `source_freshness_preflight.ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP`
+    (also in `PREFLIGHT_ACTIONS`).
+
+Both modules emit the same literal string so an operator
+scanning either tool's JSON sees the same answer.
+
+### 6.8.2 Meaning
+
+The source cache is **not stale**
+(`cache.last_date >= current_as_of_date`) and the full
+upstream chain is in place (Spymaster cache + StackBuilder
+leaderboard + multi-timeframe libraries). The only thing
+keeping Confluence from being "current" by the strict
+`last_date >= current_as_of_date` contract is the Phase 6D-1
+`persist_skip_bars=1` trim — and that trim is a load-bearing
+safety policy, not a bug. A pipeline write today will
+reproduce the same one-trading-bar lag. The verdict fires
+whether daily K / MTF K / Confluence artifacts already exist
+or not; the point is that any FUTURE pipeline write would
+still persist-skip behind the cutoff.
+
+Concretely, the audit fires this verdict when all of these
+hold for the ticker:
+
+  - `has_signal_engine_cache=True`
+  - `has_stackbuilder_run=True`
+  - `has_multitimeframe_libraries=True`
+  - `stale=False` (source cache is fresh)
+  - `parsed(cache.last_date) == parsed(current_as_of_date)`
+    (the source cache equals the resolver's cutoff exactly,
+    i.e. the cache has no trading day strictly past the
+    cutoff that would allow the persist trim to leave
+    Confluence at-cutoff).
+
+Daily K, MTF K, and Confluence artifact presence are NOT
+part of the predicate. The new verdict is about what a
+hypothetical pipeline write would produce; it intentionally
+fires even on a ticker that has never had the Phase 6D
+chain run, so the operator does not waste a write cycle on
+a structurally-blocked ticker.
+
+Under those conditions, the audit overrides what would have
+been `RECOMMENDED_READY_FOR_PIPELINE_WRITE` and emits the new
+verdict instead. The preflight passes the audit verdict
+straight through to its own
+`ACTION_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP`.
+
+### 6.8.3 Honest `likely_after_run_issue_codes`
+
+When the predicate fires, the audit's prediction of "what
+issue codes would persist after a pipeline rerun" keeps
+`stale_confluence_day_artifact` in the post-run set. The old
+behavior unconditionally dropped that code (treating it as
+"runner-owned and therefore cleared"), which lied about the
+rerun's effect. The new behavior is honest: a rerun will
+clear `missing_confluence_day_artifact` (because a fresh
+artifact WILL be written) but the readiness re-emits
+`stale_confluence_day_artifact` on the very next inspection
+because the rewrite still lands one trading bar behind the
+cutoff.
+
+### 6.8.4 Operator action
+
+The verdict closes when the source cache acquires a trading
+day **strictly after** `current_as_of_date`. The correct
+gate is therefore a cache-vs-cutoff inequality check, not a
+wall-clock event.
+
+  1. Probe the cache against the cutoff. The cheapest read
+     is the existing dry-run:
+     `python signal_engine_cache_refresher.py --ticker <T>
+     --dry-run`. The result reports
+     `old_cache_date_range_end`,
+     `new_cache_date_range_end`, and
+     `current_after`. The operator wants
+     `new_cache_date_range_end > current_as_of_date`
+     (strict inequality, not `==`). A direct
+     `pickle.loads` of
+     `cache/results/<T>_precomputed_results.pkl` comparing
+     `_last_date` against
+     `confluence_pipeline_readiness.resolve_current_as_of_date()`
+     is the equivalent inspection and does not touch the
+     network.
+  2. Once the strict inequality holds, run the authorized
+     refresh + pipeline cycle. The persist-skip trim now
+     leaves Confluence at-cutoff and the gap closes.
+       - `python signal_engine_cache_refresher.py
+         --ticker <T> --write` (if the cache itself needs
+         to be re-stamped first).
+       - `python confluence_pipeline_runner.py
+         --ticker <T> --write`.
+       - `python board_launch_readiness_audit.py
+         --tickers <T>` should now report
+         `already_leader_eligible`.
+
+The original prompt-level guidance "wait for UTC rollover"
+is **incorrect** for this contract and should not appear in
+operator-facing documentation. In the common SPY case the
+strict inequality typically opens after the next NY market
+close IF the cache is refreshed before UTC rolls the cutoff
+forward. If UTC rolls forward first (cache still equals the
+previous cutoff while the resolver advances to the new
+one), the equal-cache/cutoff lag simply recreates and
+`pipeline_output_lags_persist_skip` stays in force. The
+predicate to watch is `cache.last_date > current_as_of_date`,
+not any wall-clock event.
+
+No production cache write and no pipeline rerun will close
+the gap until that strict inequality holds. Attempting them
+earlier produces byte-identical persist-trimmed output.
+
+### 6.8.5 Safety flag contract
+
+`source_freshness_preflight` exposes two operator-facing
+boolean safety flags. Under the new action:
+
+  - `safe_to_attempt_refresh = False` — a refresh today
+    will not produce a fresher cache than the one already
+    on disk (today's bar is already in the cache).
+  - `safe_to_run_pipeline_after_refresh = False` — a
+    pipeline rerun today cannot clear the readiness
+    blocker. The flag is False to keep the operator from
+    being misled into running for cosmetic re-stamping.
+
+Both flags reading `False` is the truthful signal: there is
+no action available to the operator today that closes the
+gap. The next-trading-day rollover is the only thing that
+moves it.
+
+### 6.8.6 What did NOT change
+
+The Phase 6C-8 readiness contract is unchanged. The strict
+`current = stage.last_date >= current_as_of_date` definition
+is still load-bearing for the leader gate; loosening it would
+mask the Phase 6D-1 persistence safety. The fix lives at the
+audit/preflight prediction layer, where operator-facing
+recommendations belong. `confluence_pipeline_runner.py` and
+`confluence_pipeline_readiness.py` are untouched.
+
+### 6.8.7 Reference paths
+
+  - Launch readiness audit (the recommended-action source of
+    truth): `project/board_launch_readiness_audit.py`.
+  - Source-freshness preflight (the mirror):
+    `project/source_freshness_preflight.py`.
+  - Phase 6G-5 audit tests:
+    `project/test_scripts/test_board_launch_readiness_audit.py`
+    (search for `persist_skip_lag`).
+  - Phase 6G-5 preflight tests:
+    `project/test_scripts/test_source_freshness_preflight.py`
+    (search for `persist_skip_lag`).
+  - Daily Signal Board baseline doc § 7 (sibling caveat):
+    `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md`.
+
 ## 7. Out of scope for Phase 6E-2
 
   - Writing a non-interactive Spymaster refresh CLI.

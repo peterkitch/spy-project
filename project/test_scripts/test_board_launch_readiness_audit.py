@@ -358,7 +358,21 @@ def test_audit_does_not_write_to_artifact_root(tmp_path: Path):
 def test_full_fresh_inputs_recommend_ready_for_pipeline_write(
     tmp_path: Path,
 ):
+    """Cache is one trading day past the cutoff (the realistic
+    "right after market close, UTC has not yet rolled" window).
+    The Phase 6D-1 persist_skip_bars=1 trim will land Confluence
+    at cache.last_date - 1 trading bar == cutoff, which is
+    structurally current. So a pipeline rerun WILL clear stale
+    issues and the audit's ``ready_for_pipeline_write`` verdict
+    is honest.
+
+    Phase 6G-5 added a structural-lag override for the
+    cache.last_date == cutoff case; this test pins that the
+    cache-one-trading-day-past-cutoff case is NOT subject to
+    that override."""
     dirs = _layout(tmp_path)
+    # Friday 2026-05-08 is one trading day past Thursday
+    # 2026-05-07.
     _write_cache_pkl(
         dirs["cache_dir"], "SPY",
         last_date="2026-05-08", n=20,
@@ -371,7 +385,7 @@ def test_full_fresh_inputs_recommend_ready_for_pipeline_write(
         ["1wk", "1mo"],
     )
     entry = audit.audit_ticker_for_launch(
-        "SPY", current_as_of_date="2026-05-08",
+        "SPY", current_as_of_date="2026-05-07",
         include_dry_run=False, **dirs,
     )
     assert entry.has_signal_engine_cache is True
@@ -520,7 +534,9 @@ def test_no_cache_at_all_recommends_insufficient_saved_inputs(
 
 def test_counts_by_recommended_action_add_up(tmp_path: Path):
     dirs = _layout(tmp_path)
-    # One ticker fully ready, one with no inputs.
+    # SPY cache is one trading day past the cutoff so the Phase
+    # 6G-5 persist-skip-lag override does NOT fire; recommended
+    # action stays ready_for_pipeline_write.
     _write_cache_pkl(
         dirs["cache_dir"], "SPY",
         last_date="2026-05-08", n=20,
@@ -534,7 +550,7 @@ def test_counts_by_recommended_action_add_up(tmp_path: Path):
     )
     report = audit.build_launch_pilot_manifest(
         tickers=["SPY", "GHOST"],
-        current_as_of_date="2026-05-08",
+        current_as_of_date="2026-05-07",
         include_dry_run=False, **dirs,
     )
     assert sum(
@@ -656,10 +672,12 @@ def test_cli_empty_run_returns_0(tmp_path: Path, capsys):
 def test_likely_after_run_clears_runner_owned_codes_on_fresh_inputs(
     tmp_path: Path,
 ):
-    """When can_run_pipeline_now is True and source is fresh,
-    the likely_after_run set should EXCLUDE the issue codes
-    the runner is documented to clear: insufficient_K,
-    missing_bridge, missing_confluence."""
+    """When can_run_pipeline_now is True, source is fresh, and
+    the cache is one trading day past the cutoff (so the Phase
+    6G-5 persist-skip-lag override does NOT fire), the
+    likely_after_run set should EXCLUDE every issue code the
+    runner is documented to clear: insufficient_K,
+    missing_bridge, missing_confluence, stale_confluence."""
     dirs = _layout(tmp_path)
     _write_cache_pkl(
         dirs["cache_dir"], "SPY",
@@ -673,7 +691,7 @@ def test_likely_after_run_clears_runner_owned_codes_on_fresh_inputs(
         ["1wk", "1mo"],
     )
     entry = audit.audit_ticker_for_launch(
-        "SPY", current_as_of_date="2026-05-08",
+        "SPY", current_as_of_date="2026-05-07",
         include_dry_run=False, **dirs,
     )
     after = set(entry.likely_after_run_issue_codes)
@@ -686,6 +704,222 @@ def test_likely_after_run_clears_runner_owned_codes_on_fresh_inputs(
         assert cleared not in after, (
             f"likely_after_run leaked runner-cleared code {cleared}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6G-5: persist_skip_bars structural-lag detection
+# ---------------------------------------------------------------------------
+
+
+def test_persist_skip_lag_recommends_pipeline_output_lags(
+    tmp_path: Path,
+):
+    """SPY-shape: source cache reaches the as-of cutoff exactly
+    (no future trading day in the cache). Full upstream is in
+    place. There is no Confluence artifact yet. The audit must
+    NOT recommend ``ready_for_pipeline_write`` because the Phase
+    6D-1 persist_skip_bars=1 trim will land the about-to-be-built
+    Confluence at cache.last_date - 1 trading bar, which is
+    strictly before current_as_of_date - so leader-eligibility
+    cannot follow from the rerun. The recommendation must name
+    the structural lag explicitly via
+    ``RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP``."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY",
+        ["1wk", "1mo"],
+    )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.stale is False
+    assert entry.has_signal_engine_cache is True
+    assert entry.has_stackbuilder_run is True
+    assert entry.latest_known_date == "2026-05-08"
+    assert entry.recommended_action == (
+        audit.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    )
+
+
+def test_persist_skip_lag_predicts_stale_confluence_persists_after_run(
+    tmp_path: Path,
+):
+    """SPY-shape, full pipeline already written but with
+    Confluence one trading bar behind the cutoff (the
+    persist_skip_bars=1 trim is in effect). A pipeline rerun
+    will replace those artifacts with identically-trimmed ones,
+    so the staleness persists. ``likely_after_run_issue_codes``
+    must keep ``stale_confluence_day_artifact`` instead of
+    falsely predicting the rerun clears it."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY",
+        ["1wk", "1mo"],
+    )
+    # Persisted Confluence sits one trading bar behind the
+    # cutoff - the structural Phase 6D-1 trim result.
+    _write_full_mtf_pipeline_outputs(
+        dirs["artifact_root"], "SPY", last_date="2026-05-07",
+    )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.has_confluence_artifact is True
+    assert entry.current_leader_eligible is False
+    assert cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT in (
+        entry.current_readiness_issue_codes
+    )
+    after = set(entry.likely_after_run_issue_codes)
+    assert cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT in after, (
+        "Phase 6G-5: a pipeline rerun cannot clear "
+        "stale_confluence_day_artifact when cache.last_date == "
+        "current_as_of_date; the persist_skip_bars=1 trim keeps "
+        "Confluence one trading bar behind."
+    )
+    assert entry.recommended_action == (
+        audit.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    )
+
+
+def test_persist_skip_lag_does_not_fire_when_cache_is_one_day_ahead(
+    tmp_path: Path,
+):
+    """When cache.last_date is one trading day past the cutoff
+    (the brief UTC window between market close and the next
+    UTC date), persist_skip_bars=1 trims the cache's final
+    trading bar - which equals the cutoff exactly - so
+    Confluence WILL be current after a pipeline rerun. The
+    structural-lag override must NOT fire and the audit may
+    legitimately recommend ``ready_for_pipeline_write``."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY",
+        ["1wk", "1mo"],
+    )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-07",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.recommended_action == (
+        audit.RECOMMENDED_READY_FOR_PIPELINE_WRITE
+    )
+
+
+def test_persist_skip_lag_action_keeps_ticker_out_of_pilot_manifest(
+    tmp_path: Path,
+):
+    """The pilot manifest is the subset of tickers a write=True
+    pipeline run can promote to leader-eligible. A
+    ``pipeline_output_lags_persist_skip`` ticker cannot be
+    promoted by a rerun today - so it must NOT appear in
+    ``recommended_pilot_tickers``."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY",
+        ["1wk", "1mo"],
+    )
+    report = audit.build_launch_pilot_manifest(
+        tickers=["SPY"],
+        current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert report.counts_by_recommended_action.get(
+        audit.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP,
+    ) == 1
+    assert "SPY" not in report.recommended_pilot_tickers
+
+
+def test_persist_skip_lag_does_not_fire_without_full_upstream(
+    tmp_path: Path,
+):
+    """The structural-lag predicate requires the full upstream
+    chain: cache + StackBuilder + multi-timeframe libraries.
+    Without any one of those, the existing
+    ``needs_*`` recommendation must still fire (the operator
+    needs the structural blocker fixed first; the persist-lag
+    is irrelevant until the structural blocker clears)."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    # No multi-timeframe libraries.
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.recommended_action == (
+        audit.RECOMMENDED_NEEDS_MULTITIMEFRAME_LIBRARIES
+    )
+
+
+def test_persist_skip_lag_does_not_override_already_leader_eligible(
+    tmp_path: Path,
+):
+    """An ``already_leader_eligible`` ticker stays
+    leader-eligible. The Phase 6G-5 override only triggers when
+    the existing recommendation is ``ready_for_pipeline_write``
+    - it must not demote a verdict that is already current."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY",
+        last_date="2026-05-08", n=20,
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY",
+        ["1wk", "1mo"],
+    )
+    # Confluence is at the cutoff -> leader-eligible.
+    _write_full_mtf_pipeline_outputs(
+        dirs["artifact_root"], "SPY", last_date="2026-05-08",
+    )
+    entry = audit.audit_ticker_for_launch(
+        "SPY", current_as_of_date="2026-05-08",
+        include_dry_run=False, **dirs,
+    )
+    assert entry.current_leader_eligible is True
+    assert entry.recommended_action == (
+        audit.RECOMMENDED_ALREADY_LEADER_ELIGIBLE
+    )
+
+
+def test_persist_skip_lag_constant_is_in_recommended_actions(
+):
+    """The new constant must register in the
+    ``RECOMMENDED_ACTIONS`` tuple so JSON-emitting consumers
+    that enumerate the action namespace see the new value."""
+    assert (
+        audit.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+        in audit.RECOMMENDED_ACTIONS
+    )
+    assert (
+        audit.RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+        == "pipeline_output_lags_persist_skip"
+    )
 
 
 def test_likely_after_run_keeps_stale_when_source_is_stale(

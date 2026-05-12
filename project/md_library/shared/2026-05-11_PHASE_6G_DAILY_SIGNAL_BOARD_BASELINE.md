@@ -195,3 +195,137 @@ No further pipeline writes are authorized until an
 explicit prompt enables them. The current SPY pilot state
 is the design-review baseline and should remain stable
 through the review.
+
+## 7. Phase 6G-5 persist-skip-lag cutoff caveat
+
+The frozen baseline above describes SPY's state on the day
+the design-review was captured, when
+`current_as_of_date=2026-05-08` and the saved Confluence
+artifact matched. That alignment was time-bounded; this
+section documents what an operator sees today and what the
+correct operator response is.
+
+### 7.1 What changes under an unpinned boot
+
+Once UTC advances past the trading day the saved pipeline
+tree was written for, `current_as_of_date` rolls forward
+while the persisted artifacts stay where they are. With the
+SPY cache still being refreshed daily, the gap manifests as
+a one-trading-bar lag in every persisted stage:
+
+| Stage | Live last_date (today) | Why |
+|---|---|---|
+| Signal Engine cache | `2026-05-11` | Spymaster refresh covers the most recent trading-day close. |
+| daily K artifacts (Phase 6D-1, `persist_skip_bars=1`) | `2026-05-08` | The persistence safety trims `cache.last_date` by one trading bar so the saved tree never carries yfinance's provisional same-day data. |
+| MTF K artifacts (Phase 6D-2, `persist_skip_bars=0`) | `2026-05-08` | Inherits from daily K. The Phase 6F-4 double-trim fix is still in place; only the Phase 6D-1 trim applies. |
+| Confluence MTF (Phase 6D-3) | `2026-05-08` | Inherits from MTF K. |
+| Readiness `current_as_of_date` (unpinned) | `2026-05-11` | `confluence_pipeline_readiness.resolve_current_as_of_date` resolves to "most recent weekday strictly before UTC now". UTC has rolled past 2026-05-08. |
+
+Because Confluence's last_date is structurally
+`cache.last_date - persist_skip_bars` trading bars and the
+cache currently equals `current_as_of_date`, the readiness
+layer's strict `last_date >= current_as_of_date` rule
+reports `stale_confluence_day_artifact` and demotes SPY out
+of the leader gate. **A bare production boot today should
+not be expected to show SPY as `data-leader-eligible="true"`
+under the current pipeline contract.** No regression has
+landed; this is the honest behavior of the Phase 6D-1
+persistence safety + the Phase 6C-8 readiness contract
+working as designed.
+
+### 7.2 Reproducing the frozen design-review baseline
+
+To re-show the SPY-as-rank-#1 / leader-eligible state from
+the screenshots in § 4 against the on-disk artifacts, pin
+the readiness cutoff to the day the artifacts were written.
+The operator environment for this repo is Windows + the
+pinned `spyproject2` conda interpreter; the canonical
+PowerShell incantation is:
+
+```powershell
+$env:PRJCT9_PUBLIC_READ_ONLY = '1'
+$env:PRJCT9_BOARD_PORT = '8061'
+$env:PRJCT9_RESEARCH_AS_OF_DATE = '2026-05-08'
+& 'C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe' daily_signal_board.py
+```
+
+`confluence_pipeline_readiness.resolve_current_as_of_date`
+honors `PRJCT9_RESEARCH_AS_OF_DATE` before falling back to
+the UTC-now resolver. Under the pin, every saved Confluence
+/ MTF K / daily K artifact is `last_date == cutoff`, the
+readiness layer clears `stale_confluence_day_artifact`, and
+SPY renders as the rank-1 leader-eligible row matching the
+baseline screenshots. This is for design-review reproducibility
+only; no production cache or pipeline write is performed.
+
+### 7.3 Correct unpinned recommendation
+
+Phase 6G-5 adds a new stable verdict to the launch
+readiness audit and the source-freshness preflight so the
+operator-facing answer for SPY (and any future ticker in
+the same shape) is honest. The pre-Phase-6G-5 behavior
+falsely claimed a rerun would close the gap.
+
+| Tool | Pre-Phase-6G-5 verdict | Post-Phase-6G-5 verdict |
+|---|---|---|
+| `board_launch_readiness_audit` `recommended_action` | `ready_for_pipeline_write` | `pipeline_output_lags_persist_skip` |
+| `board_launch_readiness_audit` `likely_after_run_issue_codes` | `()` *(lied: implied the rerun cleared `stale_confluence_day_artifact`)* | `("stale_confluence_day_artifact",)` |
+| `board_launch_readiness_audit` pilot manifest | SPY listed as pilot-ready | SPY NOT in `recommended_pilot_tickers` |
+| `source_freshness_preflight` `recommended_next_action` | `run_pipeline_after_refresh` | `pipeline_output_lags_persist_skip` |
+| `source_freshness_preflight` `safe_to_attempt_refresh` | `True` | `False` |
+| `source_freshness_preflight` `safe_to_run_pipeline_after_refresh` | `True` | `False` |
+
+See § 6.8 of
+`project/md_library/shared/2026-05-11_PHASE_6E2_SOURCE_FRESHNESS_PREFLIGHT.md`
+for the full preflight contract under the new action.
+
+### 7.4 What the operator should do
+
+The action `pipeline_output_lags_persist_skip` becomes
+useful again only when the source cache acquires a trading
+day strictly after `current_as_of_date`. The persist-skip
+trim then leaves Confluence at-cutoff and a rerun makes it
+current. The correct gate to wait for is therefore a
+**cache-vs-cutoff inequality**, not a clock event:
+
+  1. Probe the cache against the cutoff. The cheapest
+     check is the existing dry-run path:
+     `python signal_engine_cache_refresher.py --ticker <T>
+     --dry-run`. The result reports
+     `old_cache_date_range_end`,
+     `new_cache_date_range_end`, and
+     `current_after`. The operator wants to see
+     `new_cache_date_range_end > current_as_of_date`
+     (strict inequality, not `==`). A direct
+     `pickle.loads` of `cache/results/<T>_precomputed_results.pkl`
+     comparing `_last_date` against
+     `confluence_pipeline_readiness.resolve_current_as_of_date()`
+     is the equivalent inspection.
+  2. Once the strict inequality holds, the gap is closable.
+     Run the authorized cache write
+     (`signal_engine_cache_refresher.py --ticker <T> --write`
+     if the cache needs to be re-stamped) followed by the
+     authorized pipeline write
+     (`confluence_pipeline_runner.py --ticker <T> --write`).
+     The recommendation flips back through
+     `run_pipeline_after_refresh` and lands on
+     `already_leader_eligible` once the pipeline write
+     completes.
+
+Notes on timing (informational, not the required gate):
+
+  - In the common SPY case, the strict inequality typically
+    opens after the next NY market close, IF the Signal
+    Engine cache is refreshed before UTC moves the cutoff
+    forward. SPY closes at ~21:00 UTC; UTC midnight is a
+    few hours later. A cache refresh inside that window
+    leaves the cache one trading day ahead of the cutoff.
+  - If UTC rolls forward first (cache still equals the
+    prior cutoff while the resolver advances to the new
+    one), the equal-cache/cutoff lag simply recreates and
+    `pipeline_output_lags_persist_skip` stays in force.
+    This is not a regression; it is the same contract.
+
+Until the strict inequality opens, nothing operator-side
+will move the verdict. No production write is authorized
+to "fix" the gap; the gap is the contract.

@@ -82,6 +82,24 @@ RECOMMENDED_BLOCKED_BY_HEALTH_REPORT = "blocked_by_health_report"
 RECOMMENDED_INSUFFICIENT_SAVED_INPUTS = "insufficient_saved_inputs"
 RECOMMENDED_UNDER_REVIEW = "under_review"
 
+# Phase 6G-5: structural persist-skip lag. The Phase 6D-1
+# pipeline trims the final ``persist_skip_bars`` bars off
+# every persisted artifact so the saved tree never carries
+# yfinance's provisional same-day bar. When the source cache
+# is fresh exactly through ``current_as_of_date`` (i.e. the
+# cache has no trading day strictly after the as-of cutoff),
+# running the pipeline cannot advance Confluence to
+# ``current_as_of_date``: Confluence will land at
+# ``cache.last_date - persist_skip_bars`` trading days, which
+# is < cutoff. ``ready_for_pipeline_write`` would mislead the
+# operator into thinking a rerun will close the gap. This
+# code names the structural lag explicitly so the operator
+# knows the next move is "wait for the next trading-day
+# rollover", not "rerun the pipeline".
+RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP = (
+    "pipeline_output_lags_persist_skip"
+)
+
 RECOMMENDED_ACTIONS: tuple[str, ...] = (
     RECOMMENDED_READY_FOR_PIPELINE_WRITE,
     RECOMMENDED_ALREADY_LEADER_ELIGIBLE,
@@ -91,6 +109,7 @@ RECOMMENDED_ACTIONS: tuple[str, ...] = (
     RECOMMENDED_BLOCKED_BY_HEALTH_REPORT,
     RECOMMENDED_INSUFFICIENT_SAVED_INPUTS,
     RECOMMENDED_UNDER_REVIEW,
+    RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP,
 )
 
 
@@ -556,14 +575,15 @@ def audit_ticker_for_launch(
     # date_range.end (one PKL load - bounded by max_tickers).
     cache_date_end: Optional[str] = None
     stale_source = False
+    parsed_cache_end: Optional[datetime] = None
+    parsed_cutoff = _parse_iso_date(resolved_cutoff)
     if has_signal_engine_cache:
         cache_date_end = _signal_engine_cache_date_range_end(
             ticker, cache_d,
         )
-        parsed_end = _parse_iso_date(cache_date_end)
-        parsed_cutoff = _parse_iso_date(resolved_cutoff)
-        if parsed_end is not None and parsed_cutoff is not None:
-            stale_source = parsed_end < parsed_cutoff
+        parsed_cache_end = _parse_iso_date(cache_date_end)
+        if parsed_cache_end is not None and parsed_cutoff is not None:
+            stale_source = parsed_cache_end < parsed_cutoff
 
     latest_known_date = (
         cache_date_end
@@ -573,6 +593,24 @@ def audit_ticker_for_launch(
 
     can_run_pipeline_now = (
         has_signal_engine_cache and has_stackbuilder_run
+    )
+
+    # Phase 6G-5: structural persist-skip lag predicate.
+    # See the RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
+    # docstring. The audit fires this branch when the source
+    # cache reaches current_as_of_date exactly (not beyond) and
+    # the full upstream chain is in place: a runner pass cannot
+    # advance Confluence to current_as_of_date because the
+    # persist trim guarantees Confluence.last_date ==
+    # cache.last_date - persist_skip_bars trading bars.
+    pipeline_output_lags_persist_skip = (
+        has_signal_engine_cache
+        and has_stackbuilder_run
+        and has_multitimeframe_libraries
+        and not stale_source
+        and parsed_cache_end is not None
+        and parsed_cutoff is not None
+        and parsed_cache_end.date() == parsed_cutoff.date()
     )
 
     runner_issue_codes: tuple[str, ...] = ()
@@ -628,6 +666,21 @@ def audit_ticker_for_launch(
         # No write would land; readiness would not change.
         likely_after = tuple(readiness.issue_codes)
 
+    # Phase 6G-5: the runner DOES clear missing_confluence on
+    # a successful write, but persist_skip_bars=1 then lands
+    # the new Confluence at cache.last_date - 1 trading bar,
+    # which is < current_as_of_date. The readiness layer
+    # re-emits stale_confluence_day_artifact on the very next
+    # boot. Surface that explicitly so the audit's post-run
+    # prediction stops lying about the lag.
+    if pipeline_output_lags_persist_skip:
+        post = [
+            c for c in likely_after
+            if c != _cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT
+        ]
+        post.append(_cpr.ISSUE_STALE_CONFLUENCE_DAY_ARTIFACT)
+        likely_after = tuple(post)
+
     recommended = _classify_recommended_action(
         leader_eligible=bool(readiness.leader_eligible),
         issue_codes=readiness_issues,
@@ -636,6 +689,17 @@ def audit_ticker_for_launch(
         has_multitimeframe_libraries=has_multitimeframe_libraries,
         stale_source=stale_source,
     )
+    # Phase 6G-5: override ready_for_pipeline_write when the
+    # persist-skip predicate applies. The pipeline can RUN but
+    # cannot make the ticker leader-eligible until the next
+    # trading-day rollover, so naming it "ready_for_pipeline_write"
+    # would mislead the operator into expecting a leader badge
+    # that won't appear.
+    if (
+        recommended == RECOMMENDED_READY_FOR_PIPELINE_WRITE
+        and pipeline_output_lags_persist_skip
+    ):
+        recommended = RECOMMENDED_PIPELINE_OUTPUT_LAGS_PERSIST_SKIP
 
     return TickerLaunchAuditEntry(
         ticker=ticker,
