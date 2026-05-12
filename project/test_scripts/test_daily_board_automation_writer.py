@@ -1181,6 +1181,576 @@ def test_execution_log_absent_when_no_path_provided(
 
 
 # ---------------------------------------------------------------------------
+# 7b. Phase 6H-6: status_dir plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_status_dir_is_forwarded_to_refresher(tmp_path: Path):
+    """Phase 6H-6: the authorized refresh path must forward
+    ``status_dir`` to the refresher so the per-ticker status
+    JSON output root is redirectable."""
+    dirs = _layout(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    refresher = _refresher_factory(
+        recorder,
+        _FakeRefreshResult(
+            refreshed=True,
+            old="2024-01-31",
+            new="2026-05-12",
+            issue_codes=(),
+        ),
+    )
+    watcher = _watcher_factory(
+        _CallRecorder(),
+        _FakeWatcherState(
+            action="ready_for_pipeline_write",
+            cache_date_range_end="2026-05-12",
+            current_as_of_date="2026-05-08",
+        ),
+    )
+    pipeline_runner = _pipeline_runner_factory(
+        _CallRecorder(),
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            issue_codes=(),
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-08",
+            ),
+        ),
+    )
+    dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        status_dir=status_dir,
+        refresher=refresher,
+        watcher=watcher,
+        pipeline_runner=pipeline_runner,
+        **dirs,
+    )
+    # The refresher fake recorded its call kwargs; the
+    # writer must have included ``status_dir`` (the explicit
+    # override) alongside the other plumbing.
+    assert len(recorder.calls) == 1
+    name, kwargs = recorder.calls[0]
+    assert name == "refresher"
+    assert kwargs.get("status_dir") == status_dir
+    assert kwargs.get("cache_dir") == dirs["cache_dir"]
+    assert kwargs.get("write") is True
+
+
+def test_status_dir_none_passes_none_to_refresher(tmp_path: Path):
+    """Phase 6H-6: when no override is supplied the writer
+    must pass ``status_dir=None`` so the refresher's
+    existing production default applies. Backward
+    compatibility."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    refresher = _refresher_factory(
+        recorder,
+        _FakeRefreshResult(
+            refreshed=True,
+            old="2024-01-31",
+            new="2026-05-12",
+            issue_codes=(),
+        ),
+    )
+    watcher = _watcher_factory(
+        _CallRecorder(),
+        _FakeWatcherState(
+            action="pipeline_output_lags_persist_skip",
+            cache_date_range_end="2026-05-12",
+            current_as_of_date="2026-05-12",
+        ),
+    )
+    dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        # status_dir intentionally omitted
+        refresher=refresher,
+        watcher=watcher,
+        pipeline_runner=lambda *a, **k: pytest.fail(
+            "pipeline must not run",
+        ),
+        **dirs,
+    )
+    assert len(recorder.calls) == 1
+    _, kwargs = recorder.calls[0]
+    # The plumbing forwards the absent-override case as None,
+    # which the refresher interprets as its production
+    # default (project/cache/status/).
+    assert kwargs.get("status_dir") is None
+
+
+def test_watcher_exception_amendment_still_holds_with_status_dir(
+    tmp_path: Path,
+):
+    """Phase 6H-5 amendment regression: when status_dir is
+    threaded AND the watcher raises post-refresh, the
+    structured-outcome contract must still hold (refresh
+    preserved, pipeline withheld, watcher_exception issue
+    code, execution log appended)."""
+    dirs = _layout(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "exec_log.jsonl"
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    refresher = _refresher_factory(
+        _CallRecorder(),
+        _FakeRefreshResult(
+            refreshed=True,
+            old="2024-01-31",
+            new="2026-05-12",
+            issue_codes=(),
+        ),
+    )
+
+    def raising_watcher(ticker, **kwargs):
+        raise RuntimeError("watcher failure (post-refresh)")
+
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        status_dir=status_dir,
+        refresher=refresher,
+        watcher=raising_watcher,
+        pipeline_runner=lambda *a, **k: pytest.fail(
+            "pipeline must NOT run",
+        ),
+        execution_log_path=log,
+        **dirs,
+    )
+    exec_state = report.executions[0]
+    assert exec_state.refresh_result is not None
+    assert "watcher_exception" in exec_state.issue_codes
+    assert exec_state.pipeline_result is None
+    assert exec_state.final_recommended_action == (
+        dbw.FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD
+    )
+    # Execution log still gets exactly one JSONL row.
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+
+
+def test_run_pipeline_only_path_unaffected_by_status_dir(
+    tmp_path: Path,
+):
+    """``run_pipeline_only`` plan verdicts must not see
+    ``status_dir`` -- it's a refresher-only knob. The
+    pipeline runner's call kwargs must remain unchanged from
+    the Phase 6H-5 contract."""
+    dirs = _layout(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    pipeline_runner = _pipeline_runner_factory(
+        recorder,
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            issue_codes=(),
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-07",
+            ),
+        ),
+    )
+    dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-07",
+        status_dir=status_dir,
+        refresher=lambda *a, **k: pytest.fail(
+            "refresher must not run for pipeline-only",
+        ),
+        pipeline_runner=pipeline_runner,
+        **dirs,
+    )
+    assert len(recorder.calls) == 1
+    _, kwargs = recorder.calls[0]
+    assert "status_dir" not in kwargs, (
+        "status_dir is a refresher-only knob; passing it to "
+        "the pipeline runner is a contract violation"
+    )
+
+
+def test_status_dir_does_not_leak_into_dry_run(tmp_path: Path):
+    """Even when status_dir is supplied, the dry-run path
+    must not call any writer. The status_dir plumbing only
+    activates on the authorized live path."""
+    dirs = _layout(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    def _no_refresher(*a, **k):
+        pytest.fail("refresher must not run on dry-run path")
+
+    def _no_pipeline(*a, **k):
+        pytest.fail("pipeline must not run on dry-run path")
+
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=False,
+        current_as_of_date="2026-05-08",
+        status_dir=status_dir,
+        refresher=_no_refresher,
+        pipeline_runner=_no_pipeline,
+        **dirs,
+    )
+    exec_state = report.executions[0]
+    assert exec_state.write_authorized is False
+    assert exec_state.refresh_result is None
+    # status_dir is empty (the writer never wrote to it).
+    assert list(status_dir.iterdir()) == []
+
+
+def test_cli_status_dir_flag_round_trips(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    """The CLI must accept ``--status-dir`` and the value
+    must reach the authorized refresher's call kwargs. We
+    inject a real env var, real planner / watcher, and a
+    recording fake refresher inside the writer's default
+    resolver via monkeypatch."""
+    dirs = _layout(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    fake_refresher = _refresher_factory(
+        recorder,
+        _FakeRefreshResult(
+            refreshed=True,
+            old="2024-01-31",
+            new="2026-05-08",
+            issue_codes=(),
+        ),
+    )
+
+    # Patch the lazy default to return our recording fake so
+    # CLI -> execute_daily_board_automation -> _execute_ticker
+    # -> refresher path is fully exercised.
+    monkeypatch.setattr(
+        dbw, "_default_refresher_callable",
+        lambda: fake_refresher,
+    )
+    monkeypatch.setenv(
+        dbw.ENV_VAR_NAME, dbw.ENV_VAR_REQUIRED_VALUE,
+    )
+    rc = dbw.main([
+        "--ticker", "SPY",
+        "--write",
+        "--cache-dir", str(dirs["cache_dir"]),
+        "--artifact-root", str(dirs["artifact_root"]),
+        "--stackbuilder-root", str(dirs["stackbuilder_root"]),
+        "--signal-library-dir", str(dirs["signal_library_dir"]),
+        "--status-dir", str(status_dir),
+        "--current-as-of-date", "2026-05-08",
+    ])
+    assert rc == 0
+    # The refresher fake was called; its kwargs include
+    # status_dir from --status-dir.
+    assert any(
+        Path(str(kw.get("status_dir"))) == status_dir
+        for name, kw in recorder.calls
+        if name == "refresher"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7c. Phase 6H-6: temp-dir authorized integration rehearsal
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_mtimes(root: Path) -> dict[str, float]:
+    """Return a {relpath: mtime} map for every file under
+    ``root``. Used to prove production paths were not touched
+    during the temp-dir authorized rehearsal."""
+    if not root.exists() or not root.is_dir():
+        return {}
+    out: dict[str, float] = {}
+    for p in root.rglob("*"):
+        if p.is_file():
+            try:
+                out[str(p.relative_to(root))] = p.stat().st_mtime
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+def test_authorized_integration_rehearsal_uses_temp_roots(
+    tmp_path: Path,
+):
+    """Phase 6H-6 integration rehearsal.
+
+    Exercises the REAL signal_engine_cache_refresher (with a
+    fake yfinance fetcher) plus the REAL cache_cutoff_watcher
+    plus a fake pipeline runner that writes a sentinel
+    artifact, all under write_authorized=True, against temp
+    roots only.
+
+    Proves:
+      - cache PKL lands in temp cache_dir
+      - manifest sidecar lands in temp cache_dir
+      - status JSON lands in temp status_dir
+      - pipeline artifact (sentinel) lands in temp
+        artifact_root
+      - execution log appends exactly one JSONL row
+      - no production cache/, output/, signal_library/, or
+        stackbuilder/ path is modified
+    """
+    import datetime as _dt
+    import numpy as np
+    import pandas as pd
+
+    # Snapshot production paths BEFORE the rehearsal so we
+    # can prove they were not touched.
+    project_dir = Path(dbw.__file__).resolve().parent
+    production_roots = {
+        "cache": project_dir / "cache" / "results",
+        "status": project_dir / "cache" / "status",
+        "artifacts": project_dir / "output" / "research_artifacts",
+        "signal_lib": project_dir / "signal_library" / "data" / "stable",
+        "stackbuilder": project_dir / "output" / "stackbuilder",
+    }
+    before = {
+        name: _snapshot_mtimes(root)
+        for name, root in production_roots.items()
+    }
+
+    # Temp roots.
+    dirs = _layout(tmp_path)
+    status_dir = tmp_path / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "exec_log.jsonl"
+
+    # Stale SPY cache in temp so the preflight emits
+    # refresh_source_cache_then_pipeline.
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    # Fake data fetcher: 200 business days ending 2026-05-12
+    # (strictly past current_as_of_date=2026-05-08).
+    fresh_dates = pd.bdate_range(
+        end=_dt.datetime(2026, 5, 12), periods=200,
+    )
+    closes = 100.0 + np.cumsum(
+        np.sin(np.arange(200) / 5.0) * 0.5,
+    )
+    fresh_df = pd.DataFrame(
+        {"Close": closes}, index=fresh_dates,
+    )
+
+    def fake_data_fetcher(ticker: str) -> pd.DataFrame:
+        return fresh_df.copy()
+
+    # Real refresher pre-bound with the fake fetcher.
+    from signal_engine_cache_refresher import (
+        refresh_signal_engine_cache as real_refresher,
+    )
+
+    def refresher_callable(ticker, **kwargs):
+        return real_refresher(
+            ticker, data_fetcher=fake_data_fetcher, **kwargs,
+        )
+
+    # Fake pipeline runner: writes a sentinel artifact to
+    # the temp artifact_root and returns a leader-eligible
+    # result.
+    pipeline_calls: list[dict] = []
+
+    def fake_pipeline(ticker: str, **kwargs):
+        pipeline_calls.append(kwargs)
+        ar = Path(kwargs["artifact_root"])
+        target_dir = ar / "confluence" / ticker.upper()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = (
+            target_dir
+            / f"{ticker.upper()}__MTF_CONSENSUS.research_day.json"
+        )
+        sentinel.write_text(json.dumps({
+            "engine": "confluence",
+            "_phase_6h6_rehearsal_sentinel": True,
+        }), encoding="utf-8")
+        return _FakePipelineRunResult(
+            leader_eligible=True,
+            ranking_blocked_reason="",
+            issue_codes=(),
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-08",
+            ),
+        )
+
+    # Run the authorized live path against temp roots.
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        status_dir=status_dir,
+        refresher=refresher_callable,
+        pipeline_runner=fake_pipeline,
+        execution_log_path=log,
+        **dirs,
+    )
+
+    exec_state = report.executions[0]
+
+    # Refresh ran via real refresher + advanced past cutoff.
+    assert exec_state.refresh_result is not None
+    assert exec_state.refresh_result.attempted is True
+    assert exec_state.refresh_result.succeeded is True
+    assert exec_state.refresh_result.new_cache_date_range_end == (
+        "2026-05-12"
+    )
+
+    # Real watcher returned ready (cache 2026-05-12 > cutoff
+    # 2026-05-08).
+    assert exec_state.post_refresh_watcher_action == (
+        "ready_for_pipeline_write"
+    )
+    assert exec_state.post_refresh_watcher_result is not None
+    assert (
+        exec_state.post_refresh_watcher_result
+        .ready_for_pipeline is True
+    )
+
+    # Pipeline runner fake was called and recorded the temp
+    # artifact_root.
+    assert len(pipeline_calls) == 1
+    pkw = pipeline_calls[0]
+    assert Path(pkw["artifact_root"]) == dirs["artifact_root"]
+    assert Path(pkw["cache_dir"]) == dirs["cache_dir"]
+    assert Path(pkw["stackbuilder_root"]) == dirs["stackbuilder_root"]
+    assert Path(pkw["signal_library_dir"]) == dirs["signal_library_dir"]
+    assert pkw["write"] is True
+
+    assert exec_state.pipeline_result is not None
+    assert exec_state.pipeline_result.attempted is True
+    assert exec_state.pipeline_result.leader_eligible is True
+    assert exec_state.final_recommended_action == (
+        dbw.FINAL_REFRESH_THEN_PIPELINE_EXECUTED
+    )
+
+    # Temp output files exist where they should.
+    cache_pkl = dirs["cache_dir"] / "SPY_precomputed_results.pkl"
+    assert cache_pkl.exists(), (
+        f"cache PKL did not land in temp cache_dir: {cache_pkl}"
+    )
+    manifest = (
+        dirs["cache_dir"]
+        / "SPY_precomputed_results.pkl.manifest.json"
+    )
+    assert manifest.exists(), (
+        f"manifest sidecar did not land in temp cache_dir: "
+        f"{manifest}"
+    )
+    status_json = status_dir / "SPY_status.json"
+    assert status_json.exists(), (
+        f"status JSON did not land in temp status_dir: "
+        f"{status_json} (would have leaked to production "
+        f"without Phase 6H-6 plumbing)"
+    )
+    sentinel_artifact = (
+        dirs["artifact_root"]
+        / "confluence" / "SPY"
+        / "SPY__MTF_CONSENSUS.research_day.json"
+    )
+    assert sentinel_artifact.exists(), (
+        f"pipeline sentinel did not land in temp artifact_root: "
+        f"{sentinel_artifact}"
+    )
+
+    # Execution log has exactly one JSONL row.
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["ticker"] == "SPY"
+    assert record["final_recommended_action"] == (
+        dbw.FINAL_REFRESH_THEN_PIPELINE_EXECUTED
+    )
+
+    # Aggregates.
+    assert report.refreshed_tickers == ("SPY",)
+    assert report.pipeline_ran_tickers == ("SPY",)
+    assert report.skipped_pipeline_after_refresh_tickers == ()
+
+    # Production roots were NOT touched.
+    after = {
+        name: _snapshot_mtimes(root)
+        for name, root in production_roots.items()
+    }
+    for name in production_roots:
+        delta_added = set(after[name]) - set(before[name])
+        delta_removed = set(before[name]) - set(after[name])
+        delta_changed = {
+            f for f in set(after[name]) & set(before[name])
+            if after[name][f] != before[name][f]
+        }
+        assert not delta_added, (
+            f"rehearsal added files under production {name}: "
+            f"{sorted(delta_added)}"
+        )
+        assert not delta_removed, (
+            f"rehearsal removed files under production {name}: "
+            f"{sorted(delta_removed)}"
+        )
+        assert not delta_changed, (
+            f"rehearsal modified files under production {name}: "
+            f"{sorted(delta_changed)}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 8. CLI
 # ---------------------------------------------------------------------------
 
