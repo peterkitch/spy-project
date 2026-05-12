@@ -47,10 +47,13 @@ runs subprocess, and never writes to any operator root.
     `TickerRankingContractValidation` and
     `RankingContractReport` dataclasses.
   - `project/test_scripts/test_confluence_ranking_contract_validator.py`
-    — 35 tests across 13 sections covering every
+    — 42 tests across 13 sections covering every
     per-contract failure mode plus aggregate report, CLI,
     no-writes, forbidden-imports static guard, and the
-    no-StackBuilder-age-window enforcement.
+    no-StackBuilder-age-window enforcement. (Originally
+    shipped at 35 tests; +7 added by the post-audit
+    amendment that closed the Confluence count-coherence
+    + board-row preview drift -- see § 4.5 and § 4.7.)
 
 **Explicit non-goals:**
 
@@ -166,6 +169,13 @@ Issue codes: `mtf_missing`, `mtf_incomplete_coverage`,
     `none_votes`, `missing_votes`, `K_values`,
     `timeframes`, `confluence_signal`, `signal`,
     `signal_value`, `source_trafficflow_mtf_run_ids`.
+  - **Signal vocabulary:** both `signal` and
+    `confluence_signal` MUST be one of
+    `{"Buy", "Short", "None"}`. Anything else flags
+    `confluence_invalid_signal_vocabulary`. The vocab
+    check fires first; if it triggers, the alias-mismatch
+    check is suppressed so the two issue codes do not
+    stack for the same root cause.
   - **Signal alias coherence:** `confluence_signal ==
     signal`; `signal_value` follows the canonical mapping
     `Buy=1 / Short=-1 / None=0`.
@@ -173,6 +183,28 @@ Issue codes: `mtf_missing`, `mtf_incomplete_coverage`,
     none_votes + missing_votes == len(K_values) *
     len(timeframes)`. `missing_votes` are per-CELL, NOT
     per-LABEL.
+  - **Full count coherence** (Phase 6I-1 amendment) -- the
+    Daily Signal Board renders its agreement display from
+    `active_count` / `available_count` (via
+    `daily_signal_board._confluence_active_total`), so
+    those fields and their siblings must agree exactly:
+      * `active_count == buy_votes + short_votes`
+      * `available_count == active_count + none_votes`
+      * `agreement_total == available_count`
+      * `available_count + missing_votes == expected_cells`
+    Any drift among these flags
+    `confluence_count_incoherent`.
+  - **Strict-unanimity rule for `agreement_active`**
+    (Phase 6I-1 amendment) -- the Phase 6D-3 builder's
+    rule for the final-signal count must hold:
+      * `buy=0, short=0`         -> `agreement_active == 0`
+      * `buy>0, short=0`         -> `agreement_active == buy_votes`
+      * `buy=0, short>0`         -> `agreement_active == short_votes`
+      * `buy>0, short>0` (mixed) -> `agreement_active == 0`
+    The rule is checked independently of `expected_cells`
+    so it pins even when `K_values` / `timeframes` are
+    unavailable. Drift flags
+    `confluence_agreement_active_inconsistent`.
   - **No cross-seed K mixing:** every
     `source_trafficflow_mtf_run_ids` entry must share the
     same seed prefix (i.e. the same StackBuilder variant
@@ -180,8 +212,11 @@ Issue codes: `mtf_missing`, `mtf_incomplete_coverage`,
 
 Issue codes: `confluence_missing`,
 `confluence_last_row_incomplete`,
+`confluence_invalid_signal_vocabulary`,
 `confluence_signal_alias_mismatch`,
 `confluence_vote_total_mismatch`,
+`confluence_count_incoherent`,
+`confluence_agreement_active_inconsistent`,
 `confluence_cross_seed_k_mixing`.
 
 ### 4.6 Readiness contract
@@ -204,9 +239,9 @@ preview the public board would render:
   "ticker": "SPY",
   "consensus_signal": "None",
   "consensus_signal_value": 0,
-  "agreement_active": 0,
+  "agreement_active": 7,
   "agreement_total": 60,
-  "agreement_ratio": 0.0,
+  "agreement_ratio": 0.11666666666666667,
   "coverage": "Full",
   "as_of_date": "2026-05-08",
   "rank_eligible": false,
@@ -214,11 +249,33 @@ preview the public board would render:
 }
 ```
 
+**Preview `agreement_active` / `agreement_total` are
+sourced from the artifact's `active_count` /
+`available_count`** (Phase 6I-1 amendment) -- exactly
+what `daily_signal_board._confluence_active_total`
+reads -- so the preview's "X of Y" matches the board's
+displayed agreement ratio. The artifact's separate
+`agreement_active` / `agreement_total` fields are
+validated by § 4.5 but are NOT the preview's display
+source; using them would have allowed a malformed
+artifact to pass while the board rendered a different
+number. The preview also honors the same fallback chain
+the board uses: `available_count → total_count →
+len(timeframes)`.
+
+`agreement_ratio` = `active_count / available_count`,
+so the SPY example above (7 active checks out of 60
+K×timeframe cells = 0.1167 ≈ "7 of 60 alignment checks
+active") matches the Daily Signal Board's Featured-card
+text exactly.
+
 `coverage` is `Full` when every upstream contract passes;
 `Partial` otherwise. `rank_eligible` mirrors
 `readiness.leader_eligible`. The preview is deterministic
 across runs against the same fixture (pinned by
-`test_board_row_preview_is_deterministic_across_runs`).
+`test_board_row_preview_is_deterministic_across_runs`)
+and the per-key sourcing is pinned by
+`test_board_row_preview_uses_active_count_not_alias_fields`.
 
 Issue codes: `board_row_incomputable`.
 
@@ -305,9 +362,9 @@ recommended_next_operator_action      "contract_valid_but_not_leader_eligible"
 board_row_preview.ticker              "SPY"
 board_row_preview.consensus_signal    "None"
 board_row_preview.consensus_signal_value  0
-board_row_preview.agreement_active    0
+board_row_preview.agreement_active    7
 board_row_preview.agreement_total     60
-board_row_preview.agreement_ratio     0.0
+board_row_preview.agreement_ratio     0.11666666666666667
 board_row_preview.coverage            "Full"
 board_row_preview.as_of_date          "2026-05-08"
 board_row_preview.rank_eligible       false
@@ -320,15 +377,29 @@ unpinned cutoff 2026-05-11). The contract data is
 correctly shaped; the leader gate is held open by the
 Phase 6D-1 persist trim, not by any contract regression.
 
+Visible meaning: **7 of 60 alignment checks active**. The
+preview's `agreement_active=7` matches what the Daily
+Signal Board's Featured-card renders ("7 of 60 alignment
+checks active") because the preview now reads from
+`active_count` / `available_count` per § 4.7. Under the
+pre-amendment Phase 6I-1 the preview's
+`agreement_active` was `0` (sourced from the artifact's
+separate `agreement_active` field) -- a different number
+from what the board displays. The amendment closes that
+drift.
+
 ## 8. Validation in this PR (no production writes)
 
   - py_compile clean on the new module + tests.
   - `test_confluence_ranking_contract_validator.py`:
-    35 passed in 3.19 s.
+    **42 passed in 3.41 s** (35 originally + 7 added by the
+    post-audit amendment that closed the Confluence
+    count-coherence + board-row preview drift).
   - Focused 9-way (validator + preflight + writer +
     pipeline runner + readiness + board + trafficflow
-    daily K + MTF bridge + MTF builder): 259 passed in
-    38.35 s.
+    daily K + MTF bridge + MTF builder):
+    **266 passed in 35.94 s** (259 originally + 7 new
+    amendment-driven tests; no upstream regression).
   - The real-cache SPY validator smoke (§ 7) is
     strictly read-only; no production path was modified.
 
