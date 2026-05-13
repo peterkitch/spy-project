@@ -209,7 +209,7 @@ accept both names:
 | `attempted_cell_count` | `len(K_values) * len(windows)`. |
 | `prepared_cell_count` | Cells in `per_cell_inputs`. |
 | `missing_cell_count` | `attempted - prepared`. |
-| `can_evaluate_full_60_cell_grid` | True iff every canonical `(K, window)` pair is prepared. |
+| `can_evaluate_full_60_cell_grid` | True **only when** every canonical `(K, window)` pair is prepared **AND** each prepared canonical cell has full member coverage (`len(members_prepared) == len(members_attempted)`). Partial-member diagnostic cells (only possible under `allow_partial_members=True`) never qualify — see §1.1. |
 | `per_cell_inputs` | The load-bearing output: feed directly into `evaluate_k_window_grid`. |
 | `per_cell_states` | Per-cell diagnostic tuples. |
 | `missing_libraries_by_ticker_window` | `{TICKER: [missing windows]}` for every absent library encountered. |
