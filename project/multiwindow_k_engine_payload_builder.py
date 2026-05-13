@@ -172,16 +172,37 @@ import multiwindow_k_input_adapter as _mw_adapter
 CANONICAL_WINDOWS: tuple[str, ...] = _mw_core.CANONICAL_WINDOWS
 CANONICAL_K_VALUES: tuple[int, ...] = _mw_core.CANONICAL_K_VALUES
 
+# Derived sets for the core-grid completeness check
+# (Phase 6I-23 Codex amendment).
+_CANONICAL_K_VALUES_SET: frozenset[int] = frozenset(
+    CANONICAL_K_VALUES,
+)
+_CANONICAL_WINDOWS_SET: frozenset[str] = frozenset(
+    CANONICAL_WINDOWS,
+)
+_CANONICAL_CELLS: frozenset[tuple[int, str]] = frozenset(
+    (k, w)
+    for k in CANONICAL_K_VALUES
+    for w in CANONICAL_WINDOWS
+)
+
 
 # Aggregate-report issue codes.
 ISSUE_ADAPTER_NOT_READY = "adapter_not_ready"
 ISSUE_CORE_GRID_FAILED = "core_grid_failed"
 ISSUE_NO_CELLS_EVALUATED = "no_cells_evaluated"
+# Phase 6I-23 Codex amendment: payload_ready=True must
+# mean the payload itself satisfies the full canonical
+# future-artifact contract (60 canonical cells, no
+# duplicates, no missing canonical pairs). A non-empty
+# but incomplete core result surfaces this code.
+ISSUE_CORE_GRID_INCOMPLETE = "core_grid_incomplete"
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_ADAPTER_NOT_READY,
     ISSUE_CORE_GRID_FAILED,
     ISSUE_NO_CELLS_EVALUATED,
+    ISSUE_CORE_GRID_INCOMPLETE,
 )
 
 
@@ -414,21 +435,83 @@ def _summarize_adapter(
     )
 
 
+def _core_cells_cover_full_canonical_60(
+    cells: Sequence[Any],
+) -> bool:
+    """Phase 6I-23 Codex amendment: validate that the core
+    grid result is structurally complete enough to count
+    as the Phase 6I-20 future-artifact contract.
+
+    Requirements:
+
+      - No duplicate ``(K, window)`` pair appears in the
+        cells list (a real engine emits one cell per
+        pair; duplicates indicate a stub / bug and must
+        NOT pass through as ``payload_ready=True``).
+      - The intersection of the cells' observed
+        ``(K, window)`` pairs with the canonical
+        ``(K=1..12, window in {1d, 1wk, 1mo, 3mo, 1y})``
+        set equals the canonical 60-pair set exactly.
+      - Noncanonical extras (e.g. ``(K=13, window="2d")``)
+        are tolerated but do NOT substitute for any
+        missing canonical cell.
+
+    Returns ``True`` iff all of the above hold.
+    """
+    seen: set[tuple[int, str]] = set()
+    canonical_observed: set[tuple[int, str]] = set()
+    for c in cells:
+        try:
+            key = (int(c.K), str(c.window))
+        except Exception:
+            # Non-coercible K -> reject (a real cell
+            # always has int K).
+            return False
+        if key in seen:
+            # Duplicate (K, window) cell.
+            return False
+        seen.add(key)
+        if (
+            key[0] in _CANONICAL_K_VALUES_SET
+            and key[1] in _CANONICAL_WINDOWS_SET
+        ):
+            canonical_observed.add(key)
+    return canonical_observed == _CANONICAL_CELLS
+
+
 def _build_window_alignment(
     cells: Sequence[Any],
     K_list: Iterable[int],
 ) -> dict[str, dict[str, Any]]:
-    """For each canonical window, count how many canonical
-    K rows have a firing combined signal at the latest
-    bar. ``firing`` = ``latest_combined_signal`` in
-    ``{"Buy", "Short"}`` (case-insensitive).
+    """Phase 6I-23 Codex amendment: member-slot semantics.
+
+    For each canonical window the entry reports the
+    **member-slot** counts aggregated across the build's
+    canonical K rows -- the field names
+    (``firing_member_count`` / ``total_member_count``)
+    match what they count.
+
+      - ``total_member_count`` = ``sum(cell.member_count for
+        canonical K cells in this window)``.
+      - ``firing_member_count`` = sum of members firing in
+        the cell's aligned direction. For a cell with
+        ``latest_combined_signal == "Buy"``, the aligned
+        contribution is ``cell.latest_buy_count``; for
+        ``"Short"`` it is ``cell.latest_short_count``;
+        ``"None"`` (or any other / empty signal) contributes
+        ``0``.
+      - ``all_members_firing`` = ``True`` only when every
+        canonical K cell in this window exists AND has
+        ``aligned == cell.member_count`` (i.e. every member
+        of that K row is firing in the aligned direction at
+        the latest bar) AND ``total_member_count > 0``.
 
     Every canonical window gets an entry -- the Phase 6I-20
     audit's ``_build_wide_alignment_is_valid`` rejects
     mappings missing any canonical window. Entries carry
-    ``all_members_firing`` (bool), ``firing_member_count``
-    (int), ``total_member_count`` (int) -- the three field
-    names + types the Phase 6I-20 validator requires.
+    the three field names + types the validator requires:
+    ``all_members_firing`` (bool) / ``firing_member_count``
+    (int) / ``total_member_count`` (int).
     """
     cells_by_cell: dict[tuple[int, str], Any] = {
         (int(c.K), str(c.window)): c for c in cells
@@ -441,20 +524,40 @@ def _build_window_alignment(
     for window in _mw_core.CANONICAL_WINDOWS:
         firing = 0
         total = 0
+        all_cells_full_firing = True
         for k in relevant_k:
             cell = cells_by_cell.get((k, window))
             if cell is None:
+                all_cells_full_firing = False
                 continue
-            total += 1
+            mc = int(
+                getattr(cell, "member_count", 0) or 0,
+            )
+            total += mc
             sig = str(
                 getattr(cell, "latest_combined_signal", "")
                 or "",
             ).strip().lower()
-            if sig in ("buy", "short"):
-                firing += 1
+            if sig == "buy":
+                aligned = int(
+                    getattr(
+                        cell, "latest_buy_count", 0,
+                    ) or 0,
+                )
+            elif sig == "short":
+                aligned = int(
+                    getattr(
+                        cell, "latest_short_count", 0,
+                    ) or 0,
+                )
+            else:
+                aligned = 0
+            firing += aligned
+            if aligned != mc or mc == 0:
+                all_cells_full_firing = False
         out[window] = {
             "all_members_firing": bool(
-                total > 0 and firing == total,
+                all_cells_full_firing and total > 0,
             ),
             "firing_member_count": int(firing),
             "total_member_count": int(total),
@@ -583,11 +686,45 @@ def build_multiwindow_k_engine_payload(
             ),
         )
 
+    # Phase 6I-23 Codex amendment: a non-empty but
+    # incomplete core result must NOT pass through as
+    # payload_ready=True. The Phase 6I-20 future-artifact
+    # contract requires the full canonical 60-cell grid
+    # (every (K, window) pair where K in 1..12 AND window
+    # in 1d/1wk/1mo/3mo/1y). Validate at the cell level:
+    # no duplicate (K, window); every canonical pair
+    # present; noncanonical extras tolerated but cannot
+    # substitute for any missing canonical cell.
+    if not _core_cells_cover_full_canonical_60(cells_tuple):
+        _append_unique(issues, ISSUE_CORE_GRID_INCOMPLETE)
+        return MultiWindowKEnginePayloadReport(
+            generated_at=_iso_now(),
+            target_ticker=target_clean,
+            payload_ready=False,
+            K_values=tuple(K_list),
+            windows=tuple(W_list),
+            cell_count=0,
+            per_window_k_metrics=[],
+            build_wide_window_alignment={},
+            adapter_summary=adapter_summary,
+            issue_codes=tuple(issues),
+            remaining_limitations=(
+                _DEFAULT_REMAINING_LIMITATIONS
+            ),
+        )
+
     per_window_k_metrics = (
         _mw_core.cells_to_per_window_k_metrics_payload(
             cells_tuple,
         )
     )
+    # Note: per_window_k_metrics length equals len(cells)
+    # (one dict per cell, including any noncanonical
+    # extras tolerated above the canonical 60). The
+    # Phase 6I-20 ``_per_window_k_metrics_are_valid``
+    # validator accepts extras on top of the canonical
+    # 60; the canonical-coverage check above is the real
+    # gate.
     build_wide_alignment = _build_window_alignment(
         cells_tuple, K_list,
     )

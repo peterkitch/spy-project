@@ -192,27 +192,40 @@ else:
 | `issue_codes` | Stable tuple of `ISSUE_*` strings raised by this builder. |
 | `remaining_limitations` | Operational-state caveats (Phase 6I-23 doc-shape). |
 
-### 4.1 Build-wide window alignment semantics
+### 4.1 Build-wide window alignment semantics (Phase 6I-23 Codex amendment)
 
-For each canonical window:
+For each canonical window the alignment entry reports
+**member-slot** counts aggregated across the build's
+canonical K rows — the field names match what they count
+(no K-row aliasing).
 
-- `total_member_count` = number of canonical K rows
-  (`1..12 ∩ K_values`) for which the core returned a cell
-  in this window. Typically 12 when
-  `K_values=CANONICAL_K_VALUES` and the adapter is ready.
-- `firing_member_count` = the subset whose
-  `latest_combined_signal` (case-insensitive) is `Buy` or
-  `Short`.
-- `all_members_firing` = `(firing_member_count ==
-  total_member_count) AND total_member_count > 0`.
+- `total_member_count` = `sum(cell.member_count for
+  canonical K cells in this window)`. With
+  `K_values=CANONICAL_K_VALUES` and each cell carrying
+  its own K-sized member set, this sums to
+  `1 + 2 + ... + 12 = 78` per window.
+- `firing_member_count` = sum of members firing in the
+  cell's aligned direction. For a cell with
+  `latest_combined_signal == "Buy"`, the aligned
+  contribution is `cell.latest_buy_count`; for `"Short"`
+  it is `cell.latest_short_count`; `"None"` (or any
+  other / empty signal) contributes `0`.
+- `all_members_firing` = `True` only when every canonical
+  K cell in this window exists AND has
+  `aligned == cell.member_count` (i.e. every member of
+  that K row is firing in the aligned direction at the
+  latest bar) AND `total_member_count > 0`.
 
 This matches the operator-facing question
-"is every K row in the build firing in this window?"
-The Phase 6I-21 core's per-cell K-thresholded
-strict-unanimity combine rule already enforces "every
-member of the K row is contributing"; the
-`build_wide_window_alignment` aggregates that across the
-build's K rows.
+"is every ticker in the build firing across every
+available window?" — the Phase 6I-21 core's per-cell
+K-thresholded combine rule allows a Buy combined signal
+even when some active members are None (e.g.
+`[Buy, Buy, None]` at K=1 fires Buy with `latest_buy_count=2`
+and `member_count=3`). The Phase 6I-23 builder's
+`all_members_firing` correctly flips to `False` for that
+window because not every member of that K row is firing
+in the aligned direction.
 
 ### 4.2 Stable issue codes
 
@@ -225,6 +238,37 @@ build's K rows.
 - `no_cells_evaluated` — adapter said ready and the core
   returned but produced zero cells (logically impossible
   on real data; defended against synthetic fakes).
+- `core_grid_incomplete` **(Phase 6I-23 Codex amendment)**
+  — adapter said ready and the core returned cells, but
+  the cells do NOT cover the canonical 60-cell grid
+  exactly (missing canonical pair, duplicate
+  `(K, window)`, or noncanonical-only substitute for a
+  missing canonical cell). `payload_ready=False`,
+  `per_window_k_metrics=[]`, `build_wide_window_alignment={}`.
+  The contract validator
+  `_core_cells_cover_full_canonical_60` runs after the
+  empty-result check.
+
+### 4.3 Core-grid completeness validation (Phase 6I-23 Codex amendment)
+
+Before `payload_ready=True`, the builder validates that
+the core grid result:
+
+- contains no duplicate `(K, window)` pair (a real engine
+  emits one cell per pair; duplicates indicate a stub /
+  bug);
+- covers the full canonical 60-cell grid (every pair
+  where `K ∈ {1..12}` AND `window ∈ {1d, 1wk, 1mo, 3mo, 1y}`);
+- noncanonical extras (e.g. `(K=13, "2d")`) are tolerated
+  but never substitute for any missing canonical cell.
+
+If validation fails, `payload_ready=False` and the new
+`core_grid_incomplete` issue code fires. This guarantees
+that `payload_ready=True` always means the payload itself
+satisfies the Phase 6I-20 future-artifact contract — a
+contract bug Codex caught: previously the builder
+rejected only the empty-result case, so a non-empty but
+incomplete core result could pass through as `payload_ready=True`.
 
 ---
 
@@ -276,7 +320,7 @@ guards (forbidden-imports + B12 raw-pickle ban).
 
 ---
 
-## 7. Tests (23 pinned contracts)
+## 7. Tests (29 pinned contracts)
 
 `project/test_scripts/test_multiwindow_k_engine_payload_builder.py`:
 
@@ -314,27 +358,60 @@ guards (forbidden-imports + B12 raw-pickle ban).
    `gap_audit._build_wide_alignment_is_valid(report.build_wide_window_alignment)` returns True.
 10. Per-entry field types: `all_members_firing` is `bool`;
     `firing_member_count` / `total_member_count` are `int`.
-11. **All-firing fixture pins counts**: in the canonical
-    all-Buy fixture every window reports
-    `total_member_count == firing_member_count == 12`
+11. **(Phase 6I-23 Codex amendment, member-slot
+    semantics)** All-firing fixture pins counts: in the
+    canonical all-Buy fixture every window reports
+    `total_member_count == firing_member_count == 78`
+    (= `1 + 2 + ... + 12`, sum of K-sized member sets)
     and `all_members_firing=True`.
-12. **None-signal cell pins counts**: a spy core returning
-    one cell with `latest_combined_signal="None"` reports
-    `firing_member_count=0`, `total_member_count=1`,
-    `all_members_firing=False`.
-13. **Core-grid exception** → `payload_ready=False` +
+12. **(Phase 6I-23 Codex amendment, member-slot
+    semantics)** None-signal cell pins counts: replacing
+    the `(K=12, window="1d")` cell with a None cell
+    (member_count=12) inside a full-canonical 60-cell
+    spy-core result reports `total_member_count=78` /
+    `firing_member_count=66` (= `78 - 12`) /
+    `all_members_firing=False` for `1d`; every other
+    window remains fully firing (78/78/True).
+13. **(Phase 6I-23 Codex amendment, member-slot
+    semantics)** Buy combined signal with partial member
+    firing: a K=3 cell with `member_count=3` but
+    `latest_buy_count=2` contributes `aligned=2` to
+    `firing_member_count` and prevents
+    `all_members_firing` for that window (the K-threshold
+    combine rule allows Buy when `buy_n >= K` even with
+    some None members; the builder correctly reports the
+    cell as not fully aligned).
+14. **(Phase 6I-23 Codex amendment, completeness
+    validation)** Core returns 1 cell → `payload_ready=False`
+    + `ISSUE_CORE_GRID_INCOMPLETE`.
+15. **(Phase 6I-23 Codex amendment)** Core returns 59
+    canonical cells → `payload_ready=False` +
+    `ISSUE_CORE_GRID_INCOMPLETE`.
+16. **(Phase 6I-23 Codex amendment)** Core returns
+    duplicate `(K, window)` cell → `payload_ready=False`
+    + `ISSUE_CORE_GRID_INCOMPLETE`.
+17. **(Phase 6I-23 Codex amendment)** Core returns 59
+    canonical + 1 noncanonical (e.g. `(K=13, "2d")`)
+    → `payload_ready=False` + `ISSUE_CORE_GRID_INCOMPLETE`
+    (noncanonical extras must not substitute for missing
+    canonical cells).
+18. **(Phase 6I-23 Codex amendment)** Core returns 60
+    canonical + 1 noncanonical extra → `payload_ready=True`
+    (extras tolerated on top of a complete canonical
+    set).
+19. **Core-grid exception** → `payload_ready=False` +
     `ISSUE_CORE_GRID_FAILED`.
-14. **Empty core result** → `payload_ready=False` +
+20. **Empty core result** → `payload_ready=False` +
     `ISSUE_NO_CELLS_EVALUATED`.
-15. **Builder NEVER forwards `allow_partial_members`** to
+21. **Builder NEVER forwards `allow_partial_members`** to
     the adapter. Pinned by an assertion inside the fake
     adapter wrapper that fires if the kwarg ever appears
     in the adapter call's kwargs.
-16-17. JSON round-trip on both happy and not-ready paths.
-18-22. CLI: `rc=0` (happy); `rc=2` (missing ticker);
+22-23. JSON round-trip on both happy and not-ready paths.
+24-28. CLI: `rc=0` (happy); `rc=2` (missing ticker);
     `rc=2` (unknown flag); `rc=2` (no `SystemExit` leak
     on argparse error); `rc=3` (unhandled exception).
-23. Constants re-exported from the core; every
+29. Constants re-exported from the core; every
     `ALL_ISSUE_CODES` entry is exposed as a module
     attribute.
 
@@ -351,12 +428,12 @@ py_compile: clean on multiwindow_k_engine_payload_builder.py +
             test_multiwindow_k_engine_payload_builder.py.
 
 pytest test_scripts/test_multiwindow_k_engine_payload_builder.py -q:
-  23 passed in 0.93 s
+  29 passed in 0.93 s
 
 Focused 4-way (builder + Phase 6I-22 adapter + Phase 6I-21 core +
               Phase 6I-20 gap audit):
-  107 passed in 1.17 s
-  ├── multiwindow_k_engine_payload_builder  23 passed
+  113 passed in 1.17 s
+  ├── multiwindow_k_engine_payload_builder  29 passed
   ├── multiwindow_k_input_adapter           23 passed
   ├── multiwindow_k_engine_core             38 passed
   └── multiwindow_k_engine_gap_audit        23 passed

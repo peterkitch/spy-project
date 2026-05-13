@@ -389,11 +389,15 @@ def test_build_wide_alignment_has_exactly_one_entry_per_canonical_window():
 
 
 def test_build_wide_alignment_all_members_firing_reflects_signal_counts():
-    """In the full-canonical happy-path fixture every K row
-    is all-Buy with K=1 threshold, so the latest combined
-    signal at every (K, window) cell is "Buy" -- every
-    window must report all_members_firing=True and
-    firing_member_count == total_member_count == 12."""
+    """Phase 6I-23 Codex amendment (member-slot semantics):
+    in the full-canonical happy-path fixture each canonical
+    K row has K members all firing Buy at the latest bar,
+    so every window's ``total_member_count`` =
+    ``sum(K for K in 1..12)`` = 78 and
+    ``firing_member_count`` = 78 (every member is firing
+    in the aligned Buy direction). ``all_members_firing``
+    is True for every window because every canonical K
+    cell has ``aligned == member_count``."""
     ready = _FakeAdapterReport(
         per_cell_inputs=_full_canonical_per_cell_inputs(),
     )
@@ -401,59 +405,328 @@ def test_build_wide_alignment_all_members_firing_reflects_signal_counts():
         "SPY",
         adapter_callable=_fake_adapter_returning(ready),
     )
+    expected_total = sum(core.CANONICAL_K_VALUES)  # 78
     for window in core.CANONICAL_WINDOWS:
         entry = report.build_wide_window_alignment[window]
-        assert entry["total_member_count"] == 12
-        assert entry["firing_member_count"] == 12
+        assert (
+            entry["total_member_count"] == expected_total
+        )
+        assert (
+            entry["firing_member_count"] == expected_total
+        )
         assert entry["all_members_firing"] is True
 
 
+def _make_buy_cell(
+    K: int,
+    window: str,
+    *,
+    buy_count: Optional[int] = None,
+    member_count: Optional[int] = None,
+) -> Any:
+    """Build a PerWindowKCell with latest_combined_signal=
+    "Buy". Defaults: member_count=K, buy_count=K (fully
+    firing).  Override buy_count + member_count to model
+    a partial-firing Buy cell."""
+    mc = K if member_count is None else int(member_count)
+    bc = mc if buy_count is None else int(buy_count)
+    return core.PerWindowKCell(
+        K=K, window=window,
+        total_capture_pct=0.0,
+        avg_daily_capture_pct=0.0,
+        sharpe_ratio=0.0,
+        trigger_days=0,
+        wins=0, losses=0,
+        latest_combined_signal="Buy",
+        latest_buy_count=bc,
+        latest_short_count=0,
+        latest_none_count=mc - bc,
+        latest_missing_count=0,
+        member_count=mc,
+    )
+
+
+def _make_none_cell(K: int, window: str) -> Any:
+    return core.PerWindowKCell(
+        K=K, window=window,
+        total_capture_pct=0.0,
+        avg_daily_capture_pct=0.0,
+        sharpe_ratio=0.0,
+        trigger_days=0,
+        wins=0, losses=0,
+        latest_combined_signal="None",
+        latest_buy_count=0,
+        latest_short_count=0,
+        latest_none_count=K,
+        latest_missing_count=0,
+        member_count=K,
+    )
+
+
+def _make_full_canonical_60_buy_cells(
+    *,
+    overrides: Optional[dict[tuple[int, str], Any]] = None,
+) -> tuple[Any, ...]:
+    """Build a tuple of 60 fully-firing Buy PerWindowKCells
+    (one per canonical (K, window)). ``overrides`` lets a
+    test swap in a specific cell at a chosen key."""
+    overrides = overrides or {}
+    out: list[Any] = []
+    for window in core.CANONICAL_WINDOWS:
+        for K in core.CANONICAL_K_VALUES:
+            key = (K, window)
+            if key in overrides:
+                out.append(overrides[key])
+            else:
+                out.append(_make_buy_cell(K, window))
+    return tuple(out)
+
+
 def test_build_wide_alignment_records_none_signals_correctly():
-    """A K row whose combined signal is None at the latest
-    bar must NOT count toward firing_member_count. Built
-    via a spy core callable that emits per-cell signals
-    of our choosing."""
+    """Phase 6I-23 Codex amendment (member-slot semantics):
+    a single canonical K cell whose latest_combined_signal
+    is None must NOT contribute to firing_member_count for
+    its window, and that window's all_members_firing must
+    flip to False (the None cell prevents full alignment
+    even when all other canonical K cells in that window
+    are fully firing)."""
     ready = _FakeAdapterReport(
-        per_cell_inputs={
-            (1, "1d"): {
-                "dates": ["d0", "d1"],
-                "target_close": [100.0, 101.0],
-                "member_signal_columns": {"A": ["None", "None"]},
-            },
-        },
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+    # Replace the (K=12, window="1d") cell with a None
+    # cell of K=12, member_count=12 -- the rest of the
+    # canonical 60 are fully-firing Buy cells.
+    overrides = {
+        (12, "1d"): _make_none_cell(12, "1d"),
+    }
+    cells = _make_full_canonical_60_buy_cells(
+        overrides=overrides,
     )
 
     def spy_core(*, target_ticker, per_cell_inputs):
-        # Return a single PerWindowKCell whose latest
-        # combined signal is None.
-        return (
-            core.PerWindowKCell(
-                K=1, window="1d",
-                total_capture_pct=0.0,
-                avg_daily_capture_pct=0.0,
-                sharpe_ratio=0.0,
-                trigger_days=0,
-                wins=0, losses=0,
-                latest_combined_signal="None",
-                latest_buy_count=0,
-                latest_short_count=0,
-                latest_none_count=1,
-                latest_missing_count=0,
-                member_count=1,
-            ),
-        )
+        return cells
 
     report = builder.build_multiwindow_k_engine_payload(
         "SPY",
-        K_values=(1,),
-        windows=("1d",),
         adapter_callable=_fake_adapter_returning(ready),
         core_grid_callable=spy_core,
     )
+    assert report.payload_ready is True
     entry_1d = report.build_wide_window_alignment["1d"]
-    assert entry_1d["total_member_count"] == 1
-    assert entry_1d["firing_member_count"] == 0
+    # Total members across canonical K=1..12 with each K's
+    # member_count = K -> 1+2+...+12 = 78.
+    assert entry_1d["total_member_count"] == 78
+    # The K=12/1d None cell contributes 0 firing; the
+    # other K=1..11 cells contribute their full K firing.
+    # firing = 1+2+...+11 = 66.
+    assert entry_1d["firing_member_count"] == 66
+    # The K=12 None cell prevents full alignment for 1d.
     assert entry_1d["all_members_firing"] is False
+    # Every other canonical window is unaffected and
+    # remains fully firing.
+    for window in core.CANONICAL_WINDOWS:
+        if window == "1d":
+            continue
+        entry = report.build_wide_window_alignment[window]
+        assert entry["total_member_count"] == 78
+        assert entry["firing_member_count"] == 78
+        assert entry["all_members_firing"] is True
+
+
+def test_build_wide_alignment_buy_with_partial_member_firing():
+    """Phase 6I-23 Codex amendment (member-slot semantics):
+    the K-threshold combine rule allows a Buy combined
+    signal even when some active members are None (e.g.
+    K=1 with three members [Buy, Buy, None] -> buy_n=2,
+    short_n=0, threshold=1 -> Buy). In that case the
+    cell's latest_buy_count=2 but member_count=3; the
+    cell must contribute aligned=2 to firing_member_count
+    AND must NOT count as fully aligned (so the window's
+    all_members_firing flips to False)."""
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+    # Build a partial-firing Buy cell for (K=3, window="1d"):
+    # member_count=3 but only 2 firing in aligned Buy.
+    partial_buy = _make_buy_cell(
+        K=3, window="1d",
+        member_count=3,
+        buy_count=2,
+    )
+    overrides = {(3, "1d"): partial_buy}
+    cells = _make_full_canonical_60_buy_cells(
+        overrides=overrides,
+    )
+
+    def spy_core(*, target_ticker, per_cell_inputs):
+        return cells
+
+    report = builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=_fake_adapter_returning(ready),
+        core_grid_callable=spy_core,
+    )
+    assert report.payload_ready is True
+    entry_1d = report.build_wide_window_alignment["1d"]
+    # total_member_count = 78 (every canonical K row's
+    # member_count = K).
+    assert entry_1d["total_member_count"] == 78
+    # K=3 / 1d contributes only 2 of its 3 members; the
+    # other K=1..12 cells contribute their full K. So
+    # firing = (1+2+...+12) - 3 + 2 = 78 - 1 = 77.
+    assert entry_1d["firing_member_count"] == 77
+    # The partial-firing K=3 cell prevents full alignment.
+    assert entry_1d["all_members_firing"] is False
+
+
+# ---------------------------------------------------------------------------
+# 4b. Core-grid completeness validation (Phase 6I-23 Codex amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_core_returns_one_cell_yields_payload_not_ready():
+    """Codex amendment: a non-empty but incomplete core
+    result (one (K, window) cell out of 60) must NOT
+    pass through as payload_ready=True. Issue code
+    ISSUE_CORE_GRID_INCOMPLETE fires; payload fields stay
+    empty."""
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+
+    def spy_core(*, target_ticker, per_cell_inputs):
+        return (_make_buy_cell(K=1, window="1d"),)
+
+    report = builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=_fake_adapter_returning(ready),
+        core_grid_callable=spy_core,
+    )
+    assert report.payload_ready is False
+    assert (
+        builder.ISSUE_CORE_GRID_INCOMPLETE
+        in report.issue_codes
+    )
+    assert report.per_window_k_metrics == []
+    assert report.build_wide_window_alignment == {}
+
+
+def test_core_returns_59_cells_yields_payload_not_ready():
+    """Codex amendment: 59 of 60 canonical cells -> not
+    ready. The single missing canonical cell prevents
+    payload_ready=True."""
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+    cells_60 = _make_full_canonical_60_buy_cells()
+    cells_59 = cells_60[:-1]  # drop the last cell
+
+    def spy_core(*, target_ticker, per_cell_inputs):
+        return cells_59
+
+    report = builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=_fake_adapter_returning(ready),
+        core_grid_callable=spy_core,
+    )
+    assert report.payload_ready is False
+    assert (
+        builder.ISSUE_CORE_GRID_INCOMPLETE
+        in report.issue_codes
+    )
+
+
+def test_core_returns_duplicate_cell_yields_payload_not_ready():
+    """Codex amendment: a duplicate (K, window) cell in
+    the core result must reject payload_ready=True even
+    when the canonical 60 set is structurally covered.
+    Duplicates indicate a stub / bug and must NOT pass."""
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+    cells_60 = _make_full_canonical_60_buy_cells()
+    # Append a duplicate cell at (1, "1d").
+    cells_with_dup = cells_60 + (
+        _make_buy_cell(K=1, window="1d"),
+    )
+
+    def spy_core(*, target_ticker, per_cell_inputs):
+        return cells_with_dup
+
+    report = builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=_fake_adapter_returning(ready),
+        core_grid_callable=spy_core,
+    )
+    assert report.payload_ready is False
+    assert (
+        builder.ISSUE_CORE_GRID_INCOMPLETE
+        in report.issue_codes
+    )
+
+
+def test_core_returns_missing_canonical_substituted_by_noncanonical():
+    """Codex amendment: noncanonical (K, window) extras
+    (e.g. (K=13, "2d")) are tolerated only as additions
+    on top of the canonical 60. They must NOT substitute
+    for any missing canonical pair. Drop one canonical
+    cell and add one noncanonical extra; result must
+    still be payload_ready=False."""
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+    cells_60 = _make_full_canonical_60_buy_cells()
+    cells_short = cells_60[:-1]  # drop (12, "1y")
+    # Add a noncanonical extra cell.
+    extra = _make_buy_cell(K=13, window="2d")
+    cells_with_noncanonical = cells_short + (extra,)
+
+    def spy_core(*, target_ticker, per_cell_inputs):
+        return cells_with_noncanonical
+
+    report = builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=_fake_adapter_returning(ready),
+        core_grid_callable=spy_core,
+    )
+    assert report.payload_ready is False
+    assert (
+        builder.ISSUE_CORE_GRID_INCOMPLETE
+        in report.issue_codes
+    )
+
+
+def test_core_returns_60_canonical_plus_noncanonical_extras_passes():
+    """Codex amendment: when the canonical 60 are all
+    present AND additional noncanonical cells are appended
+    as extras, payload_ready=True still holds (extras are
+    tolerated but never substitute)."""
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+    cells_60 = _make_full_canonical_60_buy_cells()
+    # Add a noncanonical extra cell on top of the full 60.
+    extra = _make_buy_cell(K=13, window="2d")
+    cells_60_plus = cells_60 + (extra,)
+
+    def spy_core(*, target_ticker, per_cell_inputs):
+        return cells_60_plus
+
+    report = builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=_fake_adapter_returning(ready),
+        core_grid_callable=spy_core,
+    )
+    assert report.payload_ready is True
+    # cell_count reflects the actual cells returned
+    # (including the extra), but per_window_k_metrics only
+    # carries the canonical entries (the payload helper
+    # passes every cell through; the per-window-k-metrics
+    # length is checked above).
+    assert (
+        builder.ISSUE_CORE_GRID_INCOMPLETE
+        not in report.issue_codes
+    )
 
 
 # ---------------------------------------------------------------------------
