@@ -17,17 +17,24 @@ Out of band of this phase:
   - No second writer invocation.
   - No StackBuilder / OnePass / ImpactSearch / TrafficFlow /
     Spymaster batch execution.
-  - No yfinance fetch outside the one launched by the supervised
-    refresher subprocess.
+  - No yfinance fetch outside whatever the writer-internal
+    refresher callable performed during its single in-process
+    invocation. (The writer has no subprocess path; the live
+    refresher is called as a Python function — see § 7 for
+    detail.)
   - No edits to any module / test / production root layout.
 
 The five Phase 6I-10 simulated-or-inferred items are revisited
 in Section 7. As designed, the persist-skip-lag honest
 recommendation contract withheld the production pipeline write
-on this run; two of the five items therefore remain open and
-will only close on a future supervised run where the source
-cache acquires a trading day **strictly after** the
-`current_as_of_date` of that run.
+on this run; **three** of the five items remain directly
+unproven and will only close on a future supervised run — two
+of them (pipeline write + post-pipeline validator) on a date
+where the source cache acquires a trading day **strictly after**
+the `current_as_of_date` of that run, and one
+(`real_yfinance_fetch` direct telemetry) on a future run that
+captures provider-side telemetry surfaced by the writer's
+JSONL / status / manifest.
 
 ## 1. Pre-run preconditions (captured 2026-05-13T04:14Z)
 
@@ -326,37 +333,55 @@ cache/status/SPY_status.json
 ```
 
 This is the surgically narrow blast radius the contract
-promised: refresher subprocess touched only the SPY signal
-engine cache PKL + its manifest + its status JSON. Zero writes
-to `output/research_artifacts/`, `signal_library/data/stable/`,
-or `output/stackbuilder/` — and zero writes anywhere else,
-because the pipeline was withheld by the persist-skip-lag guard.
+promised: the writer-internal refresher callable
+(`signal_engine_cache_refresher.refresh_signal_engine_cache`,
+recorded in the writer's `functions_executed`) touched only
+the SPY signal engine cache PKL + its manifest + its status
+JSON. Zero writes to `output/research_artifacts/`,
+`signal_library/data/stable/`, or `output/stackbuilder/` — and
+zero writes anywhere else, because the pipeline was withheld
+by the persist-skip-lag guard.
 
 ## 7. Did this run close the five Phase 6I-10 simulated/inferred gaps?
 
 | Phase 6I-10 simulated step | Status after this run | Evidence |
 |---|---|---|
 | `real_authorized_writer_run` | **CLOSED** | `daily_board_automation_writer.py` was invoked with `--write` + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`. `write_authorized=true` and `dry_run=false` in stdout. rc=0. No `SystemExit` leak. Valid JSON to stdout. One well-formed JSONL row to the execution log. |
-| `real_signal_engine_cache_refresher_invocation` | **CLOSED** | `commands_executed` records the subprocess `python signal_engine_cache_refresher.py --ticker SPY --write`. `refresh_result.attempted=true`, `refresh_result.succeeded=true`, cache `date_range_end` advanced `2026-05-11` → `2026-05-12`. The inventory diff confirms the SPY PKL + manifest + status JSON were the only changed files (size + mtime). |
+| `real_signal_engine_cache_refresher_invocation` | **CLOSED** | The writer's `functions_executed` records the actual in-process call `signal_engine_cache_refresher.refresh_signal_engine_cache` (the writer has no subprocess path — the refresher runs as a Python function inside the writer process). `refresh_result.attempted=true`, `refresh_result.succeeded=true`, cache `date_range_end` advanced `2026-05-11` → `2026-05-12`. `commands_executed: ["python signal_engine_cache_refresher.py --ticker SPY --write"]` is the **logical/audit command label** the writer surfaces alongside the function call; it is not evidence of a real subprocess invocation. The inventory diff confirms the SPY PKL + manifest + status JSON were the only changed files (size + mtime). |
 | `real_confluence_pipeline_runner_write` | **STILL OPEN** (by-design under current calendar position) | Persist-skip-lag honest contract correctly withheld the pipeline because after the refresh `cache_date_range_end == current_as_of_date == 2026-05-12` is not strictly greater than cutoff. `pipeline_result=null` and `pipeline_ran_tickers=[]`. **This is the contract working as documented (Phase 6E-2 + Phase 6G baseline), not a regression.** This gap closes on a future supervised run when the source cache acquires a trading day strictly after the cutoff. |
-| `real_yfinance_fetch` | **CLOSED (by inference)** | The only subprocess invoked was `signal_engine_cache_refresher.py --ticker SPY --write`, and the SPY cache `date_range_end` advanced one trading day. The refresher's documented mechanism is a yfinance fetch followed by the precomputed-results recompute; the cache PKL's size delta (+1,028 bytes) and the manifest delta are consistent with a real fetch+recompute on this calendar position. Direct telemetry from the refresher subprocess itself is not surfaced by the writer stdout / JSONL; this is an inference from the subprocess identity + the cache delta, not a captured yfinance HTTP trace. |
+| `real_yfinance_fetch` | **INDIRECTLY EVIDENCED / DIRECT TELEMETRY STILL OPEN** | The live writer-internal refresher callable `signal_engine_cache_refresher.refresh_signal_engine_cache` did run (recorded in `functions_executed`), and the SPY cache `date_range_end` advanced from `2026-05-11` to `2026-05-12` (`refresh_result.old_cache_date_range_end` → `new_cache_date_range_end`). This is **consistent with** the refresher's documented yfinance-backed path (fetch one trading day from the provider, then recompute precomputed-results), and the cache PKL's size delta (+1,028 bytes) plus the manifest delta are consistent with a real fetch+recompute on this calendar position. **However, no direct yfinance HTTP / provider-side telemetry is surfaced in the writer's stdout, the JSONL execution-log row, the SPY status JSON, or the SPY PKL manifest.** Closing this gap directly requires a future supervised run whose surface emits captured yfinance request/response telemetry. Until that exists, treat the yfinance fetch as indirectly evidenced, not directly proven. |
 | `real_post_pipeline_validation_on_writer_path` | **STILL OPEN** (by-design under current calendar position) | `contract_validation_result=null` because no pipeline ran. The Phase 6I-8 post-pipeline contract-validation callable was *not* exercised on the writer path in this run. This gap closes on a future supervised run where the pipeline actually executes (i.e., the same future condition that closes `real_confluence_pipeline_runner_write`). |
 
 ### 7.1 What the next supervised run will look like
 
-The remaining two open gaps both close on the same future
-condition: a supervised run on a date where, after the
-refresh, `cache_date_range_end > current_as_of_date`. The
-authorization candidate set will then read
-`pipeline_only` (no refresh needed) or
-`refresh_then_pipeline` (refresh first), the post-refresh
-watcher will return `ready_for_pipeline=true`, the writer will
-invoke `confluence_pipeline_runner` against the production
-artifact root, the Phase 6I-8 contract-validation callable
-will fire on the new confluence day, and the JSONL row will
-surface `contract_validation_result` populated with the seven
-contract booleans + the `_default_contract_validator_callable`
-marker.
+After this run, three of the five Phase 6I-10 items remain
+directly unproven:
+
+  - `real_confluence_pipeline_runner_write`
+  - `real_post_pipeline_validation_on_writer_path`
+  - `real_yfinance_fetch` **direct telemetry** (the live
+    refresher callable invocation itself is closed; only the
+    direct yfinance HTTP / provider-side telemetry remains
+    unproven)
+
+The first two close on the same future condition: a supervised
+run on a date where, after the refresh,
+`cache_date_range_end > current_as_of_date`. The authorization
+candidate set will then read `pipeline_only` (no refresh
+needed) or `refresh_then_pipeline` (refresh first), the
+post-refresh watcher will return `ready_for_pipeline=true`,
+the writer will invoke `confluence_pipeline_runner` against
+the production artifact root, the Phase 6I-8
+contract-validation callable will fire on the new confluence
+day, and the JSONL row will surface
+`contract_validation_result` populated with the seven contract
+booleans + the `_default_contract_validator_callable` marker.
+
+The third (yfinance direct telemetry) closes on a future
+supervised run whose writer / refresher surface captures
+provider-side telemetry (request/response identifiers, HTTP
+status, etc.) into the writer's JSONL row, status JSON, or
+manifest, rather than only the cache delta.
 
 ## 8. No-second-write confirmation
 
@@ -373,8 +398,10 @@ Five independent checks, mirroring the Phase 6I-10 §5 pattern:
    Spymaster batch execution.** Inventory diff for
    `output/stackbuilder/` shows 0 added, 0 removed, 0 changed
    across all 5,211 files. The writer's `commands_executed`
-   names only the refresher subprocess; no batch process was
-   spawned.
+   logical-label list contains only the refresher's command
+   label, and `functions_executed` contains only the refresher
+   callable + the cache-cutoff watcher callable; no batch
+   engine was invoked.
 3. **No production pipeline write.** Inventory diff for
    `output/research_artifacts/` shows 0 added, 0 removed, 0
    changed across all 35 files. `pipeline_result=null`,
