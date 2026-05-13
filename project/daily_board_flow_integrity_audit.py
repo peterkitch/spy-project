@@ -637,6 +637,16 @@ def _stage_queue_and_gate(
             from_stackbuilder_universe=from_universe,
             top_n=top_n,
             current_as_of_date=current_as_of_date,
+            # Phase 6I-15: ask the gate to consult the
+            # read-only source-availability probe over its
+            # wait_for_cache_ahead_tickers bucket. The probe
+            # is read-only (write=False refresher dry-run)
+            # and never authorizes the writer; the audit
+            # surfaces the resulting source_* fields so
+            # operators can see whether the equal-cache
+            # wait state has a fetchable strictly-future
+            # trading day available.
+            include_source_availability=True,
             **dirs,
         )
     except Exception as exc:
@@ -695,6 +705,27 @@ def _stage_queue_and_gate(
         ),
         "low_buy_tail_count": len(
             gate_report.low_buy_tail,
+        ),
+        # Phase 6I-15 source-availability passthrough.
+        "source_availability_checked": bool(
+            getattr(
+                gate_report,
+                "source_availability_checked",
+                False,
+            ),
+        ),
+        "source_ready_tickers": list(
+            getattr(gate_report, "source_ready_tickers", ()),
+        ),
+        "source_wait_tickers": list(
+            getattr(gate_report, "source_wait_tickers", ()),
+        ),
+        "source_manual_review_tickers": list(
+            getattr(
+                gate_report,
+                "source_manual_review_tickers",
+                (),
+            ),
         ),
     }
     return (
@@ -1203,18 +1234,60 @@ def run_daily_board_flow_integrity_audit(
             "and why before proceeding."
         )
     elif not gate_safe:
-        recommended_next = (
-            "Do NOT authorize the writer now. All "
-            "read-only stage_checks passed AND the "
-            "production roots stayed untouched, but the "
-            "supervised gate is not safe; "
-            f"recommended_operator_action="
-            f"{gate_action!r}. No read-only stage failed "
-            "-- this is an operator-action signal, not a "
-            "regression. Resolve the gate's blocking "
-            "conditions (or wait for the calendar position "
-            "that clears them) and re-run this audit."
+        # Phase 6I-15: split case 3 into "source-ready-for-
+        # supervised-refresh" vs "source-not-ready" /
+        # "source-availability-not-checked". The 3a / 3b
+        # subcases let the audit explicitly tell operators
+        # whether running a supervised refresh would even
+        # move the cache strictly past cutoff.
+        source_ready_list = list(
+            gate_summary.get("source_ready_tickers", []),
         )
+        source_checked = bool(
+            gate_summary.get(
+                "source_availability_checked", False,
+            ),
+        )
+        if (
+            source_checked
+            and source_ready_list
+            and gate_action == (
+                "source_ready_for_supervised_refresh"
+            )
+        ):
+            recommended_next = (
+                "A supervised refresh CAN BE PREPARED for "
+                f"{source_ready_list!r}. All read-only "
+                "stage_checks passed AND the production "
+                "roots stayed untouched. The supervised "
+                "gate is not safe (action="
+                f"{gate_action!r}); the Phase 6I-15 "
+                "source-availability probe shows a "
+                "no-write refresher dry-run would land "
+                "new_cache_date_range_end strictly past "
+                "current_as_of_date for the named "
+                "tickers. **Running the refresh is NOT a "
+                "writer authorization.** Use the Phase "
+                "6I-11 supervised-run pattern: authorize "
+                "a fresh refresh, re-run the five "
+                "standard probes against the post-refresh "
+                "cache, and proceed only if the gate then "
+                "says safe_to_authorize_writer_now=true."
+            )
+        else:
+            recommended_next = (
+                "Do NOT authorize the writer now. All "
+                "read-only stage_checks passed AND the "
+                "production roots stayed untouched, but "
+                "the supervised gate is not safe; "
+                f"recommended_operator_action="
+                f"{gate_action!r}. No read-only stage "
+                "failed -- this is an operator-action "
+                "signal, not a regression. Resolve the "
+                "gate's blocking conditions (or wait for "
+                "the calendar position that clears them) "
+                "and re-run this audit."
+            )
     else:
         recommended_next = (
             "Authorize a SUPERVISED first production "
