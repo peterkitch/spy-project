@@ -121,30 +121,42 @@ Preconditions:
 cache_date_range_end > resolved current_as_of_date
 ```
 
-**Strictly greater**, not equal. The cutoff resolver
-(`confluence_pipeline_readiness.resolve_current_as_of_date`)
-returns the most-recent-weekday strictly before UTC now —
-i.e. the resolved cutoff trails the wall clock by at least
-one trading day, so a fresh authorized refresh that lands
-yesterday's close in the cache **does not** open the gate
-(cache equals cutoff). What opens the gate is a refresh that
-lands a trading day **strictly past the resolved cutoff** —
-which in practice means a refresh after the next U.S. market
-close advances the cutoff resolver's view of "most recent
-weekday strictly before UTC now."
+**Strictly greater**, not equal. **This predicate is the
+contract.** It is the only thing an operator needs to
+believe to decide whether to proceed; wall-clock events,
+trading calendars, exchange holidays, and "is today a
+weekday" are at most **context** that *might* influence
+when the predicate flips — they do not themselves open the
+gate.
 
-**Wall-clock advance alone does not open the gate.** Two
-distinct things must happen, in this order:
+Useful framing for operators, **but never substitutes for
+re-running the read-only probes**:
 
-  1. The wall clock advances past the next U.S. market close
-     so the cutoff resolver returns a new
-     `current_as_of_date`.
-  2. An authorized refresh advances `cache_date_range_end`
-     **strictly past** that new cutoff.
+  - A useful window can occur after a new trading-day
+    close becomes fetchable by the refresher **while the
+    resolver still returns the prior cutoff**. In that
+    window, an authorized refresh can advance
+    `cache_date_range_end` strictly past the still-prior
+    cutoff and the predicate flips true.
+  - If the resolver's view advances (e.g. the next weekday
+    boundary passes in UTC) **before** the cache has
+    landed a strictly-future trading day, equality can
+    recreate at the new cutoff and the gate remains
+    closed. There is no asymmetric "once it's open it
+    stays open" — the predicate is recomputed on every
+    probe.
+  - Therefore: do not infer "the gate must be open by now"
+    from any wall-clock event. The probes are the answer.
 
-After step 2, all five preconditions in § 3 should evaluate
-positively for SPY (assuming no regression in upstream
-trio / StackBuilder / signal library state).
+**Operator discipline:** before any future authorized
+attempt, **re-run the five read-only probes from § 3** and
+read the observed predicate from `cache_cutoff_watcher`
+(`cache_ahead_of_cutoff`) and the gate
+(`safe_to_authorize_writer_now` +
+`authorization_candidate_tickers`). If the probes still
+report `wait_for_cache_ahead_of_cutoff` or any failing
+precondition, halt — regardless of how much wall-clock time
+has passed since the last attempt.
 
 ## 5. The exact conditions that must remain false
 
