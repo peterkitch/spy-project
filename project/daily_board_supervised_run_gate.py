@@ -140,7 +140,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Sequence
 
@@ -150,6 +150,22 @@ import daily_board_execution_queue_planner as _eqp
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Phase 6I-15: new advisory action emitted ONLY when
+# include_source_availability=True AND the upstream gate
+# verdict would have been wait_for_cache_ahead_of_cutoff
+# AND the new source-availability probe says at least one
+# of the wait_for_cache_ahead_tickers has a fetchable
+# trading day strictly past cutoff. It is an OPERATOR
+# ADVISORY -- the source-availability surface NEVER flips
+# safe_to_authorize_writer_now to True. The operator's
+# next move on this action is the Phase 6I-11 supervised-
+# run pattern (authorize a fresh refresh, re-run the five
+# standard probes against the post-refresh cache, proceed
+# only if the gate now says safe).
+ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH = (
+    "source_ready_for_supervised_refresh"
+)
 
 ACTION_AUTHORIZE_GUARDED_WRITER = (
     "authorize_guarded_writer_for_selected_tickers"
@@ -175,6 +191,14 @@ ALL_ACTIONS: tuple[str, ...] = (
     ACTION_BUILD_MISSING_DOWNSTREAM_ARTIFACTS,
     ACTION_ALREADY_CURRENT,
     ACTION_MANUAL_REVIEW,
+    # Phase 6I-15 advisory action; only emitted when
+    # ``include_source_availability=True`` AND the gate
+    # would otherwise have emitted
+    # ``wait_for_cache_ahead_of_cutoff`` AND the
+    # source-availability probe reports a wait ticker as
+    # source-ready. ``safe_to_authorize_writer_now``
+    # STAYS False on this action.
+    ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH,
 )
 
 # Stable blocking-reason strings included in
@@ -259,6 +283,28 @@ class SupervisedRunGateReport:
     max_pipeline: Optional[int]
     top_n: int
 
+    # Phase 6I-15: source-availability fields. The
+    # source-availability probe is OFF by default
+    # (``include_source_availability=False``); when off,
+    # ``source_availability_checked`` is False and all
+    # ticker tuples / by_ticker entries are empty. When the
+    # probe is on AND the gate verdict would otherwise be
+    # ``wait_for_cache_ahead_of_cutoff``, the gate consults
+    # the probe over ``wait_for_cache_ahead_tickers`` and
+    # may upgrade the recommended_operator_action to
+    # ``source_ready_for_supervised_refresh`` -- but
+    # ``safe_to_authorize_writer_now`` STAYS False. The
+    # gate never authorizes the writer based on the
+    # source-availability surface alone.
+    source_availability_checked: bool = False
+    source_ready_tickers: tuple[str, ...] = ()
+    source_wait_tickers: tuple[str, ...] = ()
+    source_manual_review_tickers: tuple[str, ...] = ()
+    # Compact per-ticker summary: ``ticker -> recommended_source_action``.
+    source_availability_by_ticker: dict[str, str] = field(
+        default_factory=dict,
+    )
+
     def to_json_dict(self) -> dict[str, Any]:
         return _report_to_json_dict(self)
 
@@ -316,6 +362,18 @@ def _report_to_json_dict(
         "max_refresh": r.max_refresh,
         "max_pipeline": r.max_pipeline,
         "top_n": int(r.top_n),
+        # Phase 6I-15 additive fields.
+        "source_availability_checked": bool(
+            r.source_availability_checked,
+        ),
+        "source_ready_tickers": list(r.source_ready_tickers),
+        "source_wait_tickers": list(r.source_wait_tickers),
+        "source_manual_review_tickers": list(
+            r.source_manual_review_tickers,
+        ),
+        "source_availability_by_ticker": dict(
+            r.source_availability_by_ticker,
+        ),
     }
 
 
@@ -481,6 +539,19 @@ def evaluate_supervised_run_gate(
     # planner with a fake. Defaults to the real Phase
     # 6I-6 planner.
     queue_planner_callable: Optional[Any] = None,
+    # Phase 6I-15: read-only source-availability probe.
+    # OFF by default to preserve the existing gate
+    # contract (no per-ticker refresher dry-run invoked
+    # along the gate's read-only path). When ON, AND
+    # the gate would otherwise emit
+    # ``wait_for_cache_ahead_of_cutoff``, the gate
+    # calls the source-availability probe over the
+    # wait tickers and may upgrade the recommended
+    # action to ``source_ready_for_supervised_refresh``.
+    # ``safe_to_authorize_writer_now`` NEVER flips True
+    # via the source-availability surface alone.
+    include_source_availability: bool = False,
+    source_availability_callable: Optional[Any] = None,
 ) -> SupervisedRunGateReport:
     """Evaluate the supervised-run readiness gate.
 
@@ -611,6 +682,82 @@ def evaluate_supervised_run_gate(
         if cmd:
             advisory.append(str(cmd))
 
+    # Phase 6I-15: optional source-availability probe over
+    # the wait-for-cache-ahead bucket. Strictly read-only;
+    # never invoked unless include_source_availability=True
+    # AND there is at least one wait ticker (no point
+    # asking the probe if no ticker is in the equal-cache
+    # state). The probe call itself uses
+    # signal_engine_cache_refresher with write=False; tests
+    # inject a fake via source_availability_callable.
+    source_availability_checked = False
+    source_ready_tickers: tuple[str, ...] = ()
+    source_wait_tickers_post: tuple[str, ...] = ()
+    source_manual_review_tickers: tuple[str, ...] = ()
+    source_availability_by_ticker: dict[str, str] = {}
+    if include_source_availability and wait_tickers:
+        # Lazy import so the gate's static-import surface
+        # stays clean. The probe module itself blocks
+        # writer / runner / yfinance / dash / subprocess
+        # at top level (Phase 6I-15 forbidden-import
+        # guard).
+        if source_availability_callable is None:
+            import source_availability_probe as _sap  # noqa: PLC0415
+            source_availability_fn = (
+                _sap.evaluate_source_availability_many
+            )
+        else:
+            source_availability_fn = (
+                source_availability_callable
+            )
+        sa_report = source_availability_fn(
+            list(wait_tickers),
+            cache_dir=cache_dir,
+            current_as_of_date=(
+                queue_report.current_as_of_date
+            ),
+        )
+        source_availability_checked = True
+        sa_ready: list[str] = []
+        sa_wait: list[str] = []
+        sa_manual: list[str] = []
+        for st in sa_report.states:
+            t = str(st.ticker).upper()
+            action = str(st.recommended_source_action)
+            source_availability_by_ticker[t] = action
+            if action == "source_ready_for_refresh":
+                sa_ready.append(t)
+            elif action in (
+                "source_equal_cutoff_wait",
+                "source_behind_cutoff_wait",
+            ):
+                sa_wait.append(t)
+            elif action == (
+                "source_unavailable_manual_review"
+            ):
+                sa_manual.append(t)
+        source_ready_tickers = tuple(sa_ready)
+        source_wait_tickers_post = tuple(sa_wait)
+        source_manual_review_tickers = tuple(sa_manual)
+
+        # Decision upgrade: if the gate was previously
+        # waiting on cache-ahead AND the source probe says
+        # at least one wait ticker has a fetchable strictly-
+        # future trading day, surface the new advisory
+        # action. ``safe_to_authorize_writer_now`` stays
+        # False -- this is an operator-action signal, not
+        # an authorization. The gate-safe path (write-
+        # ready candidates exist) is NEVER reduced by the
+        # source-availability surface.
+        if (
+            (not safe)
+            and recommended_action == ACTION_WAIT_FOR_CACHE_AHEAD
+            and source_ready_tickers
+        ):
+            recommended_action = (
+                ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH
+            )
+
     return SupervisedRunGateReport(
         generated_at=datetime.now(timezone.utc).isoformat(
             timespec="seconds",
@@ -649,6 +796,18 @@ def evaluate_supervised_run_gate(
         max_refresh=max_refresh,
         max_pipeline=max_pipeline,
         top_n=int(queue_report.top_n),
+        # Phase 6I-15 additive fields.
+        source_availability_checked=(
+            source_availability_checked
+        ),
+        source_ready_tickers=source_ready_tickers,
+        source_wait_tickers=source_wait_tickers_post,
+        source_manual_review_tickers=(
+            source_manual_review_tickers
+        ),
+        source_availability_by_ticker=(
+            source_availability_by_ticker
+        ),
     )
 
 
@@ -718,6 +877,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Maximum rows per Phase 6I-3 ranking tail."
         ),
     )
+    parser.add_argument(
+        "--include-source-availability",
+        action="store_true",
+        help=(
+            "Phase 6I-15: when set, the gate calls the "
+            "read-only source-availability probe over "
+            "the wait_for_cache_ahead_tickers bucket and "
+            "emits the source_availability_* fields. The "
+            "probe itself calls the Phase 6E-5 refresher "
+            "with write=False; it NEVER writes to "
+            "production roots and NEVER authorizes the "
+            "writer."
+        ),
+    )
     return parser
 
 
@@ -778,6 +951,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.impactsearch_output_dir
             ),
             current_as_of_date=args.current_as_of_date,
+            include_source_availability=bool(
+                args.include_source_availability,
+            ),
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

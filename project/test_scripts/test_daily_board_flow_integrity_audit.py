@@ -1255,3 +1255,307 @@ def test_wording_production_root_mutation_uses_mutation_text(
     assert "Resolve the failing read-only checks" not in (
         text
     )
+
+
+# ---------------------------------------------------------------------------
+# 15. Phase 6I-15: recommended_next_evidence_step distinguishes
+#     "gate not safe + source-ready for supervised refresh"
+#     (case 3b) from "gate not safe + source not ready"
+#     (case 3a).
+# ---------------------------------------------------------------------------
+
+
+def test_wording_source_ready_for_supervised_refresh_uses_advisory_text(
+    monkeypatch, tmp_path: Path,
+):
+    """When all stage_checks pass AND production_roots_untouched
+    is True AND the gate emits the new Phase 6I-15
+    ``source_ready_for_supervised_refresh`` action AND
+    source_ready_tickers is non-empty, the audit text must
+    name the advisory wording (NOT the case-3 'Do NOT
+    authorize the writer now' wording and NOT the
+    supervised-run-ready text)."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    def fake_queue_and_gate(*a, **k):
+        passing = audit.StageCheck(
+            stage=audit.STAGE_QUEUE_AND_GATE,
+            passed=True,
+            detail="injected: gate-not-safe + source-ready",
+            issue_codes=(),
+            notes=(
+                "Synthetic gate verdict for Phase 6I-15 "
+                "wording-selection test.",
+            ),
+        )
+        queue_summary = {
+            "queue_counts": {},
+            "queue_truncation": {},
+        }
+        gate_summary = {
+            "safe_to_authorize_writer_now": False,
+            "recommended_operator_action": (
+                "source_ready_for_supervised_refresh"
+            ),
+            "authorization_candidate_tickers": [],
+            "blocking_reasons": [
+                "waiting_for_cache_ahead_of_cutoff",
+            ],
+            "advisory_commands_count": 0,
+            "discovered_stackbuilder_ticker_count": 0,
+            "inspected_count": 1,
+            "positive_tail_count": 0,
+            "negative_tail_count": 0,
+            "low_buy_tail_count": 0,
+            "source_availability_checked": True,
+            "source_ready_tickers": ["SPY"],
+            "source_wait_tickers": [],
+            "source_manual_review_tickers": [],
+        }
+        return passing, queue_summary, gate_summary
+
+    monkeypatch.setattr(
+        audit, "_stage_queue_and_gate", fake_queue_and_gate,
+    )
+    report = audit.run_daily_board_flow_integrity_audit(
+        tickers=["SPY"],
+        current_as_of_date="2026-05-08",
+        snapshot_production_roots=False,
+        **dirs,
+    )
+    assert report.all_read_only_checks_passed is True
+    assert report.production_roots_untouched is True
+    assert (
+        report.safe_to_consider_authorized_run_after_review
+        is False
+    )
+
+    text = report.recommended_next_evidence_step
+    # New Phase 6I-15 advisory wording must appear.
+    assert (
+        "A supervised refresh CAN BE PREPARED for "
+        "['SPY']"
+    ) in text
+    assert (
+        "Running the refresh is NOT a writer authorization"
+    ) in text
+    assert "Phase 6I-11 supervised-run pattern" in text
+    # Case 4 supervised-run-ready text must NOT appear
+    # (the gate is not safe).
+    assert "Authorize a SUPERVISED first production" not in (
+        text
+    )
+    # Case 1 stage-failure wording must NOT appear.
+    assert "Resolve the failing read-only checks" not in (
+        text
+    )
+
+
+def test_wording_source_not_ready_uses_case3a_wording(
+    monkeypatch, tmp_path: Path,
+):
+    """When all stage_checks pass AND production_roots_untouched
+    is True AND the gate emits ``wait_for_cache_ahead_of_cutoff``
+    AND source_ready_tickers is empty (source NOT ready),
+    the audit text falls back to the Phase 6I-12 case-3
+    'Do NOT authorize the writer now' wording -- the
+    Phase 6I-15 advisory does NOT fire."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    def fake_queue_and_gate(*a, **k):
+        passing = audit.StageCheck(
+            stage=audit.STAGE_QUEUE_AND_GATE,
+            passed=True,
+            detail=(
+                "injected: gate-not-safe + source-not-"
+                "ready"
+            ),
+            issue_codes=(),
+            notes=(),
+        )
+        queue_summary = {
+            "queue_counts": {},
+            "queue_truncation": {},
+        }
+        gate_summary = {
+            "safe_to_authorize_writer_now": False,
+            "recommended_operator_action": (
+                "wait_for_cache_ahead_of_cutoff"
+            ),
+            "authorization_candidate_tickers": [],
+            "blocking_reasons": [
+                "waiting_for_cache_ahead_of_cutoff",
+            ],
+            "advisory_commands_count": 0,
+            "discovered_stackbuilder_ticker_count": 0,
+            "inspected_count": 1,
+            "positive_tail_count": 0,
+            "negative_tail_count": 0,
+            "low_buy_tail_count": 0,
+            # Probe ran but found nobody source-ready.
+            "source_availability_checked": True,
+            "source_ready_tickers": [],
+            "source_wait_tickers": ["SPY"],
+            "source_manual_review_tickers": [],
+        }
+        return passing, queue_summary, gate_summary
+
+    monkeypatch.setattr(
+        audit, "_stage_queue_and_gate", fake_queue_and_gate,
+    )
+    report = audit.run_daily_board_flow_integrity_audit(
+        tickers=["SPY"],
+        current_as_of_date="2026-05-08",
+        snapshot_production_roots=False,
+        **dirs,
+    )
+    text = report.recommended_next_evidence_step
+    assert "Do NOT authorize the writer now" in text
+    assert "wait_for_cache_ahead_of_cutoff" in text
+    # Phase 6I-15 advisory wording must NOT appear.
+    assert "A supervised refresh CAN BE PREPARED" not in (
+        text
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15.1 Phase 6I-15 amendment: source-availability is opt-in
+#      on the flow audit. By default the audit must NOT
+#      cause the gate to invoke the source-availability
+#      probe (preserving the audit's existing no-yfinance /
+#      no-provider-fetch runtime contract).
+# ---------------------------------------------------------------------------
+
+
+def test_flow_audit_does_not_invoke_source_availability_by_default(
+    tmp_path: Path,
+):
+    """The flow audit's default mode (no
+    ``include_source_availability`` kwarg) must not call
+    the source-availability probe / refresher. We pin this
+    by monkeypatching the supervised gate so we can observe
+    the actual ``include_source_availability`` value the
+    audit passes."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    captured: dict[str, Any] = {}
+
+    real_evaluate = audit._gate.evaluate_supervised_run_gate
+
+    def spy_gate(*args, **kwargs):
+        captured["include_source_availability"] = (
+            kwargs.get(
+                "include_source_availability",
+            )
+        )
+        return real_evaluate(*args, **kwargs)
+
+    import unittest.mock as mock  # noqa: PLC0415
+
+    with mock.patch.object(
+        audit._gate,
+        "evaluate_supervised_run_gate",
+        spy_gate,
+    ):
+        audit.run_daily_board_flow_integrity_audit(
+            tickers=["SPY"],
+            current_as_of_date="2026-05-08",
+            snapshot_production_roots=False,
+            **dirs,
+        )
+
+    assert (
+        captured["include_source_availability"] is False
+    ), (
+        "By default the flow audit must pass "
+        "include_source_availability=False to the gate so "
+        "no source-availability probe / refresher dry-run "
+        "/ provider fetch is invoked. Observed: "
+        f"{captured['include_source_availability']!r}"
+    )
+
+
+def test_flow_audit_threads_opt_in_source_availability_to_gate(
+    tmp_path: Path,
+):
+    """When the caller sets
+    ``include_source_availability=True`` on
+    ``run_daily_board_flow_integrity_audit``, the audit
+    must forward that exact value into the supervised
+    gate call."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    captured: dict[str, Any] = {}
+
+    real_evaluate = audit._gate.evaluate_supervised_run_gate
+
+    def spy_gate(*args, **kwargs):
+        captured["include_source_availability"] = (
+            kwargs.get(
+                "include_source_availability",
+            )
+        )
+        # Forward ``source_availability_callable`` as a
+        # no-op fake so we never touch the real refresher
+        # in this test even when the opt-in is on.
+        def _no_op_probe(tickers, **_):
+            import source_availability_probe as sap  # noqa: PLC0415
+
+            return sap.SourceAvailabilityReport(
+                generated_at=(
+                    "2026-05-13T00:00:00+00:00"
+                ),
+                current_as_of_date="2026-05-08",
+                inspected_count=0,
+                states=(),
+                counts_by_recommended_source_action={},
+                source_ready_tickers=(),
+            )
+        kwargs["source_availability_callable"] = (
+            _no_op_probe
+        )
+        return real_evaluate(*args, **kwargs)
+
+    import unittest.mock as mock  # noqa: PLC0415
+
+    with mock.patch.object(
+        audit._gate,
+        "evaluate_supervised_run_gate",
+        spy_gate,
+    ):
+        audit.run_daily_board_flow_integrity_audit(
+            tickers=["SPY"],
+            current_as_of_date="2026-05-08",
+            snapshot_production_roots=False,
+            include_source_availability=True,
+            **dirs,
+        )
+
+    assert (
+        captured["include_source_availability"] is True
+    ), (
+        "When the caller passes "
+        "include_source_availability=True the audit must "
+        "forward True to the gate. Observed: "
+        f"{captured['include_source_availability']!r}"
+    )

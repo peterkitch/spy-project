@@ -1027,3 +1027,318 @@ def test_persist_skip_lag_routes_to_wait_not_refresh():
         report.recommended_operator_action
         not in refresh_actions
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-15: source-availability integration
+# ---------------------------------------------------------------------------
+
+
+def _wait_only_fake_report(ticker: str = "SPY") -> _FakeQueueReport:
+    """Build a fake queue report that puts the given
+    ticker in the wait_for_cache_ahead bucket and nothing
+    else, mirroring the post-Phase-6I-13 equal-cache
+    state."""
+    return _FakeQueueReport(
+        current_as_of_date="2026-05-12",
+        inspected_count=1,
+        queue_counts={
+            "pipeline_only_queue": 0,
+            "refresh_source_cache_then_pipeline_queue": 0,
+            "wait_for_cache_ahead_queue": 1,
+            "manual_stackbuilder_queue": 0,
+            "upstream_blocked_queue": 0,
+            "downstream_gap_queue": 0,
+            "current_leader_eligible_queue": 0,
+        },
+        queue_truncation=_truncation_dict(),
+        wait_for_cache_ahead_queue=(
+            _FakeQueueItem(ticker=ticker),
+        ),
+    )
+
+
+def _fake_source_callable_ready_for(*ready_tickers: str):
+    """Return a fake ``source_availability_callable`` that
+    emits a ``SourceAvailabilityReport``-shaped dataclass
+    with the given tickers in the source-ready set."""
+    # Import lazily so this helper does not force the
+    # probe module to load at gate-test import time.
+    import source_availability_probe as sap  # noqa: PLC0415
+
+    def fn(tickers, *, cache_dir=None,
+           current_as_of_date=None, **_):
+        states_list: list[sap.SourceAvailabilityState] = []
+        counts: dict[str, int] = {}
+        ready: list[str] = []
+        for t in tickers:
+            tu = str(t).upper()
+            if tu in {x.upper() for x in ready_tickers}:
+                action = sap.ACTION_SOURCE_READY_FOR_REFRESH
+                ready.append(tu)
+            else:
+                action = (
+                    sap.ACTION_SOURCE_EQUAL_CUTOFF_WAIT
+                )
+            counts[action] = counts.get(action, 0) + 1
+            states_list.append(
+                sap.SourceAvailabilityState(
+                    ticker=tu,
+                    current_as_of_date=(
+                        current_as_of_date
+                        or "2026-05-12"
+                    ),
+                    old_cache_date_range_end="2026-05-12",
+                    new_cache_date_range_end=(
+                        "2026-05-13"
+                        if action == sap.ACTION_SOURCE_READY_FOR_REFRESH
+                        else "2026-05-12"
+                    ),
+                    source_ahead_of_cutoff=(
+                        action == sap.ACTION_SOURCE_READY_FOR_REFRESH
+                    ),
+                    source_equal_to_cutoff=(
+                        action == sap.ACTION_SOURCE_EQUAL_CUTOFF_WAIT
+                    ),
+                    source_behind_cutoff=False,
+                    dry_run_attempted=True,
+                    dry_run_succeeded=True,
+                    provider_fetch_telemetry=None,
+                    recommended_source_action=action,
+                    issue_codes=(),
+                ),
+            )
+        return sap.SourceAvailabilityReport(
+            generated_at="2026-05-13T00:00:00+00:00",
+            current_as_of_date=(
+                current_as_of_date or "2026-05-12"
+            ),
+            inspected_count=len(states_list),
+            states=tuple(states_list),
+            counts_by_recommended_source_action=counts,
+            source_ready_tickers=tuple(ready),
+        )
+
+    return fn
+
+
+def test_source_availability_default_off_leaves_fields_empty():
+    """Default ``include_source_availability=False`` must
+    not invoke the probe; the new fields stay empty even
+    when the gate is in the wait state."""
+    fake_q = _wait_only_fake_report("SPY")
+    report = gate.evaluate_supervised_run_gate(
+        tickers=["SPY"],
+        queue_planner_callable=_planner_returning(fake_q),
+    )
+    assert report.safe_to_authorize_writer_now is False
+    assert report.recommended_operator_action == (
+        gate.ACTION_WAIT_FOR_CACHE_AHEAD
+    )
+    assert report.source_availability_checked is False
+    assert report.source_ready_tickers == ()
+    assert report.source_wait_tickers == ()
+    assert report.source_manual_review_tickers == ()
+    assert report.source_availability_by_ticker == {}
+
+
+def test_equal_cache_plus_source_ready_advisory_action():
+    """When the gate would otherwise emit
+    ``wait_for_cache_ahead_of_cutoff`` AND the source-
+    availability probe reports the wait ticker as
+    ``source_ready_for_refresh``, the gate's
+    recommended_operator_action upgrades to
+    ``source_ready_for_supervised_refresh`` -- BUT
+    ``safe_to_authorize_writer_now`` STAYS False (the
+    source-availability surface NEVER flips safety on
+    its own).
+
+    Phase 6I-15 amendment also pins that the new
+    advisory action is included in ``ALL_ACTIONS``."""
+    fake_q = _wait_only_fake_report("SPY")
+    source_fn = _fake_source_callable_ready_for("SPY")
+    report = gate.evaluate_supervised_run_gate(
+        tickers=["SPY"],
+        queue_planner_callable=_planner_returning(fake_q),
+        include_source_availability=True,
+        source_availability_callable=source_fn,
+    )
+    assert report.safe_to_authorize_writer_now is False
+    assert report.recommended_operator_action == (
+        gate.ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH
+    )
+    # The emitted action must be in ALL_ACTIONS so
+    # downstream consumers (flow audit, ops tooling)
+    # can enumerate every possible verdict.
+    assert (
+        report.recommended_operator_action
+        in gate.ALL_ACTIONS
+    )
+    assert report.source_availability_checked is True
+    assert report.source_ready_tickers == ("SPY",)
+    assert report.source_wait_tickers == ()
+    assert report.source_manual_review_tickers == ()
+    assert (
+        report.source_availability_by_ticker["SPY"]
+        == "source_ready_for_refresh"
+    )
+
+
+def test_all_actions_includes_every_action_constant():
+    """``ALL_ACTIONS`` must enumerate every
+    ``ACTION_*`` string the gate can emit, including the
+    Phase 6I-15
+    ``ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH``
+    advisory. Discover the action constants reflectively
+    (any module-level name starting with ``ACTION_``
+    whose value is a string is in scope) so a future
+    contributor cannot add a new action constant without
+    also updating ``ALL_ACTIONS``."""
+    discovered: dict[str, str] = {}
+    for name in dir(gate):
+        if not name.startswith("ACTION_"):
+            continue
+        value = getattr(gate, name)
+        if isinstance(value, str):
+            discovered[name] = value
+
+    # Sanity: the discovery must include the Phase 6I-9
+    # baseline actions + the Phase 6I-15 advisory.
+    expected_subset = {
+        "ACTION_AUTHORIZE_GUARDED_WRITER",
+        "ACTION_WAIT_FOR_CACHE_AHEAD",
+        "ACTION_RESOLVE_STACKBUILDER_INPUTS",
+        "ACTION_FIX_UPSTREAM_INPUTS",
+        "ACTION_BUILD_MISSING_DOWNSTREAM_ARTIFACTS",
+        "ACTION_ALREADY_CURRENT",
+        "ACTION_MANUAL_REVIEW",
+        "ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH",
+    }
+    missing = expected_subset - set(discovered.keys())
+    assert not missing, (
+        "Discovery test expected these ACTION_* "
+        f"constants but did not find them: {missing!r}"
+    )
+
+    # Every discovered ACTION_* value must be in
+    # ALL_ACTIONS. This is the load-bearing assertion
+    # the Codex audit asked for.
+    for name, value in discovered.items():
+        assert value in gate.ALL_ACTIONS, (
+            f"{name}={value!r} is missing from "
+            "ALL_ACTIONS; ALL_ACTIONS must enumerate "
+            "every action constant the gate can emit"
+        )
+
+    # Phase 6I-15 advisory pin: the new constant is
+    # specifically the one the prior Codex audit caught
+    # as missing.
+    assert (
+        gate.ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH
+        in gate.ALL_ACTIONS
+    )
+
+
+def test_equal_cache_plus_source_not_ready_keeps_wait_action():
+    """When source-availability says NONE of the wait
+    tickers is ready, the gate keeps the original
+    ``wait_for_cache_ahead_of_cutoff`` action; the
+    advisory upgrade does NOT fire."""
+    fake_q = _wait_only_fake_report("SPY")
+    # Source probe returns nobody ready.
+    source_fn = _fake_source_callable_ready_for()
+    report = gate.evaluate_supervised_run_gate(
+        tickers=["SPY"],
+        queue_planner_callable=_planner_returning(fake_q),
+        include_source_availability=True,
+        source_availability_callable=source_fn,
+    )
+    assert report.safe_to_authorize_writer_now is False
+    assert report.recommended_operator_action == (
+        gate.ACTION_WAIT_FOR_CACHE_AHEAD
+    )
+    assert report.source_availability_checked is True
+    assert report.source_ready_tickers == ()
+    assert report.source_wait_tickers == ("SPY",)
+
+
+def test_safe_gate_path_is_not_reduced_by_source_availability():
+    """When the gate is already safe (write-ready
+    candidates exist), enabling the source-availability
+    probe must NOT downgrade safety. The probe is not
+    even consulted when ``wait_for_cache_ahead_tickers``
+    is empty (no wait tickers to probe)."""
+    fake_q = _FakeQueueReport(
+        current_as_of_date="2026-05-12",
+        inspected_count=1,
+        selected_refresh_count=1,
+        queue_counts={
+            "pipeline_only_queue": 0,
+            "refresh_source_cache_then_pipeline_queue": 1,
+            "wait_for_cache_ahead_queue": 0,
+            "manual_stackbuilder_queue": 0,
+            "upstream_blocked_queue": 0,
+            "downstream_gap_queue": 0,
+            "current_leader_eligible_queue": 0,
+        },
+        queue_truncation=_truncation_dict(),
+        refresh_source_cache_then_pipeline_queue=(
+            _FakeQueueItem(
+                ticker="SPY",
+                advisory_command=(
+                    "python daily_board_automation_writer.py"
+                    " --ticker SPY --write"
+                ),
+            ),
+        ),
+    )
+
+    def must_not_be_called(*a, **k):
+        raise AssertionError(
+            "source-availability probe must NOT be "
+            "consulted when there are no "
+            "wait_for_cache_ahead_tickers"
+        )
+
+    report = gate.evaluate_supervised_run_gate(
+        tickers=["SPY"],
+        queue_planner_callable=_planner_returning(fake_q),
+        include_source_availability=True,
+        source_availability_callable=must_not_be_called,
+    )
+    assert report.safe_to_authorize_writer_now is True
+    assert report.recommended_operator_action == (
+        gate.ACTION_AUTHORIZE_GUARDED_WRITER
+    )
+    # Probe was never called -> empty source-availability
+    # fields (still emitted for backward-compatible JSON
+    # shape).
+    assert report.source_availability_checked is False
+    assert report.source_ready_tickers == ()
+
+
+def test_source_availability_fields_serialize_in_json():
+    """The new fields must appear in to_json_dict()
+    output so downstream consumers (flow audit, ops
+    tooling) can read them without inspecting the
+    dataclass directly."""
+    fake_q = _wait_only_fake_report("SPY")
+    source_fn = _fake_source_callable_ready_for("SPY")
+    report = gate.evaluate_supervised_run_gate(
+        tickers=["SPY"],
+        queue_planner_callable=_planner_returning(fake_q),
+        include_source_availability=True,
+        source_availability_callable=source_fn,
+    )
+    payload = report.to_json_dict()
+    assert payload["source_availability_checked"] is True
+    assert payload["source_ready_tickers"] == ["SPY"]
+    assert payload["source_wait_tickers"] == []
+    assert payload["source_manual_review_tickers"] == []
+    assert (
+        payload["source_availability_by_ticker"]["SPY"]
+        == "source_ready_for_refresh"
+    )
+    # Round-trip via json.dumps to confirm no
+    # non-serializable types snuck in.
+    json.loads(json.dumps(payload))
