@@ -1173,3 +1173,85 @@ def test_provider_fetch_telemetry_invalid_ticker_has_none_telemetry(
     assert result.provider_fetch_telemetry is None
     j = result.to_json_dict()
     assert j["provider_fetch_telemetry"] is None
+
+
+def test_provider_fetch_telemetry_lands_on_status_json_on_write(
+    tmp_path: Path,
+):
+    """Phase 6I-12 amendment: a write=True run must
+    serialize ``provider_fetch_telemetry`` onto the
+    refresher's per-ticker status JSON, alongside the
+    existing status fields. **Temp-path only; the test
+    never touches production roots.**"""
+    layout = _layout(tmp_path)
+
+    def fake_fetcher(ticker: str) -> pd.DataFrame:
+        return _make_synthetic_df(
+            last_date="2026-05-12", n=40,
+        )
+
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=layout["cache_dir"],
+        status_dir=layout["status_dir"],
+        write=True,
+        max_sma_day=5,
+        data_fetcher=fake_fetcher,
+        current_as_of_date="2026-05-12",
+        provider_name="fake_yfinance_status_test_double",
+    )
+
+    # The refresh result still carries the telemetry (
+    # regression guard against the amendment changing the
+    # in-memory surface).
+    assert result.refreshed is True
+    assert result.status_path is not None
+    assert result.provider_fetch_telemetry is not None
+    inmem = result.provider_fetch_telemetry
+    assert inmem.provider_name == (
+        "fake_yfinance_status_test_double"
+    )
+    assert inmem.fetch_attempted is True
+    assert inmem.fetch_succeeded is True
+    assert inmem.rows == 40
+    assert inmem.date_range_end == "2026-05-12"
+    assert inmem.error is None
+
+    # The on-disk status JSON now also carries the
+    # telemetry. Preserves the existing status fields.
+    status_path = Path(result.status_path)
+    assert status_path.exists()
+    assert status_path.is_relative_to(layout["status_dir"])
+    status_payload = json.loads(
+        status_path.read_text(encoding="utf-8"),
+    )
+    assert status_payload["ticker"] == "SPY"
+    assert status_payload["status"] == "complete"
+    assert status_payload["progress"] == 100
+    assert status_payload["cache_status"] == "fresh"
+    assert (
+        status_payload["producer"]
+        == "signal_engine_cache_refresher"
+    )
+    assert "generated_at" in status_payload
+
+    # New additive key carries the telemetry verbatim.
+    telemetry_on_disk = status_payload[
+        "provider_fetch_telemetry"
+    ]
+    assert telemetry_on_disk is not None
+    assert telemetry_on_disk["provider_name"] == (
+        "fake_yfinance_status_test_double"
+    )
+    assert telemetry_on_disk["fetch_attempted"] is True
+    assert telemetry_on_disk["fetch_succeeded"] is True
+    assert telemetry_on_disk["ticker"] == "SPY"
+    assert telemetry_on_disk["rows"] == 40
+    assert telemetry_on_disk["date_range_end"] == "2026-05-12"
+    assert telemetry_on_disk["date_range_start"] is not None
+    assert telemetry_on_disk["error"] is None
+    assert telemetry_on_disk["elapsed_seconds"] >= 0.0
+
+    # The on-disk telemetry shape matches the in-memory
+    # to_json_dict() shape exactly (no field drift).
+    assert telemetry_on_disk == inmem.to_json_dict()

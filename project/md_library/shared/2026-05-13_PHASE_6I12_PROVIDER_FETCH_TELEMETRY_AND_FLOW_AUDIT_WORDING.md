@@ -14,12 +14,14 @@ lessons into code-backed evidence improvements:
     failed (see Phase 6I-11 doc § 9 for the observed quirk).
   - **Scope B — provider-fetch telemetry.** Add a narrow
     `provider_fetch_telemetry` payload to the signal engine
-    cache refresher's result surface, plumb it through the
-    writer's `RefreshOutcome` JSON serializer, and verify it
-    survives onto the writer's stdout payload and the JSONL
-    execution-log row. The telemetry is **fetch-attempt/result
-    telemetry**, NOT HTTP / wire-level telemetry; it does not
-    claim to capture provider-side request/response identifiers.
+    cache refresher's result surface, persist it on the
+    refresher's per-ticker status JSON for write runs, plumb
+    it through the writer's `RefreshOutcome` JSON serializer,
+    and verify it survives onto the writer's stdout payload
+    and the JSONL execution-log row. The telemetry is
+    **fetch-attempt/result telemetry**, NOT HTTP / wire-level
+    telemetry; it does not claim to capture provider-side
+    request/response identifiers.
 
 **No production-write authorization.** No writer `--write`
 invocation. No source refresh against production roots. No
@@ -45,10 +47,11 @@ TELEMETRY STILL OPEN**. The reasoning was honest but limited:
     consistent with a real fetch+recompute on that calendar
     position.
   - **However**, no direct telemetry from the fetcher call
-    itself was surfaced in the writer's stdout, JSONL
-    execution-log row, status JSON, or PKL manifest. The
-    evidence was confined to "the cache moved one trading day,
-    therefore the refresher must have fetched."
+    itself was surfaced in the writer's stdout, the JSONL
+    execution-log row, the refresher's status JSON, or the
+    PKL manifest. The evidence was confined to "the cache
+    moved one trading day, therefore the refresher must have
+    fetched."
 
 That inference-from-delta is structurally fragile: it cannot
 distinguish a real fetch from a hypothetical refresher path
@@ -57,11 +60,14 @@ count, the date range that came back from the provider, or the
 exception class when a fetch fails.
 
 Phase 6I-12 closes that **structural** gap by stamping
-fetch-call-level facts onto the refresher's result surface and
-threading them through the writer to stdout + JSONL. The next
-supervised authorized run will therefore carry telemetry that
-**directly observes** the refresher's fetch call, even though
-the telemetry remains above the HTTP boundary.
+fetch-call-level facts onto the refresher's result surface,
+persisting the same payload on the refresher's status JSON for
+write runs, and threading the same JSON shape through the
+writer to stdout + JSONL. The next supervised authorized run
+will therefore carry telemetry that **directly observes** the
+refresher's fetch call across four surfaces (refresher result,
+refresher status JSON, writer stdout, writer JSONL), even
+though the telemetry remains above the HTTP boundary.
 
 ## 2. What telemetry is now captured
 
@@ -145,6 +151,37 @@ execution log.
 
 Existing writer fields are unchanged; the new field is
 strictly additive.
+
+### 2.4 Refresher status JSON surface (Codex-amendment)
+
+For `write=True` runs that survive the optimizer-scope guard
+and reach `_write_status`, the per-ticker status JSON
+(`<TICKER>_status.json` under the supplied `status_dir`) also
+carries the telemetry as an additive `provider_fetch_telemetry`
+key. Existing status keys (`ticker`, `status`, `progress`,
+`cache_status`, `generated_at`, `producer`) are preserved
+verbatim and ordered as before; the new key is appended after
+them. Value is `null` when the status was written without an
+upstream telemetry payload (e.g. legacy callers); otherwise it
+is the same JSON shape produced by `ProviderFetchTelemetry.to_json_dict()`.
+
+### 2.5 Where the telemetry is surfaced (summary)
+
+After Phase 6I-12 (base + Codex amendment), `provider_fetch_telemetry`
+is surfaced in **four** locations:
+
+  - **Refresher result JSON** — `SignalEngineRefreshResult.to_json_dict()["provider_fetch_telemetry"]`
+    (populated on every refresh path that reached the fetcher
+    invocation, including the exception path; `None` on
+    pre-fetch early exits).
+  - **Refresher status JSON** — `<TICKER>_status.json["provider_fetch_telemetry"]`
+    on every `write=True` run that reaches `_write_status`
+    (populated with the same JSON shape; `null` when no
+    telemetry was passed in).
+  - **Writer stdout JSON** — `executions[i].refresh_result.provider_fetch_telemetry`
+    on every per-ticker execution that ran a refresh.
+  - **Writer JSONL execution log** — one row per ticker,
+    same `refresh_result.provider_fetch_telemetry` key shape.
 
 ## 3. What this telemetry does NOT prove
 
@@ -260,16 +297,38 @@ Three new tests added to
 
 ## 6. Files changed
 
-| File | Lines |
+| File | Lines (base PR + Codex amendment) |
 |---|---|
 | `project/daily_board_flow_integrity_audit.py` | +63 / −18 (Scope A; reworked text selection) |
-| `project/signal_engine_cache_refresher.py` | +130 / −7 (Scope B; new dataclass + telemetry capture + threading) |
+| `project/signal_engine_cache_refresher.py` | +145 / −11 (Scope B; new dataclass + telemetry capture + threading + status-JSON pass-through) |
 | `project/daily_board_automation_writer.py` | +50 / −0 (Scope B; new optional `RefreshOutcome` field + pass-through extractor) |
 | `project/test_scripts/test_daily_board_flow_integrity_audit.py` | +216 / −0 (3 new Scope A tests) |
-| `project/test_scripts/test_signal_engine_cache_refresher.py` | +154 / −0 (4 new Scope B refresher tests) |
+| `project/test_scripts/test_signal_engine_cache_refresher.py` | +236 / −0 (4 base + 1 amendment Scope B refresher tests = 5 new) |
 | `project/test_scripts/test_daily_board_automation_writer.py` | +194 / −0 (2 new Scope B writer tests) |
 | `project/md_library/shared/2026-05-13_PHASE_6I12_PROVIDER_FETCH_TELEMETRY_AND_FLOW_AUDIT_WORDING.md` | this doc |
-| **total (code+tests)** | **+807 / −25** |
+| **total (code+tests)** | **+904 / −29** |
+
+The Codex amendment adds:
+
+  - `_write_status(...)` accepts a new optional
+    `provider_fetch_telemetry` kwarg and writes the
+    additive `provider_fetch_telemetry` key onto the
+    status JSON (telemetry dict via `to_json_dict()` when
+    present; `null` when absent). All existing status
+    fields are preserved.
+  - `_write_optimizer_payload_or_block` forwards its
+    `provider_fetch_telemetry` parameter into the
+    `_write_status` call.
+  - One new refresher test
+    `test_provider_fetch_telemetry_lands_on_status_json_on_write`
+    asserts the written `<TICKER>_status.json` includes
+    `provider_fetch_telemetry` with the correct
+    `provider_name`, `fetch_attempted`, `fetch_succeeded`,
+    `ticker`, `rows`, `date_range_end`, `date_range_start`,
+    `error`, and `elapsed_seconds` for a fake successful
+    fetcher, and that the on-disk shape equals the
+    in-memory `ProviderFetchTelemetry.to_json_dict()`
+    shape exactly.
 
 ## 7. Tests run
 
@@ -279,11 +338,11 @@ test_scripts/test_daily_board_automation_writer.py
 test_scripts/test_daily_board_flow_integrity_audit.py
 test_scripts/test_daily_board_supervised_run_gate.py
 test_scripts/test_confluence_ranking_contract_validator.py
-                                                       174 passed in 157.17 s
+                                                       175 passed in 155.39 s
 
 Full regression (test_scripts):
-                                                       1549 passed in 343.05 s
-  (1540 baseline + 9 new = 1549; 60 pre-existing pandas
+                                                       1550 passed in 343.68 s
+  (1540 baseline + 10 new = 1550; 60 pre-existing pandas
    fragmentation warnings unchanged; no new failures)
 ```
 

@@ -489,9 +489,20 @@ def _atomic_pickle_write(
 
 
 def _write_status(
-    status_path: Path, ticker: str, cache_status: str,
+    status_path: Path,
+    ticker: str,
+    cache_status: str,
+    provider_fetch_telemetry: Optional[ProviderFetchTelemetry] = None,
 ) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
+    # Phase 6I-12: additive ``provider_fetch_telemetry``
+    # key on the status JSON. Carries the same JSON shape
+    # the refresher result + writer stdout / JSONL row
+    # already carry; ``null`` when the status was written
+    # before the fetcher call could be observed. The new
+    # key is appended after the existing fields so any
+    # downstream consumer that ignores unknown keys keeps
+    # working.
     payload = {
         "ticker": ticker,
         "status": "complete",
@@ -501,6 +512,11 @@ def _write_status(
             timespec="seconds",
         ),
         "producer": "signal_engine_cache_refresher",
+        "provider_fetch_telemetry": (
+            provider_fetch_telemetry.to_json_dict()
+            if provider_fetch_telemetry is not None
+            else None
+        ),
     }
     tmp = status_path.with_suffix(status_path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1044,6 +1060,7 @@ def _write_optimizer_payload_or_block(
     _write_status(
         target_status_path, norm_ticker,
         cache_status="fresh" if current_after else "stale",
+        provider_fetch_telemetry=provider_fetch_telemetry,
     )
 
     return SignalEngineRefreshResult(
