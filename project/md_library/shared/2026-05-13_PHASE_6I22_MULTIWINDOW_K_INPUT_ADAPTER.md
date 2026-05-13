@@ -71,6 +71,64 @@ in-memory dataclasses + dicts. No fabrication: every
 unrecoverable input shape is surfaced as a structured
 `skipped_cells` entry with a stable reason code.
 
+### 1.1 Strict member coverage (Phase 6I-22 Codex amendment)
+
+A `(K, window)` cell is prepared **only when every member of
+the K row** has a usable per-window library. **Strict
+coverage is the default.** This preserves the load-bearing
+product invariant: a StackBuilder K build means **every
+member in that K build, across every canonical window** — a
+K=6 build with one missing member must not silently become a
+K=5 evaluation. Cells that fail strict coverage are skipped
+with reason `incomplete_member_coverage`; the per-cell state
+still records `members_prepared` and `members_missing` so
+operators can audit what the cell would have been with
+partial-mode.
+
+An explicit opt-in `allow_partial_members=True` parameter
+exists for **diagnostics only**: it prepares cells with the
+surviving member subset. Partial-mode cells **never** count
+toward `can_evaluate_full_60_cell_grid=True`; the verdict
+requires the strict default semantics end-to-end.
+Partial-mode is a diagnostic aid, NOT a production engine
+path.
+
+### 1.2 Central provenance loader (Phase 6I-22 Codex amendment)
+
+The default library loader routes through
+`provenance_manifest.load_verified_signal_library` — the
+repo-wide central provenance-verified pickle loader. **No
+raw `pickle.load(...)` in this module.** The repo-wide B12
+static guard
+(`test_b12_no_raw_pickle_load_outside_central_loader`)
+enforces the same rule across all production files; this
+module also has a local regression test
+(`test_adapter_module_has_no_raw_pickle_load`) so future
+contributors see the contract directly in the adapter's own
+test file.
+
+Legacy libraries (no provenance manifest) are accepted —
+the central loader logs them. Provenance mismatches on
+non-legacy libraries are treated as a missing library
+(surfaced via `missing_target_library` /
+`missing_member_library` reason codes).
+
+### 1.3 Schema alias normalization (Phase 6I-22 Codex amendment)
+
+The repo carries multiple historic field-name aliases for
+the same data on signal libraries. The adapter's extractors
+accept both names:
+
+- `signals` (canonical) **OR** `primary_signals` (alias used
+  by `confluence.py` and `cross_ticker_confluence.py`).
+- `dates` (canonical) **OR** `date_index` (alias used by
+  `cross_ticker_confluence.py`).
+- Target close: `close` (canonical), `target_close`, or
+  `Close` (column name from pandas DataFrames the Spymaster
+  cache historically carried). **No fabrication** — if none
+  of those three field names are present, the cell is
+  skipped with reason `missing_target_close`.
+
 ---
 
 ## 2. What this module IS NOT
@@ -159,6 +217,12 @@ unrecoverable input shape is surfaced as a structured
 - `missing_target_close`
 - `empty_library`
 - `no_members_available`
+- `incomplete_member_coverage` **(Phase 6I-22 Codex amendment)** —
+  cell skipped because at least one member of the K row had
+  a missing / empty / length-mismatched library for this
+  window. Default strict mode. Suppressed by
+  `allow_partial_members=True` (but the verdict consequences
+  on `can_evaluate_full_60_cell_grid` still apply).
 
 ### 4.2 Stable aggregate issue codes
 
@@ -172,6 +236,7 @@ unrecoverable input shape is surfaced as a structured
 - `missing_target_close`
 - `missing_member_library`
 - `empty_library`
+- `incomplete_member_coverage` **(Phase 6I-22 Codex amendment)**
 
 ---
 
@@ -200,6 +265,12 @@ report = prepare_multiwindow_k_inputs(
     stackbuilder_run_discovery_callable=None,  # injection seam
     leaderboard_loader_callable=None,          # injection seam
     k_rows_iter_callable=None,                 # injection seam
+    allow_partial_members=False,    # Phase 6I-22 amendment;
+                                    # default strict (every
+                                    # member required);
+                                    # True = diagnostic only,
+                                    # never qualifies as
+                                    # full canonical coverage.
 )
 
 if report.can_evaluate_full_60_cell_grid:
@@ -278,15 +349,21 @@ resulting DataFrame.
 
 ### 7.1 Note on the `pandas` / `pickle` dependency
 
-The adapter itself imports only `pickle`, `dataclasses`,
-`datetime`, `pathlib`, `typing`, and the three project
-modules listed above. It does NOT import `pandas` at top
-level. However, the upstream
+The adapter itself does NOT import `pandas` or `pickle` at
+top level (Phase 6I-22 Codex amendment removed the original
+raw-pickle import). It imports `dataclasses`, `datetime`,
+`pathlib`, `typing`, and the four project modules:
+`multiwindow_k_engine_core`, `provenance_manifest`,
+`research_artifacts`, `trafficflow_k_artifact_builder`.
+
+However, the upstream
 `trafficflow_k_artifact_builder.load_stackbuilder_leaderboard`
-loads `combo_leaderboard.xlsx` via `pandas.read_excel`, and
-real signal-library `.pkl` files often contain numpy / pandas
-objects. The transitive dependency graph is therefore not
-pandas-free.
+loads `combo_leaderboard.xlsx` via `pandas.read_excel`, real
+signal-library `.pkl` files often contain numpy / pandas
+objects, and `provenance_manifest.load_verified_signal_library`
+opens those pickles via the centralized
+`pickle_load_compat` helper. The transitive dependency
+graph is therefore not pandas / pickle-free.
 
 The load-bearing claim is **no-projection / no-resample /
 no-ffill / no-live-engine / no-production-write**; the lack
@@ -294,51 +371,91 @@ of a direct `pandas` import is an honest restatement that
 this module's own code path uses plain Python loops + lists,
 not pandas vectorization.
 
+### 7.2 Central provenance loader (Phase 6I-22 Codex amendment)
+
+The default library loader routes through
+`provenance_manifest.load_verified_signal_library(path,
+requested_params={"interval": <window>, "price_source":
+"Close"}, strict=False)`. The repo-wide B12 raw-pickle
+guard (`test_b12_no_raw_pickle_load_outside_central_loader`)
+enforces "no raw `pickle.load(...)` in production code
+outside the central provenance loader contract"; this
+module's local
+`test_adapter_module_has_no_raw_pickle_load` regression
+test repeats that constraint inside the adapter's own
+test file.
+
 ---
 
-## 8. Tests (19 pinned contracts)
+## 8. Tests (23 pinned contracts)
 
 `project/test_scripts/test_multiwindow_k_input_adapter.py`:
 
 1. Forbidden-imports static guard.
-2. **Not a projection**: no `.resample()` / `.ffill()` call
+2. **No raw `pickle.load` in this module** (Phase 6I-22
+   Codex amendment). AST walk over `ast.Call` nodes
+   rejects any `pickle.load(...)` site. Repo-wide B12
+   guard enforces the same rule across all production
+   files.
+3. **Not a projection**: no `.resample()` / `.ffill()` call
    anywhere (AST walk).
-3-5. Run / leaderboard short-circuits: missing seed run;
+4-6. Run / leaderboard short-circuits: missing seed run;
    leaderboard load failure; empty K-row iteration — every
    attempted cell skipped with the appropriate reason code.
-6. **K rows with different member sets produce different
+7. **K rows with different member sets produce different
    per-cell columns** (K=1 has one member, K=2 has two; the
    adapter does NOT collapse them).
-7. Direct / Inverse / None protocols flow through to the
+8. Direct / Inverse / None protocols flow through to the
    per-cell `member_protocols`.
-8. Missing target library for one window skips every K cell
+9. Missing target library for one window skips every K cell
    in that window with reason `missing_target_library`.
-9. Missing member library skips only the affected member;
-   the cell still prepares if at least one member survives.
-   `members_missing` reflects the dropped member; the
-   missing-libraries map records the missing
-   `(member, window)` pair.
-10. When every member of a K row is missing for one window,
+10. **(Phase 6I-22 Codex amendment) Strict default missing-
+    member coverage** — a K=2 `AAA + BBB` build with BBB
+    missing for `1y` does NOT prepare with only AAA; the
+    cell is skipped with reason
+    `incomplete_member_coverage`. The 4 other windows still
+    prepare with the FULL `{AAA, BBB}` member set
+    (not a subset). Pinned by inspecting every prepared
+    K=2 cell's `member_signal_columns` keys.
+11. **(Phase 6I-22 Codex amendment) Opt-in partial-member
+    mode** — `allow_partial_members=True` does prepare the
+    cell with the surviving subset, AND
+    `can_evaluate_full_60_cell_grid` stays False even when
+    every requested `(K, window)` pair is structurally
+    present.
+12. When every member of a K row is missing for one window,
     the cell is skipped with reason `no_members_available`.
-11. **Missing target `close` does NOT fabricate prices.**
+13. **Missing target `close` does NOT fabricate prices.**
     Cell skipped with reason `missing_target_close`.
-12. Unparseable members short-circuit the K row across all
+14. Unparseable members short-circuit the K row across all
     windows with reason `unparseable_members`.
-13. **Full canonical fixture (12 K rows × 5 canonical
+15. **Full canonical fixture (12 K rows × 5 canonical
     windows × full target + member libraries with close)
     prepares 60 cells; the resulting `per_cell_inputs` feeds
     `evaluate_k_window_grid` directly and produces 60
     `PerWindowKCell` cells with `member_count == K`.**
-14. The same payload satisfies the Phase 6I-20 required
+16. The same payload satisfies the Phase 6I-20 required
     five fields when run through
     `cells_to_per_window_k_metrics_payload`.
-15. Empty `dates` skips with reason `empty_library`.
-16. Member signal length mismatch drops only the
-    misaligned member (no resample / no ffill).
-17. Canonical constants re-exported from the core.
-18. Every entry in `ALL_SKIPPED_REASON_CODES` is exposed as
+17. Empty `dates` skips with reason `empty_library`.
+18. **(Phase 6I-22 Codex amendment) Strict default member
+    length-mismatch** — when one member's `signals` length
+    disagrees with the target's `dates`, the WHOLE cell is
+    skipped (not prepared with the surviving member).
+19. **(Phase 6I-22 Codex amendment) Strict default member
+    missing signals** — when one member's library carries
+    `dates` but no `signals` / `primary_signals`, the WHOLE
+    cell is skipped.
+20. **(Phase 6I-22 Codex amendment) `can_evaluate_full_
+    60_cell_grid` requires full per-cell member coverage**
+    — even when every canonical `(K, window)` cell is
+    structurally prepared via `allow_partial_members=True`,
+    if even one cell carries `len(members_prepared) <
+    len(members_attempted)`, the verdict stays False.
+21. Canonical constants re-exported from the core.
+22. Every entry in `ALL_SKIPPED_REASON_CODES` is exposed as
     a `REASON_*` module attribute.
-19. Every entry in `ALL_ISSUE_CODES` is exposed as an
+23. Every entry in `ALL_ISSUE_CODES` is exposed as an
     `ISSUE_*` module attribute.
 
 All tests use `tmp_path` fixtures + in-memory fake loaders —

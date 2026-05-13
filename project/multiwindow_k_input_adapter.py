@@ -38,9 +38,18 @@ A read-only adapter. For one target ticker the adapter:
      read-only via ``pickle.load``; tests inject fakes via the
      ``library_loader`` seam.
   6. When the target's per-window library is present AND carries
-     ``dates``, ``close`` / ``target_close``, AND at least one
-     member library is present with matching length, the cell
-     is prepared and added to the ``per_cell_inputs`` map.
+     ``dates`` / ``date_index``, ``close`` / ``target_close`` /
+     ``Close``, AND **every member of the K row** has a usable
+     per-window library, the cell is prepared with the FULL
+     K-row member set and added to the ``per_cell_inputs`` map.
+     **Strict member coverage is the default** (Phase 6I-22
+     Codex amendment): a K=6 build with one missing member is
+     **not** silently downgraded to a K=5 evaluation; the cell
+     is skipped with reason ``incomplete_member_coverage``.
+     An explicit opt-in ``allow_partial_members=True`` mode
+     exists for diagnostics; partial cells **never** count
+     toward ``can_evaluate_full_60_cell_grid=True`` and the
+     mode is not a production engine path.
   7. Returns a structured ``MultiWindowKInputAdapterReport``
      carrying the per-cell input map AND per-cell diagnostics
      for every cell the adapter could not prepare.
@@ -99,6 +108,7 @@ Public surface
     REASON_NO_MEMBERS_AVAILABLE
     REASON_NO_STACKBUILDER_RUN
     REASON_LEADERBOARD_LOAD_FAILED
+    REASON_INCOMPLETE_MEMBER_COVERAGE   # Phase 6I-22 amend.
 
     # Stable aggregate-report issue codes.
     ISSUE_NO_STACKBUILDER_RUN
@@ -109,6 +119,7 @@ Public surface
     ISSUE_MISSING_TARGET_CLOSE
     ISSUE_MISSING_MEMBER_LIBRARY
     ISSUE_EMPTY_LIBRARY
+    ISSUE_INCOMPLETE_MEMBER_COVERAGE    # Phase 6I-22 amend.
 
     @dataclass(frozen=True) PerCellAdapterState
     @dataclass         MultiWindowKInputAdapterReport
@@ -123,6 +134,7 @@ Public surface
         stackbuilder_run_discovery_callable=None,
         leaderboard_loader_callable=None,
         k_rows_iter_callable=None,
+        allow_partial_members=False,    # Phase 6I-22 amend.
     ) -> MultiWindowKInputAdapterReport
 
 Strictly read-only
@@ -147,13 +159,13 @@ Strictly read-only
 
 from __future__ import annotations
 
-import pickle
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import multiwindow_k_engine_core as _mw_core
+import provenance_manifest as _pm
 import research_artifacts as _ra
 import trafficflow_k_artifact_builder as _tkb
 
@@ -178,6 +190,15 @@ REASON_EMPTY_LIBRARY = "empty_library"
 REASON_NO_MEMBERS_AVAILABLE = "no_members_available"
 REASON_NO_STACKBUILDER_RUN = "no_stackbuilder_run"
 REASON_LEADERBOARD_LOAD_FAILED = "leaderboard_load_failed"
+# Phase 6I-22 Codex amendment: strict member coverage. A
+# ``(K, window)`` cell is skipped when any member of the K
+# row is missing / empty / length-mismatched. A K=6 build
+# with a missing member must NOT silently become a K=5
+# evaluation -- that would violate the "all tickers in the
+# build are firing across all windows" product invariant.
+REASON_INCOMPLETE_MEMBER_COVERAGE = (
+    "incomplete_member_coverage"
+)
 
 ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_NO_K_ROW_IN_LEADERBOARD,
@@ -189,6 +210,7 @@ ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_NO_MEMBERS_AVAILABLE,
     REASON_NO_STACKBUILDER_RUN,
     REASON_LEADERBOARD_LOAD_FAILED,
+    REASON_INCOMPLETE_MEMBER_COVERAGE,
 )
 
 
@@ -201,6 +223,9 @@ ISSUE_MISSING_TARGET_LIBRARY = "missing_target_library"
 ISSUE_MISSING_TARGET_CLOSE = "missing_target_close"
 ISSUE_MISSING_MEMBER_LIBRARY = "missing_member_library"
 ISSUE_EMPTY_LIBRARY = "empty_library"
+ISSUE_INCOMPLETE_MEMBER_COVERAGE = (
+    "incomplete_member_coverage"
+)
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_NO_STACKBUILDER_RUN,
@@ -211,6 +236,7 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_MISSING_TARGET_CLOSE,
     ISSUE_MISSING_MEMBER_LIBRARY,
     ISSUE_EMPTY_LIBRARY,
+    ISSUE_INCOMPLETE_MEMBER_COVERAGE,
 )
 
 
@@ -353,14 +379,20 @@ def _default_library_loader(
     signal_library_dir: Path,
 ) -> Optional[Mapping[str, Any]]:
     """Read ``signal_library/data/stable/<TICKER>_stable_v1_0_0[_<interval>].pkl``
-    as a dict; return None on any failure.
+    via the central provenance-verified loader.
 
-    The adapter does NOT validate the library's provenance
-    manifest (the production loader in
-    ``signal_library/confluence_analyzer.load_signal_library_interval``
-    does); the adapter only needs ``dates`` / ``signals`` /
-    ``close`` slots, all of which are stable across the
-    library shape variants in this repo.
+    Phase 6I-22 Codex amendment: this default loader routes
+    through ``provenance_manifest.load_verified_signal_library``
+    so the adapter inherits the repo-wide provenance /
+    normalization contract — no raw ``pickle.load`` in this
+    module (banned by the B12 static regression guard).
+
+    Returns the verified library dict on success, or ``None``
+    when the file is missing, the pickle is corrupt, or the
+    manifest verification fails neither the ``ok`` nor
+    ``legacy`` accepted-state. Legacy libraries (no
+    provenance manifest) are accepted to preserve compatibility
+    with pre-3B-2 caches; the central loader logs them.
 
     Tests inject fakes via the ``library_loader`` seam on
     ``prepare_multiwindow_k_inputs``.
@@ -371,15 +403,23 @@ def _default_library_loader(
         )
         if not path.exists() or not path.is_file():
             continue
-        try:
-            with path.open("rb") as fh:
-                payload = pickle.load(fh)
-        except Exception:
+        library, vresult = _pm.load_verified_signal_library(
+            path,
+            requested_params={
+                "interval": interval,
+                "price_source": "Close",
+            },
+            strict=False,
+        )
+        if library is None:
             return None
-        if isinstance(payload, Mapping):
-            return payload
-        # Unknown wrapper shape; treat as missing rather
-        # than guess.
+        if not (vresult.ok or vresult.legacy):
+            # Provenance mismatch on a non-legacy library
+            # is treated as a missing library; surfacing
+            # the gap is the adapter's job.
+            return None
+        if isinstance(library, Mapping):
+            return library
         return None
     return None
 
@@ -438,31 +478,43 @@ def _extract_target_close(
 def _extract_signals(
     library: Mapping[str, Any],
 ) -> Optional[list[Any]]:
-    val = library.get("signals")
-    if val is None:
-        return None
-    try:
-        seq = list(val)
-    except TypeError:
-        return None
-    if not seq:
-        return None
-    return seq
+    """Accept either ``signals`` (canonical) or
+    ``primary_signals`` (alias used by the repo's confluence /
+    cross-ticker code paths)."""
+    for key in ("signals", "primary_signals"):
+        if key in library:
+            val = library[key]
+            if val is None:
+                continue
+            try:
+                seq = list(val)
+            except TypeError:
+                continue
+            if not seq:
+                continue
+            return seq
+    return None
 
 
 def _extract_dates(
     library: Mapping[str, Any],
 ) -> Optional[list[Any]]:
-    val = library.get("dates")
-    if val is None:
-        return None
-    try:
-        seq = list(val)
-    except TypeError:
-        return None
-    if not seq:
-        return None
-    return seq
+    """Accept either ``dates`` (canonical) or ``date_index``
+    (alias used by the repo's cross-ticker confluence code
+    paths)."""
+    for key in ("dates", "date_index"):
+        if key in library:
+            val = library[key]
+            if val is None:
+                continue
+            try:
+                seq = list(val)
+            except TypeError:
+                continue
+            if not seq:
+                continue
+            return seq
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +542,7 @@ def prepare_multiwindow_k_inputs(
     k_rows_iter_callable: Optional[
         Callable[..., list[Any]]
     ] = None,
+    allow_partial_members: bool = False,
 ) -> MultiWindowKInputAdapterReport:
     """Prepare per-``(K, window)`` inputs for the Phase 6I-21
     core evaluator from real StackBuilder K rows and saved
@@ -501,6 +554,26 @@ def prepare_multiwindow_k_inputs(
     missing target ``close`` / unparseable member strings
     produce structured per-cell diagnostics; they never
     produce fabricated rows.
+
+    Phase 6I-22 Codex amendment — strict member coverage
+    (default): a ``(K, window)`` cell is prepared **only when
+    every member of the K row has a usable per-window
+    library**. If any member is missing / empty / length-
+    mismatched, the cell is skipped with reason
+    ``incomplete_member_coverage`` — a K=6 build with one
+    missing member does NOT silently become a K=5 evaluation.
+
+    ``allow_partial_members`` (default False) is an explicit
+    opt-in diagnostics mode: when True, a cell is prepared
+    when at least one member library is usable, with the
+    surviving subset only. Cells prepared in this mode
+    carry ``members_prepared`` strictly less than
+    ``members_attempted`` (recorded in the per-cell state).
+    **Partial-member cells NEVER count toward the
+    ``can_evaluate_full_60_cell_grid=True`` verdict**;
+    that verdict requires the strict default semantics
+    end-to-end. Partial-mode is a diagnostic aid only —
+    NOT a production engine path.
     """
     K_list = [int(k) for k in K_values]
     W_list = [str(w) for w in windows]
@@ -883,7 +956,21 @@ def prepare_multiwindow_k_inputs(
                 member_protos[member_ticker] = proto
                 members_prepared.append(member_ticker)
 
+            # Codex amendment (Phase 6I-22): strict member
+            # coverage. A (K, window) cell is prepared ONLY
+            # when every member of the K row has a usable
+            # per-window library. The "every member of the K
+            # row" requirement is the load-bearing product
+            # invariant -- a StackBuilder K build means
+            # every member in that K build, across every
+            # canonical window.
+            full_member_coverage = (
+                len(members_prepared)
+                == len(members_attempted)
+            )
             if not members_prepared:
+                # No members at all -- always a skip,
+                # regardless of allow_partial_members.
                 state = PerCellAdapterState(
                     K=K,
                     window=window,
@@ -902,8 +989,45 @@ def prepare_multiwindow_k_inputs(
                     REASON_NO_MEMBERS_AVAILABLE,
                 ))
                 continue
+            if (
+                not full_member_coverage
+                and not allow_partial_members
+            ):
+                # Strict default: any missing member skips
+                # the cell. Surfaces as
+                # incomplete_member_coverage so callers
+                # can tell this apart from the legitimate
+                # "no members at all" case.
+                _append_unique(
+                    issues,
+                    ISSUE_INCOMPLETE_MEMBER_COVERAGE,
+                )
+                state = PerCellAdapterState(
+                    K=K,
+                    window=window,
+                    prepared=False,
+                    target_library_present=True,
+                    members_attempted=members_attempted,
+                    members_prepared=tuple(
+                        members_prepared,
+                    ),
+                    members_missing=tuple(members_missing),
+                    skipped_reason=(
+                        REASON_INCOMPLETE_MEMBER_COVERAGE
+                    ),
+                )
+                per_cell_states.append(state)
+                skipped.append((
+                    K, window,
+                    REASON_INCOMPLETE_MEMBER_COVERAGE,
+                ))
+                continue
 
-            # Cell prepared.
+            # Cell prepared. In the default strict mode this
+            # carries the FULL K-row member set; in opt-in
+            # partial mode it may carry a subset (the per-
+            # cell state's members_missing tuple records the
+            # dropped members so callers can audit).
             per_cell_inputs[(K, window)] = {
                 "dates": list(dates_seq),
                 "target_close": list(target_close_seq),
@@ -956,14 +1080,40 @@ def _finalize_report(
     missing = attempted - prepared
     canonical_k_set = set(CANONICAL_K_VALUES)
     canonical_w_set = set(CANONICAL_WINDOWS)
-    can_full_60 = (
+    # Phase 6I-22 Codex amendment: the can_evaluate_full_60_
+    # cell_grid verdict requires BOTH (a) every canonical
+    # (K, window) cell prepared AND (b) every prepared cell
+    # carrying its FULL K-row member set. Partial-member
+    # cells (only possible when allow_partial_members=True)
+    # do NOT count -- a "complete" multi-window K input
+    # means every member fired in every window.
+    states_by_cell: dict[
+        tuple[int, str], PerCellAdapterState,
+    ] = {(s.K, s.window): s for s in per_cell_states}
+    all_canonical_cells_full = True
+    for k in CANONICAL_K_VALUES:
+        for w in CANONICAL_WINDOWS:
+            if (k, w) not in per_cell_inputs:
+                all_canonical_cells_full = False
+                break
+            st = states_by_cell.get((k, w))
+            if st is None:
+                all_canonical_cells_full = False
+                break
+            if (
+                len(st.members_prepared)
+                != len(st.members_attempted)
+            ):
+                # Partial-member cell -- never qualifies
+                # as full canonical coverage.
+                all_canonical_cells_full = False
+                break
+        if not all_canonical_cells_full:
+            break
+    can_full_60 = bool(
         set(K_list) >= canonical_k_set
         and set(W_list) >= canonical_w_set
-        and all(
-            (k, w) in per_cell_inputs
-            for k in CANONICAL_K_VALUES
-            for w in CANONICAL_WINDOWS
-        )
+        and all_canonical_cells_full
     )
     return MultiWindowKInputAdapterReport(
         generated_at=datetime.now(timezone.utc).isoformat(

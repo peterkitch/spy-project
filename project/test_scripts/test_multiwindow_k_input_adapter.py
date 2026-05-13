@@ -248,6 +248,40 @@ def test_adapter_module_has_no_forbidden_imports():
     )
 
 
+def test_adapter_module_has_no_raw_pickle_load():
+    """Phase 6I-22 Codex amendment: this module-local
+    regression test pins that the adapter routes through the
+    central provenance loader and never falls back to a raw
+    ``pickle.load(...)``. The repo-wide B12 guard
+    (``test_b12_no_raw_pickle_load_outside_central_loader``)
+    enforces the same rule across all production files;
+    this test makes the constraint visible inside the
+    adapter's own test file so future contributors see the
+    contract directly when reading the adapter's tests."""
+    src = Path(adapter.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                base = func.value
+                if (
+                    isinstance(base, ast.Name)
+                    and base.id == "pickle"
+                    and func.attr == "load"
+                ):
+                    raise AssertionError(
+                        "adapter calls pickle.load() at "
+                        f"line {node.lineno} -- route "
+                        "through provenance_manifest."
+                        "load_verified_signal_library "
+                        "(or load_verified_pickle_artifact) "
+                        "instead. Raw pickle.load is "
+                        "banned in production code by the "
+                        "B12 static guard."
+                    )
+
+
 def test_adapter_makes_no_projection_calls():
     src = Path(adapter.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
@@ -494,13 +528,15 @@ def test_missing_target_library_skips_affected_window_cells(tmp_path):
     )
 
 
-def test_missing_member_library_skips_only_affected_cells(tmp_path):
-    """A member with no library for a given window should
-    drop OUT of that cell's member set, but the cell can
-    still prepare if at least one member library is present.
-    Cells where the missing-member-only K row has no surviving
-    members are skipped with ``no_members_available``."""
-    run_dir = tmp_path / "run_missing_member"
+def test_strict_default_missing_member_skips_cell(tmp_path):
+    """Phase 6I-22 Codex amendment (strict member coverage,
+    default): when even one member of a K row has no library
+    for a given window, the cell is SKIPPED with reason
+    ``incomplete_member_coverage`` -- NOT silently prepared
+    with the surviving subset. A K=2 ``AAA + BBB`` build with
+    BBB missing for ``1y`` does NOT become a K=1 evaluation
+    on AAA alone."""
+    run_dir = tmp_path / "run_strict_missing_member"
     run_dir.mkdir()
     rows = [
         _FakeKRow(K=1, members_str="AAA[D]"),
@@ -539,27 +575,101 @@ def test_missing_member_library_skips_only_affected_cells(tmp_path):
         k_rows_iter_callable=_fake_k_rows_iter(rows),
         library_loader=loader,
     )
-    # K=1 prepares all 5 windows (AAA present everywhere).
-    # K=2 prepares all 5 windows too: in the 1y cell the K=2
-    # row still has AAA (BBB drops out as missing). So
-    # prepared_cell_count = 10 (2 K * 5 windows). The 1y K=2
-    # cell carries only AAA in member_signal_columns, BBB in
-    # members_missing.
-    assert report.prepared_cell_count == 10
-    cell_1y_k2 = report.per_cell_inputs[(2, "1y")]
-    assert set(
-        cell_1y_k2["member_signal_columns"].keys()
-    ) == {"AAA"}
-    # The per-cell state surfaces BBB as missing.
+    # K=1 (one member AAA) prepares all 5 windows.
+    # K=2 (AAA + BBB) prepares 4 windows (1d/1wk/1mo/3mo
+    # where BBB is present); the 1y cell is SKIPPED with
+    # reason incomplete_member_coverage because BBB is
+    # missing for 1y -- the cell is NOT prepared with only
+    # AAA. prepared_cell_count = 5 + 4 = 9.
+    assert report.prepared_cell_count == 9
+    assert (2, "1y") not in report.per_cell_inputs
+    skipped_1y_k2 = [
+        (k, w, r) for (k, w, r) in report.skipped_cells
+        if k == 2 and w == "1y"
+    ]
+    assert skipped_1y_k2 == [
+        (2, "1y", adapter.REASON_INCOMPLETE_MEMBER_COVERAGE),
+    ]
+    assert (
+        adapter.ISSUE_INCOMPLETE_MEMBER_COVERAGE
+        in report.issue_codes
+    )
+    # The per-cell state for the skipped cell still records
+    # the partial coverage so an operator can audit what
+    # the cell would have been with allow_partial_members.
     state_1y_k2 = next(
         s for s in report.per_cell_states
         if s.K == 2 and s.window == "1y"
     )
-    assert state_1y_k2.members_missing == ("BBB",)
+    assert state_1y_k2.prepared is False
     assert state_1y_k2.members_prepared == ("AAA",)
+    assert state_1y_k2.members_missing == ("BBB",)
+    # Every prepared K=2 cell must carry BOTH members in its
+    # member_signal_columns (the full K-row member set, not
+    # a surviving subset).
+    for window in ("1d", "1wk", "1mo", "3mo"):
+        cell = report.per_cell_inputs[(2, window)]
+        assert (
+            set(cell["member_signal_columns"].keys())
+            == {"AAA", "BBB"}
+        )
+
+
+def test_opt_in_partial_members_prepares_partial_cell(tmp_path):
+    """Phase 6I-22 Codex amendment (opt-in partial mode):
+    when ``allow_partial_members=True``, a cell with one
+    missing member DOES prepare with the surviving subset,
+    but the per-cell state records the missing member AND
+    ``can_evaluate_full_60_cell_grid`` is False even when
+    every canonical pair is structurally present."""
+    run_dir = tmp_path / "run_partial_mode"
+    run_dir.mkdir()
+    rows = [
+        _FakeKRow(K=2, members_str="AAA[D], BBB[D]"),
+    ]
+    target_libs = {
+        "1d": _full_target_lib("1d", 3),
+    }
+    member_libs: dict[tuple[str, str], dict[str, Any]] = {
+        ("AAA", "1d"): _full_member_lib("1d", 3),
+        # BBB missing.
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(2,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        allow_partial_members=True,
+    )
+    assert report.prepared_cell_count == 1
+    cell = report.per_cell_inputs[(2, "1d")]
+    # Partial mode: only AAA survives in
+    # member_signal_columns; BBB is recorded as missing.
+    assert set(
+        cell["member_signal_columns"].keys(),
+    ) == {"AAA"}
+    state = next(
+        s for s in report.per_cell_states
+        if s.K == 2 and s.window == "1d"
+    )
+    assert state.members_prepared == ("AAA",)
+    assert state.members_missing == ("BBB",)
+    # Even with a "full" 2 K_values * 1 window set, partial
+    # cells must NEVER qualify as full canonical coverage.
     assert (
-        "1y"
-        in report.missing_libraries_by_ticker_window["BBB"]
+        report.can_evaluate_full_60_cell_grid is False
     )
 
 
@@ -873,14 +983,17 @@ def test_empty_dates_skips_cell(tmp_path):
     )
 
 
-def test_member_signal_length_mismatch_drops_member(tmp_path):
-    """A member library whose ``signals`` length disagrees
-    with the target's ``dates`` length is dropped from the
-    cell's member set (the adapter never resamples / ffills
-    to align)."""
+def test_strict_member_signal_length_mismatch_skips_cell(tmp_path):
+    """Phase 6I-22 Codex amendment (strict default): a member
+    library whose ``signals`` length disagrees with the
+    target's ``dates`` length results in the WHOLE cell being
+    SKIPPED (incomplete_member_coverage), not a partial
+    cell. The adapter never resamples / ffills to align AND
+    never silently downgrades a K=N build to a K=(N-1) one
+    over a length mismatch."""
     run_dir = tmp_path / "run_len_mismatch"
     run_dir.mkdir()
-    rows = [_FakeKRow(K=1, members_str="AAA[D], BBB[D]")]
+    rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
     target_libs = {
         "1d": _full_target_lib("1d", 3),
     }
@@ -896,7 +1009,7 @@ def test_member_signal_length_mismatch_drops_member(tmp_path):
     report = adapter.prepare_multiwindow_k_inputs(
         "SPY",
         run_dir=run_dir,
-        K_values=(1,),
+        K_values=(2,),
         windows=("1d",),
         stackbuilder_run_discovery_callable=(
             _fake_discovery_returning(run_dir)
@@ -907,18 +1020,138 @@ def test_member_signal_length_mismatch_drops_member(tmp_path):
         k_rows_iter_callable=_fake_k_rows_iter(rows),
         library_loader=loader,
     )
-    assert report.prepared_cell_count == 1
-    cell = report.per_cell_inputs[(1, "1d")]
-    # BBB dropped because its signal length disagreed; AAA
-    # survives.
-    assert set(
-        cell["member_signal_columns"].keys()
-    ) == {"AAA"}
+    assert report.prepared_cell_count == 0
+    assert (2, "1d") not in report.per_cell_inputs
+    assert (
+        report.skipped_cells[0][2]
+        == adapter.REASON_INCOMPLETE_MEMBER_COVERAGE
+    )
     state = next(
         s for s in report.per_cell_states
-        if s.K == 1 and s.window == "1d"
+        if s.K == 2 and s.window == "1d"
     )
+    assert state.members_prepared == ("AAA",)
     assert state.members_missing == ("BBB",)
+
+
+def test_strict_member_missing_signals_skips_cell(tmp_path):
+    """Phase 6I-22 Codex amendment: a member library whose
+    ``signals`` key is absent (only ``dates`` present) is
+    treated as a missing member, and the whole K cell is
+    skipped with ``incomplete_member_coverage`` -- not
+    prepared with only the surviving member."""
+    run_dir = tmp_path / "run_missing_signals"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
+    target_libs = {
+        "1d": _full_target_lib("1d", 3),
+    }
+    # BBB library carries dates but NO signals/primary_signals.
+    bbb_lib = _make_lib(
+        dates=_bars_for_window("1d", 3),
+        signals=None,
+    )
+    member_libs = {
+        ("AAA", "1d"): _full_member_lib("1d", 3),
+        ("BBB", "1d"): bbb_lib,
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(2,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 0
+    assert (
+        report.skipped_cells[0][2]
+        == adapter.REASON_INCOMPLETE_MEMBER_COVERAGE
+    )
+
+
+def test_full_60_cell_grid_requires_full_per_cell_member_coverage(tmp_path):
+    """Phase 6I-22 Codex amendment: even when every
+    canonical ``(K, window)`` cell is structurally prepared,
+    if even ONE prepared cell is missing one member,
+    ``can_evaluate_full_60_cell_grid`` must remain False.
+    The verdict's "full canonical coverage" check requires
+    BOTH (a) every canonical pair prepared AND (b) every
+    prepared cell carrying its FULL K-row member set.
+
+    Built using the opt-in ``allow_partial_members=True``
+    path so the cell is structurally prepared with a
+    partial-member subset; the verdict must still refuse
+    to flip True."""
+    run_dir = tmp_path / "run_full_60_partial"
+    run_dir.mkdir()
+    k_member_sets = {
+        k: [(f"M{i}", "D") for i in range(k)]
+        for k in core.CANONICAL_K_VALUES
+    }
+    rows, full_loader = _full_canonical_fixture(
+        k_member_sets=k_member_sets,
+    )
+    # Drop ONE specific member library (member M11 for
+    # window 1y) from the loader. M11 only appears in K=12's
+    # member set in _full_canonical_fixture (which builds
+    # members M0..M(k-1) for K=k), so other K rows are
+    # unaffected. K=12 / 1y now has 11-of-12 member coverage
+    # instead of the full 12.
+    def partial_loader(
+        ticker, interval, *, signal_library_dir=None,
+    ):
+        if (
+            ticker.upper() == "M11"
+            and interval == "1y"
+        ):
+            return None
+        return full_loader(
+            ticker, interval,
+            signal_library_dir=signal_library_dir,
+        )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=partial_loader,
+        allow_partial_members=True,
+    )
+    # The cell is structurally prepared (allow_partial_members
+    # = True), so prepared_cell_count == 60 -- every canonical
+    # (K, window) pair has SOMETHING in per_cell_inputs.
+    assert report.prepared_cell_count == 60
+    # But the K=12 / 1y cell has only 11 members prepared
+    # (M11 is missing for 1y).
+    state_k12_1y = next(
+        s for s in report.per_cell_states
+        if s.K == 12 and s.window == "1y"
+    )
+    assert state_k12_1y.members_prepared == tuple(
+        f"M{i}" for i in range(11)
+    )
+    assert state_k12_1y.members_missing == ("M11",)
+    # The load-bearing assertion: partial-member cells
+    # never qualify as full canonical coverage.
+    assert (
+        report.can_evaluate_full_60_cell_grid is False
+    )
 
 
 # ---------------------------------------------------------------------------
