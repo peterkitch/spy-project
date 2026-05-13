@@ -321,27 +321,42 @@ the Phase 6I-15 conservative operator discipline (Phase
 6I-14 handoff doc § 4.2), in this state the operator
 **halts** and re-runs the probes at a later point.
 
-The gate will move out of `wait_for_cache_ahead_of_cutoff`
-when *both* of these happen, in order:
+**The gate moves only when the probes observe
+`new_cache_date_range_end > resolved current_as_of_date`
+strictly.** The predicate is the contract; wall-clock
+events are at most context that *might* influence when
+the predicate flips, never an authorization signal in
+their own right.
 
-  1. The wall clock advances past the next U.S. market
-     close (the cutoff resolver returns the most-recent-
-     weekday strictly before UTC now; the next eligible
-     trading-day close is `2026-05-13`).
-  2. The upstream provider lands the new trading day
-     (`2026-05-13`) such that the source-availability
-     probe reports `new_cache_date_range_end > resolved
-     current_as_of_date` strictly.
+Two non-prescriptive notes for operators (neither
+substitutes for re-running the probes):
 
-When step 2 fires, this same probe will emit
-`source_ready_for_refresh`, the supervised gate (with
-`--include-source-availability`) will upgrade to
-`source_ready_for_supervised_refresh`, and the flow
+  - A useful window **may** occur after a new
+    trading-day close becomes fetchable by the
+    refresher while the resolver still returns the
+    prior cutoff. In that window, the
+    `source_availability_probe` may report
+    `new_cache_date_range_end > resolved
+    current_as_of_date` strictly and emit
+    `source_ready_for_refresh`.
+  - If the resolver advances to the same date before
+    the provider/cache becomes strictly ahead,
+    **equality can recreate** at the new cutoff and the
+    gate remains closed. There is no asymmetric "once
+    open, stays open" — both predicates are recomputed
+    on every probe.
+
+**Do not infer readiness from market close or
+wall-clock time.** Re-run the probes and trust the
+observed predicate. When the source-availability probe
+emits `source_ready_for_refresh`, the supervised gate
+(with `--include-source-availability`) will upgrade to
+`source_ready_for_supervised_refresh` and the flow
 audit case-3b wording will fire — at which point the
-operator can use the Phase 6I-11 supervised-run pattern
-(one-shot temp launcher script + two-key authorization)
-to authorize a fresh refresh. Phase 6I-16 does **not**
-authorize that step.
+operator can use the Phase 6I-11 supervised-run
+pattern (one-shot temp launcher script + two-key
+authorization) to authorize a fresh refresh. Phase
+6I-16 does **not** authorize that step.
 
 **Do not authorize a writer run merely because time has
 passed.** Re-run the probes first; trust the predicate.
