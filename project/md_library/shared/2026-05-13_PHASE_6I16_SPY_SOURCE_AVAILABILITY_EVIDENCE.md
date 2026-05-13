@@ -31,18 +31,41 @@ HEAD `756fb5f` (Phase 6I-15 merged, PR #232) with the
 pinned `spyproject2` interpreter and no
 `--current-as-of-date` override; the cutoff resolver
 returned `current_as_of_date=2026-05-12` for these
-probes:
+probes.
+
+**Pinned interpreter path used for every probe** (per
+CLAUDE.md, a bare `python` on this machine may resolve
+to `C:\Python313\python.exe` — the wrong runtime for
+this project; every probe in this evidence run used the
+absolute path explicitly):
 
 ```
-python cache_cutoff_watcher.py --ticker SPY
-python source_availability_probe.py --ticker SPY
-python daily_board_supervised_run_gate.py --ticker SPY --top-n 3
-python daily_board_supervised_run_gate.py --ticker SPY --top-n 3 --include-source-availability
-python daily_board_flow_integrity_audit.py --ticker SPY --top-n 3
-python daily_board_flow_integrity_audit.py --ticker SPY --top-n 3 --include-source-availability
-python daily_board_automation_writer.py --ticker SPY
-python confluence_ranking_contract_validator.py --ticker SPY
+C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe
 ```
+
+The eight probes were invoked through the Bash tool from
+`project/`, each with the pinned interpreter quoted as
+an absolute path. The exact command form used for each
+probe:
+
+```
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" cache_cutoff_watcher.py --ticker SPY
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" source_availability_probe.py --ticker SPY
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" daily_board_supervised_run_gate.py --ticker SPY --top-n 3
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" daily_board_supervised_run_gate.py --ticker SPY --top-n 3 --include-source-availability
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" daily_board_flow_integrity_audit.py --ticker SPY --top-n 3
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" daily_board_flow_integrity_audit.py --ticker SPY --top-n 3 --include-source-availability
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" daily_board_automation_writer.py --ticker SPY
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" confluence_ranking_contract_validator.py --ticker SPY
+```
+
+Each stdout was redirected to the corresponding
+`0N_*.json` file in the temp evidence directory below.
+The PowerShell-flavored equivalent (for operators
+running these commands interactively) would substitute
+`& 'C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe'`
+for the quoted-absolute-path prefix; the resolved
+interpreter is the same.
 
 JSON outputs captured to
 `C:/Users/sport/AppData/Local/Temp/phase_6i16_source_availability_spy/`
