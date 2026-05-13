@@ -234,12 +234,12 @@ The Phase 6G-5 / Town Notice Board section below is preserved verbatim because t
   - **Semantic / public-meaning baseline:** anchored at `24990f0` (Phase 6G-1). This is when the seven-section hierarchy and "Consensus / No consensus / Saved Research Archive" public framing locked in. The framing has been stable since.
   - **Visual review baseline at the time of this section:** `576b676` — `Phase 6G-5: SPY currentness gap audit + persist-skip-lag honest recommendation (#210)`. (This was main HEAD when the Phase 6G-5 sprint state was authored. Current main has since moved through Phase 6H + Phase 6I-1..13 and is named in § 6 above; for live state always trust § 6.) Phase 6G-4 (#209) reskinned the board to the Town Notice Board direction (warm-dark page, paper section cards, sage primary, neon `#80ff00` reserved for the current-leader accent + CSS-drawn pin/chip + Evidence Trail stamp glyphs). Phase 6G-5 (#210) layered the persist-skip-lag honest recommendation onto the launch audit + freshness preflight. Phase 6G-3 (#208) was docs-only.
 
-**How to review the current UI:** run **current main** with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` pinned (Windows + spyproject2 interpreter; recipe in `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` § 2). The pinned env reproduces SPY as rank-1 leader-eligible against the on-disk artifacts; the live code paths render the Town Notice Board polish.
+**How to review the historical Phase 6G pinned-cutoff UI baseline:** check out the historical snapshot `576b676` (Phase 6G-5) and boot with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` pinned (Windows + spyproject2 interpreter; recipe in `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` § 2). The pinned env reproduces SPY as rank-1 leader-eligible against the on-disk artifacts from the Phase 6G-5 era; the Phase 6G-5 code paths render the Town Notice Board polish. (For current live state, follow § 6 above — not this historical recipe.)
 
 **Screenshot references:**
 
-  - Phase 6G-2 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_2_audit\`) are **historical / pre-polish** — captured before #209 — and are NOT the current visual target.
-  - Phase 6G-4 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`) are the closest existing screenshot reference for the current Town Notice Board direction, **but current main is the source of truth.** Refresh screenshots from a pinned-cutoff boot if a static reference is needed.
+  - Phase 6G-2 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_2_audit\`) are **pre-polish** — captured before #209 — and are NOT the Phase 6G-5 visual target.
+  - Phase 6G-4 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`) are the closest existing screenshot reference for the Phase 6G-5 Town Notice Board direction; **the Phase 6G-5 snapshot at `576b676` is the source for this historical visual baseline; current live state is § 6 above.** Refresh screenshots from a Phase-6G-5-pinned-cutoff boot of `576b676` if a static reference for the historical visual baseline is needed.
 
 **No production data writes are currently authorized.**
 
@@ -257,40 +257,38 @@ The Phase 6G-5 / Town Notice Board section below is preserved verbatim because t
   6. **What PRJCT9 Is** (`section-what-prjct9-is`).
   7. **What It Is Not** (`section-what-it-is-not`).
 
-**SPY pilot state — pinned cutoff (current main as the visual review target, `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08`):**
+**SPY pilot state — historical Phase 6G pinned cutoff (visual baseline at `576b676` with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08`)** — the values below are **Phase 6G-5-era snapshot values**, not current live state; for current live state, follow § 6 above:
 
-  - Signal Engine cache `date_range.end` = `2026-05-11` (post Phase 6F-2 authorized refresh).
-  - Confluence MTF consensus `last_date` = `2026-05-08` (post Phase 6F-5 authorized pipeline write).
-  - Resolved `current_as_of_date` = `2026-05-08`.
-  - Readiness: `leader_eligible=True`, `issue_codes=()`, `data-rank="1"`, `data-leader-eligible="true"`, `data-ranking-blocked-reason=""`, `data-signal="None"`.
-  - Board consensus: **No directional consensus today** (7 of 60 alignment checks active).
-  - Signal Engine state: **Short 11,5**.
-  - Visible scoreboard row: `SPY / No consensus / 7/60 / Full / 2026-05-08`.
+  - **(Phase 6G-5-era)** Signal Engine cache `date_range.end` = `2026-05-11` (post Phase 6F-2 authorized refresh).
+  - **(Phase 6G-5-era)** Confluence MTF consensus `last_date` = `2026-05-08` (post Phase 6F-5 authorized pipeline write).
+  - **(Phase 6G-5-era)** Resolved `current_as_of_date` = `2026-05-08`.
+  - **(Phase 6G-5-era)** Readiness: `leader_eligible=True`, `issue_codes=()`, `data-rank="1"`, `data-leader-eligible="true"`, `data-ranking-blocked-reason=""`, `data-signal="None"`.
+  - **(Phase 6G-5-era)** Board consensus: **No directional consensus** (7 of 60 alignment checks active).
+  - **(Phase 6G-5-era)** Signal Engine state: **Short 11,5**.
+  - **(Phase 6G-5-era)** Visible scoreboard row: `SPY / No consensus / 7/60 / Full / 2026-05-08`.
 
-**SPY pilot state — unpinned production boot (current behavior, by design):**
+**SPY pilot state — historical Phase 6G unpinned production boot (behavior as of `576b676`, by design at that time)** — the values below are **Phase 6G-5-era snapshot values**, not current live state; for current live state, follow § 6 above:
 
-  - Cache last_date `2026-05-11`; pipeline tree (daily K / MTF K / Confluence) trimmed to `2026-05-08` by Phase 6D-1 `persist_skip_bars=1` safety.
-  - Resolved `current_as_of_date` = `2026-05-11` (UTC has advanced past the trading day the pipeline tree was written for).
-  - Readiness: `leader_eligible=False`, `ranking_blocked_reason="stale_confluence_day_artifact"`. SPY demotes to the Saved Research Archive on a bare boot.
-  - Launch audit + freshness preflight: `recommended_action = recommended_next_action = "pipeline_output_lags_persist_skip"`; `safe_to_attempt_refresh=False`; `safe_to_run_pipeline_after_refresh=False`; pilot manifest excludes SPY. **This is the honest behavior of the existing contract, not a regression.**
-  - The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until then no operator action will move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` against current main is the only way to reproduce SPY as rank-1 against the on-disk artifacts today.
+  - **(Phase 6G-5-era)** Cache `last_date` `2026-05-11`; pipeline tree (daily K / MTF K / Confluence) trimmed to `2026-05-08` by Phase 6D-1 `persist_skip_bars=1` safety.
+  - **(Phase 6G-5-era)** Resolved `current_as_of_date` = `2026-05-11` (UTC has advanced past the trading day the pipeline tree was written for at the time of the Phase 6G-5 snapshot).
+  - **(Phase 6G-5-era)** Readiness: `leader_eligible=False`, `ranking_blocked_reason="stale_confluence_day_artifact"`. SPY demotes to the Saved Research Archive on a bare boot.
+  - **(Phase 6G-5-era)** Launch audit + freshness preflight: `recommended_action = recommended_next_action = "pipeline_output_lags_persist_skip"`; `safe_to_attempt_refresh=False`; `safe_to_run_pipeline_after_refresh=False`; pilot manifest excludes SPY. **This was the honest behavior of the existing contract at that time, not a regression.**
+  - **(Phase 6G-5-era)** The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until that happened in the Phase 6G-5 timeline, no operator action would move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` against the `576b676` snapshot was the only way to reproduce SPY as rank-1 against the on-disk artifacts of that era. (Phase 6I-11 subsequently authorized a refresh that advanced the cache to `2026-05-12`; see § 6 above for the post-Phase-6I-13 state.)
 
-**Known limitations:**
+**Known limitations (Phase 6G-5-era):**
 
-  - Only SPY is production-pilot current at all (pinned). Every other ticker in the discovered universe is `coverage=Partial / signal=None` (saved-research-only).
-  - Broader-universe refresh + pipeline automation is unbuilt; the single-ticker tooling exists (`signal_engine_cache_refresher.py`, `confluence_pipeline_runner.py`) but there is no scheduler / orchestrator.
-  - ImpactSearch / StackBuilder day artifacts can remain legacy / stale. They are dated `research_day` evidence stations and may render stale or current; under the current Phase 6C-8 leader gate, their staleness does not block the Confluence leader verdict. (The StackBuilder *leaderboard directory* is presence-only; the day artifact is not.)
-  - Mobile (≤ ~390 px wide) scoreboard table uses contained internal horizontal scroll inside `scoreboard-table-wrapper` (Phase 6F-7). The page itself never grows horizontal scroll.
+  - **(Phase 6G-5-era)** Only SPY was production-pilot-current at all (pinned). Every other ticker in the discovered universe was `coverage=Partial / signal=None` (saved-research-only).
+  - **(Phase 6G-5-era)** Broader-universe refresh + pipeline automation was unbuilt; the single-ticker tooling existed (`signal_engine_cache_refresher.py`, `confluence_pipeline_runner.py`) but there was no scheduler / orchestrator.
+  - **(Phase 6G-5-era)** ImpactSearch / StackBuilder day artifacts could remain legacy / stale. They are dated `research_day` evidence stations and may render stale-or-fresh; under the Phase 6C-8 leader gate that was in effect, their staleness did not block the Confluence leader verdict. (The StackBuilder *leaderboard directory* is presence-only; the day artifact is not.)
+  - **(Phase 6G-5-era)** Mobile (≤ ~390 px wide) scoreboard table used contained internal horizontal scroll inside `scoreboard-table-wrapper` (Phase 6F-7). The page itself never grew horizontal scroll.
 
-**Next recommended work (no more data writes unless explicitly authorized):**
+**Next recommended work — as recorded at the Phase 6G-5 snapshot** (for current live state and next-step guidance, follow § 6 above; this list is preserved as historical context only):
 
-  - For historical pinned-cutoff visual review, the Phase 6G-5 snapshot at `576b676` booted with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` reproduces the on-disk SPY rank-1 leader-eligible state under the Town Notice Board polish. Phase 6G-4 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`) are the closest existing screenshot reference if a static artifact is needed, and Phase 6G-2 screenshots are historical / pre-polish. See `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` for the full operator handoff. (For current live state, always trust § 6 above — not this historical section.)
-  - Optional public-copy polish iteration (all visible strings still route through `BOARD_COPY`; the centralization test catches them).
-  - Universe-automation scoping is out of band of the current MVP polish track; Phase 5D-2 / 5D-3 territory.
+  - For historical pinned-cutoff visual review, the Phase 6G-5 snapshot at `576b676` booted with `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` reproduces the on-disk SPY rank-1 leader-eligible state under the Town Notice Board polish. Phase 6G-4 screenshots (`C:\Users\sport\AppData\Local\Temp\phase_6g_4_audit\`) are the closest existing screenshot reference if a static artifact is needed, and Phase 6G-2 screenshots are pre-polish. See `2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md` for the full operator handoff.
+  - **(Phase 6G-5-era)** Optional public-copy polish iteration (all visible strings still route through `BOARD_COPY`; the centralization test catches them).
+  - **(Phase 6G-5-era)** Universe-automation scoping was out of band of the MVP polish track at that time; Phase 5D-2 / 5D-3 territory.
 
-**Test baseline:** full regression **1,213 passed, 60 pre-existing pandas fragmentation warnings**. No new warnings since Phase 6C-5.
-
-**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a 6H-2 (or later) PR landed without a refresh.
+**Phase 6G-5-era test baseline:** full regression **1,213 passed, 60 pre-existing pandas fragmentation warnings**. No new warnings since Phase 6C-5. (Subsequent phases have moved the baseline; see § 6 above for the latest figure.)
 
 **Phase 6G baseline doc:** `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md` (§ 7 details the persist-skip-lag contract).
 
