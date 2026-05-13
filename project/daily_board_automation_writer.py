@@ -1,5 +1,45 @@
 """Phase 6H-5: guarded write-capable automation executor foundation.
 
+Phase 6I-8 amendment
+--------------------
+
+After every authorized pipeline write that returns
+normally, the executor now invokes the Phase 6I-1
+``confluence_ranking_contract_validator`` read-only to
+confirm the resulting saved-research chain (cache ->
+StackBuilder -> daily K -> MTF -> Confluence -> readiness
+-> board row) is shape-correct. The validator runs:
+
+  - ONLY on authorized live-write paths.
+  - ONLY after the pipeline runner returns without
+    raising.
+  - NEVER on dry-run, unauthorized, waiting / manual /
+    blocked / no-action paths.
+  - NEVER when the refresh path's watcher recheck
+    withheld the pipeline.
+  - NEVER when the pipeline runner itself raised
+    before returning.
+
+The validator's outcome is recorded as a
+``ContractValidationOutcome`` on the per-ticker
+``TickerWriteExecution`` and serialized into the JSON
+report + the JSONL execution log. Contract-invalid
+results downgrade the final-action string to
+``pipeline_executed_contract_invalid`` /
+``refresh_then_pipeline_executed_contract_invalid``
+and surface the ticker under
+``contract_invalid_tickers`` in the aggregate report.
+A validator exception is captured as
+``post_pipeline_contract_validation_exception`` and
+treated identically to contract-invalid for routing
+purposes; the validator never throws out of the
+writer.
+
+The validator import is lazy (resolved only by
+``_default_contract_validator_callable`` on the live
+path) so the writer's module top-level remains
+auditable.
+
 Successor to the Phase 6H-4 dry-run executor. Adds a real,
 explicitly-authorized execution path that:
 
@@ -180,6 +220,31 @@ FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD = (
 )
 FINAL_WRITE_NOT_AUTHORIZED = "write_not_authorized_dry_run"
 
+# Phase 6I-8 amendment: post-pipeline contract-validation
+# variants of the two successful pipeline-execution final
+# actions. The writer records that the pipeline itself
+# returned cleanly but the resulting saved-research
+# artifact chain failed at least one of the seven Phase
+# 6I-1 contract checks. The pipeline side effect is
+# preserved on disk; the operator-facing routing is
+# downgraded so the next consumer doesn't treat the
+# ticker as ready.
+FINAL_PIPELINE_EXECUTED_CONTRACT_INVALID = (
+    "pipeline_executed_contract_invalid"
+)
+FINAL_REFRESH_THEN_PIPELINE_EXECUTED_CONTRACT_INVALID = (
+    "refresh_then_pipeline_executed_contract_invalid"
+)
+
+# Phase 6I-8 stable issue codes for the post-pipeline
+# validation step.
+ISSUE_POST_PIPELINE_CONTRACT_INVALID = (
+    "post_pipeline_contract_invalid"
+)
+ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION = (
+    "post_pipeline_contract_validation_exception"
+)
+
 
 SKIP_ALREADY_CURRENT = "already_current"
 SKIP_WAITING = "waiting_for_cache_ahead_of_cutoff"
@@ -247,6 +312,64 @@ class ReadinessOutcome:
 
 
 @dataclass
+class ContractValidationOutcome:
+    """Phase 6I-8: post-pipeline contract-validation
+    verdict.
+
+    Populated only on the authorized live-write path
+    AFTER the pipeline runner returns normally. The
+    Phase 6I-1 validator is invoked read-only against
+    the same root directories the writer used; its
+    return value is mapped onto this dataclass.
+
+    Fields:
+      - ``attempted``: True iff the validator was
+        invoked (False on every dry-run / unauthorized
+        / waiting / manual / blocked / watcher-blocked
+        / pipeline-exception path).
+      - ``succeeded``: True iff the validator returned
+        AND every one of the seven Phase 6I-1
+        contracts is OK. A validator exception OR any
+        ``False`` contract sets this to ``False``.
+      - Seven per-contract booleans mirror the Phase
+        6I-1 validator's ``TickerRankingContractValidation``
+        fields.
+      - Verdict fields (``leader_eligible``,
+        ``ranking_blocked_reason``,
+        ``recommended_next_operator_action``,
+        ``issue_codes``, ``blocking_reasons``,
+        ``confluence_last_date``,
+        ``daily_k_coverage``, ``mtf_k_coverage``) carry
+        the validator's verdict verbatim.
+      - On a validator exception the seven contracts
+        and verdict fields are zero-valued / empty;
+        ``issue_codes`` carries
+        ``post_pipeline_contract_validation_exception``;
+        ``ranking_blocked_reason`` carries the literal
+        string ``"validation_exception"``.
+    """
+
+    attempted: bool
+    succeeded: bool
+    cache_contract_ok: bool
+    stackbuilder_contract_ok: bool
+    daily_k_contract_ok: bool
+    mtf_contract_ok: bool
+    confluence_contract_ok: bool
+    readiness_contract_ok: bool
+    board_row_contract_ok: bool
+    leader_eligible: bool
+    ranking_blocked_reason: str
+    recommended_next_operator_action: str
+    issue_codes: tuple[str, ...]
+    blocking_reasons: tuple[str, ...]
+    confluence_last_date: Optional[str]
+    daily_k_coverage: tuple[int, ...]
+    mtf_k_coverage: tuple[int, ...]
+    elapsed_seconds: float
+
+
+@dataclass
 class TickerWriteExecution:
     """Per-ticker execution record.
 
@@ -273,6 +396,12 @@ class TickerWriteExecution:
     post_refresh_watcher_result: Optional[WatcherRecheckOutcome]
     pipeline_result: Optional[PipelineOutcome]
     final_readiness: Optional[ReadinessOutcome]
+    # Phase 6I-8: post-pipeline contract-validation
+    # outcome. ``None`` everywhere the validator was
+    # skipped (dry-run / unauthorized / waiting /
+    # manual / blocked / watcher-blocked /
+    # pipeline-exception).
+    contract_validation_result: Optional[ContractValidationOutcome]
     commands_executed: tuple[str, ...]
     functions_executed: tuple[str, ...]
     issue_codes: tuple[str, ...]
@@ -310,6 +439,15 @@ class DailyBoardWriteExecutionReport:
     pipeline_ran_tickers: tuple[str, ...]
     skipped_pipeline_after_refresh_tickers: tuple[str, ...]
     blocked_tickers: tuple[str, ...]
+    # Phase 6I-8 aggregate buckets keyed on the
+    # post-pipeline contract-validation outcome.
+    # ``contract_validated_tickers`` covers tickers
+    # whose validator ran AND every contract passed;
+    # ``contract_invalid_tickers`` covers tickers whose
+    # validator ran AND at least one contract failed
+    # OR the validator itself raised.
+    contract_validated_tickers: tuple[str, ...]
+    contract_invalid_tickers: tuple[str, ...]
     execution_log_path: Optional[str]
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -377,6 +515,41 @@ def _readiness_outcome_to_json(
     }
 
 
+def _contract_validation_outcome_to_json(
+    o: Optional[ContractValidationOutcome],
+) -> Any:
+    if o is None:
+        return None
+    return {
+        "attempted": bool(o.attempted),
+        "succeeded": bool(o.succeeded),
+        "cache_contract_ok": bool(o.cache_contract_ok),
+        "stackbuilder_contract_ok": bool(
+            o.stackbuilder_contract_ok,
+        ),
+        "daily_k_contract_ok": bool(o.daily_k_contract_ok),
+        "mtf_contract_ok": bool(o.mtf_contract_ok),
+        "confluence_contract_ok": bool(
+            o.confluence_contract_ok,
+        ),
+        "readiness_contract_ok": bool(o.readiness_contract_ok),
+        "board_row_contract_ok": bool(
+            o.board_row_contract_ok,
+        ),
+        "leader_eligible": bool(o.leader_eligible),
+        "ranking_blocked_reason": o.ranking_blocked_reason,
+        "recommended_next_operator_action": (
+            o.recommended_next_operator_action
+        ),
+        "issue_codes": list(o.issue_codes),
+        "blocking_reasons": list(o.blocking_reasons),
+        "confluence_last_date": o.confluence_last_date,
+        "daily_k_coverage": list(o.daily_k_coverage),
+        "mtf_k_coverage": list(o.mtf_k_coverage),
+        "elapsed_seconds": float(o.elapsed_seconds),
+    }
+
+
 def _execution_to_json_dict(
     execution: TickerWriteExecution,
 ) -> dict[str, Any]:
@@ -402,6 +575,11 @@ def _execution_to_json_dict(
         ),
         "final_readiness": _readiness_outcome_to_json(
             execution.final_readiness,
+        ),
+        "contract_validation_result": (
+            _contract_validation_outcome_to_json(
+                execution.contract_validation_result,
+            )
         ),
         "commands_executed": list(execution.commands_executed),
         "functions_executed": list(execution.functions_executed),
@@ -436,6 +614,12 @@ def _report_to_json_dict(
             report.skipped_pipeline_after_refresh_tickers,
         ),
         "blocked_tickers": list(report.blocked_tickers),
+        "contract_validated_tickers": list(
+            report.contract_validated_tickers,
+        ),
+        "contract_invalid_tickers": list(
+            report.contract_invalid_tickers,
+        ),
         "execution_log_path": report.execution_log_path,
     }
 
@@ -467,6 +651,19 @@ def _default_pipeline_runner_callable():
         run_confluence_pipeline_for_ticker,
     )
     return run_confluence_pipeline_for_ticker
+
+
+def _default_contract_validator_callable():
+    """Phase 6I-8: lazy default for the post-pipeline
+    contract validator. Resolved ONLY on the live
+    write path AFTER the pipeline runner returns
+    cleanly. Dry-run / unauthorized / waiting / manual
+    / blocked / watcher-blocked / pipeline-exception
+    paths never call this resolver."""
+    from confluence_ranking_contract_validator import (  # noqa: PLC0415
+        validate_confluence_ranking_contract,
+    )
+    return validate_confluence_ranking_contract
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +758,133 @@ def _pipeline_outcome_from_result(
     )
 
 
+def _contract_validation_outcome_from_validation(
+    validation: Any, elapsed: float,
+) -> ContractValidationOutcome:
+    """Map a Phase 6I-1
+    ``TickerRankingContractValidation`` onto the
+    writer's ``ContractValidationOutcome`` dataclass.
+
+    ``succeeded`` is True iff every one of the seven
+    contracts is OK. Anything less -- even a single
+    False -- sets ``succeeded=False`` and the issue
+    codes carry the Phase 6I-1 verdict verbatim, with
+    ``post_pipeline_contract_invalid`` prepended so
+    downstream consumers can filter on a stable
+    writer-side code without parsing the per-validator
+    codes."""
+    cache_ok = bool(
+        getattr(validation, "cache_contract_ok", False),
+    )
+    sb_ok = bool(
+        getattr(
+            validation, "stackbuilder_contract_ok", False,
+        ),
+    )
+    daily_ok = bool(
+        getattr(validation, "daily_k_contract_ok", False),
+    )
+    mtf_ok = bool(
+        getattr(validation, "mtf_contract_ok", False),
+    )
+    confluence_ok = bool(
+        getattr(validation, "confluence_contract_ok", False),
+    )
+    readiness_ok = bool(
+        getattr(validation, "readiness_contract_ok", False),
+    )
+    board_ok = bool(
+        getattr(validation, "board_row_contract_ok", False),
+    )
+    all_ok = (
+        cache_ok and sb_ok and daily_ok and mtf_ok
+        and confluence_ok and readiness_ok and board_ok
+    )
+    raw_codes = tuple(
+        getattr(validation, "issue_codes", ()) or (),
+    )
+    issue_codes = (
+        raw_codes if all_ok
+        else (
+            (ISSUE_POST_PIPELINE_CONTRACT_INVALID,)
+            + tuple(raw_codes)
+        )
+    )
+    raw_coverage_daily = tuple(
+        getattr(validation, "daily_k_coverage", ()) or (),
+    )
+    raw_coverage_mtf = tuple(
+        getattr(validation, "mtf_k_coverage", ()) or (),
+    )
+    return ContractValidationOutcome(
+        attempted=True,
+        succeeded=bool(all_ok),
+        cache_contract_ok=cache_ok,
+        stackbuilder_contract_ok=sb_ok,
+        daily_k_contract_ok=daily_ok,
+        mtf_contract_ok=mtf_ok,
+        confluence_contract_ok=confluence_ok,
+        readiness_contract_ok=readiness_ok,
+        board_row_contract_ok=board_ok,
+        leader_eligible=bool(
+            getattr(validation, "leader_eligible", False),
+        ),
+        ranking_blocked_reason=str(
+            getattr(validation, "ranking_blocked_reason", "")
+            or "",
+        ),
+        recommended_next_operator_action=str(
+            getattr(
+                validation,
+                "recommended_next_operator_action",
+                "",
+            )
+            or "",
+        ),
+        issue_codes=issue_codes,
+        blocking_reasons=tuple(
+            getattr(validation, "blocking_reasons", ()) or (),
+        ),
+        confluence_last_date=getattr(
+            validation, "confluence_last_date", None,
+        ),
+        daily_k_coverage=raw_coverage_daily,
+        mtf_k_coverage=raw_coverage_mtf,
+        elapsed_seconds=float(elapsed),
+    )
+
+
+def _contract_validation_outcome_for_exception(
+    elapsed: float,
+) -> ContractValidationOutcome:
+    """Validator raised on the live path. Carry the
+    exception fact as the issue code; every contract
+    boolean reads ``False`` so downstream consumers
+    cannot mistake an exception for a clean pass."""
+    return ContractValidationOutcome(
+        attempted=True,
+        succeeded=False,
+        cache_contract_ok=False,
+        stackbuilder_contract_ok=False,
+        daily_k_contract_ok=False,
+        mtf_contract_ok=False,
+        confluence_contract_ok=False,
+        readiness_contract_ok=False,
+        board_row_contract_ok=False,
+        leader_eligible=False,
+        ranking_blocked_reason="validation_exception",
+        recommended_next_operator_action="manual_review_required",
+        issue_codes=(
+            ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION,
+        ),
+        blocking_reasons=(),
+        confluence_last_date=None,
+        daily_k_coverage=(),
+        mtf_k_coverage=(),
+        elapsed_seconds=float(elapsed),
+    )
+
+
 def _readiness_outcome_from_pipeline_result(
     result: Any,
 ) -> Optional[ReadinessOutcome]:
@@ -583,6 +907,84 @@ def _readiness_outcome_from_pipeline_result(
     )
 
 
+def _run_post_pipeline_contract_validation(
+    base: TickerWriteExecution,
+    *,
+    ticker: str,
+    pipeline_outcome: PipelineOutcome,
+    cache_dir: Optional[Any],
+    artifact_root: Optional[Any],
+    stackbuilder_root: Optional[Any],
+    signal_library_dir: Optional[Any],
+    current_as_of_date: Optional[str],
+    contract_validator: Optional[Callable[..., Any]],
+    contract_invalid_action: str,
+) -> None:
+    """Phase 6I-8: run the contract validator AFTER a
+    successful pipeline call. Mutates ``base`` in place
+    with the validation result, updates ``issue_codes``
+    on contract-invalid / exception paths, and
+    downgrades ``final_recommended_action`` to the
+    ``_contract_invalid`` variant when the validator
+    returns at least one False contract OR raises.
+
+    Pre-conditions enforced by the caller:
+      - The caller has already confirmed write
+        authorization.
+      - The pipeline runner returned without raising.
+      - ``pipeline_outcome`` is the outcome the caller
+        built from that return value.
+
+    The validator itself is invoked read-only against
+    the same root directories the writer used; its
+    return value (or exception) is mapped onto a
+    ``ContractValidationOutcome``."""
+    if not pipeline_outcome.attempted:
+        # Defensive: caller invariant says we only get
+        # here on a returned pipeline, but never run
+        # the validator if the pipeline didn't even
+        # attempt (no on-disk state to validate).
+        return
+    if contract_validator is None:
+        contract_validator = (
+            _default_contract_validator_callable()
+        )
+    validator_started = time.monotonic()
+    try:
+        validation = contract_validator(
+            ticker,
+            cache_dir=cache_dir,
+            artifact_root=artifact_root,
+            stackbuilder_root=stackbuilder_root,
+            signal_library_dir=signal_library_dir,
+            current_as_of_date=current_as_of_date,
+        )
+    except Exception:
+        elapsed = time.monotonic() - validator_started
+        base.contract_validation_result = (
+            _contract_validation_outcome_for_exception(
+                elapsed,
+            )
+        )
+        base.issue_codes = tuple(
+            list(base.issue_codes)
+            + [ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION],
+        )
+        base.final_recommended_action = contract_invalid_action
+        return
+    elapsed = time.monotonic() - validator_started
+    outcome = _contract_validation_outcome_from_validation(
+        validation, elapsed,
+    )
+    base.contract_validation_result = outcome
+    if not outcome.succeeded:
+        base.issue_codes = tuple(
+            list(base.issue_codes)
+            + [ISSUE_POST_PIPELINE_CONTRACT_INVALID],
+        )
+        base.final_recommended_action = contract_invalid_action
+
+
 def _execute_ticker(
     ticker: str,
     *,
@@ -597,6 +999,7 @@ def _execute_ticker(
     watcher: Callable[..., Any],
     refresher: Optional[Callable[..., Any]],
     pipeline_runner: Optional[Callable[..., Any]],
+    contract_validator: Optional[Callable[..., Any]],
 ) -> TickerWriteExecution:
     """Translate one ticker's plan into either a dry-run
     record or a sequenced live execution, honoring the
@@ -627,6 +1030,7 @@ def _execute_ticker(
         post_refresh_watcher_result=None,
         pipeline_result=None,
         final_readiness=None,
+        contract_validation_result=None,
         commands_executed=(),
         functions_executed=(),
         issue_codes=(),
@@ -667,6 +1071,7 @@ def _execute_ticker(
         if pipeline_runner is None:
             pipeline_runner = _default_pipeline_runner_callable()
         pipeline_started = time.monotonic()
+        pipeline_returned_cleanly = False
         try:
             result = pipeline_runner(
                 ticker,
@@ -683,6 +1088,7 @@ def _execute_ticker(
             base.final_readiness = (
                 _readiness_outcome_from_pipeline_result(result)
             )
+            pipeline_returned_cleanly = True
         except Exception as exc:
             outcome = PipelineOutcome(
                 attempted=True,
@@ -699,6 +1105,29 @@ def _execute_ticker(
             "confluence_pipeline_runner.run_confluence_pipeline_for_ticker",
         )
         base.final_recommended_action = FINAL_PIPELINE_EXECUTED
+        # Phase 6I-8: validate the saved-research chain
+        # AFTER the pipeline returned cleanly. The
+        # exception branch above set
+        # final_recommended_action to FINAL_PIPELINE_EXECUTED
+        # too, but the validator MUST NOT fire when the
+        # pipeline raised -- there is no on-disk state
+        # to validate against. The boolean guard pins
+        # this invariant.
+        if pipeline_returned_cleanly:
+            _run_post_pipeline_contract_validation(
+                base,
+                ticker=ticker,
+                pipeline_outcome=outcome,
+                cache_dir=cache_dir,
+                artifact_root=artifact_root,
+                stackbuilder_root=stackbuilder_root,
+                signal_library_dir=signal_library_dir,
+                current_as_of_date=current_as_of_date,
+                contract_validator=contract_validator,
+                contract_invalid_action=(
+                    FINAL_PIPELINE_EXECUTED_CONTRACT_INVALID
+                ),
+            )
         base.elapsed_seconds = time.monotonic() - started
         return base
 
@@ -807,6 +1236,7 @@ def _execute_ticker(
                 "confluence_pipeline_runner.run_confluence_pipeline_for_ticker",
             )
             pipeline_started = time.monotonic()
+            pipeline_returned_cleanly = False
             try:
                 pipeline_result_obj = pipeline_runner(
                     ticker,
@@ -826,6 +1256,7 @@ def _execute_ticker(
                         pipeline_result_obj,
                     )
                 )
+                pipeline_returned_cleanly = True
             except Exception:
                 pipeline_outcome = PipelineOutcome(
                     attempted=True,
@@ -845,6 +1276,30 @@ def _execute_ticker(
             base.final_recommended_action = (
                 FINAL_REFRESH_THEN_PIPELINE_EXECUTED
             )
+            # Phase 6I-8: validate the saved-research
+            # chain AFTER the pipeline returned cleanly.
+            # The exception branch above set
+            # final_recommended_action to
+            # FINAL_REFRESH_THEN_PIPELINE_EXECUTED too,
+            # but the validator MUST NOT fire when the
+            # pipeline raised -- there is no on-disk
+            # state to validate. The boolean guard
+            # pins this invariant.
+            if pipeline_returned_cleanly:
+                _run_post_pipeline_contract_validation(
+                    base,
+                    ticker=ticker,
+                    pipeline_outcome=pipeline_outcome,
+                    cache_dir=cache_dir,
+                    artifact_root=artifact_root,
+                    stackbuilder_root=stackbuilder_root,
+                    signal_library_dir=signal_library_dir,
+                    current_as_of_date=current_as_of_date,
+                    contract_validator=contract_validator,
+                    contract_invalid_action=(
+                        FINAL_REFRESH_THEN_PIPELINE_EXECUTED_CONTRACT_INVALID
+                    ),
+                )
         else:
             base.final_recommended_action = (
                 FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD
@@ -889,6 +1344,7 @@ def execute_daily_board_automation(
     watcher: Optional[Callable[..., Any]] = None,
     refresher: Optional[Callable[..., Any]] = None,
     pipeline_runner: Optional[Callable[..., Any]] = None,
+    contract_validator: Optional[Callable[..., Any]] = None,
     execution_log_path: Optional[Any] = None,
 ) -> DailyBoardWriteExecutionReport:
     """Run the Phase 6H-5 automation for an explicit ticker
@@ -963,6 +1419,7 @@ def execute_daily_board_automation(
             watcher=watcher_fn,
             refresher=refresher,
             pipeline_runner=pipeline_runner,
+            contract_validator=contract_validator,
         )
         executions.append(execution)
         if log_path is not None:
@@ -996,6 +1453,20 @@ def execute_daily_board_automation(
         e.ticker for e in executions
         if e.skipped_reason in blocked_skip_reasons
     )
+    # Phase 6I-8: post-pipeline contract-validation
+    # buckets.
+    contract_validated_tickers = tuple(
+        e.ticker for e in executions
+        if e.contract_validation_result is not None
+        and e.contract_validation_result.attempted
+        and e.contract_validation_result.succeeded
+    )
+    contract_invalid_tickers = tuple(
+        e.ticker for e in executions
+        if e.contract_validation_result is not None
+        and e.contract_validation_result.attempted
+        and not e.contract_validation_result.succeeded
+    )
 
     return DailyBoardWriteExecutionReport(
         generated_at=datetime.now(timezone.utc).isoformat(
@@ -1014,6 +1485,8 @@ def execute_daily_board_automation(
             skipped_pipeline_after_refresh_tickers
         ),
         blocked_tickers=blocked_tickers,
+        contract_validated_tickers=contract_validated_tickers,
+        contract_invalid_tickers=contract_invalid_tickers,
         execution_log_path=(
             str(log_path) if log_path is not None else None
         ),
