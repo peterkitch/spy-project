@@ -155,9 +155,9 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-13 (post Phase 6I-13)
+### 6. Current Sprint State as of 2026-05-13 (post Phase 6I-17)
 
-**main / origin/main HEAD:** `303e826` — `Phase 6I-13: supervised SPY pipeline/validation evidence attempt -- preconditions failed; writer NOT run (#230)`.
+**main / origin/main HEAD:** `ec3658e` — `Phase 6I-17: SPY source-ready recheck (STATE C; writer NOT prepared) (#234)`.
 
 **Sprint trajectory (Phase 6H + Phase 6I, top-to-bottom by phase number):**
 
@@ -230,7 +230,19 @@ The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest
 
 **Next-run handoff doc:** `project/md_library/shared/2026-05-13_PHASE_6I14_SPRINT_STATE_AND_NEXT_RUN_HANDOFF.md` (explicit preconditions, gate-opening condition, do-not-run-yet list).
 
-**Phase 6I-15 — read-only source-availability gate integration (PENDING; in PR, not yet merged):** new `source_availability_probe.py` module (read-only; calls the Phase 6E-5 refresher with `write=False` through an injectable callable) + wiring into the Phase 6I-9 supervised gate + Phase 6I-10 flow integrity audit. Surfaces a new advisory action `source_ready_for_supervised_refresh` on the gate **when the gate would otherwise emit `wait_for_cache_ahead_of_cutoff`** AND a no-write refresh dry-run shows `new_cache_date_range_end > resolved current_as_of_date` strictly. **The advisory action NEVER flips `safe_to_authorize_writer_now` to `true`** — it is pre-decision evidence telling the operator that running a refresh would be productive, not authorization to write. Default `include_source_availability=False` on **both** the supervised gate and the flow integrity audit; the gate CLI and the flow-audit CLI both opt in via `--include-source-availability`. In opt-in mode, the flow audit remains **no-write** but may invoke `source_availability_probe` → `signal_engine_cache_refresher` with `write=False` and therefore may trigger a **read-only provider fetch** through the refresher's default yfinance-backed callable. Doc: `project/md_library/shared/2026-05-13_PHASE_6I15_SOURCE_AVAILABILITY_GATE_INTEGRATION.md`. **Do not assume this is merged until `main` HEAD records a PR-suffixed Phase 6I-15 commit; until then the post-Phase-6I-14 behavior in § 6 above is authoritative.**
+**Sprint progression Phase 6I-15 → Phase 6I-17 (all merged):**
+
+  - **Phase 6I-15** (PR #232, squash `756fb5f`) — read-only source-availability gate integration. New module `source_availability_probe.py` exposes `evaluate_source_availability(...)` / `evaluate_source_availability_many(...)` + CLI; calls the Phase 6E-5 refresher with `write=False` through an injectable callable. New advisory action `ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH` added to `daily_board_supervised_run_gate.ALL_ACTIONS`; emitted only when the gate would otherwise produce `wait_for_cache_ahead_of_cutoff` AND a no-write refresh dry-run shows `new_cache_date_range_end > resolved current_as_of_date` strictly. **The advisory action NEVER flips `safe_to_authorize_writer_now` to `true`** — it is pre-decision evidence telling the operator that running a refresh would be productive, not authorization to write. Default `include_source_availability=False` on **both** the supervised gate and the flow integrity audit; the gate CLI and the flow-audit CLI both opt in via `--include-source-availability`. In opt-in mode, the flow audit remains **no-write** but may invoke `source_availability_probe` → `signal_engine_cache_refresher` with `write=False` and therefore may trigger a **read-only provider fetch** through the refresher's default yfinance-backed callable. Flow audit `recommended_next_evidence_step` extended to 5 cases with new case 3b: "A supervised refresh CAN BE PREPARED" when source-ready and gate emits the new advisory action. Doc: `project/md_library/shared/2026-05-13_PHASE_6I15_SOURCE_AVAILABILITY_GATE_INTEGRATION.md`.
+  - **Phase 6I-16** (PR #233, squash `ae8095d`) — docs-only SPY source-availability evidence probe. Ran the 8-probe suite from `project/` against main `756fb5f` with the pinned `spyproject2` interpreter; verdict STATE 3 (`source_equal_cutoff_wait`); production roots untouched 0/0/0 across all 5 roots; **first sprint capture of live `yfinance` provider telemetry** through the Phase 6I-12 instrumentation surface (`provider_fetch_telemetry` captured on the source-availability probe's `SourceAvailabilityState` output only — 8,378 SPY rows, `1993-01-29` → `2026-05-12`, elapsed 2.516 s). Doc: `project/md_library/shared/2026-05-13_PHASE_6I16_SPY_SOURCE_AVAILABILITY_EVIDENCE.md`.
+  - **Phase 6I-17** (PR #234, squash `ec3658e`) — docs-only SPY source-ready recheck. Re-ran the same 8-probe suite against main `ae8095d`; verdict **STATE C** (per Phase 6I-17 spec's 4-state list: cache not ahead AND source not ahead; continue waiting); both predicates remain equal (`cache_date_range_end == resolved current_as_of_date == new_cache_date_range_end == "2026-05-12"`); gate WITH `--include-source-availability` did NOT upgrade to `source_ready_for_supervised_refresh`; flow audit case-3b did NOT fire; production roots untouched 0/0/0 across all 5 roots; `provider_fetch_telemetry` re-captured (identical payload to Phase 6I-16; faster elapsed 0.843 s consistent with yfinance client-side caching). **No writer script prepared** (per State-C branch of the Phase 6I-17 spec). Doc: `project/md_library/shared/2026-05-13_PHASE_6I17_SPY_SOURCE_READY_RECHECK.md`. **Next operational action: WAIT** — re-run the same 8-probe suite at a later point. The gate moves only when the probes observe `new_cache_date_range_end > resolved current_as_of_date` strictly; the predicate is the contract; wall-clock events are at most context, never an authorization signal in their own right.
+
+**Phase 6I-18 next-probe handoff doc:** `project/md_library/shared/2026-05-13_PHASE_6I18_SOURCE_WAIT_HANDOFF.md` (post-Phase-6I-17 docs-only refresh; explicit closed-state snapshot + future trigger + remaining evidence gaps).
+
+**Remaining real-evidence gaps after Phase 6I-17** (unchanged from Phase 6I-15 onward):
+
+  - `real_confluence_pipeline_runner_write` — STILL OPEN. Closes on a future supervised run where `cache_date_range_end > resolved current_as_of_date` strictly.
+  - `real_post_pipeline_validation_on_writer_path` — STILL OPEN. Same future condition.
+  - `real_yfinance_fetch` direct fetch-call telemetry — **probe-surface capture re-confirmed** by Phase 6I-16 and Phase 6I-17; writer-surface capture (writer stdout / JSONL row / per-ticker status JSON) still awaits a future supervised writer run that actually invokes a refresh.
 
 **Phase 6E-2 preflight doc:** `project/md_library/shared/2026-05-11_PHASE_6E2_SOURCE_FRESHNESS_PREFLIGHT.md` (§ 6.8 details the persist-skip-lag `pipeline_output_lags_persist_skip` action).
 
@@ -242,7 +254,7 @@ The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest
 
 ---
 
-### 6.1. (Historical — superseded by 2026-05-13 / Phase 6I-13 sprint state above) Daily Signal Board visual baseline (as of 2026-05-12, Phase 6G-5)
+### 6.1. (Historical — superseded by 2026-05-13 / Phase 6I-17 sprint state above) Daily Signal Board visual baseline (as of 2026-05-12, Phase 6G-5)
 
 The Phase 6G-5 / Town Notice Board section below is preserved verbatim because the Daily Signal Board's seven-section hierarchy, public-meaning framing, and SPY pilot pinned-cutoff recipe are still load-bearing for visual / UX review work. Production-automation state has since moved through Phase 6H + Phase 6I and is documented in § 6 above; **for current automation state, follow § 6, not this section.**
 
