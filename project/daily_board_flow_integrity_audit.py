@@ -1161,25 +1161,72 @@ def run_daily_board_flow_integrity_audit(
         and production_roots_untouched
     )
 
-    recommended_next = (
-        "Authorize a SUPERVISED first production "
-        "writer run for ONE write-ready ticker on a "
-        "controlled day; confirm post-pipeline contract "
-        "validation surfaces the Phase 6I-8 JSONL "
-        "validator marker. Until that run is captured, "
-        "the writer + refresher + pipeline + post-"
-        "pipeline-validation surfaces remain proven "
-        "only with fake callables OR temp-root "
-        "rehearsals."
-        if safe_to_consider
-        else (
-            "Resolve the failing read-only checks BEFORE "
-            "any authorized run. The composite verdict "
-            "safe_to_consider_authorized_run_after_review "
-            "is False; see stage_checks for the failing "
-            "stage(s)."
-        )
+    # Phase 6I-12: text-selection now distinguishes four
+    # disjoint cases instead of a single binary True/False
+    # fork. The previous wording said "Resolve the failing
+    # read-only checks" whenever ``safe_to_consider`` was
+    # False, even when no stage actually failed (e.g. the
+    # gate moved to ``wait_for_cache_ahead_of_cutoff`` with
+    # all stages still passing); see the Phase 6I-11
+    # evidence-run doc § 9. The four cases are evaluated
+    # in priority order: stage failure first (most urgent),
+    # then production-root mutation (a regression signal
+    # that supersedes the gate verdict), then gate-not-safe
+    # with all stages passing (an operator-action signal,
+    # not a failure signal), then the supervised-run-ready
+    # case.
+    gate_action = str(
+        gate_summary.get("recommended_operator_action", ""),
     )
+    if not all_passed:
+        recommended_next = (
+            "Resolve the failing read-only checks BEFORE "
+            "any authorized run. One or more stage_checks "
+            "have ``passed=False``; see stage_checks for "
+            "the failing stage(s) and their issue_codes."
+        )
+    elif not production_roots_untouched:
+        recommended_next = (
+            "Investigate production-root mutation BEFORE "
+            "any authorized run. All read-only stage_checks "
+            "passed, but the audit's before/after snapshot "
+            "of the five production roots "
+            "("
+            "cache/results, cache/status, "
+            "output/research_artifacts, "
+            "signal_library/data/stable, "
+            "output/stackbuilder"
+            ") differs. Snapshot precision: "
+            f"{PRODUCTION_ROOT_SNAPSHOT_STRATEGY}. This "
+            "is a regression guard, not a forensic "
+            "byte-hash audit; identify which root drifted "
+            "and why before proceeding."
+        )
+    elif not gate_safe:
+        recommended_next = (
+            "Do NOT authorize the writer now. All "
+            "read-only stage_checks passed AND the "
+            "production roots stayed untouched, but the "
+            "supervised gate is not safe; "
+            f"recommended_operator_action="
+            f"{gate_action!r}. No read-only stage failed "
+            "-- this is an operator-action signal, not a "
+            "regression. Resolve the gate's blocking "
+            "conditions (or wait for the calendar position "
+            "that clears them) and re-run this audit."
+        )
+    else:
+        recommended_next = (
+            "Authorize a SUPERVISED first production "
+            "writer run for ONE write-ready ticker on a "
+            "controlled day; confirm post-pipeline contract "
+            "validation surfaces the Phase 6I-8 JSONL "
+            "validator marker. Until that run is captured, "
+            "the writer + refresher + pipeline + post-"
+            "pipeline-validation surfaces remain proven "
+            "only with fake callables OR temp-root "
+            "rehearsals."
+        )
 
     return FlowIntegrityAuditReport(
         generated_at=datetime.now(timezone.utc).isoformat(

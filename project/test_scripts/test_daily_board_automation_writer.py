@@ -3035,3 +3035,197 @@ def test_phase_6i8_skip_paths_omit_validator_marker(
         dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
         not in report.executions[0].functions_executed
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-12: writer carries provider_fetch_telemetry through stdout + JSONL
+# ---------------------------------------------------------------------------
+
+
+class _FakeRefreshResultWithTelemetry(_FakeRefreshResult):
+    """Extends the base fake refresh result so a single
+    test can return a refresh outcome PLUS a Phase 6I-12
+    ``provider_fetch_telemetry`` payload."""
+
+    def __init__(
+        self,
+        *args,
+        provider_fetch_telemetry=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.provider_fetch_telemetry = (
+            provider_fetch_telemetry
+        )
+
+
+def test_phase_6i12_writer_carries_provider_telemetry_into_stdout_and_jsonl(
+    tmp_path: Path,
+):
+    """Fake refresher returns a refresh result whose
+    ``provider_fetch_telemetry`` mimics the Phase 6I-12
+    refresher payload. The writer must forward the
+    telemetry verbatim into the
+    ``execution.refresh_result.provider_fetch_telemetry``
+    field, into the report-level JSON (stdout payload),
+    and into the JSONL execution-log row's
+    ``refresh_result.provider_fetch_telemetry`` field."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    fake_telemetry_dict = {
+        "provider_name": "fake_yfinance_test_double",
+        "fetch_attempted": True,
+        "fetch_succeeded": True,
+        "ticker": "SPY",
+        "rows": 42,
+        "date_range_start": "2024-12-30",
+        "date_range_end": "2026-05-12",
+        "elapsed_seconds": 0.1234,
+        "error": None,
+    }
+
+    recorder = _CallRecorder()
+    refresher = _refresher_factory(
+        recorder,
+        _FakeRefreshResultWithTelemetry(
+            refreshed=True,
+            old="2024-01-31",
+            new="2026-05-12",
+            stale_before=True,
+            current_after=True,
+            issue_codes=(),
+            provider_fetch_telemetry=fake_telemetry_dict,
+        ),
+    )
+    watcher = _watcher_factory(
+        recorder,
+        _FakeWatcherState(
+            action="ready_for_pipeline_write",
+            cache_date_range_end="2026-05-12",
+            current_as_of_date="2026-05-08",
+        ),
+    )
+    pipeline_runner = _pipeline_runner_factory(
+        recorder,
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            ranking_blocked_reason="",
+            issue_codes=(),
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                issue_codes=(),
+                current_as_of_date="2026-05-08",
+            ),
+        ),
+    )
+
+    log_path = tmp_path / "automation_log.jsonl"
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        refresher=refresher,
+        watcher=watcher,
+        pipeline_runner=pipeline_runner,
+        contract_validator=_passing_validator(),
+        execution_log_path=log_path,
+        **dirs,
+    )
+
+    # In-memory: telemetry survives onto the
+    # RefreshOutcome dataclass as a plain JSON dict.
+    exec_state = report.executions[0]
+    assert exec_state.refresh_result is not None
+    assert exec_state.refresh_result.attempted is True
+    assert exec_state.refresh_result.succeeded is True
+    telemetry_on_outcome = (
+        exec_state.refresh_result.provider_fetch_telemetry
+    )
+    assert telemetry_on_outcome is not None
+    assert isinstance(telemetry_on_outcome, dict)
+    assert telemetry_on_outcome == fake_telemetry_dict
+
+    # Report JSON (stdout payload): telemetry under
+    # executions[0].refresh_result.provider_fetch_telemetry.
+    payload = report.to_json_dict()
+    refresh_json = (
+        payload["executions"][0]["refresh_result"]
+    )
+    assert (
+        refresh_json["provider_fetch_telemetry"]
+        == fake_telemetry_dict
+    )
+
+    # JSONL log: one row, same telemetry block.
+    lines = log_path.read_text(
+        encoding="utf-8",
+    ).splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert (
+        record["refresh_result"][
+            "provider_fetch_telemetry"
+        ]
+        == fake_telemetry_dict
+    )
+
+
+def test_phase_6i12_writer_skip_path_has_no_provider_telemetry(
+    tmp_path: Path,
+):
+    """A writer invocation where no refresh runs (here:
+    dry-run, ``write_authorized=False``) must NOT
+    produce provider_fetch_telemetry: there is no
+    refresh outcome to carry telemetry, so
+    ``execution.refresh_result`` is ``None`` and the
+    JSON / JSONL row's ``refresh_result`` is ``None`` --
+    not a dict with telemetry."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+
+    log_path = tmp_path / "automation_log.jsonl"
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=False,
+        current_as_of_date="2026-05-08",
+        refresher=lambda *a, **k: pytest.fail(
+            "refresher must not be called on the dry-run "
+            "path",
+        ),
+        pipeline_runner=lambda *a, **k: pytest.fail(
+            "pipeline_runner must not be called on the "
+            "dry-run path",
+        ),
+        execution_log_path=log_path,
+        **dirs,
+    )
+
+    exec_state = report.executions[0]
+    # No refresh executed -> no refresh outcome -> no
+    # telemetry surface.
+    assert exec_state.refresh_result is None
+
+    payload = report.to_json_dict()
+    assert (
+        payload["executions"][0]["refresh_result"] is None
+    )
+
+    lines = log_path.read_text(
+        encoding="utf-8",
+    ).splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["refresh_result"] is None
+    # Defensive: there is no top-level
+    # ``provider_fetch_telemetry`` key on the execution
+    # row either.
+    assert "provider_fetch_telemetry" not in record

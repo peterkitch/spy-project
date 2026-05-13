@@ -146,6 +146,56 @@ OPTIMIZER_V1_SCOPE = "optimizer_v1"
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_PROVIDER_NAME = "yfinance"
+
+
+@dataclass
+class ProviderFetchTelemetry:
+    """Phase 6I-12: fetch-attempt/result telemetry for the
+    source-data fetcher invocation.
+
+    This is **fetch-call telemetry**, not HTTP / wire-level
+    telemetry. It records whether the refresher entered the
+    fetcher call, whether the call returned cleanly, the
+    shape of the returned data (row count + index date range
+    when available), the elapsed time **inside the fetcher
+    callable**, the provider name, and the short error class
+    name when the call raised. It does NOT capture HTTP
+    status codes, request/response identifiers, or any
+    provider-side telemetry that lives below the
+    ``data_fetcher`` callable boundary.
+
+    Populated when the refresher actually invokes the
+    ``data_fetcher`` callable. Refresh paths that exit before
+    the fetcher call (invalid ticker, invalid ``max_sma_day``)
+    do not produce telemetry; ``provider_fetch_telemetry`` is
+    ``None`` on those results.
+    """
+
+    provider_name: str
+    fetch_attempted: bool
+    fetch_succeeded: bool
+    ticker: str
+    rows: int
+    date_range_start: Optional[str]
+    date_range_end: Optional[str]
+    elapsed_seconds: float
+    error: Optional[str]
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "provider_name": str(self.provider_name),
+            "fetch_attempted": bool(self.fetch_attempted),
+            "fetch_succeeded": bool(self.fetch_succeeded),
+            "ticker": str(self.ticker),
+            "rows": int(self.rows),
+            "date_range_start": self.date_range_start,
+            "date_range_end": self.date_range_end,
+            "elapsed_seconds": float(self.elapsed_seconds),
+            "error": self.error,
+        }
+
+
 @dataclass
 class SignalEngineRefreshResult:
     """One refresh attempt's outcome. ``refreshed`` is True
@@ -164,6 +214,13 @@ class SignalEngineRefreshResult:
     current_after: bool
     issue_codes: tuple[str, ...]
     elapsed_seconds: float
+    # Phase 6I-12 additive field. ``None`` on refresh paths
+    # that never entered the fetcher call (invalid ticker /
+    # invalid max_sma_day); a populated
+    # ``ProviderFetchTelemetry`` on every path that reached
+    # the fetcher invocation, including the fetcher-
+    # exception path. Existing fields are unchanged.
+    provider_fetch_telemetry: Optional[ProviderFetchTelemetry] = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +236,11 @@ class SignalEngineRefreshResult:
             "current_after": bool(self.current_after),
             "issue_codes": list(self.issue_codes),
             "elapsed_seconds": float(self.elapsed_seconds),
+            "provider_fetch_telemetry": (
+                self.provider_fetch_telemetry.to_json_dict()
+                if self.provider_fetch_telemetry is not None
+                else None
+            ),
         }
 
 
@@ -427,9 +489,20 @@ def _atomic_pickle_write(
 
 
 def _write_status(
-    status_path: Path, ticker: str, cache_status: str,
+    status_path: Path,
+    ticker: str,
+    cache_status: str,
+    provider_fetch_telemetry: Optional[ProviderFetchTelemetry] = None,
 ) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
+    # Phase 6I-12: additive ``provider_fetch_telemetry``
+    # key on the status JSON. Carries the same JSON shape
+    # the refresher result + writer stdout / JSONL row
+    # already carry; ``null`` when the status was written
+    # before the fetcher call could be observed. The new
+    # key is appended after the existing fields so any
+    # downstream consumer that ignores unknown keys keeps
+    # working.
     payload = {
         "ticker": ticker,
         "status": "complete",
@@ -439,6 +512,11 @@ def _write_status(
             timespec="seconds",
         ),
         "producer": "signal_engine_cache_refresher",
+        "provider_fetch_telemetry": (
+            provider_fetch_telemetry.to_json_dict()
+            if provider_fetch_telemetry is not None
+            else None
+        ),
     }
     tmp = status_path.with_suffix(status_path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -589,6 +667,7 @@ def refresh_signal_engine_cache(
     max_sma_day: Optional[int] = None,
     data_fetcher: Optional[Callable[[str], pd.DataFrame]] = None,
     current_as_of_date: Optional[str] = None,
+    provider_name: Optional[str] = None,
 ) -> SignalEngineRefreshResult:
     """Phase 6E-5 Signal Engine cache refresher for one
     explicit ticker.
@@ -716,10 +795,39 @@ def refresh_signal_engine_cache(
     )
 
     fetcher = data_fetcher or _default_yfinance_fetcher
+    # Phase 6I-12: derive provider_name. Explicit kwarg wins;
+    # else inspect fetcher attribute; else "yfinance" when
+    # using the default fetcher; else "custom_callable".
+    if provider_name is not None:
+        resolved_provider_name = str(provider_name)
+    elif data_fetcher is None:
+        resolved_provider_name = DEFAULT_PROVIDER_NAME
+    else:
+        resolved_provider_name = str(
+            getattr(
+                data_fetcher,
+                "PROVIDER_NAME",
+                "custom_callable",
+            )
+        )
+
     issues: list[str] = []
+    fetch_started = time.monotonic()
     try:
         raw_df = fetcher(norm_ticker)
-    except Exception:
+    except Exception as exc:
+        fetch_elapsed = time.monotonic() - fetch_started
+        telemetry = ProviderFetchTelemetry(
+            provider_name=resolved_provider_name,
+            fetch_attempted=True,
+            fetch_succeeded=False,
+            ticker=norm_ticker,
+            rows=0,
+            date_range_start=None,
+            date_range_end=None,
+            elapsed_seconds=fetch_elapsed,
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
         return SignalEngineRefreshResult(
             ticker=norm_ticker,
             write=bool(write),
@@ -733,7 +841,42 @@ def refresh_signal_engine_cache(
             current_after=False,
             issue_codes=(ISSUE_DATA_FETCH_FAILED,),
             elapsed_seconds=time.monotonic() - started,
+            provider_fetch_telemetry=telemetry,
         )
+    fetch_elapsed = time.monotonic() - fetch_started
+
+    # Telemetry shape for the post-call branch. ``rows`` and
+    # the index date range are populated only when the call
+    # returned a non-empty DataFrame; in that case we treat
+    # the fetcher itself as having succeeded (downstream
+    # contract checks like ``ISSUE_DATA_NO_CLOSE_COLUMN``
+    # still apply on the refresh result, but they are not
+    # the fetcher's fault).
+    fetch_rows = 0
+    fetch_start_date: Optional[str] = None
+    fetch_end_date: Optional[str] = None
+    fetcher_returned_usable_df = (
+        isinstance(raw_df, pd.DataFrame) and not raw_df.empty
+    )
+    if fetcher_returned_usable_df:
+        fetch_rows = int(len(raw_df.index))
+        try:
+            fetch_start_date = _date_to_iso(raw_df.index[0])
+            fetch_end_date = _date_to_iso(raw_df.index[-1])
+        except Exception:
+            fetch_start_date = None
+            fetch_end_date = None
+    telemetry = ProviderFetchTelemetry(
+        provider_name=resolved_provider_name,
+        fetch_attempted=True,
+        fetch_succeeded=bool(fetcher_returned_usable_df),
+        ticker=norm_ticker,
+        rows=fetch_rows,
+        date_range_start=fetch_start_date,
+        date_range_end=fetch_end_date,
+        elapsed_seconds=fetch_elapsed,
+        error=None,
+    )
 
     if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
         return SignalEngineRefreshResult(
@@ -749,6 +892,7 @@ def refresh_signal_engine_cache(
             current_after=False,
             issue_codes=(ISSUE_DATA_EMPTY,),
             elapsed_seconds=time.monotonic() - started,
+            provider_fetch_telemetry=telemetry,
         )
 
     if "Close" not in raw_df.columns:
@@ -765,6 +909,7 @@ def refresh_signal_engine_cache(
             current_after=False,
             issue_codes=(ISSUE_DATA_NO_CLOSE_COLUMN,),
             elapsed_seconds=time.monotonic() - started,
+            provider_fetch_telemetry=telemetry,
         )
 
     # Run the Phase 6E-4 SMA-pair optimizer over the
@@ -793,6 +938,7 @@ def refresh_signal_engine_cache(
                 *opt_result.issue_codes,
             ),
             elapsed_seconds=time.monotonic() - started,
+            provider_fetch_telemetry=telemetry,
         )
 
     preprocessed = opt_result.preprocessed_data
@@ -823,6 +969,7 @@ def refresh_signal_engine_cache(
             current_after=current_after,
             issue_codes=(ISSUE_DRY_RUN,),
             elapsed_seconds=time.monotonic() - started,
+            provider_fetch_telemetry=telemetry,
         )
 
     # write=True path. The defensive scope check refuses
@@ -839,6 +986,7 @@ def refresh_signal_engine_cache(
         stale_before=stale_before,
         current_after=current_after,
         started=started,
+        provider_fetch_telemetry=telemetry,
     )
 
 
@@ -853,6 +1001,7 @@ def _write_optimizer_payload_or_block(
     stale_before: bool,
     current_after: bool,
     started: float,
+    provider_fetch_telemetry: Optional[ProviderFetchTelemetry] = None,
 ) -> SignalEngineRefreshResult:
     """Write guard + atomic writer. Refuses every payload
     that is not stamped ``OPTIMIZER_V1_SCOPE``; for the
@@ -884,6 +1033,7 @@ def _write_optimizer_payload_or_block(
             current_after=current_after,
             issue_codes=(block_code,),
             elapsed_seconds=time.monotonic() - started,
+            provider_fetch_telemetry=provider_fetch_telemetry,
         )
 
     issues: list[str] = []
@@ -910,6 +1060,7 @@ def _write_optimizer_payload_or_block(
     _write_status(
         target_status_path, norm_ticker,
         cache_status="fresh" if current_after else "stale",
+        provider_fetch_telemetry=provider_fetch_telemetry,
     )
 
     return SignalEngineRefreshResult(
@@ -927,6 +1078,7 @@ def _write_optimizer_payload_or_block(
         current_after=current_after,
         issue_codes=tuple(issues),
         elapsed_seconds=time.monotonic() - started,
+        provider_fetch_telemetry=provider_fetch_telemetry,
     )
 
 

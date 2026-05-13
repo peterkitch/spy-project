@@ -1039,3 +1039,219 @@ def test_seven_downstream_modules_have_no_forbidden_top_imports():
         "downstream modules carry forbidden top-level "
         f"imports: {violations!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Phase 6I-12 wording refinement: recommended_next_evidence_step
+#     selects across four disjoint cases instead of a single
+#     True/False fork.
+# ---------------------------------------------------------------------------
+
+
+def test_wording_gate_not_safe_with_all_stages_passing_does_not_blame_stages(
+    monkeypatch, tmp_path: Path,
+):
+    """Phase 6I-12 Scope A: when every stage_check passes
+    AND production_roots_untouched is True AND the
+    supervised gate is not safe, the recommended-next
+    text must NOT say "Resolve the failing read-only
+    checks" -- no stage failed."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    def fake_queue_and_gate(*a, **k):
+        passing = audit.StageCheck(
+            stage=audit.STAGE_QUEUE_AND_GATE,
+            passed=True,
+            detail="injected: gate-not-safe with stages OK",
+            issue_codes=(),
+            notes=(
+                "Synthetic gate verdict for "
+                "wording-selection test.",
+            ),
+        )
+        queue_summary = {
+            "queue_counts": {},
+            "queue_truncation": {},
+        }
+        gate_summary = {
+            "safe_to_authorize_writer_now": False,
+            "recommended_operator_action": (
+                "wait_for_cache_ahead_of_cutoff"
+            ),
+            "authorization_candidate_tickers": [],
+            "blocking_reasons": [
+                "waiting_for_cache_ahead_of_cutoff",
+            ],
+            "advisory_commands_count": 0,
+            "discovered_stackbuilder_ticker_count": 0,
+            "inspected_count": 1,
+            "positive_tail_count": 0,
+            "negative_tail_count": 0,
+            "low_buy_tail_count": 0,
+        }
+        return passing, queue_summary, gate_summary
+
+    monkeypatch.setattr(
+        audit, "_stage_queue_and_gate", fake_queue_and_gate,
+    )
+    report = audit.run_daily_board_flow_integrity_audit(
+        tickers=["SPY"],
+        current_as_of_date="2026-05-08",
+        snapshot_production_roots=False,
+        **dirs,
+    )
+
+    assert report.all_read_only_checks_passed is True
+    assert report.production_roots_untouched is True
+    assert (
+        report.gate_summary[
+            "safe_to_authorize_writer_now"
+        ]
+        is False
+    )
+    assert (
+        report.safe_to_consider_authorized_run_after_review
+        is False
+    )
+
+    text = report.recommended_next_evidence_step
+    # Must NOT use the stage-failure wording.
+    assert "Resolve the failing read-only checks" not in (
+        text
+    ), (
+        "gate-not-safe + stages-all-pass shape should not "
+        "use stage-failure wording; got: "
+        f"{text!r}"
+    )
+    # Must NOT use the supervised-run-ready wording.
+    assert "Authorize a SUPERVISED first production" not in (
+        text
+    ), (
+        "gate-not-safe shape should not use the "
+        "supervised-run-ready wording; got: "
+        f"{text!r}"
+    )
+    # Must surface the gate's action name verbatim so the
+    # operator knows which condition to clear.
+    assert "wait_for_cache_ahead_of_cutoff" in text, (
+        "gate-not-safe text must surface the gate's "
+        "recommended_operator_action; got: "
+        f"{text!r}"
+    )
+    assert "Do NOT authorize the writer now" in text, (
+        "gate-not-safe text must lead with the do-not-"
+        "authorize verdict; got: "
+        f"{text!r}"
+    )
+
+
+def test_wording_injected_stage_failure_uses_failure_text(
+    monkeypatch, tmp_path: Path,
+):
+    """Phase 6I-12 Scope A: an injected stage failure
+    must still produce the failing-stage wording, with
+    or without ``Resolve the failing read-only checks``
+    phrasing preserved across the wording refresh."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    def fake_writer_static(*a, **k):
+        return (
+            audit.StageCheck(
+                stage=audit.STAGE_WRITER_STATIC,
+                passed=False,
+                detail="injected failure",
+                issue_codes=("injected_failure",),
+                notes=(),
+            ),
+            {"injected": True},
+        )
+
+    monkeypatch.setattr(
+        audit, "_stage_writer_static", fake_writer_static,
+    )
+    report = audit.run_daily_board_flow_integrity_audit(
+        tickers=["SPY"],
+        current_as_of_date="2026-05-08",
+        snapshot_production_roots=False,
+        **dirs,
+    )
+    assert report.all_read_only_checks_passed is False
+    text = report.recommended_next_evidence_step
+    assert "Resolve the failing read-only checks" in text
+    # Stage-failure text must take priority over the
+    # gate or roots-mutation branches.
+    assert "Do NOT authorize the writer now" not in text
+    assert "Investigate production-root mutation" not in (
+        text
+    )
+
+
+def test_wording_production_root_mutation_uses_mutation_text(
+    monkeypatch, tmp_path: Path,
+):
+    """Phase 6I-12 Scope A: simulate production-root
+    mutation by monkeypatching ``_snapshot_production_roots``
+    to return different snapshots on call 1 vs call 2.
+    The audit must surface the production-root-mutation
+    wording instead of the gate or stage-failure
+    wording. **This test never writes a production root
+    on disk** -- the simulation is entirely in the
+    monkeypatched return value."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    snapshots = iter([
+        {"cache_results": {"SPY.pkl": (100, 1.0)}},
+        {"cache_results": {"SPY.pkl": (101, 2.0)}},
+    ])
+
+    def fake_snapshot_production_roots():
+        return next(snapshots)
+
+    monkeypatch.setattr(
+        audit,
+        "_snapshot_production_roots",
+        fake_snapshot_production_roots,
+    )
+    report = audit.run_daily_board_flow_integrity_audit(
+        tickers=["SPY"],
+        current_as_of_date="2026-05-08",
+        snapshot_production_roots=True,
+        **dirs,
+    )
+
+    assert report.all_read_only_checks_passed is True
+    assert report.production_roots_untouched is False
+    assert (
+        report.safe_to_consider_authorized_run_after_review
+        is False
+    )
+    text = report.recommended_next_evidence_step
+    assert "Investigate production-root mutation" in text
+    assert "relative_path_size_mtime" in text
+    # Roots-mutation text must take priority over the
+    # gate or supervised-run branches when all stages
+    # passed.
+    assert "Do NOT authorize the writer now" not in text
+    assert "Authorize a SUPERVISED first production" not in (
+        text
+    )
+    # Roots-mutation text must NOT borrow the stage-
+    # failure wording, since no stage failed.
+    assert "Resolve the failing read-only checks" not in (
+        text
+    )
