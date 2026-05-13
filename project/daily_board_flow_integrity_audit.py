@@ -31,8 +31,17 @@ Strictly read-only / offline
   - No writer / refresher / pipeline runner / live
     engine import at the audit module's top level.
   - Production roots are snapshotted before and after
-    the full audit and asserted byte-mtime-identical;
-    the report exposes ``production_roots_untouched``.
+    the full audit and asserted **relative path + size
+    + mtime identical**. This is a no-write regression
+    guard, NOT a forensic byte-hash audit -- the
+    snapshot strategy is exposed on the report as
+    ``production_root_snapshot_strategy =
+    "relative_path_size_mtime"`` so downstream
+    consumers see the exact precision of the
+    untouched-roots claim. Adding full content
+    hashing across production roots is deliberately
+    out of scope: the roots are large and the audit
+    stays lightweight / read-only.
 
 Public surface
 --------------
@@ -147,6 +156,21 @@ _PRODUCTION_ROOT_NAMES: tuple[str, ...] = (
     "stackbuilder",
 )
 
+# Codex-amendment: exact label for the snapshot
+# precision used by this audit. Recorded on the report
+# so downstream consumers see the precision of the
+# ``production_roots_untouched`` claim instead of
+# inferring "byte-identical" or "hash-identical". The
+# audit's snapshot helper ``_snapshot_root`` records
+# ``{relative_path: (size, mtime)}`` per file; that is
+# the inventory compared before/after. Adding full
+# content hashing across production roots is
+# deliberately out of scope (the roots are large and
+# the audit must stay lightweight).
+PRODUCTION_ROOT_SNAPSHOT_STRATEGY = (
+    "relative_path_size_mtime"
+)
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -176,6 +200,12 @@ class FlowIntegrityAuditReport:
     stage_checks: tuple[StageCheck, ...]
     all_read_only_checks_passed: bool
     production_roots_untouched: bool
+    # Codex-amendment: exact precision of the
+    # production-roots-untouched check. Always
+    # ``"relative_path_size_mtime"`` for this audit;
+    # downstream consumers see the precision instead
+    # of inferring byte / hash identity.
+    production_root_snapshot_strategy: str
     upstream_summary: dict[str, Any]
     contract_summary: dict[str, Any]
     ranking_summary: dict[str, Any]
@@ -216,6 +246,9 @@ def _report_to_json_dict(
         ),
         "production_roots_untouched": bool(
             r.production_roots_untouched,
+        ),
+        "production_root_snapshot_strategy": (
+            r.production_root_snapshot_strategy
         ),
         "upstream_summary": dict(r.upstream_summary),
         "contract_summary": dict(r.contract_summary),
@@ -1037,9 +1070,14 @@ def run_daily_board_flow_integrity_audit(
     Phase 6I-7 Spymaster helper, and a static TEXT scan
     of the Phase 6H-5 / 6I-8 writer. The writer module
     is NEVER imported by this audit. Production roots
-    are snapshotted before and after and asserted byte-
-    mtime-identical when ``snapshot_production_roots``
-    is True (the default).
+    are snapshotted before and after and asserted
+    **relative path + size + mtime identical** when
+    ``snapshot_production_roots`` is True (the default).
+    The exact snapshot precision is recorded on the
+    report as
+    ``production_root_snapshot_strategy =
+    "relative_path_size_mtime"``. This is a no-write
+    regression guard, NOT a forensic byte-hash audit.
     """
     resolved_cutoff = _cpr.resolve_current_as_of_date(
         current_as_of_date,
@@ -1153,6 +1191,9 @@ def run_daily_board_flow_integrity_audit(
         all_read_only_checks_passed=bool(all_passed),
         production_roots_untouched=bool(
             production_roots_untouched,
+        ),
+        production_root_snapshot_strategy=(
+            PRODUCTION_ROOT_SNAPSHOT_STRATEGY
         ),
         upstream_summary=upstream_summary,
         contract_summary=contract_summary,

@@ -568,6 +568,7 @@ def test_report_json_shape_has_stable_keys(tmp_path: Path):
         "stage_checks",
         "all_read_only_checks_passed",
         "production_roots_untouched",
+        "production_root_snapshot_strategy",
         "upstream_summary",
         "contract_summary",
         "ranking_summary",
@@ -832,9 +833,17 @@ def test_temp_root_rehearsal_production_roots_untouched(
     tmp_path: Path,
 ):
     """Run the audit against a full tmp fixture; the
-    production-roots before/after snapshots must match
-    (audit module does not write under cache/, output/,
-    signal_library/, stackbuilder/)."""
+    production-roots before/after **relative path +
+    size + mtime** inventory must match (audit module
+    does not write under cache/, output/,
+    signal_library/, stackbuilder/).
+
+    Note: this is a no-write regression guard, NOT a
+    forensic byte-hash audit. The snapshot helper
+    captures ``{relative_path: (size, mtime)}`` per
+    file; the audit's
+    ``production_root_snapshot_strategy`` field on the
+    report records this precision explicitly."""
     dirs = _layout(tmp_path)
     _write_full_valid_fixture(
         dirs, "SPY",
@@ -844,6 +853,8 @@ def test_temp_root_rehearsal_production_roots_untouched(
     # Snapshot real production roots ourselves to
     # double-check the audit's verdict (and to confirm
     # the audit's snapshot helper is doing real work).
+    # The snapshot precision is relative-path + size +
+    # mtime per file (NOT a byte hash).
     project_dir = Path(audit.__file__).resolve().parent
     production_roots = (
         project_dir / "cache" / "results",
@@ -867,10 +878,50 @@ def test_temp_root_rehearsal_production_roots_untouched(
         for p in production_roots
     }
     assert before == after, (
-        "audit run mutated production roots: "
-        "this is a hard safety violation"
+        "audit run mutated production roots "
+        "(relative path / size / mtime inventory "
+        "differed): this is a hard safety violation"
     )
     assert report.production_roots_untouched is True
+    # Codex-amendment: the report must record the
+    # snapshot precision so downstream consumers don't
+    # infer "byte-identical" from the
+    # ``production_roots_untouched`` boolean.
+    assert report.production_root_snapshot_strategy == (
+        "relative_path_size_mtime"
+    )
+
+
+def test_production_root_snapshot_strategy_in_json(
+    tmp_path: Path,
+):
+    """Codex-amendment regression pin: the JSON report
+    must expose ``production_root_snapshot_strategy``
+    with the exact literal value the audit module
+    declares as its constant. Round-trip through
+    json.dumps/loads to confirm serialization."""
+    dirs = _layout(tmp_path)
+    report = audit.run_daily_board_flow_integrity_audit(
+        tickers=["ZZZ"],
+        current_as_of_date="2026-05-08",
+        snapshot_production_roots=False,
+        **dirs,
+    )
+    payload = report.to_json_dict()
+    assert (
+        "production_root_snapshot_strategy" in payload
+    )
+    assert payload[
+        "production_root_snapshot_strategy"
+    ] == "relative_path_size_mtime"
+    assert payload[
+        "production_root_snapshot_strategy"
+    ] == audit.PRODUCTION_ROOT_SNAPSHOT_STRATEGY
+    # Serializable round-trip.
+    reparsed = json.loads(json.dumps(payload))
+    assert reparsed[
+        "production_root_snapshot_strategy"
+    ] == "relative_path_size_mtime"
 
 
 # ---------------------------------------------------------------------------

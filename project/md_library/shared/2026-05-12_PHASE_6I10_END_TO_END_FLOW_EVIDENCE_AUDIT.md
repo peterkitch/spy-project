@@ -97,9 +97,17 @@ OnePass / ImpactSearch / StackBuilder saved inputs
     every file under `cache/results/`, `cache/status/`,
     `output/research_artifacts/`,
     `signal_library/data/stable/`,
-    `output/stackbuilder/` (size + mtime). The
-    `production_roots_untouched` boolean is exposed on
-    the report.
+    `output/stackbuilder/` keyed by **relative path**
+    with **(size, mtime)** values per file. The
+    `production_roots_untouched` boolean and the
+    `production_root_snapshot_strategy = "relative_path_size_mtime"`
+    string are both exposed on the report so
+    downstream consumers see the **exact precision** of
+    the untouched-roots claim. This is a no-write
+    regression guard, NOT a forensic byte-hash audit;
+    full content hashing across production roots is
+    deliberately out of scope (the roots are large and
+    the audit must stay lightweight / read-only).
 
 ### 2.2 Test file: `project/test_scripts/test_daily_board_flow_integrity_audit.py`
 
@@ -121,8 +129,9 @@ OnePass / ImpactSearch / StackBuilder saved inputs
   8. **Full valid tmp fixture → all 6 stages pass +
      `production_roots_untouched=True`** (the
      temp-root rehearsal). Snapshots production roots
-     before and after and asserts byte-mtime-
-     identical.
+     before and after and asserts the **relative path
+     + size + mtime inventory match** (see § 4 for
+     the exact precision contract).
   9. One failed stage flips
      `all_read_only_checks_passed = False` AND
      `safe_to_consider_authorized_run_after_review =
@@ -166,7 +175,7 @@ OnePass / ImpactSearch / StackBuilder saved inputs
 | Phase 6H-5 / 6I-8 guarded writer (static) | Writer source TEXT inspected: required tokens, top-level imports, no age-window substrings | `test_writer_static_audit_catches_missing_marker`, `test_writer_static_audit_catches_forbidden_import`, real-cache smoke | **Pass** | **Writer runtime proven only with fake callables + temp-root rehearsals (Phase 6I-8 writer test 11).** Real authorized writer invocation against production roots NOT yet proven |
 | Phase 6I-8 post-pipeline contract validator on writer path | Validator marker / final-action constants / lazy resolver presence verified in writer source TEXT | `test_writer_static_audit_catches_missing_marker` (negative pin) | **Pass (static)** | **Real post-pipeline validation on an authorized run NOT yet proven.** Surfaced as `simulated_real_post_pipeline_validation_on_writer_path` |
 | Phase 6I-7 Spymaster master-audit helper | Helper module imported (NOT the Dash server); required names asserted; render path exercised against unavailable-state branch | `test_full_valid_fixture_all_stages_pass`'s spymaster-helper stage; real-cache smokes | **Pass** | Spymaster Dash app boot not exercised here (covered by Phase 6I-7's own boot smoke). UI consumer surface of the new audit not yet wired |
-| Production-roots untouched | Audit module snapshots every file under five production roots (size + mtime) before and after; report exposes the boolean | `test_temp_root_rehearsal_production_roots_untouched` directly snapshots production roots itself; both real-cache smokes report `production_roots_untouched: True` | **Pass** | The audit can't prove a future regression that mutates roots; the test is the regression gate going forward |
+| Production-roots untouched | Audit module snapshots every file under five production roots, keyed by **relative path** with **(size, mtime)** values per file, before and after; report exposes the boolean AND the `production_root_snapshot_strategy = "relative_path_size_mtime"` precision string | `test_temp_root_rehearsal_production_roots_untouched` directly snapshots production roots itself; `test_production_root_snapshot_strategy_in_json` pins the precision string in the JSON; both real-cache smokes report `production_roots_untouched: True` | **Pass** | This is a no-write regression guard, not a forensic byte-hash audit. The relative-path-size-mtime inventory catches every documented attack on the audit's read-only contract (file create / file delete / file overwrite-with-different-size / mtime-bump) without forcing full content hashing across large production roots. Future enhancement could add per-file content hashing if a stronger forensic claim is ever required, but that is out of scope for Phase 6I-10 |
 
 ### What's proven vs still simulated / inferred
 
@@ -302,13 +311,20 @@ its tests pin:
    `Path.read_text()`, not on `import`.
 3. **No subprocess.** Static guard on the audit
    module.
-4. **Production-roots-untouched snapshot.** The audit
+4. **Production-roots-untouched inventory.** The audit
    snapshots `cache/results/`, `cache/status/`,
    `output/research_artifacts/`,
    `signal_library/data/stable/`, and
    `output/stackbuilder/` before and after the full
-   run and exposes the boolean in the report. The
-   smokes and the temp-root rehearsal test pin this.
+   run, keyed by **relative path** with **(size,
+   mtime)** values per file, and exposes BOTH the
+   `production_roots_untouched` boolean AND the
+   `production_root_snapshot_strategy = "relative_path_size_mtime"`
+   precision string in the report. This is a no-write
+   regression guard, NOT a forensic byte-hash audit
+   (file content beyond size + mtime is not
+   compared). The smokes and the temp-root rehearsal
+   test pin both fields.
 5. **Two-key writer gate unchanged.** The Phase 6H-5
    writer's `--write` flag + `PRJCT9_AUTOMATION_WRITE_AUTH`
    env-var contract is not modified. The Phase 6I-8
