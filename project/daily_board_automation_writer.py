@@ -293,6 +293,18 @@ class RefreshOutcome:
     current_after: bool
     issue_codes: tuple[str, ...]
     elapsed_seconds: float
+    # Phase 6I-12 additive field. Carries the refresher's
+    # ``ProviderFetchTelemetry`` payload as a plain JSON
+    # dict so the writer never needs to import the
+    # refresher's telemetry dataclass at the top level (the
+    # writer's static-import guard forbids
+    # ``signal_engine_cache_refresher`` as a top-level
+    # import). ``None`` on any refresh that exited before
+    # the fetcher call (invalid ticker / invalid
+    # max_sma_day) OR on refresh paths that never ran at
+    # all (the field defaults to ``None`` so existing
+    # dataclass constructions remain backward compatible).
+    provider_fetch_telemetry: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -481,6 +493,15 @@ def _refresh_outcome_to_json(o: Optional[RefreshOutcome]) -> Any:
         "current_after": bool(o.current_after),
         "issue_codes": list(o.issue_codes),
         "elapsed_seconds": float(o.elapsed_seconds),
+        # Phase 6I-12: pass-through of the refresher's
+        # provider-fetch telemetry. ``None`` when the
+        # refresher exited before the fetcher call OR
+        # when no refresh ran at all.
+        "provider_fetch_telemetry": (
+            o.provider_fetch_telemetry
+            if o.provider_fetch_telemetry is not None
+            else None
+        ),
     }
 
 
@@ -725,6 +746,34 @@ def _pipeline_command(ticker: str) -> str:
 def _refresh_outcome_from_result(
     result: Any, elapsed: float,
 ) -> RefreshOutcome:
+    # Phase 6I-12: extract the refresher's provider-fetch
+    # telemetry as a plain JSON dict (or None) so the
+    # writer never needs to know about the
+    # ``ProviderFetchTelemetry`` dataclass. The refresher
+    # is responsible for stamping the telemetry; the
+    # writer's job here is pass-through, with a defensive
+    # ``getattr`` so fake refreshers used in tests can
+    # either expose the field or omit it.
+    raw_telemetry = getattr(
+        result, "provider_fetch_telemetry", None,
+    )
+    if raw_telemetry is None:
+        telemetry_json: Optional[dict[str, Any]] = None
+    elif isinstance(raw_telemetry, dict):
+        telemetry_json = dict(raw_telemetry)
+    else:
+        to_json = getattr(raw_telemetry, "to_json_dict", None)
+        if callable(to_json):
+            try:
+                payload = to_json()
+            except Exception:
+                payload = None
+            telemetry_json = (
+                dict(payload)
+                if isinstance(payload, dict) else None
+            )
+        else:
+            telemetry_json = None
     return RefreshOutcome(
         attempted=True,
         succeeded=bool(getattr(result, "refreshed", False)),
@@ -744,6 +793,7 @@ def _refresh_outcome_from_result(
             getattr(result, "issue_codes", ()) or (),
         ),
         elapsed_seconds=float(elapsed),
+        provider_fetch_telemetry=telemetry_json,
     )
 
 

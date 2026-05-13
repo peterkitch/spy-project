@@ -1019,3 +1019,157 @@ def test_daily_signal_board_is_not_imported_by_refresher():
     assert "daily_signal_board" not in found, (
         f"refresher imports daily_signal_board: {found}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-12: provider_fetch_telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_provider_fetch_telemetry_success(tmp_path: Path):
+    """A successful fetcher invocation populates the
+    telemetry block with fetch_attempted/fetch_succeeded
+    True, row count, ISO date range, the provider name, no
+    error, and a non-negative elapsed_seconds."""
+    layout = _layout(tmp_path)
+
+    def fake_fetcher(ticker: str) -> pd.DataFrame:
+        return _make_synthetic_df(
+            last_date="2026-05-12", n=30,
+        )
+
+    # Explicit provider_name to confirm it round-trips.
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=layout["cache_dir"],
+        status_dir=layout["status_dir"],
+        write=False,
+        max_sma_day=8,
+        data_fetcher=fake_fetcher,
+        current_as_of_date="2026-05-12",
+        provider_name="fake_yfinance_test_double",
+    )
+
+    telemetry = result.provider_fetch_telemetry
+    assert telemetry is not None
+    assert telemetry.provider_name == (
+        "fake_yfinance_test_double"
+    )
+    assert telemetry.fetch_attempted is True
+    assert telemetry.fetch_succeeded is True
+    assert telemetry.ticker == "SPY"
+    assert telemetry.rows == 30
+    assert telemetry.date_range_end == "2026-05-12"
+    assert telemetry.date_range_start is not None
+    assert telemetry.error is None
+    assert telemetry.elapsed_seconds >= 0.0
+    # Telemetry must round-trip via to_json_dict.
+    j = result.to_json_dict()
+    assert j["provider_fetch_telemetry"] is not None
+    assert (
+        j["provider_fetch_telemetry"]["fetch_succeeded"]
+        is True
+    )
+    assert j["provider_fetch_telemetry"]["rows"] == 30
+    assert (
+        j["provider_fetch_telemetry"]["provider_name"]
+        == "fake_yfinance_test_double"
+    )
+
+
+def test_provider_fetch_telemetry_exception(tmp_path: Path):
+    """When the fetcher raises, telemetry shows
+    fetch_attempted=True, fetch_succeeded=False, error
+    populated with the exception class + message, rows=0
+    and date ranges None. The refresh result also carries
+    ISSUE_DATA_FETCH_FAILED."""
+    layout = _layout(tmp_path)
+
+    def raising_fetcher(ticker: str) -> pd.DataFrame:
+        raise RuntimeError("simulated provider outage")
+
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=layout["cache_dir"],
+        status_dir=layout["status_dir"],
+        write=False,
+        max_sma_day=8,
+        data_fetcher=raising_fetcher,
+        current_as_of_date="2026-05-12",
+        provider_name="fake_unstable_provider",
+    )
+
+    assert ser.ISSUE_DATA_FETCH_FAILED in result.issue_codes
+    telemetry = result.provider_fetch_telemetry
+    assert telemetry is not None
+    assert telemetry.provider_name == "fake_unstable_provider"
+    assert telemetry.fetch_attempted is True
+    assert telemetry.fetch_succeeded is False
+    assert telemetry.ticker == "SPY"
+    assert telemetry.rows == 0
+    assert telemetry.date_range_start is None
+    assert telemetry.date_range_end is None
+    assert telemetry.error is not None
+    assert "RuntimeError" in telemetry.error
+    assert "simulated provider outage" in telemetry.error
+    assert telemetry.elapsed_seconds >= 0.0
+
+
+def test_provider_fetch_telemetry_provider_name_defaults_to_yfinance_when_default_fetcher(
+    tmp_path: Path, monkeypatch,
+):
+    """When the caller passes no data_fetcher and no
+    provider_name, the resolved telemetry surface should
+    report provider_name='yfinance'. We monkeypatch the
+    default fetcher so this test never reaches the
+    network."""
+    layout = _layout(tmp_path)
+
+    def fake_default_fetcher(ticker: str) -> pd.DataFrame:
+        return _make_synthetic_df(
+            last_date="2026-05-12", n=12,
+        )
+
+    monkeypatch.setattr(
+        ser, "_default_yfinance_fetcher", fake_default_fetcher,
+    )
+
+    result = ser.refresh_signal_engine_cache(
+        "SPY",
+        cache_dir=layout["cache_dir"],
+        status_dir=layout["status_dir"],
+        write=False,
+        max_sma_day=8,
+        current_as_of_date="2026-05-12",
+    )
+
+    telemetry = result.provider_fetch_telemetry
+    assert telemetry is not None
+    assert (
+        telemetry.provider_name
+        == ser.DEFAULT_PROVIDER_NAME
+        == "yfinance"
+    )
+
+
+def test_provider_fetch_telemetry_invalid_ticker_has_none_telemetry(
+    tmp_path: Path,
+):
+    """Refresh paths that exit BEFORE the fetcher call
+    (invalid ticker / invalid max_sma_day) must leave
+    provider_fetch_telemetry=None: the fetcher was never
+    invoked, so there is nothing honest to report."""
+    layout = _layout(tmp_path)
+
+    result = ser.refresh_signal_engine_cache(
+        "$$ not-a-ticker $$",
+        cache_dir=layout["cache_dir"],
+        status_dir=layout["status_dir"],
+        write=False,
+        current_as_of_date="2026-05-12",
+    )
+
+    assert ser.ISSUE_INVALID_TICKER in result.issue_codes
+    assert result.provider_fetch_telemetry is None
+    j = result.to_json_dict()
+    assert j["provider_fetch_telemetry"] is None
