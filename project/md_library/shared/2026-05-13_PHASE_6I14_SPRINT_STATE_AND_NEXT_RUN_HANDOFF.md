@@ -117,6 +117,8 @@ Preconditions:
 
 ## 4. The exact condition that opens the gate
 
+The hard predicate is:
+
 ```
 cache_date_range_end > resolved current_as_of_date
 ```
@@ -129,34 +131,129 @@ weekday" are at most **context** that *might* influence
 when the predicate flips — they do not themselves open the
 gate.
 
+### 4.1 Two distinct evaluations of the predicate, two distinct probes
+
+The hard predicate has **two distinct readings** depending
+on which value of `cache_date_range_end` you substitute in,
+and each reading is reported by a different probe:
+
+  - **Existing-cache predicate:** `current cache_date_range_end > resolved current_as_of_date`.
+    Reported by `cache_cutoff_watcher.py` (the
+    `cache_ahead_of_cutoff` boolean on each per-ticker
+    state) and consumed by the supervised gate
+    (`gate.safe_to_authorize_writer_now`). This is what
+    the five standard probes in § 3 evaluate against the
+    **on-disk cache as it stands**. **When this predicate
+    is false because of equality** (`cache_equal_to_cutoff
+    = true`), the gate emits `wait_for_cache_ahead_of_cutoff`
+    and the five standard probes — by themselves — **do not
+    prove** that a newly fetchable trading day is
+    available. They only inspect existing state.
+  - **Source-availability predicate:** `new_cache_date_range_end > resolved current_as_of_date`,
+    where `new_cache_date_range_end` is the date a no-write
+    refresh attempt **would** land on the cache if
+    authorized. Reported by either of these read-only
+    probes:
+    - `signal_engine_cache_refresher.py --ticker SPY --dry-run`
+      → inspect `new_cache_date_range_end` on the
+      `SignalEngineRefreshResult.to_json_dict()` output.
+    - `source_freshness_preflight.py --ticker SPY`
+      → inspect the equivalent fetch-availability fields
+      on its read-only verdict.
+    Use this probe **after** the five standard probes when
+    those probes report the equal-cache wait state,
+    specifically to check whether a future authorized
+    refresh **would** flip the existing-cache predicate
+    from `equal` to `strictly-greater`.
+
 Useful framing for operators, **but never substitutes for
-re-running the read-only probes**:
+re-running the probes**:
 
   - A useful window can occur after a new trading-day
     close becomes fetchable by the refresher **while the
     resolver still returns the prior cutoff**. In that
     window, an authorized refresh can advance
     `cache_date_range_end` strictly past the still-prior
-    cutoff and the predicate flips true.
+    cutoff and the existing-cache predicate flips true.
   - If the resolver's view advances (e.g. the next weekday
     boundary passes in UTC) **before** the cache has
     landed a strictly-future trading day, equality can
     recreate at the new cutoff and the gate remains
     closed. There is no asymmetric "once it's open it
-    stays open" — the predicate is recomputed on every
+    stays open" — both predicates are recomputed on every
     probe.
   - Therefore: do not infer "the gate must be open by now"
     from any wall-clock event. The probes are the answer.
 
-**Operator discipline:** before any future authorized
-attempt, **re-run the five read-only probes from § 3** and
-read the observed predicate from `cache_cutoff_watcher`
-(`cache_ahead_of_cutoff`) and the gate
-(`safe_to_authorize_writer_now` +
-`authorization_candidate_tickers`). If the probes still
-report `wait_for_cache_ahead_of_cutoff` or any failing
-precondition, halt — regardless of how much wall-clock time
-has passed since the last attempt.
+### 4.2 Conservative operator discipline (for the post-Phase-6I-13 equal-cache state)
+
+  1. **First, re-run the five standard read-only probes
+     from § 3.** Read the observed predicate from
+     `cache_cutoff_watcher` (`cache_ahead_of_cutoff` +
+     `cache_equal_to_cutoff`) and the gate
+     (`safe_to_authorize_writer_now` +
+     `authorization_candidate_tickers`).
+
+  2. **If the five standard probes already show
+     `gate.safe_to_authorize_writer_now = true`** and SPY
+     is in `gate.authorization_candidate_tickers`,
+     proceed to normal supervised authorization review
+     (the Phase 6I-11 supervised-run pattern). This is
+     the happy path; skip step 3.
+
+  3. **If `cache_cutoff_watcher` shows
+     `cache_equal_to_cutoff = true` and the gate emits
+     `wait_for_cache_ahead_of_cutoff`** (the current
+     post-Phase-6I-13 state), **do NOT** authorize the
+     writer merely because time has passed. In this
+     equal-cache state:
+
+     a. First run the read-only **source-availability
+        probe** (`signal_engine_cache_refresher.py
+        --ticker SPY --dry-run` or
+        `source_freshness_preflight.py --ticker SPY`).
+
+     b. **If the source-availability probe does NOT
+        show `new_cache_date_range_end > resolved
+        current_as_of_date`**, halt. There is no
+        productive refresh available yet; record the
+        probe output and wait. Re-run the standard
+        probes at a later point.
+
+     c. **If the source-availability probe DOES show
+        `new_cache_date_range_end > resolved
+        current_as_of_date`**, record that evidence
+        and then either:
+
+        - **(a)** use an already-existing documented
+          supervised path that consumes that predicate
+          — e.g. authorize a fresh refresh per the
+          Phase 6I-11 supervised-run pattern, then
+          immediately re-run the five standard probes
+          against the post-refresh cache and proceed
+          only if the gate now says
+          `safe_to_authorize_writer_now = true` —
+          **OR**
+        - **(b)** stop and open a follow-up
+          implementation PR to wire the source-
+          availability predicate into the supervised
+          gate / authorization flow.
+
+  **Do NOT invent an undocumented writer authorization
+  path** based on the source-availability probe alone.
+  The two-key writer gate (Phase 6H-5: `--write` +
+  `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`) and
+  the supervised-run gate (Phase 6I-9:
+  `safe_to_authorize_writer_now` + the five-precondition
+  checklist) are the only currently-merged authorization
+  surfaces. Bypassing either of them — or chaining a new
+  authorization heuristic on top — is out of scope for
+  this docs handoff.
+
+  Regardless of how much wall-clock time has passed since
+  the last attempt: if the standard probes still report
+  `wait_for_cache_ahead_of_cutoff` or any failing
+  precondition, halt.
 
 ## 5. The exact conditions that must remain false
 

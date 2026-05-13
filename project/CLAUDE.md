@@ -161,9 +161,9 @@ an explicit ledger entry classifies the divergence.
 
 **Sprint trajectory (Phase 6H + Phase 6I, top-to-bottom by phase number):**
 
-The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest-recommendation contract) has shipped and is preserved verbatim in the demoted section below for future UI / UX review. Phase 6H added the **read-only automation foundation**; Phase 6I added the **data/evidence and authorization layers** that gate any production writer invocation. The current state is post-Phase 6I-13, which attempted but did not invoke the writer.
+The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest-recommendation contract) has shipped and is preserved verbatim in the demoted section below for future UI / UX review. Phase 6H added the **read-only-by-default planning + guarded-writer foundation** (most of the chain is read-only — watcher, preflight, dry-run executor, root plumbing, runbook — but the guarded writer module itself is write-capable, gated behind the two-key authorization `--write` + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`). Phase 6I added the **data/evidence and authorization layers** that screen any production writer invocation. The current state is post-Phase 6I-13, which attempted but did not invoke the writer.
 
-**Phase 6H — read-only automation foundation (all merged):**
+**Phase 6H — read-only-by-default planning + guarded-writer foundation (all merged):** every module below is read-only except `daily_board_automation_writer.py` (Phase 6H-5 + 6H-6), which is write-capable but **two-key gated** (`--write` CLI flag + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` env var; both required).
 
   - **Phase 6H-1** (PR #211) — Daily Signal Board launch / design handoff doc (`md_library/shared/2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md`).
   - **Phase 6H-2** (PR #212) — `cache_cutoff_watcher.py`: read-only cache-vs-cutoff watcher; strict-inequality predicate (`cache_date_range_end > current_as_of_date`) drives the `pipeline_output_lags_persist_skip` action used downstream by the launch audit, the freshness preflight, the supervised gate, and the writer's post-refresh recheck.
@@ -197,7 +197,24 @@ The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest
   4. Flow audit: all 6 stages pass AND `production_roots_untouched == true`.
   5. Contract validator: all 7 contract booleans `true`; no manual/blocker recommended action.
 
-**The one operational condition that opens the gate:** `cache_date_range_end > resolved current_as_of_date` strictly. Wall-clock advance alone does not open the gate; a fresh refresh must land a trading day strictly past the cutoff in the source cache.
+**The one operational condition that opens the gate (the hard predicate):** `cache_date_range_end > resolved current_as_of_date` strictly. Wall-clock advance alone does not open the gate; a fresh refresh must land a trading day strictly past the cutoff in the source cache. **The predicate is the contract — re-run the read-only probes; do not infer readiness from any wall-clock event.**
+
+**Two distinct predicates, two distinct probes:**
+
+  - **Existing-cache predicate** (what the five standard probes inspect): `current cache_date_range_end > resolved current_as_of_date`. Reported by `cache_cutoff_watcher.py` (`cache_ahead_of_cutoff` boolean) and consumed by the supervised gate. **When this predicate is false because of equality** (`cache_equal_to_cutoff=true`, current state post-Phase-6I-13), the gate emits `wait_for_cache_ahead_of_cutoff`. The five existing probes by themselves **do not prove that a newly fetchable trading day is available** — they only inspect existing on-disk cache / gate / validator state.
+  - **Source-availability predicate** (what a separate, explicit dry-run probe inspects): `new_cache_date_range_end > resolved current_as_of_date` where `new_cache_date_range_end` is the date that a no-write refresh attempt **would** land on the cache if authorized. Reported by `signal_engine_cache_refresher.py --ticker SPY --dry-run` (`new_cache_date_range_end` field on `SignalEngineRefreshResult.to_json_dict()`) or by `source_freshness_preflight.py --ticker SPY` (read-only mode). Use this probe to check whether a future authorized refresh **would** flip the existing-cache predicate from `equal` to `strictly-greater`.
+
+**Conservative operator discipline for the post-Phase-6I-13 equal-cache state:**
+
+  1. **If the five standard probes already show `gate.safe_to_authorize_writer_now=true` and SPY is in `authorization_candidate_tickers`**, proceed to normal supervised authorization review (the Phase 6I-11 supervised-run pattern).
+  2. **If `cache_cutoff_watcher` shows `cache_equal_to_cutoff=true` and the gate emits `wait_for_cache_ahead_of_cutoff`**, **do NOT** authorize the writer merely because time has passed. The equal-cache verdict will not change without an explicit refresh; assuming "next market close fixed it" is exactly the failure mode the predicate-first discipline is meant to prevent.
+  3. In the equal-cache state, first run the read-only source-availability probe (`signal_engine_cache_refresher.py --ticker SPY --dry-run` or `source_freshness_preflight.py --ticker SPY`).
+  4. **If the source-availability probe does not show `new_cache_date_range_end > resolved current_as_of_date`**, halt — there is no productive refresh available yet; record the probe output and wait.
+  5. **If the source-availability probe DOES show `new_cache_date_range_end > resolved current_as_of_date`**, record that evidence and then either:
+     a. use an already-existing documented supervised path that consumes that predicate (e.g. the Phase 6I-11 pattern with a fresh round of the five standard probes after refresh), **OR**
+     b. stop and open a follow-up implementation PR to wire that predicate into the supervised gate / authorization flow.
+
+     **Do NOT invent an undocumented writer authorization path** based on the source-availability probe alone. The two-key writer gate (Phase 6H-5) and the supervised-run gate (Phase 6I-9) are the only currently-merged authorization surfaces.
 
 **Remaining real-evidence gaps after Phase 6I-13** (carry-forward from Phase 6I-12 with no change):
 
