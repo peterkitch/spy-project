@@ -9,9 +9,11 @@ yfinance telemetry capture on the writer's surfaces) **did
 NOT proceed to a writer invocation**. The five required
 read-only probes returned a consistent persist-skip-lag
 verdict: the SPY signal-engine cache `date_range_end` already
-equals today's `current_as_of_date` (both `2026-05-12`, the
-state Phase 6I-11 left the cache in), so the strict-greater-
-than persist-skip-lag gate has *not* opened. The supervised
+equals the resolved `current_as_of_date` (both `2026-05-12`,
+the state Phase 6I-11 left the cache in; the probe ran at
+2026-05-13T06:56Z UTC and the cutoff resolver returned
+`2026-05-12` for that probe), so the strict-greater-than
+persist-skip-lag gate has *not* opened. The supervised
 gate's `safe_to_authorize_writer_now` is `False`,
 `recommended_operator_action` is `wait_for_cache_ahead_of_cutoff`,
 `authorization_candidate_tickers` is empty, and the writer
@@ -28,8 +30,8 @@ document is committed.
 All probes ran from `project/` against the current main HEAD
 (`5dfd054` — Phase 6I-12 merged, PR #229) with the pinned
 `spyproject2` interpreter and no `--current-as-of-date`
-override; the cutoff resolver returned today
-(`2026-05-12`).
+override; the cutoff resolver returned a resolved
+`current_as_of_date` of `2026-05-12` for these probes.
 
 ### 1.1 `cache_cutoff_watcher.py --ticker SPY` (`01_cache_cutoff_watcher.json`)
 
@@ -164,7 +166,7 @@ Per spec: **do not proceed to writer run.** No temporary launcher script was cre
 
 A future Phase 6I-13a (or whatever the next phase is named) can attempt this run when, and only when, the source cache acquires a trading day **strictly after** the resolved `current_as_of_date`. Concretely:
 
-  - The next U.S. market close after 2026-05-12 lands a fresh trading day's price data. (Today is 2026-05-12, a Tuesday; the next trading-day close is 2026-05-13.)
+  - The resolved trading cutoff for this probe is `2026-05-12`; the next U.S. trading-day close strictly after that cutoff is `2026-05-13`, which will land a fresh trading day's price data on the cache once it is fetched. (Wall-clock date and resolved cutoff are distinct: the wall clock advances continuously, while the cutoff resolver returns the most-recent-weekday strictly before UTC now — see `confluence_pipeline_readiness.resolve_current_as_of_date`.)
   - The Phase 6E-5 signal-engine cache refresher then advances `cache_date_range_end` to that strictly-future date (either via a fresh authorized refresher run OR as the natural happy path of the next supervised writer run that includes a refresh).
   - On that calendar position, `cache_date_range_end > current_as_of_date` becomes `true`, the persist-skip-lag guard opens, the watcher returns `ready_for_pipeline=true`, the supervised gate returns `safe_to_authorize_writer_now=true` with SPY in `authorization_candidate_tickers`, and the writer dry-run's `initial_recommended_action` becomes `run_pipeline_only` (or `refresh_then_pipeline` if the refresh was deferred).
 
