@@ -150,6 +150,7 @@ from multiwindow_k_engine_payload_builder import (
     ISSUE_ADAPTER_NOT_READY,
     ISSUE_CORE_GRID_FAILED,
     ISSUE_NO_CELLS_EVALUATED,
+    ISSUE_CORE_GRID_INCOMPLETE,         # Phase 6I-23 Codex amendment
 )
 
 report = build_multiwindow_k_engine_payload(

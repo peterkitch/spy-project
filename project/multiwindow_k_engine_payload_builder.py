@@ -55,17 +55,30 @@ builder:
      output when 60 cells are present (cross-module
      integration pin already exists in Phase 6I-21
      tests).
-  4. Computes ``build_wide_window_alignment``: for every
-     canonical window, counts how many of the K rows in
-     the build have a firing combined signal (``Buy`` or
-     ``Short``) at the latest bar of that window.
-     ``all_members_firing = (firing == total and total > 0)``;
-     ``total_member_count`` is the number of canonical K
-     rows present for that window; ``firing_member_count``
-     is the count whose latest combined signal is Buy or
-     Short. Every canonical window gets an entry (the
-     Phase 6I-20 audit rejects mappings missing any
-     canonical window).
+  4. Computes ``build_wide_window_alignment`` with
+     member-slot semantics (Phase 6I-23 Codex amendment).
+     For every canonical window:
+
+       - ``total_member_count = sum(cell.member_count for
+         canonical K cells in this window)``. With
+         ``K_values = CANONICAL_K_VALUES`` and each cell
+         carrying its own K-sized member set this sums to
+         ``1 + 2 + ... + 12 = 78`` per window.
+       - ``firing_member_count`` = sum of the aligned-
+         direction member counts: ``cell.latest_buy_count``
+         when ``latest_combined_signal == "Buy"``,
+         ``cell.latest_short_count`` when
+         ``latest_combined_signal == "Short"``, ``0``
+         when the signal is ``"None"`` or any other /
+         empty value.
+       - ``all_members_firing = True`` only when every
+         canonical K cell in this window exists AND every
+         member slot in every such cell is firing in the
+         aligned direction (``aligned == cell.member_count``)
+         AND ``total_member_count > 0``.
+
+     Every canonical window gets an entry (the Phase 6I-20
+     audit rejects mappings missing any canonical window).
 
 What this module IS NOT
 -----------------------
@@ -117,6 +130,9 @@ Public surface
     ISSUE_ADAPTER_NOT_READY                  # str
     ISSUE_CORE_GRID_FAILED                   # str
     ISSUE_NO_CELLS_EVALUATED                 # str
+    ISSUE_CORE_GRID_INCOMPLETE               # str
+                                             # (Phase 6I-23
+                                             # Codex amend.)
 
     @dataclass(frozen=True) AdapterSummary
     @dataclass         MultiWindowKEnginePayloadReport
