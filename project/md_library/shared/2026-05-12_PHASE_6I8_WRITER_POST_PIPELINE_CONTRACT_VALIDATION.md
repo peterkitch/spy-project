@@ -87,6 +87,16 @@ the live path.
   - **New final-action constants:**
     - `FINAL_PIPELINE_EXECUTED_CONTRACT_INVALID = "pipeline_executed_contract_invalid"`.
     - `FINAL_REFRESH_THEN_PIPELINE_EXECUTED_CONTRACT_INVALID = "refresh_then_pipeline_executed_contract_invalid"`.
+  - **New function-marker constant** (Codex amendment):
+    - `CONTRACT_VALIDATOR_FUNCTION_MARKER = "confluence_ranking_contract_validator.validate_confluence_ranking_contract"`.
+      Appended to `functions_executed` whenever
+      post-pipeline contract validation is **attempted**
+      — success, contract-invalid, OR exception
+      (including a resolver-import exception). NEVER
+      appended on skip paths (dry-run / unauthorized /
+      waiting / manual / blocked /
+      watcher-blocked-after-refresh / pipeline-
+      exception).
   - **Lazy default resolver:**
     `_default_contract_validator_callable()` lazily
     imports
@@ -108,6 +118,28 @@ the live path.
       updates `issue_codes`, downgrades
       `final_recommended_action` when contract-invalid
       or exception.
+
+      **Codex amendment (Issue 1):** the lazy default
+      resolver (`_default_contract_validator_callable`)
+      is now invoked **inside** the helper's protected
+      `try` block. A validator-module-import failure
+      no longer escapes the writer after a pipeline
+      side effect; it surfaces as a structured
+      `post_pipeline_contract_validation_exception`
+      outcome identical to a runtime validator
+      exception. The pipeline artifact is preserved on
+      disk; the routing carries the failure forward
+      via `contract_invalid_tickers`.
+
+      **Codex amendment (Issue 2):** when validation
+      is attempted (success / contract-invalid /
+      exception), the caller appends
+      `CONTRACT_VALIDATOR_FUNCTION_MARKER` to its
+      local `functions` accumulator (refresh+pipeline)
+      or to `base.functions_executed` (pipeline-only)
+      via an `if base.contract_validation_result is
+      not None` guard. The marker NEVER lands on skip
+      paths.
 
 ### 2.2 API changes
 
@@ -283,6 +315,40 @@ being polluted by the new validator-default behavior.
       byte-mtime-identical state — proving no
       production path is mutated.
 
+### 3.4 Codex-amendment tests (5)
+
+  1. `test_phase_6i8_resolver_import_failure_is_structured`
+     — monkeypatches `_default_contract_validator_callable`
+     to raise `ImportError`. Asserts the writer
+     returns normally with a structured
+     `post_pipeline_contract_validation_exception`
+     outcome, downgraded final action, ticker in
+     `contract_invalid_tickers`, validator marker
+     present in `functions_executed`, exactly one
+     JSONL execution-log row written.
+  2. `test_phase_6i8_run_pipeline_only_functions_sequence`
+     — successful `run_pipeline_only`: pins
+     `functions_executed = (pipeline_runner,
+     contract_validator)`.
+  3. `test_phase_6i8_refresh_then_pipeline_functions_sequence`
+     — successful refresh+pipeline: pins
+     `functions_executed = (refresher, watcher,
+     pipeline_runner, contract_validator)`.
+  4. `test_phase_6i8_invalid_and_exception_jsonl_include_marker`
+     — JSONL rows for contract-invalid AND validator-
+     exception cases include the validator marker.
+  5. `test_phase_6i8_skip_paths_omit_validator_marker`
+     — four skip paths (dry-run / manual / watcher-
+     blocked-after-refresh / pipeline-exception) all
+     keep the marker OUT of `functions_executed`.
+
+### 3.5 Extended carry-forward test
+
+`test_execution_log_records_stage_sequence` — now
+injects `contract_validator=_passing_validator()` and
+asserts the JSONL stage sequence reads `[refresher,
+watcher, pipeline_runner, contract_validator]`.
+
 ### 3.3 Adapted carry-forward tests
 
   - `test_refresh_then_pipeline_runs_pipeline_when_watcher_ready`
@@ -305,11 +371,15 @@ being polluted by the new validator-default behavior.
   - `py_compile` clean on
     `daily_board_automation_writer.py` and the test
     file.
-  - **`test_daily_board_automation_writer.py`: 47
-    passed in 53.34 s** (36 carried + 11 new).
+  - **`test_daily_board_automation_writer.py`: 52
+    passed in 50.31 s** (36 carried + 11 base Phase
+    6I-8 + 5 Codex-amendment tests; one existing test
+    `test_execution_log_records_stage_sequence` was
+    extended to assert the validator marker in the
+    JSONL stage sequence).
   - **Focused 5-way (writer + validator + pipeline
     runner + automation preflight + queue planner):
-    152 passed in 61.38 s.**
+    157 passed in 57.88 s.**
   - `git diff --check` clean.
 
 ## 5. Confirmation no production writes were run

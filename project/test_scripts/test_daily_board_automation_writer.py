@@ -1244,6 +1244,11 @@ def test_execution_log_records_stage_sequence(tmp_path: Path):
         refresher=refresher,
         watcher=watcher,
         pipeline_runner=pipeline_runner,
+        # Phase 6I-8: inject the silent all-OK
+        # validator so the recorded stage sequence
+        # pins refresher -> watcher -> pipeline ->
+        # validator deterministically.
+        contract_validator=_passing_validator(),
         execution_log_path=log,
         **dirs,
     )
@@ -1255,6 +1260,10 @@ def test_execution_log_records_stage_sequence(tmp_path: Path):
         "signal_engine_cache_refresher.refresh_signal_engine_cache",
         "cache_cutoff_watcher.evaluate_cache_cutoff_state",
         "confluence_pipeline_runner.run_confluence_pipeline_for_ticker",
+        # Phase 6I-8 marker appended after the pipeline
+        # runner whenever post-pipeline contract
+        # validation is attempted.
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER,
     ]
     assert record["commands_executed"] == [
         "python signal_engine_cache_refresher.py --ticker SPY --write",
@@ -2620,4 +2629,409 @@ def test_phase_6i8_temp_dir_authorized_rehearsal_with_real_validator(
         "production paths were modified by the Phase "
         "6I-8 temp-dir rehearsal: this is a hard safety "
         "violation"
+    )
+
+
+# ===========================================================================
+# Phase 6I-8 audit amendment (Issue 1 + Issue 2)
+# ===========================================================================
+
+
+def test_phase_6i8_resolver_import_failure_is_structured(
+    monkeypatch, tmp_path: Path,
+):
+    """Codex audit Issue 1: no ``contract_validator``
+    injected AND the lazy default-resolver raises on
+    import. The writer must NOT throw out; instead it
+    captures the resolver failure as
+    ``post_pipeline_contract_validation_exception``,
+    downgrades the final action, surfaces the ticker
+    under ``contract_invalid_tickers``, and writes
+    exactly one JSONL execution-log row."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    log = tmp_path / "execution_log.jsonl"
+
+    def boom():
+        raise ImportError(
+            "simulated validator-module-import failure"
+        )
+
+    # Monkeypatch the lazy default resolver itself so
+    # the import failure happens INSIDE the writer's
+    # protected try-block. Pre-amendment, this would
+    # have thrown out of the writer after the pipeline
+    # already wrote to disk.
+    monkeypatch.setattr(
+        dbw, "_default_contract_validator_callable", boom,
+    )
+
+    recorder = _CallRecorder()
+    pipeline_runner = _pipeline_runner_factory(
+        recorder,
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-07",
+            ),
+        ),
+    )
+
+    # No contract_validator injected: forces the resolver
+    # path.
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-07",
+        pipeline_runner=pipeline_runner,
+        execution_log_path=log,
+        **dirs,
+    )
+    exec_state = report.executions[0]
+    cvr = exec_state.contract_validation_result
+    assert cvr is not None
+    assert cvr.attempted is True
+    assert cvr.succeeded is False
+    assert (
+        dbw.ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION
+        in cvr.issue_codes
+    )
+    assert cvr.ranking_blocked_reason == (
+        "validation_exception"
+    )
+    assert (
+        dbw.ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION
+        in exec_state.issue_codes
+    )
+    assert exec_state.final_recommended_action == (
+        dbw.FINAL_PIPELINE_EXECUTED_CONTRACT_INVALID
+    )
+    assert report.contract_invalid_tickers == ("SPY",)
+    # The function marker IS appended even when the
+    # resolver itself failed -- validation WAS
+    # attempted.
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        in exec_state.functions_executed
+    )
+    # JSONL log written exactly once.
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["ticker"] == "SPY"
+    assert record["contract_validation_result"] is not None
+    assert (
+        record["contract_validation_result"]["succeeded"]
+        is False
+    )
+    assert (
+        dbw.ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION
+        in record["contract_validation_result"]["issue_codes"]
+    )
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        in record["functions_executed"]
+    )
+
+
+def test_phase_6i8_run_pipeline_only_functions_sequence(
+    tmp_path: Path,
+):
+    """Codex audit Issue 2: on successful
+    ``run_pipeline_only``, ``functions_executed``
+    includes the validator marker AFTER the pipeline
+    runner."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    pipeline_runner = _pipeline_runner_factory(
+        recorder,
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-07",
+            ),
+        ),
+    )
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-07",
+        pipeline_runner=pipeline_runner,
+        contract_validator=_passing_validator(),
+        **dirs,
+    )
+    exec_state = report.executions[0]
+    assert tuple(exec_state.functions_executed) == (
+        "confluence_pipeline_runner.run_confluence_pipeline_for_ticker",
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER,
+    )
+
+
+def test_phase_6i8_refresh_then_pipeline_functions_sequence(
+    tmp_path: Path,
+):
+    """Codex audit Issue 2: on successful refresh +
+    pipeline, ``functions_executed`` reads refresher
+    -> watcher -> pipeline -> validator in that order."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    refresher = _refresher_factory(
+        recorder,
+        _FakeRefreshResult(
+            refreshed=True, old="2024-01-31",
+            new="2026-05-12", stale_before=True,
+            current_after=True, issue_codes=(),
+        ),
+    )
+    watcher = _watcher_factory(
+        recorder,
+        _FakeWatcherState(
+            action="ready_for_pipeline_write",
+            cache_date_range_end="2026-05-12",
+            current_as_of_date="2026-05-08",
+        ),
+    )
+    pipeline_runner = _pipeline_runner_factory(
+        recorder,
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-08",
+            ),
+        ),
+    )
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        refresher=refresher,
+        watcher=watcher,
+        pipeline_runner=pipeline_runner,
+        contract_validator=_passing_validator(),
+        **dirs,
+    )
+    exec_state = report.executions[0]
+    assert tuple(exec_state.functions_executed) == (
+        "signal_engine_cache_refresher.refresh_signal_engine_cache",
+        "cache_cutoff_watcher.evaluate_cache_cutoff_state",
+        "confluence_pipeline_runner.run_confluence_pipeline_for_ticker",
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER,
+    )
+
+
+def test_phase_6i8_invalid_and_exception_jsonl_include_marker(
+    tmp_path: Path,
+):
+    """Codex audit Issue 2: JSONL rows for contract-
+    invalid AND validator-exception cases include the
+    validator function marker."""
+    dirs = _layout(tmp_path)
+    _write_cache_pkl(
+        dirs["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_stackbuilder_run(dirs["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    # Run 1: contract-invalid validator result.
+    log_invalid = tmp_path / "log_invalid.jsonl"
+    recorder = _CallRecorder()
+    pipeline_runner = _pipeline_runner_factory(
+        recorder,
+        _FakePipelineRunResult(
+            leader_eligible=True,
+            readiness=_FakeReadiness(
+                leader_eligible=True,
+                current_as_of_date="2026-05-07",
+            ),
+        ),
+    )
+    invalid_validator = _validator_factory(
+        recorder,
+        _FakeValidation(
+            confluence_contract_ok=False,
+            leader_eligible=False,
+        ),
+    )
+    dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-07",
+        pipeline_runner=pipeline_runner,
+        contract_validator=invalid_validator,
+        execution_log_path=log_invalid,
+        **dirs,
+    )
+    lines_invalid = log_invalid.read_text(encoding="utf-8").splitlines()
+    assert len(lines_invalid) == 1
+    record_invalid = json.loads(lines_invalid[0])
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        in record_invalid["functions_executed"]
+    )
+
+    # Run 2: validator-exception case.
+    log_exception = tmp_path / "log_exception.jsonl"
+
+    def raising_validator(*a, **k):
+        raise RuntimeError("simulated validator failure")
+
+    dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-07",
+        pipeline_runner=pipeline_runner,
+        contract_validator=raising_validator,
+        execution_log_path=log_exception,
+        **dirs,
+    )
+    lines_exc = log_exception.read_text(encoding="utf-8").splitlines()
+    assert len(lines_exc) == 1
+    record_exc = json.loads(lines_exc[0])
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        in record_exc["functions_executed"]
+    )
+
+
+def test_phase_6i8_skip_paths_omit_validator_marker(
+    tmp_path: Path,
+):
+    """Codex audit Issue 2 (negative): every skip path
+    (dry-run / unauthorized / waiting / manual /
+    blocked / watcher-blocked-after-refresh /
+    pipeline-exception) keeps the validator marker
+    OUT of ``functions_executed``."""
+
+    # 1. Dry-run.
+    dirs1 = _layout(tmp_path / "dryrun")
+    _write_cache_pkl(
+        dirs1["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_stackbuilder_run(dirs1["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs1["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=False,
+        current_as_of_date="2026-05-07",
+        contract_validator=_raise_on_validator_call,
+        **dirs1,
+    )
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        not in report.executions[0].functions_executed
+    )
+
+    # 2. Manual (no StackBuilder run).
+    dirs2 = _layout(tmp_path / "manual")
+    _write_cache_pkl(
+        dirs2["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_multitimeframe_libs(
+        dirs2["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        contract_validator=_raise_on_validator_call,
+        **dirs2,
+    )
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        not in report.executions[0].functions_executed
+    )
+
+    # 3. Watcher-blocked-after-refresh.
+    dirs3 = _layout(tmp_path / "watcher_blocked")
+    _write_cache_pkl(
+        dirs3["cache_dir"], "SPY", last_date="2024-01-31",
+    )
+    _write_stackbuilder_run(dirs3["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs3["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+    recorder = _CallRecorder()
+    refresher = _refresher_factory(
+        recorder,
+        _FakeRefreshResult(
+            refreshed=True, old="2024-01-31",
+            new="2026-05-07", stale_before=True,
+            current_after=False, issue_codes=(),
+        ),
+    )
+    watcher = _watcher_factory(
+        recorder,
+        _FakeWatcherState(
+            action="refresh_source_cache",  # not ready
+            cache_date_range_end="2026-05-07",
+            current_as_of_date="2026-05-08",
+        ),
+    )
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-08",
+        refresher=refresher,
+        watcher=watcher,
+        pipeline_runner=_raise_on_validator_call,
+        contract_validator=_raise_on_validator_call,
+        **dirs3,
+    )
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        not in report.executions[0].functions_executed
+    )
+
+    # 4. Pipeline-exception.
+    dirs4 = _layout(tmp_path / "pipeline_exception")
+    _write_cache_pkl(
+        dirs4["cache_dir"], "SPY", last_date="2026-05-08",
+    )
+    _write_stackbuilder_run(dirs4["stackbuilder_root"], "SPY")
+    _write_multitimeframe_libs(
+        dirs4["signal_library_dir"], "SPY", ["1wk", "1mo"],
+    )
+
+    def raising_pipeline(*a, **k):
+        raise RuntimeError("simulated pipeline failure")
+
+    report = dbw.execute_daily_board_automation(
+        ["SPY"],
+        write_authorized=True,
+        current_as_of_date="2026-05-07",
+        pipeline_runner=raising_pipeline,
+        contract_validator=_raise_on_validator_call,
+        **dirs4,
+    )
+    assert (
+        dbw.CONTRACT_VALIDATOR_FUNCTION_MARKER
+        not in report.executions[0].functions_executed
     )

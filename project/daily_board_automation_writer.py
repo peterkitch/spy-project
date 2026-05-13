@@ -245,6 +245,16 @@ ISSUE_POST_PIPELINE_CONTRACT_VALIDATION_EXCEPTION = (
     "post_pipeline_contract_validation_exception"
 )
 
+# Phase 6I-8 stable function marker appended to
+# ``functions_executed`` whenever post-pipeline contract
+# validation is ATTEMPTED -- success, contract-invalid,
+# OR exception. NEVER appended on skip paths (dry-run /
+# unauthorized / waiting / manual / blocked /
+# watcher-blocked-after-refresh / pipeline-exception).
+CONTRACT_VALIDATOR_FUNCTION_MARKER = (
+    "confluence_ranking_contract_validator.validate_confluence_ranking_contract"
+)
+
 
 SKIP_ALREADY_CURRENT = "already_current"
 SKIP_WAITING = "waiting_for_cache_ahead_of_cutoff"
@@ -945,12 +955,25 @@ def _run_post_pipeline_contract_validation(
         # the validator if the pipeline didn't even
         # attempt (no on-disk state to validate).
         return
-    if contract_validator is None:
-        contract_validator = (
-            _default_contract_validator_callable()
-        )
+
     validator_started = time.monotonic()
+    # Codex amendment: the resolver
+    # (``_default_contract_validator_callable``) is now
+    # invoked INSIDE the protected try-block. A
+    # validator-import failure (broken validator module,
+    # missing dependency, etc.) used to throw out of the
+    # writer AFTER the pipeline already wrote to disk;
+    # now it is captured as a structured
+    # ``post_pipeline_contract_validation_exception``
+    # outcome identical to a runtime validator
+    # exception. The pipeline side effect is preserved;
+    # the routing surfaces the failure to the operator
+    # via ``contract_invalid_tickers``.
     try:
+        if contract_validator is None:
+            contract_validator = (
+                _default_contract_validator_callable()
+            )
         validation = contract_validator(
             ticker,
             cache_dir=cache_dir,
@@ -1128,6 +1151,18 @@ def _execute_ticker(
                     FINAL_PIPELINE_EXECUTED_CONTRACT_INVALID
                 ),
             )
+            # Codex amendment: append the validator
+            # function marker iff validation was
+            # attempted (success / contract-invalid /
+            # exception -- including resolver-import
+            # exception). Pipeline-exception path
+            # leaves contract_validation_result=None
+            # and so does NOT append the marker.
+            if base.contract_validation_result is not None:
+                base.functions_executed = (
+                    base.functions_executed
+                    + (CONTRACT_VALIDATOR_FUNCTION_MARKER,)
+                )
         base.elapsed_seconds = time.monotonic() - started
         return base
 
@@ -1300,6 +1335,18 @@ def _execute_ticker(
                         FINAL_REFRESH_THEN_PIPELINE_EXECUTED_CONTRACT_INVALID
                     ),
                 )
+                # Codex amendment: append the validator
+                # function marker to the local
+                # ``functions`` list iff validation was
+                # attempted (success / contract-invalid
+                # / exception). The downstream
+                # ``base.functions_executed = tuple(functions)``
+                # assignment at the bottom of this
+                # branch preserves the marker.
+                if base.contract_validation_result is not None:
+                    functions.append(
+                        CONTRACT_VALIDATOR_FUNCTION_MARKER,
+                    )
         else:
             base.final_recommended_action = (
                 FINAL_REFRESH_EXECUTED_PIPELINE_WITHHELD
