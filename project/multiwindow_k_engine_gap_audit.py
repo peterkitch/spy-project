@@ -72,8 +72,18 @@ machine-readable gap report distinguishing three layers:
      (NOT YET BUILT): recognized only when the existing
      Confluence artifact exposes the future-shape fields
      ``per_window_k_metrics`` AND
-     ``build_wide_window_alignment``. Until both fields
-     exist with the expected shape, the audit reports
+     ``build_wide_window_alignment``. ``per_window_k_metrics``
+     must cover the **full canonical 60-cell grid**:
+     every ``(K, window)`` pair where ``K = 1..12`` and
+     ``window`` is one of ``1d / 1wk / 1mo / 3mo / 1y``
+     — partial coverage does NOT count as the true
+     engine (a single K value across all windows, or
+     all K values across only some windows, is still
+     rejected). Noncanonical windows like ``"2d"`` may
+     be present as extras but do not substitute for any
+     missing canonical cell. Until both future-shape
+     fields exist with the expected shape AND the
+     full 60-cell coverage, the audit reports
      ``has_true_multiwindow_k_engine_outputs=False`` and
      surfaces ``missing_true_multiwindow_k_engine`` in
      the ``missing_capabilities`` tuple.
@@ -178,6 +188,20 @@ CANONICAL_WINDOWS: tuple[str, ...] = (
     "1d", "1wk", "1mo", "3mo", "1y",
 )
 CANONICAL_K_VALUES: tuple[int, ...] = tuple(range(1, 13))
+
+# Derived sets used by the per-window-K coverage check.
+# The canonical (K, window) grid has 12 * 5 = 60 cells.
+_CANONICAL_K_VALUES_SET: frozenset[int] = frozenset(
+    CANONICAL_K_VALUES,
+)
+_CANONICAL_WINDOWS_SET: frozenset[str] = frozenset(
+    CANONICAL_WINDOWS,
+)
+_CANONICAL_CELLS: frozenset[tuple[int, str]] = frozenset(
+    (k, w)
+    for k in CANONICAL_K_VALUES
+    for w in CANONICAL_WINDOWS
+)
 
 
 # Stable missing-capability codes. These appear in the
@@ -572,17 +596,42 @@ def _count_stackbuilder_runs(
 def _per_window_k_metrics_are_valid(
     payload: Any,
 ) -> bool:
-    """A valid ``per_window_k_metrics`` is a non-empty
-    list of mappings each carrying the five required
-    fields with usable types AND covering at least one
-    non-daily window. A daily-only entry list does NOT
-    qualify (a true per-window K engine must produce
-    metrics for windows beyond ``1d``)."""
+    """A valid ``per_window_k_metrics`` covers the FULL
+    canonical 60-cell grid: every ``(K, window)`` pair
+    where ``K`` is one of ``1..12`` (``CANONICAL_K_VALUES``)
+    and ``window`` is one of ``1d / 1wk / 1mo / 3mo / 1y``
+    (``CANONICAL_WINDOWS``).
+
+    Each entry must be a mapping carrying the five
+    required fields (``K`` / ``window`` /
+    ``total_capture_pct`` / ``sharpe_ratio`` /
+    ``trigger_days``) with usable types.
+
+    Extras are allowed — the canonical 60 cells must be
+    present, but the payload may also carry additional
+    K values, additional windows, or additional fields
+    per entry. Noncanonical windows (e.g. ``"2d"``,
+    ``"5d"``) on top of the canonical 60 do NOT
+    substitute for the canonical 60 — a partial coverage
+    payload that uses noncanonical windows is rejected.
+
+    Rejection cases:
+      - non-list / empty list;
+      - any entry is not a mapping;
+      - any entry omits a required field;
+      - any entry has a non-int / non-coercible ``K``;
+      - any entry has a non-str / empty ``window``;
+      - any of the three numeric metric fields is
+        ``None`` or non-numeric;
+      - the set of observed canonical ``(K, window)``
+        cells does not cover the full 60-cell canonical
+        grid.
+    """
     if not isinstance(payload, list):
         return False
     if not payload:
         return False
-    seen_windows: set[str] = set()
+    observed_cells: set[tuple[int, str]] = set()
     for entry in payload:
         if not isinstance(entry, Mapping):
             return False
@@ -590,7 +639,7 @@ def _per_window_k_metrics_are_valid(
             if f not in entry:
                 return False
         try:
-            int(entry["K"])
+            k_int = int(entry["K"])
         except (TypeError, ValueError):
             return False
         win = entry.get("window")
@@ -607,10 +656,19 @@ def _per_window_k_metrics_are_valid(
                 return False
             if not isinstance(val, (int, float)):
                 return False
-        seen_windows.add(win.strip())
-    if seen_windows <= {"1d"}:
-        return False
-    return True
+            if isinstance(val, bool):
+                return False
+        # Only canonical (K, window) cells contribute to
+        # the coverage check. Extra cells (noncanonical
+        # K or window) are silently tolerated; they do
+        # not substitute for a missing canonical cell.
+        win_clean = win.strip()
+        if (
+            k_int in _CANONICAL_K_VALUES_SET
+            and win_clean in _CANONICAL_WINDOWS_SET
+        ):
+            observed_cells.add((k_int, win_clean))
+    return observed_cells == _CANONICAL_CELLS
 
 
 def _build_wide_alignment_is_valid(
@@ -682,7 +740,9 @@ def _recommended_next_build_step(
             "window K engine: emit per-(K, window) "
             "capture / Sharpe / trigger-day metrics on "
             "the Confluence artifact under the field "
-            "'per_window_k_metrics'. Existing artifacts "
+            "'per_window_k_metrics' covering the full "
+            "canonical 60-cell grid (K=1..12 x 1d / 1wk "
+            "/ 1mo / 3mo / 1y). Existing artifacts "
             "project daily signals onto resampled "
             "windows via ffill; that is not a true per-"
             "window K evaluation. This engine does NOT "
@@ -720,13 +780,17 @@ _DEFAULT_REMAINING_LIMITATIONS: tuple[str, ...] = (
     "contract: it surfaces what would have to be on "
     "disk for the true engine to count as built. Until "
     "the Confluence artifact carries "
-    "'per_window_k_metrics' (per-(K, window) capture / "
-    "Sharpe / trigger-day metrics across 1d / 1wk / "
-    "1mo / 3mo / 1y) AND "
+    "'per_window_k_metrics' covering the full canonical "
+    "60-cell grid (K=1..12 x 1d / 1wk / 1mo / 3mo / 1y "
+    "= 60 (K, window) cells, each with capture / Sharpe "
+    "/ trigger-day metrics) AND "
     "'build_wide_window_alignment' (per-window "
     "all_members_firing / firing_member_count / "
     "total_member_count), the audit reports "
-    "has_true_multiwindow_k_engine_outputs=False.",
+    "has_true_multiwindow_k_engine_outputs=False. "
+    "Partial coverage (a single K across all windows, "
+    "or all K across only some windows) is NOT the "
+    "true engine.",
     "Existing MTF bridge / projection artifacts must "
     "NOT be counted as the true engine. The Phase 6D-2 "
     "bridge projects daily signals onto resampled "

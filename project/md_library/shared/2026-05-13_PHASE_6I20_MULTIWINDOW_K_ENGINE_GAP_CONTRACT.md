@@ -204,8 +204,10 @@ for `has_true_multiwindow_k_engine_outputs` to return
 
 ### 4.1 `per_window_k_metrics` (top-level on the Confluence artifact)
 
-A non-empty list of mappings. Each entry covers one
-`(K, window)` cell:
+A list of mappings covering the **full canonical 60-cell
+grid**: every `(K, window)` pair where `K ∈ {1..12}` and
+`window ∈ {1d, 1wk, 1mo, 3mo, 1y}`. That is, **12 × 5 =
+60 cells, all present**. Each entry covers one cell:
 
 ```jsonc
 {
@@ -217,18 +219,39 @@ A non-empty list of mappings. Each entry covers one
 }
 ```
 
-Required keys (see
+Required keys per entry (see
 `_REQUIRED_PER_WINDOW_K_METRIC_FIELDS` in the audit):
 
 - `K` (int)
-- `window` (non-empty str — one of `1d / 1wk / 1mo / 3mo / 1y`)
+- `window` (non-empty str — must be one of `1d / 1wk /
+  1mo / 3mo / 1y` for the cell to count toward the
+  canonical-60 coverage)
 - `total_capture_pct` (int | float)
 - `sharpe_ratio` (int | float)
 - `trigger_days` (int | float)
 
-A daily-only entry list (every entry has `window == "1d"`)
-is **rejected** as a true multi-window engine. The whole
-point of the field is the multi-window cross-section.
+Coverage rule (Phase 6I-20 Codex amendment):
+
+- The set of `(K, window)` pairs observed in the payload
+  **must equal** the canonical 60-cell set after
+  intersecting with the canonical K and window sets.
+- Partial coverage is rejected. A list covering only one
+  K value across all windows, or all K values across
+  only some windows (e.g. omitting `1y` across all K),
+  does **NOT** pass.
+- Daily-only coverage (`window == "1d"` for every entry)
+  is rejected as a special case of partial coverage.
+- Noncanonical windows (`"2d"`, `"5d"`, etc.) may appear
+  as **extras** on top of the canonical 60 cells, but
+  they do not substitute for any missing canonical cell.
+  A payload whose only entries are noncanonical windows
+  is rejected.
+- Extras (additional canonical K values beyond 1..12,
+  additional canonical windows beyond the five named,
+  or additional per-entry fields like
+  `extra_diagnostic_field`) are tolerated. The contract
+  is "the canonical 60 must be present"; extras are
+  permitted.
 
 ### 4.2 `build_wide_window_alignment` (top-level on the Confluence artifact)
 
@@ -387,7 +410,7 @@ exercise that path against a live planner.
 
 ---
 
-## 9. Tests (19 pinned contracts)
+## 9. Tests (23 pinned contracts)
 
 `project/test_scripts/test_multiwindow_k_engine_gap_audit.py`:
 
@@ -396,28 +419,50 @@ exercise that path against a live planner.
 3. MTF bridge + Confluence artifact alone does NOT pass.
 4. Daily-only `per_window_k_metrics` (every entry has
    `window=="1d"`) rejected.
-5. Full future-shaped fixture (all K=1..12 + all five
+5. **(Phase 6I-20 Codex amendment)** Partial
+   `per_window_k_metrics` covering only K=1 across all
+   five canonical windows REJECTED, even when
+   `build_wide_window_alignment` is valid and observed
+   K_values / timeframes look full.
+6. **(Phase 6I-20 Codex amendment)**
+   `per_window_k_metrics` covering all 12 K values across
+   four canonical windows (omitting `1y`) REJECTED — a
+   missing canonical window column breaks 60-cell
+   coverage.
+7. **(Phase 6I-20 Codex amendment)** Noncanonical-only
+   `per_window_k_metrics` (e.g. only `2d` and `5d`)
+   REJECTED — noncanonical windows do not substitute for
+   any missing canonical cell.
+8. **(Phase 6I-20 Codex amendment)** Extras on top of the
+   canonical 60-cell grid (noncanonical windows AND
+   extra per-entry fields) PASS — the contract is "the
+   canonical 60 must be present"; extras are tolerated.
+9. Full future-shaped fixture (all K=1..12 + all five
    canonical windows + valid `per_window_k_metrics` +
    valid `build_wide_window_alignment`) PASSES.
-6. Incomplete K coverage detected.
-7. Incomplete timeframe coverage detected.
-8. Missing `build_wide_window_alignment` fields detected.
-9. Missing canonical window in alignment mapping
-   rejected.
-10. `recommended_next_build_step` names the future
+10. Incomplete K coverage detected (`observed_k_values`
+    proper subset of `{1..12}`).
+11. Incomplete timeframe coverage detected
+    (`observed_timeframes` proper subset of the
+    canonical 5).
+12. Missing `build_wide_window_alignment` fields
+    detected.
+13. Missing canonical window in alignment mapping
+    rejected.
+14. `recommended_next_build_step` names the future
     engine + the specific artifact field
     `per_window_k_metrics` + "does NOT exist yet".
-11. `to_json_dict()` round-trips through `json.dumps`.
-12. Aggregate buckets
+15. `to_json_dict()` round-trips through `json.dumps`.
+16. Aggregate buckets
     (`tickers_with_true_multiwindow_k_engine` /
     `tickers_missing_true_multiwindow_k_engine`)
     partition the inspected set correctly.
-13-16. CLI rc=0 / rc=2 / rc=3 / no `SystemExit` leak.
-17. CLI happy path emits JSON with the audit's contract
+17-20. CLI rc=0 / rc=2 / rc=3 / no `SystemExit` leak.
+21. CLI happy path emits JSON with the audit's contract
     fields.
-18. Every `ALL_MISSING_CAPABILITY_CODES` constant is
+22. Every `ALL_MISSING_CAPABILITY_CODES` constant is
     exported as a named module attribute.
-19. `CANONICAL_WINDOWS` and `CANONICAL_K_VALUES` are
+23. `CANONICAL_WINDOWS` and `CANONICAL_K_VALUES` are
     pinned to the canonical tuples.
 
 All tests use fakes / `monkeypatch`; no `yfinance` / live

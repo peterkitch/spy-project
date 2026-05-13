@@ -353,6 +353,182 @@ def test_bridge_with_daily_only_per_window_metrics_does_not_pass():
 
 
 # ---------------------------------------------------------------------------
+# 3b. Partial per_window_k_metrics coverage does NOT pass
+# (Phase 6I-20 Codex amendment: full 60-cell grid required)
+# ---------------------------------------------------------------------------
+
+
+def test_per_window_metrics_one_k_across_all_windows_does_not_pass():
+    """Codex audit (Phase 6I-20 amendment): a partial
+    ``per_window_k_metrics`` covering ONLY K=1 across all
+    five canonical windows must NOT pass as the true
+    multi-window engine even when
+    ``build_wide_window_alignment`` is valid AND observed
+    K_values / timeframes look full from the existing
+    upstream artifact. A single K is not the full
+    canonical 12-K cross-section."""
+    val = _FakeValidation(ticker="ONEK")
+    one_k_only: list[dict[str, Any]] = []
+    for window in ("1d", "1wk", "1mo", "3mo", "1y"):
+        one_k_only.append({
+            "K": 1,
+            "window": window,
+            "total_capture_pct": 5.0,
+            "sharpe_ratio": 0.05,
+            "trigger_days": 100,
+        })
+    payload = _full_future_shaped_payload()
+    payload["per_window_k_metrics"] = one_k_only
+    state = audit.audit_multiwindow_k_engine_gap(
+        "ONEK",
+        validator_callable=_validator_returning(val),
+        confluence_artifact_inspector_callable=(
+            _inspector_returning(payload)
+        ),
+    )
+    # observed_k_values + observed_timeframes still look
+    # "full" because they reflect the existing upstream
+    # ranking row, not per_window_k_metrics' coverage.
+    assert (
+        set(state.observed_k_values)
+        == set(audit.CANONICAL_K_VALUES)
+    )
+    assert (
+        set(state.observed_timeframes)
+        == set(audit.CANONICAL_WINDOWS)
+    )
+    # But per_window_k_metrics is too thin -> rejected.
+    assert state.has_per_window_k_metrics is False
+    assert (
+        state.has_true_multiwindow_k_engine_outputs is False
+    )
+    missing = set(state.missing_capabilities)
+    assert audit.MISSING_PER_WINDOW_K_METRICS in missing
+    assert (
+        audit.MISSING_TRUE_MULTIWINDOW_K_ENGINE in missing
+    )
+    # build_wide_window_alignment is valid in this fixture
+    # so its capability MUST NOT be flagged as missing --
+    # the per_window grid is the only gap.
+    assert (
+        audit.MISSING_BUILD_WIDE_WINDOW_ALIGNMENT_FIELDS
+        not in missing
+    )
+
+
+def test_per_window_metrics_missing_one_canonical_window_does_not_pass():
+    """Codex audit (Phase 6I-20 amendment): a
+    ``per_window_k_metrics`` list that covers all 12 K
+    values across four canonical windows but OMITS one
+    (e.g. ``1y``) across all K must NOT pass as the true
+    multi-window engine. The 60-cell canonical grid
+    requires every (K, window) pair; a missing column
+    breaks coverage."""
+    val = _FakeValidation(ticker="NO1Y")
+    four_window_only: list[dict[str, Any]] = []
+    for k in range(1, 13):
+        for window in ("1d", "1wk", "1mo", "3mo"):
+            four_window_only.append({
+                "K": k,
+                "window": window,
+                "total_capture_pct": 5.0 + k * 0.1,
+                "sharpe_ratio": 0.05,
+                "trigger_days": 100,
+            })
+    payload = _full_future_shaped_payload()
+    payload["per_window_k_metrics"] = four_window_only
+    state = audit.audit_multiwindow_k_engine_gap(
+        "NO1Y",
+        validator_callable=_validator_returning(val),
+        confluence_artifact_inspector_callable=(
+            _inspector_returning(payload)
+        ),
+    )
+    assert state.has_per_window_k_metrics is False
+    assert (
+        state.has_true_multiwindow_k_engine_outputs is False
+    )
+    missing = set(state.missing_capabilities)
+    assert audit.MISSING_PER_WINDOW_K_METRICS in missing
+    assert (
+        audit.MISSING_TRUE_MULTIWINDOW_K_ENGINE in missing
+    )
+
+
+def test_per_window_metrics_noncanonical_windows_do_not_substitute():
+    """Codex audit (Phase 6I-20 amendment): noncanonical
+    windows like ``2d`` and ``5d`` may appear in
+    ``per_window_k_metrics`` as extras, but they MUST
+    NOT substitute for missing canonical cells. A
+    payload covering only noncanonical windows (no
+    canonical cells at all) is rejected even when every
+    entry is well-formed."""
+    val = _FakeValidation(ticker="NONCAN")
+    noncanonical_only: list[dict[str, Any]] = []
+    for k in range(1, 13):
+        for window in ("2d", "5d"):
+            noncanonical_only.append({
+                "K": k,
+                "window": window,
+                "total_capture_pct": 5.0,
+                "sharpe_ratio": 0.05,
+                "trigger_days": 100,
+            })
+    payload = _full_future_shaped_payload()
+    payload["per_window_k_metrics"] = noncanonical_only
+    state = audit.audit_multiwindow_k_engine_gap(
+        "NONCAN",
+        validator_callable=_validator_returning(val),
+        confluence_artifact_inspector_callable=(
+            _inspector_returning(payload)
+        ),
+    )
+    assert state.has_per_window_k_metrics is False
+    assert (
+        state.has_true_multiwindow_k_engine_outputs is False
+    )
+    assert (
+        audit.MISSING_PER_WINDOW_K_METRICS
+        in state.missing_capabilities
+    )
+
+
+def test_per_window_metrics_extras_on_top_of_canonical_60_pass():
+    """Codex audit (Phase 6I-20 amendment): extras (extra
+    K values OR extra windows OR extra fields per entry)
+    on top of the canonical 60-cell grid do NOT
+    invalidate the metric. The contract is "canonical 60
+    must be present"; additional cells are tolerated."""
+    val = _FakeValidation(ticker="EXTRA")
+    payload = _full_future_shaped_payload()
+    # Append a noncanonical window on top of the full
+    # 60-cell grid that the helper already produces.
+    extras = list(payload["per_window_k_metrics"])
+    for k in range(1, 13):
+        extras.append({
+            "K": k,
+            "window": "2d",
+            "total_capture_pct": 9.9,
+            "sharpe_ratio": 0.99,
+            "trigger_days": 999,
+            # Extra entry field is allowed.
+            "extra_diagnostic_field": "ok",
+        })
+    payload["per_window_k_metrics"] = extras
+    state = audit.audit_multiwindow_k_engine_gap(
+        "EXTRA",
+        validator_callable=_validator_returning(val),
+        confluence_artifact_inspector_callable=(
+            _inspector_returning(payload)
+        ),
+    )
+    assert state.has_per_window_k_metrics is True
+    assert (
+        state.has_true_multiwindow_k_engine_outputs is True
+    )
+
+
+# ---------------------------------------------------------------------------
 # 4. Full future-shaped fixture passes
 # ---------------------------------------------------------------------------
 
