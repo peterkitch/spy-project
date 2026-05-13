@@ -44,9 +44,22 @@ A read-only Python module that, for one target ticker:
    leaderboard's K rows AND `window` is one of the canonical
    windows, attempts to load the per-window signal library
    for the target and for every member. The default loader
-   reads `signal_library/data/stable/<TICKER>_stable_v1_0_0[_<interval>].pkl`
-   read-only via `pickle.load`; tests inject fakes via the
-   `library_loader` seam.
+   resolves
+   `signal_library/data/stable/<TICKER>_stable_v1_0_0[_<interval>].pkl`
+   and reads it through the central provenance-verified
+   loader
+   `provenance_manifest.load_verified_signal_library(path,
+   requested_params={"interval": <window>, "price_source":
+   "Close"}, strict=False)`. **Raw `pickle.load` is NOT used
+   in `multiwindow_k_input_adapter.py`** — see §1.2 below
+   for the central-loader contract, the repo-wide B12
+   static guard, and the module-local regression test that
+   enforces it. Legacy libraries (no provenance manifest)
+   may still be accepted by the central loader under
+   `strict=False`; non-legacy provenance mismatches surface
+   as `missing_target_library` / `missing_member_library`
+   (no fabrication). Tests may still inject fake loaders
+   via the `library_loader` seam.
 6. When the target's per-window library is present AND carries
    `dates`, a target-`close` series, AND at least one member
    library is present with matching length, the cell is

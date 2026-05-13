@@ -34,9 +34,24 @@ A read-only adapter. For one target ticker the adapter:
      leaderboard K rows AND ``window`` is one of the canonical
      windows, attempts to load the per-window signal library
      for the target and for every member. The default loader
-     reads ``signal_library/data/stable/<TICKER>_stable_v1_0_0[_<interval>].pkl``
-     read-only via ``pickle.load``; tests inject fakes via the
-     ``library_loader`` seam.
+     resolves ``signal_library/data/stable/<TICKER>_stable_v1_0_0[_<interval>].pkl``
+     and reads it through the central provenance-verified
+     loader ``provenance_manifest.load_verified_signal_library(
+     path, requested_params={"interval": <window>,
+     "price_source": "Close"}, strict=False)``. **Raw
+     ``pickle.load`` is NOT used in this module** -- the
+     repo-wide B12 static guard bans it in production code
+     outside the central provenance loader, and a module-
+     local regression test (``test_adapter_module_has_no_
+     raw_pickle_load``) repeats that constraint inside the
+     adapter's own test file. Legacy libraries (no
+     provenance manifest) are accepted by the central loader
+     under ``strict=False``; provenance mismatches on
+     non-legacy libraries are treated as a missing library
+     (the gap is surfaced via
+     ``missing_target_library`` / ``missing_member_library``
+     reason codes, not by fabricating a row). Tests inject
+     fakes via the ``library_loader`` seam.
   6. When the target's per-window library is present AND carries
      ``dates`` / ``date_index``, ``close`` / ``target_close`` /
      ``Close``, AND **every member of the K row** has a usable
