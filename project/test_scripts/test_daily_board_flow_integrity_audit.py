@@ -1426,3 +1426,136 @@ def test_wording_source_not_ready_uses_case3a_wording(
     assert "A supervised refresh CAN BE PREPARED" not in (
         text
     )
+
+
+# ---------------------------------------------------------------------------
+# 15.1 Phase 6I-15 amendment: source-availability is opt-in
+#      on the flow audit. By default the audit must NOT
+#      cause the gate to invoke the source-availability
+#      probe (preserving the audit's existing no-yfinance /
+#      no-provider-fetch runtime contract).
+# ---------------------------------------------------------------------------
+
+
+def test_flow_audit_does_not_invoke_source_availability_by_default(
+    tmp_path: Path,
+):
+    """The flow audit's default mode (no
+    ``include_source_availability`` kwarg) must not call
+    the source-availability probe / refresher. We pin this
+    by monkeypatching the supervised gate so we can observe
+    the actual ``include_source_availability`` value the
+    audit passes."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    captured: dict[str, Any] = {}
+
+    real_evaluate = audit._gate.evaluate_supervised_run_gate
+
+    def spy_gate(*args, **kwargs):
+        captured["include_source_availability"] = (
+            kwargs.get(
+                "include_source_availability",
+            )
+        )
+        return real_evaluate(*args, **kwargs)
+
+    import unittest.mock as mock  # noqa: PLC0415
+
+    with mock.patch.object(
+        audit._gate,
+        "evaluate_supervised_run_gate",
+        spy_gate,
+    ):
+        audit.run_daily_board_flow_integrity_audit(
+            tickers=["SPY"],
+            current_as_of_date="2026-05-08",
+            snapshot_production_roots=False,
+            **dirs,
+        )
+
+    assert (
+        captured["include_source_availability"] is False
+    ), (
+        "By default the flow audit must pass "
+        "include_source_availability=False to the gate so "
+        "no source-availability probe / refresher dry-run "
+        "/ provider fetch is invoked. Observed: "
+        f"{captured['include_source_availability']!r}"
+    )
+
+
+def test_flow_audit_threads_opt_in_source_availability_to_gate(
+    tmp_path: Path,
+):
+    """When the caller sets
+    ``include_source_availability=True`` on
+    ``run_daily_board_flow_integrity_audit``, the audit
+    must forward that exact value into the supervised
+    gate call."""
+    dirs = _layout(tmp_path)
+    _write_full_valid_fixture(
+        dirs, "SPY",
+        cache_last_date="2026-05-12",
+        last_date="2026-05-08",
+    )
+
+    captured: dict[str, Any] = {}
+
+    real_evaluate = audit._gate.evaluate_supervised_run_gate
+
+    def spy_gate(*args, **kwargs):
+        captured["include_source_availability"] = (
+            kwargs.get(
+                "include_source_availability",
+            )
+        )
+        # Forward ``source_availability_callable`` as a
+        # no-op fake so we never touch the real refresher
+        # in this test even when the opt-in is on.
+        def _no_op_probe(tickers, **_):
+            import source_availability_probe as sap  # noqa: PLC0415
+
+            return sap.SourceAvailabilityReport(
+                generated_at=(
+                    "2026-05-13T00:00:00+00:00"
+                ),
+                current_as_of_date="2026-05-08",
+                inspected_count=0,
+                states=(),
+                counts_by_recommended_source_action={},
+                source_ready_tickers=(),
+            )
+        kwargs["source_availability_callable"] = (
+            _no_op_probe
+        )
+        return real_evaluate(*args, **kwargs)
+
+    import unittest.mock as mock  # noqa: PLC0415
+
+    with mock.patch.object(
+        audit._gate,
+        "evaluate_supervised_run_gate",
+        spy_gate,
+    ):
+        audit.run_daily_board_flow_integrity_audit(
+            tickers=["SPY"],
+            current_as_of_date="2026-05-08",
+            snapshot_production_roots=False,
+            include_source_availability=True,
+            **dirs,
+        )
+
+    assert (
+        captured["include_source_availability"] is True
+    ), (
+        "When the caller passes "
+        "include_source_availability=True the audit must "
+        "forward True to the gate. Observed: "
+        f"{captured['include_source_availability']!r}"
+    )

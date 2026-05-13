@@ -267,10 +267,22 @@ flag, the gate behaves exactly as in Phase 6I-14.
 ## 4. Flow integrity audit wiring
 
 `daily_board_flow_integrity_audit.run_daily_board_flow_integrity_audit`
-calls the supervised gate with
-`include_source_availability=True` so the audit's
-read-only end-to-end snapshot always inspects the
-source-availability state. The audit's `gate_summary`
+gains an additive parameter
+`include_source_availability: bool = False` (and a
+matching `--include-source-availability` CLI flag).
+**Default OFF** so the audit's existing no-yfinance /
+no-provider-fetch runtime contract holds out of the
+box. When the caller opts in, the audit threads the
+flag into the supervised gate call (which may then
+invoke `source_availability_probe` →
+`signal_engine_cache_refresher` with `write=False` — a
+read-only refresher dry-run that **can** trigger a
+provider fetch via the refresher's default yfinance-
+backed callable). **The audit remains no-write in both
+modes**; opting in only relaxes the no-provider-fetch
+part of the contract.
+
+When the opt-in is on, the audit's `gate_summary`
 gains four passthrough keys:
 
 ```
@@ -283,7 +295,9 @@ source_manual_review_tickers
 ### 4.1 Five-case wording selector
 
 The Phase 6I-12 four-case `recommended_next_evidence_step`
-selector gains a **case 3b**:
+selector gains a **case 3b** (fires only when the
+operator opted into source-availability AND the gate
+emitted the new advisory action):
 
   - **Case 1** — any stage failed →
     "Resolve the failing read-only checks ..."
@@ -432,7 +446,7 @@ tests):**
     `json.dumps` round-trips cleanly.
 
 **Flow integrity audit
-(`test_daily_board_flow_integrity_audit.py`, +2 Phase
+(`test_daily_board_flow_integrity_audit.py`, +4 Phase
 6I-15 tests):**
 
   - Case 3b wording fires when the gate action is
@@ -440,6 +454,25 @@ tests):**
     `source_ready_tickers` is non-empty.
   - Case 3a wording is preserved verbatim when the
     probe ran but found nobody source-ready.
+  - Codex-amendment: default flow audit passes
+    `include_source_availability=False` to the gate
+    (spy-patched gate call confirms the kwarg
+    received). Pins the no-provider-fetch default.
+  - Codex-amendment: opt-in
+    `include_source_availability=True` is forwarded
+    verbatim into the gate call.
+
+**Supervised gate ALL_ACTIONS (Codex-amendment, +1 new
+gate test):**
+
+  - Reflective discovery test enumerates every
+    module-level `ACTION_*` string constant and
+    asserts each is present in `ALL_ACTIONS`. The
+    Phase 6I-15
+    `ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH` was
+    flagged as missing on the original PR; the
+    completeness test prevents the same drift in
+    future ACTION_* additions.
 
 ## 8. No-production-write confirmation
 

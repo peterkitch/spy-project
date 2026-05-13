@@ -8,8 +8,24 @@ it still simulated or inferred?"
 
 **This is NOT a production-authorization phase.** The
 audit does NOT execute the writer. It does NOT execute
-any engine. It does NOT fetch yfinance. It runs read-
-only over the existing Phase 6H / 6I stack:
+any engine. By default, it does NOT fetch yfinance and
+runs strictly read-only / offline. The audit always
+remains **no-write** -- production roots are
+snapshotted before and after every run -- but a Phase
+6I-15 opt-in (``include_source_availability=True`` on
+``run_daily_board_flow_integrity_audit``, or the
+``--include-source-availability`` CLI flag) relaxes the
+no-provider-fetch part of the contract: when set, the
+audit threads the flag into the Phase 6I-9 supervised
+gate which may invoke ``source_availability_probe`` ->
+``signal_engine_cache_refresher`` with ``write=False``
+(a read-only refresher dry-run that **can** trigger a
+provider fetch via the refresher's default
+yfinance-backed callable). The audit's no-write
+contract holds in both modes; only the no-provider-
+fetch contract loosens, and only when explicitly opted
+in. It runs read-only over the existing Phase 6H / 6I
+stack:
 
   - Phase 6I-4 ``upstream_research_input_audit``
   - Phase 6I-1 ``confluence_ranking_contract_validator``
@@ -23,10 +39,14 @@ only over the existing Phase 6H / 6I stack:
     this audit module so even a defensive accidental
     runtime call is contained.
 
-Strictly read-only / offline
-----------------------------
+Strictly read-only / offline (default mode)
+-------------------------------------------
 
-  - No yfinance import / fetch.
+  - No yfinance import / fetch **by default**. The
+    ``include_source_availability`` opt-in described
+    above is the only way the audit can trigger a
+    provider fetch, and it still does so only through
+    the refresher's ``write=False`` dry-run path.
   - No subprocess.
   - No writer / refresher / pipeline runner / live
     engine import at the audit module's top level.
@@ -624,29 +644,37 @@ def _stage_queue_and_gate(
     dirs: dict[str, Any],
     current_as_of_date: Optional[str],
     top_n: int,
+    include_source_availability: bool = False,
 ) -> tuple[
     StageCheck, dict[str, Any], dict[str, Any],
 ]:
     """Call Phase 6I-6 queue planner + Phase 6I-9
     supervised gate. Confirm advisory commands are
     strings only and the gate's decision is consistent
-    with the queue counts."""
+    with the queue counts.
+
+    Phase 6I-15 amendment: ``include_source_availability``
+    is **off by default** so the audit's existing no-
+    yfinance / no-provider-fetch runtime contract holds.
+    When the caller (or CLI ``--include-source-availability``)
+    opts in, the audit threads the flag into the gate,
+    which may invoke ``source_availability_probe`` ->
+    ``signal_engine_cache_refresher`` with ``write=False``
+    (a no-write refresher dry-run that **can** trigger a
+    provider fetch via the refresher's default
+    yfinance-backed callable). The audit remains no-write
+    in both modes; the difference is whether a read-only
+    fetch is permissible.
+    """
     try:
         gate_report = _gate.evaluate_supervised_run_gate(
             tickers=tickers if tickers else None,
             from_stackbuilder_universe=from_universe,
             top_n=top_n,
             current_as_of_date=current_as_of_date,
-            # Phase 6I-15: ask the gate to consult the
-            # read-only source-availability probe over its
-            # wait_for_cache_ahead_tickers bucket. The probe
-            # is read-only (write=False refresher dry-run)
-            # and never authorizes the writer; the audit
-            # surfaces the resulting source_* fields so
-            # operators can see whether the equal-cache
-            # wait state has a fetchable strictly-future
-            # trading day available.
-            include_source_availability=True,
+            include_source_availability=bool(
+                include_source_availability,
+            ),
             **dirs,
         )
     except Exception as exc:
@@ -1092,10 +1120,11 @@ def run_daily_board_flow_integrity_audit(
     impactsearch_output_dir: Optional[Any] = None,
     current_as_of_date: Optional[str] = None,
     snapshot_production_roots: bool = True,
+    include_source_availability: bool = False,
 ) -> FlowIntegrityAuditReport:
     """End-to-end flow integrity audit.
 
-    Strictly read-only. The audit invokes the Phase 6I-4
+    Strictly no-write. The audit invokes the Phase 6I-4
     audit, Phase 6I-1 validator, Phase 6I-3 emitter,
     Phase 6I-6 queue planner, Phase 6I-9 supervised gate,
     Phase 6I-7 Spymaster helper, and a static TEXT scan
@@ -1109,6 +1138,25 @@ def run_daily_board_flow_integrity_audit(
     ``production_root_snapshot_strategy =
     "relative_path_size_mtime"``. This is a no-write
     regression guard, NOT a forensic byte-hash audit.
+
+    Phase 6I-15 amendment: ``include_source_availability``
+    is **off by default** so the audit's existing
+    no-yfinance / no-provider-fetch runtime contract
+    holds out of the box. When the caller (or the CLI
+    ``--include-source-availability`` flag) opts in, the
+    audit threads the flag into the Phase 6I-9 supervised
+    gate, which may then invoke
+    ``source_availability_probe`` ->
+    ``signal_engine_cache_refresher`` with ``write=False``.
+    The probe is a no-write refresher dry-run that **can**
+    trigger a read-only provider fetch via the refresher's
+    default yfinance-backed callable. **The audit remains
+    no-write in both modes**; opting in only relaxes the
+    no-provider-fetch part of the contract, not the
+    no-production-write part. The two-key writer gate
+    (Phase 6H-5) is unchanged in both modes; the
+    source-availability surface NEVER flips
+    ``safe_to_authorize_writer_now`` to ``True``.
     """
     resolved_cutoff = _cpr.resolve_current_as_of_date(
         current_as_of_date,
@@ -1153,6 +1201,9 @@ def run_daily_board_flow_integrity_audit(
     ) = _stage_queue_and_gate(
         ticker_list, from_stackbuilder_universe, dirs,
         resolved_cutoff, top_n,
+        include_source_availability=(
+            include_source_availability
+        ),
     )
     stage_checks.append(queue_gate_check)
 
@@ -1383,6 +1434,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "(passed through)."
         ),
     )
+    parser.add_argument(
+        "--include-source-availability",
+        action="store_true",
+        help=(
+            "Phase 6I-15: opt in to the read-only "
+            "source-availability probe on the supervised "
+            "gate's wait_for_cache_ahead_tickers bucket. "
+            "When set, the audit threads the flag into "
+            "the gate which may invoke "
+            "source_availability_probe -> "
+            "signal_engine_cache_refresher with "
+            "write=False (a no-write refresher dry-run "
+            "that CAN trigger a read-only provider "
+            "fetch via yfinance). The audit remains no-"
+            "write in both modes; the two-key writer "
+            "gate is unchanged. Default OFF preserves "
+            "the audit's existing no-yfinance / no-"
+            "provider-fetch runtime contract."
+        ),
+    )
     return parser
 
 
@@ -1440,6 +1511,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.impactsearch_output_dir
             ),
             current_as_of_date=args.current_as_of_date,
+            include_source_availability=bool(
+                args.include_source_availability,
+            ),
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

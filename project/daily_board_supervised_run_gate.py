@@ -191,6 +191,14 @@ ALL_ACTIONS: tuple[str, ...] = (
     ACTION_BUILD_MISSING_DOWNSTREAM_ARTIFACTS,
     ACTION_ALREADY_CURRENT,
     ACTION_MANUAL_REVIEW,
+    # Phase 6I-15 advisory action; only emitted when
+    # ``include_source_availability=True`` AND the gate
+    # would otherwise have emitted
+    # ``wait_for_cache_ahead_of_cutoff`` AND the
+    # source-availability probe reports a wait ticker as
+    # source-ready. ``safe_to_authorize_writer_now``
+    # STAYS False on this action.
+    ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH,
 )
 
 # Stable blocking-reason strings included in

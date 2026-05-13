@@ -1151,7 +1151,10 @@ def test_equal_cache_plus_source_ready_advisory_action():
     ``source_ready_for_supervised_refresh`` -- BUT
     ``safe_to_authorize_writer_now`` STAYS False (the
     source-availability surface NEVER flips safety on
-    its own)."""
+    its own).
+
+    Phase 6I-15 amendment also pins that the new
+    advisory action is included in ``ALL_ACTIONS``."""
     fake_q = _wait_only_fake_report("SPY")
     source_fn = _fake_source_callable_ready_for("SPY")
     report = gate.evaluate_supervised_run_gate(
@@ -1164,6 +1167,13 @@ def test_equal_cache_plus_source_ready_advisory_action():
     assert report.recommended_operator_action == (
         gate.ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH
     )
+    # The emitted action must be in ALL_ACTIONS so
+    # downstream consumers (flow audit, ops tooling)
+    # can enumerate every possible verdict.
+    assert (
+        report.recommended_operator_action
+        in gate.ALL_ACTIONS
+    )
     assert report.source_availability_checked is True
     assert report.source_ready_tickers == ("SPY",)
     assert report.source_wait_tickers == ()
@@ -1171,6 +1181,61 @@ def test_equal_cache_plus_source_ready_advisory_action():
     assert (
         report.source_availability_by_ticker["SPY"]
         == "source_ready_for_refresh"
+    )
+
+
+def test_all_actions_includes_every_action_constant():
+    """``ALL_ACTIONS`` must enumerate every
+    ``ACTION_*`` string the gate can emit, including the
+    Phase 6I-15
+    ``ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH``
+    advisory. Discover the action constants reflectively
+    (any module-level name starting with ``ACTION_``
+    whose value is a string is in scope) so a future
+    contributor cannot add a new action constant without
+    also updating ``ALL_ACTIONS``."""
+    discovered: dict[str, str] = {}
+    for name in dir(gate):
+        if not name.startswith("ACTION_"):
+            continue
+        value = getattr(gate, name)
+        if isinstance(value, str):
+            discovered[name] = value
+
+    # Sanity: the discovery must include the Phase 6I-9
+    # baseline actions + the Phase 6I-15 advisory.
+    expected_subset = {
+        "ACTION_AUTHORIZE_GUARDED_WRITER",
+        "ACTION_WAIT_FOR_CACHE_AHEAD",
+        "ACTION_RESOLVE_STACKBUILDER_INPUTS",
+        "ACTION_FIX_UPSTREAM_INPUTS",
+        "ACTION_BUILD_MISSING_DOWNSTREAM_ARTIFACTS",
+        "ACTION_ALREADY_CURRENT",
+        "ACTION_MANUAL_REVIEW",
+        "ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH",
+    }
+    missing = expected_subset - set(discovered.keys())
+    assert not missing, (
+        "Discovery test expected these ACTION_* "
+        f"constants but did not find them: {missing!r}"
+    )
+
+    # Every discovered ACTION_* value must be in
+    # ALL_ACTIONS. This is the load-bearing assertion
+    # the Codex audit asked for.
+    for name, value in discovered.items():
+        assert value in gate.ALL_ACTIONS, (
+            f"{name}={value!r} is missing from "
+            "ALL_ACTIONS; ALL_ACTIONS must enumerate "
+            "every action constant the gate can emit"
+        )
+
+    # Phase 6I-15 advisory pin: the new constant is
+    # specifically the one the prior Codex audit caught
+    # as missing.
+    assert (
+        gate.ACTION_SOURCE_READY_FOR_SUPERVISED_REFRESH
+        in gate.ALL_ACTIONS
     )
 
 
