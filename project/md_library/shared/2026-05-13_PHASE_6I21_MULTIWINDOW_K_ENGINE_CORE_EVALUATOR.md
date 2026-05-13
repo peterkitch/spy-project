@@ -19,15 +19,24 @@ Confluence artifact.
 
 ## 0. Scope
 
-A read-only pure-Python module that exposes:
+A read-only module that exposes:
 
-- `evaluate_cell(...)` — evaluates one `(K, window)` cell
-  from in-memory inputs and returns a `PerWindowKCell`
+- `evaluate_cell(...)` — primitive: evaluates one `(K, window)`
+  cell from in-memory inputs and returns a `PerWindowKCell`
   dataclass.
-- `evaluate_grid(...)` — evaluates many cells across many
-  windows in one call; emits exactly 60 cells when supplied
-  the canonical 12 K values × 5 canonical windows with
-  complete inputs.
+- `evaluate_k_window_grid(...)` — **production-relevant
+  per-`(K, window)` grid evaluator** (Phase 6I-21 Codex
+  amendment). Accepts a per-cell input map so each
+  `(K, window)` cell can carry its own member set / dates /
+  target_close / protocols. This is the shape the real
+  StackBuilder workflow needs: K=1..12 rows can each have
+  different `members_str` and the future engine must carry
+  those differences through to the per-cell metrics.
+- `evaluate_grid(...)` — **same-member-set convenience
+  helper, NOT the StackBuilder production path.** Evaluates
+  every K supplied for a given window against the SAME
+  member bundle for that window. Kept for tests / coverage
+  smokes only; do not use it on real StackBuilder data.
 - `cells_to_per_window_k_metrics_payload(cells)` — converts
   cells into the Phase 6I-20-defined `per_window_k_metrics`
   contract shape (list of dicts each carrying the canonical
@@ -219,7 +228,30 @@ cell = evaluate_cell(
 #       latest_short_count, latest_none_count,
 #       latest_missing_count, member_count.
 
-cells = evaluate_grid(
+# Production-relevant per-(K, window) grid (Phase 6I-21
+# Codex amendment). Each cell can have its OWN member set,
+# matching real StackBuilder where K=1..12 rows may emit
+# different members_str.
+cells = evaluate_k_window_grid(
+    target_ticker="SPY",
+    per_cell_inputs={
+        # K=1, 1d window — single member.
+        (1, "1d"):  {"dates": ..., "target_close": ..., "member_signal_columns": {"M1": [...]}},
+        # K=2, 1d window — two members (potentially
+        # different from K=1's member set).
+        (2, "1d"):  {"dates": ..., "target_close": ..., "member_signal_columns": {"M1": [...], "M2": [...]}},
+        # ... all 60 canonical (K, window) cells ...
+        (12, "1y"): {"dates": ..., "target_close": ..., "member_signal_columns": {...}},
+    },
+    member_protocols_default=None,
+)
+# cells: tuple of N PerWindowKCell, one per supplied
+# (K, window) pair (no fabricated cells for missing pairs).
+# Full canonical 60-cell input -> 60 cells.
+
+# Same-member-set convenience grid (NOT the production
+# path; do not use on real StackBuilder data).
+cells_convenience = evaluate_grid(
     target_ticker="SPY",
     K_values=CANONICAL_K_VALUES,
     windows=CANONICAL_WINDOWS,
@@ -232,7 +264,10 @@ cells = evaluate_grid(
     },
     member_protocols=None,
 )
-# cells: tuple of 60 PerWindowKCell when fully populated.
+# Every K=1..12 row for a given window shares the SAME
+# member bundle. Cells from this helper are NOT
+# representative of real StackBuilder per-K member
+# differences.
 
 payload = cells_to_per_window_k_metrics_payload(cells)
 # payload: list[dict] in the Phase 6I-20 contract shape.
@@ -253,6 +288,8 @@ canonical 60-cell coverage is present (tests pin this).
 
 ## 5. Strictly read-only
 
+The load-bearing claims of this module:
+
 - No `daily_board_automation_writer` import.
 - No `signal_engine_cache_refresher` import.
 - No `confluence_pipeline_runner` import.
@@ -264,22 +301,47 @@ canonical 60-cell coverage is present (tests pin this).
 - **No `trafficflow_multitimeframe_bridge` import** (the
   projection / bridge module). Pinned by
   `test_core_module_has_no_forbidden_imports`.
-- No `pandas` / `numpy` import at top level. Pinned by
-  `test_core_is_not_projection_no_pandas_or_resample`.
-- No call to `.resample()` or `.ffill()` anywhere in code.
-  Pinned by the same test via AST walk over `ast.Call`
-  nodes (the module docstring is allowed to mention the
-  words because the test scans call sites, not strings).
+- **No projection logic**: no call to `.resample()` or
+  `.ffill()` anywhere in code. Pinned by
+  `test_core_is_not_projection_no_pandas_or_resample` via
+  AST walk over `ast.Call` nodes (the module docstring is
+  allowed to mention the words because the test scans call
+  sites, not strings).
+- No production write at any layer.
+
+### Note on the `pandas` / `numpy` dependency
+
+The module does NOT itself import `pandas` or `numpy` at
+top level. It does import `research_artifacts` (for the
+public `combine_member_signals` helper), which may
+transitively pull `pandas` / `numpy` into the process.
+
+The static "no `pandas` / `numpy` at top level" check in
+the test suite is therefore a check on **this module's
+own imports only** — the transitive dependency graph is
+out of scope of that check.
+
+The load-bearing claim is the **no-projection /
+no-resample / no-ffill / no-live-engine / no-production-
+write** set above; the lack of a direct `pandas` /
+`numpy` import is just an honest restatement that the
+core does its math in plain Python loops, not pandas
+vectorization. **This phase does not promise that no
+`pandas` is anywhere in the process** — only that this
+module does not invoke the Phase 6D-2 bridge's
+projection path.
 
 ---
 
-## 6. Tests (29 pinned contracts)
+## 6. Tests (38 pinned contracts)
 
 `project/test_scripts/test_multiwindow_k_engine_core.py`:
 
 1. Forbidden-imports static guard.
-2. Not a projection: no `pandas` / `numpy` import; no
-   `.resample()` / `.ffill()` call.
+2. Not a projection: this module's own top-level imports
+   do not include `pandas` / `numpy`; no `.resample()` /
+   `.ffill()` call. (The transitive dependency graph is out
+   of scope — see § 5 above.)
 3-6. Direct / Inverse protocol: Direct pass-through; Inverse
    `Buy → Short`; Inverse `Short → Buy`; unknown protocol
    string defaults to Direct.
@@ -292,20 +354,46 @@ canonical 60-cell coverage is present (tests pin this).
    None = 0 (no trigger day); single-trigger Sharpe = 0.
 18. Sharpe positive when trigger captures have positive
     mean and non-zero std (sample std, ddof=1).
-19-20. Grid evaluator: 60 canonical cells emitted from full
-    inputs; payload helper carries the Phase 6I-20-required
-    five fields on every cell.
-21-24. Grid evaluator: missing window silently skipped;
-    incomplete per-window input block silently skipped;
-    empty `K_values` yields no cells; empty `windows`
-    yields no cells.
-25-26. Length-alignment safety: mismatched `target_close`
+19-20. **Same-member-set convenience** `evaluate_grid`: 60
+    canonical cells emitted from full inputs; payload helper
+    carries the Phase 6I-20-required five fields on every
+    cell.
+21-24. Same-member-set convenience: missing window silently
+    skipped; incomplete per-window input block silently
+    skipped; empty `K_values` yields no cells; empty
+    `windows` yields no cells.
+25-33. **(Phase 6I-21 Codex amendment)**
+    **Production-relevant per-`(K, window)` grid**
+    `evaluate_k_window_grid`:
+    - K=1 and K=2 use different member sets for the same
+      window; the cells reflect each cell's own member set;
+    - per-cell evaluator outputs DIFFER from the shared-
+      member helper (the cross-test pins the failure mode
+      the amendment guards against — using the convenience
+      helper on real StackBuilder data would mis-attribute
+      member counts);
+    - full canonical 60-cell input emits exactly 60 cells
+      with `member_count == K` per cell (each cell has its
+      own K-sized member bundle);
+    - dropping one canonical pair from the input map yields
+      59 cells (no fabrication);
+    - incomplete per-cell input (missing `target_close`)
+      silently skipped;
+    - payload carries the Phase 6I-20 five required fields
+      on every cell;
+    - payload is accepted by Phase 6I-20's
+      `_per_window_k_metrics_are_valid` when all 60 cells
+      are present (cross-module integration assertion);
+    - per-cell `member_protocols` overrides the call-level
+      `member_protocols_default`;
+    - empty `per_cell_inputs` yields zero cells.
+34-35. Length-alignment safety: mismatched `target_close`
     raises `ValueError`; mismatched member column raises
     `ValueError`.
-27. Latest signal counts mirror the final bar (including
+36. Latest signal counts mirror the final bar (including
     Inverse-protocol flip on a per-member basis).
-28. `to_dict()` round-trip carries all 14 fields.
-29. Canonical constants pinned to their expected values.
+37. `to_dict()` round-trip carries all 14 fields.
+38. Canonical constants pinned to their expected values.
 
 All tests use in-memory inputs only — no `tmp_path` is
 needed because nothing is read from / written to disk. No

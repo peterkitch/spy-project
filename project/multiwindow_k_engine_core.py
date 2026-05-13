@@ -92,6 +92,22 @@ Semantics (reused from the existing local engine family)
     core operates on the bars it is given; the caller is
     responsible for any trimming before invocation.
 
+Production-relevant input shape (Phase 6I-21 Codex amendment)
+-------------------------------------------------------------
+
+Real StackBuilder builds emit one row per K value, and each K
+row may have a different ``members_str`` -- the K=1 row's
+member set is not necessarily the K=2 row's member set. The
+production-relevant evaluator is therefore
+``evaluate_k_window_grid``, which accepts a per-``(K, window)``
+input map so each cell can carry its own member set, dates,
+target closes, and protocols.
+
+``evaluate_grid`` (the older same-member-set helper) is kept
+as a convenience for tests / coverage smokes where every K
+row uses the same member bundle per window; do NOT use it on
+real StackBuilder data.
+
 Public surface
 --------------
 
@@ -106,14 +122,20 @@ Public surface
 
     @dataclass(frozen=True) PerWindowKCell
 
-    evaluate_cell(
+    evaluate_cell(                     # primitive
         *, target_ticker, K, window,
         dates, target_close,
         member_signal_columns,
         member_protocols=None,
     ) -> PerWindowKCell
 
-    evaluate_grid(
+    evaluate_k_window_grid(            # production-relevant grid
+        *, target_ticker,
+        per_cell_inputs,               # Mapping[(K, window), Mapping]
+        member_protocols_default=None,
+    ) -> tuple[PerWindowKCell, ...]
+
+    evaluate_grid(                     # same-member-set convenience
         *, target_ticker, K_values, windows,
         per_window_inputs,
         member_protocols=None,
@@ -126,6 +148,8 @@ Public surface
 Strictly read-only
 ------------------
 
+The load-bearing claims of this module:
+
   * No ``yfinance`` / ``dash`` import.
   * No live engine import (``trafficflow`` / ``spymaster`` /
     ``impactsearch`` / ``onepass`` / ``confluence`` /
@@ -134,9 +158,22 @@ Strictly read-only
   * No ``subprocess``.
   * No ``trafficflow_multitimeframe_bridge`` import (this
     module is NOT a projection / bridge).
-  * Pure-Python: no ``pandas`` / ``numpy`` import at top level
-    (the Phase 6D-2 bridge uses ``pandas.resample``; we
-    deliberately avoid the dependency to prove no projection).
+  * **No projection logic**: no call to ``.resample()`` or
+    ``.ffill()`` anywhere in code (AST-verified by tests).
+  * No production write at any layer.
+
+Note on the ``pandas`` / ``numpy`` dependency: this module
+does NOT itself import ``pandas`` or ``numpy`` at top level,
+but it does import ``research_artifacts`` (for the public
+``combine_member_signals`` helper), which may transitively
+pull those in. The static "no pandas/numpy at top level" check
+in the test suite is therefore a check on this module's own
+imports only -- the transitive dependency graph is out of
+scope. The load-bearing claim is the no-projection / no-live-
+engine / no-production-write set above; the lack of a direct
+``pandas`` / ``numpy`` import is just an honest restatement
+that the core does its math in plain Python loops, not
+pandas vectorization.
 """
 
 from __future__ import annotations
@@ -481,7 +518,18 @@ def evaluate_grid(
         Mapping[str, Optional[str]]
     ] = None,
 ) -> tuple[PerWindowKCell, ...]:
-    """Evaluate many ``(K, window)`` cells in one call.
+    """Same-member-set convenience helper. **NOT the
+    StackBuilder production path.**
+
+    Every K value supplied for a given window is evaluated
+    against the SAME ``member_signal_columns`` bundle for
+    that window. Real StackBuilder builds emit one row per
+    K value with potentially different ``members_str`` per
+    K row, so the production-relevant shape is per-(K,
+    window) -- see ``evaluate_k_window_grid`` below.
+    ``evaluate_grid`` is kept as a convenience for tests /
+    smoke fixtures where every K row uses the same member
+    set; **do not use it on real StackBuilder data**.
 
     ``per_window_inputs`` maps window -> dict with three
     required keys:
@@ -500,6 +548,10 @@ def evaluate_grid(
     AND ``windows = CANONICAL_WINDOWS`` AND every canonical
     window has inputs, exactly 60 cells are emitted, sorted
     ``(1d, K=1..12), (1wk, K=1..12), ..., (1y, K=1..12)``.
+    Because every K row shares one member bundle per window,
+    cells from this helper are NOT representative of real
+    StackBuilder per-K member differences -- use it for
+    coverage smokes only.
     """
     cells: list[PerWindowKCell] = []
     K_list = list(K_values)
@@ -532,6 +584,96 @@ def evaluate_grid(
                     member_protocols=member_protocols,
                 ),
             )
+    return tuple(cells)
+
+
+# ---------------------------------------------------------------------------
+# Per-(K, window) grid evaluator — production-relevant shape
+# ---------------------------------------------------------------------------
+
+
+def evaluate_k_window_grid(
+    *,
+    target_ticker: str,
+    per_cell_inputs: Mapping[
+        tuple[int, str], Mapping[str, Any],
+    ],
+    member_protocols_default: Optional[
+        Mapping[str, Optional[str]]
+    ] = None,
+) -> tuple[PerWindowKCell, ...]:
+    """Evaluate per-``(K, window)`` cells where **each cell
+    supplies its own inputs**. This is the production-
+    relevant shape for the future TrafficFlow-style multi-
+    window K engine: real StackBuilder builds emit one row
+    per K value, and each K row may have a different
+    ``members_str``; each window for that K row has its own
+    bar series of member signals.
+
+    ``per_cell_inputs`` maps a ``(K, window)`` tuple to a
+    mapping with the following keys:
+
+      - ``dates`` (required) — sequence aligned 1-to-1 with
+        ``target_close`` and every member column;
+      - ``target_close`` (required) — close prices already
+        at the cell's window's bar frequency;
+      - ``member_signal_columns`` (required) — mapping of
+        member ticker -> sequence of pre-protocol Buy /
+        Short / None / "missing" strings, one per bar;
+      - ``member_protocols`` (optional) — mapping of member
+        ticker -> ``"D"`` / ``"I"``; if absent, falls back
+        to the ``member_protocols_default`` argument.
+
+    Cells missing from ``per_cell_inputs`` are silently
+    skipped (no fabricated output). Cells whose input dict
+    omits any of the three required keys are silently
+    skipped (no fabricated output).
+
+    The returned tuple iterates ``per_cell_inputs`` in
+    insertion order. To get all 60 canonical cells, the
+    caller must supply every ``(K, window)`` pair where
+    ``K`` is one of ``CANONICAL_K_VALUES`` AND ``window``
+    is one of ``CANONICAL_WINDOWS``.
+
+    This is the function the future production-engine
+    glue path should call. The same-member-set
+    ``evaluate_grid`` above is a convenience for tests /
+    coverage smokes and is NOT representative of real
+    StackBuilder per-K member differences.
+    """
+    cells: list[PerWindowKCell] = []
+    for (K, window), inputs in per_cell_inputs.items():
+        dates = inputs.get("dates")
+        target_close = inputs.get("target_close")
+        member_signal_columns = inputs.get(
+            "member_signal_columns",
+        )
+        if (
+            dates is None
+            or target_close is None
+            or member_signal_columns is None
+        ):
+            continue
+        # Per-cell protocols override the default; absent
+        # protocols entry falls back to the default; absent
+        # default leaves the per-member protocol = None
+        # (Direct).
+        proto = inputs.get("member_protocols")
+        if proto is None:
+            proto = member_protocols_default
+        cells.append(
+            evaluate_cell(
+                target_ticker=target_ticker,
+                K=K,
+                window=window,
+                dates=dates,
+                target_close=target_close,
+                member_signal_columns=(
+                    member_signal_columns
+                ),
+                member_protocols=proto,
+            ),
+        )
     return tuple(cells)
 
 

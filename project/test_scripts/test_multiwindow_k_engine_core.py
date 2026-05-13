@@ -637,6 +637,300 @@ def test_grid_empty_windows_yields_no_cells():
 
 
 # ---------------------------------------------------------------------------
+# 7b. evaluate_k_window_grid (production-relevant per-(K, window) shape)
+# (Phase 6I-21 Codex amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_k_window_grid_per_k_member_sets_differ():
+    """Codex audit (Phase 6I-21 amendment): the real
+    StackBuilder workflow emits one row per K with
+    potentially different member sets. ``evaluate_k_window_grid``
+    must accept per-``(K, window)`` member sets and the
+    resulting cells must reflect each cell's own member
+    bundle.
+
+    Fixture: same 3-bar +5% target close on the 1d window,
+    K=1 row uses one member (Buy on every bar) while K=2
+    row uses two members (one Buy, one Short). Outputs:
+    K=1 -> Buy combined, all bars fire; K=2 -> mixed Buy +
+    Short -> None combined; 0 trigger days."""
+    closes = [100.0, 105.0, 110.25]
+    dates = _simple_dates(3)
+    per_cell = {
+        (1, "1d"): {
+            "dates": dates,
+            "target_close": closes,
+            "member_signal_columns": {
+                "A": ["Buy", "Buy", "Buy"],
+            },
+        },
+        (2, "1d"): {
+            "dates": dates,
+            "target_close": closes,
+            "member_signal_columns": {
+                "A": ["Buy", "Buy", "Buy"],
+                "B": ["Short", "Short", "Short"],
+            },
+        },
+    }
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=per_cell,
+    )
+    assert len(cells) == 2
+    by_k = {c.K: c for c in cells}
+    # K=1 with one Buy member -> Buy combined on every bar.
+    assert by_k[1].latest_combined_signal == core.SIGNAL_BUY
+    assert by_k[1].trigger_days == 3
+    # K=2 with mixed Buy+Short -> combined collapses to
+    # None; 0 trigger days; 0 capture.
+    assert by_k[2].latest_combined_signal == core.SIGNAL_NONE
+    assert by_k[2].trigger_days == 0
+    assert by_k[2].total_capture_pct == 0.0
+    # Member counts reflect each cell's own bundle.
+    assert by_k[1].member_count == 1
+    assert by_k[2].member_count == 2
+
+
+def test_k_window_grid_outputs_differ_from_shared_member_grid():
+    """Codex audit (Phase 6I-21 amendment): when each K row
+    legitimately has a different member set, the per-cell
+    evaluator yields different cells than the same-member
+    convenience helper. This pins that the new shape
+    actually carries the per-K member differences through
+    to the metrics."""
+    closes = [100.0, 105.0, 110.25]
+    dates = _simple_dates(3)
+    # Per-cell: K=1 uses just one Buy member; K=2 uses two
+    # Buy members.
+    per_cell = {
+        (1, "1d"): {
+            "dates": dates,
+            "target_close": closes,
+            "member_signal_columns": {
+                "A": ["Buy", "Buy", "Buy"],
+            },
+        },
+        (2, "1d"): {
+            "dates": dates,
+            "target_close": closes,
+            "member_signal_columns": {
+                "A": ["Buy", "Buy", "Buy"],
+                "B": ["Buy", "Buy", "Buy"],
+            },
+        },
+    }
+    per_cell_cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=per_cell,
+    )
+    by_k = {c.K: c for c in per_cell_cells}
+    # K=1 with one member should pass member_count=1.
+    # K=2 with two members should pass member_count=2.
+    # If the implementation ever started sharing the K=2
+    # member bundle across K=1 (i.e. ignoring per-cell
+    # inputs), member_count for K=1 would be wrong.
+    assert by_k[1].member_count == 1
+    assert by_k[2].member_count == 2
+    # Run the same data through the shared-member helper
+    # using ONLY the K=2 bundle for the window; that helper
+    # would evaluate K=1 against the two-member bundle.
+    shared_cells = core.evaluate_grid(
+        target_ticker="SPY",
+        K_values=(1, 2),
+        windows=("1d",),
+        per_window_inputs={
+            "1d": {
+                "dates": dates,
+                "target_close": closes,
+                "member_signal_columns": {
+                    "A": ["Buy", "Buy", "Buy"],
+                    "B": ["Buy", "Buy", "Buy"],
+                },
+            },
+        },
+    )
+    shared_by_k = {c.K: c for c in shared_cells}
+    # Shared-member helper: K=1 sees 2 members (matches
+    # K=2's bundle). This is the exact failure mode the
+    # amendment guards against -- using evaluate_grid on
+    # real StackBuilder data would mis-attribute member
+    # counts.
+    assert shared_by_k[1].member_count == 2
+    # Per-cell helper correctly carries K=1's single
+    # member through; shared helper does not.
+    assert (
+        by_k[1].member_count != shared_by_k[1].member_count
+    )
+
+
+def _full_per_cell_inputs() -> dict[
+    tuple[int, str], dict[str, Any],
+]:
+    """Build a per-(K, window) input map covering all 60
+    canonical cells. Each cell uses K+window-specific
+    member sets so the amendment's per-K member-set
+    contract is exercised."""
+    n = 3
+    closes = [100.0, 105.0, 110.25]
+    dates = _simple_dates(n)
+    out: dict[tuple[int, str], dict[str, Any]] = {}
+    for window in core.CANONICAL_WINDOWS:
+        for k in core.CANONICAL_K_VALUES:
+            # Member set varies by K to ensure no shared-
+            # bundle assumption survives.
+            members = {
+                f"M{i}": ["Buy"] * n for i in range(k)
+            }
+            out[(k, window)] = {
+                "dates": list(dates),
+                "target_close": list(closes),
+                "member_signal_columns": members,
+            }
+    return out
+
+
+def test_k_window_grid_full_canonical_emits_60_cells():
+    """Per-cell evaluator: 60 canonical ``(K, window)`` pairs
+    with per-cell member sets -> exactly 60 cells, one per
+    pair, member_count reflecting each cell's own bundle."""
+    per_cell = _full_per_cell_inputs()
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=per_cell,
+    )
+    assert len(cells) == 60
+    observed = {(c.K, c.window) for c in cells}
+    expected = {
+        (k, w)
+        for k in core.CANONICAL_K_VALUES
+        for w in core.CANONICAL_WINDOWS
+    }
+    assert observed == expected
+    # member_count must equal K because each cell has K
+    # members in _full_per_cell_inputs.
+    for c in cells:
+        assert c.member_count == c.K
+
+
+def test_k_window_grid_missing_cell_does_not_fabricate():
+    """Per-cell evaluator: cells absent from
+    ``per_cell_inputs`` are silently skipped (no fabricated
+    output). Dropping one canonical pair leaves 59 cells."""
+    per_cell = _full_per_cell_inputs()
+    per_cell.pop((6, "1mo"))  # Drop one canonical pair.
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=per_cell,
+    )
+    assert len(cells) == 59
+    observed = {(c.K, c.window) for c in cells}
+    assert (6, "1mo") not in observed
+
+
+def test_k_window_grid_incomplete_cell_input_skipped():
+    """Per-cell evaluator: a cell whose input dict omits
+    any of the three required keys is silently skipped (no
+    fabricated output)."""
+    per_cell = _full_per_cell_inputs()
+    # Strip target_close from one canonical cell.
+    del per_cell[(3, "3mo")]["target_close"]
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=per_cell,
+    )
+    assert len(cells) == 59
+    observed = {(c.K, c.window) for c in cells}
+    assert (3, "3mo") not in observed
+
+
+def test_k_window_grid_payload_satisfies_phase_6i20_required_five():
+    """Per-cell evaluator's payload must still satisfy the
+    Phase 6I-20 contract: the five required fields appear
+    on every cell."""
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=_full_per_cell_inputs(),
+    )
+    payload = core.cells_to_per_window_k_metrics_payload(
+        cells,
+    )
+    assert len(payload) == 60
+    required = {
+        "K",
+        "window",
+        "total_capture_pct",
+        "sharpe_ratio",
+        "trigger_days",
+    }
+    for entry in payload:
+        assert required.issubset(set(entry.keys()))
+
+
+def test_k_window_grid_payload_validates_against_phase_6i20_audit():
+    """Per-cell evaluator's payload must be accepted by the
+    Phase 6I-20 gap audit's ``_per_window_k_metrics_are_valid``
+    when all 60 canonical cells are present."""
+    import multiwindow_k_engine_gap_audit as audit
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=_full_per_cell_inputs(),
+    )
+    payload = core.cells_to_per_window_k_metrics_payload(
+        cells,
+    )
+    assert audit._per_window_k_metrics_are_valid(payload)
+
+
+def test_k_window_grid_per_cell_protocol_overrides_default():
+    """Per-cell ``member_protocols`` overrides the call-
+    level default. Two cells, same one-member set, default
+    Direct: K=1 (Direct via default) -> Buy combined; the
+    same shape with the per-cell override to Inverse ->
+    Short combined."""
+    closes = [100.0, 105.0]
+    dates = _simple_dates(2)
+    cols = {"A": ["Buy", "Buy"]}
+    per_cell = {
+        (1, "1d"): {
+            "dates": dates,
+            "target_close": closes,
+            "member_signal_columns": cols,
+        },
+        (1, "1wk"): {
+            "dates": dates,
+            "target_close": closes,
+            "member_signal_columns": cols,
+            "member_protocols": {"A": core.PROTOCOL_INVERSE},
+        },
+    }
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs=per_cell,
+        member_protocols_default={"A": core.PROTOCOL_DIRECT},
+    )
+    by_window = {c.window: c for c in cells}
+    assert (
+        by_window["1d"].latest_combined_signal
+        == core.SIGNAL_BUY
+    )
+    assert (
+        by_window["1wk"].latest_combined_signal
+        == core.SIGNAL_SHORT
+    )
+
+
+def test_k_window_grid_empty_input_yields_no_cells():
+    """Empty ``per_cell_inputs`` yields zero cells."""
+    cells = core.evaluate_k_window_grid(
+        target_ticker="SPY",
+        per_cell_inputs={},
+    )
+    assert cells == ()
+
+
+# ---------------------------------------------------------------------------
 # 8. Length-alignment safety
 # ---------------------------------------------------------------------------
 
