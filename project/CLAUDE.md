@@ -155,9 +155,77 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-12 (Phase 6G-5; Town Notice Board visual baseline live on current main)
+### 6. Current Sprint State as of 2026-05-13 (post Phase 6I-13)
 
-**main / origin/main HEAD:** `576b676` — `Phase 6G-5: SPY currentness gap audit + persist-skip-lag honest recommendation (#210)`.
+**main / origin/main HEAD:** `303e826` — `Phase 6I-13: supervised SPY pipeline/validation evidence attempt -- preconditions failed; writer NOT run (#230)`.
+
+**Sprint trajectory (Phase 6H + Phase 6I, top-to-bottom by phase number):**
+
+The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest-recommendation contract) has shipped and is preserved verbatim in the demoted section below for future UI / UX review. Phase 6H added the **read-only automation foundation**; Phase 6I added the **data/evidence and authorization layers** that gate any production writer invocation. The current state is post-Phase 6I-13, which attempted but did not invoke the writer.
+
+**Phase 6H — read-only automation foundation (all merged):**
+
+  - **Phase 6H-1** (PR #213) — Daily Signal Board launch / design handoff doc (`md_library/shared/2026-05-12_PHASE_6H_DAILY_SIGNAL_BOARD_LAUNCH_HANDOFF.md`).
+  - **Phase 6H-3** (PR #215) — `daily_board_automation_preflight.py` read-only preflight planner (`md_library/shared/2026-05-12_PHASE_6H3_DAILY_BOARD_AUTOMATION_PREFLIGHT.md`).
+  - **Phase 6H-4** (PR #216) — `daily_board_automation_executor.py` dry-run executor (`md_library/shared/2026-05-12_PHASE_6H4_DAILY_BOARD_AUTOMATION_DRY_RUN_EXECUTOR.md`).
+  - **Phase 6H-5** (PR #217) — `daily_board_automation_writer.py` two-key guarded writer foundation: `--write` CLI flag + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` env var both required (`md_library/shared/2026-05-12_PHASE_6H5_GUARDED_WRITE_EXECUTOR_FOUNDATION.md`).
+  - **Phase 6H-6** (PR #218) — writer root plumbing: `--cache-dir`, `--status-dir`, `--artifact-root`, `--stackbuilder-root`, `--signal-library-dir`, `--execution-log` (`md_library/shared/2026-05-12_PHASE_6H6_LIVE_WRITER_ROOT_PLUMBING.md`).
+  - **Phase 6H-7** (PR #219) — production runbook + operator command manifest (`md_library/shared/2026-05-12_PHASE_6H7_PRODUCTION_RUNBOOK.md`).
+
+**Phase 6I — data/evidence and authorization layers (all merged):**
+
+  - **Phase 6I-1** (PR #220) — `confluence_ranking_contract_validator.py`: seven per-ticker contract booleans (cache, stackbuilder, daily_k, mtf, confluence, readiness, board_row) + leader-eligibility + ranking-blocked-reason verdict.
+  - **Phase 6I-3** (PR #221) — `confluence_ranking_emitter.py`: cross-ticker ranking emission with Group A signal-breadth + Group B performance-quality + three tails (positive / negative / low_buy).
+  - **Phase 6I-4** (PR #222) — `upstream_research_input_audit.py`: upstream trio audit (OnePass / ImpactSearch / StackBuilder) with 12 stable issue codes + 11 primary-blocker strings + three predictive flags (`can_build_daily_trafficflow_k` / `can_project_multitimeframe` / `can_build_confluence`).
+  - **Phase 6I-5** (PR #223) — `daily_board_universe_planner.py`: discovers the StackBuilder universe (248 tickers as of merge) and joins per-ticker upstream/preflight/ranking state with three predictive handoff flags.
+  - **Phase 6I-6** (PR #224) — `daily_board_execution_queue_planner.py`: action-first 7-queue classification (`pipeline_only_queue` / `refresh_source_cache_then_pipeline_queue` / `wait_for_cache_ahead_queue` / `manual_stackbuilder_queue` / `upstream_blocked_queue` / `downstream_gap_queue` / `current_leader_eligible_queue`) with advisory writer commands on the two write-ready queues.
+  - **Phase 6I-7** (PR #225) — `spymaster_master_audit.py`: Spymaster collapsed-by-default master-audit panel consuming the Phase 6I-6 planner read-only. No write button. No daily_board_automation_writer import.
+  - **Phase 6I-8** (PR #226) — writer post-pipeline contract validation: the Phase 6I-1 validator is invoked read-only AFTER every authorized pipeline write that returns normally; `ContractValidationOutcome` carries the seven booleans + the `CONTRACT_VALIDATOR_FUNCTION_MARKER` in `functions_executed`.
+  - **Phase 6I-9** (PR #227) — `daily_board_supervised_run_gate.py`: pre-decision **SCREEN** ("Is it safe to authorize the guarded writer right now, for which tickers, and why or why not?"). Seven `ACTION_*` constants + seven `BLOCKING_*` reason constants. Action-first decision cascade. **The writer's two-key gate is unchanged**; this screen sits in front of it.
+  - **Phase 6I-10** (PR #228) — `daily_board_flow_integrity_audit.py`: read-only end-to-end flow audit walking 6 named stages (`STAGE_UPSTREAM` / `STAGE_CONTRACT` / `STAGE_RANKING` / `STAGE_QUEUE_AND_GATE` / `STAGE_WRITER_STATIC` / `STAGE_SPYMASTER_HELPER`). Production-root snapshot (`relative_path_size_mtime` strategy) before/after the audit. Composite verdict `safe_to_consider_authorized_run_after_review` is True iff every stage passes AND gate is safe AND production roots stayed untouched. Five `known_simulated_or_inferred_steps` named: `real_authorized_writer_run`, `real_signal_engine_cache_refresher_invocation`, `real_confluence_pipeline_runner_write`, `real_yfinance_fetch`, `real_post_pipeline_validation_on_writer_path`.
+  - **Phase 6I-11** (PR #229) — **first supervised authorized SPY writer run.** Writer invoked exactly once from `project/` via a one-shot temp launcher script (deleted before commit) with the pinned `spyproject2` interpreter + the two-key authorization. **The refresher callable ran** (in-process Python function `signal_engine_cache_refresher.refresh_signal_engine_cache` recorded in `functions_executed`; the writer has **no subprocess path**) and advanced cache `date_range_end` from `2026-05-11` to `2026-05-12`. **The pipeline was withheld** by the persist-skip-lag honest contract because, after the refresh, `cache_date_range_end == current_as_of_date == 2026-05-12` is not strictly greater than cutoff. `final_recommended_action="refresh_executed_pipeline_withheld"`. Surgical inventory diff: 3 files changed in `cache/results/` + `cache/status/`; 0 changes across `output/research_artifacts/`, `signal_library/data/stable/`, `output/stackbuilder/`. Closed two of five evidence gaps (`real_authorized_writer_run`, `real_signal_engine_cache_refresher_invocation`); three remained open.
+  - **Phase 6I-12** (PR #230 / squash `5dfd054`) — additive code-backed evidence improvements. **Scope A** added a four-case selector to the flow-audit `recommended_next_evidence_step` so it distinguishes stage-failure / roots-touched / gate-not-safe-with-all-stages-pass / supervised-run-ready. **Scope B** added `ProviderFetchTelemetry` (provider_name / fetch_attempted / fetch_succeeded / ticker / rows / date_range_start / date_range_end / elapsed_seconds / error) to the refresher's result surface, persisted it onto the refresher's per-ticker status JSON for write runs (Codex amendment), and threaded the same JSON shape through the writer's `RefreshOutcome` JSON serializer to stdout + JSONL execution log. **Fetch-attempt/result telemetry, NOT HTTP-level telemetry.** Telemetry is unfired until a future refresh actually runs.
+  - **Phase 6I-13** (PR #230 / squash `303e826`) — **supervised-run evidence attempt; writer NOT run.** Five required pre-run read-only probes captured `2026-05-13T06:56Z UTC` against main `5dfd054`. The resolver returned `current_as_of_date=2026-05-12` for those probes. Gate verdict: `safe_to_authorize_writer_now=false`, `recommended_operator_action="wait_for_cache_ahead_of_cutoff"`, SPY in `wait_for_cache_ahead_tickers` and absent from `authorization_candidate_tickers`. Writer dry-run: `initial_recommended_action="wait_for_cache_ahead_of_cutoff"` (neither `run_pipeline_only` nor `refresh_source_cache_then_pipeline`). Three of seven spec preconditions failed (gate-safe / SPY-in-candidates / writer-action-actionable), all on the same root cause: `cache_date_range_end == current_as_of_date == 2026-05-12`. Per spec, **no temp launcher script, no `PRJCT9_AUTOMATION_WRITE_AUTH` env var set, no writer `--write`**. The Phase 6I-12 Scope A wording fix is verified live in the flow audit's case-3 text. Three real-evidence gaps remain open (see § 6.1 below).
+
+**Five-precondition checklist before any future writer authorization** (from Phase 6I-13 spec; an attempted run halts and writes a docs-only branch if ANY fails):
+
+  1. `gate.safe_to_authorize_writer_now == true`.
+  2. `gate.authorization_candidate_tickers` contains the target ticker.
+  3. Writer dry-run `initial_recommended_action` is `run_pipeline_only` OR `refresh_source_cache_then_pipeline` (neither `wait_for_cache_ahead_of_cutoff` nor any manual/blocker action).
+  4. Flow audit: all 6 stages pass AND `production_roots_untouched == true`.
+  5. Contract validator: all 7 contract booleans `true`; no manual/blocker recommended action.
+
+**The one operational condition that opens the gate:** `cache_date_range_end > resolved current_as_of_date` strictly. Wall-clock advance alone does not open the gate; a fresh refresh must land a trading day strictly past the cutoff in the source cache.
+
+**Remaining real-evidence gaps after Phase 6I-13** (carry-forward from Phase 6I-12 with no change):
+
+  - `real_confluence_pipeline_runner_write` — STILL OPEN.
+  - `real_post_pipeline_validation_on_writer_path` — STILL OPEN.
+  - `real_yfinance_fetch` direct fetch-call telemetry — **instrumented** (Phase 6I-12 ProviderFetchTelemetry across four surfaces: refresher result, refresher status JSON, writer stdout, writer JSONL); **awaiting capture** on a future supervised run that actually invokes a refresh.
+
+**Test baseline:** full regression **1,550 passed in 343.68 s, 60 pre-existing pandas fragmentation warnings** (Phase 6I-12 baseline; Phase 6I-13 was docs-only so the baseline did not move).
+
+**No production writes are currently authorized.** The next attempt must run the five Phase 6I-13 read-only probes first and pass the precondition checklist before any `--write` invocation is considered. **Do not authorize a writer run merely because time has passed.**
+
+**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a Phase 6I-14 or later PR landed without a refresh.
+
+**Next-run handoff doc:** `project/md_library/shared/2026-05-13_PHASE_6I14_SPRINT_STATE_AND_NEXT_RUN_HANDOFF.md` (explicit preconditions, gate-opening condition, do-not-run-yet list).
+
+**Phase 6E-2 preflight doc:** `project/md_library/shared/2026-05-11_PHASE_6E2_SOURCE_FRESHNESS_PREFLIGHT.md` (§ 6.8 details the persist-skip-lag `pipeline_output_lags_persist_skip` action).
+
+**Phase 6G baseline doc:** `project/md_library/shared/2026-05-11_PHASE_6G_DAILY_SIGNAL_BOARD_BASELINE.md` (§ 7 details the persist-skip-lag contract from the UX side).
+
+**Testing root:** `C:\Users\sport\Documents\PythonProjects\spy-project` (the primary repo on `main`). The stale emdash worktree at `C:\Users\sport\emdash\worktrees\spy-project\emdash\sprint-continued-qlpvw` is many phases behind and is NOT a valid test target.
+
+**PRJCT9 north star:** "PRJCT9 is a pattern-discovery engine. The MVP front door is the Daily Signal Board — a public read-only leaderboard of saved-research alignment by ticker."
+
+---
+
+### 6.1. (Historical — superseded by 2026-05-13 / Phase 6I-13 sprint state above) Daily Signal Board visual baseline (as of 2026-05-12, Phase 6G-5)
+
+The Phase 6G-5 / Town Notice Board section below is preserved verbatim because the Daily Signal Board's seven-section hierarchy, public-meaning framing, and SPY pilot pinned-cutoff recipe are still load-bearing for visual / UX review work. Production-automation state has since moved through Phase 6H + Phase 6I and is documented in § 6 above; **for current automation state, follow § 6, not this section.**
+
+**main / origin/main HEAD (when this section was current):** `576b676` — `Phase 6G-5: SPY currentness gap audit + persist-skip-lag honest recommendation (#210)`.
 
 **Two baselines, separated:**
 
