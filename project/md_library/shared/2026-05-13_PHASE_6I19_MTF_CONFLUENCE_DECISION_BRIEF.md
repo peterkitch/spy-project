@@ -3,12 +3,15 @@
 ## 0. Scope
 
 A new read-only module `confluence_decision_brief.py`
-(+ CLI + tests + this doc) that **replaces the old
-manual TrafficFlow K=6 + AI-prompt workflow** with a
-structured operator-facing brief. The brief consumes
-the existing Phase 6I-3 ranking emitter / Phase 6I-5
-universe planner outputs — it does **not** rebuild
-ranking math.
+(+ CLI + tests + this doc) that **adapts** the existing
+Phase 6I-3 ranking emitter / Phase 6I-5 universe planner
+outputs into a structured operator-facing brief. The
+brief consumes whatever those upstream surfaces already
+produce — it does **not** rebuild ranking math, and it
+does **not** build the still-missing TrafficFlow-style
+multi-window K engine (§ 1 and § 9 below). It is a
+**presentation adapter**, not a replacement for any
+runtime engine.
 
 **Strict no-write contract.** No writer `--write`. No
 `PRJCT9_AUTOMATION_WRITE_AUTH` env var. No source
@@ -22,56 +25,107 @@ static guard blocks the writer / refresher / pipeline
 runner / live engines / yfinance / dash / subprocess at
 the brief module's top level.
 
-## 1. How this replaces the old manual workflow
+## 1. The old manual workflow and what's still missing
 
-The old flow operators used to answer "what's our best
-buy / short candidate today?" was:
+### 1.1 The actual legacy flow (operator-confirmed)
 
-  1. delete cached PKLs (so TrafficFlow would notice
-     them as missing);
-  2. let TrafficFlow build a "missing" list;
-  3. run the Spymaster batch to refill them;
-  4. inspect TrafficFlow's K=6 confluence table by eye;
-  5. paste the table into an AI prompt and ask for a
-     ranking + pattern read.
+The daily decision workflow operators were running to
+ask "what's our best buy / short candidate today?" was:
 
-Three problems with that flow:
+  1. delete cached PKLs;
+  2. open TrafficFlow and let it surface a missing-PKL
+     list;
+  3. run the Spymaster batch process to refill those
+     PKLs;
+  4. return to TrafficFlow;
+  5. enter a K value (e.g. `K=6`);
+  6. export / inspect that single daily K table;
+  7. paste the table into an AI prompt and ask for a
+     pattern read / ranking / confidence call before
+     the next market close.
 
-  - **Destructive prereq** — step 1 is a deliberate
-    cache invalidation; the system has been deliberately
-    moving toward never-delete since Phase 5C-1.
-  - **K=6 only** — step 4 cherry-picks one K value out
-    of K=1..12; the ranking signal can sit at K=2 or
-    K=11 and be completely missed.
-  - **Single-timeframe ambiguity** — the manual table
-    didn't distinguish a daily-only confluence from a
-    broad multi-timeframe alignment, so the AI prompt
-    couldn't either.
+### 1.2 The key limitation of that flow
 
-Phase 6I-1 / 6I-3 / 6I-5 fixed all three:
+The K table TrafficFlow exported at step 6 was
+**single-window**: it was a daily / next-24-hour
+ranking only. The pattern read at step 7 had no
+multi-window context — the operator could not see at a
+glance whether a candidate that looked strong at K=6
+daily was also strong at K=6 weekly, monthly, quarterly,
+or yearly. The exported table simply didn't carry that
+information.
 
-  - The Phase 6I-1 validator is read-only against the
-    on-disk artifacts (no cache invalidation needed).
-  - The Phase 6I-3 emitter aggregates per-ticker
-    ranking inputs across **all 12 K values and up to 5
-    timeframes** (12 × 5 = 60 alignment cells).
-  - The Phase 6I-3 emitter pre-sorts three operator-
-    facing tails: positive (buy / long), negative
-    (short / sell), and low-buy (near-zero buy
-    support).
+### 1.3 The long-term target — NOT YET BUILT
 
-Phase 6I-19's brief is the thin adapter that surfaces
-that data in the shape operators were previously using
-the AI prompt for: top buy candidates, top short
-candidates, low-buy candidates, multi-timeframe context
-per row, and inverse-pair annotations when the
-inspected set happens to include both sides of a known
-inverse / leveraged-inverse pair.
+The future-work goal is a TrafficFlow-style
+**multi-window** engine that, for each StackBuilder K
+build, evaluates K behavior across the five canonical
+windows `1d / 1wk / 1mo / 3mo / 1y` and writes the
+resulting artifacts so Confluence can display whether
+*every* ticker in a build is firing across *every*
+available window. The operator's North Star phrasing
+is: "look at the Confluence view and say *wow, this
+whole build is aligned across windows.*"
 
-The brief **does not** decide what to trade. It surfaces
-the same evidence the AI prompt was being asked to
-ingest, in a deterministic JSON shape with no
-hallucination surface.
+**That engine does not exist in this repo yet.** It is
+the load-bearing future-work item that this Phase
+6I-19 PR explicitly does NOT build (see § 9 below).
+
+### 1.4 What Phase 6I-19's brief actually is
+
+This module is a **read-only presentation adapter** on
+top of the existing Phase 6I-3 ranking emitter / Phase
+6I-5 universe planner. It consumes whatever those
+upstream surfaces already produce — including whatever
+`timeframes` / `K_values` tuples those surfaces already
+contain — and emits a structured JSON brief that
+arranges them by tail (positive / negative / low-buy),
+adds three small presentation annotations per row
+(`mtf_breadth`, `k_count`, `k_coverage_complete`), and
+attaches inverse-pair annotations when the inspected
+set happens to include both sides of a known inverse /
+leveraged-inverse pair.
+
+**The brief does NOT:**
+
+  - generate TrafficFlow-style K metrics across the
+    five canonical windows;
+  - create or populate any missing multi-timeframe
+    artifacts;
+  - replace TrafficFlow, StackBuilder, Spymaster, or
+    Confluence as runtime engines;
+  - decide what to trade;
+  - close any of the Phase 6I-16 / 6I-17 evidence gaps
+    (real_confluence_pipeline_runner_write /
+    real_post_pipeline_validation_on_writer_path /
+    writer-surface provider telemetry).
+
+If the upstream artifacts for a ticker do not yet
+contain multi-timeframe K data, the brief reflects
+that absence honestly: `timeframes` may be daily-only
+or empty, `mtf_breadth` will be `daily_only` or
+`none`, and `k_coverage_complete` may be `False`. The
+brief surfaces the absence; it does not manufacture
+data to fill it.
+
+### 1.5 What the brief replaces — and what it does NOT replace
+
+The brief replaces **step 7 of the legacy flow** (the
+"paste a daily K table into an AI prompt and ask for a
+ranking / pattern read" step) with a deterministic
+JSON output shape that has no hallucination surface.
+It does this against whatever data already exists
+upstream — including, in the multi-window case,
+whatever the upstream artifacts already carry.
+
+The brief does **not** replace steps 1–6 of the
+legacy flow (the deliberate cache invalidation +
+TrafficFlow missing-PKL list + Spymaster batch
+process + K-table export). Those steps are still the
+runtime path that produces the underlying data, and
+none of them have been superseded by this PR. A future
+phase that builds the missing multi-window engine
+(§ 1.3) is what would eventually displace them.
 
 ## 2. Public API
 
@@ -206,30 +260,54 @@ Inverse-confirmation note shape:
 }
 ```
 
-## 5. Why multi-timeframe is the key upgrade
+## 5. Multi-timeframe annotations (presentation only)
 
-The Phase 6I-3 emitter aggregates ranking inputs across
-all 12 K values for up to 5 timeframes (1d / 1wk / 1mo /
-3mo / 1y; `expected_cell_count = 12 × 5 = 60`). Phase
-6I-19's brief surfaces this directly on each per-row
-output as three derived fields:
+**Important:** the brief does NOT generate
+multi-timeframe data. It surfaces whatever the
+upstream artifacts already contain. If the upstream
+artifacts for a given ticker only carry a daily
+window, the brief faithfully reports `daily_only`; it
+does not invent the missing weekly / monthly /
+quarterly / yearly columns. Building the engine that
+*would* populate those columns is the load-bearing
+future-work item in § 1.3 / § 9.
 
-  - `mtf_breadth` ∈ {`daily_only`, `mixed`,
-    `broad_multi_timeframe`, `none`}.
-  - `k_count` — how many K values contributed.
-  - `k_coverage_complete` — `true` only when the row's
-    `K_values` exactly equals `{1, 2, ..., 12}`.
+What the Phase 6I-3 emitter already exposes per row:
 
-`broad_multi_timeframe` requires the row's
-`timeframes` tuple to include at least 3 of the
-canonical set `{1d, 1wk, 1mo, 3mo, 1y}`. A row that
-fires only at the daily level is `daily_only`; a row
-that fires across just two of the canonical
-timeframes is `mixed`. This single field lets an
-operator distinguish at a glance between a thin
-daily-only consensus and a deep multi-timeframe
-confluence — exactly the discrimination the old K=6
-table could not provide.
+  - `timeframes` — a tuple naming whichever windows
+    are present in the upstream artifact. The
+    canonical aspiration is `(1d, 1wk, 1mo, 3mo, 1y)`
+    but the actual contents depend entirely on what
+    the upstream pipeline / TrafficFlow path wrote.
+  - `K_values` — a tuple of K values the upstream
+    artifact carries (aspiration: `K=1..12`).
+  - `expected_cell_count` — the implied 12 × 5 = 60
+    alignment cell count when full MTF coverage is
+    present.
+
+What Phase 6I-19 adds (presentation annotations only):
+
+  - `mtf_breadth ∈ {none, daily_only, mixed, broad_multi_timeframe}`
+    classifies the row's `timeframes` tuple against
+    the canonical set:
+      - `none` — empty / no overlap.
+      - `daily_only` — exactly `{"1d"}`.
+      - `broad_multi_timeframe` — 3 or more of the
+        canonical set are present.
+      - `mixed` — anything in between.
+  - `k_count` — `len(K_values)`.
+  - `k_coverage_complete` — `True` only when
+    `set(K_values) == {1, 2, ..., 12}`.
+
+These three derived fields are the brief's contribution
+to the multi-window surface. They are **observation
+labels on existing upstream data**, not new MTF data.
+When the upstream artifacts lack MTF coverage today
+(the common case until the missing engine described in
+§ 1.3 lands), the brief will faithfully label each row
+`daily_only` (or `none`), and the operator will see at
+a glance that the multi-window picture is not yet
+populated.
 
 ## 6. Why both top and bottom tails matter
 
@@ -332,8 +410,21 @@ Phase 6I-3 inputs.
 
 `remaining_limitations` is emitted on the JSON output
 verbatim from the module's `_DEFAULT_REMAINING_LIMITATIONS`
-tuple. Six items as of Phase 6I-19:
+tuple. **Seven** items as of the Phase 6I-19 review
+amendment, with the load-bearing missing-engine item
+named first:
 
+  - **True TrafficFlow-style multi-window K evaluation
+    is NOT built by this brief.** Each StackBuilder K
+    build still needs a future engine / path that
+    evaluates and writes `1d / 1wk / 1mo / 3mo / 1y`
+    artifacts so Confluence can display whether every
+    ticker in a build is firing across every available
+    window. This brief is a presentation adapter — it
+    surfaces the existing `timeframes` / `K_values`
+    tuples if and only if upstream artifacts already
+    contain them, and it never creates the missing MTF
+    data. See § 1.3 for the long-term target framing.
   - **`real_confluence_pipeline_runner_write`** still
     open (closes on a future supervised run where
     `cache_date_range_end > resolved current_as_of_date`

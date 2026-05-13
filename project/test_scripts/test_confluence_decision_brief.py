@@ -599,6 +599,94 @@ def test_remaining_limitations_names_pipeline_writer_gaps():
     assert "Aggregate Confluence p_value" in joined
 
 
+def test_remaining_limitations_names_missing_multi_window_engine():
+    """Phase 6I-19 amendment (operator product
+    correction): the brief's ``remaining_limitations``
+    must explicitly name that the true TrafficFlow-style
+    multi-window K engine is NOT built by this brief.
+    The named windows ``1d / 1wk / 1mo / 3mo / 1y`` must
+    appear in the limitation, alongside an explicit
+    acknowledgement that the brief is a presentation
+    adapter and does not create missing MTF data."""
+    fake = _make_report(rows=())
+    report = brief.evaluate_confluence_decision_brief(
+        tickers=[],
+        ranking_callable=_ranking_returning(fake),
+    )
+    joined = " ".join(report.remaining_limitations)
+    # Load-bearing words: multi-window engine,
+    # StackBuilder K build, the five named windows, and
+    # the explicit "presentation adapter / never
+    # creates" disclaimer.
+    assert (
+        "True TrafficFlow-style multi-window K "
+        "evaluation"
+    ) in joined
+    assert "StackBuilder K build" in joined
+    assert "1d / 1wk / 1mo / 3mo / 1y" in joined
+    assert "presentation adapter" in joined
+    assert "never creates the missing" in joined
+
+
+def test_module_docstring_and_doc_do_not_overclaim():
+    """Phase 6I-19 amendment (operator product
+    correction): the module docstring and the Phase 6I-19
+    markdown doc must NOT carry the original overclaim
+    phrases that read as if the legacy workflow was
+    fully replaced or as if Phase 6I-1 / 6I-3 / 6I-5
+    fixed the multi-window generation problem.
+
+    The brief is a presentation adapter; the actual
+    multi-window engine is still future work. Test
+    enforces both files do not contain the flagged
+    phrases."""
+    module_src = Path(brief.__file__).read_text(
+        encoding="utf-8",
+    )
+    doc_path = (
+        Path(brief.__file__).resolve().parent
+        / "md_library" / "shared"
+        / (
+            "2026-05-13_PHASE_6I19_MTF_CONFLUENCE_"
+            "DECISION_BRIEF.md"
+        )
+    )
+    doc_src = doc_path.read_text(encoding="utf-8")
+    overclaim_phrases = [
+        # Original module docstring overclaim.
+        "That chain is now obsolete",
+        # Original doc Section 1 overclaim header.
+        "How this replaces the old manual workflow",
+        # Original doc Section 1 overclaim closure
+        # phrase.
+        "Phase 6I-1 / 6I-3 / 6I-5 fixed all three",
+        # Original doc Section 5 overclaim header.
+        "Why multi-timeframe is the key upgrade",
+        # Cross-doc overclaim variants.
+        "old chain is now obsolete",
+    ]
+    found_in_module: list[str] = [
+        p for p in overclaim_phrases if p in module_src
+    ]
+    found_in_doc: list[str] = [
+        p for p in overclaim_phrases if p in doc_src
+    ]
+    assert not found_in_module, (
+        "Phase 6I-19 module docstring still carries "
+        f"overclaim phrase(s): {found_in_module!r}. "
+        "Per operator product correction, the brief is "
+        "a presentation adapter on existing artifacts "
+        "and must not claim to have replaced the "
+        "legacy workflow or to have built the still-"
+        "missing multi-window engine."
+    )
+    assert not found_in_doc, (
+        "Phase 6I-19 markdown doc still carries "
+        f"overclaim phrase(s): {found_in_doc!r}. Same "
+        "operator product correction applies."
+    )
+
+
 # ---------------------------------------------------------------------------
 # 8. JSON serialization
 # ---------------------------------------------------------------------------

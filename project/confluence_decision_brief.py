@@ -1,42 +1,103 @@
-"""Phase 6I-19: read-only multi-timeframe Confluence decision brief.
+"""Phase 6I-19: read-only multi-timeframe Confluence decision-brief adapter.
 
-The old manual workflow operators used to ask
+Scope clarification (operator-confirmed at PR #236 review)
+----------------------------------------------------------
+
+The legacy manual workflow operators ran daily to ask
 "what's our best buy / short candidate today?" was:
 
   1. delete cached PKLs;
-  2. let TrafficFlow build a "missing"  list;
-  3. run the Spymaster batch to refill them;
-  4. inspect TrafficFlow's K=6 table by eye;
-  5. paste the table into an AI prompt and ask for a
-     ranking + pattern read.
+  2. open TrafficFlow and let it surface a missing-PKL
+     list;
+  3. run the Spymaster batch process to refill those
+     PKLs;
+  4. return to TrafficFlow;
+  5. enter a K value (e.g. K=6);
+  6. export / inspect that single daily K table;
+  7. paste the table into an AI prompt and ask for a
+     pattern read / ranking / confidence call before
+     the next market close.
 
-That chain is now obsolete. Phase 6I-1 / 6I-3 / 6I-5
-already compute the per-ticker ranking inputs (signal-
-breadth Group A + performance-quality Group B) for an
-arbitrary ticker set, with a Phase 6I-1 contract
-validator gate, and pre-sort them into three operator-
-facing tails (positive / negative / low-buy).
+That flow was essentially **daily / next-24-hour only**:
+the K table TrafficFlow exported was single-window
+(daily), so the operator's pattern read at step 7 had
+no multi-window context.
 
-This module is a thin read-only adapter on top of the
-Phase 6I-3 emitter. It does NOT rebuild ranking math; it
-consumes the existing surfaces and emits a single
-JSON brief shaped for operator decision-making:
+**The long-term target is NOT yet built.** A true
+TrafficFlow-style multi-window engine would, for each
+StackBuilder K build, evaluate K behavior across the
+five canonical windows (1d / 1wk / 1mo / 3mo / 1y) and
+write the resulting artifacts so Confluence could
+display whether *every* ticker in a build is firing
+across *every* available window. That engine does not
+exist yet in this repo.
+
+What this module IS
+-------------------
+
+A thin read-only adapter that consumes whatever the
+Phase 6I-3 ranking emitter already produces (which in
+turn consumes whatever the Phase 6I-1 contract
+validator / Confluence artifacts already contain) and
+emits a structured JSON brief shaped for operator
+decision-making. The brief delegates all ranking math
+to the Phase 6I-3 emitter; it never rebuilds the
+ranking. It is essentially a presentation layer.
+
+Each per-ticker row carries:
+
+  - the Phase 6I-3 Group A signal-breadth fields verbatim;
+  - the Phase 6I-3 Group B performance-quality fields
+    verbatim;
+  - the row's ``timeframes`` / ``K_values`` tuples
+    **as already populated upstream** (the brief does
+    not augment them);
+  - three small derived fields the brief computes from
+    those tuples (``mtf_breadth``, ``k_count``,
+    ``k_coverage_complete``) **only as a presentation
+    annotation of what's already there**.
+
+What this module IS NOT
+-----------------------
+
+This module **does NOT**:
+
+  - generate TrafficFlow-style K metrics across 1d /
+    1wk / 1mo / 3mo / 1y;
+  - create or populate any missing multi-timeframe
+    artifacts;
+  - replace TrafficFlow / StackBuilder / Spymaster /
+    Confluence as runtime engines;
+  - decide what to buy or short;
+  - close any of the Phase 6I-16 / 6I-17 evidence gaps.
+
+If the upstream artifacts for a ticker do not yet
+contain multi-timeframe K data, the brief will reflect
+that absence: ``timeframes`` may be daily-only or
+empty, ``mtf_breadth`` will be ``daily_only`` or
+``none``, and ``k_coverage_complete`` may be ``False``.
+The brief surfaces the absence honestly; it does not
+manufacture data to fill it.
+
+Brief output sections
+---------------------
 
   - Top positive (buy / long) candidates.
   - Top negative (short / sell) candidates.
   - Low-buy candidates (near-zero buy support).
   - Optional inverse-confirmation annotations when an
     inverse / leveraged-inverse pair appears in the
-    inspected set.
-  - Multi-timeframe coverage breakdown per row so
-    operators can see whether a ranking is daily-only,
-    broad-multi-timeframe, or mixed.
+    inspected set. Annotations are observation-only;
+    the brief draws no conclusion.
+  - Multi-timeframe coverage breakdown per row as a
+    presentation annotation of the existing
+    ``timeframes`` tuple.
   - Aggregate summary of blocked / unrankable tickers
     and missing-data buckets.
-  - Explicit ``remaining_limitations`` field naming what
-    this brief does NOT decide (production pipeline
-    write evidence, aggregate Confluence p_value across
-    MTF, etc).
+  - Explicit ``remaining_limitations`` field naming
+    what this brief does NOT decide AND naming the
+    still-missing TrafficFlow-style multi-window K
+    engine (the load-bearing future-work item).
 
 Strictly read-only / offline:
 
@@ -520,6 +581,19 @@ def _build_missing_data_summary(
 
 
 _DEFAULT_REMAINING_LIMITATIONS: tuple[str, ...] = (
+    # Load-bearing future-work item: the true
+    # multi-window engine is not built yet.
+    "True TrafficFlow-style multi-window K evaluation "
+    "is NOT built by this brief. Each StackBuilder K "
+    "build still needs a future engine / path that "
+    "evaluates and writes 1d / 1wk / 1mo / 3mo / 1y "
+    "artifacts so Confluence can display whether every "
+    "ticker in a build is firing across every available "
+    "window. This brief is a presentation adapter -- it "
+    "surfaces the existing timeframes / K_values "
+    "tuples if and only if upstream artifacts already "
+    "contain them, and it never creates the missing "
+    "MTF data.",
     # Production-evidence gaps carried forward from
     # Phase 6I-17 / 6I-18.
     "real_confluence_pipeline_runner_write: still open "
