@@ -161,7 +161,7 @@ an explicit ledger entry classifies the divergence.
 
 **Sprint trajectory (Phase 6H + Phase 6I, top-to-bottom by phase number):**
 
-The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest-recommendation contract) has shipped and is preserved verbatim in the demoted section below for future UI / UX review. Phase 6H added the **read-only-by-default planning + guarded-writer foundation** (most of the chain is read-only — watcher, preflight, dry-run executor, root plumbing, runbook — but the guarded writer module itself is write-capable, gated behind the two-key authorization `--write` + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`). Phase 6I added the **data/evidence and authorization layers** that screen any production writer invocation. The current state is post-Phase 6I-13, which attempted but did not invoke the writer.
+The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest-recommendation contract) has shipped and is preserved verbatim in the demoted section below for future UI / UX review. Phase 6H added the **read-only-by-default planning + guarded-writer foundation** (most of the chain is read-only — watcher, preflight, dry-run executor, root plumbing, runbook — but the guarded writer module itself is write-capable, gated behind the two-key authorization `--write` + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`). Phase 6I added the **data/evidence and authorization layers** that screen any production writer invocation. **The current state is post-Phase 6I-17 — STATE C / WAIT.** Both the existing-cache predicate and the source-availability predicate observe equality (`cache_date_range_end == resolved current_as_of_date == new_cache_date_range_end == "2026-05-12"`); the supervised gate emits `wait_for_cache_ahead_of_cutoff`; `safe_to_authorize_writer_now=false`; `source_ready_for_supervised_refresh` did not fire (correctly, source is NOT ready); no writer script was prepared; production roots are `0/0/0` across all five roots; **no production writes are authorized**.
 
 **Phase 6H — read-only-by-default planning + guarded-writer foundation (all merged):** every module below is read-only except `daily_board_automation_writer.py` (Phase 6H-5 + 6H-6), which is write-capable but **two-key gated** (`--write` CLI flag + `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` env var; both required).
 
@@ -201,10 +201,10 @@ The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest
 
 **Two distinct predicates, two distinct probes:**
 
-  - **Existing-cache predicate** (what the five standard probes inspect): `current cache_date_range_end > resolved current_as_of_date`. Reported by `cache_cutoff_watcher.py` (`cache_ahead_of_cutoff` boolean) and consumed by the supervised gate. **When this predicate is false because of equality** (`cache_equal_to_cutoff=true`, current state post-Phase-6I-13), the gate emits `wait_for_cache_ahead_of_cutoff`. The five existing probes by themselves **do not prove that a newly fetchable trading day is available** — they only inspect existing on-disk cache / gate / validator state.
+  - **Existing-cache predicate** (what the five standard probes inspect): `current cache_date_range_end > resolved current_as_of_date`. Reported by `cache_cutoff_watcher.py` (`cache_ahead_of_cutoff` boolean) and consumed by the supervised gate. **When this predicate is false because of equality** (`cache_equal_to_cutoff=true`, current state post-Phase-6I-17), the gate emits `wait_for_cache_ahead_of_cutoff`. The five existing probes by themselves **do not prove that a newly fetchable trading day is available** — they only inspect existing on-disk cache / gate / validator state.
   - **Source-availability predicate** (what a separate, explicit dry-run probe inspects): `new_cache_date_range_end > resolved current_as_of_date` where `new_cache_date_range_end` is the date that a no-write refresh attempt **would** land on the cache if authorized. Reported by `signal_engine_cache_refresher.py --ticker SPY --dry-run` (`new_cache_date_range_end` field on `SignalEngineRefreshResult.to_json_dict()`) or by `source_freshness_preflight.py --ticker SPY` (read-only mode). Use this probe to check whether a future authorized refresh **would** flip the existing-cache predicate from `equal` to `strictly-greater`.
 
-**Conservative operator discipline for the post-Phase-6I-13 equal-cache state:**
+**Conservative operator discipline for the post-Phase-6I-17 equal-cache state (framing established by the Phase 6I-14 next-run handoff and re-verified by the Phase 6I-15 → 6I-17 sequence):**
 
   1. **If the five standard probes already show `gate.safe_to_authorize_writer_now=true` and SPY is in `authorization_candidate_tickers`**, proceed to normal supervised authorization review (the Phase 6I-11 supervised-run pattern).
   2. **If `cache_cutoff_watcher` shows `cache_equal_to_cutoff=true` and the gate emits `wait_for_cache_ahead_of_cutoff`**, **do NOT** authorize the writer merely because time has passed. The equal-cache verdict will not change without an explicit refresh; assuming "next market close fixed it" is exactly the failure mode the predicate-first discipline is meant to prevent.
@@ -216,19 +216,13 @@ The Phase 6G UX baseline (the Town Notice Board reskin + persist-skip-lag honest
 
      **Do NOT invent an undocumented writer authorization path** based on the source-availability probe alone. The two-key writer gate (Phase 6H-5) and the supervised-run gate (Phase 6I-9) are the only currently-merged authorization surfaces.
 
-**Remaining real-evidence gaps after Phase 6I-13** (carry-forward from Phase 6I-12 with no change):
+**Test baseline:** full regression **1,550 passed in 343.68 s, 60 pre-existing pandas fragmentation warnings** (Phase 6I-12 baseline; the Phase 6I-13 through Phase 6I-18 docs-only / evidence phases did not move the baseline).
 
-  - `real_confluence_pipeline_runner_write` — STILL OPEN.
-  - `real_post_pipeline_validation_on_writer_path` — STILL OPEN.
-  - `real_yfinance_fetch` direct fetch-call telemetry — **instrumented** (Phase 6I-12 ProviderFetchTelemetry across four surfaces: refresher result, refresher status JSON, writer stdout, writer JSONL); **awaiting capture** on a future supervised run that actually invokes a refresh.
+**No production writes are currently authorized.** **Next operational action: WAIT.** Re-run the same **8-probe suite** established in Phase 6I-16 / 6I-17 (`cache_cutoff_watcher` / `source_availability_probe` / `daily_board_supervised_run_gate` × 2 modes / `daily_board_flow_integrity_audit` × 2 modes / `daily_board_automation_writer` `--dry-run` / `confluence_ranking_contract_validator`) at a later point. **Do not authorize a writer run merely because time has passed.** Trust the observed predicate; the gate moves only when the probes report `new_cache_date_range_end > resolved current_as_of_date` strictly. See § "Remaining real-evidence gaps after Phase 6I-17" below for the live gap list.
 
-**Test baseline:** full regression **1,550 passed in 343.68 s, 60 pre-existing pandas fragmentation warnings** (Phase 6I-12 baseline; Phase 6I-13 was docs-only so the baseline did not move).
+**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a Phase 6I-19 or later PR landed without a refresh.
 
-**No production writes are currently authorized.** The next attempt must run the five Phase 6I-13 read-only probes first and pass the precondition checklist before any `--write` invocation is considered. **Do not authorize a writer run merely because time has passed.**
-
-**Confirm before assuming current state:** run `git log -10 --oneline main`. This block may lag reality if a Phase 6I-14 or later PR landed without a refresh.
-
-**Next-run handoff doc:** `project/md_library/shared/2026-05-13_PHASE_6I14_SPRINT_STATE_AND_NEXT_RUN_HANDOFF.md` (explicit preconditions, gate-opening condition, do-not-run-yet list).
+**Current next-probe handoff doc:** `project/md_library/shared/2026-05-13_PHASE_6I18_SOURCE_WAIT_HANDOFF.md` (post-Phase-6I-17 closed-state snapshot, the exact future trigger that would justify preparing a reviewed writer script, remaining gaps). **Historical predicate-foundation handoff:** `project/md_library/shared/2026-05-13_PHASE_6I14_SPRINT_STATE_AND_NEXT_RUN_HANDOFF.md` (the predicate-first discipline + five-precondition checklist + existing-cache vs source-availability distinction were established here; preserved as historical context, not the current next-run handoff).
 
 **Sprint progression Phase 6I-15 → Phase 6I-17 (all merged):**
 
@@ -304,7 +298,7 @@ The Phase 6G-5 / Town Notice Board section below is preserved verbatim because t
   - **(Phase 6G-5-era)** Resolved `current_as_of_date` = `2026-05-11` (UTC has advanced past the trading day the pipeline tree was written for at the time of the Phase 6G-5 snapshot).
   - **(Phase 6G-5-era)** Readiness: `leader_eligible=False`, `ranking_blocked_reason="stale_confluence_day_artifact"`. SPY demotes to the Saved Research Archive on a bare boot.
   - **(Phase 6G-5-era)** Launch audit + freshness preflight: `recommended_action = recommended_next_action = "pipeline_output_lags_persist_skip"`; `safe_to_attempt_refresh=False`; `safe_to_run_pipeline_after_refresh=False`; pilot manifest excludes SPY. **This was the honest behavior of the existing contract at that time, not a regression.**
-  - **(Phase 6G-5-era)** The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until that happened in the Phase 6G-5 timeline, no operator action would move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` against the `576b676` snapshot was the only way to reproduce SPY as rank-1 against the on-disk artifacts of that era. (Phase 6I-11 subsequently authorized a refresh that advanced the cache to `2026-05-12`; see § 6 above for the post-Phase-6I-13 state.)
+  - **(Phase 6G-5-era)** The gap closes when the source cache acquires a trading day **strictly after** `current_as_of_date` (cache-vs-cutoff strict inequality, not a wall-clock event). Until that happened in the Phase 6G-5 timeline, no operator action would move the verdict; pinning `PRJCT9_RESEARCH_AS_OF_DATE=2026-05-08` against the `576b676` snapshot was the only way to reproduce SPY as rank-1 against the on-disk artifacts of that era. (Phase 6I-11 subsequently authorized a refresh that advanced the cache to `2026-05-12`; see § 6 above for the post-Phase-6I-17 state.)
 
 **Known limitations (Phase 6G-5-era):**
 
