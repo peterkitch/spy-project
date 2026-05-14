@@ -276,7 +276,12 @@ def validate_interval_data(df: pd.DataFrame, ticker: str, interval: str) -> bool
     return True
 
 
-def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
+def generate_signals_for_interval(
+    ticker: str,
+    interval: str,
+    *,
+    df: Optional[pd.DataFrame] = None,
+) -> Optional[dict]:
     """
     Generate complete signal library for specified interval.
     Uses MAX_SMA_DAY=114 constant across all intervals.
@@ -284,6 +289,14 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
     Args:
         ticker: Ticker symbol
         interval: '1wk', '1mo', '3mo', or '1y' (NOT '1d' - protected)
+        df: Optional injected OHLCV DataFrame (Phase 6I-30 seam). When
+            supplied, the function uses this DataFrame directly instead
+            of calling ``fetch_interval_data`` (which goes to yfinance).
+            The injected DataFrame must carry a single ``Close`` column
+            and a ``DatetimeIndex``. This seam exists so the sandbox
+            local-cache builder can avoid yfinance; production callers
+            still leave it as ``None`` to preserve the historic
+            yfinance-backed default.
 
     Returns:
         Library dictionary or None if generation fails
@@ -291,11 +304,17 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
     logger.info(f"Generating {interval} library for {ticker}...")
 
     # Fetch data with T-1 skip
-    try:
-        df = fetch_interval_data(ticker, interval)
-    except Exception as e:
-        logger.error(f"Failed to fetch {ticker} {interval}: {e}")
-        return None
+    if df is None:
+        try:
+            df = fetch_interval_data(ticker, interval)
+        except Exception as e:
+            logger.error(f"Failed to fetch {ticker} {interval}: {e}")
+            return None
+    else:
+        logger.info(
+            f"{ticker} {interval}: using injected DataFrame "
+            f"({len(df)} bars); yfinance fetch skipped",
+        )
 
     # Validate
     if not validate_interval_data(df, ticker, interval):
@@ -360,6 +379,18 @@ def generate_signals_for_interval(ticker: str, interval: str) -> Optional[dict]:
         'primary_signals': signals.tolist(),     # ALIAS for legacy
         'primary_signals_int8': signals_int8,    # ALIAS for stackbuilder (Patch 2)
         'signal_entry_dates': signal_entry_dates.tolist(),  # NEW field
+        # Phase 6I-30: persist the per-interval native ``close`` series
+        # alongside ``dates`` / ``signals``. Aligned 1:1 with the
+        # library's date axis (same length, same order). This is the
+        # raw ``Close`` column already used to compute SMAs and
+        # signals -- no resample / no ffill / no fabrication happens
+        # here, the values are just plain Python floats from
+        # ``df['Close'].tolist()``. The multi-window K input adapter
+        # consumes this directly via the ``_extract_target_close``
+        # helper (which recognizes ``close`` / ``target_close`` /
+        # ``Close``) and no longer needs the Phase 6I-28 close-source
+        # fallback for non-daily windows when this field is present.
+        'close': df['Close'].tolist(),
 
         # Integrity snapshots (Patch 2)
         'head_snapshot': head_snapshot,
