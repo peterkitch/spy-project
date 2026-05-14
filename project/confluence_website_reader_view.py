@@ -322,6 +322,21 @@ def _build_ranking_table_row(
             )
         else:
             strongest_now_label = None
+        # Phase 6I-37 amendment-1: surface BOTH the loose
+        # any-K predicate and the strict same-K cross-
+        # window predicate so a renderer can show "every
+        # window has SOME current signal" vs "the SAME K
+        # is signaling across every window" without
+        # confusion.
+        strongest_cross_k_raw = cbsum.get(
+            "strongest_cross_window_k_build",
+        )
+        if isinstance(strongest_cross_k_raw, Mapping):
+            strongest_cross_k_dict: Optional[
+                dict[str, Any]
+            ] = dict(strongest_cross_k_raw)
+        else:
+            strongest_cross_k_dict = None
         current_signal_block: Optional[dict[str, Any]] = {
             "cells_currently_buy": _safe_int(
                 cbsum.get("cells_currently_buy"),
@@ -340,6 +355,10 @@ def _build_ranking_table_row(
                     "cells_with_all_members_aligned",
                 ),
             ),
+            "cells_historically_fired": _safe_int(
+                cbsum.get("cells_historically_fired"),
+            ),
+            # Any-K (loose) pass-through.
             "windows_with_any_currently_signaling": (
                 _safe_list(
                     cbsum.get(
@@ -350,14 +369,57 @@ def _build_ranking_table_row(
                     ),
                 )
             ),
-            "all_five_windows_currently_signaling": bool(
+            "all_windows_have_any_current_signal": bool(
                 cbsum.get(
-                    (
-                        "all_five_windows_currently_"
-                        "signaling"
-                    ),
+                    "all_windows_have_any_current_signal",
                     False,
                 ),
+            ),
+            # Same-K (strict) pass-through.
+            "k_builds_currently_signaling_all_windows": (
+                _safe_list(
+                    cbsum.get(
+                        (
+                            "k_builds_currently_signaling_"
+                            "all_windows"
+                        ),
+                    ),
+                )
+            ),
+            "k_builds_all_members_aligned_all_windows": (
+                _safe_list(
+                    cbsum.get(
+                        (
+                            "k_builds_all_members_aligned_"
+                            "all_windows"
+                        ),
+                    ),
+                )
+            ),
+            "all_five_windows_same_k_currently_signaling": (
+                bool(
+                    cbsum.get(
+                        (
+                            "all_five_windows_same_k_"
+                            "currently_signaling"
+                        ),
+                        False,
+                    ),
+                )
+            ),
+            "all_five_windows_same_k_all_members_aligned": (
+                bool(
+                    cbsum.get(
+                        (
+                            "all_five_windows_same_k_"
+                            "all_members_aligned"
+                        ),
+                        False,
+                    ),
+                )
+            ),
+            "strongest_cross_window_k_build": (
+                strongest_cross_k_dict
             ),
             "strongest_currently_signaling_cell_label": (
                 strongest_now_label

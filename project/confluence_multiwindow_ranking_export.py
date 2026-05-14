@@ -869,7 +869,7 @@ def _build_current_signal_matrix(
     ``1d / 1wk / 1mo / 3mo / 1y`` and K ascending 1..12 within
     each window.
 
-    Phase 6I-37 schema (per row):
+    Phase 6I-37 amendment-1 schema (per row):
 
       * ``ticker``                  (str, repeated for renderer convenience)
       * ``K``                       (int, canonical 1..12)
@@ -882,14 +882,23 @@ def _build_current_signal_matrix(
       * ``member_count``            (int)
       * ``alignment_ratio``         (float, 0..1)
       * ``all_members_aligned``     (bool)
-      * ``currently_signaling``     (bool: latest_combined_signal in Buy/Short)
-      * ``firing``                  (bool: trigger_days > 0; historical)
+      * ``currently_signaling``     (bool: latest_combined_signal in Buy/Short -- CURRENT state)
+      * ``currently_firing``        (bool: alias of currently_signaling for UI clarity)
+      * ``historically_fired``      (bool: trigger_days > 0 -- HISTORICAL)
       * ``total_capture_pct``       (float)
       * ``avg_daily_capture_pct``   (float | None)
       * ``sharpe_ratio``            (float | None)
       * ``trigger_days``            (int)
       * ``wins``                    (int | None)
       * ``losses``                  (int | None)
+
+    Amendment-1 naming honesty: per Codex audit, the
+    previous ``firing`` field name was ambiguous because it
+    meant ``trigger_days > 0`` (historical) but read like
+    "is firing now." It is now ``historically_fired``. The
+    current-state predicate is ``currently_signaling``
+    (kept) plus a ``currently_firing`` alias so a renderer
+    can use either spelling without confusion.
     """
     canonical_k_set = set(CANONICAL_K_VALUES)
     canonical_w_set = set(CANONICAL_WINDOWS)
@@ -965,7 +974,13 @@ def _build_current_signal_matrix(
                 _CURRENT_SIGNAL_BUY, _CURRENT_SIGNAL_SHORT,
             )
         )
-        firing = bool(trigger_days > 0)
+        # Phase 6I-37 amendment-1 naming honesty:
+        # historically_fired = trigger_days > 0 (HISTORICAL).
+        # currently_firing = alias of currently_signaling
+        # (CURRENT) for UI clarity. Both flags are exposed
+        # so the renderer can use either spelling.
+        historically_fired = bool(trigger_days > 0)
+        currently_firing = bool(currently_signaling)
 
         by_cell[(K_int, w_raw)] = {
             "ticker": ticker,
@@ -980,7 +995,8 @@ def _build_current_signal_matrix(
             "alignment_ratio": float(alignment_ratio),
             "all_members_aligned": all_members_aligned,
             "currently_signaling": currently_signaling,
-            "firing": firing,
+            "currently_firing": currently_firing,
+            "historically_fired": historically_fired,
             "total_capture_pct": float(total_capture_pct),
             "avg_daily_capture_pct": (
                 avg_daily_capture_pct
@@ -1010,23 +1026,77 @@ def _build_current_signal_summary(
     """Aggregate the per-cell matrix into a compact summary
     for the website ranking row / ticker card.
 
-    The summary surfaces:
+    Phase 6I-37 amendment-1 (Codex audit response): the
+    summary distinguishes **any-K** "every window has at
+    least one currently-signaling cell" from the stricter
+    **same-K** "the SAME K value is currently signaling in
+    every canonical window." The any-K predicate is the
+    loose product-impression check the previous PR shipped;
+    the same-K predicate is what the TrafficFlow-style
+    Confluence North Star actually requires when the user
+    asks "which K builds are firing now across all five
+    windows."
+
+    The summary surfaces (final field names):
+
+    Any-K (loose) -- every window has at least one cell:
+
+      * ``windows_with_any_currently_signaling`` (any
+        Buy/Short cell exists in the window).
+      * ``all_windows_have_any_current_signal`` (bool: every
+        canonical window has at least one currently-
+        signaling cell, regardless of K).
+
+    Same-K (strict) -- the SAME K value is currently
+    signaling in every canonical window:
+
+      * ``k_builds_currently_signaling_all_windows``: list
+        of K values where the same K has
+        ``currently_signaling=True`` in EVERY canonical
+        window (1d AND 1wk AND 1mo AND 3mo AND 1y).
+      * ``k_builds_all_members_aligned_all_windows``: list
+        of K values where the same K has
+        ``all_members_aligned=True`` in EVERY canonical
+        window. Strict subset of the previous list.
+      * ``all_five_windows_same_k_currently_signaling``:
+        bool, ``len(k_builds_currently_signaling_all_windows
+        ) > 0``.
+      * ``all_five_windows_same_k_all_members_aligned``:
+        bool, ``len(k_builds_all_members_aligned_all_windows
+        ) > 0``.
+      * ``strongest_cross_window_k_build``: compact dict
+        picking the strongest K from
+        ``k_builds_currently_signaling_all_windows`` by
+        descending ``total_capture_pct`` summed across the
+        five windows; carries K,
+        ``total_capture_pct_sum``, ``avg_sharpe_ratio``
+        (None when undefined),
+        ``trigger_days_sum``, ``buy_window_count``,
+        ``short_window_count``,
+        ``all_members_aligned_window_count``. ``None`` when
+        the same-K list is empty.
+
+    Cell counts:
 
       * ``cells_total`` (60 when grid is complete).
       * ``cells_currently_buy / _short / _none / _missing``.
       * ``cells_with_all_members_aligned``.
-      * ``cells_historically_firing`` (``trigger_days > 0``).
-      * ``windows_with_any_currently_signaling`` (any Buy or
-        Short cell exists in the window).
+      * ``cells_historically_fired``
+        (``trigger_days > 0`` -- HISTORICAL; renamed from
+        ``cells_historically_firing`` to match the per-cell
+        ``historically_fired`` flag).
+
+    Build-wide alignment (pass-through):
+
       * ``windows_with_all_members_firing`` (echoed from
-        the build_wide_window_alignment mapping when
-        present; honest about emptiness when not).
-      * ``all_five_windows_currently_signaling`` (every
-        canonical window has at least one currently-signaling
-        cell).
+        ``build_wide_window_alignment`` when present; honest
+        empty list otherwise).
+
+    Loose strongest cell:
+
       * ``strongest_currently_signaling_cell`` (the firing
-        Buy/Short cell with highest ``total_capture_pct``; or
-        ``None`` if no cell is currently signaling).
+        Buy/Short cell with highest ``total_capture_pct``;
+        any K. ``None`` if no cell is currently signaling).
     """
     cells_total = int(len(matrix))
     cells_currently_buy = 0
@@ -1034,10 +1104,16 @@ def _build_current_signal_summary(
     cells_currently_none = 0
     cells_currently_missing = 0
     cells_with_all_members_aligned = 0
-    cells_historically_firing = 0
+    cells_historically_fired = 0
     windows_signaling: set[str] = set()
     strongest_cell: Optional[dict[str, Any]] = None
     strongest_capture: Optional[float] = None
+
+    # Per-K, per-window indexing for the strict same-K
+    # cross-window predicate.
+    by_k_window: dict[
+        tuple[int, str], Mapping[str, Any]
+    ] = {}
 
     for row in matrix:
         sig = row.get("latest_combined_signal")
@@ -1051,8 +1127,8 @@ def _build_current_signal_summary(
             cells_currently_missing += 1
         if row.get("all_members_aligned"):
             cells_with_all_members_aligned += 1
-        if row.get("firing"):
-            cells_historically_firing += 1
+        if row.get("historically_fired"):
+            cells_historically_fired += 1
         if row.get("currently_signaling"):
             w = row.get("window")
             if isinstance(w, str):
@@ -1084,6 +1160,116 @@ def _build_current_signal_summary(
                             "all_members_aligned",
                         ),
                     }
+        K = row.get("K")
+        w_val = row.get("window")
+        if (
+            isinstance(K, int)
+            and not isinstance(K, bool)
+            and isinstance(w_val, str)
+        ):
+            by_k_window[(K, w_val)] = row
+
+    # Same-K cross-window predicates.
+    canonical_w_set = set(CANONICAL_WINDOWS)
+    k_signaling_all: list[int] = []
+    k_aligned_all: list[int] = []
+    for K in CANONICAL_K_VALUES:
+        signaling_windows: list[str] = []
+        aligned_windows: list[str] = []
+        for w in CANONICAL_WINDOWS:
+            row = by_k_window.get((K, w))
+            if row is None:
+                continue
+            if row.get("currently_signaling"):
+                signaling_windows.append(w)
+            if row.get("all_members_aligned"):
+                aligned_windows.append(w)
+        if (
+            len(signaling_windows) == len(canonical_w_set)
+            and len(signaling_windows) > 0
+        ):
+            k_signaling_all.append(K)
+        if (
+            len(aligned_windows) == len(canonical_w_set)
+            and len(aligned_windows) > 0
+        ):
+            k_aligned_all.append(K)
+
+    strongest_cross_k: Optional[dict[str, Any]] = None
+    if k_signaling_all:
+        best_K: Optional[int] = None
+        best_capture_sum: Optional[float] = None
+        best_payload: Optional[dict[str, Any]] = None
+        for K in k_signaling_all:
+            capture_sum = 0.0
+            trigger_days_sum = 0
+            sharpe_values: list[float] = []
+            buy_window_count = 0
+            short_window_count = 0
+            aligned_window_count = 0
+            for w in CANONICAL_WINDOWS:
+                row = by_k_window.get((K, w))
+                if row is None:
+                    continue
+                cap = row.get("total_capture_pct")
+                if (
+                    isinstance(cap, (int, float))
+                    and not isinstance(cap, bool)
+                ):
+                    capture_sum += float(cap)
+                trig = row.get("trigger_days")
+                if (
+                    isinstance(trig, int)
+                    and not isinstance(trig, bool)
+                ):
+                    trigger_days_sum += int(trig)
+                sharpe = row.get("sharpe_ratio")
+                if (
+                    isinstance(sharpe, (int, float))
+                    and not isinstance(sharpe, bool)
+                ):
+                    sharpe_values.append(float(sharpe))
+                sig = row.get("latest_combined_signal")
+                if sig == _CURRENT_SIGNAL_BUY:
+                    buy_window_count += 1
+                elif sig == _CURRENT_SIGNAL_SHORT:
+                    short_window_count += 1
+                if row.get("all_members_aligned"):
+                    aligned_window_count += 1
+            avg_sharpe = (
+                sum(sharpe_values) / len(sharpe_values)
+                if sharpe_values else None
+            )
+            if (
+                best_capture_sum is None
+                or capture_sum > best_capture_sum
+                or (
+                    capture_sum == best_capture_sum
+                    and (best_K is None or K < best_K)
+                )
+            ):
+                best_K = K
+                best_capture_sum = capture_sum
+                best_payload = {
+                    "K": K,
+                    "total_capture_pct_sum": float(
+                        capture_sum,
+                    ),
+                    "avg_sharpe_ratio": avg_sharpe,
+                    "trigger_days_sum": int(
+                        trigger_days_sum,
+                    ),
+                    "buy_window_count": int(
+                        buy_window_count,
+                    ),
+                    "short_window_count": int(
+                        short_window_count,
+                    ),
+                    "all_members_aligned_window_count": (
+                        int(aligned_window_count)
+                    ),
+                }
+        strongest_cross_k = best_payload
 
     windows_with_all_members_firing: list[str] = []
     if isinstance(bwwa, Mapping):
@@ -1103,19 +1289,41 @@ def _build_current_signal_summary(
         "cells_with_all_members_aligned": (
             cells_with_all_members_aligned
         ),
-        "cells_historically_firing": (
-            cells_historically_firing
+        # Renamed (amendment-1) from cells_historically_firing
+        # to match the per-cell historically_fired flag.
+        "cells_historically_fired": (
+            cells_historically_fired
         ),
+        # Any-K (loose) cross-window summary.
         "windows_with_any_currently_signaling": [
             w for w in CANONICAL_WINDOWS
             if w in windows_signaling
         ],
+        "all_windows_have_any_current_signal": bool(
+            len(windows_signaling)
+            == len(CANONICAL_WINDOWS)
+        ),
+        # Same-K (strict) cross-window summary.
+        "k_builds_currently_signaling_all_windows": list(
+            k_signaling_all,
+        ),
+        "k_builds_all_members_aligned_all_windows": list(
+            k_aligned_all,
+        ),
+        "all_five_windows_same_k_currently_signaling": (
+            bool(len(k_signaling_all) > 0)
+        ),
+        "all_five_windows_same_k_all_members_aligned": (
+            bool(len(k_aligned_all) > 0)
+        ),
+        "strongest_cross_window_k_build": (
+            strongest_cross_k
+        ),
+        # Build-wide alignment pass-through.
         "windows_with_all_members_firing": (
             windows_with_all_members_firing
         ),
-        "all_five_windows_currently_signaling": bool(
-            len(windows_signaling) == len(CANONICAL_WINDOWS)
-        ),
+        # Loose strongest single-cell pick.
         "strongest_currently_signaling_cell": strongest_cell,
     }
 

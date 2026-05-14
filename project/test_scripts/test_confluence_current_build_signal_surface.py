@@ -306,6 +306,9 @@ def test_full_60_cell_payload_yields_60_row_matrix():
 
 
 def test_matrix_row_carries_required_phase_6i37_fields():
+    """Phase 6I-37 amendment-1: per-cell schema must carry
+    every required field, including the renamed
+    historically_fired flag and the currently_firing alias."""
     artifact = _make_full_60_cell_artifact(
         ticker="AAA", pattern="all_buy",
     )
@@ -320,12 +323,23 @@ def test_matrix_row_carries_required_phase_6i37_fields():
         "latest_none_count", "latest_missing_count",
         "member_count",
         "alignment_ratio", "all_members_aligned",
-        "currently_signaling", "firing",
+        # Phase 6I-37 amendment-1 naming:
+        # currently_signaling + currently_firing (alias)
+        # for current state; historically_fired for
+        # historical (trigger_days > 0).
+        "currently_signaling", "currently_firing",
+        "historically_fired",
         "total_capture_pct", "avg_daily_capture_pct",
         "sharpe_ratio", "trigger_days",
         "wins", "losses",
     }
     assert required.issubset(set(row.keys()))
+    # The ambiguous old "firing" name MUST be gone.
+    assert "firing" not in row, (
+        "Phase 6I-37 amendment-1: per-cell 'firing' flag "
+        "must be renamed to 'historically_fired' for "
+        "current-vs-historical clarity."
+    )
 
 
 def test_all_buy_pattern_alignment_ratios_are_one():
@@ -340,7 +354,11 @@ def test_all_buy_pattern_alignment_ratios_are_one():
         assert row["alignment_ratio"] == 1.0
         assert row["all_members_aligned"] is True
         assert row["currently_signaling"] is True
-        assert row["firing"] is True  # trigger_days > 0
+        # Phase 6I-37 amendment-1: currently_firing is an
+        # alias of currently_signaling for UI clarity;
+        # historically_fired is the trigger_days>0 flag.
+        assert row["currently_firing"] is True
+        assert row["historically_fired"] is True
         assert row["ticker"] == "AAA"
 
 
@@ -356,7 +374,8 @@ def test_all_none_pattern_no_currently_signaling_cells():
         assert row["alignment_ratio"] == 0.0
         assert row["all_members_aligned"] is False
         assert row["currently_signaling"] is False
-        assert row["firing"] is False
+        assert row["currently_firing"] is False
+        assert row["historically_fired"] is False
 
 
 def test_mixed_pattern_per_window_signal_distribution():
@@ -452,6 +471,10 @@ def test_matrix_skips_non_canonical_extras():
 
 
 def test_summary_all_buy_pattern_counts_correctly():
+    """Phase 6I-37 amendment-1: all-Buy fixture exercises
+    both the loose any-K predicates and the strict same-K
+    predicates -- every K from 1..12 has Buy in every
+    window."""
     artifact = _make_full_60_cell_artifact(
         ticker="AAA", pattern="all_buy",
     )
@@ -468,12 +491,33 @@ def test_summary_all_buy_pattern_counts_correctly():
     assert sumry["cells_currently_none"] == 0
     assert sumry["cells_currently_missing"] == 0
     assert sumry["cells_with_all_members_aligned"] == 60
-    assert sumry["cells_historically_firing"] == 60
+    # Amendment-1: cells_historically_firing renamed.
+    assert sumry["cells_historically_fired"] == 60
+    assert "cells_historically_firing" not in sumry
+    # Any-K (loose).
     assert sumry["windows_with_any_currently_signaling"] == [
         "1d", "1wk", "1mo", "3mo", "1y",
     ]
-    assert sumry["all_five_windows_currently_signaling"] is (
+    assert sumry["all_windows_have_any_current_signal"] is (
         True
+    )
+    assert "all_five_windows_currently_signaling" not in sumry
+    # Same-K (strict). All K=1..12 signal in every window.
+    assert (
+        sumry["k_builds_currently_signaling_all_windows"]
+        == list(range(1, 13))
+    )
+    assert (
+        sumry["k_builds_all_members_aligned_all_windows"]
+        == list(range(1, 13))
+    )
+    assert (
+        sumry["all_five_windows_same_k_currently_signaling"]
+        is True
+    )
+    assert (
+        sumry["all_five_windows_same_k_all_members_aligned"]
+        is True
     )
     assert (
         sumry["windows_with_all_members_firing"]
@@ -482,6 +526,15 @@ def test_summary_all_buy_pattern_counts_correctly():
     strongest = sumry["strongest_currently_signaling_cell"]
     assert strongest is not None
     assert strongest["latest_combined_signal"] == "Buy"
+    cross = sumry["strongest_cross_window_k_build"]
+    assert cross is not None
+    assert cross["K"] in range(1, 13)
+    # 5 windows * 10.0 capture each in the all_buy fixture
+    # = 50.0 per K.
+    assert cross["total_capture_pct_sum"] == 50.0
+    assert cross["buy_window_count"] == 5
+    assert cross["short_window_count"] == 0
+    assert cross["all_members_aligned_window_count"] == 5
 
 
 def test_summary_all_none_pattern_no_signaling_cells():
@@ -498,9 +551,29 @@ def test_summary_all_none_pattern_no_signaling_cells():
     assert sumry["cells_currently_buy"] == 0
     assert sumry["cells_currently_short"] == 0
     assert sumry["cells_currently_none"] == 60
-    assert sumry["cells_historically_firing"] == 0
-    assert sumry["all_five_windows_currently_signaling"] is (
-        False
+    assert sumry["cells_historically_fired"] == 0
+    # Loose any-K predicate AND strict same-K predicate
+    # both False when nothing is signaling.
+    assert (
+        sumry["all_windows_have_any_current_signal"]
+        is False
+    )
+    assert (
+        sumry[
+            "all_five_windows_same_k_currently_signaling"
+        ]
+        is False
+    )
+    assert (
+        sumry["k_builds_currently_signaling_all_windows"]
+        == []
+    )
+    assert (
+        sumry["k_builds_all_members_aligned_all_windows"]
+        == []
+    )
+    assert (
+        sumry["strongest_cross_window_k_build"] is None
     )
     assert (
         sumry["strongest_currently_signaling_cell"] is None
@@ -533,15 +606,29 @@ def test_summary_mixed_pattern_strongest_currently_signaling():
     assert strongest["total_capture_pct"] == 20.0
     assert strongest["all_members_aligned"] is True
     # 1mo None cells are NOT currently signaling -> only 4
-    # windows currently signaling.
-    assert sumry["all_five_windows_currently_signaling"] is (
-        False
+    # windows currently signaling. Both the any-K loose
+    # predicate AND the strict same-K predicate must
+    # therefore be False.
+    assert (
+        sumry["all_windows_have_any_current_signal"]
+        is False
     )
-    assert sumry["windows_with_any_currently_signaling"] == [
-        "1d", "1wk", "1y", "3mo",
-    ][:0] or set(
+    assert set(
         sumry["windows_with_any_currently_signaling"]
     ) == {"1d", "1wk", "3mo", "1y"}
+    assert (
+        sumry[
+            "all_five_windows_same_k_currently_signaling"
+        ]
+        is False
+    )
+    assert (
+        sumry["k_builds_currently_signaling_all_windows"]
+        == []
+    )
+    assert (
+        sumry["strongest_cross_window_k_build"] is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -830,12 +917,27 @@ def test_view_model_ranking_table_row_carries_signal_summary(
     cs = rt["current_signal_summary"]
     assert cs is not None
     assert cs["cells_currently_buy"] == 60
-    assert cs["all_five_windows_currently_signaling"] is (
-        True
+    # Phase 6I-37 amendment-1: the loose any-K predicate
+    # was renamed; both loose and strict same-K predicates
+    # are exposed on the compact ranking-table summary.
+    assert (
+        cs["all_windows_have_any_current_signal"] is True
+    )
+    assert "all_five_windows_currently_signaling" not in cs
+    assert (
+        cs["all_five_windows_same_k_currently_signaling"]
+        is True
+    )
+    assert (
+        cs["k_builds_currently_signaling_all_windows"]
+        == list(range(1, 13))
     )
     assert (
         cs["strongest_currently_signaling_cell_label"]
         is not None
+    )
+    assert (
+        cs["strongest_cross_window_k_build"] is not None
     )
 
 
@@ -967,6 +1069,502 @@ def test_large_universe_fixture_does_not_assume_spy(
     vm = _crv.build_view_model(package)
     assert len(vm["ranking_table"]) == 4
     assert len(vm["blocked_table"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-37 amendment-1: same-K cross-window semantics.
+# ---------------------------------------------------------------------------
+
+
+def _make_different_k_per_window_artifact() -> dict[str, Any]:
+    """Each canonical window has a current Buy/Short signal,
+    but on a DIFFERENT K value. The any-K loose predicate is
+    True; the strict same-K predicate must be False.
+
+    Layout:
+      * 1d  -- K=1  Buy
+      * 1wk -- K=4  Buy
+      * 1mo -- K=7  Short
+      * 3mo -- K=2  Buy
+      * 1y  -- K=12 Buy
+    Every other cell is "None" with zero alignment.
+    """
+    windows = ("1d", "1wk", "1mo", "3mo", "1y")
+    Ks = tuple(range(1, 13))
+    signaling_map: dict[str, tuple[int, str]] = {
+        "1d": (1, "Buy"),
+        "1wk": (4, "Buy"),
+        "1mo": (7, "Short"),
+        "3mo": (2, "Buy"),
+        "1y": (12, "Buy"),
+    }
+    cells: list[dict[str, Any]] = []
+    for w in windows:
+        sig_K, sig_dir = signaling_map[w]
+        for K in Ks:
+            if K == sig_K:
+                cells.append(
+                    _make_cell(
+                        K=K, window=w,
+                        latest_combined_signal=sig_dir,
+                        latest_buy_count=(
+                            3 if sig_dir == "Buy" else 0
+                        ),
+                        latest_short_count=(
+                            3 if sig_dir == "Short" else 0
+                        ),
+                        latest_none_count=0,
+                        member_count=3,
+                        total_capture_pct=10.0,
+                    )
+                )
+            else:
+                cells.append(
+                    _make_cell(
+                        K=K, window=w,
+                        latest_combined_signal="None",
+                        latest_buy_count=0,
+                        latest_short_count=0,
+                        latest_none_count=3,
+                        member_count=3,
+                        trigger_days=0,
+                        total_capture_pct=0.0,
+                    )
+                )
+    bwwa = {
+        w: {
+            "all_members_firing": False,
+            "firing_member_count": 0,
+            "total_member_count": 3,
+        }
+        for w in windows
+    }
+    return {
+        "target_ticker": "AAA",
+        "generated_at": "2026-05-14T00:00:00+00:00",
+        "per_window_k_metrics": cells,
+        "build_wide_window_alignment": bwwa,
+        "multiwindow_k_engine_payload_metadata": {
+            "schema_version": "v1",
+        },
+        "timeframes": list(windows),
+        "daily": {
+            "dates": ["2026-05-14"],
+            "close": [100.0],
+            "last_date": "2026-05-14",
+        },
+        "chart_rows": [
+            {"date": "2026-05-14", "close": 100.0},
+        ],
+    }
+
+
+def _make_same_K_artifact(
+    *,
+    K_target: int,
+    direction: str,
+    aligned_count: int,
+    member_count: int = 3,
+) -> dict[str, Any]:
+    """Every canonical window has the SAME K=K_target firing
+    Buy/Short with ``aligned_count``-of-``member_count``
+    members aligned. Other K values in every window are
+    "None"."""
+    windows = ("1d", "1wk", "1mo", "3mo", "1y")
+    Ks = tuple(range(1, 13))
+    cells: list[dict[str, Any]] = []
+    for w in windows:
+        for K in Ks:
+            if K == K_target:
+                cells.append(
+                    _make_cell(
+                        K=K, window=w,
+                        latest_combined_signal=direction,
+                        latest_buy_count=(
+                            aligned_count
+                            if direction == "Buy" else 0
+                        ),
+                        latest_short_count=(
+                            aligned_count
+                            if direction == "Short" else 0
+                        ),
+                        latest_none_count=(
+                            member_count - aligned_count
+                        ),
+                        member_count=member_count,
+                        total_capture_pct=10.0,
+                    )
+                )
+            else:
+                cells.append(
+                    _make_cell(
+                        K=K, window=w,
+                        latest_combined_signal="None",
+                        latest_buy_count=0,
+                        latest_short_count=0,
+                        latest_none_count=member_count,
+                        member_count=member_count,
+                        trigger_days=0,
+                        total_capture_pct=0.0,
+                    )
+                )
+    bwwa = {
+        w: {
+            "all_members_firing": (
+                aligned_count == member_count
+            ),
+            "firing_member_count": aligned_count,
+            "total_member_count": member_count,
+        }
+        for w in windows
+    }
+    return {
+        "target_ticker": "AAA",
+        "generated_at": "2026-05-14T00:00:00+00:00",
+        "per_window_k_metrics": cells,
+        "build_wide_window_alignment": bwwa,
+        "multiwindow_k_engine_payload_metadata": {
+            "schema_version": "v1",
+        },
+        "timeframes": list(windows),
+        "daily": {
+            "dates": ["2026-05-14"],
+            "close": [100.0],
+            "last_date": "2026-05-14",
+        },
+        "chart_rows": [
+            {"date": "2026-05-14", "close": 100.0},
+        ],
+    }
+
+
+def test_amendment1_different_k_per_window_loose_true_strict_false():
+    """Codex audit fixture: each window has a current
+    Buy/Short signal but on a different K. The loose any-K
+    predicate is True; the strict same-K predicate is False
+    and the same-K list is empty."""
+    artifact = _make_different_k_per_window_artifact()
+    matrix = _cmre._build_current_signal_matrix(
+        artifact["per_window_k_metrics"], ticker="AAA",
+    )
+    sumry = _cmre._build_current_signal_summary(
+        matrix,
+        bwwa=artifact["build_wide_window_alignment"],
+    )
+    # Any-K loose: every window has some current signal.
+    assert (
+        sumry["all_windows_have_any_current_signal"]
+        is True
+    )
+    assert set(
+        sumry["windows_with_any_currently_signaling"]
+    ) == {"1d", "1wk", "1mo", "3mo", "1y"}
+    # Same-K strict: NO single K fires across all five
+    # windows.
+    assert (
+        sumry[
+            "all_five_windows_same_k_currently_signaling"
+        ]
+        is False
+    )
+    assert (
+        sumry["k_builds_currently_signaling_all_windows"]
+        == []
+    )
+    assert (
+        sumry[
+            "all_five_windows_same_k_all_members_aligned"
+        ]
+        is False
+    )
+    assert (
+        sumry["k_builds_all_members_aligned_all_windows"]
+        == []
+    )
+    # No same-K strongest pick.
+    assert (
+        sumry["strongest_cross_window_k_build"] is None
+    )
+
+
+def test_amendment1_same_K6_all_windows_aligned():
+    """K=6 is the same currently-signaling Buy K across all
+    five windows AND all members are aligned. The same-K
+    lists both include 6 and both same-K booleans are True."""
+    artifact = _make_same_K_artifact(
+        K_target=6, direction="Buy", aligned_count=3,
+        member_count=3,
+    )
+    matrix = _cmre._build_current_signal_matrix(
+        artifact["per_window_k_metrics"], ticker="AAA",
+    )
+    sumry = _cmre._build_current_signal_summary(
+        matrix,
+        bwwa=artifact["build_wide_window_alignment"],
+    )
+    assert (
+        sumry["k_builds_currently_signaling_all_windows"]
+        == [6]
+    )
+    assert (
+        sumry["k_builds_all_members_aligned_all_windows"]
+        == [6]
+    )
+    assert (
+        sumry[
+            "all_five_windows_same_k_currently_signaling"
+        ]
+        is True
+    )
+    assert (
+        sumry[
+            "all_five_windows_same_k_all_members_aligned"
+        ]
+        is True
+    )
+    cross = sumry["strongest_cross_window_k_build"]
+    assert cross is not None
+    assert cross["K"] == 6
+    # 5 windows * 10.0 capture each = 50.0.
+    assert cross["total_capture_pct_sum"] == 50.0
+    assert cross["buy_window_count"] == 5
+    assert cross["short_window_count"] == 0
+    assert cross["all_members_aligned_window_count"] == 5
+
+
+def test_amendment1_same_K6_signaling_but_partial_alignment():
+    """K=6 fires Buy in every window but only 2-of-3
+    members agree. The currently-signaling same-K list
+    includes 6; the all-members-aligned same-K list does
+    NOT."""
+    artifact = _make_same_K_artifact(
+        K_target=6, direction="Buy", aligned_count=2,
+        member_count=3,
+    )
+    matrix = _cmre._build_current_signal_matrix(
+        artifact["per_window_k_metrics"], ticker="AAA",
+    )
+    sumry = _cmre._build_current_signal_summary(
+        matrix,
+        bwwa=artifact["build_wide_window_alignment"],
+    )
+    assert (
+        sumry["k_builds_currently_signaling_all_windows"]
+        == [6]
+    )
+    assert (
+        sumry["k_builds_all_members_aligned_all_windows"]
+        == []
+    )
+    assert (
+        sumry[
+            "all_five_windows_same_k_currently_signaling"
+        ]
+        is True
+    )
+    assert (
+        sumry[
+            "all_five_windows_same_k_all_members_aligned"
+        ]
+        is False
+    )
+    cross = sumry["strongest_cross_window_k_build"]
+    assert cross is not None
+    assert cross["K"] == 6
+    assert cross["all_members_aligned_window_count"] == 0
+
+
+def test_amendment1_per_cell_naming_clarity():
+    """The per-cell schema MUST expose the unambiguous
+    name ``historically_fired`` (HISTORICAL: trigger_days > 0)
+    and MUST expose the current-state predicate as
+    ``currently_signaling`` plus the ``currently_firing``
+    alias. The ambiguous bare ``firing`` name is gone."""
+    artifact = _make_full_60_cell_artifact(
+        ticker="AAA", pattern="all_buy",
+    )
+    matrix = _cmre._build_current_signal_matrix(
+        artifact["per_window_k_metrics"], ticker="AAA",
+    )
+    for row in matrix:
+        assert "historically_fired" in row
+        assert "currently_signaling" in row
+        assert "currently_firing" in row
+        assert "firing" not in row
+        # In the all-Buy fixture, every cell is currently
+        # signaling AND has historically fired.
+        assert row["currently_signaling"] is True
+        assert row["currently_firing"] is True
+        assert row["historically_fired"] is True
+        # The two current-state spellings must agree.
+        assert (
+            row["currently_signaling"]
+            == row["currently_firing"]
+        )
+
+
+def test_amendment1_package_carries_same_K_fields_through(
+    tmp_path,
+):
+    """Phase 6I-35 package's ranking_rows AND ticker_details
+    must surface the new strict same-K fields."""
+    artifact = _make_same_K_artifact(
+        K_target=6, direction="Buy", aligned_count=3,
+        member_count=3,
+    )
+
+    def fake_export(
+        tickers, *, artifact_root, cache_dir=None,
+    ):
+        return _build_export(
+            tickers,
+            {"AAA": artifact},
+            tmp_path=tmp_path,
+        )
+
+    package = _cwep.build_website_export_package(
+        ["AAA"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=_cwep.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake_export,
+    )
+    rrow_summary = package["ranking_rows"][0][
+        "current_build_signal_summary"
+    ]
+    assert rrow_summary is not None
+    assert (
+        rrow_summary[
+            "k_builds_currently_signaling_all_windows"
+        ]
+        == [6]
+    )
+    assert (
+        rrow_summary[
+            "all_five_windows_same_k_currently_signaling"
+        ]
+        is True
+    )
+    assert (
+        rrow_summary["strongest_cross_window_k_build"][
+            "K"
+        ]
+        == 6
+    )
+    detail = package["ticker_details"]["AAA"]
+    detail_summary = detail["current_build_signal_summary"]
+    assert (
+        detail_summary[
+            "k_builds_all_members_aligned_all_windows"
+        ]
+        == [6]
+    )
+
+
+def test_amendment1_view_model_carries_same_K_fields_through(
+    tmp_path,
+):
+    """Phase 6I-36 reader/view's compact ranking-table
+    summary AND ticker card summary must surface the new
+    strict same-K fields, including the
+    ``strongest_cross_window_k_build`` payload."""
+    artifact = _make_same_K_artifact(
+        K_target=6, direction="Buy", aligned_count=3,
+        member_count=3,
+    )
+
+    def fake_export(
+        tickers, *, artifact_root, cache_dir=None,
+    ):
+        return _build_export(
+            tickers,
+            {"AAA": artifact},
+            tmp_path=tmp_path,
+        )
+
+    package = _cwep.build_website_export_package(
+        ["AAA"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=_cwep.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake_export,
+    )
+    vm = _crv.build_view_model(package)
+    rt = vm["ranking_table"][0]
+    cs = rt["current_signal_summary"]
+    assert cs is not None
+    # Strict same-K predicate exposed on the compact
+    # ranking-table summary.
+    assert (
+        cs["k_builds_currently_signaling_all_windows"]
+        == [6]
+    )
+    assert (
+        cs["k_builds_all_members_aligned_all_windows"]
+        == [6]
+    )
+    assert (
+        cs["all_five_windows_same_k_currently_signaling"]
+        is True
+    )
+    assert (
+        cs["all_five_windows_same_k_all_members_aligned"]
+        is True
+    )
+    assert (
+        cs["strongest_cross_window_k_build"]["K"] == 6
+    )
+    # Loose any-K predicate also still exposed.
+    assert (
+        cs["all_windows_have_any_current_signal"] is True
+    )
+    # Ticker card carries the full summary block too.
+    card = vm["ticker_cards"][0]
+    card_summary = card["current_build_signal_summary"]
+    assert (
+        card_summary[
+            "k_builds_currently_signaling_all_windows"
+        ]
+        == [6]
+    )
+
+
+def test_amendment1_blocked_ticker_still_has_null_summary_under_strict_predicate(
+    tmp_path,
+):
+    """Blocked daily-only tickers MUST NOT receive
+    fabricated same-K fields. The whole summary stays
+    null on the package detail and on the view-model
+    card."""
+    blocked = _make_blocked_daily_only_artifact(
+        ticker="BBB",
+    )
+
+    def fake_export(
+        tickers, *, artifact_root, cache_dir=None,
+    ):
+        return _build_export(
+            tickers,
+            {"BBB": blocked},
+            tmp_path=tmp_path,
+        )
+
+    package = _cwep.build_website_export_package(
+        ["BBB"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=_cwep.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake_export,
+    )
+    detail = package["ticker_details"]["BBB"]
+    assert detail["rank_eligible"] is False
+    assert detail["current_build_signals"] == []
+    assert detail["current_build_signal_summary"] is None
+    vm = _crv.build_view_model(package)
+    card = vm["ticker_cards"][0]
+    assert card["rank_eligible"] is False
+    assert card["current_build_signals"] == []
+    assert card["current_build_signal_summary"] is None
+    # The ranking table is empty (the ticker is blocked,
+    # not eligible).
+    assert vm["ranking_table"] == []
 
 
 # ---------------------------------------------------------------------------

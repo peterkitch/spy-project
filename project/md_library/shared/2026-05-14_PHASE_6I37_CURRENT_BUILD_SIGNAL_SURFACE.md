@@ -70,8 +70,9 @@ window. The renderer can iterate deterministically.
 | `member_count` | int | from Phase 6I-23 cell |
 | `alignment_ratio` | float | aligned-direction count / member_count (0..1); 0.0 when signal is None/missing or member_count=0 |
 | `all_members_aligned` | bool | alignment_ratio==1.0 AND member_count>0 AND signal in Buy/Short |
-| `currently_signaling` | bool | latest_combined_signal in Buy/Short |
-| `firing` | bool | `trigger_days > 0` (historical: cell has fired at least once) |
+| `currently_signaling` | bool | **CURRENT state**: latest_combined_signal in Buy/Short |
+| `currently_firing` | bool | **CURRENT state**, alias of `currently_signaling` for UI clarity (amendment-1) |
+| `historically_fired` | bool | **HISTORICAL**: `trigger_days > 0` — cell has fired at least once in the build's history. Renamed from `firing` (amendment-1) because the old name read like "is firing now" but meant "has historically fired." |
 | `total_capture_pct` | float | from Phase 6I-23 cell |
 | `avg_daily_capture_pct` | float / null | from Phase 6I-23 cell |
 | `sharpe_ratio` | float / null | from Phase 6I-23 cell |
@@ -81,6 +82,17 @@ window. The renderer can iterate deterministically.
 
 ### 3.2 `current_build_signal_summary` aggregate (per eligible ticker)
 
+**Amendment-1 split** (Codex audit): the summary now
+distinguishes the loose **any-K** "every window has at
+least one currently-signaling cell" predicate from the
+strict **same-K** "the SAME K value is currently signaling
+in every canonical window" predicate. The strict same-K
+fields are what the TrafficFlow-style Confluence North
+Star actually requires when the user asks "which K builds
+are firing now across all five windows."
+
+#### Cell counts
+
 | Field | Type | Notes |
 |---|---|---|
 | `cells_total` | int | 60 when grid is complete |
@@ -89,24 +101,50 @@ window. The renderer can iterate deterministically.
 | `cells_currently_none` | int | latest_combined_signal == "None" |
 | `cells_currently_missing` | int | else |
 | `cells_with_all_members_aligned` | int | |
-| `cells_historically_firing` | int | trigger_days > 0 |
+| `cells_historically_fired` | int | trigger_days > 0 (renamed from `cells_historically_firing` in amendment-1) |
+
+#### Any-K (loose) cross-window
+
+| Field | Type | Notes |
+|---|---|---|
 | `windows_with_any_currently_signaling` | list[str] | canonical-ordered windows with at least one Buy/Short cell |
+| `all_windows_have_any_current_signal` | bool | renamed from `all_five_windows_currently_signaling`; every canonical window has ≥1 currently-signaling cell, regardless of K |
+
+#### Same-K (strict) cross-window — NEW in amendment-1
+
+| Field | Type | Notes |
+|---|---|---|
+| `k_builds_currently_signaling_all_windows` | list[int] | K values where the same K has `currently_signaling=True` in EVERY canonical window |
+| `k_builds_all_members_aligned_all_windows` | list[int] | K values where the same K has `all_members_aligned=True` in every canonical window (strict subset of above) |
+| `all_five_windows_same_k_currently_signaling` | bool | `len(k_builds_currently_signaling_all_windows) > 0` |
+| `all_five_windows_same_k_all_members_aligned` | bool | `len(k_builds_all_members_aligned_all_windows) > 0` |
+| `strongest_cross_window_k_build` | object / null | strongest K from `k_builds_currently_signaling_all_windows`, picked by descending `total_capture_pct` summed across the five windows; carries `K`, `total_capture_pct_sum`, `avg_sharpe_ratio` (None when undefined), `trigger_days_sum`, `buy_window_count`, `short_window_count`, `all_members_aligned_window_count`. Null when the same-K list is empty. |
+
+#### Build-wide alignment & loose strongest cell
+
+| Field | Type | Notes |
+|---|---|---|
 | `windows_with_all_members_firing` | list[str] | echoed from `build_wide_window_alignment` |
-| `all_five_windows_currently_signaling` | bool | every canonical window has at least one currently-signaling cell |
-| `strongest_currently_signaling_cell` | object / null | Buy/Short cell with highest total_capture_pct (carries K, window, signal, capture, Sharpe, trigger_days, alignment_ratio, all_members_aligned) |
+| `strongest_currently_signaling_cell` | object / null | (loose, any-K) Buy/Short cell with highest total_capture_pct — kept for the "show me the single hottest cell" UI element |
 
 ### 3.3 Phase 6I-36 ranking-table row compact summary
 
 The reader/view's `ranking_table[i].current_signal_summary`
-mirrors the package summary minus the heavy fields, plus a
+mirrors the package summary minus the heavy matrix, plus a
 pre-formatted strongest-cell label for the renderer:
 
 | Field | Source |
 |---|---|
 | `cells_currently_buy / _short / _none / _missing` | package summary |
 | `cells_with_all_members_aligned` | package summary |
-| `windows_with_any_currently_signaling` | package summary |
-| `all_five_windows_currently_signaling` | package summary |
+| `cells_historically_fired` | package summary (renamed in amendment-1) |
+| `windows_with_any_currently_signaling` | package summary (loose any-K) |
+| `all_windows_have_any_current_signal` | package summary (loose any-K, renamed) |
+| `k_builds_currently_signaling_all_windows` | package summary (strict same-K) |
+| `k_builds_all_members_aligned_all_windows` | package summary (strict same-K) |
+| `all_five_windows_same_k_currently_signaling` | package summary (strict same-K) |
+| `all_five_windows_same_k_all_members_aligned` | package summary (strict same-K) |
+| `strongest_cross_window_k_build` | package summary (strict same-K) |
 | `strongest_currently_signaling_cell_label` | `_format_strongest(window, K, capture, sharpe)` over `strongest_currently_signaling_cell` |
 
 The full 60-cell matrix is exposed on
@@ -133,14 +171,40 @@ record using:
   - Returns `0.0` when `member_count <= 0` (no div-by-zero).
 - `all_members_aligned`: `alignment_ratio == 1.0 AND
   member_count > 0 AND signal in {Buy, Short}`.
-- `currently_signaling`: `latest_combined_signal in {Buy,
-  Short}`.
-- `firing`: `trigger_days > 0` (consistent with the
-  existing Phase 6I-34 row aggregator's
-  `k_cells_firing`).
+- `currently_signaling` (CURRENT):
+  `latest_combined_signal in {Buy, Short}`.
+- `currently_firing` (CURRENT, alias): same as
+  `currently_signaling`, exposed under a second name so a
+  UI built around "firing" terminology stays unambiguous.
+- `historically_fired` (HISTORICAL): `trigger_days > 0`
+  — the cell has fired at least once in the build's
+  history. Renamed from `firing` in amendment-1.
 - `total_capture_pct`, `avg_daily_capture_pct`,
   `sharpe_ratio`, `trigger_days`, `wins`, `losses` —
   copied through (None when undefined).
+
+### Same-K cross-window predicates (amendment-1)
+
+For each canonical K in `1..12`, the summary builder
+indexes the matrix by `(K, window)` and checks every
+canonical window:
+
+- If the same K has `currently_signaling=True` in every
+  one of the five canonical windows → K is added to
+  `k_builds_currently_signaling_all_windows`.
+- If the same K has `all_members_aligned=True` in every
+  one of the five canonical windows → K is added to
+  `k_builds_all_members_aligned_all_windows` (always a
+  subset of the previous list since alignment implies
+  signaling).
+- `strongest_cross_window_k_build` selects the K from
+  `k_builds_currently_signaling_all_windows` with the
+  highest sum of `total_capture_pct` across the five
+  windows (smaller K wins ties for determinism). It
+  carries summary stats `total_capture_pct_sum`,
+  `avg_sharpe_ratio`, `trigger_days_sum`,
+  `buy_window_count`, `short_window_count`,
+  `all_members_aligned_window_count`.
 
 Non-canonical extras (e.g. K=13, window=6mo) are silently
 skipped in the matrix builder.
@@ -205,7 +269,10 @@ with no SPY ticker and verifies:
 - the reader/view exposes the data through
   `ranking_table` + `ticker_cards` end-to-end.
 
-## 8. Tests (23 new + 100 existing focused tests; total 123)
+## 8. Tests (30 new + 100 existing focused tests; total 130)
+
+Amendment-1 adds 7 new tests (24..30 below) and updates
+several existing tests to assert the renamed fields.
 
 The new test file is
 `project/test_scripts/test_confluence_current_build_signal_surface.py`.
@@ -237,6 +304,13 @@ The new test file is
 | 21 | `test_duplicate_canonical_cells_still_block_eligibility` | Duplicate canonical → blocked + no fabrication |
 | 22 | `test_missing_canonical_cell_still_blocks_eligibility` | 59-cell grid → blocked + no fabrication |
 | 23 | `test_cmre_no_forbidden_top_level_imports` | No yfinance / dash / live engines / writers / pipeline_runner |
+| 24 | `test_amendment1_different_k_per_window_loose_true_strict_false` | Per-window Buy/Short on different K each → loose any-K=True, strict same-K=False, same-K lists empty |
+| 25 | `test_amendment1_same_K6_all_windows_aligned` | K=6 Buy in every window with full alignment → strict same-K lists contain `[6]`, both same-K booleans True, `strongest_cross_window_k_build.K=6` |
+| 26 | `test_amendment1_same_K6_signaling_but_partial_alignment` | K=6 Buy in every window with 2/3 alignment → signaling same-K=`[6]`, aligned same-K=`[]` |
+| 27 | `test_amendment1_per_cell_naming_clarity` | Per-cell schema exposes `currently_signaling` + `currently_firing` + `historically_fired`; old `firing` key is gone |
+| 28 | `test_amendment1_package_carries_same_K_fields_through` | Phase 6I-35 package's `ranking_rows[].current_build_signal_summary` AND `ticker_details[t].current_build_signal_summary` surface the new same-K fields |
+| 29 | `test_amendment1_view_model_carries_same_K_fields_through` | Phase 6I-36 view model's compact `ranking_table[].current_signal_summary` AND `ticker_cards[].current_build_signal_summary` surface the new same-K fields (incl. `strongest_cross_window_k_build`) |
+| 30 | `test_amendment1_blocked_ticker_still_has_null_summary_under_strict_predicate` | Blocked daily-only tickers carry empty matrix + null summary on both package and view-model surfaces; no fabricated same-K data |
 
 ### 8.2 Existing focused suite (100)
 
@@ -253,12 +327,12 @@ All from the pinned conda interpreter
 - `py_compile project/confluence_multiwindow_ranking_export.py` → clean.
 - `py_compile project/confluence_website_export_package.py` → clean.
 - `py_compile project/confluence_website_reader_view.py` → clean.
-- `pytest test_scripts/test_confluence_current_build_signal_surface.py -q` → **23 passed in 0.15s**.
+- `pytest test_scripts/test_confluence_current_build_signal_surface.py -q` → **30 passed in 0.20s** (23 original + 7 amendment-1).
 - `pytest test_scripts/test_confluence_current_build_signal_surface.py
   test_scripts/test_confluence_website_reader_view.py
   test_scripts/test_confluence_website_export_package.py
   test_scripts/test_confluence_multiwindow_ranking_export.py
-  test_scripts/test_static_regression_guards.py -q` → **123 passed in 3.45s**.
+  test_scripts/test_static_regression_guards.py -q` → **130 passed in 3.36s** (30 current-signal + 30 reader/view + 25 package + 36 ranking export + 9 static regression).
 - `git diff --check` → clean.
 - B12 raw-pickle regression guard still passes without a new allowlist entry.
 
