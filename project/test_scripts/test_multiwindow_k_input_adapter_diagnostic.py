@@ -799,3 +799,203 @@ def test_cli_unhandled_exception_returns_rc_3(monkeypatch):
     )
     rc = diagnostic.main(["--ticker", "SPY"])
     assert rc == 3
+
+
+# ---------------------------------------------------------------------------
+# 8. Phase 6I-28 close-source threading + happy path
+# ---------------------------------------------------------------------------
+
+
+def test_close_source_root_threaded_through_diagnostic_to_adapter():
+    """The diagnostic must forward ``close_source_root`` to
+    the adapter so the new fallback path is reachable from
+    the CLI surface."""
+    captured: dict[str, Any] = {}
+
+    def spy_adapter(target_ticker, **kwargs):
+        captured.update(kwargs)
+        # Return an empty report-like object that the
+        # diagnostic can serialize.
+        return adapter.MultiWindowKInputAdapterReport(
+            generated_at="2026-05-13T00:00:00",
+            target_ticker=target_ticker,
+            selected_run_dir=None,
+            selected_run_id=None,
+            K_values=tuple(core.CANONICAL_K_VALUES),
+            windows=tuple(core.CANONICAL_WINDOWS),
+            attempted_cell_count=60,
+            prepared_cell_count=0,
+            missing_cell_count=60,
+            can_evaluate_full_60_cell_grid=False,
+            issue_codes=(),
+        )
+    result = diagnostic.run_adapter_diagnostic(
+        "SPY",
+        close_source_root="/tmp/explicit_close_root",
+        adapter_callable=spy_adapter,
+    )
+    assert (
+        captured.get("close_source_root")
+        == "/tmp/explicit_close_root"
+    )
+    assert result["ticker"] == "SPY"
+
+
+def test_cache_dir_threaded_to_adapter_when_no_close_source_root():
+    """When the operator passes ``--cache-dir`` (the
+    established convention) and no explicit
+    ``--close-source-root``, the diagnostic must use
+    ``cache_dir`` as the close-source root."""
+    captured: dict[str, Any] = {}
+
+    def spy_adapter(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return adapter.MultiWindowKInputAdapterReport(
+            generated_at="2026-05-13T00:00:00",
+            target_ticker=target_ticker,
+            selected_run_dir=None,
+            selected_run_id=None,
+            K_values=tuple(core.CANONICAL_K_VALUES),
+            windows=tuple(core.CANONICAL_WINDOWS),
+            attempted_cell_count=60,
+            prepared_cell_count=0,
+            missing_cell_count=60,
+            can_evaluate_full_60_cell_grid=False,
+            issue_codes=(),
+        )
+    diagnostic.run_adapter_diagnostic(
+        "SPY",
+        cache_dir="/tmp/cache_results_alias",
+        adapter_callable=spy_adapter,
+    )
+    assert (
+        captured.get("close_source_root")
+        == "/tmp/cache_results_alias"
+    )
+
+
+def test_close_source_root_takes_precedence_over_cache_dir():
+    """If both ``cache_dir`` and ``close_source_root`` are
+    supplied, the explicit ``close_source_root`` wins."""
+    captured: dict[str, Any] = {}
+
+    def spy_adapter(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return adapter.MultiWindowKInputAdapterReport(
+            generated_at="2026-05-13T00:00:00",
+            target_ticker=target_ticker,
+            selected_run_dir=None,
+            selected_run_id=None,
+            K_values=tuple(core.CANONICAL_K_VALUES),
+            windows=tuple(core.CANONICAL_WINDOWS),
+            attempted_cell_count=60,
+            prepared_cell_count=0,
+            missing_cell_count=60,
+            can_evaluate_full_60_cell_grid=False,
+            issue_codes=(),
+        )
+    diagnostic.run_adapter_diagnostic(
+        "SPY",
+        cache_dir="/tmp/cache_results_alias",
+        close_source_root="/tmp/explicit_close_root",
+        adapter_callable=spy_adapter,
+    )
+    assert (
+        captured.get("close_source_root")
+        == "/tmp/explicit_close_root"
+    )
+
+
+def test_close_source_join_makes_diagnostic_report_60_prepared(
+    tmp_path,
+):
+    """End-to-end happy path through the diagnostic with the
+    real Phase 6I-22 adapter and a fixture where the target
+    libraries lack close but the close-source supplies every
+    canonical date -> diagnostic reports prepared=60 /
+    skipped=0 / can_evaluate_full_60_cell_grid=True / no
+    missing_target_close anywhere."""
+    run_dir = tmp_path / "run_close_join_diagnostic_60"
+    run_dir.mkdir()
+    rows, _ = _full_canonical_fixture(
+        k_member_sets=_all_canonical_full_k_member_sets(),
+    )
+    # Target libs with NO close.
+    target_libs = {
+        window: _make_lib(
+            dates=_bars(window, 3),
+            signals=["None"] * 3,
+            close=None,
+        )
+        for window in core.CANONICAL_WINDOWS
+    }
+    # Members are still complete.
+    member_libs: dict[tuple[str, str], dict[str, Any]] = {}
+    for k in core.CANONICAL_K_VALUES:
+        for i in range(k):
+            for window in core.CANONICAL_WINDOWS:
+                member_libs[(f"M{i}", window)] = (
+                    _full_member_lib(window, 3)
+                )
+    lib_loader = _library_factory(
+        target_libs=target_libs,
+        member_libs=member_libs,
+    )
+    # Close source covers every canonical date.
+    close_by_date: dict[str, Any] = {}
+    for window in core.CANONICAL_WINDOWS:
+        for d in _bars(window, 3):
+            key = adapter._normalize_date_key(d)
+            if key is not None:
+                close_by_date.setdefault(key, 200.0)
+    resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+
+    def close_loader_fn(ticker, *, close_source_root=None):
+        return resolution
+
+    # Wrap the adapter with seams pre-injected, AND forward
+    # the new close_loader / close_source_root.
+    real_adapter = adapter.prepare_multiwindow_k_inputs
+
+    def wrapped(target_ticker, **kwargs):
+        merged = {
+            "run_dir": run_dir,
+            "stackbuilder_run_discovery_callable":
+                _fake_discovery_returning(run_dir),
+            "leaderboard_loader_callable":
+                _fake_leaderboard_loader_ok(),
+            "k_rows_iter_callable":
+                _fake_k_rows_iter(rows),
+            "library_loader": lib_loader,
+            "close_loader": close_loader_fn,
+        }
+        for k, v in kwargs.items():
+            if k in merged:
+                continue
+            merged[k] = v
+        return real_adapter(target_ticker, **merged)
+    result = diagnostic.run_adapter_diagnostic(
+        "SPY",
+        adapter_callable=wrapped,
+    )
+    assert result["prepared_cell_count"] == 60
+    assert result["skipped_cell_count"] == 0
+    assert (
+        result["can_evaluate_full_60_cell_grid"] is True
+    )
+    assert result["counts_by_skipped_reason"] == {}
+    assert result["dominant_skipped_reason"] is None
+    assert (
+        result["recommended_next_action"]
+        == "adapter_ready_for_writer_evidence_run"
+    )
+    # And missing_target_close MUST NOT appear in adapter
+    # issue codes -- it was resolved via the close-source
+    # fallback.
+    assert (
+        "missing_target_close"
+        not in result["adapter_issue_codes"]
+    )

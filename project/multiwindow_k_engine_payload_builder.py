@@ -594,6 +594,7 @@ def build_multiwindow_k_engine_payload(
     K_values: Iterable[int] = CANONICAL_K_VALUES,
     windows: Iterable[str] = CANONICAL_WINDOWS,
     run_dir: Optional[Any] = None,
+    close_source_root: Optional[Any] = None,
     adapter_callable: Optional[
         Callable[..., Any]
     ] = None,
@@ -621,6 +622,12 @@ def build_multiwindow_k_engine_payload(
     # forwarded. The builder always invokes the adapter in
     # strict default mode. A caller cannot opt this builder
     # into partial-member territory.
+    #
+    # Phase 6I-28: the optional read-only ``close_source_root``
+    # is forwarded straight through. The builder never injects
+    # its own ``close_loader`` -- the adapter's central
+    # provenance-verified default loader is the only production
+    # path. Tests inject fakes by passing an ``adapter_callable``.
     adapter_report = adapter_fn(
         target_clean,
         stackbuilder_root=stackbuilder_root,
@@ -628,6 +635,7 @@ def build_multiwindow_k_engine_payload(
         K_values=K_list,
         windows=W_list,
         run_dir=run_dir,
+        close_source_root=close_source_root,
     )
 
     adapter_summary = _summarize_adapter(adapter_report)
@@ -802,6 +810,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "stackbuilder_root/<TARGET>/."
         ),
     )
+    # Phase 6I-28: optional read-only close-source root. The
+    # ``--cache-dir`` flag matches the established convention
+    # in the multi-window K module family (gap audit,
+    # confluence pipeline runner, etc.) where ``--cache-dir``
+    # resolves to ``cache/results``.
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument(
+        "--close-source-root", default=None,
+    )
     return parser
 
 
@@ -828,12 +845,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    effective_close_source_root = (
+        args.close_source_root
+        if args.close_source_root is not None
+        else args.cache_dir
+    )
     try:
         report = build_multiwindow_k_engine_payload(
             ticker,
             stackbuilder_root=args.stackbuilder_root,
             signal_library_dir=args.signal_library_dir,
             run_dir=args.run_dir,
+            close_source_root=effective_close_source_root,
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

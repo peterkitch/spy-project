@@ -79,6 +79,8 @@ Public surface
         windows=CANONICAL_WINDOWS,
         run_dir=None,
         current_as_of_date=None,
+        cache_dir=None,                     # 6I-28 close source
+        close_source_root=None,             # 6I-28 close source
         adapter_callable=None,
     ) -> dict[str, Any]
 
@@ -251,6 +253,8 @@ def run_adapter_diagnostic(
     windows: Iterable[str] = CANONICAL_WINDOWS,
     run_dir: Optional[Any] = None,
     current_as_of_date: Optional[str] = None,
+    cache_dir: Optional[Any] = None,
+    close_source_root: Optional[Any] = None,
     adapter_callable: Optional[
         Callable[..., Any]
     ] = None,
@@ -278,6 +282,19 @@ def run_adapter_diagnostic(
     # argument (the adapter discovers cache state via
     # the StackBuilder run / signal libraries on disk).
     # Forwarding it would raise ``TypeError``.
+    #
+    # Phase 6I-28: the ``cache_dir`` / ``close_source_root``
+    # operator surfaces both wire to the adapter's
+    # ``close_source_root`` parameter. ``close_source_root``
+    # is preferred when both are supplied; otherwise the
+    # operator-conventional ``--cache-dir`` value is used
+    # (matching the ``multiwindow_k_engine_gap_audit`` /
+    # ``confluence_pipeline_runner`` family conventions
+    # where ``--cache-dir`` resolves to ``cache/results``).
+    effective_close_source_root = (
+        close_source_root if close_source_root is not None
+        else cache_dir
+    )
     report = adapter_fn(
         target_clean,
         stackbuilder_root=stackbuilder_root,
@@ -285,6 +302,7 @@ def run_adapter_diagnostic(
         K_values=K_list,
         windows=W_list,
         run_dir=run_dir,
+        close_source_root=effective_close_source_root,
     )
 
     states_by_key: dict[tuple[int, str], Any] = {}
@@ -418,6 +436,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--current-as-of-date", default=None,
     )
+    # Phase 6I-28: optional opt-in read-only close source.
+    # ``--cache-dir`` matches the broader operator
+    # convention used across the multi-window K family
+    # (``multiwindow_k_engine_gap_audit`` resolves it to
+    # ``cache/results``); ``--close-source-root`` is the
+    # explicit alias for callers who would rather name
+    # the parameter literally.
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument(
+        "--close-source-root", default=None,
+    )
     return parser
 
 
@@ -451,6 +480,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             signal_library_dir=args.signal_library_dir,
             run_dir=args.run_dir,
             current_as_of_date=args.current_as_of_date,
+            cache_dir=args.cache_dir,
+            close_source_root=args.close_source_root,
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

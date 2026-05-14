@@ -214,6 +214,24 @@ REASON_LEADERBOARD_LOAD_FAILED = "leaderboard_load_failed"
 REASON_INCOMPLETE_MEMBER_COVERAGE = (
     "incomplete_member_coverage"
 )
+# Phase 6I-28 close-source join: when the target signal
+# library lacks a usable ``close`` series, the adapter may
+# fall back to a separate read-only close source (default:
+# ``cache/results/<TICKER>_precomputed_results.pkl`` via the
+# central provenance loader). The three reason codes below
+# surface the three distinct close-source failure modes;
+# they NEVER cause the adapter to fabricate close values
+# and they NEVER widen the strict full-member-coverage
+# contract.
+REASON_TARGET_CLOSE_SOURCE_MISSING = (
+    "target_close_source_missing"
+)
+REASON_TARGET_CLOSE_SOURCE_UNREADABLE = (
+    "target_close_source_unreadable"
+)
+REASON_TARGET_CLOSE_JOIN_INCOMPLETE = (
+    "target_close_join_incomplete"
+)
 
 ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_NO_K_ROW_IN_LEADERBOARD,
@@ -226,6 +244,9 @@ ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_NO_STACKBUILDER_RUN,
     REASON_LEADERBOARD_LOAD_FAILED,
     REASON_INCOMPLETE_MEMBER_COVERAGE,
+    REASON_TARGET_CLOSE_SOURCE_MISSING,
+    REASON_TARGET_CLOSE_SOURCE_UNREADABLE,
+    REASON_TARGET_CLOSE_JOIN_INCOMPLETE,
 )
 
 
@@ -241,6 +262,16 @@ ISSUE_EMPTY_LIBRARY = "empty_library"
 ISSUE_INCOMPLETE_MEMBER_COVERAGE = (
     "incomplete_member_coverage"
 )
+# Phase 6I-28 close-source join aggregate issue codes.
+ISSUE_TARGET_CLOSE_SOURCE_MISSING = (
+    "target_close_source_missing"
+)
+ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE = (
+    "target_close_source_unreadable"
+)
+ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE = (
+    "target_close_join_incomplete"
+)
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_NO_STACKBUILDER_RUN,
@@ -252,6 +283,20 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_MISSING_MEMBER_LIBRARY,
     ISSUE_EMPTY_LIBRARY,
     ISSUE_INCOMPLETE_MEMBER_COVERAGE,
+    ISSUE_TARGET_CLOSE_SOURCE_MISSING,
+    ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE,
+    ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE,
+)
+
+
+# Phase 6I-28: close-source resolution states.
+CLOSE_SOURCE_STATUS_OK = "ok"
+CLOSE_SOURCE_STATUS_MISSING = "missing"
+CLOSE_SOURCE_STATUS_UNREADABLE = "unreadable"
+ALL_CLOSE_SOURCE_STATUSES: tuple[str, ...] = (
+    CLOSE_SOURCE_STATUS_OK,
+    CLOSE_SOURCE_STATUS_MISSING,
+    CLOSE_SOURCE_STATUS_UNREADABLE,
 )
 
 
@@ -280,6 +325,28 @@ class PerCellAdapterState:
     members_prepared: tuple[str, ...]
     members_missing: tuple[str, ...]
     skipped_reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class CloseSourceResolution:
+    """Result of resolving the target's read-only close source.
+
+    Phase 6I-28: when the per-window signal library does not
+    carry a usable ``close`` series, the adapter may fall back
+    to a separate read-only close source (default:
+    ``cache/results/<TICKER>_precomputed_results.pkl`` via the
+    central provenance loader). Tests inject fakes via the
+    ``close_loader`` seam.
+
+    ``close_by_date`` is set only when ``status == "ok"`` and is
+    a mapping keyed on normalized ISO-8601 ``YYYY-MM-DD`` strings
+    so per-window library dates can be matched exactly without
+    pandas conversions inside the adapter. The adapter NEVER
+    resamples / ffills / interpolates -- exact-date join only.
+    """
+
+    status: str
+    close_by_date: Optional[Mapping[str, Any]] = None
 
 
 @dataclass
@@ -336,6 +403,18 @@ def _default_signal_library_dir() -> Path:
     return (
         _project_dir() / "signal_library" / "data" / "stable"
     )
+
+
+def _default_close_source_root() -> Path:
+    """Default read-only close source root.
+
+    Phase 6I-28: this matches the established
+    ``multiwindow_k_engine_gap_audit._default_cache_dir`` pattern
+    in the multi-window K module family -- the path resolves to
+    ``cache/results`` so the loader looks for
+    ``<close_source_root>/<TICKER>_precomputed_results.pkl``.
+    """
+    return _project_dir() / "cache" / "results"
 
 
 def _filename_safe_ticker(ticker: str) -> str:
@@ -437,6 +516,219 @@ def _default_library_loader(
             return library
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-28: read-only close-source resolution
+# ---------------------------------------------------------------------------
+
+
+def _normalize_date_key(value: Any) -> Optional[str]:
+    """Normalize a date-like value to an ISO-8601 ``YYYY-MM-DD``
+    string for exact-date matching.
+
+    Accepts ``datetime`` / ``date`` / ``Timestamp`` / ``str``.
+    Returns ``None`` for unparseable / null inputs. The adapter
+    NEVER resamples / ffills / projects -- this function is the
+    only date-normalization site and it is strictly format-only.
+    """
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    if callable(iso):
+        try:
+            text = str(iso())
+        except Exception:
+            text = ""
+    else:
+        text = str(value).strip()
+    if not text:
+        return None
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    if " " in text:
+        text = text.split(" ", 1)[0]
+    if len(text) >= 10:
+        head = text[:10]
+        if (
+            len(head) == 10
+            and head[4] == "-"
+            and head[7] == "-"
+        ):
+            return head
+    return text
+
+
+def _default_close_source_loader(
+    ticker: str,
+    *,
+    close_source_root: Path,
+) -> CloseSourceResolution:
+    """Read ``<close_source_root>/<TICKER>_precomputed_results.pkl``
+    via the central provenance-verified loader and return a
+    ``CloseSourceResolution``.
+
+    Phase 6I-28: this is the production close-source loader for
+    the adapter's optional read-only fallback. The Spymaster
+    cache PKL (an output-kind artifact) is loaded through
+    ``provenance_manifest.load_verified_pickle_artifact`` so the
+    adapter inherits the repo-wide B12 raw-pickle ban -- no
+    ``pickle.load`` is added by Phase 6I-28.
+
+    Returns:
+      * ``CloseSourceResolution("ok", close_by_date)`` when the
+        cache PKL loads, its provenance verifies (or is legacy),
+        and a usable ``preprocessed_data`` DataFrame with a
+        ``Close`` column is found. ``close_by_date`` is keyed on
+        normalized ``YYYY-MM-DD`` strings.
+      * ``CloseSourceResolution("missing")`` when no cache PKL
+        exists for any candidate ticker form.
+      * ``CloseSourceResolution("unreadable")`` when the cache
+        PKL is present but cannot be loaded / verified / parsed
+        / yields no ``Close`` column.
+
+    Tests inject fakes via the ``close_loader`` seam on
+    ``prepare_multiwindow_k_inputs``.
+    """
+    forms = _ticker_form_candidates(ticker)
+    if not forms:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_MISSING,
+        )
+    found_path: Optional[Path] = None
+    for form in forms:
+        candidate = (
+            close_source_root
+            / f"{form}_precomputed_results.pkl"
+        )
+        if candidate.exists() and candidate.is_file():
+            found_path = candidate
+            break
+    if found_path is None:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_MISSING,
+        )
+
+    try:
+        data, vresult = _pm.load_verified_pickle_artifact(
+            found_path,
+        )
+    except Exception:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    if data is None:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    if not (vresult.ok or vresult.legacy):
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    if not isinstance(data, Mapping):
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+
+    pre = data.get("preprocessed_data")
+    if pre is None:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+
+    # The Spymaster cache stores ``preprocessed_data`` as a
+    # pandas DataFrame with a ``Close`` column and a
+    # ``DatetimeIndex``. The adapter MUST NOT add a pandas
+    # import just for this; we extract index + Close via the
+    # public attributes pandas exposes (``columns`` /
+    # ``index`` / ``to_dict()``) without naming the class. If
+    # the shape disagrees the resolution is treated as
+    # unreadable -- never as a partial close (the strict
+    # exact-date join rule does not tolerate guesses).
+    cols = getattr(pre, "columns", None)
+    idx = getattr(pre, "index", None)
+    if cols is None or idx is None:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    try:
+        col_names = list(cols)
+    except TypeError:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    if "Close" not in col_names:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+
+    try:
+        close_series = pre["Close"]
+        close_values = list(close_series)
+        index_values = list(idx)
+    except Exception:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    if len(close_values) != len(index_values):
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+
+    close_by_date: dict[str, Any] = {}
+    for d, c in zip(index_values, close_values):
+        key = _normalize_date_key(d)
+        if key is None:
+            continue
+        if c is None:
+            continue
+        # Exact-date semantics: the FIRST observation per
+        # date wins. Duplicate-date rows (rare in normal
+        # caches but theoretically possible) do NOT trigger a
+        # fabrication; they are silently deduplicated to keep
+        # the join contract simple.
+        if key not in close_by_date:
+            close_by_date[key] = c
+    if not close_by_date:
+        return CloseSourceResolution(
+            status=CLOSE_SOURCE_STATUS_UNREADABLE,
+        )
+    return CloseSourceResolution(
+        status=CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+
+
+def _resolve_target_close_via_close_source(
+    dates_seq: list[Any],
+    resolution: CloseSourceResolution,
+) -> tuple[Optional[list[Any]], Optional[str]]:
+    """Exact-date join of ``dates_seq`` against a resolved
+    close-source mapping.
+
+    Returns ``(target_close_seq, None)`` on a complete join, or
+    ``(None, reason_code)`` on a failure that the cell loop can
+    surface directly. **Strict exact-date semantics**: any
+    library date that does not appear in ``resolution.close_by_date``
+    causes the whole cell to be skipped with
+    ``target_close_join_incomplete``. No resample / no ffill / no
+    interpolation / no fabrication.
+    """
+    if resolution.status == CLOSE_SOURCE_STATUS_MISSING:
+        return None, REASON_TARGET_CLOSE_SOURCE_MISSING
+    if resolution.status == CLOSE_SOURCE_STATUS_UNREADABLE:
+        return None, REASON_TARGET_CLOSE_SOURCE_UNREADABLE
+    if resolution.status != CLOSE_SOURCE_STATUS_OK:
+        # Defensive: unknown status is treated as unreadable.
+        return None, REASON_TARGET_CLOSE_SOURCE_UNREADABLE
+    close_by_date = resolution.close_by_date or {}
+    out: list[Any] = []
+    for d in dates_seq:
+        key = _normalize_date_key(d)
+        if key is None or key not in close_by_date:
+            return None, REASON_TARGET_CLOSE_JOIN_INCOMPLETE
+        out.append(close_by_date[key])
+    return out, None
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +850,10 @@ def prepare_multiwindow_k_inputs(
         Callable[..., list[Any]]
     ] = None,
     allow_partial_members: bool = False,
+    close_source_root: Optional[Any] = None,
+    close_loader: Optional[
+        Callable[..., CloseSourceResolution]
+    ] = None,
 ) -> MultiWindowKInputAdapterReport:
     """Prepare per-``(K, window)`` inputs for the Phase 6I-21
     core evaluator from real StackBuilder K rows and saved
@@ -604,8 +900,54 @@ def prepare_multiwindow_k_inputs(
         if signal_library_dir is not None
         else _default_signal_library_dir()
     )
+    # Phase 6I-28: the read-only close source is OPT-IN. The
+    # caller must either pass an explicit ``close_source_root``
+    # (Path) OR an injected ``close_loader`` callable to enable
+    # the fallback path. The legacy behaviour -- skip with
+    # ``missing_target_close`` when the per-window library does
+    # not carry a close -- is preserved when both are None so
+    # existing callers that don't know about the new surface are
+    # unaffected. The ``allow_partial_members`` strict / partial
+    # contract is **unchanged**: the fallback only supplies the
+    # target-close column; it does NOT touch member coverage.
+    close_source_enabled = (
+        close_source_root is not None
+        or close_loader is not None
+    )
+    close_root = (
+        Path(close_source_root)
+        if close_source_root is not None
+        else _default_close_source_root()
+    )
+    close_loader_fn = (
+        close_loader or _default_close_source_loader
+    )
 
     target_clean = str(target_ticker or "").strip().upper()
+    # Resolve the close source lazily on first need. Caching
+    # avoids loading the cache PKL once per (K, window) cell
+    # (~60x for SPY).
+    close_resolution_cache: dict[str, CloseSourceResolution] = {}
+
+    def _get_close_resolution() -> CloseSourceResolution:
+        cached = close_resolution_cache.get(target_clean)
+        if cached is not None:
+            return cached
+        try:
+            resolved = close_loader_fn(
+                target_clean,
+                close_source_root=close_root,
+            )
+        except Exception:
+            resolved = CloseSourceResolution(
+                status=CLOSE_SOURCE_STATUS_UNREADABLE,
+            )
+        if not isinstance(resolved, CloseSourceResolution):
+            resolved = CloseSourceResolution(
+                status=CLOSE_SOURCE_STATUS_UNREADABLE,
+            )
+        close_resolution_cache[target_clean] = resolved
+        return resolved
 
     per_cell_inputs: dict[
         tuple[int, str], dict[str, Any],
@@ -870,6 +1212,60 @@ def prepare_multiwindow_k_inputs(
             target_close_seq = _extract_target_close(
                 target_lib,
             )
+            if target_close_seq is None and close_source_enabled:
+                # Phase 6I-28 close-source join: the per-window
+                # library lacks ``close`` / ``target_close`` /
+                # ``Close``. Fall back to the opt-in read-only
+                # close source (default ``cache/results/<TICKER>_
+                # precomputed_results.pkl``) via the central
+                # provenance loader. Exact-date join only -- no
+                # resample / no ffill / no projection / no
+                # fabrication.
+                resolution = _get_close_resolution()
+                joined_seq, join_reason = (
+                    _resolve_target_close_via_close_source(
+                        list(dates_seq), resolution,
+                    )
+                )
+                if join_reason is None:
+                    target_close_seq = joined_seq
+                else:
+                    if join_reason == (
+                        REASON_TARGET_CLOSE_SOURCE_MISSING
+                    ):
+                        _append_unique(
+                            issues,
+                            ISSUE_TARGET_CLOSE_SOURCE_MISSING,
+                        )
+                    elif join_reason == (
+                        REASON_TARGET_CLOSE_SOURCE_UNREADABLE
+                    ):
+                        _append_unique(
+                            issues,
+                            (
+                                ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE
+                            ),
+                        )
+                    elif join_reason == (
+                        REASON_TARGET_CLOSE_JOIN_INCOMPLETE
+                    ):
+                        _append_unique(
+                            issues,
+                            ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE,
+                        )
+                    state = PerCellAdapterState(
+                        K=K,
+                        window=window,
+                        prepared=False,
+                        target_library_present=True,
+                        members_attempted=members_attempted,
+                        members_prepared=(),
+                        members_missing=(),
+                        skipped_reason=join_reason,
+                    )
+                    per_cell_states.append(state)
+                    skipped.append((K, window, join_reason))
+                    continue
             if target_close_seq is None:
                 _append_unique(
                     issues, ISSUE_MISSING_TARGET_CLOSE,

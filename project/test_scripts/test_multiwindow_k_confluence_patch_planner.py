@@ -1086,3 +1086,51 @@ def test_planned_payload_keys_pinned():
         "build_wide_window_alignment",
         "multiwindow_k_engine_payload_metadata",
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-28 close-source plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_planner_threads_close_source_root_to_builder(tmp_path):
+    """The planner must forward ``close_source_root`` to the
+    Phase 6I-23 builder so the close-source fallback is
+    reachable through the planner CLI."""
+    captured: dict[str, Any] = {}
+    not_ready = _make_not_ready_payload_report()
+
+    def spy_builder(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return not_ready
+    planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        close_source_root="/tmp/planner_close_root",
+        payload_builder_callable=spy_builder,
+    )
+    assert (
+        captured.get("close_source_root")
+        == "/tmp/planner_close_root"
+    )
+
+
+def test_planner_passes_none_close_source_root_when_unset(
+    tmp_path,
+):
+    """Backwards-compat: if the operator does not pass
+    ``--close-source-root``, the planner forwards None to the
+    builder, preserving the adapter's opt-in default."""
+    captured: dict[str, Any] = {}
+    not_ready = _make_not_ready_payload_report()
+
+    def spy_builder(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return not_ready
+    planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=spy_builder,
+    )
+    assert "close_source_root" in captured
+    assert captured["close_source_root"] is None
