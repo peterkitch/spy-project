@@ -766,6 +766,286 @@ def test_cli_unhandled_exception_returns_rc_3(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 10b. Planner-side payload contract validation (Phase 6I-24 Codex amendment)
+# ---------------------------------------------------------------------------
+#
+# The planner must NOT mark patch_ready=True when the upstream builder
+# returns payload_ready=True but the payload itself is empty / malformed.
+# These tests inject deliberately-malformed payload reports through the
+# fake builder seam to prove the planner enforces its own Phase 6I-20-
+# shaped contract before any patch_ready=True verdict.
+
+
+def _make_malformed_payload_report(
+    *,
+    per_window_k_metrics=None,
+    build_wide_window_alignment=None,
+) -> Any:
+    """Build a payload report whose ``payload_ready=True``
+    flag lies: the carried per_window_k_metrics /
+    build_wide_window_alignment fields are caller-
+    supplied and may be deliberately invalid."""
+    if per_window_k_metrics is None:
+        per_window_k_metrics = []
+    if build_wide_window_alignment is None:
+        build_wide_window_alignment = {}
+    return builder.MultiWindowKEnginePayloadReport(
+        generated_at="2026-05-13T00:00:00+00:00",
+        target_ticker="SPY",
+        payload_ready=True,  # the lie
+        K_values=core.CANONICAL_K_VALUES,
+        windows=core.CANONICAL_WINDOWS,
+        cell_count=len(per_window_k_metrics),
+        per_window_k_metrics=per_window_k_metrics,
+        build_wide_window_alignment=(
+            build_wide_window_alignment
+        ),
+        adapter_summary=None,
+        issue_codes=(),
+        remaining_limitations=(),
+    )
+
+
+def _good_alignment_dict():
+    s = sum(core.CANONICAL_K_VALUES)
+    return {
+        w: {
+            "all_members_firing": True,
+            "firing_member_count": s,
+            "total_member_count": s,
+        }
+        for w in core.CANONICAL_WINDOWS
+    }
+
+
+def test_empty_payload_with_ready_flag_keeps_patch_not_ready(
+    tmp_path,
+):
+    """Upstream builder lies: payload_ready=True but
+    per_window_k_metrics=[] and build_wide_window_alignment={}.
+    Planner must refuse patch_ready=True and fire
+    ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID +
+    ACTION_MANUAL_REVIEW_REQUIRED."""
+    malformed = _make_malformed_payload_report(
+        per_window_k_metrics=[],
+        build_wide_window_alignment={},
+    )
+    _write_confluence_artifact(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=_builder_returning(
+            malformed,
+        ),
+    )
+    assert plan.payload_ready is True  # upstream's claim
+    assert plan.patch_ready is False
+    assert plan.fields_to_add == ()
+    assert plan.fields_to_replace == ()
+    assert plan.planned_payload == {}
+    assert plan.planned_payload_keys == ()
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        in plan.issue_codes
+    )
+    assert (
+        plan.recommended_next_action
+        == planner.ACTION_MANUAL_REVIEW_REQUIRED
+    )
+
+
+def test_59_cell_payload_keeps_patch_not_ready(tmp_path):
+    """59 of 60 canonical cells -> planner rejects.
+    Upstream's payload_ready=True is overridden by the
+    planner's own canonical-coverage check."""
+    cells = _make_full_canonical_60_buy_cells()
+    metrics = core.cells_to_per_window_k_metrics_payload(
+        cells,
+    )
+    metrics_short = metrics[:-1]  # drop one canonical cell
+    malformed = _make_malformed_payload_report(
+        per_window_k_metrics=metrics_short,
+        build_wide_window_alignment=_good_alignment_dict(),
+    )
+    _write_confluence_artifact(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=_builder_returning(
+            malformed,
+        ),
+    )
+    assert plan.patch_ready is False
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        in plan.issue_codes
+    )
+    assert (
+        plan.recommended_next_action
+        == planner.ACTION_MANUAL_REVIEW_REQUIRED
+    )
+
+
+def test_duplicate_canonical_cell_keeps_patch_not_ready(
+    tmp_path,
+):
+    """Duplicate (K, window) entry in per_window_k_metrics
+    -> planner rejects (even when the canonical 60 set
+    is structurally covered)."""
+    cells = _make_full_canonical_60_buy_cells()
+    metrics = core.cells_to_per_window_k_metrics_payload(
+        cells,
+    )
+    # Append a duplicate of (K=1, window="1d").
+    duplicate = dict(metrics[0])
+    metrics_with_dup = list(metrics) + [duplicate]
+    malformed = _make_malformed_payload_report(
+        per_window_k_metrics=metrics_with_dup,
+        build_wide_window_alignment=_good_alignment_dict(),
+    )
+    _write_confluence_artifact(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=_builder_returning(
+            malformed,
+        ),
+    )
+    assert plan.patch_ready is False
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        in plan.issue_codes
+    )
+
+
+def test_invalid_alignment_missing_canonical_window_keeps_patch_not_ready(
+    tmp_path,
+):
+    """build_wide_window_alignment missing one canonical
+    window -> planner rejects."""
+    cells = _make_full_canonical_60_buy_cells()
+    metrics = core.cells_to_per_window_k_metrics_payload(
+        cells,
+    )
+    alignment = _good_alignment_dict()
+    alignment.pop("1y")  # drop a canonical window
+    malformed = _make_malformed_payload_report(
+        per_window_k_metrics=metrics,
+        build_wide_window_alignment=alignment,
+    )
+    _write_confluence_artifact(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=_builder_returning(
+            malformed,
+        ),
+    )
+    assert plan.patch_ready is False
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        in plan.issue_codes
+    )
+
+
+def test_invalid_alignment_wrong_field_types_keeps_patch_not_ready(
+    tmp_path,
+):
+    """build_wide_window_alignment with bool-as-int in
+    firing_member_count -> planner rejects (bool is a
+    subclass of int in Python; the contract explicitly
+    rejects bool slots in count fields)."""
+    cells = _make_full_canonical_60_buy_cells()
+    metrics = core.cells_to_per_window_k_metrics_payload(
+        cells,
+    )
+    alignment = _good_alignment_dict()
+    # Replace one window's firing_member_count with a bool
+    # value -- bool is technically a subclass of int but
+    # the contract bans it.
+    alignment["1d"]["firing_member_count"] = True
+    malformed = _make_malformed_payload_report(
+        per_window_k_metrics=metrics,
+        build_wide_window_alignment=alignment,
+    )
+    _write_confluence_artifact(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=_builder_returning(
+            malformed,
+        ),
+    )
+    assert plan.patch_ready is False
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        in plan.issue_codes
+    )
+
+
+def test_valid_happy_path_still_passes(tmp_path):
+    """Phase 6I-24 Codex amendment regression guard: the
+    full canonical happy-path fixture must STILL pass
+    after the new planner-side validator is wired in.
+    The planner output must continue to satisfy the
+    Phase 6I-20 audit's validators (cross-module
+    integration)."""
+    ready = _make_ready_payload_report()
+    _write_confluence_artifact(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = planner.plan_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        payload_builder_callable=_builder_returning(ready),
+    )
+    assert plan.payload_ready is True
+    assert plan.patch_ready is True
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        not in plan.issue_codes
+    )
+    assert (
+        plan.recommended_next_action
+        == planner.ACTION_READY_FOR_REVIEWED_ARTIFACT_WRITE
+    )
+    # Phase 6I-20 audit validators still accept.
+    assert gap_audit._per_window_k_metrics_are_valid(
+        plan.planned_payload["per_window_k_metrics"],
+    )
+    assert gap_audit._build_wide_alignment_is_valid(
+        plan.planned_payload[
+            "build_wide_window_alignment"
+        ],
+    )
+
+
+def test_planned_payload_contract_invalid_in_all_issue_codes():
+    """Reflective completeness: the new issue code must be
+    in ALL_ISSUE_CODES."""
+    assert (
+        planner.ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID
+        in planner.ALL_ISSUE_CODES
+    )
+
+
+# ---------------------------------------------------------------------------
 # 11. Constant surface
 # ---------------------------------------------------------------------------
 

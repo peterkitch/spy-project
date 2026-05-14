@@ -73,7 +73,8 @@ four recommended-next-action codes:
 | Payload builder reports `payload_ready=False` | `False` | `build_payload_first` |
 | Payload ready, artifact missing | `False` | `create_confluence_artifact_first` |
 | Payload ready, artifact present but unreadable | `False` | `manual_review_required` |
-| Payload ready, artifact readable | `True` | `ready_for_reviewed_artifact_write` |
+| Payload ready + artifact ready, **but planner's own contract validator rejects the planned payload** | `False` | `manual_review_required` |
+| Payload ready + artifact ready + planner's contract validator accepts | `True` | `ready_for_reviewed_artifact_write` |
 
 `patch_ready=False` always means `fields_to_add=()`,
 `fields_to_replace=()`, and `planned_payload={}`. No
@@ -82,6 +83,51 @@ near-miss schema; no fabrication.
 `patch_ready=True` does **NOT** authorize an artifact
 write. It only means a reviewable patch plan is available
 for a future writer phase to consume.
+
+### 1.0 `patch_ready=True` is a TWO-gate verdict (Phase 6I-24 Codex amendment)
+
+The planner does **not** trust the upstream Phase 6I-23
+builder's `payload_ready=True` flag alone. `patch_ready=True`
+requires BOTH:
+
+1. **Upstream gate**: the Phase 6I-23 builder reported
+   `payload_ready=True` (which itself gates on the
+   Phase 6I-22 adapter's strict full-member coverage AND
+   the Phase 6I-23 core-grid completeness validation).
+2. **Planner-side gate**: the planner's own
+   `_planner_planned_payload_is_valid` re-derives the
+   Phase 6I-20 future-artifact contract LOCALLY (no
+   `multiwindow_k_engine_gap_audit` import) and accepts
+   the assembled `planned_payload`.
+
+When the upstream gate passes but the planner-side
+gate rejects (e.g. an adversarial / buggy builder claims
+ready with an empty or malformed payload), the planner
+fires `ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID` and routes
+to `recommended_next_action=ACTION_MANUAL_REVIEW_REQUIRED`.
+The discrepancy between the upstream readiness claim and
+the actual payload shape is a real operator-review
+signal, not a near-miss the planner should mask.
+
+The planner's local validator enforces:
+
+- `planned_payload` has exactly the three keys in
+  `PLANNED_PAYLOAD_KEYS` — no missing, no extra.
+- `per_window_k_metrics`: list of mappings, each with
+  the Phase 6I-20-required five fields (`K` / `window` /
+  `total_capture_pct` / `sharpe_ratio` / `trigger_days`),
+  `K` int-coercible, `window` non-empty str, the three
+  numeric fields `int`/`float` and **not** `bool`. No
+  duplicate `(K, window)` pairs. Canonical cells
+  (K in `CANONICAL_K_VALUES` AND window in
+  `CANONICAL_WINDOWS`) cover the full 60-cell grid.
+  Noncanonical extras tolerated but never substitute
+  for a missing canonical cell.
+- `build_wide_window_alignment`: mapping with one entry
+  per canonical window, each entry with the three
+  required fields (`all_members_firing` strictly
+  `bool`; `firing_member_count` / `total_member_count`
+  strictly `int` and **not** `bool`).
 
 ### 1.1 Field add/replace classification
 
@@ -226,6 +272,13 @@ else:
   `<artifact_root>/confluence/<TICKER>/`.
 - `confluence_artifact_unreadable` — file found but JSON
   parse failed or top-level was not a dict.
+- `planned_payload_contract_invalid` **(Phase 6I-24
+  Codex amendment)** — upstream builder reported
+  `payload_ready=True` but the planner's own
+  `_planner_planned_payload_is_valid` rejected the
+  assembled `planned_payload`. The planner refuses to
+  propagate the discrepancy as `patch_ready=True`
+  and routes to `recommended_next_action=ACTION_MANUAL_REVIEW_REQUIRED`.
 
 ### 4.2 Stable recommended-action codes
 
@@ -298,7 +351,7 @@ Phase 6I-23 payload builder (read-only by contract).
 
 ---
 
-## 7. Tests (23 pinned contracts)
+## 7. Tests (30 pinned contracts)
 
 `project/test_scripts/test_multiwindow_k_confluence_patch_planner.py`:
 
@@ -342,10 +395,32 @@ Phase 6I-23 payload builder (read-only by contract).
     `gap_audit._build_wide_alignment_is_valid`
     respectively.
 13-14. JSON round-trip on ready + not-ready paths.
-15-19. CLI: `rc=0` (happy); `rc=2` (missing ticker);
+15. **(Phase 6I-24 Codex amendment)** Empty payload with
+    upstream `payload_ready=True` → `patch_ready=False`,
+    `ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID`,
+    `ACTION_MANUAL_REVIEW_REQUIRED`.
+16. **(Phase 6I-24 Codex amendment)** 59-of-60 cell
+    payload with upstream `payload_ready=True` →
+    rejected.
+17. **(Phase 6I-24 Codex amendment)** Duplicate
+    canonical `(K, window)` cell with upstream
+    `payload_ready=True` → rejected.
+18. **(Phase 6I-24 Codex amendment)** Build-wide
+    alignment missing one canonical window → rejected.
+19. **(Phase 6I-24 Codex amendment)** Build-wide
+    alignment with `bool` in `firing_member_count` →
+    rejected (`bool` is a subclass of `int` in Python;
+    the contract explicitly bans it).
+20. **(Phase 6I-24 Codex amendment)** Valid happy path
+    still passes the new gate AND still satisfies the
+    Phase 6I-20 audit's validators (regression guard).
+21. **(Phase 6I-24 Codex amendment)** Reflective:
+    `ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID` is in
+    `ALL_ISSUE_CODES`.
+22-26. CLI: `rc=0` (happy); `rc=2` (missing ticker);
     `rc=2` (unknown flag); `rc=2` (no `SystemExit`
     leak); `rc=3` (unhandled exception).
-20-23. Constants: re-exported from the core; every
+27-30. Constants: re-exported from the core; every
     `ALL_ISSUE_CODES` entry exposed as an `ISSUE_*`
     module attribute; every `ALL_ACTIONS` entry exposed
     as an `ACTION_*` module attribute;
@@ -366,12 +441,12 @@ py_compile: clean on multiwindow_k_confluence_patch_planner.py +
             test_multiwindow_k_confluence_patch_planner.py.
 
 pytest test_scripts/test_multiwindow_k_confluence_patch_planner.py -q:
-  23 passed in 0.99 s
+  30 passed in 1.09 s
 
 Focused 5-way (planner + Phase 6I-23 builder + Phase 6I-22
               adapter + Phase 6I-21 core + Phase 6I-20 gap audit):
-  136 passed in 1.32 s
-  ├── multiwindow_k_confluence_patch_planner   23 passed
+  143 passed in 1.32 s
+  ├── multiwindow_k_confluence_patch_planner   30 passed
   ├── multiwindow_k_engine_payload_builder     29 passed
   ├── multiwindow_k_input_adapter              23 passed
   ├── multiwindow_k_engine_core                38 passed

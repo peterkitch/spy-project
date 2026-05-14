@@ -57,7 +57,23 @@ planner:
          ``K_values`` / ``windows`` / ``phase`` so a
          future writer + audit can trace which builder
          run produced the payload).
-  5. Returns a structured
+  5. **Independently validates** the planned payload
+     against a local re-derivation of the Phase 6I-20
+     future-artifact contract (Phase 6I-24 Codex
+     amendment). The planner does NOT trust the upstream
+     builder's ``payload_ready=True`` claim alone --
+     ``patch_ready=True`` requires BOTH (a) the upstream
+     builder reported ``payload_ready=True`` AND (b) the
+     planner's own ``_planner_planned_payload_is_valid``
+     accepts the assembled ``planned_payload``. When
+     the upstream claim contradicts the actual payload
+     shape (empty / malformed metrics, missing canonical
+     cells, duplicate cells, wrong field types,
+     ``bool``-as-``int`` slots, etc.), the planner
+     refuses to mark ``patch_ready=True`` and surfaces
+     ``ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID`` with
+     ``recommended_next_action=ACTION_MANUAL_REVIEW_REQUIRED``.
+  6. Returns a structured
      ``MultiWindowKConfluencePatchPlan`` carrying the
      **planned payload body** (the exact JSON object
      that would be merged) plus a compact existing-
@@ -112,6 +128,9 @@ Public surface
     ISSUE_PAYLOAD_NOT_READY                 # str
     ISSUE_CONFLUENCE_ARTIFACT_MISSING       # str
     ISSUE_CONFLUENCE_ARTIFACT_UNREADABLE    # str
+    ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID  # str
+                                            # (Phase 6I-24
+                                            # Codex amend.)
 
     # Stable recommended-action codes.
     ACTION_BUILD_PAYLOAD_FIRST
@@ -178,6 +197,41 @@ import multiwindow_k_engine_payload_builder as _mw_payload
 CANONICAL_WINDOWS: tuple[str, ...] = _mw_core.CANONICAL_WINDOWS
 CANONICAL_K_VALUES: tuple[int, ...] = _mw_core.CANONICAL_K_VALUES
 
+# Derived sets for the planner-side payload validator
+# (Phase 6I-24 Codex amendment). The validator must not
+# import ``multiwindow_k_engine_gap_audit`` -- the
+# contract is re-derived locally so the planner stays on
+# the right side of its own forbidden-imports static
+# guard.
+_CANONICAL_K_VALUES_SET: frozenset[int] = frozenset(
+    CANONICAL_K_VALUES,
+)
+_CANONICAL_WINDOWS_SET: frozenset[str] = frozenset(
+    CANONICAL_WINDOWS,
+)
+_CANONICAL_CELLS: frozenset[tuple[int, str]] = frozenset(
+    (k, w)
+    for k in CANONICAL_K_VALUES
+    for w in CANONICAL_WINDOWS
+)
+
+# Per-window-K-metrics required-five fields (matches the
+# Phase 6I-20 audit's _REQUIRED_PER_WINDOW_K_METRIC_FIELDS
+# verbatim).
+_REQUIRED_PER_WINDOW_K_METRIC_FIELDS: tuple[str, ...] = (
+    "K", "window", "total_capture_pct",
+    "sharpe_ratio", "trigger_days",
+)
+
+# Build-wide alignment per-window required fields (matches
+# the Phase 6I-20 audit's
+# _REQUIRED_BUILD_WIDE_ALIGNMENT_FIELDS verbatim).
+_REQUIRED_BUILD_WIDE_ALIGNMENT_FIELDS: tuple[str, ...] = (
+    "all_members_firing",
+    "firing_member_count",
+    "total_member_count",
+)
+
 
 # Stable issue codes.
 ISSUE_PAYLOAD_NOT_READY = "payload_not_ready"
@@ -187,11 +241,27 @@ ISSUE_CONFLUENCE_ARTIFACT_MISSING = (
 ISSUE_CONFLUENCE_ARTIFACT_UNREADABLE = (
     "confluence_artifact_unreadable"
 )
+# Phase 6I-24 Codex amendment: the planner must NOT
+# trust the upstream payload report's
+# ``payload_ready=True`` claim blindly. After the
+# planner builds its own ``planned_payload`` dict, it
+# runs a local Phase 6I-20-shaped contract validator
+# (no ``multiwindow_k_engine_gap_audit`` import). If
+# the planned payload fails that validator, the
+# planner refuses to mark ``patch_ready=True`` and
+# fires this issue code instead -- the discrepancy
+# between the upstream builder's readiness claim and
+# the actual payload shape is a real operator-review
+# signal, not a near-miss the planner should mask.
+ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID = (
+    "planned_payload_contract_invalid"
+)
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_PAYLOAD_NOT_READY,
     ISSUE_CONFLUENCE_ARTIFACT_MISSING,
     ISSUE_CONFLUENCE_ARTIFACT_UNREADABLE,
+    ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID,
 )
 
 
@@ -504,6 +574,168 @@ def _summarize_existing_artifact(
     }
 
 
+# ---------------------------------------------------------------------------
+# Planner-side payload validators (Phase 6I-24 Codex amendment)
+# ---------------------------------------------------------------------------
+#
+# These validators independently re-derive the Phase 6I-20 future-artifact
+# contract so the planner can refuse to mark ``patch_ready=True`` when the
+# upstream builder's ``payload_ready=True`` claim contradicts the actual
+# payload shape. They MUST NOT import ``multiwindow_k_engine_gap_audit`` --
+# the planner's forbidden-imports static guard explicitly bans the audit
+# module from this code path. The contract is re-derived; the behaviour
+# (cell coverage, field types, no-bool-as-int) must match.
+
+
+def _planner_per_window_k_metrics_are_valid(
+    payload: Any,
+) -> bool:
+    """Re-derives the Phase 6I-20 audit's
+    ``_per_window_k_metrics_are_valid`` contract locally.
+
+    Requires:
+      - ``payload`` is a non-empty list;
+      - every entry is a Mapping with the five required
+        fields (``K`` / ``window`` / ``total_capture_pct``
+        / ``sharpe_ratio`` / ``trigger_days``);
+      - ``K`` is int-coercible; ``window`` is a non-empty
+        str;
+      - the three numeric fields are ``int`` / ``float``
+        and explicitly NOT ``bool`` (``bool`` is a
+        subclass of ``int`` in Python; a True / False
+        slot would silently satisfy a permissive type
+        check);
+      - duplicate ``(K, window)`` pairs fail;
+      - canonical cells (those with K in
+        ``CANONICAL_K_VALUES`` AND window in
+        ``CANONICAL_WINDOWS``) cover the full 60-cell
+        grid;
+      - noncanonical extras are tolerated but never
+        substitute for a missing canonical cell.
+    """
+    if not isinstance(payload, list):
+        return False
+    if not payload:
+        return False
+    seen: set[tuple[int, str]] = set()
+    canonical_observed: set[tuple[int, str]] = set()
+    for entry in payload:
+        if not isinstance(entry, Mapping):
+            return False
+        for f in _REQUIRED_PER_WINDOW_K_METRIC_FIELDS:
+            if f not in entry:
+                return False
+        try:
+            k_int = int(entry["K"])
+        except (TypeError, ValueError):
+            return False
+        win = entry.get("window")
+        if not isinstance(win, str) or not win.strip():
+            return False
+        win_clean = win.strip()
+        for numeric_key in (
+            "total_capture_pct",
+            "sharpe_ratio",
+            "trigger_days",
+        ):
+            val = entry.get(numeric_key)
+            if val is None:
+                return False
+            if not isinstance(val, (int, float)):
+                return False
+            if isinstance(val, bool):
+                # bool is a subclass of int; reject
+                # explicitly so a True/False value
+                # cannot satisfy a permissive type
+                # check.
+                return False
+        cell_key = (k_int, win_clean)
+        if cell_key in seen:
+            # Duplicate (K, window) -> reject.
+            return False
+        seen.add(cell_key)
+        if (
+            k_int in _CANONICAL_K_VALUES_SET
+            and win_clean in _CANONICAL_WINDOWS_SET
+        ):
+            canonical_observed.add(cell_key)
+    return canonical_observed == _CANONICAL_CELLS
+
+
+def _planner_build_wide_alignment_is_valid(
+    payload: Any,
+) -> bool:
+    """Re-derives the Phase 6I-20 audit's
+    ``_build_wide_alignment_is_valid`` contract locally.
+
+    Requires:
+      - ``payload`` is a Mapping;
+      - every canonical window has an entry;
+      - each entry has the three required fields
+        (``all_members_firing`` / ``firing_member_count``
+        / ``total_member_count``);
+      - ``all_members_firing`` is exactly ``bool`` (not
+        any int-like truthy value);
+      - ``firing_member_count`` / ``total_member_count``
+        are ``int`` and explicitly NOT ``bool``.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    canonical = set(CANONICAL_WINDOWS)
+    if not canonical.issubset(set(payload.keys())):
+        return False
+    for win in CANONICAL_WINDOWS:
+        entry = payload.get(win)
+        if not isinstance(entry, Mapping):
+            return False
+        for f in _REQUIRED_BUILD_WIDE_ALIGNMENT_FIELDS:
+            if f not in entry:
+                return False
+        amf = entry["all_members_firing"]
+        if not isinstance(amf, bool):
+            return False
+        for count_key in (
+            "firing_member_count",
+            "total_member_count",
+        ):
+            cv = entry[count_key]
+            if not isinstance(cv, int) or isinstance(
+                cv, bool,
+            ):
+                return False
+    return True
+
+
+def _planner_planned_payload_is_valid(
+    planned_payload: Mapping[str, Any],
+) -> bool:
+    """Top-level planner-side contract: planned_payload
+    must carry exactly the three ``PLANNED_PAYLOAD_KEYS``
+    AND the two Phase 6I-20-shaped fields must each pass
+    their local validator.
+
+    The metadata block's shape is not policed by this
+    contract; the planner is free to evolve it without
+    breaking the future writer's contract. The two Phase
+    6I-20-shaped fields are the load-bearing surface.
+    """
+    if not isinstance(planned_payload, Mapping):
+        return False
+    if set(planned_payload.keys()) != set(
+        PLANNED_PAYLOAD_KEYS,
+    ):
+        return False
+    if not _planner_per_window_k_metrics_are_valid(
+        planned_payload.get(_PER_WINDOW_K_METRICS_KEY),
+    ):
+        return False
+    if not _planner_build_wide_alignment_is_valid(
+        planned_payload.get(_BUILD_WIDE_ALIGNMENT_KEY),
+    ):
+        return False
+    return True
+
+
 def _build_planned_payload(
     payload_report: Any,
     current_as_of_date: Optional[str],
@@ -719,19 +951,42 @@ def plan_multiwindow_k_confluence_patch(
     fields_to_replace: list[str] = []
     planned_payload: dict[str, Any] = {}
     planned_payload_keys: tuple[str, ...] = ()
+    planned_payload_contract_invalid = False
     if patch_ready:
-        planned_payload = _build_planned_payload(
+        candidate_payload = _build_planned_payload(
             payload_report, current_as_of_date,
         )
-        for key in PLANNED_PAYLOAD_KEYS:
-            if (
-                isinstance(artifact, Mapping)
-                and key in artifact
-            ):
-                fields_to_replace.append(key)
-            else:
-                fields_to_add.append(key)
-        planned_payload_keys = tuple(planned_payload.keys())
+        # Phase 6I-24 Codex amendment: the planner must
+        # independently validate the planned_payload it is
+        # about to mark ready_for_reviewed_artifact_write.
+        # An upstream builder that reports payload_ready=
+        # True with an empty / malformed payload is a
+        # contract violation; the planner refuses to
+        # propagate the discrepancy as patch_ready=True.
+        if _planner_planned_payload_is_valid(
+            candidate_payload,
+        ):
+            planned_payload = candidate_payload
+            for key in PLANNED_PAYLOAD_KEYS:
+                if (
+                    isinstance(artifact, Mapping)
+                    and key in artifact
+                ):
+                    fields_to_replace.append(key)
+                else:
+                    fields_to_add.append(key)
+            planned_payload_keys = tuple(
+                planned_payload.keys(),
+            )
+        else:
+            planned_payload_contract_invalid = True
+            patch_ready = False
+            _append_unique(
+                issues,
+                ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID,
+            )
+            planned_payload = {}
+            planned_payload_keys = ()
 
     existing_field_summary = (
         _summarize_existing_artifact(artifact)
@@ -745,6 +1000,13 @@ def plan_multiwindow_k_confluence_patch(
     elif not artifact_exists:
         recommended = ACTION_CREATE_CONFLUENCE_ARTIFACT_FIRST
     elif artifact_unreadable:
+        recommended = ACTION_MANUAL_REVIEW_REQUIRED
+    elif planned_payload_contract_invalid:
+        # Phase 6I-24 Codex amendment: the upstream builder
+        # claimed payload_ready=True but the planner's own
+        # contract validator rejected the payload. This is
+        # a discrepancy the operator must review, not a
+        # near-miss the planner should mask.
         recommended = ACTION_MANUAL_REVIEW_REQUIRED
     else:
         recommended = ACTION_READY_FOR_REVIEWED_ARTIFACT_WRITE
