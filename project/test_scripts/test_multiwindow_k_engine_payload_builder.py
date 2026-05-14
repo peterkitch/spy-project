@@ -951,3 +951,60 @@ def test_all_issue_codes_exposed():
         assert matches, (
             f"issue code {code!r} not exported"
         )
+
+
+# ---------------------------------------------------------------------------
+# 10. Phase 6I-28 close-source plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_builder_threads_close_source_root_to_adapter():
+    """The builder must forward the optional
+    ``close_source_root`` kwarg to the adapter so the
+    Phase 6I-28 close-source fallback is reachable from
+    downstream callers (planner / writer)."""
+    captured: dict[str, Any] = {}
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+
+    def spy_adapter(target_ticker, **kwargs):
+        captured.update(kwargs)
+        # Builder must NEVER forward allow_partial_members.
+        assert (
+            "allow_partial_members" not in kwargs
+        )
+        return ready
+    builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        close_source_root="/tmp/builder_close_root",
+        adapter_callable=spy_adapter,
+    )
+    assert (
+        captured.get("close_source_root")
+        == "/tmp/builder_close_root"
+    )
+
+
+def test_builder_omits_close_source_root_when_not_passed():
+    """Backwards-compat pin: callers that don't pass the new
+    ``close_source_root`` kwarg still produce
+    ``close_source_root=None`` in the adapter call. The
+    adapter's opt-in default (no fallback) preserves the
+    Phase 6I-22 behaviour for the legacy code path."""
+    captured: dict[str, Any] = {}
+    ready = _FakeAdapterReport(
+        per_cell_inputs=_full_canonical_per_cell_inputs(),
+    )
+
+    def spy_adapter(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return ready
+    builder.build_multiwindow_k_engine_payload(
+        "SPY",
+        adapter_callable=spy_adapter,
+    )
+    # The keyword is present in the call (with value None)
+    # so the adapter's signature is satisfied.
+    assert "close_source_root" in captured
+    assert captured["close_source_root"] is None

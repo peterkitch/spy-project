@@ -1445,3 +1445,56 @@ def test_writer_does_not_resolve_paths_outside_tmp_path(
         f"writer touched a path outside tmp_path: "
         f"{written_resolved!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-28 close-source plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_writer_threads_close_source_root_to_planner(tmp_path):
+    """The writer must forward ``close_source_root`` to the
+    Phase 6I-24 planner so the close-source fallback is
+    reachable through the writer CLI."""
+    captured: dict[str, Any] = {}
+    plan = _FakePlan(
+        artifact_path=None, patch_ready=False,
+        issue_codes=("payload_not_ready",),
+        recommended_next_action="build_payload_first",
+    )
+
+    def spy_planner(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return plan
+    writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        close_source_root="/tmp/writer_close_root",
+        patch_planner_callable=spy_planner,
+    )
+    assert (
+        captured.get("close_source_root")
+        == "/tmp/writer_close_root"
+    )
+
+
+def test_writer_passes_none_close_source_root_when_unset(
+    tmp_path,
+):
+    captured: dict[str, Any] = {}
+    plan = _FakePlan(
+        artifact_path=None, patch_ready=False,
+        issue_codes=("payload_not_ready",),
+        recommended_next_action="build_payload_first",
+    )
+
+    def spy_planner(target_ticker, **kwargs):
+        captured.update(kwargs)
+        return plan
+    writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=spy_planner,
+    )
+    assert "close_source_root" in captured
+    assert captured["close_source_root"] is None

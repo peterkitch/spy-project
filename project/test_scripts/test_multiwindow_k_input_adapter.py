@@ -1198,3 +1198,633 @@ def test_all_issue_codes_exposed_as_attributes():
         assert matches, (
             f"issue code {code!r} not exported"
         )
+
+
+# ---------------------------------------------------------------------------
+# 11. Phase 6I-28 close-source join
+# ---------------------------------------------------------------------------
+
+
+def _close_source_loader_returning(
+    resolution: adapter.CloseSourceResolution,
+    *,
+    call_log: Optional[list[Any]] = None,
+):
+    """Build a fake close-source loader that returns the
+    supplied resolution. ``call_log`` (if provided) captures
+    each invocation's ``(ticker, close_source_root)`` kwargs
+    so tests can assert the adapter passed the right values."""
+    def fn(ticker, *, close_source_root=None):
+        if call_log is not None:
+            call_log.append((
+                str(ticker).strip().upper(),
+                close_source_root,
+            ))
+        return resolution
+    return fn
+
+
+def _ok_close_resolution_for_full_canonical(
+    bars_per_window: int = 3,
+) -> adapter.CloseSourceResolution:
+    """Build a close-by-date map covering every date in the
+    full canonical fixture (every canonical window × every
+    bar). The fixture's synthetic bar dates are exactly
+    ``2026-01-DD_<window>`` strings, which match
+    ``_normalize_date_key`` because the leading 10 chars
+    parse as ``YYYY-MM-DD``."""
+    close_by_date: dict[str, Any] = {}
+    for window in core.CANONICAL_WINDOWS:
+        for d in _bars_for_window(window, bars_per_window):
+            key = adapter._normalize_date_key(d)
+            if key is None:
+                continue
+            close_by_date.setdefault(key, 100.0)
+    return adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+
+
+def test_close_source_join_resolves_missing_target_close(tmp_path):
+    """Target library has dates+signals but NO close. With
+    the close-source enabled and a matching exact-date close
+    map, the cell prepares with the joined close sequence."""
+    run_dir = tmp_path / "run_close_join"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=None,  # explicitly absent
+        ),
+    }
+    member_libs = {
+        ("AAA", "1d"): _full_member_lib("1d", 3),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    close_by_date = {
+        adapter._normalize_date_key(d): 200.0 + i
+        for i, d in enumerate(_bars_for_window("1d", 3))
+    }
+    close_resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+    call_log: list[Any] = []
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            close_resolution, call_log=call_log,
+        ),
+    )
+    assert report.prepared_cell_count == 1
+    assert report.skipped_cells == ()
+    cell = report.per_cell_inputs[(1, "1d")]
+    assert cell["target_close"] == [200.0, 201.0, 202.0]
+    # Adapter must NOT emit missing_target_close when the
+    # fallback supplied a complete join.
+    assert (
+        adapter.ISSUE_MISSING_TARGET_CLOSE
+        not in report.issue_codes
+    )
+    # The close-source loader was called at most once across
+    # all per-cell loops -- per-call caching.
+    assert len(call_log) == 1
+    assert call_log[0][0] == "SPY"
+
+
+def test_close_source_missing_surfaces_dedicated_reason(
+    tmp_path,
+):
+    """When the close source resolves to ``status="missing"``,
+    cells skip with ``target_close_source_missing`` -- NOT
+    the legacy ``missing_target_close`` -- so operators can
+    tell the two failure modes apart."""
+    run_dir = tmp_path / "run_close_missing"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=None,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs={
+            ("AAA", "1d"): _full_member_lib("1d", 3),
+        },
+    )
+    missing_resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_MISSING,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            missing_resolution,
+        ),
+    )
+    assert report.prepared_cell_count == 0
+    assert report.skipped_cells[0][2] == (
+        adapter.REASON_TARGET_CLOSE_SOURCE_MISSING
+    )
+    assert (
+        adapter.ISSUE_TARGET_CLOSE_SOURCE_MISSING
+        in report.issue_codes
+    )
+    assert (
+        adapter.ISSUE_MISSING_TARGET_CLOSE
+        not in report.issue_codes
+    )
+
+
+def test_close_source_unreadable_surfaces_dedicated_reason(
+    tmp_path,
+):
+    """When the close source resolves to ``status="unreadable"``,
+    cells skip with ``target_close_source_unreadable``."""
+    run_dir = tmp_path / "run_close_unreadable"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=None,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs={
+            ("AAA", "1d"): _full_member_lib("1d", 3),
+        },
+    )
+    unreadable_resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_UNREADABLE,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            unreadable_resolution,
+        ),
+    )
+    assert report.prepared_cell_count == 0
+    assert report.skipped_cells[0][2] == (
+        adapter.REASON_TARGET_CLOSE_SOURCE_UNREADABLE
+    )
+    assert (
+        adapter.ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE
+        in report.issue_codes
+    )
+
+
+def test_close_source_partial_dates_surfaces_join_incomplete(
+    tmp_path,
+):
+    """When the close-source map covers SOME but NOT all
+    library dates, the cell is skipped with
+    ``target_close_join_incomplete``. The adapter MUST NOT
+    fabricate / ffill / resample the missing date's close."""
+    run_dir = tmp_path / "run_close_partial"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    dates = _bars_for_window("1d", 3)
+    target_libs = {
+        "1d": _make_lib(
+            dates=dates,
+            signals=["None"] * 3,
+            close=None,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs={
+            ("AAA", "1d"): _full_member_lib("1d", 3),
+        },
+    )
+    # Map only contains the FIRST two of the three library
+    # dates; the third has no close.
+    close_by_date = {
+        adapter._normalize_date_key(dates[0]): 100.0,
+        adapter._normalize_date_key(dates[1]): 101.0,
+    }
+    partial_resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            partial_resolution,
+        ),
+    )
+    assert report.prepared_cell_count == 0
+    assert report.skipped_cells[0][2] == (
+        adapter.REASON_TARGET_CLOSE_JOIN_INCOMPLETE
+    )
+    assert (
+        adapter.ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE
+        in report.issue_codes
+    )
+    # No partial close was written to per_cell_inputs.
+    assert report.per_cell_inputs == {}
+
+
+def test_close_source_disabled_preserves_legacy_missing_close(
+    tmp_path,
+):
+    """When BOTH ``close_source_root`` and ``close_loader``
+    are None, the adapter MUST preserve the Phase 6I-22
+    legacy behaviour: missing-close cells skip with
+    ``missing_target_close``. This pins backwards
+    compatibility for callers that don't know about the new
+    surface."""
+    run_dir = tmp_path / "run_legacy_no_close"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=None,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs={
+            ("AAA", "1d"): _full_member_lib("1d", 3),
+        },
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        # No close_source_root / no close_loader -- the
+        # opt-in fallback path must NOT engage.
+    )
+    assert report.prepared_cell_count == 0
+    assert report.skipped_cells[0][2] == (
+        adapter.REASON_MISSING_TARGET_CLOSE
+    )
+    assert (
+        adapter.ISSUE_MISSING_TARGET_CLOSE
+        in report.issue_codes
+    )
+    # And none of the new close-source issue codes fire.
+    for code in (
+        adapter.ISSUE_TARGET_CLOSE_SOURCE_MISSING,
+        adapter.ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE,
+        adapter.ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE,
+    ):
+        assert code not in report.issue_codes
+
+
+def test_native_close_in_library_still_preferred_over_close_source(
+    tmp_path,
+):
+    """If the target library already has ``close``, the
+    adapter MUST use it -- the close-source loader must not
+    be invoked at all (the per-call cache stays empty)."""
+    run_dir = tmp_path / "run_native_close"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    native_closes = [10.0, 11.0, 12.0]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=list(native_closes),
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs={
+            ("AAA", "1d"): _full_member_lib("1d", 3),
+        },
+    )
+    call_log: list[Any] = []
+    fallback_resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date={
+            adapter._normalize_date_key(d): 999.0
+            for d in _bars_for_window("1d", 3)
+        },
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            fallback_resolution, call_log=call_log,
+        ),
+    )
+    assert report.prepared_cell_count == 1
+    cell = report.per_cell_inputs[(1, "1d")]
+    # Native close wins. Fallback was NOT consulted.
+    assert cell["target_close"] == native_closes
+    assert call_log == []
+
+
+def test_close_source_does_not_relax_strict_member_coverage(
+    tmp_path,
+):
+    """The close-source join only supplies the target close.
+    It MUST NOT relax the strict full-member-coverage gate:
+    if any member library is missing, the cell still skips
+    with ``incomplete_member_coverage`` (the Phase 6I-22
+    Codex amendment invariant)."""
+    run_dir = tmp_path / "run_strict_unchanged"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=None,
+        ),
+    }
+    # AAA has a 1d library, BBB does NOT.
+    member_libs = {
+        ("AAA", "1d"): _full_member_lib("1d", 3),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    close_by_date = {
+        adapter._normalize_date_key(d): 100.0
+        for d in _bars_for_window("1d", 3)
+    }
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(2,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            adapter.CloseSourceResolution(
+                status=adapter.CLOSE_SOURCE_STATUS_OK,
+                close_by_date=close_by_date,
+            ),
+        ),
+    )
+    assert report.prepared_cell_count == 0
+    # The cell skipped because BBB had no library -- NOT
+    # because of any close-source issue.
+    assert report.skipped_cells[0][2] == (
+        adapter.REASON_INCOMPLETE_MEMBER_COVERAGE
+    )
+
+
+def test_close_source_full_canonical_fixture_prepares_60_cells(
+    tmp_path,
+):
+    """End-to-end happy path: target libraries lack close,
+    members are full, close source supplies exact-date close
+    for every canonical date -> all 60 cells prepare AND
+    ``can_evaluate_full_60_cell_grid=True``."""
+    run_dir = tmp_path / "run_close_join_60"
+    run_dir.mkdir()
+    rows, lib_loader = _full_canonical_fixture(
+        k_member_sets={
+            k: [(f"M{i}", "D") for i in range(k)]
+            for k in core.CANONICAL_K_VALUES
+        },
+    )
+    # Re-build target libs WITHOUT close; reuse member libs.
+    no_close_target_libs = {
+        window: _make_lib(
+            dates=_bars_for_window(window, 3),
+            signals=["None"] * 3,
+            close=None,
+        )
+        for window in core.CANONICAL_WINDOWS
+    }
+    full_member_libs: dict[tuple[str, str], dict[str, Any]] = {}
+    all_members: set[str] = set()
+    for K in core.CANONICAL_K_VALUES:
+        for i in range(K):
+            all_members.add(f"M{i}")
+    for member in all_members:
+        for window in core.CANONICAL_WINDOWS:
+            full_member_libs[(member, window)] = (
+                _full_member_lib(window, 3)
+            )
+    loader = _library_factory(
+        target_libs=no_close_target_libs,
+        member_libs=full_member_libs,
+    )
+    resolution = _ok_close_resolution_for_full_canonical()
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_loader=_close_source_loader_returning(
+            resolution,
+        ),
+    )
+    assert report.prepared_cell_count == 60
+    assert report.missing_cell_count == 0
+    assert report.can_evaluate_full_60_cell_grid is True
+    # And every prepared cell got the joined close.
+    for (K, window), cell in report.per_cell_inputs.items():
+        assert (
+            len(cell["target_close"])
+            == len(cell["dates"])
+        )
+
+
+def test_close_source_root_path_threaded_to_loader(tmp_path):
+    """``close_source_root`` argument should be forwarded
+    intact to the close-source loader so production / tests
+    can point at different directories."""
+    run_dir = tmp_path / "run_close_root_thread"
+    run_dir.mkdir()
+    custom_root = tmp_path / "custom_close_root"
+    custom_root.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {
+        "1d": _make_lib(
+            dates=_bars_for_window("1d", 3),
+            signals=["None"] * 3,
+            close=None,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs={
+            ("AAA", "1d"): _full_member_lib("1d", 3),
+        },
+    )
+    call_log: list[Any] = []
+    close_by_date = {
+        adapter._normalize_date_key(d): 100.0
+        for d in _bars_for_window("1d", 3)
+    }
+    resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+    adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,),
+        windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        close_source_root=custom_root,
+        close_loader=_close_source_loader_returning(
+            resolution, call_log=call_log,
+        ),
+    )
+    assert call_log
+    received_root = call_log[0][1]
+    # The adapter wrapped the str/Path into a Path before
+    # forwarding; identity is not required, but path equality
+    # under Path is.
+    assert Path(received_root) == custom_root
+
+
+def test_normalize_date_key_handles_common_shapes():
+    """The normalizer must handle ``Timestamp``-like /
+    ``datetime``-like / plain-string inputs and return ISO
+    ``YYYY-MM-DD`` substrings. None / empty inputs return
+    None."""
+    # datetime / Timestamp-like via duck-typing
+    import datetime as _dt
+    assert (
+        adapter._normalize_date_key(_dt.date(2026, 5, 13))
+        == "2026-05-13"
+    )
+    assert (
+        adapter._normalize_date_key(
+            _dt.datetime(2026, 5, 13, 16, 0, 0),
+        )
+        == "2026-05-13"
+    )
+    # ISO strings: leading 10 chars survive
+    assert (
+        adapter._normalize_date_key("2026-05-13")
+        == "2026-05-13"
+    )
+    assert (
+        adapter._normalize_date_key(
+            "2026-05-13T00:00:00+00:00"
+        )
+        == "2026-05-13"
+    )
+    # Pre-existing fixture format -- 2026-01-XX_1d -- truncates
+    # to the date head.
+    assert (
+        adapter._normalize_date_key("2026-01-01_1d")
+        == "2026-01-01"
+    )
+    # Null / empty
+    assert adapter._normalize_date_key(None) is None
+    assert adapter._normalize_date_key("") is None
+
+
+def test_close_source_helpers_make_no_projection_calls():
+    """Defensive AST scan: the Phase 6I-28 close-source
+    helpers MUST NOT call ``.resample()`` / ``.ffill()`` --
+    the spec is exact-date-only."""
+    src = Path(adapter.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = None
+            if isinstance(func, ast.Attribute):
+                name = func.attr
+            elif isinstance(func, ast.Name):
+                name = func.id
+            assert name not in {"resample", "ffill"}, (
+                "adapter calls forbidden "
+                f"{name!r}() at line {node.lineno}"
+            )

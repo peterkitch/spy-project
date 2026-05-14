@@ -838,6 +838,7 @@ def plan_multiwindow_k_confluence_patch(
     windows: Iterable[str] = CANONICAL_WINDOWS,
     run_dir: Optional[Any] = None,
     current_as_of_date: Optional[str] = None,
+    close_source_root: Optional[Any] = None,
     payload_builder_callable: Optional[
         Callable[..., Any]
     ] = None,
@@ -885,6 +886,9 @@ def plan_multiwindow_k_confluence_patch(
         payload_builder_callable
         or _mw_payload.build_multiwindow_k_engine_payload
     )
+    # Phase 6I-28: the optional read-only ``close_source_root``
+    # is forwarded straight through to the Phase 6I-23 builder
+    # (which in turn forwards it to the Phase 6I-22 adapter).
     payload_report = payload_fn(
         target_clean,
         stackbuilder_root=stackbuilder_root,
@@ -892,6 +896,7 @@ def plan_multiwindow_k_confluence_patch(
         K_values=K_values,
         windows=windows,
         run_dir=run_dir,
+        close_source_root=close_source_root,
     )
     payload_ready = bool(
         getattr(payload_report, "payload_ready", False),
@@ -1073,6 +1078,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--current-as-of-date", default=None,
     )
+    # Phase 6I-28: optional read-only close-source root.
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument(
+        "--close-source-root", default=None,
+    )
     return parser
 
 
@@ -1099,6 +1109,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    effective_close_source_root = (
+        args.close_source_root
+        if args.close_source_root is not None
+        else args.cache_dir
+    )
     try:
         plan = plan_multiwindow_k_confluence_patch(
             ticker,
@@ -1107,6 +1122,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             signal_library_dir=args.signal_library_dir,
             run_dir=args.run_dir,
             current_as_of_date=args.current_as_of_date,
+            close_source_root=effective_close_source_root,
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

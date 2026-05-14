@@ -793,6 +793,7 @@ def apply_multiwindow_k_confluence_patch(
     windows: Iterable[str] = CANONICAL_WINDOWS,
     run_dir: Optional[Any] = None,
     current_as_of_date: Optional[str] = None,
+    close_source_root: Optional[Any] = None,
     write: bool = False,
     execution_log: Optional[Any] = None,
     patch_planner_callable: Optional[
@@ -821,6 +822,8 @@ def apply_multiwindow_k_confluence_patch(
         patch_planner_callable
         or _mw_planner.plan_multiwindow_k_confluence_patch
     )
+    # Phase 6I-28: the optional read-only ``close_source_root``
+    # is forwarded straight through to the Phase 6I-24 planner.
     plan = planner_fn(
         target_clean,
         artifact_root=artifact_root,
@@ -830,6 +833,7 @@ def apply_multiwindow_k_confluence_patch(
         windows=windows,
         run_dir=run_dir,
         current_as_of_date=current_as_of_date,
+        close_source_root=close_source_root,
     )
 
     planner_patch_ready = bool(
@@ -1065,6 +1069,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--current-as-of-date", default=None,
     )
+    # Phase 6I-28: optional read-only close-source root.
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument(
+        "--close-source-root", default=None,
+    )
     parser.add_argument(
         "--write",
         action="store_true",
@@ -1109,6 +1118,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    effective_close_source_root = (
+        args.close_source_root
+        if args.close_source_root is not None
+        else args.cache_dir
+    )
     try:
         result = apply_multiwindow_k_confluence_patch(
             ticker,
@@ -1117,6 +1131,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             signal_library_dir=args.signal_library_dir,
             run_dir=args.run_dir,
             current_as_of_date=args.current_as_of_date,
+            close_source_root=effective_close_source_root,
             write=bool(args.write),
             execution_log=args.execution_log,
         )
