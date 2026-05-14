@@ -189,18 +189,66 @@ _PRODUCTION_STABLE_SUFFIX: tuple[str, ...] = (
 )
 
 
-def _path_under_production_stable_suffix(path: Path) -> bool:
+def _path_is_under_production_stable(
+    candidate: Any,
+    production_stable_dir: Any = None,
+) -> bool:
+    """Return ``True`` if ``candidate`` is unsafe for sandbox
+    writes because it would land at or under the production
+    stable signal-library directory.
+
+    Phase 6I-32 amendment-1 (rejects the original guard's
+    suffix-only check that missed child paths like
+    ``signal_library/data/stable/staged_libs``).
+
+    A path is unsafe when:
+
+      1. ``candidate`` equals ``production_stable_dir``
+         (when supplied) after resolution; OR
+      2. ``candidate`` is anywhere UNDER
+         ``production_stable_dir`` (when supplied); OR
+      3. ``candidate``'s resolved components contain
+         ``signal_library/data/stable`` as a CONTIGUOUS
+         ancestor segment (regardless of where in the path
+         it sits). This catches paths that resolve under a
+         signal_library/data/stable root even when an
+         explicit ``production_stable_dir`` was not threaded
+         through.
+
+    The check is conservative on purpose: false positives
+    are operator-recoverable (rename the staged dir);
+    false negatives could let staged writes land in
+    production.
+    """
     try:
-        resolved = path.resolve()
+        cand = Path(candidate).resolve()
     except Exception:
-        return False
-    parts = [p.lower() for p in resolved.parts]
+        # Unresolvable candidate -> assume unsafe.
+        return True
+
+    if production_stable_dir is not None:
+        try:
+            prod = Path(production_stable_dir).resolve()
+            if cand == prod:
+                return True
+            try:
+                cand.relative_to(prod)
+                return True
+            except ValueError:
+                pass
+        except Exception:
+            pass
+
+    parts = [p.lower() for p in cand.parts]
     suffix = [
         p.lower() for p in _PRODUCTION_STABLE_SUFFIX
     ]
     if len(parts) < len(suffix):
         return False
-    return parts[-len(suffix):] == suffix
+    for i in range(len(parts) - len(suffix) + 1):
+        if parts[i:i + len(suffix)] == suffix:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +414,20 @@ def _default_sandbox_builder(
     staged_dir: Path,
     end_date: Optional[str],
 ) -> dict[str, Any]:
+    # Phase 6I-32 amendment-1 defense-in-depth: even though
+    # the harness's outer guard already short-circuits the
+    # sandbox call when staged_dir is unsafe, re-check here
+    # so a future call-path mistake -- or an out-of-band
+    # caller that uses this helper directly -- cannot write
+    # under the production stable root. The
+    # ``build_sandbox_libraries_for_ticker`` API does not
+    # itself run the sandbox CLI's path guard (the CLI guard
+    # runs in ``multi_timeframe_sandbox_builder.main``).
+    if _path_is_under_production_stable(staged_dir):
+        raise ValueError(
+            "refusing to write sandbox libraries under "
+            f"signal_library/data/stable: {staged_dir!r}"
+        )
     from signal_library import (
         multi_timeframe_sandbox_builder as _sb,
     )
@@ -589,8 +651,18 @@ def evaluate_fresh_staging_readiness(
 
     issues: list[str] = []
 
-    # Safety gate: refuse staged_dir under signal_library/data/stable.
-    if _path_under_production_stable_suffix(staged_path):
+    # Safety gate: refuse staged_dir that resolves at or under
+    # the production stable signal-library directory. The
+    # check covers (a) exact match with production_stable_dir,
+    # (b) any path under production_stable_dir, AND (c) any
+    # path containing signal_library/data/stable as a
+    # contiguous segment -- so child paths like
+    # signal_library/data/stable/staged_libs are caught even
+    # when production_stable_dir was not threaded through.
+    unsafe_staged_dir = _path_is_under_production_stable(
+        staged_path, prod_stable_path,
+    )
+    if unsafe_staged_dir:
         _append_unique(
             issues, ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE,
         )
@@ -664,46 +736,55 @@ def evaluate_fresh_staging_readiness(
             }
 
     # ----------------------------------------------------- 3. sandbox build
-    sandbox_fn = (
-        sandbox_builder_callable
-        or _default_sandbox_builder
-    )
-    sandbox_attempted = True
-    try:
-        sandbox_result = sandbox_fn(
-            list(target_tickers_tuple),
-            intervals=list(interval_list),
-            cache_dir=cache_path,
-            staged_dir=staged_path,
-            end_date=sandbox_end_date,
+    # Phase 6I-32 amendment-1: hard-stop the sandbox call when
+    # staged_dir is unsafe. The check above set
+    # ``unsafe_staged_dir`` BEFORE any disk-touching stage; if
+    # it's True we refuse to invoke the sandbox builder
+    # callable AT ALL, regardless of whether the caller
+    # supplied a fake. This is the operator-safety contract:
+    # no path that even THEORETICALLY resolves under the
+    # production stable root gets a sandbox builder call.
+    sandbox_attempted = not unsafe_staged_dir
+    sandbox_written = 0
+    sandbox_failed = 0
+    if sandbox_attempted:
+        sandbox_fn = (
+            sandbox_builder_callable
+            or _default_sandbox_builder
         )
-        sandbox_written = len(
-            sandbox_result.get("written", []) or [],
-        )
-        sandbox_failed = len(
-            sandbox_result.get("failed", []) or [],
-        )
-    except Exception as exc:
-        sandbox_result = {
-            "error": "sandbox_builder_failed",
-            "detail": str(exc),
-        }
-        sandbox_written = 0
-        sandbox_failed = (
-            len(target_tickers_tuple) * len(interval_list)
-        )
+        try:
+            sandbox_result = sandbox_fn(
+                list(target_tickers_tuple),
+                intervals=list(interval_list),
+                cache_dir=cache_path,
+                staged_dir=staged_path,
+                end_date=sandbox_end_date,
+            )
+            sandbox_written = len(
+                sandbox_result.get("written", []) or [],
+            )
+            sandbox_failed = len(
+                sandbox_result.get("failed", []) or [],
+            )
+        except Exception as exc:
+            sandbox_result = {
+                "error": "sandbox_builder_failed",
+                "detail": str(exc),
+            }
+            sandbox_written = 0
+            sandbox_failed = (
+                len(target_tickers_tuple) * len(interval_list)
+            )
 
-    if sandbox_failed:
-        _append_unique(
-            issues, ISSUE_SANDBOX_BUILD_INCOMPLETE,
-        )
+        if sandbox_failed:
+            _append_unique(
+                issues, ISSUE_SANDBOX_BUILD_INCOMPLETE,
+            )
 
     # ----------------------------------------------------- 4. promotion planner
     promotion_plan_summary: Optional[dict[str, Any]] = None
     promotion_plan_ready: Optional[bool] = None
-    if sandbox_written > 0 and (
-        not _path_under_production_stable_suffix(staged_path)
-    ):
+    if sandbox_written > 0 and not unsafe_staged_dir:
         planner_fn = (
             promotion_planner_callable
             or _default_promotion_planner
@@ -757,7 +838,16 @@ def evaluate_fresh_staging_readiness(
     payload_summary: Optional[dict[str, Any]] = None
     patch_planner_summary: Optional[dict[str, Any]] = None
     patch_writer_dry_run_summary: Optional[dict[str, Any]] = None
-    if run_downstream_chain and primary:
+    # Phase 6I-32 amendment-1: downstream chain ALSO skipped
+    # when staged_dir is unsafe. The chain reads from
+    # staged_dir; running it against an unsafe staged_dir
+    # could attempt to load production stable files under a
+    # sandbox interpretation.
+    if (
+        run_downstream_chain
+        and primary
+        and not unsafe_staged_dir
+    ):
         adapter_fn = (
             adapter_diagnostic_callable
             or _default_adapter_diagnostic

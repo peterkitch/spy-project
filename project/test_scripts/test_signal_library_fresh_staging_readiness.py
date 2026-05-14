@@ -511,12 +511,30 @@ def test_staged_dir_under_production_stable_yields_state_b(
     tmp_path,
 ):
     bundle = _all_green_kwargs(tmp_path)
-    # Force staged_dir to be UNDER signal_library/data/stable.
+    # Force staged_dir to be EXACTLY the production stable
+    # directory. The Phase 6I-32 amendment-1 guard MUST
+    # short-circuit the sandbox callable BEFORE invocation.
     bad_staged = (
         tmp_path / "signal_library" / "data" / "stable"
     )
     bad_staged.mkdir(parents=True, exist_ok=True)
     bundle["kwargs"]["staged_dir"] = bad_staged
+    # Wrap the sandbox callable in a recorder that fails
+    # the test if it ever gets called.
+    invocation_log: list[Any] = []
+
+    def recording_sandbox(
+        tickers, *, intervals, cache_dir, staged_dir, end_date,
+    ):
+        invocation_log.append((tickers, staged_dir))
+        return _fake_sandbox_builder_all_written(
+            tickers, intervals=intervals,
+            cache_dir=cache_dir, staged_dir=staged_dir,
+            end_date=end_date,
+        )
+    bundle["kwargs"]["sandbox_builder_callable"] = (
+        recording_sandbox
+    )
     report = harness.evaluate_fresh_staging_readiness(
         bundle["tickers"], **bundle["kwargs"],
     )
@@ -527,8 +545,13 @@ def test_staged_dir_under_production_stable_yields_state_b(
         harness.ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE
         in report.issue_codes
     )
-    # And the promotion planner must NOT have been called.
+    # The promotion planner must NOT have been called.
     assert report.promotion_plan_summary is None
+    # The sandbox builder callable must NOT have been called.
+    assert invocation_log == []
+    # sandbox_build_attempted MUST be False because the
+    # outer guard short-circuited before invocation.
+    assert report.sandbox_build_attempted is False
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +766,208 @@ def test_harness_no_projection_calls():
                 f"harness calls forbidden {name!r}() at "
                 f"line {node.lineno}"
             )
+
+
+# ---------------------------------------------------------------------------
+# 15a-15d. Phase 6I-32 amendment-1: robust staged-dir safety boundary
+# ---------------------------------------------------------------------------
+
+
+def _recording_sandbox_factory():
+    """Return ``(recorder_callable, invocation_log_list)``.
+    The recorder fails fast if it ever gets called with a
+    staged_dir that resolves under signal_library/data/stable
+    (defense-in-depth inside the test itself), and records
+    every invocation in the returned list."""
+    invocations: list[Any] = []
+
+    def recording(
+        tickers, *, intervals, cache_dir, staged_dir, end_date,
+    ):
+        invocations.append({
+            "tickers": list(tickers),
+            "staged_dir": str(staged_dir),
+        })
+        # Defense-in-depth: even if the harness fails to
+        # short-circuit, the test's recorder refuses to
+        # cooperate with an unsafe staged_dir.
+        if harness._path_is_under_production_stable(staged_dir):
+            raise AssertionError(
+                "recorder invoked with unsafe staged_dir: "
+                f"{staged_dir!r}",
+            )
+        return _fake_sandbox_builder_all_written(
+            tickers, intervals=intervals,
+            cache_dir=cache_dir, staged_dir=staged_dir,
+            end_date=end_date,
+        )
+    return recording, invocations
+
+
+def test_amendment1_exact_production_stable_dir_skips_sandbox(
+    tmp_path,
+):
+    """When staged_dir == production_stable_dir the sandbox
+    callable MUST NOT be invoked. The state classifier must
+    surface ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE and
+    sandbox_build_attempted must be False."""
+    bundle = _all_green_kwargs(tmp_path)
+    prod_stable = (
+        tmp_path / "signal_library" / "data" / "stable"
+    )
+    prod_stable.mkdir(parents=True, exist_ok=True)
+    bundle["kwargs"]["staged_dir"] = prod_stable
+    bundle["kwargs"]["production_stable_dir"] = prod_stable
+    recorder, log = _recording_sandbox_factory()
+    bundle["kwargs"]["sandbox_builder_callable"] = recorder
+
+    report = harness.evaluate_fresh_staging_readiness(
+        bundle["tickers"], **bundle["kwargs"],
+    )
+    assert (
+        report.state == harness.STATE_STAGED_REBUILD_NOT_READY
+    )
+    assert (
+        harness.ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE
+        in report.issue_codes
+    )
+    assert log == []
+    assert report.sandbox_build_attempted is False
+    assert report.sandbox_build_written == 0
+
+
+def test_amendment1_child_of_production_stable_skips_sandbox(
+    tmp_path,
+):
+    """When staged_dir is a CHILD of production_stable_dir
+    (e.g. signal_library/data/stable/staged_libs) the sandbox
+    callable MUST NOT be invoked. This is the exact case the
+    original suffix-only guard missed."""
+    bundle = _all_green_kwargs(tmp_path)
+    prod_stable = (
+        tmp_path / "signal_library" / "data" / "stable"
+    )
+    prod_stable.mkdir(parents=True, exist_ok=True)
+    bad_staged = prod_stable / "staged_libs"
+    bad_staged.mkdir()
+    bundle["kwargs"]["staged_dir"] = bad_staged
+    bundle["kwargs"]["production_stable_dir"] = prod_stable
+    recorder, log = _recording_sandbox_factory()
+    bundle["kwargs"]["sandbox_builder_callable"] = recorder
+
+    report = harness.evaluate_fresh_staging_readiness(
+        bundle["tickers"], **bundle["kwargs"],
+    )
+    assert (
+        report.state == harness.STATE_STAGED_REBUILD_NOT_READY
+    )
+    assert (
+        harness.ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE
+        in report.issue_codes
+    )
+    assert log == []
+    assert report.sandbox_build_attempted is False
+    # The downstream multi-window K chain MUST also have
+    # been short-circuited because the chain reads from
+    # staged_dir.
+    assert report.adapter_diagnostic_summary is None
+    assert report.payload_builder_summary is None
+    assert report.patch_planner_summary is None
+    assert report.patch_writer_dry_run_summary is None
+
+
+def test_amendment1_child_blocked_even_with_run_snapshot_diff_false(
+    tmp_path,
+):
+    """The path guard MUST fire even when run_snapshot_diff
+    is False -- the snapshot diff would otherwise be the
+    last line of defense, and disabling it must not unlock
+    sandbox calls under unsafe staged dirs."""
+    bundle = _all_green_kwargs(tmp_path)
+    prod_stable = (
+        tmp_path / "signal_library" / "data" / "stable"
+    )
+    prod_stable.mkdir(parents=True, exist_ok=True)
+    bad_staged = prod_stable / "staged_libs"
+    bad_staged.mkdir()
+    bundle["kwargs"]["staged_dir"] = bad_staged
+    bundle["kwargs"]["production_stable_dir"] = prod_stable
+    bundle["kwargs"]["run_snapshot_diff"] = False
+    recorder, log = _recording_sandbox_factory()
+    bundle["kwargs"]["sandbox_builder_callable"] = recorder
+
+    report = harness.evaluate_fresh_staging_readiness(
+        bundle["tickers"], **bundle["kwargs"],
+    )
+    assert (
+        report.state == harness.STATE_STAGED_REBUILD_NOT_READY
+    )
+    assert (
+        harness.ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE
+        in report.issue_codes
+    )
+    assert log == []
+    assert report.sandbox_build_attempted is False
+
+
+def test_amendment1_safe_temp_staged_dir_still_runs_full_chain(
+    tmp_path,
+):
+    """Regression pin: the amendment-1 guard must NOT
+    regress the all-green safe-temp-staged-dir path. A
+    staged_dir under tmp_path that is NOT under production
+    stable must still reach STATE_STAGED_REBUILD_READY and
+    must still invoke the sandbox callable exactly once
+    per ticker."""
+    bundle = _all_green_kwargs(tmp_path)
+    # Safe staged_dir under tmp_path (NOT under
+    # signal_library/data/stable).
+    safe_staged = tmp_path / "safe_temp_staged"
+    safe_staged.mkdir()
+    bundle["kwargs"]["staged_dir"] = safe_staged
+    recorder, log = _recording_sandbox_factory()
+    bundle["kwargs"]["sandbox_builder_callable"] = recorder
+
+    report = harness.evaluate_fresh_staging_readiness(
+        bundle["tickers"], **bundle["kwargs"],
+    )
+    assert (
+        report.state == harness.STATE_STAGED_REBUILD_READY
+    )
+    assert (
+        harness.ISSUE_STAGED_DIR_UNDER_PRODUCTION_STABLE
+        not in report.issue_codes
+    )
+    assert len(log) == 1
+    assert report.sandbox_build_attempted is True
+
+
+def test_amendment1_default_sandbox_builder_refuses_unsafe_dir(
+    tmp_path,
+):
+    """Defense-in-depth: the harness's _default_sandbox_builder
+    helper itself MUST raise ValueError if called with a
+    staged_dir under signal_library/data/stable, regardless
+    of whether the outer harness guard fired. This protects
+    against a future call-path mistake or an out-of-band
+    caller that bypasses evaluate_fresh_staging_readiness."""
+    import pytest as _pt
+    bad_staged = (
+        tmp_path / "signal_library" / "data" / "stable"
+        / "staged_libs"
+    )
+    bad_staged.mkdir(parents=True, exist_ok=True)
+    with _pt.raises(ValueError, match=(
+        "refusing to write sandbox libraries under "
+        "signal_library/data/stable"
+    )):
+        harness._default_sandbox_builder(
+            ["SPY"],
+            intervals=["1d"],
+            cache_dir=tmp_path,
+            staged_dir=bad_staged,
+            end_date=None,
+        )
 
 
 # ---------------------------------------------------------------------------

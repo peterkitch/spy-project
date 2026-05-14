@@ -100,6 +100,11 @@ Every external probe / builder / writer / snapshot helper is reachable through a
 - `PRJCT9_AUTOMATION_WRITE_AUTH` is never read or set by this module.
 - No top-level imports of yfinance / dash / subprocess / spymaster / trafficflow / stackbuilder / onepass / impactsearch / confluence / cross_ticker_confluence / daily_signal_board / daily_board_automation_writer / signal_engine_cache_refresher / confluence_pipeline_runner / daily_board_automation_executor.
 - No raw `pickle.load`. No `.resample()` / `.ffill()` calls.
+- **Staged-dir safety boundary (Phase 6I-32 amendment-1):** the harness hard-stops the sandbox builder, promotion planner, promotion writer dry-run, AND the multi-window K downstream chain when `staged_dir` resolves at OR under the production stable signal-library directory. The helper `_path_is_under_production_stable(candidate, production_stable_dir)` rejects three distinct unsafe shapes:
+  1. `staged_dir` equals `production_stable_dir` (after resolution),
+  2. `staged_dir` is anywhere under `production_stable_dir` (e.g. `signal_library/data/stable/staged_libs`),
+  3. `staged_dir`'s resolved components contain `signal_library/data/stable` as a contiguous ancestor segment regardless of where in the path it sits.
+  In the unsafe-staged-dir state, `sandbox_build_attempted=False`, the sandbox builder callable is NEVER invoked, the promotion planner / writer / downstream chain are all short-circuited, and the state is `STATE_STAGED_REBUILD_NOT_READY` (unless source-not-ready takes precedence). Additionally, the harness's `_default_sandbox_builder` helper itself raises `ValueError` if it ever sees an unsafe `staged_dir` (defense-in-depth against future call-path mistakes or out-of-band callers that bypass `evaluate_fresh_staging_readiness`).
 
 ---
 
@@ -119,7 +124,7 @@ This makes the harness a useful operator readiness screen: it does not gate on s
 
 ---
 
-## 4. Tests added (18 new)
+## 4. Tests added (23 new — 18 original + 5 amendment-1 staged-dir safety)
 
 `project/test_scripts/test_signal_library_fresh_staging_readiness.py` (new, ~770 lines) pins:
 
@@ -140,6 +145,11 @@ This makes the harness a useful operator readiness screen: it does not gate on s
 | 16 | Harness has no forbidden top-level imports (yfinance / dash / subprocess / live engines / writers / refreshers / pipeline runner) | strictly bounded |
 | 17 | Harness has no `.resample()` / `.ffill()` calls | no-projection scope |
 | 18 | Harness AST has no `write=True` keyword arg anywhere | belt-and-braces dry-run guard |
+| 19 | `staged_dir == production_stable_dir` → sandbox callable NOT invoked, `sandbox_build_attempted=False` | amendment-1 exact-match path guard |
+| 20 | `staged_dir` is a CHILD of production_stable_dir (the original bug case) → sandbox / promotion / downstream chain ALL short-circuited | amendment-1 ancestor path guard |
+| 21 | Child path still blocked when `run_snapshot_diff=False` | amendment-1 guard fires regardless of snapshot policy |
+| 22 | Safe temp `staged_dir` regression: sandbox still invoked, state still `STATE_STAGED_REBUILD_READY` | amendment-1 guard does NOT regress the safe path |
+| 23 | `_default_sandbox_builder` raises `ValueError` on unsafe `staged_dir` | amendment-1 defense-in-depth helper |
 
 The repo-wide B12 raw-pickle static regression guard continues to pass without an allowlist entry.
 
@@ -157,16 +167,17 @@ Main HEAD (at branch creation): c73e20e (Phase 6I-31, PR #248)
 ## 6. Test results
 
 ```
-Phase 6I-32 harness tests          :  18 passed
+Phase 6I-32 harness tests          :  23 passed (18 original + 5 amendment-1)
 Phase 6I-31 promotion tests        :  26 passed
 Phase 6I-30 builder tests          :  10 passed
 Adapter / diagnostic / core /
   builder / planner / writer /
   gap audit / static regression    : 240 passed
                                    -----
-Focused 11-way sweep               : 294 passed in 11.28 s
+Focused 11-way sweep               : 299 passed in 11.31 s
 
-Full repo regression               : 1,881 passed in 5:48 (0 failures)
+Full repo regression (at original
+  PR commit, pre-amendment-1)      : 1,881 passed in 5:48 (0 failures)
 
 py_compile                         : clean across all changed Python files
 git diff --check                   : clean
