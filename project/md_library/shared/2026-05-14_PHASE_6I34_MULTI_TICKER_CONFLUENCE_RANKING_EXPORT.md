@@ -122,33 +122,61 @@ Sorted DESCENDING by:
 
 ## 5. Blocked-row semantics
 
-A row is **blocked** (`rank_eligible=False`) when ANY of the following are true. Each maps to a stable `ranking_blocked_reason` code:
+A row is **blocked** (`rank_eligible=False`) when ANY of the following are true. Each maps to a stable `ranking_blocked_reason` code; the runtime taxonomy `ALL_RANKING_BLOCKED_REASONS` has exactly **9** stable codes (pinned by `test_all_ranking_blocked_reasons_taxonomy_size`):
 
 | Reason code | Cause |
 |---|---|
 | `artifact_missing` | No Confluence artifact JSON exists at the expected per-ticker path |
 | `artifact_unreadable` | File exists but cannot be parsed as JSON / is not a dict |
-| `invalid_payload_shape` | Phase 6I-20 fields present but contents fail the canonical 60-cell schema |
+| `invalid_payload_shape` | Phase 6I-20 fields present but contents fail the strict per-cell or alignment-entry validators (see § 5a below) |
 | `missing_per_window_k_metrics` | Field absent |
 | `missing_build_wide_window_alignment` | Field absent OR one of the 5 canonical windows missing |
 | `missing_multiwindow_payload_metadata` | Field absent |
-| `incomplete_60_cell_grid` | `per_window_k_metrics` has < 60 unique (K, window) cells, OR contains a cell with K / window outside the canonical sets |
+| `incomplete_60_cell_grid` | `per_window_k_metrics` is missing one or more canonical (K, window) cells, OR contains a duplicate canonical (K, window) cell |
 | `daily_only` | Artifact has the Phase 6C baseline shape (`timeframes` list + `summary`) but no Phase 6I-20 multi-window fields — legitimate but predates the multi-window contract |
-| `projected_or_bridge_only` | reserved for a future field; not currently emitted |
+| `projected_or_bridge_only` | Reserved for a future projection-source field; not currently emitted by the classifier. Present in the stable taxonomy so a future phase can populate it without breaking downstream consumers. |
 
 **No fabrication.** Missing data surfaces as a blocked row with an honest reason. The module NEVER invents 60-cell data, NEVER treats daily-only as multi-window, NEVER treats projected / bridge-only as true multi-window.
+
+### 5a. Strict Phase 6I-20 validation (Phase 6I-34 amendment-1)
+
+The Phase 6I-34 amendment-1 tightened the per-cell and per-alignment-entry validators so a ticker reaches `rank_eligible=True` only when its artifact truly satisfies the Phase 6I-20 future-artifact shape.
+
+**`per_window_k_metrics` strict rules:**
+
+- Must be a `list` / `tuple` of mappings.
+- Every canonical `(K, window)` pair for K=1..12 × window in (1d/1wk/1mo/3mo/1y) must exist **exactly once**.
+- **Duplicate canonical (K, window) cells are rejected** — the artifact cannot carry two different evaluations for the same cell. Surfaces as `incomplete_60_cell_grid`.
+- Non-canonical extras (e.g. a K=13 cell or a `6mo` window) are **tolerated silently** as diagnostic extras — they do NOT substitute for missing canonical cells.
+- Each canonical cell must include all five Phase 6I-20 required fields with the correct type:
+  - `K` — int (already canonical-checked); bool rejected.
+  - `window` — str (already canonical-checked).
+  - `total_capture_pct` — int|float, NOT bool, NOT None, key MUST be present.
+  - `sharpe_ratio` — key MUST be present; value MAY be `None` (engine documents this for undefined Sharpe) OR int|float (NOT bool).
+  - `trigger_days` — int, NOT bool, NOT None, key MUST be present.
+- Any per-cell type/key violation surfaces as `invalid_payload_shape`.
+
+**`build_wide_window_alignment` strict rules:**
+
+- Must be a `Mapping`.
+- All 5 canonical windows must be present as keys.
+- Each canonical window entry must be a `Mapping` carrying:
+  - `all_members_firing` — strict `bool` (int rejected, even truthy/falsy int).
+  - `firing_member_count` — strict `int` (NOT bool).
+  - `total_member_count` — strict `int` (NOT bool).
+- Any per-entry type/key violation surfaces as `invalid_payload_shape`.
 
 ---
 
 ## 6. Chart-readiness semantics
 
-For each ticker the module emits a conservative chart-readiness verdict:
+For each ticker the module emits a conservative chart-readiness verdict. **Phase 6I-34 amendment-1: `daily.dates` / `daily.date_index` alone is NOT chart-ready.** The website needs at least one chartable value per date.
 
 | `chart_ready_source` | When it fires |
 |---|---|
-| `confluence_artifact` | Artifact carries `chart_rows` list OR `daily.dates` / `daily.date_index` is a non-empty list |
+| `confluence_artifact` | Artifact carries a non-empty `chart_rows` list-of-mappings each with `date` + at least one chartable value field; OR a non-empty `daily.dates`/`daily.date_index` axis WITH at least one chartable value field (`close` / `target_close` / `Close` / `cumulative_capture_pct` / `signals` / `primary_signals`) |
 | `signal_engine_cache` | A `<TICKER>_precomputed_results.pkl` exists in the supplied `cache_dir` (file existence only — the module does NOT read the PKL) |
-| `unavailable` | Neither of the above; `chart_blocker="no_chart_data_source"` is recorded |
+| `unavailable` | Neither of the above; `chart_blocker` is either `"insufficient_chart_fields"` (artifact has a date axis but no value column) or `"no_chart_data_source"` (no usable artifact or cache source) |
 
 When `chart_ready_source=signal_engine_cache`, `chart_row_count=null` because the module does not crack the cache PKL (that needs the central provenance loader, which is the future website reader's job, not this export).
 
@@ -170,9 +198,9 @@ The StackBuilder discovery is intentionally **LAZY**: it lists directory names u
 
 ---
 
-## 8. Tests added (19 new)
+## 8. Tests added (36 new — 19 original + 17 amendment-1)
 
-`project/test_scripts/test_confluence_multiwindow_ranking_export.py` (new, ~700 lines) pins:
+`project/test_scripts/test_confluence_multiwindow_ranking_export.py` pins:
 
 | # | Test | Pins |
 |---|---|---|
@@ -188,6 +216,23 @@ The StackBuilder discovery is intentionally **LAZY**: it lists directory names u
 | 10 | `--all-artifacts` discovery handles unreadable / no-artifact dirs safely | resilience |
 | 11-14 | CLI rc=0 / rc=2 (missing universe / unknown flag / empty universe) | operator-surface sanity |
 | 15-19 | Static guards: no raw `pickle.load`; no forbidden top-level imports (yfinance / dash / subprocess / writers / refreshers / pipeline runners / live engines); no `.resample()` / `.ffill()`; AST has no `write=True` kwarg; no on-disk `write_text` / `write_bytes` / `json.dump` call sites | bounded read-only contract |
+| 20 | Cell missing `total_capture_pct` → blocked with `invalid_payload_shape` | amendment-1 strict cell validation |
+| 21 | Cell missing `sharpe_ratio` KEY → blocked (None VALUE accepted; missing KEY rejected) | amendment-1 key-vs-value distinction |
+| 22 | Cell missing `trigger_days` → blocked with `invalid_payload_shape` | amendment-1 strict cell validation |
+| 23 | `total_capture_pct=True` (bool) → blocked | amendment-1 bool rejection |
+| 24 | `sharpe_ratio=False` (bool) → blocked | amendment-1 bool rejection |
+| 25 | `trigger_days=True` (bool) → blocked | amendment-1 bool rejection |
+| 26 | `sharpe_ratio=None` is accepted (engine documents this) | amendment-1 engine-contract preservation |
+| 27 | Alignment entry missing `firing_member_count` → blocked | amendment-1 strict alignment validation |
+| 28 | Alignment `firing_member_count=True` (bool) → blocked | amendment-1 bool rejection |
+| 29 | Alignment `all_members_firing=1` (int, not bool) → blocked | amendment-1 strict bool check |
+| 30 | Duplicate canonical (K, window) cell → blocked with `incomplete_60_cell_grid` | amendment-1 duplicate rejection |
+| 31 | 60 canonical + non-canonical extra → ELIGIBLE | amendment-1 extras tolerated |
+| 32 | 59 canonical + non-canonical extra → BLOCKED (extras don't substitute) | amendment-1 strict substitution rule |
+| 33 | `daily.dates` alone without value field → chart-unavailable with `insufficient_chart_fields` | amendment-1 chart-readiness honesty |
+| 34 | `daily.dates` + `close` → chart-ready | amendment-1 chart-readiness happy path |
+| 35 | `chart_rows` missing value field → chart-unavailable | amendment-1 chart-rows strict shape |
+| 36 | `ALL_RANKING_BLOCKED_REASONS` has exactly **9** entries (incl. `projected_or_bridge_only`) | amendment-1 doc / runtime consistency pin |
 
 The repo-wide B12 raw-pickle static regression guard continues to pass without an allowlist entry.
 
@@ -196,20 +241,21 @@ The repo-wide B12 raw-pickle static regression guard continues to pass without a
 ## 9. Test results
 
 ```
-Phase 6I-34 ranking-export tests   :  19 passed
-Phase 6I-33 source-readiness tests :  13 passed
-Phase 6I-32 harness tests          :  23 passed
-Phase 6I-31 promotion tests        :  26 passed
-Phase 6I-30 builder tests          :  10 passed
-Adapter / diagnostic / core /
-  builder / planner / writer /
-  gap audit / static regression    : 240 passed
-                                   -----
-Focused 13-way sweep               : 331 passed in 11.95 s
-
-py_compile                         : clean
-git diff --check                   : clean
+Phase 6I-34 ranking-export tests   :  36 passed (19 original + 17 amendment-1)
+                                       (original 19 ran at PR open;
+                                        focused-suite re-run after
+                                        amendment-1 below)
 ```
+
+The amendment-1 commit re-runs only the
+`test_confluence_multiwindow_ranking_export.py` suite — the
+public surface (input fixture builders, blocked-reason
+taxonomy, sort key, CLI shape) is unchanged from the
+original 19 tests, so a full focused 13-way sweep is not
+required again. Original PR-open focused 13-way: 331 passed.
+
+py_compile: clean (module + tests).
+git diff --check: clean.
 
 ---
 

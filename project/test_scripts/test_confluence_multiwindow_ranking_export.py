@@ -662,6 +662,393 @@ def test_module_ast_has_no_write_true_kwarg():
 
 
 # ---------------------------------------------------------------------------
+# 17. Phase 6I-34 amendment-1: strict Phase 6I-20 cell validation
+# ---------------------------------------------------------------------------
+
+
+def _strip_required_field_in_one_cell(
+    artifact: dict[str, Any], field_name: str,
+) -> dict[str, Any]:
+    """Mutate the artifact's first canonical cell by removing
+    ``field_name``."""
+    artifact["per_window_k_metrics"][0].pop(field_name, None)
+    return artifact
+
+
+def test_cell_missing_total_capture_pct_yields_blocked(tmp_path):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    _strip_required_field_in_one_cell(
+        artifact, "total_capture_pct",
+    )
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    row = report.blocked_rows[0]
+    assert (
+        row.ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_cell_missing_sharpe_ratio_yields_blocked(tmp_path):
+    """``sharpe_ratio`` is allowed to be None (engine emits
+    None on undefined Sharpe). It must NOT be missing
+    entirely. This pins the 6I-23 contract."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    _strip_required_field_in_one_cell(
+        artifact, "sharpe_ratio",
+    )
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    row = report.blocked_rows[0]
+    assert (
+        row.ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_cell_missing_trigger_days_yields_blocked(tmp_path):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    _strip_required_field_in_one_cell(artifact, "trigger_days")
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    row = report.blocked_rows[0]
+    assert (
+        row.ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_cell_total_capture_pct_bool_yields_blocked(tmp_path):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    artifact["per_window_k_metrics"][0]["total_capture_pct"] = True
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_cell_sharpe_ratio_bool_yields_blocked(tmp_path):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    artifact["per_window_k_metrics"][0]["sharpe_ratio"] = False
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_cell_trigger_days_bool_yields_blocked(tmp_path):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    artifact["per_window_k_metrics"][0]["trigger_days"] = True
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_cell_sharpe_ratio_none_is_accepted(tmp_path):
+    """The engine emits None on undefined Sharpe; the
+    validator MUST accept None on this field while still
+    rejecting missing-key / bool."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    for cell in artifact["per_window_k_metrics"]:
+        cell["sharpe_ratio"] = None
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 1
+    assert report.ranking_rows[0].rank_eligible is True
+
+
+# ---------------------------------------------------------------------------
+# 18. Strict build_wide_window_alignment validation
+# ---------------------------------------------------------------------------
+
+
+def test_alignment_entry_missing_required_field_yields_blocked(
+    tmp_path,
+):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    # Strip firing_member_count from one window entry.
+    del artifact["build_wide_window_alignment"]["1d"][
+        "firing_member_count"
+    ]
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_alignment_firing_member_count_bool_yields_blocked(
+    tmp_path,
+):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    artifact["build_wide_window_alignment"]["1d"][
+        "firing_member_count"
+    ] = True
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+def test_alignment_all_members_firing_not_bool_yields_blocked(
+    tmp_path,
+):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    artifact["build_wide_window_alignment"]["1d"][
+        "all_members_firing"
+    ] = 1  # int, not bool
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
+    )
+
+
+# ---------------------------------------------------------------------------
+# 19. Duplicate / extra canonical-cell handling
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_canonical_cell_yields_blocked(tmp_path):
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    # Duplicate the first cell.
+    cell0 = dict(artifact["per_window_k_metrics"][0])
+    artifact["per_window_k_metrics"].append(cell0)
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INCOMPLETE_60_CELL_GRID
+    )
+
+
+def test_60_canonical_plus_noncanonical_extra_is_eligible(
+    tmp_path,
+):
+    """A well-formed artifact MAY carry diagnostic extras
+    (e.g. a K=13 cell or an experimental 6mo window) on top
+    of the canonical 60. The validator must tolerate these
+    as silently-skipped extras, not reject them."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    # Append a non-canonical extra cell (K=13 outside the
+    # 1..12 canonical set).
+    artifact["per_window_k_metrics"].append({
+        "K": 13,
+        "window": "1d",
+        "total_capture_pct": 2.0,
+        "sharpe_ratio": 0.2,
+        "trigger_days": 1,
+        "latest_combined_signal": "Buy",
+    })
+    # And a non-canonical window extra.
+    artifact["per_window_k_metrics"].append({
+        "K": 1,
+        "window": "6mo",
+        "total_capture_pct": 3.0,
+        "sharpe_ratio": 0.3,
+        "trigger_days": 1,
+        "latest_combined_signal": "Buy",
+    })
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 1
+    assert report.ranking_rows[0].rank_eligible is True
+
+
+def test_59_canonical_plus_noncanonical_extra_is_blocked(
+    tmp_path,
+):
+    """Non-canonical extras do NOT substitute for missing
+    canonical cells. 59 + 1 extra must still block."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    # Drop the last canonical cell.
+    artifact["per_window_k_metrics"] = (
+        artifact["per_window_k_metrics"][:-1]
+    )
+    # Add a non-canonical extra (K=99).
+    artifact["per_window_k_metrics"].append({
+        "K": 99,
+        "window": "1d",
+        "total_capture_pct": 2.0,
+        "sharpe_ratio": 0.2,
+        "trigger_days": 1,
+        "latest_combined_signal": "Buy",
+    })
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"], artifact_root=art_root,
+    )
+    assert report.eligible_count == 0
+    assert (
+        report.blocked_rows[0].ranking_blocked_reason
+        == cmre.RANKING_BLOCKED_REASON_INCOMPLETE_60_CELL_GRID
+    )
+
+
+# ---------------------------------------------------------------------------
+# 20. Chart-readiness: daily.dates alone is NOT chart-ready
+# ---------------------------------------------------------------------------
+
+
+def test_chart_ready_false_when_only_dates_no_value_field(
+    tmp_path,
+):
+    """Phase 6I-34 amendment-1: a bare ``daily.dates`` axis
+    (no chartable value field) MUST NOT classify as
+    chart-ready. The website needs at least one value per
+    date."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    # daily already has 'dates' from _full_artifact but no
+    # chartable value field. Confirm the fixture does NOT
+    # carry close / signals.
+    daily = artifact["daily"]
+    assert "close" not in daily and "signals" not in daily
+    _write_artifact_file(art_root, "SPY", artifact)
+    # cache_dir=None so the signal-engine-cache fallback
+    # cannot fire.
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    assert row.chart_ready_available is False
+    assert (
+        row.chart_ready_source
+        == cmre.CHART_READY_SOURCE_UNAVAILABLE
+    )
+    assert row.chart_blocker == "insufficient_chart_fields"
+
+
+def test_chart_ready_true_when_daily_has_dates_and_close(
+    tmp_path,
+):
+    """Date axis + a chartable value column (close) IS
+    chart-ready."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(target_ticker="SPY")
+    artifact["daily"]["close"] = [
+        100.0 + i for i in range(
+            len(artifact["daily"]["dates"]),
+        )
+    ]
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    assert row.chart_ready_available is True
+    assert (
+        row.chart_ready_source
+        == cmre.CHART_READY_SOURCE_CONFLUENCE_ARTIFACT
+    )
+    assert row.chart_row_count == len(
+        artifact["daily"]["dates"],
+    )
+
+
+def test_chart_rows_missing_value_field_rejected(tmp_path):
+    """``chart_rows`` MUST be a list of mappings each with at
+    least ``date`` + one chartable value field. A list with
+    only ``date`` keys is rejected as chart-unready."""
+    art_root = tmp_path / "research_artifacts"
+    artifact = _full_artifact(
+        target_ticker="SPY",
+        chart_rows=[
+            {"date": "2026-05-13"},
+            {"date": "2026-05-14"},
+        ],
+    )
+    _write_artifact_file(art_root, "SPY", artifact)
+    report = cmre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    assert row.chart_ready_available is False
+
+
+# ---------------------------------------------------------------------------
+# 21. Doc / runtime reason-code count consistency
+# ---------------------------------------------------------------------------
+
+
+def test_all_ranking_blocked_reasons_taxonomy_size():
+    """Pins the documented runtime taxonomy size. The
+    evidence doc must list exactly this many reason codes."""
+    assert len(cmre.ALL_RANKING_BLOCKED_REASONS) == 9
+    # Plus a stable spot-check that
+    # projected_or_bridge_only is present (reserved future
+    # field; not currently emitted by the classifier).
+    assert (
+        cmre.RANKING_BLOCKED_REASON_PROJECTED_OR_BRIDGE_ONLY
+        in cmre.ALL_RANKING_BLOCKED_REASONS
+    )
+
+
+# ---------------------------------------------------------------------------
 # 16. Static guard: no on-disk write call sites
 # ---------------------------------------------------------------------------
 

@@ -431,6 +431,78 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _cell_required_fields_ok(
+    cell: Mapping[str, Any],
+    *,
+    K_int: int,
+    window_str: str,
+) -> bool:
+    """Validate the five Phase 6I-20 required fields on a
+    single canonical ``per_window_k_metrics`` cell.
+
+    The cell mapping is checked directly (not pre-coerced)
+    because the validator must distinguish "key absent" from
+    "key present with value None" for ``sharpe_ratio`` — the
+    engine documents that ``sharpe_ratio`` value may be
+    ``None`` when Sharpe is undefined (e.g. zero trade
+    sample), but the KEY itself must still be present per
+    the Phase 6I-23 builder contract.
+
+    Required fields (and their type contract):
+
+      * ``K``  -- int (canonical 1..12; already coerced +
+        canonical-checked upstream of this helper). Bool is
+        rejected.
+      * ``window`` -- str (canonical 1d/1wk/1mo/3mo/1y;
+        already canonical-checked upstream).
+      * ``total_capture_pct`` -- int|float, NOT bool. Must
+        be present and not None.
+      * ``sharpe_ratio`` -- key MUST be present. Value may
+        be None OR int|float (NOT bool).
+      * ``trigger_days`` -- key MUST be present. Value
+        must be int (NOT bool, NOT None).
+
+    Returns ``True`` iff every required field is present
+    AND well-typed.
+    """
+    if not isinstance(K_int, int) or isinstance(K_int, bool):
+        return False
+    if not isinstance(window_str, str):
+        return False
+
+    if "total_capture_pct" not in cell:
+        return False
+    cap = cell["total_capture_pct"]
+    if (
+        cap is None
+        or isinstance(cap, bool)
+        or not isinstance(cap, (int, float))
+    ):
+        return False
+
+    if "sharpe_ratio" not in cell:
+        return False
+    sharpe = cell["sharpe_ratio"]
+    if sharpe is not None:
+        if (
+            isinstance(sharpe, bool)
+            or not isinstance(sharpe, (int, float))
+        ):
+            return False
+
+    if "trigger_days" not in cell:
+        return False
+    trig = cell["trigger_days"]
+    if (
+        trig is None
+        or isinstance(trig, bool)
+        or not isinstance(trig, int)
+    ):
+        return False
+
+    return True
+
+
 def _classify_artifact_data_status(
     artifact: Mapping[str, Any],
 ) -> tuple[str, list[str]]:
@@ -484,21 +556,22 @@ def _classify_artifact_data_status(
     if pwk is None or bwwa is None or meta is None:
         return DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues
 
-    # Validate per_window_k_metrics is a list-of-dicts with
-    # the canonical shape.
+    # ----- per_window_k_metrics: Phase 6I-20 strict validation -----
+    # Phase 6I-34 amendment-1: validate every CANONICAL (K, window)
+    # pair exists exactly once with all five required Phase 6I-20
+    # fields and the correct types. Non-canonical extras are
+    # tolerated (skipped silently); duplicate canonical pairs are
+    # rejected as ``incomplete_60_cell_grid`` because the artifact
+    # cannot carry two different evaluations for the same cell.
     if not isinstance(pwk, (list, tuple)):
         issues.append(
             RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE,
         )
         return DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues
-    if len(pwk) < DEFAULT_K_CELL_COUNT:
-        issues.append(
-            RANKING_BLOCKED_REASON_INCOMPLETE_60_CELL_GRID,
-        )
-        return DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues
-    seen_cells: set[tuple[int, str]] = set()
     canonical_k_set = set(CANONICAL_K_VALUES)
     canonical_w_set = set(CANONICAL_WINDOWS)
+    seen_canonical: set[tuple[int, str]] = set()
+    duplicate_canonical = False
     for cell in pwk:
         if not isinstance(cell, Mapping):
             issues.append(
@@ -507,39 +580,65 @@ def _classify_artifact_data_status(
             return (
                 DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues,
             )
-        K = cell.get("K")
-        w = cell.get("window")
-        try:
-            K_int = int(K)
-        except Exception:
+        K_raw = cell.get("K")
+        w_raw = cell.get("window")
+        # K must be int-coercible AND not bool. Bools subclass
+        # int in Python, so an explicit reject is required.
+        if isinstance(K_raw, bool):
             issues.append(
                 RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE,
             )
             return (
                 DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues,
             )
-        w_str = str(w) if w is not None else None
+        try:
+            K_int = int(K_raw)
+        except Exception:
+            # Non-int K -> non-canonical extra; skip silently.
+            continue
+        # window must be a string.
+        if not isinstance(w_raw, str):
+            continue
+        # Non-canonical extras are silently skipped so a
+        # well-formed artifact can carry diagnostic extras
+        # alongside the canonical 60.
         if (
             K_int not in canonical_k_set
-            or w_str not in canonical_w_set
+            or w_raw not in canonical_w_set
+        ):
+            continue
+        # Canonical cell -- the five Phase 6I-20 required
+        # fields must be present and well-typed.
+        if not _cell_required_fields_ok(
+            cell, K_int=K_int, window_str=w_raw,
         ):
             issues.append(
-                (
-                    RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
-                ),
+                RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE,
             )
             return (
                 DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues,
             )
-        seen_cells.add((K_int, w_str))
-    if len(seen_cells) < DEFAULT_K_CELL_COUNT:
+        key = (K_int, w_raw)
+        if key in seen_canonical:
+            duplicate_canonical = True
+            # Continue scanning so any further malformed cell
+            # surfaces with the strongest (invalid_payload_shape)
+            # reason instead of the milder duplicate one.
+        else:
+            seen_canonical.add(key)
+
+    if duplicate_canonical:
+        issues.append(
+            RANKING_BLOCKED_REASON_INCOMPLETE_60_CELL_GRID,
+        )
+        return DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues
+    if len(seen_canonical) < DEFAULT_K_CELL_COUNT:
         issues.append(
             RANKING_BLOCKED_REASON_INCOMPLETE_60_CELL_GRID,
         )
         return DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues
 
-    # build_wide_window_alignment must carry all 5 canonical
-    # windows.
+    # ----- build_wide_window_alignment: strict per-window validation -----
     if not isinstance(bwwa, Mapping):
         issues.append(
             RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE,
@@ -555,6 +654,31 @@ def _classify_artifact_data_status(
             ),
         )
         return DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues
+    for w in CANONICAL_WINDOWS:
+        entry = bwwa.get(w)
+        if not isinstance(entry, Mapping):
+            issues.append(
+                RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE,
+            )
+            return (
+                DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues,
+            )
+        all_firing = entry.get("all_members_firing")
+        firing_n = entry.get("firing_member_count")
+        total_n = entry.get("total_member_count")
+        if (
+            not isinstance(all_firing, bool)
+            or isinstance(firing_n, bool)
+            or not isinstance(firing_n, int)
+            or isinstance(total_n, bool)
+            or not isinstance(total_n, int)
+        ):
+            issues.append(
+                RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE,
+            )
+            return (
+                DATA_STATUS_INCOMPLETE_MULTIWINDOW, issues,
+            )
 
     return DATA_STATUS_FULL_60_CELL, issues
 
@@ -740,6 +864,38 @@ def _resolve_freshness_status(
 # ---------------------------------------------------------------------------
 
 
+_CHART_VALUE_FIELDS: tuple[str, ...] = (
+    "close",
+    "target_close",
+    "Close",
+    "cumulative_capture_pct",
+    "signals",
+    "primary_signals",
+)
+
+
+def _chart_rows_are_valid(
+    chart_rows: Any,
+) -> Optional[int]:
+    """Return the row count when ``chart_rows`` is a non-empty
+    list of mappings each carrying at least a ``date`` field
+    AND one chartable value field (close / target_close /
+    Close / cumulative_capture_pct / signals / primary_signals).
+    Returns ``None`` otherwise."""
+    if not isinstance(chart_rows, (list, tuple)) or not chart_rows:
+        return None
+    for row in chart_rows:
+        if not isinstance(row, Mapping):
+            return None
+        if "date" not in row:
+            return None
+        if not any(
+            field in row for field in _CHART_VALUE_FIELDS
+        ):
+            return None
+    return len(chart_rows)
+
+
 def _default_chart_readiness(
     ticker: str,
     artifact: Optional[Mapping[str, Any]],
@@ -748,41 +904,67 @@ def _default_chart_readiness(
 ) -> dict[str, Any]:
     """Conservative chart-readiness verdict.
 
-    Checks (in order):
+    Phase 6I-34 amendment-1: ``daily.dates`` / ``daily.date_index``
+    alone is NOT chart-ready. The website needs at least one
+    chartable VALUE per date (close / target_close / Close /
+    cumulative_capture_pct / signals / primary_signals).
+    A bare date axis surfaces as ``unavailable`` with
+    ``chart_blocker="insufficient_chart_fields"``.
 
-      1. If the artifact carries a ``chart_rows`` list (the
-         documented field the future website reader will
-         consume), return source=confluence_artifact +
-         row_count.
-      2. Else if the artifact carries a non-empty ``daily``
-         dict with ``dates`` / ``date_index``, return
-         source=confluence_artifact + row_count from the
-         dates length.
-      3. Else if ``cache_dir`` is provided AND a
-         ``<TICKER>_precomputed_results.pkl`` exists, return
-         source=signal_engine_cache with row_count=None
-         (the module does NOT crack open the cache PKL --
-         that requires the provenance loader; the future
-         website reader is expected to do that).
-      4. Else return source=unavailable with a stable
-         ``chart_blocker`` string.
+    Source resolution order:
+
+      1. Artifact ``chart_rows`` -- only when it is a non-
+         empty list of mappings each carrying at least a
+         ``date`` plus one chartable value field. Returns
+         ``chart_ready_source=confluence_artifact`` and
+         ``chart_row_count=len(chart_rows)``.
+      2. Artifact ``daily`` block -- only when it carries
+         BOTH a non-empty date axis (``dates`` or
+         ``date_index``) AND at least one chartable value
+         field. Returns
+         ``chart_ready_source=confluence_artifact`` and
+         ``chart_row_count=len(dates)``.
+      3. Cache fallback -- when ``cache_dir`` is provided AND
+         ``<cache_dir>/<TICKER>_precomputed_results.pkl``
+         exists, returns
+         ``chart_ready_source=signal_engine_cache`` and
+         ``chart_row_count=None`` (the module does NOT open
+         the cache PKL -- that needs the central provenance
+         loader, which is the future website reader's job).
+      4. Otherwise unavailable. The ``chart_blocker`` is
+         ``"insufficient_chart_fields"`` when the artifact
+         carries a date axis but no value column, else
+         ``"no_chart_data_source"``.
     """
+    has_date_axis_but_no_value = False
     if isinstance(artifact, Mapping):
         chart_rows = artifact.get("chart_rows")
-        if isinstance(chart_rows, (list, tuple)) and chart_rows:
+        chart_rows_len = _chart_rows_are_valid(chart_rows)
+        if chart_rows_len is not None:
             return {
                 "chart_ready_available": True,
                 "chart_ready_source": (
                     CHART_READY_SOURCE_CONFLUENCE_ARTIFACT
                 ),
-                "chart_row_count": len(chart_rows),
+                "chart_row_count": chart_rows_len,
                 "chart_blocker": None,
             }
+
         daily = artifact.get("daily")
         if isinstance(daily, Mapping):
+            dates: Optional[Sequence[Any]] = None
             for key in ("dates", "date_index"):
-                dates = daily.get(key)
-                if isinstance(dates, (list, tuple)) and dates:
+                d = daily.get(key)
+                if isinstance(d, (list, tuple)) and d:
+                    dates = d
+                    break
+            if dates is not None:
+                has_value_field = any(
+                    field in daily
+                    and daily[field] is not None
+                    for field in _CHART_VALUE_FIELDS
+                )
+                if has_value_field:
                     return {
                         "chart_ready_available": True,
                         "chart_ready_source": (
@@ -791,6 +973,11 @@ def _default_chart_readiness(
                         "chart_row_count": len(dates),
                         "chart_blocker": None,
                     }
+                # Date axis present but no chartable value
+                # column -- defer to cache fallback but
+                # remember the more specific blocker.
+                has_date_axis_but_no_value = True
+
     if cache_dir is not None:
         cache_path = Path(cache_dir) / (
             f"{ticker}_precomputed_results.pkl"
@@ -808,7 +995,11 @@ def _default_chart_readiness(
         "chart_ready_available": False,
         "chart_ready_source": CHART_READY_SOURCE_UNAVAILABLE,
         "chart_row_count": None,
-        "chart_blocker": "no_chart_data_source",
+        "chart_blocker": (
+            "insufficient_chart_fields"
+            if has_date_axis_but_no_value
+            else "no_chart_data_source"
+        ),
     }
 
 
