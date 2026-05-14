@@ -281,6 +281,12 @@ class PerTickerRankingRow:
         dict[str, Any]
     ] = None
 
+    # Phase 6I-39: primary build summary for the
+    # one-row-per-ticker website display. Eligible rows
+    # carry the primary-build dict; blocked rows carry
+    # None (no fabrication).
+    primary_build_summary: Optional[dict[str, Any]] = None
+
 
 @dataclass
 class MultiTickerRankingExportReport:
@@ -354,6 +360,13 @@ class MultiTickerRankingExportReport:
                     dict(r.current_build_signal_summary)
                     if r.current_build_signal_summary
                     is not None
+                    else None
+                ),
+                # Phase 6I-39 one-row-per-ticker primary
+                # build summary.
+                "primary_build_summary": (
+                    dict(r.primary_build_summary)
+                    if r.primary_build_summary is not None
                     else None
                 ),
             }
@@ -820,6 +833,51 @@ def _aggregate_build_wide_window_alignment(
 _CURRENT_SIGNAL_BUY = "Buy"
 _CURRENT_SIGNAL_SHORT = "Short"
 _CURRENT_SIGNAL_NONE = "None"
+
+
+# Phase 6I-39: one-row-per-ticker display contract.
+# A renderer reading the Phase 6I-34 / 6I-35 / 6I-36 chain
+# MUST display each ticker as exactly one row in the
+# ranking board, regardless of how many K builds it has
+# active. The "primary build" is chosen by the
+# ``_build_primary_build_summary`` selector below; other
+# active K builds are exposed via ``other_active_k_builds``
+# on the same single row's payload.
+DISPLAY_ROW_CARDINALITY: str = "one_row_per_ticker"
+
+
+# Selection tiers for the Phase 6I-39 primary build.
+PRIMARY_BUILD_TIER_SAME_K_ALL_SAME_DIR = (
+    "same_k_all_windows_same_direction"
+)
+PRIMARY_BUILD_TIER_SAME_K_ALL_MIXED_DIR = (
+    "same_k_all_windows_mixed_direction"
+)
+PRIMARY_BUILD_TIER_STRONGEST_CURRENT_CELL = (
+    "strongest_current_cell"
+)
+PRIMARY_BUILD_TIER_NONE = "none"
+
+ALL_PRIMARY_BUILD_TIERS: tuple[str, ...] = (
+    PRIMARY_BUILD_TIER_SAME_K_ALL_SAME_DIR,
+    PRIMARY_BUILD_TIER_SAME_K_ALL_MIXED_DIR,
+    PRIMARY_BUILD_TIER_STRONGEST_CURRENT_CELL,
+    PRIMARY_BUILD_TIER_NONE,
+)
+
+# Stable explanation strings.
+PRIMARY_BUILD_EXPLANATION_SAME_K_ALL_SAME_DIR = (
+    "all_windows_same_direction"
+)
+PRIMARY_BUILD_EXPLANATION_SAME_K_ALL_MIXED_DIR = (
+    "all_windows_mixed_direction"
+)
+PRIMARY_BUILD_EXPLANATION_SINGLE_CELL_FALLBACK = (
+    "single_cell_fallback"
+)
+PRIMARY_BUILD_EXPLANATION_NO_CURRENT_SIGNAL = (
+    "no_current_signal"
+)
 
 
 def _cell_alignment_ratio(
@@ -1328,6 +1386,482 @@ def _build_current_signal_summary(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 6I-39: primary build selector (one-row-per-ticker)
+# ---------------------------------------------------------------------------
+
+
+def _empty_primary_build_summary() -> dict[str, Any]:
+    """Return the no-signal primary build payload."""
+    return {
+        "primary_build_available": False,
+        "selection_tier": PRIMARY_BUILD_TIER_NONE,
+        "K": None,
+        "signal_direction": None,
+        "windows_signaling_count": 0,
+        "windows_signaling": [],
+        "buy_window_count": 0,
+        "short_window_count": 0,
+        "all_members_aligned_window_count": 0,
+        "total_capture_pct_sum": None,
+        "avg_sharpe_ratio": None,
+        "trigger_days_sum": 0,
+        "strongest_cell_window": None,
+        "direction_conflict": False,
+        "explanation": (
+            PRIMARY_BUILD_EXPLANATION_NO_CURRENT_SIGNAL
+        ),
+        "same_direction_k_builds_all_windows": [],
+        "mixed_direction_k_builds_all_windows": [],
+        "other_active_k_builds": [],
+        "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
+    }
+
+
+def _aggregate_k_across_windows(
+    by_k_window: Mapping[tuple[int, str], Mapping[str, Any]],
+    *,
+    K: int,
+) -> Optional[dict[str, Any]]:
+    """Aggregate a single K across all canonical windows.
+
+    Returns ``None`` if the K has no cell in any canonical
+    window (extremely defensive; canonical 60-cell artifacts
+    always have all 60 cells when this helper is called).
+    Otherwise returns an aggregate dict suitable for use as
+    a per-K payload in the primary-build selector.
+    """
+    capture_sum = 0.0
+    trigger_days_sum = 0
+    sharpe_values: list[float] = []
+    buy_window_count = 0
+    short_window_count = 0
+    aligned_window_count = 0
+    signaling_windows: list[str] = []
+    saw_any = False
+    for w in CANONICAL_WINDOWS:
+        r = by_k_window.get((K, w))
+        if r is None:
+            continue
+        saw_any = True
+        cap = r.get("total_capture_pct")
+        if (
+            isinstance(cap, (int, float))
+            and not isinstance(cap, bool)
+        ):
+            capture_sum += float(cap)
+        trig = r.get("trigger_days")
+        if (
+            isinstance(trig, int)
+            and not isinstance(trig, bool)
+        ):
+            trigger_days_sum += int(trig)
+        sharpe = r.get("sharpe_ratio")
+        if (
+            isinstance(sharpe, (int, float))
+            and not isinstance(sharpe, bool)
+        ):
+            sharpe_values.append(float(sharpe))
+        sig = r.get("latest_combined_signal")
+        if r.get("currently_signaling"):
+            if isinstance(w, str):
+                signaling_windows.append(w)
+        if sig == _CURRENT_SIGNAL_BUY:
+            buy_window_count += 1
+        elif sig == _CURRENT_SIGNAL_SHORT:
+            short_window_count += 1
+        if r.get("all_members_aligned"):
+            aligned_window_count += 1
+    if not saw_any:
+        return None
+    avg_sharpe = (
+        sum(sharpe_values) / len(sharpe_values)
+        if sharpe_values else None
+    )
+    return {
+        "K": int(K),
+        "buy_window_count": int(buy_window_count),
+        "short_window_count": int(short_window_count),
+        "all_members_aligned_window_count": int(
+            aligned_window_count,
+        ),
+        "total_capture_pct_sum": float(capture_sum),
+        "avg_sharpe_ratio": avg_sharpe,
+        "trigger_days_sum": int(trigger_days_sum),
+        "windows_signaling_count": int(
+            len(signaling_windows),
+        ),
+        "windows_signaling": list(signaling_windows),
+    }
+
+
+def _direction_for_payload(
+    payload: Mapping[str, Any],
+) -> Optional[str]:
+    """Map per-K window counts to a single direction label
+    (Buy / Short / Mixed / None)."""
+    buy = int(payload.get("buy_window_count", 0) or 0)
+    short = int(payload.get("short_window_count", 0) or 0)
+    if buy > 0 and short > 0:
+        return "Mixed"
+    if buy > 0:
+        return _CURRENT_SIGNAL_BUY
+    if short > 0:
+        return _CURRENT_SIGNAL_SHORT
+    return None
+
+
+def _strongest_cell_window_for_K(
+    by_k_window: Mapping[tuple[int, str], Mapping[str, Any]],
+    *,
+    K: int,
+) -> Optional[str]:
+    """Return the canonical window in which the (K, window)
+    cell has the highest ``total_capture_pct``; ``None`` if
+    the K is missing entirely."""
+    best_w: Optional[str] = None
+    best_cap: Optional[float] = None
+    for w in CANONICAL_WINDOWS:
+        r = by_k_window.get((K, w))
+        if r is None:
+            continue
+        cap = r.get("total_capture_pct")
+        if not isinstance(cap, (int, float)) or isinstance(
+            cap, bool,
+        ):
+            continue
+        if best_cap is None or float(cap) > best_cap:
+            best_cap = float(cap)
+            best_w = w
+    return best_w
+
+
+def _build_other_active_k_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compact non-primary K record for
+    ``other_active_k_builds``."""
+    return {
+        "K": int(payload["K"]),
+        "signal_direction": _direction_for_payload(payload),
+        "windows_signaling_count": int(
+            payload.get("windows_signaling_count", 0) or 0,
+        ),
+        "buy_window_count": int(
+            payload.get("buy_window_count", 0) or 0,
+        ),
+        "short_window_count": int(
+            payload.get("short_window_count", 0) or 0,
+        ),
+        "all_members_aligned_window_count": int(
+            payload.get(
+                "all_members_aligned_window_count", 0,
+            ) or 0,
+        ),
+        "total_capture_pct_sum": (
+            payload.get("total_capture_pct_sum")
+        ),
+        "avg_sharpe_ratio": payload.get("avg_sharpe_ratio"),
+        "trigger_days_sum": int(
+            payload.get("trigger_days_sum", 0) or 0,
+        ),
+    }
+
+
+def _build_primary_build_summary(
+    matrix: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Phase 6I-39: pick the single primary K-build for the
+    website's one-row-per-ticker ranking grid.
+
+    Selection rule (in priority order):
+
+      1. **Tier 1 (preferred): same_k_all_windows_same_direction.**
+         A K is in tier 1 iff every canonical window has the
+         SAME ``latest_combined_signal`` value, and that
+         value is in ``{Buy, Short}``. Pick the strongest K
+         from this set.
+      2. **Tier 2 (lower confidence):
+         same_k_all_windows_mixed_direction.** A K is in
+         tier 2 iff every canonical window has
+         ``currently_signaling=True`` but the directions are
+         not all the same (at least one Buy AND at least
+         one Short across the five windows). Pick the
+         strongest K from this set;
+         ``direction_conflict=True``.
+      3. **Tier 3 (fallback): strongest_current_cell.** Pick
+         the single ``currently_signaling`` cell with the
+         highest ``total_capture_pct``. Surfaces just one
+         (K, window) cell.
+      4. **Tier 4: none.** No cell currently signals.
+         ``primary_build_available=False``.
+
+    "Strongest" tie-break cascade for tiers 1 and 2:
+    descending ``total_capture_pct_sum`` (across all five
+    windows) → descending ``avg_sharpe_ratio`` (None
+    treated as -inf so any K with a defined Sharpe wins) →
+    descending ``trigger_days_sum`` → ascending K.
+
+    The function never explodes a ticker into multiple
+    output records. It always returns a single payload dict
+    suitable for embedding under one ticker's
+    ``primary_build_summary`` key.
+    """
+    by_k_window: dict[
+        tuple[int, str], Mapping[str, Any]
+    ] = {}
+    for row in matrix:
+        K = row.get("K")
+        w = row.get("window")
+        if (
+            isinstance(K, int)
+            and not isinstance(K, bool)
+            and isinstance(w, str)
+        ):
+            by_k_window[(K, w)] = row
+
+    per_k_payload: dict[int, dict[str, Any]] = {}
+    same_dir_k: list[int] = []
+    mixed_dir_k: list[int] = []
+    canonical_w_count = len(CANONICAL_WINDOWS)
+    for K in CANONICAL_K_VALUES:
+        payload = _aggregate_k_across_windows(
+            by_k_window, K=K,
+        )
+        if payload is None:
+            continue
+        per_k_payload[K] = payload
+        signaling_windows = payload["windows_signaling"]
+        if (
+            len(signaling_windows) == canonical_w_count
+            and canonical_w_count > 0
+        ):
+            # Same-K all-window: check direction uniformity.
+            dirs_seen: set[str] = set()
+            for w in CANONICAL_WINDOWS:
+                r = by_k_window.get((K, w))
+                if r is None:
+                    continue
+                sig = r.get("latest_combined_signal")
+                if sig in (
+                    _CURRENT_SIGNAL_BUY,
+                    _CURRENT_SIGNAL_SHORT,
+                ):
+                    dirs_seen.add(sig)
+            if len(dirs_seen) == 1:
+                same_dir_k.append(K)
+            elif len(dirs_seen) > 1:
+                mixed_dir_k.append(K)
+            # If dirs_seen is empty here the K can't be in
+            # this branch because signaling_windows was 5;
+            # but defensively, don't classify it.
+
+    def _strongest_K(K_list: Sequence[int]) -> Optional[int]:
+        if not K_list:
+            return None
+
+        def _sort_key(K: int) -> tuple:
+            p = per_k_payload[K]
+            cap = p.get("total_capture_pct_sum")
+            cap_f = float(cap) if isinstance(
+                cap, (int, float),
+            ) and not isinstance(cap, bool) else 0.0
+            avg = p.get("avg_sharpe_ratio")
+            avg_f = (
+                float(avg)
+                if avg is not None and isinstance(
+                    avg, (int, float),
+                ) and not isinstance(avg, bool)
+                else float("-inf")
+            )
+            trig = int(p.get("trigger_days_sum", 0) or 0)
+            return (-cap_f, -avg_f, -trig, K)
+
+        return sorted(K_list, key=_sort_key)[0]
+
+    # Tier 1.
+    primary_K = _strongest_K(same_dir_k)
+    if primary_K is not None:
+        selection_tier = (
+            PRIMARY_BUILD_TIER_SAME_K_ALL_SAME_DIR
+        )
+        direction_conflict = False
+        explanation = (
+            PRIMARY_BUILD_EXPLANATION_SAME_K_ALL_SAME_DIR
+        )
+    else:
+        # Tier 2.
+        primary_K = _strongest_K(mixed_dir_k)
+        if primary_K is not None:
+            selection_tier = (
+                PRIMARY_BUILD_TIER_SAME_K_ALL_MIXED_DIR
+            )
+            direction_conflict = True
+            explanation = (
+                PRIMARY_BUILD_EXPLANATION_SAME_K_ALL_MIXED_DIR
+            )
+        else:
+            # Tier 3 (fallback): strongest single cell.
+            best_cell: Optional[Mapping[str, Any]] = None
+            best_cap: Optional[float] = None
+            for row in matrix:
+                if not row.get("currently_signaling"):
+                    continue
+                cap = row.get("total_capture_pct")
+                if not isinstance(
+                    cap, (int, float),
+                ) or isinstance(cap, bool):
+                    continue
+                if (
+                    best_cap is None
+                    or float(cap) > best_cap
+                ):
+                    best_cap = float(cap)
+                    best_cell = row
+            if best_cell is None:
+                # Tier 4: nothing currently signals.
+                return _empty_primary_build_summary()
+            cell_K = best_cell.get("K")
+            cell_w = best_cell.get("window")
+            cell_dir = best_cell.get("latest_combined_signal")
+            cell_aligned = bool(
+                best_cell.get("all_members_aligned", False),
+            )
+            cell_trigger = int(
+                best_cell.get("trigger_days", 0) or 0,
+            )
+            cell_sharpe = best_cell.get("sharpe_ratio")
+            # Active non-primary K builds: any K with at
+            # least one currently_signaling cell, excluding
+            # the primary K.
+            other_K_set: set[int] = set()
+            for r in matrix:
+                if r.get("currently_signaling"):
+                    K_v = r.get("K")
+                    if (
+                        isinstance(K_v, int)
+                        and not isinstance(K_v, bool)
+                        and K_v != cell_K
+                    ):
+                        other_K_set.add(K_v)
+            other_active = []
+            for K in sorted(other_K_set):
+                p = per_k_payload.get(K)
+                if p is None:
+                    continue
+                other_active.append(
+                    _build_other_active_k_payload(p),
+                )
+            return {
+                "primary_build_available": True,
+                "selection_tier": (
+                    PRIMARY_BUILD_TIER_STRONGEST_CURRENT_CELL
+                ),
+                "K": (
+                    int(cell_K)
+                    if isinstance(cell_K, int)
+                    and not isinstance(cell_K, bool)
+                    else None
+                ),
+                "signal_direction": cell_dir,
+                "windows_signaling_count": 1,
+                "windows_signaling": (
+                    [cell_w] if isinstance(cell_w, str)
+                    else []
+                ),
+                "buy_window_count": (
+                    1 if cell_dir == _CURRENT_SIGNAL_BUY
+                    else 0
+                ),
+                "short_window_count": (
+                    1 if cell_dir == _CURRENT_SIGNAL_SHORT
+                    else 0
+                ),
+                "all_members_aligned_window_count": (
+                    1 if cell_aligned else 0
+                ),
+                "total_capture_pct_sum": (
+                    float(best_cap)
+                    if best_cap is not None else None
+                ),
+                "avg_sharpe_ratio": cell_sharpe,
+                "trigger_days_sum": cell_trigger,
+                "strongest_cell_window": (
+                    cell_w if isinstance(cell_w, str)
+                    else None
+                ),
+                "direction_conflict": False,
+                "explanation": (
+                    PRIMARY_BUILD_EXPLANATION_SINGLE_CELL_FALLBACK
+                ),
+                "same_direction_k_builds_all_windows": [],
+                "mixed_direction_k_builds_all_windows": [],
+                "other_active_k_builds": other_active,
+                "display_row_cardinality": (
+                    DISPLAY_ROW_CARDINALITY
+                ),
+            }
+
+    # Tiers 1 / 2 path.
+    payload = per_k_payload[primary_K]
+    signal_direction = _direction_for_payload(payload)
+    if (
+        selection_tier
+        == PRIMARY_BUILD_TIER_SAME_K_ALL_MIXED_DIR
+    ):
+        signal_direction = "Mixed"
+    strongest_cell_window = _strongest_cell_window_for_K(
+        by_k_window, K=primary_K,
+    )
+
+    # other_active_k_builds: every K that is "active" in
+    # the same-K-all-window sense (same_dir or mixed_dir),
+    # minus the primary K.
+    other_K_set = set(same_dir_k) | set(mixed_dir_k)
+    other_K_set.discard(primary_K)
+    other_active = [
+        _build_other_active_k_payload(per_k_payload[K])
+        for K in sorted(other_K_set)
+        if K in per_k_payload
+    ]
+
+    return {
+        "primary_build_available": True,
+        "selection_tier": selection_tier,
+        "K": int(primary_K),
+        "signal_direction": signal_direction,
+        "windows_signaling_count": int(
+            payload["windows_signaling_count"],
+        ),
+        "windows_signaling": list(
+            payload["windows_signaling"],
+        ),
+        "buy_window_count": int(payload["buy_window_count"]),
+        "short_window_count": int(
+            payload["short_window_count"],
+        ),
+        "all_members_aligned_window_count": int(
+            payload["all_members_aligned_window_count"],
+        ),
+        "total_capture_pct_sum": (
+            payload["total_capture_pct_sum"]
+        ),
+        "avg_sharpe_ratio": payload["avg_sharpe_ratio"],
+        "trigger_days_sum": int(payload["trigger_days_sum"]),
+        "strongest_cell_window": strongest_cell_window,
+        "direction_conflict": direction_conflict,
+        "explanation": explanation,
+        "same_direction_k_builds_all_windows": list(
+            same_dir_k,
+        ),
+        "mixed_direction_k_builds_all_windows": list(
+            mixed_dir_k,
+        ),
+        "other_active_k_builds": other_active,
+        "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
+    }
+
+
 def _latest_overall_direction(
     summary_block: Optional[Mapping[str, Any]],
     pwk_agg: Mapping[str, Any],
@@ -1751,6 +2285,11 @@ def _build_one_ticker_row(
         current_signal_matrix,
         bwwa=artifact["build_wide_window_alignment"],
     )
+    # Phase 6I-39: primary build summary for the
+    # one-row-per-ticker display contract.
+    primary_build_summary = _build_primary_build_summary(
+        current_signal_matrix,
+    )
 
     return PerTickerRankingRow(
         ticker=ticker,
@@ -1797,6 +2336,7 @@ def _build_one_ticker_row(
         current_build_signal_summary=(
             current_signal_summary
         ),
+        primary_build_summary=primary_build_summary,
     )
 
 
@@ -1948,6 +2488,10 @@ def build_multiwindow_ranking_export(
             "first-pass; future phase replaces with researched "
             "scoring contract)"
         ),
+        # Phase 6I-39 display contract: one row per ticker.
+        # A renderer MUST NOT explode a ticker into multiple
+        # rows just because it has multiple active K builds.
+        "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
         "blocked_reason_counts": {},
         "data_status_counts": {},
         "freshness_status_counts": {},
