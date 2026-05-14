@@ -186,6 +186,44 @@ def _normalize_ranking_row(
         primary_build_summary_out = dict(
             primary_build_summary,
         )
+    # Phase 6I-40 row_sort_values: the ranking export emits
+    # rank_sort=None (it doesn't know the rank yet); the
+    # package fills it in here using the assigned rank so
+    # the renderer sees a complete sort-value block.
+    raw_sort_values = row.get("row_sort_values")
+    if isinstance(raw_sort_values, Mapping):
+        row_sort_values_out: dict[str, Any] = dict(
+            raw_sort_values,
+        )
+    else:
+        row_sort_values_out = {}
+    row_sort_values_out["rank_sort"] = int(rank)
+    # Phase 6I-40 data-completeness pass-through.
+    raw_completeness = row.get("data_completeness")
+    if isinstance(raw_completeness, Mapping):
+        data_completeness_out: dict[str, Any] = dict(
+            raw_completeness,
+        )
+    else:
+        data_completeness_out = {}
+    # Phase 6I-40 current-signal status block pass-through.
+    raw_signal_status = row.get(
+        "current_signal_status_block",
+    )
+    if isinstance(raw_signal_status, Mapping):
+        current_signal_status_out: dict[str, Any] = dict(
+            raw_signal_status,
+        )
+    else:
+        current_signal_status_out = {}
+    # Phase 6I-40 flip-risk placeholders pass-through.
+    raw_flip_risk = row.get("flip_risk")
+    if isinstance(raw_flip_risk, Mapping):
+        flip_risk_out: dict[str, Any] = dict(
+            raw_flip_risk,
+        )
+    else:
+        flip_risk_out = {}
     return {
         "rank": int(rank),
         "ticker": row.get("ticker"),
@@ -241,6 +279,14 @@ def _normalize_ranking_row(
         "primary_build_summary": (
             primary_build_summary_out
         ),
+        # Phase 6I-40 sortable / completeness / signal /
+        # flip-risk blocks.
+        "row_sort_values": row_sort_values_out,
+        "data_completeness": data_completeness_out,
+        "current_signal_status_block": (
+            current_signal_status_out
+        ),
+        "flip_risk": flip_risk_out,
     }
 
 
@@ -249,6 +295,31 @@ def _normalize_blocked_row(
 ) -> dict[str, Any]:
     """Project a Phase 6I-34 blocked row into the website
     blocked-row shape."""
+    # Phase 6I-40 blocks pass-through (blocked rows do
+    # NOT carry a rank, so the rank_sort key is left as
+    # whatever the ranking export emitted -- None).
+    raw_sort_values = row.get("row_sort_values")
+    sort_values_out = (
+        dict(raw_sort_values)
+        if isinstance(raw_sort_values, Mapping) else {}
+    )
+    raw_completeness = row.get("data_completeness")
+    completeness_out = (
+        dict(raw_completeness)
+        if isinstance(raw_completeness, Mapping) else {}
+    )
+    raw_signal_status = row.get(
+        "current_signal_status_block",
+    )
+    signal_status_out = (
+        dict(raw_signal_status)
+        if isinstance(raw_signal_status, Mapping) else {}
+    )
+    raw_flip_risk = row.get("flip_risk")
+    flip_risk_out = (
+        dict(raw_flip_risk)
+        if isinstance(raw_flip_risk, Mapping) else {}
+    )
     return {
         "ticker": row.get("ticker"),
         "ranking_blocked_reason": row.get(
@@ -263,6 +334,12 @@ def _normalize_blocked_row(
         "issue_codes": list(
             row.get("issue_codes", []) or [],
         ),
+        # Phase 6I-40 sortable / completeness / signal /
+        # flip-risk blocks.
+        "row_sort_values": sort_values_out,
+        "data_completeness": completeness_out,
+        "current_signal_status_block": signal_status_out,
+        "flip_risk": flip_risk_out,
     }
 
 
@@ -401,6 +478,27 @@ def _build_ticker_detail(
         current_build_signal_summary = None
         primary_build_summary_detail = None
 
+    # Phase 6I-40 blocks on ticker_details (both eligible
+    # and blocked carry them).
+    raw_completeness = row.get("data_completeness")
+    data_completeness_detail = (
+        dict(raw_completeness)
+        if isinstance(raw_completeness, Mapping) else {}
+    )
+    raw_signal_status_d = row.get(
+        "current_signal_status_block",
+    )
+    current_signal_status_detail = (
+        dict(raw_signal_status_d)
+        if isinstance(raw_signal_status_d, Mapping)
+        else {}
+    )
+    raw_flip_risk_d = row.get("flip_risk")
+    flip_risk_detail = (
+        dict(raw_flip_risk_d)
+        if isinstance(raw_flip_risk_d, Mapping) else {}
+    )
+
     full_60_cell_detail_embedded = False
     artifact_path = row.get("artifact_path")
     if (
@@ -472,6 +570,13 @@ def _build_ticker_detail(
         "primary_build_summary": (
             primary_build_summary_detail
         ),
+        # Phase 6I-40 completeness + current-signal status
+        # + flip-risk blocks on ticker_details.
+        "data_completeness": data_completeness_detail,
+        "current_signal_status_block": (
+            current_signal_status_detail
+        ),
+        "flip_risk": flip_risk_detail,
     }
 
 
@@ -664,6 +769,30 @@ def build_website_export_package(
         "is transparent but not the final investment model.",
     ])
 
+    # Phase 6I-40 sortable leaderboard metadata pass-through
+    # from the ranking export's top-level summary block.
+    summary_block = ur.get("summary")
+    if not isinstance(summary_block, Mapping):
+        summary_block = {}
+    sortable_columns = list(
+        summary_block.get("sortable_columns")
+        or list(_cmre.ALL_SORT_COLUMNS),
+    )
+    default_sort = [
+        dict(s) for s in (
+            summary_block.get("default_sort")
+            or [dict(s) for s in _cmre.DEFAULT_SORT]
+        )
+        if isinstance(s, Mapping)
+    ]
+    sort_options = [
+        dict(o) for o in (
+            summary_block.get("sort_options")
+            or [dict(o) for o in _cmre.SORT_OPTIONS]
+        )
+        if isinstance(o, Mapping)
+    ]
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _iso_now(),
@@ -678,6 +807,10 @@ def build_website_export_package(
         "display_row_cardinality": (
             _cmre.DISPLAY_ROW_CARDINALITY
         ),
+        # Phase 6I-40 sortable leaderboard contract.
+        "sortable_columns": sortable_columns,
+        "default_sort": default_sort,
+        "sort_options": sort_options,
         "artifact_root": ur.get("artifact_root"),
         "cache_dir": (
             str(cache_dir) if cache_dir is not None else None

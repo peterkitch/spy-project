@@ -216,6 +216,183 @@ CHART_READY_SOURCE_UNAVAILABLE = "unavailable"
 
 
 # ---------------------------------------------------------------------------
+# Phase 6I-40: sortable leaderboard contract
+# ---------------------------------------------------------------------------
+#
+# Reference: ``trafficflow.py`` lines 3111-3112 use Dash native
+# sorting with default ``sort_by=[Sharpe desc, Total % desc,
+# Trigs desc]``. The website export/view model mirrors that
+# default and exposes ascending+descending options so the
+# renderer can also bring negative / short-candidate / bottom
+# rows to the top WITHOUT duplicating ticker rows.
+
+SORT_COLUMN_TOTAL_CAPTURE_PCT: str = "total_capture_pct"
+SORT_COLUMN_SHARPE_RATIO: str = "sharpe_ratio"
+SORT_COLUMN_TRIGGER_DAYS: str = "trigger_days"
+SORT_COLUMN_RANK: str = "rank"
+SORT_COLUMN_TICKER: str = "ticker"
+
+ALL_SORT_COLUMNS: tuple[str, ...] = (
+    SORT_COLUMN_TOTAL_CAPTURE_PCT,
+    SORT_COLUMN_SHARPE_RATIO,
+    SORT_COLUMN_TRIGGER_DAYS,
+    SORT_COLUMN_RANK,
+    SORT_COLUMN_TICKER,
+)
+
+# Per-row sort-value keys (numeric where defensible; None
+# values must be handled by the renderer's sort comparator).
+SORT_VALUE_KEY_TOTAL_CAPTURE_PCT: str = (
+    "total_capture_pct_sort"
+)
+SORT_VALUE_KEY_SHARPE_RATIO: str = "sharpe_ratio_sort"
+SORT_VALUE_KEY_TRIGGER_DAYS: str = "trigger_days_sort"
+SORT_VALUE_KEY_RANK: str = "rank_sort"
+SORT_VALUE_KEY_TICKER: str = "ticker_sort"
+
+# Default sort -- mirrors trafficflow.py:3111-3112.
+DEFAULT_SORT: tuple[dict[str, str], ...] = (
+    {
+        "column_id": SORT_COLUMN_SHARPE_RATIO,
+        "direction": "desc",
+    },
+    {
+        "column_id": SORT_COLUMN_TOTAL_CAPTURE_PCT,
+        "direction": "desc",
+    },
+    {
+        "column_id": SORT_COLUMN_TRIGGER_DAYS,
+        "direction": "desc",
+    },
+)
+
+# Sort options exposed for the renderer. Each option lists
+# both directions so the renderer can bring negative /
+# short-candidate / bottom rows to the top via descending
+# OR ascending without duplicating rows.
+SORT_OPTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "column_id": SORT_COLUMN_TOTAL_CAPTURE_PCT,
+        "label": "Total Capture %",
+        "row_sort_value_key": (
+            SORT_VALUE_KEY_TOTAL_CAPTURE_PCT
+        ),
+        "directions": ["desc", "asc"],
+        "value_type": "number",
+    },
+    {
+        "column_id": SORT_COLUMN_SHARPE_RATIO,
+        "label": "Sharpe Ratio",
+        "row_sort_value_key": (
+            SORT_VALUE_KEY_SHARPE_RATIO
+        ),
+        "directions": ["desc", "asc"],
+        "value_type": "number",
+    },
+    {
+        "column_id": SORT_COLUMN_TRIGGER_DAYS,
+        "label": "Trigger Days",
+        "row_sort_value_key": (
+            SORT_VALUE_KEY_TRIGGER_DAYS
+        ),
+        "directions": ["desc", "asc"],
+        "value_type": "number",
+    },
+    {
+        "column_id": SORT_COLUMN_RANK,
+        "label": "Rank",
+        "row_sort_value_key": SORT_VALUE_KEY_RANK,
+        "directions": ["asc", "desc"],
+        "value_type": "number",
+    },
+    {
+        "column_id": SORT_COLUMN_TICKER,
+        "label": "Ticker",
+        "row_sort_value_key": SORT_VALUE_KEY_TICKER,
+        "directions": ["asc", "desc"],
+        "value_type": "string",
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-40: data-completeness / incomplete-member warning
+# ---------------------------------------------------------------------------
+#
+# Reference: ``trafficflow.py`` lines 2906 / 2935 scan
+# missing/stale PKLs; line 3031 marks affected rows with a
+# warning icon; line 3346 surfaces a missing/stale PKL summary
+# panel. We adopt the same product behavior: incomplete members
+# are surfaced via stable fields, NOT silently dropped.
+
+DATA_COMPLETENESS_COMPLETE: str = "complete"
+DATA_COMPLETENESS_PARTIAL: str = "partial"
+DATA_COMPLETENESS_BLOCKED: str = "blocked"
+DATA_COMPLETENESS_UNKNOWN: str = "unknown"
+
+ALL_DATA_COMPLETENESS_STATUSES: tuple[str, ...] = (
+    DATA_COMPLETENESS_COMPLETE,
+    DATA_COMPLETENESS_PARTIAL,
+    DATA_COMPLETENESS_BLOCKED,
+    DATA_COMPLETENESS_UNKNOWN,
+)
+
+DATA_WARNING_SYMBOL_ATTENTION: str = "!"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-40: current signal status (locked / provisional)
+# ---------------------------------------------------------------------------
+#
+# Product question: "If the market closed right now, what
+# would the play be?" The board still shows ONE current
+# signal per ticker (the Phase 6I-39 primary build), but the
+# row honestly says whether that signal is locked
+# (artifact-derived) or provisional (overlaid with a live
+# price probe). This phase exposes the contract and the
+# injection seam; no live fetch is performed in the default
+# (production) path.
+
+CURRENT_SIGNAL_STATUS_LOCKED: str = "locked"
+CURRENT_SIGNAL_STATUS_PROVISIONAL: str = "provisional"
+CURRENT_SIGNAL_STATUS_STALE: str = "stale"
+CURRENT_SIGNAL_STATUS_BLOCKED: str = "blocked"
+CURRENT_SIGNAL_STATUS_UNKNOWN: str = "unknown"
+
+ALL_CURRENT_SIGNAL_STATUSES: tuple[str, ...] = (
+    CURRENT_SIGNAL_STATUS_LOCKED,
+    CURRENT_SIGNAL_STATUS_PROVISIONAL,
+    CURRENT_SIGNAL_STATUS_STALE,
+    CURRENT_SIGNAL_STATUS_BLOCKED,
+    CURRENT_SIGNAL_STATUS_UNKNOWN,
+)
+
+SIGNAL_UPDATE_SOURCE_ARTIFACT: str = "artifact"
+SIGNAL_UPDATE_SOURCE_LIVE_PRICE_OVERLAY: str = (
+    "live_price_overlay"
+)
+SIGNAL_UPDATE_SOURCE_UNAVAILABLE: str = "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-40: Spymaster-style flip-risk placeholders
+# ---------------------------------------------------------------------------
+#
+# Reference: ``spymaster.py`` carries price-threshold / range
+# logic that maps a current price to Buy / Short / Cash and
+# computes proximity to the flip threshold. The Phase 6I-23
+# multi-window K engine + Phase 6I-20 Confluence artifact
+# don't carry that range data on the current production
+# surface. This phase adds NULL/false placeholder fields so a
+# future phase can wire real flip-risk values without a
+# schema change.
+
+ALL_FLIP_RISK_LABELS: tuple[Optional[str], ...] = (
+    None, "Low", "Medium", "High", "Critical",
+)
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -286,6 +463,41 @@ class PerTickerRankingRow:
     # carry the primary-build dict; blocked rows carry
     # None (no fabrication).
     primary_build_summary: Optional[dict[str, Any]] = None
+
+    # Phase 6I-40: sortable leaderboard contract --
+    # per-row numeric sort values keyed by SORT_VALUE_KEY_*.
+    row_sort_values: dict[str, Any] = field(
+        default_factory=dict,
+    )
+
+    # Phase 6I-40: incomplete-member warning surface.
+    # When the upstream artifact carries member-level issue
+    # data (a future phase) this block surfaces it honestly.
+    # When the artifact does NOT carry it (current production
+    # state) the block reports has_incomplete_build_members=
+    # False and data_completeness_status reflects the row's
+    # actual rank-eligibility -- no fabrication.
+    data_completeness: dict[str, Any] = field(
+        default_factory=dict,
+    )
+
+    # Phase 6I-40: current signal status (locked /
+    # provisional). The default production path returns
+    # status="locked" for eligible rows (artifact-derived)
+    # and "blocked" for blocked rows. An optional
+    # live_price_provider injection seam lets a future phase
+    # (or tests) overlay a provisional latest price.
+    current_signal_status_block: dict[str, Any] = field(
+        default_factory=dict,
+    )
+
+    # Phase 6I-40: flip-risk placeholders. Null / False by
+    # default; a future phase that wires Spymaster-style
+    # price-range / flip-threshold data fills these in
+    # without a schema change.
+    flip_risk: dict[str, Any] = field(
+        default_factory=dict,
+    )
 
 
 @dataclass
@@ -369,6 +581,17 @@ class MultiTickerRankingExportReport:
                     if r.primary_build_summary is not None
                     else None
                 ),
+                # Phase 6I-40 sortable leaderboard +
+                # data-completeness + current-signal +
+                # flip-risk blocks.
+                "row_sort_values": dict(r.row_sort_values),
+                "data_completeness": dict(
+                    r.data_completeness,
+                ),
+                "current_signal_status_block": dict(
+                    r.current_signal_status_block,
+                ),
+                "flip_risk": dict(r.flip_risk),
             }
         return {
             "generated_at": self.generated_at,
@@ -1862,6 +2085,324 @@ def _build_primary_build_summary(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 6I-40: sort / completeness / current-signal / flip-risk helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_row_sort_values(
+    *,
+    ticker: str,
+    rank: Optional[int],
+    total_capture_pct_sum: Optional[float],
+    avg_sharpe_ratio: Optional[float],
+    trigger_days_sum: Optional[int],
+) -> dict[str, Any]:
+    """Build the per-row numeric sort-value dict used by the
+    sortable leaderboard contract.
+
+    The renderer is responsible for null-safe comparison;
+    None values stay as None so the renderer can decide
+    where to put them (last on desc / first on asc by
+    convention is common but NOT pinned here).
+    """
+    return {
+        SORT_VALUE_KEY_TOTAL_CAPTURE_PCT: (
+            float(total_capture_pct_sum)
+            if isinstance(total_capture_pct_sum, (int, float))
+            and not isinstance(total_capture_pct_sum, bool)
+            else None
+        ),
+        SORT_VALUE_KEY_SHARPE_RATIO: (
+            float(avg_sharpe_ratio)
+            if isinstance(avg_sharpe_ratio, (int, float))
+            and not isinstance(avg_sharpe_ratio, bool)
+            else None
+        ),
+        SORT_VALUE_KEY_TRIGGER_DAYS: (
+            int(trigger_days_sum)
+            if isinstance(trigger_days_sum, int)
+            and not isinstance(trigger_days_sum, bool)
+            else 0
+        ),
+        SORT_VALUE_KEY_RANK: (
+            int(rank) if rank is not None else None
+        ),
+        SORT_VALUE_KEY_TICKER: str(ticker).upper(),
+    }
+
+
+def _default_member_completeness_provider(
+    ticker: str,
+    artifact: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Default member-completeness provider.
+
+    The current production Confluence artifact does NOT yet
+    carry member-level issue details. The default provider
+    therefore returns ``has_incomplete_build_members=False``
+    with empty member lists -- honest about the upstream gap.
+    Tests inject a fake provider that supplies member-level
+    issue data.
+
+    Returns a dict with stable keys:
+
+      * has_incomplete_build_members: bool
+      * incomplete_member_count: int
+      * incomplete_members: list[str]
+      * incomplete_member_reasons: dict[str, str]
+    """
+    return {
+        "has_incomplete_build_members": False,
+        "incomplete_member_count": 0,
+        "incomplete_members": [],
+        "incomplete_member_reasons": {},
+    }
+
+
+def _build_data_completeness(
+    *,
+    rank_eligible: bool,
+    member_block: Mapping[str, Any],
+    blocked_reason: Optional[str],
+) -> dict[str, Any]:
+    """Compose the per-row data-completeness block.
+
+    Status taxonomy (see ALL_DATA_COMPLETENESS_STATUSES):
+
+      * complete  -- rank_eligible AND no incomplete members
+      * partial   -- rank_eligible AND >= 1 incomplete member
+      * blocked   -- NOT rank_eligible
+      * unknown   -- defensive catch-all
+    """
+    incomplete = bool(
+        member_block.get(
+            "has_incomplete_build_members", False,
+        ),
+    )
+    incomplete_count = int(
+        member_block.get("incomplete_member_count", 0) or 0,
+    )
+    incomplete_members = list(
+        member_block.get("incomplete_members", []) or [],
+    )
+    reasons_raw = member_block.get(
+        "incomplete_member_reasons", {},
+    )
+    incomplete_reasons = (
+        dict(reasons_raw)
+        if isinstance(reasons_raw, Mapping) else {}
+    )
+    # Defensive: enforce count <-> list invariant.
+    if incomplete_count == 0 and incomplete_members:
+        incomplete_count = len(incomplete_members)
+    if incomplete and incomplete_count == 0:
+        # Provider claims incomplete but supplies no list /
+        # count -- treat as not incomplete (no fabrication).
+        incomplete = False
+
+    if not rank_eligible:
+        status = DATA_COMPLETENESS_BLOCKED
+        message = (
+            f"blocked: {blocked_reason}"
+            if blocked_reason
+            else "blocked"
+        )
+        warning_symbol: Optional[str] = (
+            DATA_WARNING_SYMBOL_ATTENTION
+        )
+    elif incomplete:
+        status = DATA_COMPLETENESS_PARTIAL
+        message = (
+            f"partial: {incomplete_count} member(s) "
+            "incomplete or stale"
+        )
+        warning_symbol = DATA_WARNING_SYMBOL_ATTENTION
+    else:
+        status = DATA_COMPLETENESS_COMPLETE
+        message = "complete: all build members reporting"
+        warning_symbol = None
+
+    return {
+        "has_incomplete_build_members": bool(incomplete),
+        "incomplete_member_count": int(incomplete_count),
+        "incomplete_members": incomplete_members,
+        "incomplete_member_reasons": incomplete_reasons,
+        "data_warning_symbol": warning_symbol,
+        "data_completeness_status": status,
+        "data_completeness_message": message,
+    }
+
+
+def _build_current_signal_status_block(
+    *,
+    ticker: str,
+    rank_eligible: bool,
+    confluence_last_date: Optional[str],
+    live_price_payload: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compose the per-row current-signal status block.
+
+    Default (no live overlay): eligible rows are
+    ``locked`` with ``signal_update_source="artifact"``.
+    Blocked rows are ``blocked`` with
+    ``signal_update_source="unavailable"``.
+
+    When ``live_price_payload`` is supplied by a
+    test/future-phase injection seam, the block flips to
+    ``provisional`` and ``signal_update_source=
+    live_price_overlay``. Stale latest-price data may set
+    status to ``stale`` instead.
+    """
+    if not rank_eligible:
+        return {
+            "current_signal_status": (
+                CURRENT_SIGNAL_STATUS_BLOCKED
+            ),
+            "current_signal_as_of": None,
+            "latest_price": None,
+            "latest_price_as_of": None,
+            "uses_provisional_price": False,
+            "signal_update_source": (
+                SIGNAL_UPDATE_SOURCE_UNAVAILABLE
+            ),
+        }
+    # Eligible row baseline.
+    current_signal_as_of = confluence_last_date
+    if isinstance(live_price_payload, Mapping):
+        latest_price = live_price_payload.get(
+            "latest_price",
+        )
+        latest_price_as_of = live_price_payload.get(
+            "latest_price_as_of",
+        )
+        uses_provisional = bool(
+            live_price_payload.get(
+                "uses_provisional_price", False,
+            ),
+        )
+        provisional_status = live_price_payload.get(
+            "current_signal_status",
+        )
+        if provisional_status in (
+            CURRENT_SIGNAL_STATUS_PROVISIONAL,
+            CURRENT_SIGNAL_STATUS_LOCKED,
+            CURRENT_SIGNAL_STATUS_STALE,
+            CURRENT_SIGNAL_STATUS_UNKNOWN,
+        ):
+            status = provisional_status
+        elif uses_provisional:
+            status = CURRENT_SIGNAL_STATUS_PROVISIONAL
+        else:
+            status = CURRENT_SIGNAL_STATUS_LOCKED
+        source = (
+            SIGNAL_UPDATE_SOURCE_LIVE_PRICE_OVERLAY
+            if uses_provisional
+            else SIGNAL_UPDATE_SOURCE_ARTIFACT
+        )
+        return {
+            "current_signal_status": status,
+            "current_signal_as_of": (
+                live_price_payload.get(
+                    "current_signal_as_of",
+                )
+                or current_signal_as_of
+            ),
+            "latest_price": (
+                float(latest_price)
+                if isinstance(latest_price, (int, float))
+                and not isinstance(latest_price, bool)
+                else None
+            ),
+            "latest_price_as_of": (
+                str(latest_price_as_of)
+                if latest_price_as_of is not None else None
+            ),
+            "uses_provisional_price": uses_provisional,
+            "signal_update_source": source,
+        }
+    # No live overlay -- conservative locked artifact view.
+    return {
+        "current_signal_status": (
+            CURRENT_SIGNAL_STATUS_LOCKED
+        ),
+        "current_signal_as_of": current_signal_as_of,
+        "latest_price": None,
+        "latest_price_as_of": None,
+        "uses_provisional_price": False,
+        "signal_update_source": (
+            SIGNAL_UPDATE_SOURCE_ARTIFACT
+        ),
+    }
+
+
+def _default_flip_risk_block() -> dict[str, Any]:
+    """Phase 6I-40 flip-risk placeholders. Null / False
+    until a future phase wires Spymaster-style price-range
+    data through the chain."""
+    return {
+        "flip_risk_available": False,
+        "flip_risk_label": None,
+        "nearest_flip_price": None,
+        "nearest_flip_pct": None,
+        "flip_to_signal": None,
+    }
+
+
+def _build_flip_risk_block(
+    *,
+    flip_risk_payload: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compose the per-row flip-risk block. When no payload
+    is supplied returns the null placeholder block."""
+    if not isinstance(flip_risk_payload, Mapping):
+        return _default_flip_risk_block()
+    label = flip_risk_payload.get("flip_risk_label")
+    if label not in ALL_FLIP_RISK_LABELS:
+        # Reject unknown labels rather than silently
+        # accepting fabricated values.
+        label = None
+    return {
+        "flip_risk_available": bool(
+            flip_risk_payload.get(
+                "flip_risk_available", False,
+            ),
+        ),
+        "flip_risk_label": label,
+        "nearest_flip_price": (
+            float(
+                flip_risk_payload.get("nearest_flip_price")
+            )
+            if isinstance(
+                flip_risk_payload.get("nearest_flip_price"),
+                (int, float),
+            )
+            and not isinstance(
+                flip_risk_payload.get("nearest_flip_price"),
+                bool,
+            )
+            else None
+        ),
+        "nearest_flip_pct": (
+            float(
+                flip_risk_payload.get("nearest_flip_pct")
+            )
+            if isinstance(
+                flip_risk_payload.get("nearest_flip_pct"),
+                (int, float),
+            )
+            and not isinstance(
+                flip_risk_payload.get("nearest_flip_pct"),
+                bool,
+            )
+            else None
+        ),
+        "flip_to_signal": flip_risk_payload.get(
+            "flip_to_signal",
+        ),
+    }
+
+
 def _latest_overall_direction(
     summary_block: Optional[Mapping[str, Any]],
     pwk_agg: Mapping[str, Any],
@@ -2091,6 +2632,16 @@ def _build_blocked_row(
     chart_readiness: Optional[Mapping[str, Any]] = None,
     artifact_last_date: Optional[str] = None,
     confluence_last_date: Optional[str] = None,
+    artifact: Optional[Mapping[str, Any]] = None,
+    member_completeness_provider: Optional[
+        Callable[..., Mapping[str, Any]]
+    ] = None,
+    live_price_provider: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ] = None,
+    flip_risk_provider: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ] = None,
 ) -> PerTickerRankingRow:
     chart = chart_readiness or {
         "chart_ready_available": False,
@@ -2100,6 +2651,54 @@ def _build_blocked_row(
         "chart_row_count": None,
         "chart_blocker": "no_chart_data_source",
     }
+    # Phase 6I-40: completeness + current-signal-status +
+    # flip-risk blocks on blocked rows. Blocked rows surface
+    # status=blocked / source=unavailable; the completeness
+    # block reports the blocker reason rather than fabricating
+    # a complete view.
+    member_provider = (
+        member_completeness_provider
+        or _default_member_completeness_provider
+    )
+    try:
+        member_block = member_provider(ticker, artifact)
+    except Exception:
+        member_block = (
+            _default_member_completeness_provider(
+                ticker, artifact,
+            )
+        )
+    if not isinstance(member_block, Mapping):
+        member_block = (
+            _default_member_completeness_provider(
+                ticker, artifact,
+            )
+        )
+    completeness = _build_data_completeness(
+        rank_eligible=False,
+        member_block=member_block,
+        blocked_reason=blocked_reason,
+    )
+    current_signal_status_block = (
+        _build_current_signal_status_block(
+            ticker=ticker,
+            rank_eligible=False,
+            confluence_last_date=confluence_last_date,
+            live_price_payload=None,
+        )
+    )
+    # Blocked rows do not consult the flip-risk provider --
+    # the placeholder block is sufficient.
+    _ = live_price_provider  # not consulted on blocked rows
+    _ = flip_risk_provider   # not consulted on blocked rows
+    flip_risk = _default_flip_risk_block()
+    sort_values = _build_row_sort_values(
+        ticker=ticker,
+        rank=None,
+        total_capture_pct_sum=None,
+        avg_sharpe_ratio=None,
+        trigger_days_sum=0,
+    )
     return PerTickerRankingRow(
         ticker=ticker,
         artifact_path=(
@@ -2138,6 +2737,12 @@ def _build_blocked_row(
         chart_row_count=chart.get("chart_row_count"),
         chart_blocker=chart.get("chart_blocker"),
         issue_codes=tuple(issue_codes),
+        row_sort_values=sort_values,
+        data_completeness=completeness,
+        current_signal_status_block=(
+            current_signal_status_block
+        ),
+        flip_risk=flip_risk,
     )
 
 
@@ -2150,6 +2755,15 @@ def _build_one_ticker_row(
         [Path], Optional[Mapping[str, Any]],
     ],
     chart_readiness_callable: Callable[..., dict[str, Any]],
+    member_completeness_provider: Optional[
+        Callable[..., Mapping[str, Any]]
+    ] = None,
+    live_price_provider: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ] = None,
+    flip_risk_provider: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ] = None,
 ) -> PerTickerRankingRow:
     artifact_path = _resolve_artifact_path(
         ticker, artifact_root,
@@ -2168,6 +2782,12 @@ def _build_one_ticker_row(
                 RANKING_BLOCKED_REASON_ARTIFACT_MISSING,
             ),
             chart_readiness=chart,
+            artifact=None,
+            member_completeness_provider=(
+                member_completeness_provider
+            ),
+            live_price_provider=live_price_provider,
+            flip_risk_provider=flip_risk_provider,
         )
 
     artifact = artifact_loader(artifact_path)
@@ -2186,6 +2806,12 @@ def _build_one_ticker_row(
             ),
             data_status=DATA_STATUS_UNREADABLE,
             chart_readiness=chart,
+            artifact=None,
+            member_completeness_provider=(
+                member_completeness_provider
+            ),
+            live_price_provider=live_price_provider,
+            flip_risk_provider=flip_risk_provider,
         )
 
     data_status, issue_codes = _classify_artifact_data_status(
@@ -2219,6 +2845,52 @@ def _build_one_ticker_row(
             blocked_reason = (
                 RANKING_BLOCKED_REASON_INVALID_PAYLOAD_SHAPE
             )
+        # Phase 6I-40 blocks on partial-payload blocked
+        # rows. Completeness reports the blocker reason;
+        # status=blocked / source=unavailable; flip-risk
+        # is null.
+        member_provider = (
+            member_completeness_provider
+            or _default_member_completeness_provider
+        )
+        try:
+            member_block = member_provider(
+                ticker, artifact,
+            )
+        except Exception:
+            member_block = (
+                _default_member_completeness_provider(
+                    ticker, artifact,
+                )
+            )
+        if not isinstance(member_block, Mapping):
+            member_block = (
+                _default_member_completeness_provider(
+                    ticker, artifact,
+                )
+            )
+        completeness_blocked = _build_data_completeness(
+            rank_eligible=False,
+            member_block=member_block,
+            blocked_reason=blocked_reason,
+        )
+        signal_status_blocked = (
+            _build_current_signal_status_block(
+                ticker=ticker,
+                rank_eligible=False,
+                confluence_last_date=(
+                    confluence_last_date
+                ),
+                live_price_payload=None,
+            )
+        )
+        sort_values_blocked = _build_row_sort_values(
+            ticker=ticker,
+            rank=None,
+            total_capture_pct_sum=None,
+            avg_sharpe_ratio=None,
+            trigger_days_sum=0,
+        )
         return PerTickerRankingRow(
             ticker=ticker,
             artifact_path=str(artifact_path),
@@ -2257,6 +2929,12 @@ def _build_one_ticker_row(
             chart_row_count=chart.get("chart_row_count"),
             chart_blocker=chart.get("chart_blocker"),
             issue_codes=tuple(issue_codes),
+            row_sort_values=sort_values_blocked,
+            data_completeness=completeness_blocked,
+            current_signal_status_block=(
+                signal_status_blocked
+            ),
+            flip_risk=_default_flip_risk_block(),
         )
 
     # FULL 60-cell payload -- aggregate.
@@ -2289,6 +2967,78 @@ def _build_one_ticker_row(
     # one-row-per-ticker display contract.
     primary_build_summary = _build_primary_build_summary(
         current_signal_matrix,
+    )
+
+    # Phase 6I-40: completeness / current-signal-status /
+    # flip-risk / sort-value blocks on eligible rows.
+    member_provider = (
+        member_completeness_provider
+        or _default_member_completeness_provider
+    )
+    try:
+        member_block = member_provider(ticker, artifact)
+    except Exception:
+        member_block = (
+            _default_member_completeness_provider(
+                ticker, artifact,
+            )
+        )
+    if not isinstance(member_block, Mapping):
+        member_block = (
+            _default_member_completeness_provider(
+                ticker, artifact,
+            )
+        )
+    completeness_block = _build_data_completeness(
+        rank_eligible=True,
+        member_block=member_block,
+        blocked_reason=None,
+    )
+    live_price_payload: Optional[Mapping[str, Any]] = None
+    if live_price_provider is not None:
+        try:
+            live_price_payload = live_price_provider(
+                ticker, artifact,
+            )
+        except Exception:
+            live_price_payload = None
+        if (
+            live_price_payload is not None
+            and not isinstance(live_price_payload, Mapping)
+        ):
+            live_price_payload = None
+    signal_status_block = (
+        _build_current_signal_status_block(
+            ticker=ticker,
+            rank_eligible=True,
+            confluence_last_date=confluence_last_date,
+            live_price_payload=live_price_payload,
+        )
+    )
+    flip_risk_payload: Optional[Mapping[str, Any]] = None
+    if flip_risk_provider is not None:
+        try:
+            flip_risk_payload = flip_risk_provider(
+                ticker, artifact,
+            )
+        except Exception:
+            flip_risk_payload = None
+        if (
+            flip_risk_payload is not None
+            and not isinstance(flip_risk_payload, Mapping)
+        ):
+            flip_risk_payload = None
+    flip_risk_block = _build_flip_risk_block(
+        flip_risk_payload=flip_risk_payload,
+    )
+    sort_values_block = _build_row_sort_values(
+        ticker=ticker,
+        rank=None,  # set later by package layer
+        total_capture_pct_sum=pwk_agg[
+            "total_capture_pct_sum"
+        ],
+        avg_sharpe_ratio=pwk_agg["avg_sharpe_ratio"],
+        trigger_days_sum=pwk_agg["trigger_days_sum"],
     )
 
     return PerTickerRankingRow(
@@ -2337,6 +3087,10 @@ def _build_one_ticker_row(
             current_signal_summary
         ),
         primary_build_summary=primary_build_summary,
+        row_sort_values=sort_values_block,
+        data_completeness=completeness_block,
+        current_signal_status_block=signal_status_block,
+        flip_risk=flip_risk_block,
     )
 
 
@@ -2434,11 +3188,40 @@ def build_multiwindow_ranking_export(
     stackbuilder_universe_callable: Optional[
         Callable[..., list[str]]
     ] = None,
+    member_completeness_provider_callable: Optional[
+        Callable[..., Mapping[str, Any]]
+    ] = None,
+    live_price_provider_callable: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ] = None,
+    flip_risk_provider_callable: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ] = None,
 ) -> MultiTickerRankingExportReport:
     """Build the Phase 6I-34 multi-ticker ranking export.
 
     Read-only. Default loader / chart-readiness implementations
     can be overridden via injection kwargs for tests.
+
+    Phase 6I-40 injection seams (all default to a
+    conservative / read-only behavior so the production
+    path does not fetch live data):
+
+      * ``member_completeness_provider_callable`` -- returns
+        per-ticker member-level issue data. Default returns
+        ``has_incomplete_build_members=False`` with empty
+        lists (current production artifacts don't carry
+        member-level issue data yet).
+      * ``live_price_provider_callable`` -- returns
+        per-ticker live-price overlay
+        (``latest_price`` / ``latest_price_as_of`` /
+        ``uses_provisional_price``). Default is ``None``;
+        rows surface ``current_signal_status="locked"``
+        with no live overlay.
+      * ``flip_risk_provider_callable`` -- returns
+        per-ticker Spymaster-style flip-risk payload.
+        Default is ``None``; rows surface the null
+        placeholder block.
     """
     artifact_root_path = Path(artifact_root)
     cache_dir_path = (
@@ -2470,6 +3253,15 @@ def build_multiwindow_ranking_export(
             cache_dir=cache_dir_path,
             artifact_loader=loader,
             chart_readiness_callable=chart_fn,
+            member_completeness_provider=(
+                member_completeness_provider_callable
+            ),
+            live_price_provider=(
+                live_price_provider_callable
+            ),
+            flip_risk_provider=(
+                flip_risk_provider_callable
+            ),
         )
         rows.append(row)
 
@@ -2492,6 +3284,10 @@ def build_multiwindow_ranking_export(
         # A renderer MUST NOT explode a ticker into multiple
         # rows just because it has multiple active K builds.
         "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
+        # Phase 6I-40 sortable leaderboard metadata.
+        "sortable_columns": list(ALL_SORT_COLUMNS),
+        "default_sort": [dict(s) for s in DEFAULT_SORT],
+        "sort_options": [dict(o) for o in SORT_OPTIONS],
         "blocked_reason_counts": {},
         "data_status_counts": {},
         "freshness_status_counts": {},
