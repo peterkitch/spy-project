@@ -767,8 +767,8 @@ def _align_member_signals_to_target_dates(
     member_dates_seq: Optional[list[Any]],
     member_signals_seq: list[Any],
 ) -> tuple[Optional[list[str]], Optional[str]]:
-    """Project a member's signal sequence onto the target's
-    exact date axis by normalized ISO-8601 ``YYYY-MM-DD`` key.
+    """Align a member's signal sequence to the target's exact
+    date axis by normalized ISO-8601 ``YYYY-MM-DD`` key.
 
     Phase 6I-29: the previous adapter contract required member
     signal length to match the target's ``len(dates_seq)``
@@ -1480,15 +1480,15 @@ def prepare_multiwindow_k_inputs(
                     ]
                 else:
                     # Phase 6I-29 exact-date alignment: when
-                    # bar counts disagree, attempt to project
-                    # the member's signal sequence onto the
+                    # bar counts disagree, attempt to align
+                    # the member's signal sequence to the
                     # target's exact date axis using exact
                     # normalized date keys. No resample / no
-                    # ffill / no "nearest". If any target date
-                    # is missing from the member's date axis,
-                    # the member remains unusable and the cell
-                    # still skips under strict full-member
-                    # coverage.
+                    # ffill / no "nearest" / no projection.
+                    # If any target date is missing from the
+                    # member's date axis, the member remains
+                    # unusable and the cell still skips
+                    # under strict full-member coverage.
                     member_dates = _extract_dates(member_lib)
                     aligned, align_reason = (
                         _align_member_signals_to_target_dates(
