@@ -216,6 +216,151 @@ def load_view_model_from_builder(
 
 
 # ---------------------------------------------------------------------------
+# Phase 6I-42 amendment-1: from-tickers + local-overlays integration path
+# ---------------------------------------------------------------------------
+
+
+def build_view_model_from_tickers(
+    tickers: Sequence[str],
+    *,
+    artifact_root: Any,
+    cache_dir: Optional[Any] = None,
+    universe_mode: Optional[str] = None,
+    with_local_overlays: bool = False,
+    overlay_cache_dir: Optional[Any] = None,
+    overlay_artifact_root: Optional[Any] = None,
+    overlay_stackbuilder_root: Optional[Any] = None,
+    overlay_signal_library_dir: Optional[Any] = None,
+    current_as_of_date: Optional[str] = None,
+    overlay_cache_loader_callable: Optional[
+        Callable[..., Any]
+    ] = None,
+    overlay_stackbuilder_member_callable: Optional[
+        Callable[..., Any]
+    ] = None,
+    overlay_adapter_diagnostic_callable: Optional[
+        Callable[..., Any]
+    ] = None,
+    ranking_artifact_loader_callable: Optional[
+        Callable[..., Any]
+    ] = None,
+    ranking_chart_readiness_callable: Optional[
+        Callable[..., Any]
+    ] = None,
+) -> dict[str, Any]:
+    """Build a Phase 6I-36 view model from raw tickers,
+    optionally enriching with Phase 6I-42 local overlays.
+
+    Read-only. Threads through::
+
+        Phase 6I-42 overlay scan (when with_local_overlays)
+          -> Phase 6I-34 build_multiwindow_ranking_export()
+          -> Phase 6I-35 build_website_export_package()
+          -> Phase 6I-36 build_view_model()
+
+    All deeper imports are deferred so the renderer's
+    top-level import surface stays small.
+    """
+    # Deferred imports.
+    import confluence_board_runtime_overlays as _ovl
+    import confluence_multiwindow_ranking_export as _cmre
+    import confluence_website_export_package as _cwep
+
+    ticker_list = [
+        str(t).strip().upper()
+        for t in tickers if str(t).strip()
+    ]
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for t in ticker_list:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    ticker_list = deduped
+
+    member_provider: Optional[Callable[..., Any]] = None
+    live_price_provider: Optional[
+        Callable[..., Any]
+    ] = None
+    if with_local_overlays:
+        overlay_report = (
+            _ovl.build_board_runtime_overlays(
+                ticker_list,
+                artifact_root=overlay_artifact_root,
+                cache_dir=(
+                    overlay_cache_dir
+                    if overlay_cache_dir is not None
+                    else cache_dir
+                ),
+                stackbuilder_root=(
+                    overlay_stackbuilder_root
+                ),
+                signal_library_dir=(
+                    overlay_signal_library_dir
+                ),
+                current_as_of_date=current_as_of_date,
+                cache_loader_callable=(
+                    overlay_cache_loader_callable
+                ),
+                stackbuilder_member_callable=(
+                    overlay_stackbuilder_member_callable
+                ),
+                adapter_diagnostic_callable=(
+                    overlay_adapter_diagnostic_callable
+                ),
+            )
+        )
+        member_provider = (
+            _ovl.make_member_completeness_provider(
+                overlay_report,
+            )
+        )
+        live_price_provider = (
+            _ovl.make_live_price_provider(overlay_report)
+        )
+
+    ranking_report = _cmre.build_multiwindow_ranking_export(
+        ticker_list,
+        artifact_root=artifact_root,
+        cache_dir=cache_dir,
+        artifact_loader_callable=(
+            ranking_artifact_loader_callable
+        ),
+        chart_readiness_callable=(
+            ranking_chart_readiness_callable
+        ),
+        member_completeness_provider_callable=(
+            member_provider
+        ),
+        live_price_provider_callable=(
+            live_price_provider
+        ),
+    )
+
+    def _stub_underlying_export(
+        _tickers,
+        *,
+        artifact_root=None,
+        cache_dir=None,
+    ):
+        return ranking_report
+
+    package = _cwep.build_website_export_package(
+        ticker_list,
+        artifact_root=artifact_root,
+        cache_dir=cache_dir,
+        universe_mode=(
+            universe_mode
+            or _cwep.UNIVERSE_MODE_EXPLICIT
+        ),
+        underlying_export_callable=(
+            _stub_underlying_export
+        ),
+    )
+    return _crv.build_view_model(package)
+
+
+# ---------------------------------------------------------------------------
 # HTML / JSON escaping helpers
 # ---------------------------------------------------------------------------
 
@@ -1690,6 +1835,70 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "stdin."
         ),
     )
+    # Phase 6I-42 amendment-1: from-tickers source.
+    src.add_argument(
+        "--from-tickers",
+        default=None,
+        help=(
+            "Comma-separated explicit ticker list. Drives "
+            "the full Phase 6I-34 ranking export -> "
+            "6I-35 package -> 6I-36 view-model chain in-"
+            "process. Combine with --with-local-overlays "
+            "to thread Phase 6I-42 local overlays through."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-root",
+        default=None,
+        help=(
+            "Artifact root for the Phase 6I-34 ranking "
+            "export (used with --from-tickers)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help=(
+            "Cache directory for the Phase 6I-34 chart-"
+            "readiness fallback (used with "
+            "--from-tickers)."
+        ),
+    )
+    parser.add_argument(
+        "--with-local-overlays",
+        action="store_true",
+        help=(
+            "Enable Phase 6I-42 local overlays "
+            "(member-completeness + latest local price + "
+            "current-signal status). Read-only -- the "
+            "default cache loader uses the central "
+            "provenance loader; no yfinance fetch, no "
+            "subprocess, no production write."
+        ),
+    )
+    parser.add_argument(
+        "--overlay-cache-dir", default=None,
+        help=(
+            "Cache directory for the Phase 6I-42 overlay "
+            "loader (defaults to --cache-dir)."
+        ),
+    )
+    parser.add_argument(
+        "--overlay-artifact-root", default=None,
+    )
+    parser.add_argument(
+        "--overlay-stackbuilder-root", default=None,
+    )
+    parser.add_argument(
+        "--overlay-signal-library-dir", default=None,
+    )
+    parser.add_argument(
+        "--current-as-of-date", default=None,
+        help=(
+            "ISO date (YYYY-MM-DD). Drives the Phase "
+            "6I-42 overlay's locked/stale classification."
+        ),
+    )
     parser.add_argument(
         "--output",
         default=None,
@@ -1724,13 +1933,68 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             view_model = _crv.build_view_model(pkg)
         elif args.stdin:
             view_model = load_view_model_from_stdin()
+        elif args.from_tickers:
+            if not args.artifact_root:
+                print(
+                    json.dumps({
+                        "error": (
+                            "missing_artifact_root"
+                        ),
+                        "detail": (
+                            "--from-tickers requires "
+                            "--artifact-root."
+                        ),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            tickers = [
+                t.strip()
+                for t in args.from_tickers.split(",")
+                if t.strip()
+            ]
+            if not tickers:
+                print(
+                    json.dumps({
+                        "error": "empty_ticker_list",
+                        "detail": (
+                            "--from-tickers parsed to "
+                            "zero tickers."
+                        ),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            view_model = build_view_model_from_tickers(
+                tickers,
+                artifact_root=args.artifact_root,
+                cache_dir=args.cache_dir,
+                with_local_overlays=(
+                    args.with_local_overlays
+                ),
+                overlay_cache_dir=(
+                    args.overlay_cache_dir
+                ),
+                overlay_artifact_root=(
+                    args.overlay_artifact_root
+                ),
+                overlay_stackbuilder_root=(
+                    args.overlay_stackbuilder_root
+                ),
+                overlay_signal_library_dir=(
+                    args.overlay_signal_library_dir
+                ),
+                current_as_of_date=(
+                    args.current_as_of_date
+                ),
+            )
         else:
             print(
                 json.dumps({
                     "error": "missing_source",
                     "detail": (
                         "Provide --view-model, --package, "
-                        "or --stdin."
+                        "--stdin, or --from-tickers."
                     ),
                 }),
                 file=sys.stderr,

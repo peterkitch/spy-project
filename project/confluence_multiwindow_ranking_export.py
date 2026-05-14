@@ -371,7 +371,19 @@ SIGNAL_UPDATE_SOURCE_ARTIFACT: str = "artifact"
 SIGNAL_UPDATE_SOURCE_LIVE_PRICE_OVERLAY: str = (
     "live_price_overlay"
 )
+SIGNAL_UPDATE_SOURCE_LOCAL_CACHE: str = "local_cache"
 SIGNAL_UPDATE_SOURCE_UNAVAILABLE: str = "unavailable"
+
+# Sanctioned values a provider may supply via the
+# Phase 6I-40 live_price_provider_callable. Any other
+# value is rejected back to the default behavior so
+# providers cannot fabricate arbitrary source labels.
+ALL_SANCTIONED_SIGNAL_UPDATE_SOURCES: tuple[str, ...] = (
+    SIGNAL_UPDATE_SOURCE_ARTIFACT,
+    SIGNAL_UPDATE_SOURCE_LIVE_PRICE_OVERLAY,
+    SIGNAL_UPDATE_SOURCE_LOCAL_CACHE,
+    SIGNAL_UPDATE_SOURCE_UNAVAILABLE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2295,11 +2307,31 @@ def _build_current_signal_status_block(
             status = CURRENT_SIGNAL_STATUS_PROVISIONAL
         else:
             status = CURRENT_SIGNAL_STATUS_LOCKED
-        source = (
-            SIGNAL_UPDATE_SOURCE_LIVE_PRICE_OVERLAY
-            if uses_provisional
-            else SIGNAL_UPDATE_SOURCE_ARTIFACT
+        # Phase 6I-42 amendment-1: honor a provider-supplied
+        # signal_update_source when it is one of the
+        # sanctioned values. This lets the Phase 6I-42
+        # local-cache overlay surface
+        # ``signal_update_source="local_cache"`` instead of
+        # the previous behavior (everything non-provisional
+        # masked back to "artifact"). Any non-sanctioned
+        # provider value falls back to the default rule:
+        # ``live_price_overlay`` when provisional, else
+        # ``artifact``.
+        provided_source = live_price_payload.get(
+            "signal_update_source",
         )
+        if (
+            isinstance(provided_source, str)
+            and provided_source
+            in ALL_SANCTIONED_SIGNAL_UPDATE_SOURCES
+        ):
+            source = provided_source
+        else:
+            source = (
+                SIGNAL_UPDATE_SOURCE_LIVE_PRICE_OVERLAY
+                if uses_provisional
+                else SIGNAL_UPDATE_SOURCE_ARTIFACT
+            )
         return {
             "current_signal_status": status,
             "current_signal_as_of": (
