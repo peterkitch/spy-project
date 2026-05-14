@@ -554,6 +554,38 @@ def _build_ranking_table_row(
         "primary_build": _build_primary_build_compact(
             row.get("primary_build_summary"),
         ),
+        # Phase 6I-40 pass-through blocks. The renderer can
+        # use these on the leaderboard row without
+        # descending into the ticker card detail.
+        "row_sort_values": (
+            dict(row.get("row_sort_values"))
+            if isinstance(
+                row.get("row_sort_values"), Mapping,
+            )
+            else {}
+        ),
+        "data_completeness": (
+            dict(row.get("data_completeness"))
+            if isinstance(
+                row.get("data_completeness"), Mapping,
+            )
+            else {}
+        ),
+        "current_signal_status_block": (
+            dict(row.get("current_signal_status_block"))
+            if isinstance(
+                row.get(
+                    "current_signal_status_block",
+                ),
+                Mapping,
+            )
+            else {}
+        ),
+        "flip_risk": (
+            dict(row.get("flip_risk"))
+            if isinstance(row.get("flip_risk"), Mapping)
+            else {}
+        ),
     }
 
 
@@ -569,6 +601,24 @@ def _build_blocked_table_row(
         chart_status = (
             row.get("chart_blocker") or "unavailable"
         )
+    # Phase 6I-40: surface the data_completeness +
+    # current_signal_status_block pass-through on blocked
+    # rows too -- the renderer can show the "!" warning
+    # symbol + blocker reason instead of silently dropping
+    # the ticker.
+    completeness_out = (
+        dict(row.get("data_completeness"))
+        if isinstance(row.get("data_completeness"), Mapping)
+        else {}
+    )
+    signal_status_out = (
+        dict(row.get("current_signal_status_block"))
+        if isinstance(
+            row.get("current_signal_status_block"),
+            Mapping,
+        )
+        else {}
+    )
     return {
         "ticker": row.get("ticker") or "unknown",
         "reason": (
@@ -583,6 +633,9 @@ def _build_blocked_table_row(
         ),
         "chart_status": chart_status,
         "issues": _safe_list(row.get("issue_codes")),
+        # Phase 6I-40 pass-through.
+        "data_completeness": completeness_out,
+        "current_signal_status_block": signal_status_out,
     }
 
 
@@ -658,6 +711,29 @@ def _build_ticker_card(
         ] = dict(raw_primary)
     else:
         primary_build_summary_card = None
+    # Phase 6I-40: completeness + current-signal status +
+    # flip-risk pass-through on ticker cards (eligible AND
+    # blocked).
+    raw_completeness = detail.get("data_completeness")
+    data_completeness_card = (
+        dict(raw_completeness)
+        if isinstance(raw_completeness, Mapping)
+        else {}
+    )
+    raw_signal_status = detail.get(
+        "current_signal_status_block",
+    )
+    current_signal_status_card = (
+        dict(raw_signal_status)
+        if isinstance(raw_signal_status, Mapping)
+        else {}
+    )
+    raw_flip_risk = detail.get("flip_risk")
+    flip_risk_card = (
+        dict(raw_flip_risk)
+        if isinstance(raw_flip_risk, Mapping)
+        else {}
+    )
     return {
         "ticker": ticker,
         "rank_eligible": rank_eligible,
@@ -693,6 +769,12 @@ def _build_ticker_card(
         "primary_build_summary": (
             primary_build_summary_card
         ),
+        # Phase 6I-40 blocks.
+        "data_completeness": data_completeness_card,
+        "current_signal_status_block": (
+            current_signal_status_card
+        ),
+        "flip_risk": flip_risk_card,
     }
 
 
@@ -859,6 +941,58 @@ def build_view_model(
         )
     )
 
+    # Phase 6I-40: sort metadata pass-through.
+    sortable_columns = _safe_list(
+        package.get("sortable_columns"),
+    )
+    default_sort = [
+        dict(s) for s in _safe_list(
+            package.get("default_sort"),
+        )
+        if isinstance(s, Mapping)
+    ]
+    sort_options = [
+        dict(o) for o in _safe_list(
+            package.get("sort_options"),
+        )
+        if isinstance(o, Mapping)
+    ]
+
+    # Phase 6I-40: incomplete-member warning summary
+    # aggregated across rows (the TrafficFlow "missing/stale
+    # PKL summary panel" analog from trafficflow.py:3346).
+    incomplete_total = 0
+    incomplete_tickers: list[str] = []
+    completeness_status_counts: dict[str, int] = {}
+    for row in (
+        list(ranking_rows) + list(blocked_rows)
+    ):
+        cb = row.get("data_completeness")
+        if not isinstance(cb, Mapping):
+            continue
+        if cb.get("has_incomplete_build_members"):
+            incomplete_total += 1
+            t = row.get("ticker")
+            if isinstance(t, str):
+                incomplete_tickers.append(t)
+        status = cb.get(
+            "data_completeness_status", "unknown",
+        )
+        if not isinstance(status, str):
+            status = "unknown"
+        completeness_status_counts[status] = (
+            completeness_status_counts.get(status, 0) + 1
+        )
+    data_completeness_summary = {
+        "tickers_with_incomplete_members": int(
+            incomplete_total,
+        ),
+        "ticker_list": incomplete_tickers,
+        "by_data_completeness_status": (
+            completeness_status_counts
+        ),
+    }
+
     return {
         "schema_version": schema_version,
         "view_model_version": VIEW_MODEL_VERSION,
@@ -867,6 +1001,10 @@ def build_view_model(
         "page_title": PAGE_TITLE,
         # Phase 6I-39: one-row-per-ticker display contract.
         "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
+        # Phase 6I-40: sortable leaderboard metadata.
+        "sortable_columns": sortable_columns,
+        "default_sort": default_sort,
+        "sort_options": sort_options,
         "has_eligible_rankings": has_eligible,
         "eligible_count": eligible_count,
         "blocked_count": blocked_count,
@@ -878,6 +1016,10 @@ def build_view_model(
         "chart_readiness_summary": chart_summary_out,
         "freshness_summary": freshness_summary_out,
         "issue_summary": issue_summary_out,
+        # Phase 6I-40 data-completeness summary panel.
+        "data_completeness_summary": (
+            data_completeness_summary
+        ),
         "status_banner": status_banner,
         "remaining_limitations": remaining_limitations,
     }
@@ -913,6 +1055,12 @@ def build_error_view_model(
         # the error view model so the renderer never sees
         # this key missing.
         "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
+        # Phase 6I-40: sort metadata anchored on the error
+        # view model so the renderer never sees these keys
+        # missing.
+        "sortable_columns": [],
+        "default_sort": [],
+        "sort_options": [],
         "has_eligible_rankings": False,
         "eligible_count": 0,
         "blocked_count": 0,
@@ -924,6 +1072,11 @@ def build_error_view_model(
         "chart_readiness_summary": None,
         "freshness_summary": None,
         "issue_summary": None,
+        "data_completeness_summary": {
+            "tickers_with_incomplete_members": 0,
+            "ticker_list": [],
+            "by_data_completeness_status": {},
+        },
         "status_banner": {
             "kind": STATUS_BANNER_KIND_SCHEMA_ERROR,
             "headline": _BANNER_HEADLINE_SCHEMA_ERROR,
