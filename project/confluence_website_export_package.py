@@ -160,6 +160,20 @@ def _normalize_ranking_row(
     """Project a Phase 6I-34 eligible row into the website
     ranking-row shape."""
     windows_total = len(_cmre.CANONICAL_WINDOWS)
+    # Phase 6I-37 current-build signal summary pass-through.
+    # Eligible rows carry the summary; missing / non-mapping
+    # surfaces as None (renderer can branch).
+    current_signal_summary = row.get(
+        "current_build_signal_summary",
+    )
+    if not isinstance(current_signal_summary, Mapping):
+        current_signal_summary_out: Optional[
+            dict[str, Any]
+        ] = None
+    else:
+        current_signal_summary_out = dict(
+            current_signal_summary,
+        )
     return {
         "rank": int(rank),
         "ticker": row.get("ticker"),
@@ -206,6 +220,10 @@ def _normalize_ranking_row(
         "freshness_status": row.get("freshness_status"),
         "issue_codes": list(
             row.get("issue_codes", []) or [],
+        ),
+        # Phase 6I-37 current-build signal summary.
+        "current_build_signal_summary": (
+            current_signal_summary_out
         ),
     }
 
@@ -330,6 +348,31 @@ def _build_ticker_detail(
     # version; surface None rather than a misleading list.
     build_wide_window_alignment = None
 
+    # Phase 6I-37 current build signal surface. Eligible rows
+    # carry the per-cell matrix + aggregate summary; blocked
+    # rows surface empty matrix + null summary -- NO
+    # fabrication.
+    if rank_eligible:
+        raw_matrix = row.get("current_build_signals")
+        if isinstance(raw_matrix, (list, tuple)):
+            current_build_signals = [
+                dict(c) for c in raw_matrix
+                if isinstance(c, Mapping)
+            ]
+        else:
+            current_build_signals = []
+        cbsum = row.get("current_build_signal_summary")
+        current_build_signal_summary: Optional[
+            dict[str, Any]
+        ] = (
+            dict(cbsum)
+            if isinstance(cbsum, Mapping)
+            else None
+        )
+    else:
+        current_build_signals = []
+        current_build_signal_summary = None
+
     full_60_cell_detail_embedded = False
     artifact_path = row.get("artifact_path")
     if (
@@ -391,6 +434,11 @@ def _build_ticker_detail(
         ),
         "detail_available": detail_available,
         "detail_blocker": detail_blocker,
+        # Phase 6I-37 current build signal surface.
+        "current_build_signals": current_build_signals,
+        "current_build_signal_summary": (
+            current_build_signal_summary
+        ),
     }
 
 

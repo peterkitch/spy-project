@@ -298,6 +298,135 @@ def _build_ranking_table_row(
 ) -> dict[str, Any]:
     """Project a Phase 6I-35 normalized ranking row into a
     table-row shape suited for the website grid."""
+    # Phase 6I-37: surface a compact current-signal summary on
+    # the ranking-table row so a renderer can show
+    # "windows firing now / K cells signaling now / strongest
+    # currently-firing build" without descending into the
+    # ticker card.
+    cbsum_raw = row.get("current_build_signal_summary")
+    cbsum: Optional[Mapping[str, Any]] = (
+        cbsum_raw if isinstance(cbsum_raw, Mapping) else None
+    )
+    if cbsum is not None:
+        strongest_now_cell = cbsum.get(
+            "strongest_currently_signaling_cell",
+        )
+        if isinstance(strongest_now_cell, Mapping):
+            strongest_now_label = _format_strongest(
+                strongest_now_cell.get("window"),
+                strongest_now_cell.get("K"),
+                strongest_now_cell.get(
+                    "total_capture_pct",
+                ),
+                strongest_now_cell.get("sharpe_ratio"),
+            )
+        else:
+            strongest_now_label = None
+        # Phase 6I-37 amendment-1: surface BOTH the loose
+        # any-K predicate and the strict same-K cross-
+        # window predicate so a renderer can show "every
+        # window has SOME current signal" vs "the SAME K
+        # is signaling across every window" without
+        # confusion.
+        strongest_cross_k_raw = cbsum.get(
+            "strongest_cross_window_k_build",
+        )
+        if isinstance(strongest_cross_k_raw, Mapping):
+            strongest_cross_k_dict: Optional[
+                dict[str, Any]
+            ] = dict(strongest_cross_k_raw)
+        else:
+            strongest_cross_k_dict = None
+        current_signal_block: Optional[dict[str, Any]] = {
+            "cells_currently_buy": _safe_int(
+                cbsum.get("cells_currently_buy"),
+            ),
+            "cells_currently_short": _safe_int(
+                cbsum.get("cells_currently_short"),
+            ),
+            "cells_currently_none": _safe_int(
+                cbsum.get("cells_currently_none"),
+            ),
+            "cells_currently_missing": _safe_int(
+                cbsum.get("cells_currently_missing"),
+            ),
+            "cells_with_all_members_aligned": _safe_int(
+                cbsum.get(
+                    "cells_with_all_members_aligned",
+                ),
+            ),
+            "cells_historically_fired": _safe_int(
+                cbsum.get("cells_historically_fired"),
+            ),
+            # Any-K (loose) pass-through.
+            "windows_with_any_currently_signaling": (
+                _safe_list(
+                    cbsum.get(
+                        (
+                            "windows_with_any_currently_"
+                            "signaling"
+                        ),
+                    ),
+                )
+            ),
+            "all_windows_have_any_current_signal": bool(
+                cbsum.get(
+                    "all_windows_have_any_current_signal",
+                    False,
+                ),
+            ),
+            # Same-K (strict) pass-through.
+            "k_builds_currently_signaling_all_windows": (
+                _safe_list(
+                    cbsum.get(
+                        (
+                            "k_builds_currently_signaling_"
+                            "all_windows"
+                        ),
+                    ),
+                )
+            ),
+            "k_builds_all_members_aligned_all_windows": (
+                _safe_list(
+                    cbsum.get(
+                        (
+                            "k_builds_all_members_aligned_"
+                            "all_windows"
+                        ),
+                    ),
+                )
+            ),
+            "all_five_windows_same_k_currently_signaling": (
+                bool(
+                    cbsum.get(
+                        (
+                            "all_five_windows_same_k_"
+                            "currently_signaling"
+                        ),
+                        False,
+                    ),
+                )
+            ),
+            "all_five_windows_same_k_all_members_aligned": (
+                bool(
+                    cbsum.get(
+                        (
+                            "all_five_windows_same_k_"
+                            "all_members_aligned"
+                        ),
+                        False,
+                    ),
+                )
+            ),
+            "strongest_cross_window_k_build": (
+                strongest_cross_k_dict
+            ),
+            "strongest_currently_signaling_cell_label": (
+                strongest_now_label
+            ),
+        }
+    else:
+        current_signal_block = None
     return {
         "rank": _safe_int(row.get("rank"), default=0),
         "ticker": row.get("ticker") or "unknown",
@@ -335,6 +464,8 @@ def _build_ranking_table_row(
             row.get("freshness_status") or "unknown"
         ),
         "issues": _safe_list(row.get("issue_codes")),
+        # Phase 6I-37 current-build signal compact summary.
+        "current_signal_summary": current_signal_block,
     }
 
 
@@ -409,6 +540,28 @@ def _build_ticker_card(
             detail.get("ranking_blocked_reason")
             or detail.get("detail_blocker")
         )
+    # Phase 6I-37: pass through the per-cell matrix +
+    # aggregate summary. Eligible rows carry the data;
+    # blocked rows surface empty matrix + null summary --
+    # NO fabrication.
+    raw_matrix = detail.get("current_build_signals")
+    if (
+        rank_eligible
+        and isinstance(raw_matrix, (list, tuple))
+    ):
+        current_build_signals = [
+            dict(c) for c in raw_matrix
+            if isinstance(c, Mapping)
+        ]
+    else:
+        current_build_signals = []
+    raw_summary = detail.get("current_build_signal_summary")
+    if rank_eligible and isinstance(raw_summary, Mapping):
+        current_build_signal_summary: Optional[
+            dict[str, Any]
+        ] = dict(raw_summary)
+    else:
+        current_build_signal_summary = None
     return {
         "ticker": ticker,
         "rank_eligible": rank_eligible,
@@ -435,6 +588,11 @@ def _build_ticker_card(
             detail.get("issue_codes"),
         ),
         "blocker_text": blocker_text,
+        # Phase 6I-37 current-build signal surface.
+        "current_build_signals": current_build_signals,
+        "current_build_signal_summary": (
+            current_build_signal_summary
+        ),
     }
 
 

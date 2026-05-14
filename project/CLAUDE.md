@@ -172,25 +172,34 @@ an explicit ledger entry classifies the divergence.
 
 ---
 
-#### Product North Star / Do Not Drift (Phase 6I-33 amendment-1)
+#### Product North Star / Do Not Drift (Phase 6I-37)
 
-The current SPY path is a **pilot/proof path**, not the final product.
+The current SPY path is a **pilot/proof path**, not the final product. **SPY remains parked until source readiness flips.**
 
-The final Confluence goal is a **multi-ticker ranking board**, not a single-ticker detail page. The desired product is effectively the old **TrafficFlow ranking workflow** rebuilt with **true multi-window support** — a TrafficFlow-style ranking/export layer over a **large ticker universe**, scoring and comparing many tickers using **all five canonical windows: 1d / 1wk / 1mo / 3mo / 1y**.
+The final Confluence goal is a **multi-ticker, TrafficFlow-style ranking board over a large and growing ticker universe**, scoring and comparing many tickers using **all five canonical windows: 1d / 1wk / 1mo / 3mo / 1y**.
 
-The per-ticker 60-cell payload (Phase 6I-20 contract: `per_window_k_metrics` + `build_wide_window_alignment` + `multiwindow_k_engine_payload_metadata`) is the **building block**, not the user-facing destination. The current Phase 6I-22..32 chain proves the per-ticker payload is reachable + safe for SPY; a future phase must wire this into a **cross-ticker multi-window Confluence ranking/export layer** that scans every valid ticker artifact and emits website-ready ranking/detail data.
+The per-ticker 60-cell payload (Phase 6I-20 contract: `per_window_k_metrics` + `build_wide_window_alignment` + `multiwindow_k_engine_payload_metadata`) is the **building block**, not the user-facing destination.
 
-Future website-facing data should include:
+The key user question the website must answer every day:
 
-- multi-ticker ranking rows (one row per qualifying ticker);
-- per-ticker 60-cell multi-window detail (`per_window_k_metrics`);
-- `build_wide_window_alignment` per ticker;
-- chart-ready rows where available;
-- data freshness / blocker fields (so the UI can honestly surface "stale" / "missing window" / "missing K row" instead of hiding them).
+> *"What tickers/builds are firing now across multiple windows, and what has historically happened when they fired?"*
+
+The website must therefore surface, per ticker and per `(K, window)` cell:
+
+1. **Which tickers/builds are firing now.**
+2. **Which K builds are firing now.**
+3. **Which canonical windows are firing** (1d / 1wk / 1mo / 3mo / 1y).
+4. **How many build members agree with the current signal** (alignment ratio, all-members-aligned flag).
+5. **Historical performance when that (K, window) condition fired** (total capture, avg daily capture, Sharpe, trigger days, wins/losses).
+6. **Chart / freshness / blocker status** so stale or incomplete signals are obvious.
+
+**Current signal state** comes from the latest combined signal + member counts (`latest_combined_signal` + `latest_buy_count` / `latest_short_count` / `latest_none_count` / `latest_missing_count` / `member_count` on each Phase 6I-23 cell). **Historical performance** comes from the per-window K cell metrics (`total_capture_pct`, `avg_daily_capture_pct`, `sharpe_ratio`, `trigger_days`, `wins`, `losses`).
+
+**TrafficFlow parity gap (honest):** legacy TrafficFlow `compute_build_metrics_spymaster_parity` averages metrics across all non-empty subsets (`2^N - 1`) of active build members per build — its K is a *subset size* with subset-averaging. The Phase 6I-23 multi-window K engine emits one cell per `(K, window)` where K is a *combine threshold* (`n`-of-`N` agreement). The Phase 6I-37 `current_build_signals` matrix answers the user-facing current-signal + per-cell-historical-performance question, but it does **NOT** reproduce legacy TrafficFlow subset-average semantics. A future scoring / parity phase may close that gap; until then, the website surface honestly carries combine-threshold K cells, not subset-averaged K builds.
 
 Stay aligned with the existing script family — **OnePass** / **ImpactSearch** / **StackBuilder** / **TrafficFlow** / **MultiTimeframe** / **Confluence**. Do not invent vague replacement language that hides which data came from which layer. When future phases name a new module, the name should make it obvious whether it consumes StackBuilder's K rows, the OnePass interval libraries, the TrafficFlow multi-timeframe surface, or the Confluence multi-ticker ranking surface.
 
-**Do not drift.** A "single-ticker SPY pass works end-to-end" verdict is not a website launch. The website launch verdict is "the multi-ticker ranking board can score and rank every qualifying ticker in the universe on the canonical 1d / 1wk / 1mo / 3mo / 1y window grid AND surface honest freshness/blocker fields for the rest."
+**Do not drift.** A "single-ticker SPY pass works end-to-end" verdict is **not** a website launch. A payload-only data contract that hides current signal clarity is **not** a website launch. The website launch verdict is: *"the multi-ticker ranking board can score and rank every qualifying ticker in the universe on the canonical 1d / 1wk / 1mo / 3mo / 1y window grid, surface current signal state plus historical performance per `(K, window)` cell, AND surface honest freshness / blocker fields for the rest."*
 
 ---
 
