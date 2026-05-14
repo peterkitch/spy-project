@@ -269,6 +269,18 @@ class PerTickerRankingRow:
     # Issues.
     issue_codes: tuple[str, ...]
 
+    # Phase 6I-37: current build signal surface.
+    # Eligible rows carry a 60-entry tuple of canonical (K,
+    # window) cell records (matrix) plus an aggregate summary.
+    # Blocked rows carry empty matrix + null summary -- no
+    # fabrication.
+    current_build_signals: tuple[dict[str, Any], ...] = field(
+        default_factory=tuple,
+    )
+    current_build_signal_summary: Optional[
+        dict[str, Any]
+    ] = None
+
 
 @dataclass
 class MultiTickerRankingExportReport:
@@ -333,6 +345,17 @@ class MultiTickerRankingExportReport:
                 "chart_row_count": r.chart_row_count,
                 "chart_blocker": r.chart_blocker,
                 "issue_codes": list(r.issue_codes),
+                # Phase 6I-37 current-build signal surface.
+                "current_build_signals": [
+                    dict(cell)
+                    for cell in r.current_build_signals
+                ],
+                "current_build_signal_summary": (
+                    dict(r.current_build_signal_summary)
+                    if r.current_build_signal_summary
+                    is not None
+                    else None
+                ),
             }
         return {
             "generated_at": self.generated_at,
@@ -789,6 +812,314 @@ def _aggregate_build_wide_window_alignment(
     return tuple(out)
 
 
+# ---------------------------------------------------------------------------
+# Phase 6I-37: current build signal matrix
+# ---------------------------------------------------------------------------
+
+
+_CURRENT_SIGNAL_BUY = "Buy"
+_CURRENT_SIGNAL_SHORT = "Short"
+_CURRENT_SIGNAL_NONE = "None"
+
+
+def _cell_alignment_ratio(
+    *,
+    latest_combined_signal: Optional[str],
+    latest_buy_count: int,
+    latest_short_count: int,
+    member_count: int,
+) -> float:
+    """Per-cell alignment ratio.
+
+    Defined as the share of members whose latest signal
+    matches the combined signal direction:
+
+      * Buy   -> ``latest_buy_count   / member_count``
+      * Short -> ``latest_short_count / member_count``
+      * else  -> ``0.0``
+
+    Returns ``0.0`` when ``member_count <= 0``.
+    """
+    if member_count <= 0:
+        return 0.0
+    if latest_combined_signal == _CURRENT_SIGNAL_BUY:
+        return float(latest_buy_count) / float(
+            member_count,
+        )
+    if latest_combined_signal == _CURRENT_SIGNAL_SHORT:
+        return float(latest_short_count) / float(
+            member_count,
+        )
+    return 0.0
+
+
+def _build_current_signal_matrix(
+    pwk: Sequence[Mapping[str, Any]],
+    *,
+    ticker: str,
+) -> tuple[dict[str, Any], ...]:
+    """Project a validated ``per_window_k_metrics`` list into
+    a per-cell current-build-signal matrix.
+
+    One row per canonical ``(K, window)`` cell. Non-canonical
+    extras are silently skipped (the strict validator already
+    cleared them upstream). The matrix is sorted in
+    ``(window, K)`` canonical order so the renderer can iterate
+    deterministically: windows in the canonical order
+    ``1d / 1wk / 1mo / 3mo / 1y`` and K ascending 1..12 within
+    each window.
+
+    Phase 6I-37 schema (per row):
+
+      * ``ticker``                  (str, repeated for renderer convenience)
+      * ``K``                       (int, canonical 1..12)
+      * ``window``                  (str, canonical)
+      * ``latest_combined_signal``  ("Buy" / "Short" / "None" / "missing")
+      * ``latest_buy_count``        (int)
+      * ``latest_short_count``      (int)
+      * ``latest_none_count``       (int)
+      * ``latest_missing_count``    (int)
+      * ``member_count``            (int)
+      * ``alignment_ratio``         (float, 0..1)
+      * ``all_members_aligned``     (bool)
+      * ``currently_signaling``     (bool: latest_combined_signal in Buy/Short)
+      * ``firing``                  (bool: trigger_days > 0; historical)
+      * ``total_capture_pct``       (float)
+      * ``avg_daily_capture_pct``   (float | None)
+      * ``sharpe_ratio``            (float | None)
+      * ``trigger_days``            (int)
+      * ``wins``                    (int | None)
+      * ``losses``                  (int | None)
+    """
+    canonical_k_set = set(CANONICAL_K_VALUES)
+    canonical_w_set = set(CANONICAL_WINDOWS)
+    by_cell: dict[tuple[int, str], dict[str, Any]] = {}
+    for cell in pwk:
+        if not isinstance(cell, Mapping):
+            continue
+        K_raw = cell.get("K")
+        w_raw = cell.get("window")
+        if isinstance(K_raw, bool):
+            continue
+        try:
+            K_int = int(K_raw)
+        except Exception:
+            continue
+        if not isinstance(w_raw, str):
+            continue
+        if (
+            K_int not in canonical_k_set
+            or w_raw not in canonical_w_set
+        ):
+            continue
+        latest_combined = _safe_str(
+            cell.get("latest_combined_signal"),
+        )
+        latest_buy = _safe_int(cell.get("latest_buy_count"))
+        latest_short = _safe_int(
+            cell.get("latest_short_count"),
+        )
+        latest_none = _safe_int(cell.get("latest_none_count"))
+        latest_missing = _safe_int(
+            cell.get("latest_missing_count"),
+        )
+        member_count = _safe_int(cell.get("member_count"))
+        trigger_days = _safe_int(cell.get("trigger_days"))
+        total_capture_pct = (
+            _safe_float(cell.get("total_capture_pct")) or 0.0
+        )
+        avg_daily_capture_pct = _safe_float(
+            cell.get("avg_daily_capture_pct"),
+        )
+        sharpe_ratio = _safe_float(cell.get("sharpe_ratio"))
+        wins_raw = cell.get("wins")
+        wins = (
+            int(wins_raw)
+            if isinstance(wins_raw, int)
+            and not isinstance(wins_raw, bool)
+            else None
+        )
+        losses_raw = cell.get("losses")
+        losses = (
+            int(losses_raw)
+            if isinstance(losses_raw, int)
+            and not isinstance(losses_raw, bool)
+            else None
+        )
+
+        alignment_ratio = _cell_alignment_ratio(
+            latest_combined_signal=latest_combined,
+            latest_buy_count=latest_buy,
+            latest_short_count=latest_short,
+            member_count=member_count,
+        )
+        all_members_aligned = bool(
+            member_count > 0
+            and alignment_ratio == 1.0
+            and latest_combined in (
+                _CURRENT_SIGNAL_BUY, _CURRENT_SIGNAL_SHORT,
+            )
+        )
+        currently_signaling = bool(
+            latest_combined in (
+                _CURRENT_SIGNAL_BUY, _CURRENT_SIGNAL_SHORT,
+            )
+        )
+        firing = bool(trigger_days > 0)
+
+        by_cell[(K_int, w_raw)] = {
+            "ticker": ticker,
+            "K": K_int,
+            "window": w_raw,
+            "latest_combined_signal": latest_combined,
+            "latest_buy_count": int(latest_buy),
+            "latest_short_count": int(latest_short),
+            "latest_none_count": int(latest_none),
+            "latest_missing_count": int(latest_missing),
+            "member_count": int(member_count),
+            "alignment_ratio": float(alignment_ratio),
+            "all_members_aligned": all_members_aligned,
+            "currently_signaling": currently_signaling,
+            "firing": firing,
+            "total_capture_pct": float(total_capture_pct),
+            "avg_daily_capture_pct": (
+                avg_daily_capture_pct
+            ),
+            "sharpe_ratio": sharpe_ratio,
+            "trigger_days": int(trigger_days),
+            "wins": wins,
+            "losses": losses,
+        }
+
+    # Emit in canonical (window, K) order for deterministic
+    # rendering.
+    out: list[dict[str, Any]] = []
+    for w in CANONICAL_WINDOWS:
+        for K in CANONICAL_K_VALUES:
+            row = by_cell.get((K, w))
+            if row is not None:
+                out.append(row)
+    return tuple(out)
+
+
+def _build_current_signal_summary(
+    matrix: Sequence[Mapping[str, Any]],
+    *,
+    bwwa: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Aggregate the per-cell matrix into a compact summary
+    for the website ranking row / ticker card.
+
+    The summary surfaces:
+
+      * ``cells_total`` (60 when grid is complete).
+      * ``cells_currently_buy / _short / _none / _missing``.
+      * ``cells_with_all_members_aligned``.
+      * ``cells_historically_firing`` (``trigger_days > 0``).
+      * ``windows_with_any_currently_signaling`` (any Buy or
+        Short cell exists in the window).
+      * ``windows_with_all_members_firing`` (echoed from
+        the build_wide_window_alignment mapping when
+        present; honest about emptiness when not).
+      * ``all_five_windows_currently_signaling`` (every
+        canonical window has at least one currently-signaling
+        cell).
+      * ``strongest_currently_signaling_cell`` (the firing
+        Buy/Short cell with highest ``total_capture_pct``; or
+        ``None`` if no cell is currently signaling).
+    """
+    cells_total = int(len(matrix))
+    cells_currently_buy = 0
+    cells_currently_short = 0
+    cells_currently_none = 0
+    cells_currently_missing = 0
+    cells_with_all_members_aligned = 0
+    cells_historically_firing = 0
+    windows_signaling: set[str] = set()
+    strongest_cell: Optional[dict[str, Any]] = None
+    strongest_capture: Optional[float] = None
+
+    for row in matrix:
+        sig = row.get("latest_combined_signal")
+        if sig == _CURRENT_SIGNAL_BUY:
+            cells_currently_buy += 1
+        elif sig == _CURRENT_SIGNAL_SHORT:
+            cells_currently_short += 1
+        elif sig == _CURRENT_SIGNAL_NONE:
+            cells_currently_none += 1
+        else:
+            cells_currently_missing += 1
+        if row.get("all_members_aligned"):
+            cells_with_all_members_aligned += 1
+        if row.get("firing"):
+            cells_historically_firing += 1
+        if row.get("currently_signaling"):
+            w = row.get("window")
+            if isinstance(w, str):
+                windows_signaling.add(w)
+            cap = row.get("total_capture_pct")
+            if isinstance(cap, (int, float)) and not isinstance(
+                cap, bool,
+            ):
+                if (
+                    strongest_capture is None
+                    or float(cap) > strongest_capture
+                ):
+                    strongest_capture = float(cap)
+                    strongest_cell = {
+                        "K": row.get("K"),
+                        "window": row.get("window"),
+                        "latest_combined_signal": sig,
+                        "total_capture_pct": float(cap),
+                        "sharpe_ratio": row.get(
+                            "sharpe_ratio",
+                        ),
+                        "trigger_days": row.get(
+                            "trigger_days",
+                        ),
+                        "alignment_ratio": row.get(
+                            "alignment_ratio",
+                        ),
+                        "all_members_aligned": row.get(
+                            "all_members_aligned",
+                        ),
+                    }
+
+    windows_with_all_members_firing: list[str] = []
+    if isinstance(bwwa, Mapping):
+        for w in CANONICAL_WINDOWS:
+            entry = bwwa.get(w)
+            if isinstance(entry, Mapping) and entry.get(
+                "all_members_firing",
+            ):
+                windows_with_all_members_firing.append(w)
+
+    return {
+        "cells_total": cells_total,
+        "cells_currently_buy": cells_currently_buy,
+        "cells_currently_short": cells_currently_short,
+        "cells_currently_none": cells_currently_none,
+        "cells_currently_missing": cells_currently_missing,
+        "cells_with_all_members_aligned": (
+            cells_with_all_members_aligned
+        ),
+        "cells_historically_firing": (
+            cells_historically_firing
+        ),
+        "windows_with_any_currently_signaling": [
+            w for w in CANONICAL_WINDOWS
+            if w in windows_signaling
+        ],
+        "windows_with_all_members_firing": (
+            windows_with_all_members_firing
+        ),
+        "all_five_windows_currently_signaling": bool(
+            len(windows_signaling) == len(CANONICAL_WINDOWS)
+        ),
+        "strongest_currently_signaling_cell": strongest_cell,
+    }
+
+
 def _latest_overall_direction(
     summary_block: Optional[Mapping[str, Any]],
     pwk_agg: Mapping[str, Any],
@@ -1203,6 +1534,16 @@ def _build_one_ticker_row(
         summary_block, pwk_agg,
     )
 
+    # Phase 6I-37: current build signal matrix + summary.
+    current_signal_matrix = _build_current_signal_matrix(
+        artifact["per_window_k_metrics"],
+        ticker=ticker,
+    )
+    current_signal_summary = _build_current_signal_summary(
+        current_signal_matrix,
+        bwwa=artifact["build_wide_window_alignment"],
+    )
+
     return PerTickerRankingRow(
         ticker=ticker,
         artifact_path=str(artifact_path),
@@ -1244,6 +1585,10 @@ def _build_one_ticker_row(
         chart_row_count=chart.get("chart_row_count"),
         chart_blocker=chart.get("chart_blocker"),
         issue_codes=(),
+        current_build_signals=current_signal_matrix,
+        current_build_signal_summary=(
+            current_signal_summary
+        ),
     )
 
 
@@ -1313,6 +1658,17 @@ _DEFAULT_REMAINING_LIMITATIONS: tuple[str, ...] = (
     "sum, then average Sharpe, then trigger days, then fewer "
     "issue codes); a future phase replaces it with a "
     "researched scoring contract.",
+    "TrafficFlow parity gap: legacy TrafficFlow "
+    "compute_build_metrics_spymaster_parity averages metrics "
+    "across all non-empty subsets (2^N - 1) of active members "
+    "per build. The Phase 6I-23 multi-window K engine emits "
+    "one (K, window) cell where K is a combine THRESHOLD "
+    "(n-of-N agreement), not a subset size. The Phase 6I-37 "
+    "current_build_signals matrix surfaces per-cell current "
+    "state + per-cell historical capture / Sharpe / trigger "
+    "days, but it does NOT reproduce legacy TrafficFlow "
+    "subset-average semantics. A future scoring/parity phase "
+    "may close that gap.",
 )
 
 
