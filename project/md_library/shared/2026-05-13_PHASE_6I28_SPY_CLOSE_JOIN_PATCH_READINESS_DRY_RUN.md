@@ -141,13 +141,50 @@ The optional `close_source_root` is forwarded end-to-end:
 
 When both `--cache-dir` and `--close-source-root` are supplied, the explicit `--close-source-root` wins. Otherwise `--cache-dir` is used as the close-source root — which matches the multi-window K module-family convention (`multiwindow_k_engine_gap_audit._default_cache_dir` already resolves to `cache/results`).
 
-The writer's **three-key gate is untouched**:
+The Phase 6I-25 writer-mutation contract is **untouched**.
+It is structurally two layers — an **authorization gate**
+followed by a set of **downstream mutation gates** — and
+Phase 6I-28 changes neither:
+
+**Two-key authorization gate (Phase 6H-5, unchanged):**
 
 1. `--write` CLI flag, AND
-2. `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` env var, AND
-3. `planner_patch_ready=true` (which still requires `payload_ready=true` which still requires `adapter.can_evaluate_full_60_cell_grid=true`).
+2. `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` env var.
 
-Phase 6I-28 only changes WHEN the third gate can flip; the first two are unchanged.
+Both keys absent / either key absent / either key wrong →
+the writer refuses to mutate before any downstream gate is
+even consulted.
+
+**Downstream mutation gates (Phase 6I-25, unchanged):**
+once authorization succeeds, the writer ALSO requires, in
+order:
+
+3. `planner_patch_ready=true` from the Phase 6I-24 planner
+   (which still requires `payload_ready=true` from the
+   Phase 6I-23 builder, which still requires
+   `adapter.can_evaluate_full_60_cell_grid=true` from the
+   Phase 6I-22 adapter).
+4. The artifact path resolves to a real on-disk artifact
+   (`artifact_path is not None`).
+5. The Phase 6I-25 writer-side plan/payload consistency
+   validator
+   `multiwindow_k_confluence_patch_writer._writer_plan_payload_is_consistent(plan)`
+   accepts the plan. This validator independently
+   cross-checks the plan's `planned_payload` against its
+   `planned_payload_keys` / `fields_to_add` /
+   `fields_to_replace` and runs the local Phase 6I-20 shape
+   validators on the planned payload body. If the validator
+   refuses, the writer surfaces `patch_plan_contract_invalid`
+   and does NOT mutate -- even when the planner reported
+   `patch_ready=true`.
+
+Phase 6I-28 only changes WHEN gate #3
+(`planner_patch_ready`) is reachable in the cascade, by
+making the previously-blocking `missing_target_close` gap
+resolvable via the opt-in close-source fallback. Gates #1 /
+#2 / #4 / #5 are **untouched**, including the
+`_writer_plan_payload_is_consistent` writer-side validator
+that is the Phase 6I-25 Codex-amendment guarantee.
 
 ### 1.3 Tests added (21 new)
 
@@ -371,10 +408,18 @@ Planner remains blocked because the builder still reports
 The on-disk Confluence artifact at
 `output/research_artifacts/confluence/SPY/SPY__MTF_CONSENSUS.research_day.json`
 is byte-for-byte unchanged. The writer correctly refuses to
-mutate because (a) `--write` is absent, (b)
-`PRJCT9_AUTOMATION_WRITE_AUTH` is unset, and (c)
-`planner_patch_ready=false`. Any one of the three would block
-on its own; all three were observed to block in this run.
+mutate because every layer of its Phase 6H-5 +
+Phase 6I-25 contract independently blocks: (a) `--write` is
+absent (authorization gate #1), (b)
+`PRJCT9_AUTOMATION_WRITE_AUTH` is unset (authorization gate
+#2), AND (c) `planner_patch_ready=false` (downstream
+mutation gate #3). Each gate alone would block on its own;
+all three were observed to block in this run. The further
+downstream mutation gates (#4 `artifact_path` resolution and
+#5 `_writer_plan_payload_is_consistent(plan)`) were not
+reached in this dry-run because the authorization gate is
+not satisfied -- but they remain in force for any future
+authorized run and were not weakened by Phase 6I-28.
 
 ---
 
@@ -434,11 +479,20 @@ close-price column**, not the member-coverage gate:
    K-row member set. Partial-member cells continue to be
    counted out of that verdict (the Phase 6I-22 Codex
    amendment is preserved verbatim).
-5. The writer's three-key gate is unchanged. `--write` +
-   `PRJCT9_AUTOMATION_WRITE_AUTH` are still required, and
-   `planner_patch_ready=true` is still required, which still
+5. The Phase 6I-25 writer-mutation contract is unchanged.
+   The two-key authorization gate (`--write` AND
+   `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`) is
+   still required, AND the downstream mutation gates are
+   still required: `planner_patch_ready=true` (which still
    requires `payload_ready=true` which still requires
-   `can_evaluate_full_60_cell_grid=true`.
+   `can_evaluate_full_60_cell_grid=true`), the artifact path
+   must resolve, AND the writer-side
+   `_writer_plan_payload_is_consistent(plan)` validator
+   (Phase 6I-25 Codex amendment) must accept the plan. None
+   of these were weakened by Phase 6I-28; the close-source
+   fallback only widens when the upstream
+   `can_evaluate_full_60_cell_grid=true` precondition for
+   gate #3 (`planner_patch_ready`) is reachable.
 
 ---
 
@@ -606,8 +660,11 @@ runtime contracts.
 ## 11. Validation
 
 - `git diff --check`: clean.
-- `git diff --stat`: 10 files modified (5 production + 5
-  test).
+- `git diff --stat`: 11 files touched -- 5 production
+  modules modified (adapter, diagnostic, builder, planner,
+  writer), 5 test files modified (one per production
+  module), and 1 new Markdown evidence doc added (this
+  file). No pre-existing production files deleted.
 - Pinned interpreter on every Python invocation:
   `C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`.
 - Focused 8-way: **226 passed**.
