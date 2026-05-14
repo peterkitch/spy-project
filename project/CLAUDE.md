@@ -155,9 +155,68 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-13 (post Phase 6I-17)
+### 6. Current Sprint State as of 2026-05-14 (post Phase 6I-33)
 
-**main / origin/main HEAD:** `ec3658e` — `Phase 6I-17: SPY source-ready recheck (STATE C; writer NOT prepared) (#234)`.
+**main / origin/main HEAD:** `6ae247b` — `Phase 6I-32: supervised fresh-source readiness + staged signal-library rebuild evidence harness (#249)`.
+
+**Phase 6I-33 status:** PR #250 is OPEN at head `369a112` — `Phase 6I-33: SPY K-universe source-cache refresh readiness + exact supervised refresh candidate`. **Not merged.** Read-only source-refresh readiness coordinator. Verdict against the 15-ticker SPY K-universe (SPY + AROW / AWR / CLH / CP / EXPO / FCFS / GBCI / HCSG / JNJ / LLY / MO / PRA / PRGO / TEF): **`refresh_candidate_ready=false`**. Every ticker classifies as `source_behind_or_error`:
+
+- 14 equities — yfinance `new_cache_date_range_end=2026-05-13` < resolved cutoff `2026-05-14` (one trading day behind; supervised refresh would NOT be productive yet).
+- TEF — yfinance `new_cache_date_range_end=null` (no parseable end-date returned); flagged for separate triage if it persists.
+
+**No future supervised refresh command was prepared** because the predicate failed. Production roots remained 0/0/0 across all 5 roots (83,027 files). The Phase 6I-32 fresh-staging harness re-run inside the same evidence pass confirmed the downstream staged chain is still all-green (sandbox 75/0, promotion planner `plan_ready=true`, adapter `prepared=60` / `can_evaluate_full_60_cell_grid=true`, payload_ready, patch_ready, patch writer dry-run `planner_patch_ready=true`).
+
+**Authorization wording correction (Phase 6I-33 amendment-1).** The Phase 6E-5 source refresher `signal_engine_cache_refresher.py` uses the explicit `--write` flag plus its internal optimizer / provenance write guards. It does **NOT** use the `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` two-key gate. The `PRJCT9_AUTOMATION_WRITE_AUTH` env-var gate applies to the LATER guarded writer surfaces — the Phase 6I-25 Confluence patch writer (`multiwindow_k_confluence_patch_writer.py`), the Phase 6I-31 signal-library promotion writer (`signal_library_stable_promotion_writer.py`), and the Phase 6H-5 daily-board automation writer (`daily_board_automation_writer.py`). Earlier sprint narrative incorrectly described the refresher as two-key-gated; that was wrong. Note that `daily_board_automation_writer` in supervised mode wraps the refresher behind its own two-key gate, but the refresher's own CLI surface is single-key.
+
+**No production write is currently authorized.** The next operational event is a clock-time wait until yfinance publishes the 2026-05-14 trading-day data. Once that lands, an operator may re-run the Phase 6I-33 readiness module; if it then reports `refresh_candidate_ready=true`, a supervised refresh of the 15-ticker K-universe can be requested in a SEPARATE prompt.
+
+---
+
+#### Product North Star / Do Not Drift (Phase 6I-33 amendment-1)
+
+The current SPY path is a **pilot/proof path**, not the final product.
+
+The final Confluence goal is a **multi-ticker ranking board**, not a single-ticker detail page. The desired product is effectively the old **TrafficFlow ranking workflow** rebuilt with **true multi-window support** — a TrafficFlow-style ranking/export layer over a **large ticker universe**, scoring and comparing many tickers using **all five canonical windows: 1d / 1wk / 1mo / 3mo / 1y**.
+
+The per-ticker 60-cell payload (Phase 6I-20 contract: `per_window_k_metrics` + `build_wide_window_alignment` + `multiwindow_k_engine_payload_metadata`) is the **building block**, not the user-facing destination. The current Phase 6I-22..32 chain proves the per-ticker payload is reachable + safe for SPY; a future phase must wire this into a **cross-ticker multi-window Confluence ranking/export layer** that scans every valid ticker artifact and emits website-ready ranking/detail data.
+
+Future website-facing data should include:
+
+- multi-ticker ranking rows (one row per qualifying ticker);
+- per-ticker 60-cell multi-window detail (`per_window_k_metrics`);
+- `build_wide_window_alignment` per ticker;
+- chart-ready rows where available;
+- data freshness / blocker fields (so the UI can honestly surface "stale" / "missing window" / "missing K row" instead of hiding them).
+
+Stay aligned with the existing script family — **OnePass** / **ImpactSearch** / **StackBuilder** / **TrafficFlow** / **MultiTimeframe** / **Confluence**. Do not invent vague replacement language that hides which data came from which layer. When future phases name a new module, the name should make it obvious whether it consumes StackBuilder's K rows, the OnePass interval libraries, the TrafficFlow multi-timeframe surface, or the Confluence multi-ticker ranking surface.
+
+**Do not drift.** A "single-ticker SPY pass works end-to-end" verdict is not a website launch. The website launch verdict is "the multi-ticker ranking board can score and rank every qualifying ticker in the universe on the canonical 1d / 1wk / 1mo / 3mo / 1y window grid AND surface honest freshness/blocker fields for the rest."
+
+---
+
+#### Recent merged phase trail (Phase 6I-20 → Phase 6I-32)
+
+| Phase | PR | Hash | Subject |
+|---|---|---|---|
+| 6I-32 | #249 | `6ae247b` | Supervised fresh-source readiness + staged rebuild evidence harness (incl. amendment-1 robust staged-dir safety boundary) |
+| 6I-31 | #248 | `c73e20e` | Guarded signal-library stable promotion path + SPY staged rebuild evidence (incl. transactional rollback amendment) |
+| 6I-30 | #247 | `9421bfe` | Interval-native close in signal-library builder + sandbox 60-cell SPY proof |
+| 6I-29 | #246 | `1e07fae` | Daily member exact-date alignment — 12/12 daily cells prepare |
+| 6I-28 | #245 | `7407415` | Adapter close-source join + SPY patch-readiness dry-run |
+| 6I-27 | #244 | `1cee319` | SPY adapter diagnostic — `missing_target_close` directly proven |
+| 6I-26 | #243 | `e0c42e9` | Supervised SPY Confluence patch writer DRY-RUN evidence |
+| 6I-25 | #242 | `10b535b` | Guarded Confluence artifact patch writer (`_writer_plan_payload_is_consistent` lives here) |
+| 6I-24 | #241 | `e62cb5a` | Read-only Confluence artifact patch planner |
+| 6I-23 | #240 | `948c961` | In-memory multi-window K engine payload builder |
+| 6I-22 | #239 | `66599c7` | Read-only adapter from StackBuilder + OnePass libraries into engine inputs |
+| 6I-21 | #238 | `3bce8aa` | Multi-window K engine core |
+| 6I-20 | #237 | `38a1bcb` | Gap audit |
+
+---
+
+### 6.0. (Historical — superseded by 2026-05-14 / Phase 6I-33 sprint state above) Phase 6I-17 sprint state (as of 2026-05-13)
+
+**(historical) main / origin/main HEAD:** `ec3658e` — `Phase 6I-17: SPY source-ready recheck (STATE C; writer NOT prepared) (#234)`.
 
 **Sprint trajectory (Phase 6H + Phase 6I, top-to-bottom by phase number):**
 
