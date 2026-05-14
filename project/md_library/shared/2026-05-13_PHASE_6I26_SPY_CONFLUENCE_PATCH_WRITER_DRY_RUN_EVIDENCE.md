@@ -27,7 +27,7 @@ byte-identical before and after the dry-run.
 | Phase 6I-24 planner `patch_ready` | **`false`** (`payload_not_ready` → `build_payload_first`) |
 | Future artifact-write command preparation | **BLOCKED** — see § 9 |
 
-**Future artifact-write command preparation is BLOCKED** in this evidence pass because the upstream Phase 6I-23 payload builder reports `adapter_not_ready` (the Phase 6I-22 input adapter cannot produce a full canonical 60-cell input set for SPY today). This is the known `missing_target_close` gap from the Phase 6I-22 doc § 6 — the production signal-library shape (`signal_library/data/stable/SPY_stable_v1_0_0[_<interval>].pkl`) carries `dates` + `signals` but does not always carry a `close` series, so the strict full-member-coverage gate refuses the canonical 60-cell payload. The writer correctly refuses to mutate.
+**Future artifact-write command preparation is BLOCKED** in this evidence pass because the upstream Phase 6I-23 payload builder reports `adapter_not_ready` and the Phase 6I-24 planner consequently reports `payload_not_ready` / `build_payload_first`. **These are the only diagnostics directly captured in this evidence pass.** The Phase 6I-22 input adapter's specific per-cell skip reasons were not exercised through an explicit adapter-diagnostic CLI run here; the likely root cause inferred from prior Phase 6I-22 documentation (§ 6) is the `missing_target_close` gap (production signal libraries carry `dates` + `signals` but not always a `close` series), but this evidence pass does not directly prove that — see § 12.2 for the qualified inference and § 12.3 for the explicit next-step suggestion (an adapter diagnostic run, or a fix-with-tests). The writer correctly refuses to mutate regardless of the root cause.
 
 ---
 
@@ -216,10 +216,19 @@ Embedded `payload_summary` (from Phase 6I-23 builder):
 
 ### 6.1 Why the planner refused
 
-- The Phase 6I-23 builder returned `payload_ready=False` because the Phase 6I-22 adapter could not prepare full strict-coverage per-`(K, window)` inputs (`adapter_not_ready`).
-- The root cause is the known **`missing_target_close`** limitation documented in the Phase 6I-22 doc § 6: the production signal-library shape carries `dates` and `signals` but not always a `close` series, so the adapter's strict full-member-coverage gate refuses the canonical 60-cell input map.
+**Directly observed in this evidence pass:**
+
+- The Phase 6I-23 builder returned `payload_ready=False` with `issue_codes=["adapter_not_ready"]` (captured in `04_writer_dry_run.json` via the planner's `payload_summary` and in `03_planner.json` via the embedded summary).
+- The Phase 6I-24 planner returned `patch_ready=False` with `issue_codes=["payload_not_ready"]` and `recommended_next_action="build_payload_first"` (captured directly in `03_planner.json`).
 - The Confluence artifact exists at `output\research_artifacts\confluence\SPY\SPY__MTF_CONSENSUS.research_day.json` with 12 top-level keys; none of the three planned keys (`per_window_k_metrics` / `build_wide_window_alignment` / `multiwindow_k_engine_payload_metadata`) is present yet.
-- `recommended_next_action=build_payload_first` is the correct verdict.
+
+**Inferred likely root cause (prior documented context — NOT directly captured by Phase 6I-26 probes):**
+
+- Phase 6I-22 doc § 6 documents a `missing_target_close` limitation of the production signal-library shape: the saved `.pkl` files carry `dates` and `signals` but do not always carry a `close` series, which would prevent the Phase 6I-22 adapter's strict full-member-coverage gate from preparing the canonical 60-cell input map.
+- This is the most likely explanation for the `adapter_not_ready` flag observed here, but **the Phase 6I-26 probes did not run an explicit adapter diagnostic** (`multiwindow_k_input_adapter.py` does not currently expose a CLI surface that would print per-cell skip reasons for SPY). The inference is supported by prior documentation but not directly proven by the captured evidence in this pass.
+- A future phase that targets this gap should either:
+  - **(a) run an explicit adapter diagnostic** that prints the Phase 6I-22 `MultiWindowKInputAdapterReport.skipped_cells` reasons for SPY across all 60 canonical `(K, window)` pairs and verifies whether `missing_target_close` is in fact the dominant reason; OR
+  - **(b) implement the close-source join / signal-library extension** as a code change with tests that prove the adapter prepares the full canonical 60-cell input set for SPY end-to-end.
 
 Because `patch_ready=false`, no canonical SHA-256 of a `planned_payload` is computed — the planner returns an empty `planned_payload`.
 
@@ -359,7 +368,7 @@ The writer was invoked with `--execution-log <TEMP>/phase_6i26_spy_patch_writer_
 | Spymaster batch | **No** |
 | Confluence batch | **No** |
 | Production data write | **No** |
-| Subprocess invocations | only standard `git` / `gh` for branch + PR housekeeping (no Python subprocess from production modules) |
+| Subprocess invocations | **No subprocess launched by production modules.** Direct operator commands included pinned-interpreter Python script invocations of `cache_cutoff_watcher.py` / `multiwindow_k_engine_gap_audit.py` / `multiwindow_k_confluence_patch_planner.py` / `multiwindow_k_confluence_patch_writer.py` and standard `git` / `gh` housekeeping for the branch + PR. |
 | Execution-log path | temp dir only; `output/automation_logs/` untouched |
 
 The Phase 6H-5 two-key writer gate, the Phase 6I-9 supervised gate, the Phase 6I-10 production-root snapshot strategy (`relative_path_size_mtime`), the Phase 6I-12 ProviderFetchTelemetry four-surface contract, the Phase 6I-15 source-availability advisory contract, the Phase 6I-20 gap audit, the Phase 6I-21 engine core, the Phase 6I-22 input adapter, the Phase 6I-23 payload builder, the Phase 6I-24 patch planner, and the Phase 6I-25 patch writer are all unchanged.
@@ -378,25 +387,41 @@ The readiness conditions for preparing a future artifact-write command (per the 
 | writer dry-run `issue_codes` includes `write_not_requested` | yes | yes |
 | Production roots unchanged 0/0/0 | yes | yes |
 
-**One readiness condition failed** (`patch_ready=false` because of the upstream `adapter_not_ready` chain → `missing_target_close` known limitation). **No future write command is prepared in this evidence pass.**
+**Two checklist rows failed, both from the same upstream root condition**: the planner was not patch-ready because the payload builder reported `adapter_not_ready`. The writer dry-run row's `planner_patch_ready=false` is **not** an independent failure — it correctly mirrors the planner's verdict (the writer reads the planner's `patch_ready` flag and surfaces it as `planner_patch_ready`). **No future write command is prepared in this evidence pass.**
 
 ### 12.1 Blocking issue codes + recommended actions
 
-| Layer | Issue | Recommended next action |
+**Directly observed** in `03_planner.json` / `04_writer_dry_run.json`:
+
+| Layer | Issue (directly captured) | Recommended next action |
 |---|---|---|
-| Phase 6I-22 adapter | `missing_target_close` (likely; documented in Phase 6I-22 doc § 6) | Extend the signal-library builder to carry per-window `close`, OR join close from a separate cache source (Phase 6I-22 doc § 6 spells out the gap). |
-| Phase 6I-23 builder | `adapter_not_ready` | Upstream resolution above. |
+| Phase 6I-23 builder | `adapter_not_ready` | Surface per-cell adapter diagnostics (see § 12.3) or fix the upstream gap. |
 | Phase 6I-24 planner | `payload_not_ready` | `build_payload_first`. |
 | Phase 6I-25 writer | `write_not_requested` (correct — dry-run was intentional) | `dry_run_review_patch_plan`. |
+
+**Inferred (prior documented context, NOT directly observed by Phase 6I-26 probes):**
+
+| Layer | Issue (inferred) | Notes |
+|---|---|---|
+| Phase 6I-22 adapter | `missing_target_close` is the **most likely** explanation per Phase 6I-22 doc § 6 (production signal libraries carry `dates` + `signals` but not always `close`). | Not directly captured here; would need an explicit adapter-diagnostic run (see § 12.3). |
 
 ### 12.2 What this evidence pass leaves un-prepared
 
 A future supervised authorized-write phase will need both:
 
-1. **Upstream fix**: resolve `missing_target_close` (Phase 6I-22 limitation) so the adapter can prepare full-canonical 60-cell inputs for SPY.
-2. **Source refresh**: separately, `cache_date_range_end=2026-05-12` is now **behind** `current_as_of_date=2026-05-13`. The Phase 6I-15 / 6I-17 / 6I-18 source-availability discipline applies — a `signal_engine_cache_refresher` dry-run + supervised refresh would be the standard path. That is a separate phase from this writer-evidence pass.
+1. **Upstream adapter fix** — resolve whatever the Phase 6I-22 adapter's actual per-cell skip reason is for SPY (most likely the `missing_target_close` limitation documented in Phase 6I-22 doc § 6, but **not directly proven by this evidence pass**) so the adapter can prepare a full canonical 60-cell input set for SPY end-to-end.
+2. **Source refresh** — separately, `cache_date_range_end=2026-05-12` is now **behind** `current_as_of_date=2026-05-13`. The Phase 6I-15 / 6I-17 / 6I-18 source-availability discipline applies — a `signal_engine_cache_refresher` dry-run + supervised refresh would be the standard path. That is a separate phase from this writer-evidence pass.
 
 Once **both** upstream gaps close, the planner should report `patch_ready=true` and the future write command can be prepared (in a subsequent phase, with Codex sign-off, per the Phase 6I-25 doc § 12 5-step Phase 6I-11-pattern).
+
+### 12.3 Next-phase suggestion: confirm or fix the inferred root cause
+
+To convert the inferred `missing_target_close` explanation into a directly-observed fact (or rule it out), the next phase should pick ONE of:
+
+- **(a) Adapter diagnostic evidence run** — invoke a Phase 6I-22 adapter diagnostic (extending `multiwindow_k_input_adapter.py`'s CLI if needed, or via a one-shot Python script) that prints the `MultiWindowKInputAdapterReport.skipped_cells` per-cell skip reasons for SPY across all 60 canonical `(K, window)` pairs. If `missing_target_close` is in fact the dominant skip reason, the inference is confirmed. If a different reason dominates (e.g. `incomplete_member_coverage`, `missing_member_library`, length-mismatch), that becomes the load-bearing gap.
+- **(b) Fix-with-tests** — implement the close-source join / signal-library extension as a code change with new tests proving the adapter prepares the full canonical 60-cell input set for SPY end-to-end. If the planner subsequently reports `patch_ready=true` for SPY, the gap is closed by definition.
+
+Either path produces the evidence needed to either prepare a future write command (option b) or refine the next-phase plan (option a).
 
 **This evidence pass deliberately does NOT include a "Future command candidate" code block** — per the Phase 6I-26 spec, that section only appears when ALL readiness conditions are met. They are not.
 
@@ -409,7 +434,7 @@ Once **both** upstream gaps close, the planner should report `patch_ready=true` 
 - `real_confluence_pipeline_runner_write` — still open.
 - `real_post_pipeline_validation_on_writer_path` — still open.
 - Writer-surface provider telemetry — still pending.
-- The Phase 6I-25 writer is in place and correctly refused to mutate the artifact in dry-run mode. **The writer code path is healthy** — this dry-run did not surface a writer bug; it surfaced the upstream `missing_target_close` adapter gap that pre-existed.
+- The Phase 6I-25 writer is in place and correctly refused to mutate the artifact in dry-run mode. **The writer code path is healthy** — this dry-run did not surface a writer bug; it surfaced an upstream `adapter_not_ready` → `payload_not_ready` chain whose most likely root cause (per Phase 6I-22 doc § 6) is the pre-existing `missing_target_close` gap, but the per-cell adapter diagnostic was not run in this pass; § 12.3 names the next-phase options for confirming or fixing it.
 
 ---
 
