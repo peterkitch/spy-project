@@ -541,16 +541,25 @@ def test_missing_member_library_strict_skip_per_cell(
 def test_member_signal_length_mismatch_strict_skip(
     tmp_path,
 ):
+    """Phase 6I-22 strict-coverage gate preserved through
+    the Phase 6I-29 alignment widening: length-mismatch
+    plus non-aligning dates still causes a cell skip with
+    incomplete_member_coverage."""
     run_dir = tmp_path / "run_len_mismatch"
     run_dir.mkdir()
     rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
     target_libs = {
         "1d": _full_target_lib("1d", 3),
     }
+    # BBB has 5 bars AND its dates do NOT include every
+    # target date (target uses 01..03; BBB uses 04..08)
+    # so the alignment helper fails.
+    bbb_dates = [f"2026-01-{i+4:02d}_1d" for i in range(5)]
     member_libs = {
         ("AAA", "1d"): _full_member_lib("1d", 3),
-        # BBB has 5 bars, target has 3.
-        ("BBB", "1d"): _full_member_lib("1d", 5),
+        ("BBB", "1d"): _make_lib(
+            dates=bbb_dates, signals=["Buy"] * 5,
+        ),
     }
     loader = _library_factory(
         target_libs=target_libs,
@@ -563,7 +572,6 @@ def test_member_signal_length_mismatch_strict_skip(
         "SPY",
         adapter_callable=wrapped,
     )
-    # Find the K=2 / 1d cell.
     k2_1d = next(
         d for d in result["per_cell_diagnostics"]
         if d["K"] == 2 and d["window"] == "1d"
@@ -998,4 +1006,174 @@ def test_close_source_join_makes_diagnostic_report_60_prepared(
     assert (
         "missing_target_close"
         not in result["adapter_issue_codes"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Phase 6I-29 member-alignment surfacing in the diagnostic
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostic_exposes_member_alignment_failures(
+    tmp_path,
+):
+    """When the Phase 6I-29 alignment helper fails for one
+    or more members, the new issue codes must appear in
+    `adapter_issue_codes`."""
+    run_dir = tmp_path / "run_diag_alignment_fail"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_dates = _bars("1d", 3)
+    # Member length-different AND missing one target date.
+    member_dates = [
+        "2026-01-01_1d",
+        "2026-01-03_1d",
+        "2026-01-04_1d",
+        "2026-01-05_1d",
+    ]
+    target_libs = {
+        "1d": _make_lib(
+            dates=target_dates,
+            signals=["None"] * 3,
+            close=[100.0, 101.0, 102.0],
+        ),
+    }
+    member_libs = {
+        ("AAA", "1d"): _make_lib(
+            dates=member_dates,
+            signals=["W", "X", "Y", "Z"],
+        ),
+    }
+    lib_loader = _library_factory(
+        target_libs=target_libs,
+        member_libs=member_libs,
+    )
+
+    real_adapter = adapter.prepare_multiwindow_k_inputs
+
+    def wrapped(target_ticker, **kwargs):
+        merged = {
+            "run_dir": run_dir,
+            "stackbuilder_run_discovery_callable":
+                _fake_discovery_returning(run_dir),
+            "leaderboard_loader_callable":
+                _fake_leaderboard_loader_ok(),
+            "k_rows_iter_callable":
+                _fake_k_rows_iter(rows),
+            "library_loader": lib_loader,
+            "K_values": (1,),
+            "windows": ("1d",),
+        }
+        for k, v in kwargs.items():
+            if k in merged:
+                continue
+            merged[k] = v
+        return real_adapter(target_ticker, **merged)
+
+    result = diagnostic.run_adapter_diagnostic(
+        "SPY",
+        adapter_callable=wrapped,
+    )
+    assert (
+        adapter.ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+        in result["adapter_issue_codes"]
+    )
+
+
+def test_diagnostic_daily_alignment_removes_no_members_available(
+    tmp_path,
+):
+    """End-to-end happy path: when the close-source supplies
+    target close AND every K-row member has a superset
+    daily date axis, the diagnostic prepares all 60
+    canonical cells and `no_members_available` vanishes
+    from the daily counts."""
+    run_dir = tmp_path / "run_diag_daily_alignment_ok"
+    run_dir.mkdir()
+    rows, _ = _full_canonical_fixture(
+        k_member_sets=_all_canonical_full_k_member_sets(),
+    )
+    # Target libs LACK close -- the fallback supplies it.
+    target_libs = {
+        window: _make_lib(
+            dates=_bars(window, 3),
+            signals=["None"] * 3,
+            close=None,
+        )
+        for window in core.CANONICAL_WINDOWS
+    }
+    # 1d members: superset dates (length-different).
+    # Non-1d members: equal-length fast path.
+    all_members: set[str] = set()
+    for k in core.CANONICAL_K_VALUES:
+        for i in range(k):
+            all_members.add(f"M{i}")
+    target_1d_dates = _bars("1d", 3)
+    superset_1d_dates = (
+        ["2025-12-30_1d"] + list(target_1d_dates)
+        + ["2026-01-04_1d", "2026-01-05_1d"]
+    )
+    member_libs: dict[tuple[str, str], dict[str, Any]] = {}
+    for member in all_members:
+        for window in core.CANONICAL_WINDOWS:
+            if window == "1d":
+                member_libs[(member, window)] = _make_lib(
+                    dates=superset_1d_dates,
+                    signals=["Buy"] * len(superset_1d_dates),
+                )
+            else:
+                member_libs[(member, window)] = (
+                    _full_member_lib(window, 3)
+                )
+    lib_loader = _library_factory(
+        target_libs=target_libs,
+        member_libs=member_libs,
+    )
+    # Close-source supplies all canonical fixture dates.
+    close_by_date: dict[str, Any] = {}
+    for window in core.CANONICAL_WINDOWS:
+        for d in _bars(window, 3):
+            key = adapter._normalize_date_key(d)
+            if key is not None:
+                close_by_date.setdefault(key, 200.0)
+    close_resolution = adapter.CloseSourceResolution(
+        status=adapter.CLOSE_SOURCE_STATUS_OK,
+        close_by_date=close_by_date,
+    )
+
+    def close_loader_fn(ticker, *, close_source_root=None):
+        return close_resolution
+
+    real_adapter = adapter.prepare_multiwindow_k_inputs
+
+    def wrapped(target_ticker, **kwargs):
+        merged = {
+            "run_dir": run_dir,
+            "stackbuilder_run_discovery_callable":
+                _fake_discovery_returning(run_dir),
+            "leaderboard_loader_callable":
+                _fake_leaderboard_loader_ok(),
+            "k_rows_iter_callable":
+                _fake_k_rows_iter(rows),
+            "library_loader": lib_loader,
+            "close_loader": close_loader_fn,
+        }
+        for k, v in kwargs.items():
+            if k in merged:
+                continue
+            merged[k] = v
+        return real_adapter(target_ticker, **merged)
+
+    result = diagnostic.run_adapter_diagnostic(
+        "SPY",
+        adapter_callable=wrapped,
+    )
+    assert result["prepared_cell_count"] == 60
+    assert result["skipped_cell_count"] == 0
+    assert (
+        result["can_evaluate_full_60_cell_grid"] is True
+    )
+    assert (
+        "no_members_available"
+        not in result["counts_by_skipped_reason"]
     )

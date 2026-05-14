@@ -984,23 +984,37 @@ def test_empty_dates_skips_cell(tmp_path):
 
 
 def test_strict_member_signal_length_mismatch_skips_cell(tmp_path):
-    """Phase 6I-22 Codex amendment (strict default): a member
-    library whose ``signals`` length disagrees with the
-    target's ``dates`` length results in the WHOLE cell being
-    SKIPPED (incomplete_member_coverage), not a partial
-    cell. The adapter never resamples / ffills to align AND
-    never silently downgrades a K=N build to a K=(N-1) one
-    over a length mismatch."""
+    """Phase 6I-22 Codex amendment (strict default), preserved
+    through the Phase 6I-29 exact-date alignment widening: a
+    member library whose ``signals`` length disagrees with the
+    target's ``dates`` length AND whose dates do NOT exact-
+    date-align onto the target axis results in the WHOLE cell
+    being SKIPPED (incomplete_member_coverage). The adapter
+    never resamples / ffills to align AND never silently
+    downgrades a K=N build to a K=(N-1) one over a member
+    that cannot be exact-date aligned.
+
+    Phase 6I-29 widens length-mismatch from an immediate skip
+    to an alignment-attempt, but the strict-coverage gate
+    still fires when alignment fails -- this test pins that
+    gate by giving BBB a different bar-count AND a date axis
+    that does not include every target date.
+    """
     run_dir = tmp_path / "run_len_mismatch"
     run_dir.mkdir()
     rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
     target_libs = {
         "1d": _full_target_lib("1d", 3),
     }
+    # BBB has 5 bars AND its dates do NOT include every target
+    # date -- target uses bars 01..03 and BBB uses bars 04..08,
+    # so exact-date alignment is incomplete.
+    bbb_dates = [f"2026-01-{i+4:02d}_1d" for i in range(5)]
     member_libs = {
         ("AAA", "1d"): _full_member_lib("1d", 3),
-        # BBB has 5 bars, doesn't match target's 3.
-        ("BBB", "1d"): _full_member_lib("1d", 5),
+        ("BBB", "1d"): _make_lib(
+            dates=bbb_dates, signals=["Buy"] * 5,
+        ),
     }
     loader = _library_factory(
         target_libs=target_libs,
@@ -1032,6 +1046,13 @@ def test_strict_member_signal_length_mismatch_skips_cell(tmp_path):
     )
     assert state.members_prepared == ("AAA",)
     assert state.members_missing == ("BBB",)
+    # Phase 6I-29: BBB's failure mode is now
+    # member_date_alignment_incomplete (alignment was
+    # attempted), NOT just empty_library.
+    assert (
+        adapter.ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+        in report.issue_codes
+    )
 
 
 def test_strict_member_missing_signals_skips_cell(tmp_path):
@@ -1826,5 +1847,563 @@ def test_close_source_helpers_make_no_projection_calls():
                 name = func.id
             assert name not in {"resample", "ffill"}, (
                 "adapter calls forbidden "
+                f"{name!r}() at line {node.lineno}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 12. Phase 6I-29 exact-date member alignment
+# ---------------------------------------------------------------------------
+
+
+def test_member_alignment_equal_length_uses_fast_path(tmp_path):
+    """When member library length equals the target's date
+    axis length, the Phase 6I-29 alignment helper is NOT
+    invoked -- the fast path preserves the Phase 6I-22
+    legacy semantics exactly. Pinned by checking that the
+    cell prepares without surfacing any Phase 6I-29 issue
+    code."""
+    run_dir = tmp_path / "run_equal_len"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {"1d": _full_target_lib("1d", 3)}
+    member_libs = {("AAA", "1d"): _full_member_lib("1d", 3)}
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 1
+    assert (
+        adapter.ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+        not in report.issue_codes
+    )
+    assert (
+        adapter.ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING
+        not in report.issue_codes
+    )
+
+
+def test_member_alignment_extra_older_dates_succeeds(tmp_path):
+    """Member library has extra OLDER dates (member starts
+    before the target's first bar). The target's dates form
+    a subset of the member's dates -> exact-date alignment
+    succeeds -> cell prepares with the aligned member
+    signals."""
+    run_dir = tmp_path / "run_older_dates"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_dates = _bars_for_window("1d", 3)  # 01,02,03
+    # Member has 5 bars: 2 older + the 3 target dates.
+    older = ["2025-12-30_1d", "2025-12-31_1d"]
+    member_dates = older + list(target_dates)
+    target_libs = {
+        "1d": _make_lib(
+            dates=target_dates,
+            signals=["None"] * 3,
+            close=[100.0, 101.0, 102.0],
+        ),
+    }
+    member_signals = ["Buy", "Short", "Buy", "Short", "Buy"]
+    member_libs = {
+        ("AAA", "1d"): _make_lib(
+            dates=member_dates, signals=member_signals,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 1
+    cell = report.per_cell_inputs[(1, "1d")]
+    # Aligned signals correspond to target dates 01,02,03 ->
+    # member positions 2,3,4 -> "Buy", "Short", "Buy".
+    assert cell["member_signal_columns"]["AAA"] == [
+        "Buy", "Short", "Buy",
+    ]
+
+
+def test_member_alignment_extra_newer_dates_succeeds(tmp_path):
+    """Member library has extra NEWER dates after the
+    target's last bar. Target dates form a subset of member
+    dates -> alignment succeeds."""
+    run_dir = tmp_path / "run_newer_dates"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_dates = _bars_for_window("1d", 3)
+    newer = ["2026-01-04_1d", "2026-01-05_1d"]
+    member_dates = list(target_dates) + newer
+    target_libs = {
+        "1d": _make_lib(
+            dates=target_dates,
+            signals=["None"] * 3,
+            close=[100.0, 101.0, 102.0],
+        ),
+    }
+    member_signals = ["A", "B", "C", "D", "E"]
+    member_libs = {
+        ("AAA", "1d"): _make_lib(
+            dates=member_dates, signals=member_signals,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 1
+    cell = report.per_cell_inputs[(1, "1d")]
+    assert cell["member_signal_columns"]["AAA"] == [
+        "A", "B", "C",
+    ]
+
+
+def test_member_alignment_missing_one_target_date_skips_member(
+    tmp_path,
+):
+    """If even ONE target date is missing from the member's
+    date axis, alignment is incomplete. The member must NOT
+    be fabricated, the strict-coverage gate fires, and the
+    cell is skipped with REASON_INCOMPLETE_MEMBER_COVERAGE
+    (single-member K=1 -> the cell becomes
+    no_members_available).
+
+    Member library uses a DIFFERENT bar count than the
+    target so the alignment helper is exercised (the
+    length-equal fast path is bypassed)."""
+    run_dir = tmp_path / "run_missing_target_date"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_dates = _bars_for_window("1d", 3)  # 01,02,03
+    # Member has 4 dates (length-different from target's 3)
+    # AND is missing target's middle date (02).
+    member_dates = [
+        "2026-01-01_1d",
+        "2026-01-03_1d",
+        "2026-01-04_1d",
+        "2026-01-05_1d",
+    ]
+    target_libs = {
+        "1d": _make_lib(
+            dates=target_dates,
+            signals=["None"] * 3,
+            close=[100.0, 101.0, 102.0],
+        ),
+    }
+    member_libs = {
+        ("AAA", "1d"): _make_lib(
+            dates=member_dates,
+            signals=["W", "X", "Y", "Z"],
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 0
+    # K=1 with only one member missing -> the cell short-
+    # circuits with no_members_available.
+    assert (
+        report.skipped_cells[0][2]
+        == adapter.REASON_NO_MEMBERS_AVAILABLE
+    )
+    assert (
+        adapter.ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+        in report.issue_codes
+    )
+
+
+def test_member_alignment_member_dates_missing_surfaces_axis_missing(
+    tmp_path,
+):
+    """A member library that has signals but no usable
+    ``dates`` / ``date_index`` key returns the
+    member_signal_date_axis_missing reason on the alignment
+    helper, surfaces the corresponding issue code, and skips
+    the cell under strict coverage."""
+    run_dir = tmp_path / "run_axis_missing"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=1, members_str="AAA[D]")]
+    target_libs = {"1d": _full_target_lib("1d", 3)}
+    # AAA has signals but NO dates field, AND a length that
+    # doesn't match the target (so the fast path is bypassed
+    # and the alignment helper is consulted).
+    member_libs = {
+        ("AAA", "1d"): {"signals": ["X", "Y", "Z", "W"]},
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(1,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 0
+    assert (
+        adapter.ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING
+        in report.issue_codes
+    )
+
+
+def test_member_alignment_mixed_k_row_strict_coverage_holds(
+    tmp_path,
+):
+    """K=2 row where AAA aligns successfully (superset
+    dates) but BBB cannot align (missing target date). The
+    strict full-member-coverage gate still fires and the
+    whole cell skips with incomplete_member_coverage --
+    Phase 6I-29 does NOT silently downgrade K=2 to K=1.
+
+    Both members use bar counts DIFFERENT from the target
+    so the alignment helper is exercised for both."""
+    run_dir = tmp_path / "run_mixed_alignment"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
+    target_dates = _bars_for_window("1d", 3)
+    target_libs = {
+        "1d": _make_lib(
+            dates=target_dates,
+            signals=["None"] * 3,
+            close=[100.0, 101.0, 102.0],
+        ),
+    }
+    # AAA: 5 bars, superset of target dates -> aligns.
+    aaa_dates = (
+        ["2025-12-31_1d"] + list(target_dates)
+        + ["2026-01-04_1d"]
+    )
+    # BBB: 4 bars, missing target date 02 -> alignment
+    # incomplete.
+    bbb_dates = [
+        "2026-01-01_1d",
+        "2026-01-03_1d",
+        "2026-01-04_1d",
+        "2026-01-05_1d",
+    ]
+    member_libs = {
+        ("AAA", "1d"): _make_lib(
+            dates=aaa_dates, signals=["a"] * 5,
+        ),
+        ("BBB", "1d"): _make_lib(
+            dates=bbb_dates, signals=["b"] * 4,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(2,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 0
+    assert (
+        report.skipped_cells[0][2]
+        == adapter.REASON_INCOMPLETE_MEMBER_COVERAGE
+    )
+    state = next(
+        s for s in report.per_cell_states
+        if s.K == 2 and s.window == "1d"
+    )
+    assert state.members_prepared == ("AAA",)
+    assert state.members_missing == ("BBB",)
+
+
+def test_member_alignment_partial_mode_does_not_unlock_full_grid(
+    tmp_path,
+):
+    """``allow_partial_members=True`` is a diagnostic mode
+    only. With Phase 6I-29 alignment widening, AAA may
+    align and BBB may fail; partial mode prepares the cell
+    with the surviving member ONLY, but
+    ``can_evaluate_full_60_cell_grid`` MUST remain False
+    because the cell does not carry the FULL K-row member
+    set. The Phase 6I-22 invariant is preserved.
+
+    Both members use bar counts DIFFERENT from the target
+    so the alignment helper is exercised."""
+    run_dir = tmp_path / "run_partial_alignment"
+    run_dir.mkdir()
+    rows = [_FakeKRow(K=2, members_str="AAA[D], BBB[D]")]
+    target_dates = _bars_for_window("1d", 3)
+    target_libs = {
+        "1d": _make_lib(
+            dates=target_dates,
+            signals=["None"] * 3,
+            close=[100.0, 101.0, 102.0],
+        ),
+    }
+    aaa_dates = (
+        ["2025-12-31_1d"] + list(target_dates)
+        + ["2026-01-04_1d"]
+    )
+    # BBB is length-different (4 vs target's 3) AND missing
+    # target date 02 -> alignment helper fires and fails.
+    bbb_dates = [
+        "2026-01-01_1d",
+        "2026-01-03_1d",
+        "2026-01-04_1d",
+        "2026-01-05_1d",
+    ]
+    member_libs = {
+        ("AAA", "1d"): _make_lib(
+            dates=aaa_dates, signals=["a"] * 5,
+        ),
+        ("BBB", "1d"): _make_lib(
+            dates=bbb_dates, signals=["b"] * 4,
+        ),
+    }
+    loader = _library_factory(
+        target_libs=target_libs, member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        K_values=(2,), windows=("1d",),
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+        allow_partial_members=True,
+    )
+    # In partial mode the cell prepares with AAA only ...
+    assert report.prepared_cell_count == 1
+    cell = report.per_cell_inputs[(2, "1d")]
+    assert (
+        sorted(cell["member_signal_columns"].keys())
+        == ["AAA"]
+    )
+    # ... but the canonical-grid verdict MUST stay False
+    # because the prepared cell does NOT carry the full
+    # 2-member K-row set.
+    assert (
+        report.can_evaluate_full_60_cell_grid is False
+    )
+
+
+def test_member_alignment_helper_directly_returns_aligned_signals():
+    """Direct unit test of the helper: a superset member
+    library returns the correctly-ordered aligned signal
+    list. Pins the target-date-order invariant."""
+    target_dates = [
+        "2026-01-01", "2026-01-02", "2026-01-03",
+    ]
+    member_dates = [
+        "2025-12-31",
+        "2026-01-02",
+        "2026-01-01",  # duplicate? no -- different from "01"
+        "2026-01-03",
+        "2026-01-04",
+    ]
+    member_signals = ["a", "b", "c", "d", "e"]
+    aligned, reason = (
+        adapter._align_member_signals_to_target_dates(
+            target_dates, member_dates, member_signals,
+        )
+    )
+    assert reason is None
+    # Target order: 01 -> "c", 02 -> "b", 03 -> "d".
+    assert aligned == ["c", "b", "d"]
+
+
+def test_member_alignment_helper_directly_returns_incomplete():
+    target_dates = [
+        "2026-01-01", "2026-01-02", "2026-01-03",
+    ]
+    member_dates = ["2026-01-01", "2026-01-03"]
+    member_signals = ["x", "y"]
+    aligned, reason = (
+        adapter._align_member_signals_to_target_dates(
+            target_dates, member_dates, member_signals,
+        )
+    )
+    assert aligned is None
+    assert reason == (
+        adapter.REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+    )
+
+
+def test_member_alignment_helper_returns_axis_missing_on_none_dates():
+    target_dates = ["2026-01-01"]
+    aligned, reason = (
+        adapter._align_member_signals_to_target_dates(
+            target_dates, None, ["x"],
+        )
+    )
+    assert aligned is None
+    assert reason == (
+        adapter.REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING
+    )
+
+
+def test_member_alignment_full_canonical_daily_prepares_60(
+    tmp_path,
+):
+    """End-to-end happy path: target libs are NATIVE-close
+    (no fallback required) AND every K-row member's daily
+    signal library has a superset date axis (extra older +
+    newer bars). The Phase 6I-29 alignment widening allows
+    all 60 canonical cells to prepare; the strict full-
+    member-coverage verdict flips to True.
+
+    Tests the per-window canonical fixture for the 1d
+    window only because Phase 6I-29 intentionally does NOT
+    address the non-daily date-axis blocker; non-daily
+    windows continue to use equal-length fast-path member
+    libraries (same as the Phase 6I-22 happy-path fixture)."""
+    run_dir = tmp_path / "run_full_daily_alignment"
+    run_dir.mkdir()
+    rows, _ = _full_canonical_fixture(
+        k_member_sets={
+            k: [(f"M{i}", "D") for i in range(k)]
+            for k in core.CANONICAL_K_VALUES
+        },
+    )
+    # Target libs: identical to the canonical fixture's
+    # 1d entry plus matching dates for all canonical
+    # windows. Use the helper-built target libs (with
+    # native close) so the close-source fallback is not
+    # required.
+    target_libs = {
+        window: _full_target_lib(window, 3)
+        for window in core.CANONICAL_WINDOWS
+    }
+    # For 1d members: build superset libraries that
+    # include the target's 3 dates plus extra older +
+    # newer bars (so they trigger the Phase 6I-29
+    # alignment widening). For non-1d members: keep the
+    # equal-length fast path so this test isolates the
+    # daily-alignment behaviour.
+    all_members: set[str] = set()
+    for K in core.CANONICAL_K_VALUES:
+        for i in range(K):
+            all_members.add(f"M{i}")
+    member_libs: dict[tuple[str, str], dict[str, Any]] = {}
+    target_1d_dates = _bars_for_window("1d", 3)
+    superset_1d_dates = (
+        ["2025-12-30_1d"] + list(target_1d_dates)
+        + ["2026-01-04_1d", "2026-01-05_1d"]
+    )
+    for member in all_members:
+        for window in core.CANONICAL_WINDOWS:
+            if window == "1d":
+                member_libs[(member, window)] = _make_lib(
+                    dates=superset_1d_dates,
+                    signals=["Buy"] * len(
+                        superset_1d_dates,
+                    ),
+                )
+            else:
+                member_libs[(member, window)] = (
+                    _full_member_lib(window, 3)
+                )
+    loader = _library_factory(
+        target_libs=target_libs,
+        member_libs=member_libs,
+    )
+    report = adapter.prepare_multiwindow_k_inputs(
+        "SPY",
+        run_dir=run_dir,
+        stackbuilder_run_discovery_callable=(
+            _fake_discovery_returning(run_dir)
+        ),
+        leaderboard_loader_callable=(
+            _fake_leaderboard_loader_ok()
+        ),
+        k_rows_iter_callable=_fake_k_rows_iter(rows),
+        library_loader=loader,
+    )
+    assert report.prepared_cell_count == 60
+    assert report.missing_cell_count == 0
+    assert report.can_evaluate_full_60_cell_grid is True
+
+
+def test_member_alignment_no_projection_calls_in_helper():
+    """Phase 6I-29 helper AST-scanned for absence of
+    ``.resample()`` / ``.ffill()``. The existing module-
+    wide AST guard already covers this, but a focused
+    pin makes the contract obvious."""
+    import inspect
+    src = inspect.getsource(
+        adapter._align_member_signals_to_target_dates,
+    )
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = None
+            if isinstance(func, ast.Attribute):
+                name = func.attr
+            elif isinstance(func, ast.Name):
+                name = func.id
+            assert name not in {"resample", "ffill"}, (
+                f"alignment helper calls forbidden "
                 f"{name!r}() at line {node.lineno}"
             )

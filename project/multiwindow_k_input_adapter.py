@@ -232,6 +232,21 @@ REASON_TARGET_CLOSE_SOURCE_UNREADABLE = (
 REASON_TARGET_CLOSE_JOIN_INCOMPLETE = (
     "target_close_join_incomplete"
 )
+# Phase 6I-29 exact-date member alignment: when a member's
+# signal library has a different bar count than the target's
+# per-window library, the adapter attempts an exact-date
+# alignment of member signals onto the target's date axis
+# (no resample / no ffill / no projection / no "nearest"). The
+# two reason codes below surface the two distinct alignment
+# failure modes; they NEVER cause the adapter to fabricate
+# member signals and they NEVER widen the strict full-member-
+# coverage contract.
+REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE = (
+    "member_date_alignment_incomplete"
+)
+REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING = (
+    "member_signal_date_axis_missing"
+)
 
 ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_NO_K_ROW_IN_LEADERBOARD,
@@ -247,6 +262,8 @@ ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_TARGET_CLOSE_SOURCE_MISSING,
     REASON_TARGET_CLOSE_SOURCE_UNREADABLE,
     REASON_TARGET_CLOSE_JOIN_INCOMPLETE,
+    REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE,
+    REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING,
 )
 
 
@@ -272,6 +289,13 @@ ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE = (
 ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE = (
     "target_close_join_incomplete"
 )
+# Phase 6I-29 exact-date member alignment aggregate codes.
+ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE = (
+    "member_date_alignment_incomplete"
+)
+ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING = (
+    "member_signal_date_axis_missing"
+)
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_NO_STACKBUILDER_RUN,
@@ -286,6 +310,8 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_TARGET_CLOSE_SOURCE_MISSING,
     ISSUE_TARGET_CLOSE_SOURCE_UNREADABLE,
     ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE,
+    ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE,
+    ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING,
 )
 
 
@@ -728,6 +754,98 @@ def _resolve_target_close_via_close_source(
         if key is None or key not in close_by_date:
             return None, REASON_TARGET_CLOSE_JOIN_INCOMPLETE
         out.append(close_by_date[key])
+    return out, None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-29: exact-date member alignment
+# ---------------------------------------------------------------------------
+
+
+def _align_member_signals_to_target_dates(
+    target_dates_seq: list[Any],
+    member_dates_seq: Optional[list[Any]],
+    member_signals_seq: list[Any],
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Project a member's signal sequence onto the target's
+    exact date axis by normalized ISO-8601 ``YYYY-MM-DD`` key.
+
+    Phase 6I-29: the previous adapter contract required member
+    signal length to match the target's ``len(dates_seq)``
+    exactly. That is too strict for production signal libraries
+    where every per-ticker library starts at the ticker's own
+    first trading day -- a SPY 8,302-bar daily library and a
+    PRGO 8,585-bar daily library *should* be alignable because
+    PRGO's date set is a superset of SPY's, but the previous
+    length-only check rejected the member outright.
+
+    This helper performs the **minimum sound widening**: build
+    a ``date_key -> signal`` map from
+    ``zip(member_dates_seq, member_signals_seq)`` and walk
+    ``target_dates_seq`` in order, looking up each target date.
+
+    **Strict exact-date semantics**:
+
+      * No resample / ffill / interpolation / "nearest date" /
+        projection -- if a target date is not present in the
+        member's date axis, the alignment is incomplete and
+        the member is unusable.
+      * Target order is preserved -- the returned list is
+        indexed positionally against ``target_dates_seq``.
+      * Duplicate-date rows on the member side keep the FIRST
+        observation (mirrors the Phase 6I-28 close-source
+        contract -- duplicates do not trigger fabrication).
+      * ``None`` member signals (after coercion to ``str``)
+        are NOT special-cased -- they round-trip as the string
+        ``"None"`` which is the existing canonical
+        no-direction marker for adapter inputs.
+
+    Returns:
+      * ``(aligned, None)`` on a complete alignment, where
+        ``aligned`` is a list of length ``len(target_dates_seq)``
+        carrying string-coerced member signals in target order.
+      * ``(None, REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING)`` if
+        the member library has no usable ``dates`` /
+        ``date_index`` series, OR if the member date axis
+        length does not match the member signal length, OR if
+        no member date key can be normalized (the library is
+        structurally unusable).
+      * ``(None, REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE)`` if
+        one or more target dates are missing from the
+        member's date axis (the library is well-formed but
+        does not cover the target's date range exactly).
+
+    This helper is the only Phase 6I-29 date-aware code site
+    in the adapter; it is AST-scanned by the existing
+    no-projection regression test PLUS a new dedicated test.
+    """
+    if member_dates_seq is None:
+        return None, REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING
+    if len(member_dates_seq) != len(member_signals_seq):
+        return None, REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING
+
+    signal_by_date: dict[str, Any] = {}
+    any_key_normalized = False
+    for d, s in zip(member_dates_seq, member_signals_seq):
+        key = _normalize_date_key(d)
+        if key is None:
+            # Skip unparseable date rows; a structurally usable
+            # library may have a sparse / odd row, but if NO
+            # rows normalize we surface the axis-missing reason
+            # below.
+            continue
+        any_key_normalized = True
+        if key not in signal_by_date:
+            signal_by_date[key] = s
+    if not any_key_normalized:
+        return None, REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING
+
+    out: list[str] = []
+    for d in target_dates_seq:
+        key = _normalize_date_key(d)
+        if key is None or key not in signal_by_date:
+            return None, REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+        out.append(str(signal_by_date[key]))
     return out, None
 
 
@@ -1351,19 +1469,59 @@ def prepare_multiwindow_k_inputs(
                         issues, ISSUE_EMPTY_LIBRARY,
                     )
                     continue
-                if len(member_signals) != len(dates_seq):
-                    # Member signal length must match the
-                    # target's bar count for this window.
-                    # No projection / no resample; if they
-                    # disagree, skip the member.
-                    members_missing.append(member_ticker)
-                    _append_unique(
-                        issues, ISSUE_EMPTY_LIBRARY,
+                if len(member_signals) == len(dates_seq):
+                    # Fast path: length-equal -- preserve the
+                    # Phase 6I-22 semantics exactly (the date
+                    # axes are *assumed* aligned when lengths
+                    # match, which is what the legacy contract
+                    # has always done).
+                    member_columns[member_ticker] = [
+                        str(s) for s in member_signals
+                    ]
+                else:
+                    # Phase 6I-29 exact-date alignment: when
+                    # bar counts disagree, attempt to project
+                    # the member's signal sequence onto the
+                    # target's exact date axis using exact
+                    # normalized date keys. No resample / no
+                    # ffill / no "nearest". If any target date
+                    # is missing from the member's date axis,
+                    # the member remains unusable and the cell
+                    # still skips under strict full-member
+                    # coverage.
+                    member_dates = _extract_dates(member_lib)
+                    aligned, align_reason = (
+                        _align_member_signals_to_target_dates(
+                            list(dates_seq),
+                            (
+                                list(member_dates)
+                                if member_dates is not None
+                                else None
+                            ),
+                            list(member_signals),
+                        )
                     )
-                    continue
-                member_columns[member_ticker] = [
-                    str(s) for s in member_signals
-                ]
+                    if align_reason is None and aligned is not None:
+                        member_columns[member_ticker] = aligned
+                    else:
+                        members_missing.append(member_ticker)
+                        if align_reason == (
+                            REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING
+                        ):
+                            _append_unique(
+                                issues,
+                                (
+                                    ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING
+                                ),
+                            )
+                        else:
+                            _append_unique(
+                                issues,
+                                (
+                                    ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE
+                                ),
+                            )
+                        continue
                 member_protos[member_ticker] = proto
                 members_prepared.append(member_ticker)
 
