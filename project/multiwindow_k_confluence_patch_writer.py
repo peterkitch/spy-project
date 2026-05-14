@@ -41,17 +41,38 @@ writer:
      default. Either key absent / wrong returns
      ``wrote_artifact=False`` + a stable issue code +
      a stable recommended action; **no file mutation**.
-  3. If both authorization keys pass AND
-     ``plan.patch_ready=True``, reads the existing
+  3. **Runs writer-side plan/payload consistency
+     validation** (Phase 6I-25 Codex amendment). The
+     writer is the final mutation boundary; it does
+     NOT blindly trust an injected or buggy planner
+     object that claims ``patch_ready=True``. Before
+     any artifact read or merge, the writer asserts
+     ``_writer_plan_payload_is_consistent(plan)``
+     accepts the plan: ``planned_payload`` is a Mapping
+     with exactly the three ``PLANNED_PAYLOAD_KEYS``;
+     ``planned_payload_keys`` mirrors; ``fields_to_add``
+     and ``fields_to_replace`` partition
+     ``PLANNED_PAYLOAD_KEYS`` exactly, are disjoint, and
+     contain no unknown keys; the
+     ``per_window_k_metrics`` and
+     ``build_wide_window_alignment`` payload contents
+     pass the writer's local re-derivation of the
+     Phase 6I-20-shape contract. On failure: fires
+     ``ISSUE_PATCH_PLAN_CONTRACT_INVALID`` +
+     ``recommended_next_action=ACTION_MANUAL_REVIEW_REQUIRED``;
+     **no file mutation**.
+  4. If both authorization keys pass AND
+     ``plan.patch_ready=True`` AND the writer-side
+     consistency validator accepts, reads the existing
      artifact JSON, merges the planned payload onto a
      **copy**, writes the merged JSON to a same-directory
      temporary file, then atomically replaces the
      original via ``Path.replace`` (POSIX / Windows
      atomic move within the same filesystem).
-  4. Records SHA-256 of the artifact before and after
+  5. Records SHA-256 of the artifact before and after
      the write attempt so an audit can verify the
      identity of bytes that were replaced.
-  5. Optionally appends one JSONL row to the execution
+  6. Optionally appends one JSONL row to the execution
      log (``--execution-log``) per invocation, covering
      both dry-run and write attempts.
 
@@ -114,6 +135,9 @@ Public surface
     ISSUE_ARTIFACT_PATH_MISSING
     ISSUE_ARTIFACT_READ_FAILED
     ISSUE_ARTIFACT_WRITE_FAILED
+    ISSUE_PATCH_PLAN_CONTRACT_INVALID
+                                       # Phase 6I-25 Codex
+                                       # amendment
 
     # Stable recommended-action codes.
     ACTION_DRY_RUN_REVIEW_PATCH_PLAN
@@ -213,6 +237,21 @@ ISSUE_PATCH_PLAN_NOT_READY = "patch_plan_not_ready"
 ISSUE_ARTIFACT_PATH_MISSING = "artifact_path_missing"
 ISSUE_ARTIFACT_READ_FAILED = "artifact_read_failed"
 ISSUE_ARTIFACT_WRITE_FAILED = "artifact_write_failed"
+# Phase 6I-25 Codex amendment: the writer must NOT trust
+# the upstream planner's patch_ready=True claim blindly.
+# Before any artifact mutation the writer runs its own
+# plan/payload consistency validator. If the plan's
+# planned_payload / planned_payload_keys / fields_to_add
+# / fields_to_replace are mutually inconsistent, OR if
+# the planned_payload contents fail the local Phase 6I-20
+# -shape validator, the writer refuses to mutate and
+# fires this issue code instead. The writer is the final
+# mutation boundary; an injected or buggy planner object
+# cannot drive a partial / malformed write through this
+# layer.
+ISSUE_PATCH_PLAN_CONTRACT_INVALID = (
+    "patch_plan_contract_invalid"
+)
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_WRITE_NOT_REQUESTED,
@@ -221,6 +260,37 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_ARTIFACT_PATH_MISSING,
     ISSUE_ARTIFACT_READ_FAILED,
     ISSUE_ARTIFACT_WRITE_FAILED,
+    ISSUE_PATCH_PLAN_CONTRACT_INVALID,
+)
+
+
+# Phase 6I-25 Codex amendment: canonical-set helpers for
+# the writer's local Phase 6I-20-shape validator. The
+# writer re-derives the contract LOCALLY -- it does NOT
+# call the Phase 6I-24 planner's private validators (the
+# writer's forbidden-imports static guard still allows
+# importing the planner module for its public surface,
+# but reaching into private validators creates brittle
+# coupling). The contract is small enough to mirror.
+_CANONICAL_K_VALUES_SET: frozenset[int] = frozenset(
+    CANONICAL_K_VALUES,
+)
+_CANONICAL_WINDOWS_SET: frozenset[str] = frozenset(
+    CANONICAL_WINDOWS,
+)
+_CANONICAL_CELLS: frozenset[tuple[int, str]] = frozenset(
+    (k, w)
+    for k in CANONICAL_K_VALUES
+    for w in CANONICAL_WINDOWS
+)
+_REQUIRED_PER_WINDOW_K_METRIC_FIELDS: tuple[str, ...] = (
+    "K", "window", "total_capture_pct",
+    "sharpe_ratio", "trigger_days",
+)
+_REQUIRED_BUILD_WIDE_ALIGNMENT_FIELDS: tuple[str, ...] = (
+    "all_members_firing",
+    "firing_member_count",
+    "total_member_count",
 )
 
 
@@ -431,6 +501,202 @@ def _summarize_planner(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Writer-side plan/payload consistency validator
+# (Phase 6I-25 Codex amendment)
+# ---------------------------------------------------------------------------
+#
+# The writer is the final mutation boundary. A malformed / injected /
+# buggy patch plan that claims patch_ready=True must NOT be able to drive
+# a partial or malformed write through this layer. The writer re-derives
+# the Phase 6I-20-shape contract locally + adds its own structural
+# invariants (planned_payload_keys mirrors the dict; fields_to_add /
+# fields_to_replace partition PLANNED_PAYLOAD_KEYS exactly; no overlap;
+# no unknown keys). Used inside ``apply_multiwindow_k_confluence_patch``
+# AFTER patch_ready / artifact_path checks but BEFORE the artifact is
+# read or merged.
+
+
+def _writer_per_window_k_metrics_are_valid(
+    payload: Any,
+) -> bool:
+    """Re-derives the Phase 6I-20 per_window_k_metrics
+    contract locally.
+
+    Required: non-empty list of Mappings; every entry has
+    the five required fields; K int-coercible; window
+    non-empty str; the three numeric fields ``int`` /
+    ``float`` and NOT ``bool``; no duplicate ``(K, window)``
+    pairs; canonical cells (K in CANONICAL_K_VALUES AND
+    window in CANONICAL_WINDOWS) cover the full 60-cell
+    grid; noncanonical extras tolerated but never
+    substitute.
+    """
+    if not isinstance(payload, list):
+        return False
+    if not payload:
+        return False
+    seen: set[tuple[int, str]] = set()
+    canonical_observed: set[tuple[int, str]] = set()
+    for entry in payload:
+        if not isinstance(entry, Mapping):
+            return False
+        for f in _REQUIRED_PER_WINDOW_K_METRIC_FIELDS:
+            if f not in entry:
+                return False
+        try:
+            k_int = int(entry["K"])
+        except (TypeError, ValueError):
+            return False
+        win = entry.get("window")
+        if not isinstance(win, str) or not win.strip():
+            return False
+        win_clean = win.strip()
+        for numeric_key in (
+            "total_capture_pct",
+            "sharpe_ratio",
+            "trigger_days",
+        ):
+            val = entry.get(numeric_key)
+            if val is None:
+                return False
+            if not isinstance(val, (int, float)):
+                return False
+            if isinstance(val, bool):
+                return False
+        cell_key = (k_int, win_clean)
+        if cell_key in seen:
+            return False
+        seen.add(cell_key)
+        if (
+            k_int in _CANONICAL_K_VALUES_SET
+            and win_clean in _CANONICAL_WINDOWS_SET
+        ):
+            canonical_observed.add(cell_key)
+    return canonical_observed == _CANONICAL_CELLS
+
+
+def _writer_build_wide_alignment_is_valid(
+    payload: Any,
+) -> bool:
+    """Re-derives the Phase 6I-20
+    build_wide_window_alignment contract locally."""
+    if not isinstance(payload, Mapping):
+        return False
+    canonical = set(CANONICAL_WINDOWS)
+    if not canonical.issubset(set(payload.keys())):
+        return False
+    for win in CANONICAL_WINDOWS:
+        entry = payload.get(win)
+        if not isinstance(entry, Mapping):
+            return False
+        for f in _REQUIRED_BUILD_WIDE_ALIGNMENT_FIELDS:
+            if f not in entry:
+                return False
+        amf = entry["all_members_firing"]
+        if not isinstance(amf, bool):
+            return False
+        for count_key in (
+            "firing_member_count",
+            "total_member_count",
+        ):
+            cv = entry[count_key]
+            if not isinstance(cv, int) or isinstance(
+                cv, bool,
+            ):
+                return False
+    return True
+
+
+def _writer_plan_payload_is_consistent(plan: Any) -> bool:
+    """Writer-side plan/payload consistency validator.
+
+    Requires ALL of:
+
+      - ``plan.planned_payload`` is a Mapping;
+      - ``set(planned_payload.keys()) ==
+        set(PLANNED_PAYLOAD_KEYS)`` (exactly the three
+        planned top-level keys);
+      - ``plan.planned_payload_keys`` represents exactly
+        the three planned keys (same set, length 3);
+      - ``plan.fields_to_add`` and ``plan.fields_to_replace``
+        partition ``PLANNED_PAYLOAD_KEYS`` exactly;
+      - ``plan.fields_to_add`` and
+        ``plan.fields_to_replace`` are disjoint;
+      - no unknown keys appear in either
+        ``plan.fields_to_add`` or
+        ``plan.fields_to_replace``;
+      - ``planned_payload`` contents pass the local
+        Phase 6I-20-shape validators
+        (``_writer_per_window_k_metrics_are_valid`` for
+        ``per_window_k_metrics`` +
+        ``_writer_build_wide_alignment_is_valid`` for
+        ``build_wide_window_alignment``).
+
+    Returns True iff all the above hold. The writer
+    refuses to mutate the artifact otherwise.
+    """
+    planned_payload = getattr(plan, "planned_payload", None)
+    if not isinstance(planned_payload, Mapping):
+        return False
+    expected_key_set = set(PLANNED_PAYLOAD_KEYS)
+    if set(planned_payload.keys()) != expected_key_set:
+        return False
+
+    keys_attr = getattr(plan, "planned_payload_keys", None)
+    if keys_attr is None:
+        return False
+    try:
+        keys_seq = tuple(keys_attr)
+    except TypeError:
+        return False
+    if set(keys_seq) != expected_key_set:
+        return False
+    if len(keys_seq) != len(PLANNED_PAYLOAD_KEYS):
+        return False
+
+    fields_to_add_attr = getattr(
+        plan, "fields_to_add", None,
+    )
+    fields_to_replace_attr = getattr(
+        plan, "fields_to_replace", None,
+    )
+    if (
+        fields_to_add_attr is None
+        or fields_to_replace_attr is None
+    ):
+        return False
+    try:
+        fields_to_add = tuple(fields_to_add_attr)
+        fields_to_replace = tuple(fields_to_replace_attr)
+    except TypeError:
+        return False
+    add_set = set(fields_to_add)
+    replace_set = set(fields_to_replace)
+    # No unknown keys.
+    if add_set - expected_key_set:
+        return False
+    if replace_set - expected_key_set:
+        return False
+    # Disjoint.
+    if add_set & replace_set:
+        return False
+    # Exact partition.
+    if (add_set | replace_set) != expected_key_set:
+        return False
+
+    # Phase 6I-20-shape contents.
+    if not _writer_per_window_k_metrics_are_valid(
+        planned_payload.get("per_window_k_metrics"),
+    ):
+        return False
+    if not _writer_build_wide_alignment_is_valid(
+        planned_payload.get("build_wide_window_alignment"),
+    ):
+        return False
+    return True
+
+
 def _merge_planned_payload(
     existing: Mapping[str, Any],
     planned_payload: Mapping[str, Any],
@@ -618,8 +884,10 @@ def apply_multiwindow_k_confluence_patch(
         )
 
     if write_authorized:
-        # Both keys present -- now gate on patch readiness
-        # and on artifact-path resolution.
+        # Both keys present -- now gate on patch readiness,
+        # artifact-path resolution, AND writer-side
+        # plan/payload consistency validation (Phase 6I-25
+        # Codex amendment).
         if not planner_patch_ready:
             _append_unique(
                 issues, ISSUE_PATCH_PLAN_NOT_READY,
@@ -627,6 +895,17 @@ def apply_multiwindow_k_confluence_patch(
         elif artifact_path is None:
             _append_unique(
                 issues, ISSUE_ARTIFACT_PATH_MISSING,
+            )
+        elif not _writer_plan_payload_is_consistent(plan):
+            # Plan claimed patch_ready=True but its
+            # planned_payload / planned_payload_keys /
+            # fields_to_add / fields_to_replace are
+            # mutually inconsistent, OR the planned
+            # payload contents fail the local Phase 6I-20
+            # shape validators. The writer refuses to
+            # mutate.
+            _append_unique(
+                issues, ISSUE_PATCH_PLAN_CONTRACT_INVALID,
             )
         else:
             # Read existing artifact -> merge -> atomic
@@ -690,6 +969,7 @@ def apply_multiwindow_k_confluence_patch(
         ISSUE_ARTIFACT_PATH_MISSING in issues
         or ISSUE_ARTIFACT_READ_FAILED in issues
         or ISSUE_ARTIFACT_WRITE_FAILED in issues
+        or ISSUE_PATCH_PLAN_CONTRACT_INVALID in issues
     ):
         recommended = ACTION_MANUAL_REVIEW_REQUIRED
     elif wrote_artifact:

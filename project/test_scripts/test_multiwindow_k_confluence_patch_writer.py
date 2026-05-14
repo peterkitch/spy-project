@@ -1054,6 +1054,359 @@ def test_cli_unhandled_exception_returns_rc_3(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 9b. Writer-side plan/payload consistency validation
+# (Phase 6I-25 Codex amendment)
+# ---------------------------------------------------------------------------
+#
+# The writer is the final mutation boundary. A malformed / injected /
+# buggy patch plan that claims patch_ready=True must NOT be able to drive
+# a partial or malformed write through this layer. These tests inject
+# deliberately-inconsistent plans through the fake-planner seam and
+# assert the writer refuses to mutate the artifact + fires
+# ISSUE_PATCH_PLAN_CONTRACT_INVALID + ACTION_MANUAL_REVIEW_REQUIRED.
+
+
+def test_plan_missing_planned_payload_key_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """Codex amendment: plan.patch_ready=True +
+    plan.planned_payload_keys lists all three keys +
+    plan.fields_to_add lists all three keys, but
+    plan.planned_payload itself only carries ONE of the
+    three keys. The writer must refuse to mutate."""
+    _set_env_auth(monkeypatch)
+    pre_existing = {
+        "engine": "confluence",
+        "preserved": "value",
+    }
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY", contents=pre_existing,
+    )
+    raw_before = artifact_path.read_bytes()
+    full_payload = _make_full_planned_payload()
+    # Lying plan: planned_payload missing the last two
+    # keys; planned_payload_keys / fields_to_add still
+    # claim all three.
+    malformed_payload = {
+        "per_window_k_metrics": full_payload[
+            "per_window_k_metrics"
+        ],
+    }
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        planned_payload=malformed_payload,
+        planned_payload_keys=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_add=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_replace=(),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert result.wrote_artifact is False
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+    assert (
+        result.recommended_next_action
+        == writer.ACTION_MANUAL_REVIEW_REQUIRED
+    )
+
+
+def test_plan_planned_payload_keys_attr_lies_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """Plan.planned_payload itself has the three keys
+    but plan.planned_payload_keys ATTR claims a
+    different (smaller) set. Writer refuses to mutate."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    raw_before = artifact_path.read_bytes()
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        # planned_payload is consistent...
+        planned_payload=_make_full_planned_payload(),
+        # ...but the planned_payload_keys attr lies.
+        planned_payload_keys=("per_window_k_metrics",),
+        fields_to_add=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_replace=(),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+    assert (
+        result.recommended_next_action
+        == writer.ACTION_MANUAL_REVIEW_REQUIRED
+    )
+
+
+def test_plan_fields_dont_partition_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """plan.fields_to_add + plan.fields_to_replace
+    don't partition PLANNED_PAYLOAD_KEYS exactly
+    (missing one key). Writer refuses."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    raw_before = artifact_path.read_bytes()
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        planned_payload=_make_full_planned_payload(),
+        planned_payload_keys=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        # Missing multiwindow_k_engine_payload_metadata
+        # from both add + replace -> doesn't partition.
+        fields_to_add=("per_window_k_metrics",),
+        fields_to_replace=("build_wide_window_alignment",),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+
+
+def test_plan_fields_overlap_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """fields_to_add and fields_to_replace share a key
+    (overlapping). Writer refuses."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    raw_before = artifact_path.read_bytes()
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        planned_payload=_make_full_planned_payload(),
+        planned_payload_keys=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        # per_window_k_metrics appears in BOTH.
+        fields_to_add=(
+            "per_window_k_metrics",
+            "build_wide_window_alignment",
+            "multiwindow_k_engine_payload_metadata",
+        ),
+        fields_to_replace=("per_window_k_metrics",),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+
+
+def test_plan_fields_contain_unknown_key_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """fields_to_add contains a key outside
+    PLANNED_PAYLOAD_KEYS. Writer refuses."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    raw_before = artifact_path.read_bytes()
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        planned_payload=_make_full_planned_payload(),
+        planned_payload_keys=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_add=(
+            "per_window_k_metrics",
+            "build_wide_window_alignment",
+            "multiwindow_k_engine_payload_metadata",
+            "some_other_field",  # NOT canonical
+        ),
+        fields_to_replace=(),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+
+
+def test_plan_with_malformed_per_window_metrics_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """planned_payload has all three top-level keys but
+    per_window_k_metrics carries only 59 canonical
+    cells. Writer's local Phase 6I-20-shape validator
+    rejects."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    raw_before = artifact_path.read_bytes()
+    bad_payload = _make_full_planned_payload()
+    # Drop one canonical (K, window) entry from
+    # per_window_k_metrics.
+    bad_payload["per_window_k_metrics"] = bad_payload[
+        "per_window_k_metrics"
+    ][:-1]
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        planned_payload=bad_payload,
+        planned_payload_keys=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_add=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_replace=(),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+
+
+def test_plan_with_malformed_build_wide_alignment_does_not_write(
+    tmp_path, monkeypatch,
+):
+    """planned_payload has all three keys but
+    build_wide_window_alignment is missing one canonical
+    window. Writer rejects."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    raw_before = artifact_path.read_bytes()
+    bad_payload = _make_full_planned_payload()
+    bad_payload["build_wide_window_alignment"].pop("1y")
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        planned_payload=bad_payload,
+        planned_payload_keys=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_add=tuple(
+            planner.PLANNED_PAYLOAD_KEYS,
+        ),
+        fields_to_replace=(),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert artifact_path.read_bytes() == raw_before
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in result.issue_codes
+    )
+
+
+def test_valid_happy_path_still_writes_after_amendment(
+    tmp_path, monkeypatch,
+):
+    """Phase 6I-25 Codex amendment regression guard: the
+    full canonical happy-path fixture must STILL write
+    after the new writer-side validator is wired in.
+    wrote_artifact=True, no ISSUE_PATCH_PLAN_CONTRACT_INVALID,
+    ACTION_ARTIFACT_WRITE_COMPLETE."""
+    _set_env_auth(monkeypatch)
+    artifact_path = _write_artifact_file(
+        tmp_path, "SPY",
+        contents={"engine": "confluence"},
+    )
+    plan = _FakePlan(
+        artifact_path=str(artifact_path),
+        patch_ready=True,
+        fields_to_add=tuple(planner.PLANNED_PAYLOAD_KEYS),
+        fields_to_replace=(),
+    )
+    result = writer.apply_multiwindow_k_confluence_patch(
+        "SPY",
+        artifact_root=tmp_path,
+        patch_planner_callable=_fake_planner_returning(plan),
+        write=True,
+    )
+    assert result.wrote_artifact is True
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        not in result.issue_codes
+    )
+    assert (
+        result.recommended_next_action
+        == writer.ACTION_ARTIFACT_WRITE_COMPLETE
+    )
+
+
+def test_patch_plan_contract_invalid_in_all_issue_codes():
+    """Reflective completeness: the new issue code must
+    be in ALL_ISSUE_CODES."""
+    assert (
+        writer.ISSUE_PATCH_PLAN_CONTRACT_INVALID
+        in writer.ALL_ISSUE_CODES
+    )
+
+
+# ---------------------------------------------------------------------------
 # 10. No production roots touched (regression guard)
 # ---------------------------------------------------------------------------
 

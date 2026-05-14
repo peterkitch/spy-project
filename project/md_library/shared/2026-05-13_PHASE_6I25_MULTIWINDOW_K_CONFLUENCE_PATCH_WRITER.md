@@ -55,19 +55,63 @@ writer:
 
 ---
 
-## 1. Two-key writer authorization
+## 1. `wrote_artifact=True` requires THREE gates (Phase 6I-25 Codex amendment)
 
-Same contract as Phase 6H-5 (`daily_board_automation_writer`):
+The writer is the final mutation boundary in the
+multi-window K engine track. It does NOT blindly trust
+an injected or buggy planner object that claims
+`patch_ready=True`. `wrote_artifact=True` requires ALL
+of:
 
-| Gate | Required for `write_authorized=True` |
-|---|---|
-| `write=True` (CLI `--write` flag or function arg) | Yes |
-| `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` | Yes |
+1. **Two-key writer authorization** (same pattern as
+   Phase 6H-5 `daily_board_automation_writer`):
 
-Both keys are required. **`write=False` is the default.**
-Either key absent / wrong returns
-`wrote_artifact=False` + a stable issue code + a stable
-recommended action; **no file mutation**.
+   | Gate | Required |
+   |---|---|
+   | `write=True` (CLI `--write` flag or function arg) | Yes |
+   | `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` | Yes |
+
+   Both keys are required. **`write=False` is the
+   default.**
+
+2. **Upstream planner readiness**: the Phase 6I-24
+   planner reported `patch_ready=True`.
+
+3. **Writer-side plan/payload consistency** (Phase 6I-25
+   Codex amendment): the writer's own
+   `_writer_plan_payload_is_consistent(plan)` accepts the
+   plan. This validator requires ALL of:
+
+   - `plan.planned_payload` is a Mapping;
+   - `set(planned_payload.keys()) ==
+     set(PLANNED_PAYLOAD_KEYS)` — exactly the three
+     planned top-level keys;
+   - `plan.planned_payload_keys` mirrors those three
+     keys (same set, length 3);
+   - `plan.fields_to_add` and `plan.fields_to_replace`
+     partition `PLANNED_PAYLOAD_KEYS` exactly;
+   - `plan.fields_to_add` and `plan.fields_to_replace`
+     are disjoint;
+   - no unknown keys appear in either
+     `plan.fields_to_add` or `plan.fields_to_replace`;
+   - `per_window_k_metrics` passes
+     `_writer_per_window_k_metrics_are_valid` (canonical
+     60-cell grid, required-five fields, no
+     `bool`-as-`int`, no duplicates);
+   - `build_wide_window_alignment` passes
+     `_writer_build_wide_alignment_is_valid` (one entry
+     per canonical window with bool / int field types).
+
+   The validators are re-derived LOCALLY in the writer
+   module — they do NOT call the Phase 6I-24 planner's
+   private validators. The contract is small enough to
+   mirror, and self-sufficiency means a buggy / replaced
+   planner cannot subvert the writer's own contract.
+
+Either auth gate failed / planner not ready / writer-side
+consistency rejected → `wrote_artifact=False` +
+appropriate `ISSUE_*` + `recommended_next_action`; **no
+file mutation**.
 
 ### 1.1 Decision cascade
 
@@ -77,9 +121,10 @@ recommended action; **no file mutation**.
 | `write=True` but env wrong | `False` | `env_authorization_missing_or_invalid` | `set_write_authorization_and_rerun` |
 | Both keys pass + `patch_ready=False` | `False` | `patch_plan_not_ready` | `resolve_patch_plan_first` |
 | Both keys pass + `patch_ready=True` + no artifact path | `False` | `artifact_path_missing` | `manual_review_required` |
+| **Both keys pass + `patch_ready=True` + plan/payload inconsistent** *(Codex amendment)* | `False` | `patch_plan_contract_invalid` | `manual_review_required` |
 | Both keys pass + `patch_ready=True` + read failure | `False` | `artifact_read_failed` | `manual_review_required` |
 | Both keys pass + `patch_ready=True` + write failure | `False` | `artifact_write_failed` | `manual_review_required` |
-| Both keys pass + `patch_ready=True` + write succeeds | `True` | `()` | `artifact_write_complete` |
+| Both keys pass + `patch_ready=True` + writer-side consistency OK + write succeeds | `True` | `()` | `artifact_write_complete` |
 
 On any not-write path, the original artifact bytes are
 **not touched**. The atomic-write helper's `except` path
@@ -246,6 +291,22 @@ result = apply_multiwindow_k_confluence_patch(
   existing artifact / non-dict top level.
 - `artifact_write_failed` — atomic write helper raised;
   original bytes preserved.
+- `patch_plan_contract_invalid` **(Phase 6I-25 Codex
+  amendment)** — planner claimed `patch_ready=True` but
+  the writer's own `_writer_plan_payload_is_consistent`
+  validator rejected the plan. Causes: `planned_payload`
+  not a Mapping; `set(planned_payload.keys())` doesn't
+  match `set(PLANNED_PAYLOAD_KEYS)`;
+  `planned_payload_keys` attr lies about the keys;
+  `fields_to_add` / `fields_to_replace` don't partition
+  `PLANNED_PAYLOAD_KEYS` exactly; the two lists overlap;
+  unknown keys in either list; or
+  `per_window_k_metrics` / `build_wide_window_alignment`
+  payload contents fail the local Phase 6I-20-shape
+  validators. The writer is the final mutation
+  boundary; a malformed / injected / buggy planner
+  object cannot drive a partial or malformed write
+  through this layer.
 
 ### 5.3 Stable recommended-action codes
 
@@ -338,7 +399,7 @@ upstream chain).
 
 ---
 
-## 9. Tests (28 pinned contracts)
+## 9. Tests (37 pinned contracts)
 
 `project/test_scripts/test_multiwindow_k_confluence_patch_writer.py`:
 
@@ -400,6 +461,37 @@ upstream chain).
 28. **No production roots touched**: defensive
     regression guard pins that the written artifact
     path is under `tmp_path`.
+29. **(Phase 6I-25 Codex amendment)** Plan with
+    `patch_ready=True` but `planned_payload` missing
+    one of the three planned keys → no mutation +
+    `ISSUE_PATCH_PLAN_CONTRACT_INVALID` +
+    `ACTION_MANUAL_REVIEW_REQUIRED`.
+30. **(Phase 6I-25 Codex amendment)**
+    `planned_payload_keys` attr lies about the keys →
+    no mutation.
+31. **(Phase 6I-25 Codex amendment)** `fields_to_add` +
+    `fields_to_replace` don't partition
+    `PLANNED_PAYLOAD_KEYS` exactly → no mutation.
+32. **(Phase 6I-25 Codex amendment)** `fields_to_add`
+    and `fields_to_replace` overlap on a shared key →
+    no mutation.
+33. **(Phase 6I-25 Codex amendment)** `fields_to_add`
+    contains an unknown key outside
+    `PLANNED_PAYLOAD_KEYS` → no mutation.
+34. **(Phase 6I-25 Codex amendment)**
+    `per_window_k_metrics` has only 59 canonical cells
+    → writer's local Phase 6I-20-shape validator
+    rejects → no mutation.
+35. **(Phase 6I-25 Codex amendment)**
+    `build_wide_window_alignment` missing one canonical
+    window → writer's local validator rejects → no
+    mutation.
+36. **(Phase 6I-25 Codex amendment)** Valid happy path
+    still writes after the new validator is wired in
+    (regression guard).
+37. **(Phase 6I-25 Codex amendment)** Reflective:
+    `ISSUE_PATCH_PLAN_CONTRACT_INVALID` is in
+    `ALL_ISSUE_CODES`.
 
 All tests use `tmp_path` fixtures + `monkeypatch` env
 state + injected fake `_FakePlan` returns through the
@@ -416,12 +508,12 @@ py_compile: clean on multiwindow_k_confluence_patch_writer.py +
             test_multiwindow_k_confluence_patch_writer.py.
 
 pytest test_scripts/test_multiwindow_k_confluence_patch_writer.py -q:
-  28 passed in 0.68 s
+  37 passed in 0.77 s
 
 Focused 6-way (writer + Phase 6I-24 planner + Phase 6I-23 builder +
               Phase 6I-22 adapter + Phase 6I-21 core + Phase 6I-20 gap audit):
-  171 passed in 1.64 s
-  ├── multiwindow_k_confluence_patch_writer    28 passed
+  180 passed in 1.65 s
+  ├── multiwindow_k_confluence_patch_writer    37 passed
   ├── multiwindow_k_confluence_patch_planner   30 passed
   ├── multiwindow_k_engine_payload_builder     29 passed
   ├── multiwindow_k_input_adapter              23 passed
