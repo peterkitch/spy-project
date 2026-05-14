@@ -128,6 +128,9 @@ EXPECTED_SCHEMA_VERSION: str = "confluence_website_export_v1"
 VIEW_MODEL_VERSION: str = "confluence_website_reader_view_v1"
 PAGE_TITLE: str = "Confluence Multi-Ticker Ranking Board"
 
+# Phase 6I-39: one-row-per-ticker display contract.
+DISPLAY_ROW_CARDINALITY: str = "one_row_per_ticker"
+
 
 STATUS_BANNER_KIND_HAS_ELIGIBLE: str = "has_eligible_rankings"
 STATUS_BANNER_KIND_NO_ELIGIBLE_PRODUCTION_BLOCKED: str = (
@@ -291,6 +294,87 @@ def _safe_list(value: Any) -> list[Any]:
 # ---------------------------------------------------------------------------
 # Row builders
 # ---------------------------------------------------------------------------
+
+
+def _build_primary_build_compact(
+    primary: Optional[Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Phase 6I-39: compact primary-build block for the
+    one-row-per-ticker ranking-table summary. Pre-formats a
+    short label the renderer can drop into a single cell.
+
+    Returns ``None`` only when ``primary`` is not a
+    Mapping. When the primary-build dict is present but
+    reports ``primary_build_available=False``, the compact
+    block carries the same shape with null/zero fields and
+    ``primary_build_available=False`` so the renderer can
+    branch without crashing.
+    """
+    if not isinstance(primary, Mapping):
+        return None
+    if not primary.get("primary_build_available"):
+        return {
+            "primary_build_available": False,
+            "selection_tier": (
+                primary.get("selection_tier") or "none"
+            ),
+            "K": None,
+            "signal_direction": None,
+            "windows_signaling_count": 0,
+            "direction_conflict": False,
+            "explanation": (
+                primary.get("explanation")
+                or "no_current_signal"
+            ),
+            "label": None,
+            "other_active_k_count": 0,
+        }
+    K = primary.get("K")
+    direction = primary.get("signal_direction")
+    windows_count = _safe_int(
+        primary.get("windows_signaling_count"),
+    )
+    cap = _format_capture(
+        primary.get("total_capture_pct_sum"),
+    )
+    sharpe = _format_sharpe(primary.get("avg_sharpe_ratio"))
+    parts: list[str] = []
+    if K is not None:
+        try:
+            parts.append(f"K={int(K)}")
+        except (TypeError, ValueError):
+            parts.append(f"K={K}")
+    if direction:
+        parts.append(str(direction))
+    if windows_count:
+        parts.append(f"in {windows_count} window(s)")
+    sub: list[str] = []
+    if cap is not None:
+        sub.append(f"cap {cap}")
+    if sharpe is not None:
+        sub.append(f"Sharpe {sharpe}")
+    label_main = " ".join(parts) if parts else None
+    label = (
+        f"{label_main} ({', '.join(sub)})"
+        if label_main and sub
+        else label_main
+    )
+    other_active = _safe_list(
+        primary.get("other_active_k_builds"),
+    )
+    return {
+        "primary_build_available": True,
+        "selection_tier": primary.get("selection_tier"),
+        "K": K,
+        "signal_direction": direction,
+        "windows_signaling_count": windows_count,
+        "direction_conflict": bool(
+            primary.get("direction_conflict", False),
+        ),
+        "explanation": primary.get("explanation"),
+        "label": label,
+        "other_active_k_count": len(other_active),
+    }
 
 
 def _build_ranking_table_row(
@@ -466,6 +550,10 @@ def _build_ranking_table_row(
         "issues": _safe_list(row.get("issue_codes")),
         # Phase 6I-37 current-build signal compact summary.
         "current_signal_summary": current_signal_block,
+        # Phase 6I-39 primary build compact block.
+        "primary_build": _build_primary_build_compact(
+            row.get("primary_build_summary"),
+        ),
     }
 
 
@@ -562,6 +650,14 @@ def _build_ticker_card(
         ] = dict(raw_summary)
     else:
         current_build_signal_summary = None
+    # Phase 6I-39: primary build summary on eligible cards.
+    raw_primary = detail.get("primary_build_summary")
+    if rank_eligible and isinstance(raw_primary, Mapping):
+        primary_build_summary_card: Optional[
+            dict[str, Any]
+        ] = dict(raw_primary)
+    else:
+        primary_build_summary_card = None
     return {
         "ticker": ticker,
         "rank_eligible": rank_eligible,
@@ -592,6 +688,10 @@ def _build_ticker_card(
         "current_build_signals": current_build_signals,
         "current_build_signal_summary": (
             current_build_signal_summary
+        ),
+        # Phase 6I-39 primary build summary.
+        "primary_build_summary": (
+            primary_build_summary_card
         ),
     }
 
@@ -765,6 +865,8 @@ def build_view_model(
         "generated_at": package.get("generated_at"),
         "rendered_at": _iso_now(),
         "page_title": PAGE_TITLE,
+        # Phase 6I-39: one-row-per-ticker display contract.
+        "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
         "has_eligible_rankings": has_eligible,
         "eligible_count": eligible_count,
         "blocked_count": blocked_count,
@@ -807,6 +909,10 @@ def build_error_view_model(
         "generated_at": None,
         "rendered_at": _iso_now(),
         "page_title": PAGE_TITLE,
+        # Phase 6I-39: display contract still anchored on
+        # the error view model so the renderer never sees
+        # this key missing.
+        "display_row_cardinality": DISPLAY_ROW_CARDINALITY,
         "has_eligible_rankings": False,
         "eligible_count": 0,
         "blocked_count": 0,

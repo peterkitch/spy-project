@@ -174,6 +174,18 @@ def _normalize_ranking_row(
         current_signal_summary_out = dict(
             current_signal_summary,
         )
+    # Phase 6I-39 primary build summary pass-through.
+    primary_build_summary = row.get(
+        "primary_build_summary",
+    )
+    if not isinstance(primary_build_summary, Mapping):
+        primary_build_summary_out: Optional[
+            dict[str, Any]
+        ] = None
+    else:
+        primary_build_summary_out = dict(
+            primary_build_summary,
+        )
     return {
         "rank": int(rank),
         "ticker": row.get("ticker"),
@@ -224,6 +236,10 @@ def _normalize_ranking_row(
         # Phase 6I-37 current-build signal summary.
         "current_build_signal_summary": (
             current_signal_summary_out
+        ),
+        # Phase 6I-39 primary build summary.
+        "primary_build_summary": (
+            primary_build_summary_out
         ),
     }
 
@@ -369,9 +385,21 @@ def _build_ticker_detail(
             if isinstance(cbsum, Mapping)
             else None
         )
+        # Phase 6I-39 primary build summary on eligible
+        # ticker_details. Blocked rows -> null (no
+        # fabrication).
+        pbsum = row.get("primary_build_summary")
+        primary_build_summary_detail: Optional[
+            dict[str, Any]
+        ] = (
+            dict(pbsum)
+            if isinstance(pbsum, Mapping)
+            else None
+        )
     else:
         current_build_signals = []
         current_build_signal_summary = None
+        primary_build_summary_detail = None
 
     full_60_cell_detail_embedded = False
     artifact_path = row.get("artifact_path")
@@ -438,6 +466,11 @@ def _build_ticker_detail(
         "current_build_signals": current_build_signals,
         "current_build_signal_summary": (
             current_build_signal_summary
+        ),
+        # Phase 6I-39 primary build summary
+        # (one-row-per-ticker display contract).
+        "primary_build_summary": (
+            primary_build_summary_detail
         ),
     }
 
@@ -636,6 +669,14 @@ def build_website_export_package(
         "generated_at": _iso_now(),
         "source": (
             "confluence_multiwindow_ranking_export"
+        ),
+        # Phase 6I-39 display contract: renderer MUST treat
+        # ``ranking_rows`` as one-row-per-ticker. Multiple
+        # active K builds are surfaced via the primary build
+        # summary + ``other_active_k_builds``, never by
+        # exploding rows.
+        "display_row_cardinality": (
+            _cmre.DISPLAY_ROW_CARDINALITY
         ),
         "artifact_root": ur.get("artifact_root"),
         "cache_dir": (
