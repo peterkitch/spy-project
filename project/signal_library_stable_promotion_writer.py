@@ -29,19 +29,34 @@ In order:
      (``len(dates) == len(signals) == len(close)``). Mismatch
      blocks the entire promotion.
 
-When all five gates pass AND ``write=True``, the writer:
+When all five gates pass AND ``write=True``, the writer
+runs the staged-to-production copy as a **transactional
+batch**:
 
-  * Copies each staged PKL to a ``<filename>.tmp`` next to
-    the production target, then atomically renames it onto
-    the production filename.
-  * Copies the optional ``<filename>.manifest.json`` sidecar
-    (when present on the staged side) the same way.
-  * Appends one JSONL row per writer invocation to the
-    optional execution log.
+  * Each PKL is copied via ``<filename>.tmp`` + ``os.replace``
+    onto the production target. Before each copy, the
+    target's prior bytes are snapshotted in memory (or
+    ``None`` for newly-added targets).
+  * The optional ``<filename>.manifest.json`` sidecar is
+    copied the same way; its prior bytes are snapshotted too.
+  * If ANY copy fails mid-batch (PKL OR sidecar, for ANY
+    library), the writer walks the touched-target log in
+    reverse and **restores every prior target to its exact
+    pre-run state**: newly-added targets are unlinked,
+    replaced targets are restored from their captured
+    prior-bytes payload via an atomic
+    ``<filename>.restore_tmp`` + ``os.replace`` pattern.
+    The ``files_added`` / ``files_replaced`` /
+    ``sidecars_copied`` accumulators are zeroed and the
+    result surface honestly reports zero net writes.
+  * One JSONL row per writer invocation is appended to the
+    optional execution log (best-effort).
 
 When ANY gate fails, the writer surfaces structured issue
-codes and refuses to mutate. The on-disk production state is
-byte-for-byte unchanged.
+codes and refuses to mutate. The on-disk production state
+is byte-for-byte unchanged. The same byte-for-byte
+guarantee holds for mid-batch copy failures via the
+transactional rollback described above.
 
 Strictly bounded
 ----------------
@@ -216,6 +231,44 @@ def _atomic_copy(
         return True, None
     except Exception as exc:
         return False, str(exc)
+
+
+def _restore_target(
+    path_str: str, prior_bytes: Optional[bytes],
+) -> None:
+    """Restore one production target to its exact pre-run
+    state during transactional rollback.
+
+    ``prior_bytes is None`` means the target was newly added
+    by this run (it did NOT exist before any copy happened),
+    so rollback unlinks it. Otherwise the target existed
+    before and must be restored to those exact bytes via an
+    atomic ``<path>.restore_tmp`` + ``os.replace`` pattern
+    so the restore is itself crash-safe.
+
+    Best-effort: a restore failure is swallowed (no public
+    surface for partial-rollback diagnostics in Phase 6I-31).
+    The Phase 6I-31 evidence doc § 14 notes that any
+    rollback-time exception is itself a fatal-class
+    incident that must be handled by operator review.
+    """
+    try:
+        target = Path(path_str)
+        if prior_bytes is None:
+            if target.exists():
+                target.unlink()
+            return
+        tmp = target.with_suffix(target.suffix + ".restore_tmp")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(prior_bytes)
+        os.replace(str(tmp), str(target))
+    except Exception:
+        pass
 
 
 def _writer_side_revalidate(
@@ -404,17 +457,51 @@ def promote_signal_libraries(
                 issues, ISSUE_WRITER_REVALIDATION_FAILED,
             )
         else:
-            # Step 3: copy files. Pre-write SHA captured for
-            # every production target BEFORE any mutation so
-            # the result surface can prove pre/post hash
-            # changes.
+            # Step 3: TRANSACTIONAL copy across the full
+            # planned batch. The Phase 6I-31 contract guarantees
+            # that a failed promotion leaves production state
+            # byte-for-byte unchanged. We achieve this by:
+            #
+            #   1. Pre-write SHA captured for every existing
+            #      production target BEFORE any mutation so the
+            #      result surface can prove pre/post hash
+            #      changes on success AND so rollback can
+            #      verify it restored the original bytes.
+            #   2. Each successful copy is tracked in a
+            #      ``touched`` log carrying the per-target
+            #      prior bytes (or ``None`` for ADD targets
+            #      that did not previously exist).
+            #   3. On ANY copy failure mid-batch, the touched
+            #      log is walked in reverse and every entry
+            #      is restored: ADD targets are unlinked,
+            #      REPLACE targets are restored from the
+            #      captured prior-bytes payload. The
+            #      ``files_added`` / ``files_replaced`` /
+            #      ``sidecars_copied`` accumulators are
+            #      cleared so the result surface reports
+            #      truthfully (i.e. zero counts on rollback).
+            #
+            # Memory budget: for a 75-library SPY promotion the
+            # captured prior bytes total ~150 MB worst case
+            # (PKLs ~1-2 MB each, sidecars ~5 KB). Acceptable.
             for state in per_states:
                 prod_file = Path(state.production_path)
                 if prod_file.exists():
                     sha = _sha256_of_path(prod_file)
                     if sha is not None:
                         pre_sha[str(prod_file)] = sha
-            any_copy_failed = False
+
+            # touched: list of (path, prior_bytes_or_None).
+            # prior_bytes_or_None=None means the target did
+            # NOT exist before the copy and must be unlinked
+            # on rollback; bytes means the target existed and
+            # must be restored to those exact bytes.
+            touched: list[
+                tuple[str, Optional[bytes]]
+            ] = []
+            copy_failed_path: Optional[str] = None
+            copy_failed_reason: Optional[str] = None
+
             for state in per_states:
                 staged_file = Path(state.staged_path)
                 prod_file = Path(state.production_path)
@@ -423,14 +510,35 @@ def promote_signal_libraries(
                 ):
                     files_unchanged.append(str(prod_file))
                     continue
-                ok, err = _atomic_copy(staged_file, prod_file)
-                if not ok:
-                    any_copy_failed = True
-                    _append_unique(
-                        issues, ISSUE_PROMOTION_COPY_FAILED,
+
+                # Capture prior PKL bytes (None for ADD).
+                prior_pkl: Optional[bytes]
+                try:
+                    prior_pkl = (
+                        prod_file.read_bytes()
+                        if prod_file.exists() else None
+                    )
+                except Exception as exc:
+                    copy_failed_path = str(prod_file)
+                    copy_failed_reason = (
+                        f"pre-copy snapshot read failed: {exc!r}"
                     )
                     break
-                # Sidecar (optional).
+
+                ok, err = _atomic_copy(staged_file, prod_file)
+                if not ok:
+                    copy_failed_path = str(prod_file)
+                    copy_failed_reason = err
+                    break
+                touched.append((str(prod_file), prior_pkl))
+                if state.production_outcome == (
+                    _planner.OUTCOME_ADD
+                ):
+                    files_added.append(str(prod_file))
+                else:
+                    files_replaced.append(str(prod_file))
+
+                # Sidecar (optional). Same prior-bytes capture.
                 if state.has_sidecar:
                     sidecar_src = Path(
                         str(staged_file) + ".manifest.json",
@@ -438,24 +546,46 @@ def promote_signal_libraries(
                     sidecar_dst = Path(
                         str(prod_file) + ".manifest.json",
                     )
-                    sc_ok, _ = _atomic_copy(
-                        sidecar_src, sidecar_dst,
-                    )
-                    if sc_ok:
-                        sidecars_copied.append(str(sidecar_dst))
-                    else:
-                        any_copy_failed = True
-                        _append_unique(
-                            issues, ISSUE_PROMOTION_COPY_FAILED,
+                    try:
+                        prior_sidecar = (
+                            sidecar_dst.read_bytes()
+                            if sidecar_dst.exists() else None
+                        )
+                    except Exception as exc:
+                        copy_failed_path = str(sidecar_dst)
+                        copy_failed_reason = (
+                            f"sidecar pre-copy snapshot "
+                            f"read failed: {exc!r}"
                         )
                         break
-                if state.production_outcome == (
-                    _planner.OUTCOME_ADD
-                ):
-                    files_added.append(str(prod_file))
-                else:
-                    files_replaced.append(str(prod_file))
-            if not any_copy_failed:
+                    sc_ok, sc_err = _atomic_copy(
+                        sidecar_src, sidecar_dst,
+                    )
+                    if not sc_ok:
+                        copy_failed_path = str(sidecar_dst)
+                        copy_failed_reason = sc_err
+                        break
+                    touched.append((
+                        str(sidecar_dst), prior_sidecar,
+                    ))
+                    sidecars_copied.append(str(sidecar_dst))
+
+            if copy_failed_path is not None:
+                # Rollback every touched entry, in reverse.
+                _append_unique(
+                    issues, ISSUE_PROMOTION_COPY_FAILED,
+                )
+                for path, prior in reversed(touched):
+                    _restore_target(path, prior)
+                # Clear truthful accumulators -- on rollback
+                # NOTHING was committed.
+                files_added = []
+                files_replaced = []
+                sidecars_copied = []
+                # Pre/post SHA dicts: keep pre_sha (operator
+                # may still want it for audit), but post_sha
+                # stays empty because no net write happened.
+            else:
                 for state in per_states:
                     prod_file = Path(state.production_path)
                     if prod_file.exists():

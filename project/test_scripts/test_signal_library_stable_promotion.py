@@ -735,3 +735,348 @@ def test_writer_cli_dry_run_emits_json(
     assert (
         "write_not_requested" in payload["issue_codes"]
     )
+
+
+# ---------------------------------------------------------------------------
+# 18. Transactional rollback
+# ---------------------------------------------------------------------------
+
+
+def _stage_pkl_and_pre_seed_prod_with_known_bytes(
+    tmp_path, *, tickers, intervals, prior_bytes_marker,
+):
+    """Build a tmp_path-rooted staged dir + a tmp_path-rooted
+    production stable dir where SOME of the production targets
+    already exist with a known byte-marker. Returns
+    ``(staged, prod, list_of_pre_seeded_prod_paths)``.
+
+    Used by the rollback tests so we can assert that ``replace``
+    targets get restored to their exact pre-run bytes."""
+    staged = _make_staged_dir(
+        tmp_path, tickers=tickers, intervals=intervals,
+    )
+    prod = _make_production_stable_root(tmp_path)
+    pre_seeded: list[Path] = []
+    for ticker in tickers:
+        for interval in intervals:
+            if interval == "1d":
+                filename = f"{ticker}_stable_v1_0_0.pkl"
+            else:
+                filename = (
+                    f"{ticker}_stable_v1_0_0_{interval}.pkl"
+                )
+            target = prod / filename
+            target.write_bytes(prior_bytes_marker)
+            pre_seeded.append(target)
+    return staged, prod, pre_seeded
+
+
+def test_sidecar_copy_failure_after_pkl_copy_rolls_back_pkl(
+    tmp_path, monkeypatch,
+):
+    """The exact contract this amendment is fixing: if the
+    sidecar copy fails AFTER the PKL is already in place on
+    the production target, the writer MUST roll the PKL
+    back too. For an ADD target, that means the production
+    PKL is unlinked. The result surface must NOT report
+    files_added / sidecars_copied counts -- the transactional
+    contract says zero net writes on failure."""
+    monkeypatch.setenv(
+        promoter.ENV_VAR_NAME,
+        promoter.ENV_VAR_REQUIRED_VALUE,
+    )
+    staged = _make_staged_dir(
+        tmp_path, tickers=["SPY"], intervals=["1d"],
+        attach_sidecar=True,
+    )
+    prod = _make_production_stable_root(tmp_path)
+
+    # Force the sidecar copy to fail by patching
+    # ``shutil.copyfile`` to raise when the source path is
+    # the staged sidecar.
+    sidecar_src_path = str(
+        staged / "SPY_stable_v1_0_0.pkl.manifest.json"
+    )
+    real_copyfile = promoter.shutil.copyfile
+
+    def flaky_copyfile(src, dst, *a, **kw):
+        if str(src) == sidecar_src_path:
+            raise OSError("synthetic sidecar copy failure")
+        return real_copyfile(src, dst, *a, **kw)
+    monkeypatch.setattr(
+        promoter.shutil, "copyfile", flaky_copyfile,
+    )
+
+    result = promoter.promote_signal_libraries(
+        ["SPY"],
+        staged_dir=staged,
+        production_stable_dir=prod,
+        intervals=("1d",),
+        write=True,
+    )
+
+    assert result.wrote_files is False
+    assert (
+        promoter.ISSUE_PROMOTION_COPY_FAILED
+        in result.issue_codes
+    )
+    assert result.files_added == ()
+    assert result.files_replaced == ()
+    assert result.sidecars_copied == ()
+    # PKL has been rolled back. ADD target was never present
+    # before the run, so rollback unlinks it entirely.
+    assert not (
+        prod / "SPY_stable_v1_0_0.pkl"
+    ).exists()
+    # Sidecar likewise absent.
+    assert not (
+        prod / "SPY_stable_v1_0_0.pkl.manifest.json"
+    ).exists()
+
+
+def test_multi_library_failure_rolls_back_all_prior_copies(
+    tmp_path, monkeypatch,
+):
+    """Mid-batch failure must roll back EVERY successful
+    PKL+sidecar copy that preceded it. Build three target
+    libraries; arrange for the third library's PKL copy
+    to fail; verify zero net writes."""
+    monkeypatch.setenv(
+        promoter.ENV_VAR_NAME,
+        promoter.ENV_VAR_REQUIRED_VALUE,
+    )
+    staged = _make_staged_dir(
+        tmp_path, tickers=["AAA", "BBB", "CCC"],
+        intervals=["1d"], attach_sidecar=True,
+    )
+    prod = _make_production_stable_root(tmp_path)
+
+    failing_target_pkl_src = str(
+        staged / "CCC_stable_v1_0_0.pkl"
+    )
+    real_copyfile = promoter.shutil.copyfile
+
+    def flaky_copyfile(src, dst, *a, **kw):
+        if str(src) == failing_target_pkl_src:
+            raise OSError(
+                "synthetic third-library PKL copy failure",
+            )
+        return real_copyfile(src, dst, *a, **kw)
+    monkeypatch.setattr(
+        promoter.shutil, "copyfile", flaky_copyfile,
+    )
+
+    result = promoter.promote_signal_libraries(
+        ["AAA", "BBB", "CCC"],
+        staged_dir=staged,
+        production_stable_dir=prod,
+        intervals=("1d",),
+        write=True,
+    )
+    assert result.wrote_files is False
+    assert (
+        promoter.ISSUE_PROMOTION_COPY_FAILED
+        in result.issue_codes
+    )
+    assert result.files_added == ()
+    assert result.sidecars_copied == ()
+    # All three production targets unlinked (or never
+    # written in CCC's case).
+    for ticker in ("AAA", "BBB", "CCC"):
+        assert not (
+            prod / f"{ticker}_stable_v1_0_0.pkl"
+        ).exists()
+        assert not (
+            prod / f"{ticker}_stable_v1_0_0.pkl.manifest.json"
+        ).exists()
+
+
+def test_replaced_files_restored_to_original_bytes_on_failure(
+    tmp_path, monkeypatch,
+):
+    """When a replace-mode target is rolled back, it MUST be
+    restored to its exact pre-run bytes -- not deleted, not
+    re-copied from staged, not left in a partial state."""
+    monkeypatch.setenv(
+        promoter.ENV_VAR_NAME,
+        promoter.ENV_VAR_REQUIRED_VALUE,
+    )
+    prior_marker = (
+        b"prior production bytes -- this must be restored"
+    )
+    # Pre-seed all three ticker PKLs with the prior_marker so
+    # every target is a REPLACE (not an ADD).
+    staged, prod, pre_seeded = (
+        _stage_pkl_and_pre_seed_prod_with_known_bytes(
+            tmp_path,
+            tickers=["AAA", "BBB", "CCC"],
+            intervals=["1d"],
+            prior_bytes_marker=prior_marker,
+        )
+    )
+    # Sanity: prior bytes are exactly the marker.
+    for p in pre_seeded:
+        assert p.read_bytes() == prior_marker
+
+    # Arrange CCC's PKL copy to fail.
+    failing_target_pkl_src = str(
+        staged / "CCC_stable_v1_0_0.pkl"
+    )
+    real_copyfile = promoter.shutil.copyfile
+
+    def flaky_copyfile(src, dst, *a, **kw):
+        if str(src) == failing_target_pkl_src:
+            raise OSError("synthetic third-library failure")
+        return real_copyfile(src, dst, *a, **kw)
+    monkeypatch.setattr(
+        promoter.shutil, "copyfile", flaky_copyfile,
+    )
+
+    result = promoter.promote_signal_libraries(
+        ["AAA", "BBB", "CCC"],
+        staged_dir=staged,
+        production_stable_dir=prod,
+        intervals=("1d",),
+        write=True,
+    )
+    assert result.wrote_files is False
+    assert (
+        promoter.ISSUE_PROMOTION_COPY_FAILED
+        in result.issue_codes
+    )
+    # AAA + BBB rolled back to prior_marker. CCC never got
+    # touched (its copy is what failed).
+    assert (
+        (prod / "AAA_stable_v1_0_0.pkl").read_bytes()
+        == prior_marker
+    )
+    assert (
+        (prod / "BBB_stable_v1_0_0.pkl").read_bytes()
+        == prior_marker
+    )
+    assert (
+        (prod / "CCC_stable_v1_0_0.pkl").read_bytes()
+        == prior_marker
+    )
+
+
+def test_newly_added_files_removed_on_rollback(
+    tmp_path, monkeypatch,
+):
+    """ADD targets that did NOT exist before the run must
+    be unlinked on rollback (not left at zero bytes / partial
+    bytes)."""
+    monkeypatch.setenv(
+        promoter.ENV_VAR_NAME,
+        promoter.ENV_VAR_REQUIRED_VALUE,
+    )
+    # Mixed: pre-seed AAA + BBB with prior bytes (REPLACE),
+    # leave CCC absent (ADD). Then fail on CCC's PKL copy.
+    prior_marker = b"prior bytes"
+    staged, prod, _ = (
+        _stage_pkl_and_pre_seed_prod_with_known_bytes(
+            tmp_path,
+            tickers=["AAA", "BBB"],  # pre-seed only AAA, BBB
+            intervals=["1d"],
+            prior_bytes_marker=prior_marker,
+        )
+    )
+    # Add CCC to the staged dir AFTER pre-seeding so CCC's
+    # production target does NOT exist.
+    ccc_lib = _make_library(ticker="CCC", interval="1d")
+    ccc_path = staged / "CCC_stable_v1_0_0.pkl"
+    pm.attach_manifest(
+        ccc_lib, ccc_path,
+        artifact_type="interval_signal_library",
+        ticker="CCC", interval="1d",
+        params={
+            "MAX_SMA_DAY": 114, "price_source": "Close",
+            "interval": "1d", "auto_adjust": False,
+            "t1_skip_policy": "fetch_t1_skip",
+        },
+        engine_version="1.0.0",
+    )
+    with open(ccc_path, "wb") as fh:
+        pickle.dump(
+            ccc_lib, fh, protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    # Sanity: CCC production target is absent before any copy.
+    assert not (prod / "CCC_stable_v1_0_0.pkl").exists()
+
+    # Arrange CCC's sidecar copy to fail (after CCC PKL is
+    # already in place), exercising the rollback that must
+    # unlink the just-added CCC PKL + the prior-AAA/BBB
+    # restore path together.
+    ccc_sidecar_src = str(
+        staged / "CCC_stable_v1_0_0.pkl.manifest.json"
+    )
+    real_copyfile = promoter.shutil.copyfile
+
+    def flaky_copyfile(src, dst, *a, **kw):
+        if str(src) == ccc_sidecar_src:
+            raise OSError("synthetic CCC sidecar failure")
+        return real_copyfile(src, dst, *a, **kw)
+    monkeypatch.setattr(
+        promoter.shutil, "copyfile", flaky_copyfile,
+    )
+
+    result = promoter.promote_signal_libraries(
+        ["AAA", "BBB", "CCC"],
+        staged_dir=staged,
+        production_stable_dir=prod,
+        intervals=("1d",),
+        write=True,
+    )
+    assert result.wrote_files is False
+    # AAA + BBB restored.
+    assert (
+        (prod / "AAA_stable_v1_0_0.pkl").read_bytes()
+        == prior_marker
+    )
+    assert (
+        (prod / "BBB_stable_v1_0_0.pkl").read_bytes()
+        == prior_marker
+    )
+    # CCC ADD target was newly written by the failed run;
+    # rollback must have unlinked it entirely.
+    assert not (prod / "CCC_stable_v1_0_0.pkl").exists()
+    assert not (
+        prod / "CCC_stable_v1_0_0.pkl.manifest.json"
+    ).exists()
+
+
+def test_successful_authorized_promotion_still_copies_pkl_and_sidecars(
+    tmp_path, monkeypatch,
+):
+    """Regression pin: the transactional rollback path MUST
+    NOT regress the success path. Re-asserts the existing
+    'authorized writer promotes files and sidecars' test
+    body to confirm a clean run still copies PKLs and
+    sidecars when no copy fails."""
+    monkeypatch.setenv(
+        promoter.ENV_VAR_NAME,
+        promoter.ENV_VAR_REQUIRED_VALUE,
+    )
+    staged = _make_staged_dir(
+        tmp_path, tickers=["SPY"], intervals=["1d", "1wk"],
+        attach_sidecar=True,
+    )
+    prod = _make_production_stable_root(tmp_path)
+    result = promoter.promote_signal_libraries(
+        ["SPY"],
+        staged_dir=staged,
+        production_stable_dir=prod,
+        intervals=("1d", "1wk"),
+        write=True,
+    )
+    assert result.wrote_files is True
+    assert (prod / "SPY_stable_v1_0_0.pkl").exists()
+    assert (prod / "SPY_stable_v1_0_0_1wk.pkl").exists()
+    assert (
+        prod / "SPY_stable_v1_0_0.pkl.manifest.json"
+    ).exists()
+    assert (
+        prod / "SPY_stable_v1_0_0_1wk.pkl.manifest.json"
+    ).exists()
+    assert len(result.files_added) == 2
+    assert len(result.sidecars_copied) == 2

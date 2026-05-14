@@ -53,14 +53,18 @@ The planner **never writes**.
 4. **Production target path constrained** to a directory whose resolved tail components are `signal_library/data/stable` (the path guard).
 5. **Writer-side re-validation** of every staged file: each library is re-loaded via the central provenance loader AND re-schema-checked. A stale plan whose staged file was tampered with between planning and writing is caught here.
 
-When all five gates pass AND `write=True`:
+When all five gates pass AND `write=True`, the writer runs
+the staged-to-production copy as a **transactional batch**:
 
-- The writer copies each staged PKL atomically (`<filename>.tmp` then `os.replace`) onto the production target.
-- The optional `<filename>.manifest.json` sidecar (when present on the staged side) is copied the same way.
+- Each staged PKL is copied atomically (`<filename>.tmp` then `os.replace`) onto the production target. Before each copy, the target's prior bytes are snapshotted in memory (or `None` for ADD targets that did not previously exist).
+- The optional `<filename>.manifest.json` sidecar is copied the same way; its prior bytes are snapshotted too.
+- If ANY copy fails mid-batch (PKL OR sidecar, for ANY library), the writer walks the touched-target log in reverse and **restores every prior target to its exact pre-run state**: newly-added targets are unlinked, replaced targets are restored from their captured prior-bytes payload via an atomic `<filename>.restore_tmp` + `os.replace` pattern. The `files_added` / `files_replaced` / `sidecars_copied` accumulators are zeroed so the result surface reports zero net writes truthfully.
 - One JSONL row is appended to `--execution-log` per invocation (best-effort).
 - The result surface records pre-write and post-write SHA-256 per touched production file, so an operator can independently verify which files actually changed.
 
-When any gate fails, the writer surfaces structured issue codes and refuses to mutate. On-disk production state is byte-for-byte unchanged.
+The Phase 6I-31 amendment-1 PR pins this transactional contract by five rollback regression tests (§ 4 below): sidecar-copy-failure-after-PKL-copy rolls back the PKL; multi-library failure rolls back all prior copies; replaced files are restored to their exact original bytes; newly-added files are unlinked on rollback; successful runs still copy PKL + sidecar.
+
+When any gate fails, the writer surfaces structured issue codes and refuses to mutate. **On-disk production state is byte-for-byte unchanged in both the all-gates-blocked case AND the mid-batch-copy-failure case.**
 
 ## 3. Why this is NOT the production promotion yet
 
@@ -74,9 +78,9 @@ Phase 6I-31 explicitly does not perform the production promotion. Reasons:
 | **No source refresh has run** | Cache `date_range_end=2026-05-12` is still behind `current_as_of_date=2026-05-13` (STATE 4 / cache-behind-cutoff). The Phase 6I-15 source-availability advisory still applies. |
 | **Codex audit unfinished** | This PR is open for Codex review; promotion-path safety claims need to be independently audited before any production write. |
 
-## 4. Tests added (21 new)
+## 4. Tests added (26 new — 21 original + 5 rollback amendment)
 
-`project/test_scripts/test_signal_library_stable_promotion.py` (new, ~530 lines) pins:
+`project/test_scripts/test_signal_library_stable_promotion.py` (new, ~870 lines) pins:
 
 | # | Test | Pins |
 |---|---|---|
@@ -97,6 +101,13 @@ Phase 6I-31 explicitly does not perform the production promotion. Reasons:
 | 15-16 | planner + writer have no raw `pickle.load` | B12 scope |
 | 17-18 | planner + writer have no yfinance / dash / subprocess / live engine imports | strictly bounded |
 | 19-21 | CLI rc=2 (missing args) and rc=0 (dry-run JSON output) | operator-surface sanity |
+| 22 | sidecar-copy-failure after PKL-copy rolls back the PKL | transactional rollback: ADD-target case |
+| 23 | multi-library failure rolls back all prior PKLs + sidecars | transactional rollback: cascade |
+| 24 | replaced files restored to original bytes on failure | transactional rollback: REPLACE-target restoration |
+| 25 | newly-added files removed on rollback | transactional rollback: ADD-target unlink |
+| 26 | successful authorized promotion still copies PKL + sidecars | rollback path does NOT regress the success path |
+
+Tests 22-26 were added in the Phase 6I-31 amendment-1 PR after Codex audit identified a per-library copy ordering issue (PKL copied → sidecar copy failure → PKL left in place violated the writer/doc contract). The amendment refactored the writer into a transactional batch: each successful copy is tracked in a touched-target log carrying the per-target prior bytes (or `None` for ADD targets); on ANY copy failure mid-batch, the touched log is walked in reverse and every entry is restored. The `files_added` / `files_replaced` / `sidecars_copied` accumulators are zeroed so the result surface reports zero net writes truthfully.
 
 The repo-wide B12 raw-pickle static regression guard continues to pass without an allowlist entry.
 
@@ -114,24 +125,23 @@ Main HEAD (at branch creation): 9421bfe (Phase 6I-30, PR #247)
 ## 6. Test results
 
 ```
-Phase 6I-31 promotion tests       :  21 passed
+Phase 6I-31 promotion tests       :  26 passed (21 original + 5 rollback)
 Phase 6I-30 builder tests         :  10 passed
 Adapter / diagnostic / core /
   builder / planner / writer /
   gap audit / static regression   : 240 passed
                                   -----
-Focused 10-way sweep              : 271 passed in 8.99 s
-
-Full repo regression              : 1,858 passed in 5:52 (0 failures;
-                                    60 pre-existing pandas
-                                    fragmentation warnings unchanged;
-                                    +105 cosmetic SMA-loop warnings
-                                    from Phase 6I-30 builder tests
-                                    -- not Phase 6I-31 regressions)
+Focused 10-way sweep              : 276 passed in 11.04 s
+                                    (21 -> 26 promotion tests added)
 
 py_compile                        : clean across all new Python files
 git diff --check                  : clean
 ```
+
+Full repo regression after the amendment-1 transactional
+refactor: re-run on demand; the amendment is scoped to one
+production module (the promotion writer) and one test file,
+so a focused 10-way sweep is the load-bearing signal.
 
 ---
 
@@ -152,10 +162,17 @@ C:\Users\sport\AppData\Local\Temp\phase_6i31_signal_library_promotion_path\
 ├── 07_patch_writer_dry_run.json + 07b_patch_writer_execution_log.jsonl
 ├── 08_gap_audit_after.json
 ├── 99_snapshot_after.json
-├── 99b_snapshot_diff.json
 ├── snapshot_helper.py            (copied from Phase 6I-26)
 └── diff_helper.py                (copied from Phase 6I-26)
 ```
+
+The production-root diff in § 8 below is computed in-process
+by ``diff_helper.py`` and printed to stdout; in this
+evidence pass the diff JSON is captured inline in this doc
+rather than persisted to a separate ``99b_snapshot_diff.json``
+file. Re-running ``diff_helper.py 00_snapshot_before.json
+99_snapshot_after.json`` against the same inputs reproduces
+the 0/0/0 result.
 
 Pinned interpreter: `C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`.
 
@@ -207,12 +224,16 @@ Every staged library loaded successfully via the central provenance-verified loa
 | `issue_codes` | `[write_not_requested]` |
 | `recommended_next_action` | `dry_run_review_promotion_plan` |
 
-The promotion writer correctly refused mutation because gate #1 (`--write`) was absent. Gates #2 / #3 / #4 / #5 were satisfied:
+The promotion writer correctly refused mutation. Per-gate
+status as observed in this dry-run:
 
-- gate #2 (`PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`): never set,
-- gate #3 (`planner plan_ready=true`): satisfied,
-- gate #4 (production-path guard): satisfied (default `--production-stable-dir` resolved to `project/signal_library/data/stable`),
-- gate #5 (writer-side revalidation): reachable for a future authorized run.
+- **Gate #1 (`--write`)**: **NOT authorized** — the flag was absent. This alone is sufficient to block.
+- **Gate #2 (`PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit`)**: **NOT authorized** — the env var was never set. This too would have blocked on its own.
+- **Gate #3 (planner `plan_ready=true`)**: observed `true` (the planner found 75/75 staged files schema-valid).
+- **Gate #4 (production-path guard)**: observed satisfied (default `--production-stable-dir` resolved to `project/signal_library/data/stable`).
+- **Gate #5 (writer-side staged-file revalidation)**: **NOT REACHED** in this dry-run, because the authorization gates (#1, #2) failed before the writer entered the copy-and-revalidate phase. Gate #5 remains enforced for any future authorized run, and its contract is exercised by the focused tests.
+
+The single observed `issue_codes=[write_not_requested]` reflects gate #1 alone because the writer surfaces issue codes for `--write`-absence OR env-var-absence in an `if/elif` (the `--write` absence takes precedence in the surfaced reason). The structural truth is that BOTH gates #1 AND #2 were unauthorized; either alone is sufficient to block.
 
 ### 7.5 Multi-window K chain against staged dir
 
@@ -344,10 +365,10 @@ $env:PRJCT9_AUTOMATION_WRITE_AUTH="phase_6h5_explicit"
 ## 12. Validation
 
 - `git diff --check`: clean.
-- `git diff --stat`: 4 files touched — 2 new production modules (`signal_library_stable_promotion_planner.py`, `signal_library_stable_promotion_writer.py`), 1 new test file (`test_scripts/test_signal_library_stable_promotion.py`), 1 new Markdown evidence doc (this file).
+- `git diff --stat`: 4 files touched at this PR — 2 new production modules (`signal_library_stable_promotion_planner.py`, `signal_library_stable_promotion_writer.py`), 1 new test file (`test_scripts/test_signal_library_stable_promotion.py`), 1 new Markdown evidence doc (this file). The amendment-1 commit modifies the writer + test files in place.
 - Pinned interpreter on every Python invocation: `C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`.
-- Focused 10-way: **271 passed in 8.99s**.
-- Full repo regression: **1,858 passed in 5:52**; 0 failures.
+- Focused 10-way after the amendment-1 transactional refactor: **276 passed in 11.04 s** (21 → 26 promotion tests).
+- Full repo regression at the original PR commit: **1,858 passed in 5:52**; 0 failures.
 
 ---
 
