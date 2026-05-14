@@ -8,6 +8,24 @@ Phase 6I-32 (PR #249) landed the supervised fresh-staging readiness harness; its
 
 ---
 
+## Product scope guard
+
+This PR only checks **source-refresh readiness for the SPY K-universe**. It does **NOT** complete the final Confluence product.
+
+The final Confluence product must include a **cross-ticker multi-window ranking / export layer** for a **large ticker universe** — effectively the TrafficFlow ranking workflow rebuilt with true multi-window support across all five canonical windows (1d / 1wk / 1mo / 3mo / 1y). The current single-ticker SPY chain (Phase 6I-22..33) exists to **prove the per-ticker data contract before scaling** to a multi-ticker universe. A single-ticker SPY pass landing 60/60 cells and `patch_ready=true` is the building block, NOT the website launch.
+
+Required future website-facing data the multi-ticker layer must surface:
+
+- **multi-ticker ranking rows** — one per qualifying ticker, scored on the canonical multi-window grid;
+- **per-ticker 60-cell multi-window detail** (the Phase 6I-23 `per_window_k_metrics`);
+- **`build_wide_window_alignment`** per ticker (the Phase 6I-23 alignment surface);
+- **chart-ready rows** where available;
+- **data freshness / blocker fields** so the UI can honestly surface "stale" / "missing window" / "missing K row" / "below-cutoff cache" instead of hiding them.
+
+Stay aligned with the existing script family — **OnePass** / **ImpactSearch** / **StackBuilder** / **TrafficFlow** / **MultiTimeframe** / **Confluence**. Future module names should make it obvious which layer's data they consume. Do not invent vague replacement language that hides the data provenance.
+
+---
+
 ## 0. TL;DR
 
 | Check | Result |
