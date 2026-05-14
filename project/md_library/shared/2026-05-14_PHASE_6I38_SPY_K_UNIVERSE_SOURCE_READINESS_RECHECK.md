@@ -7,10 +7,23 @@ readiness coordinator. No code changes.
 
 ## 1. Verdict
 
-**`refresh_candidate_ready = false` — refresh remains blocked.**
+**`refresh_candidate_ready = false` under the current
+Phase 6I-33 strict-greater readiness predicate — refresh
+remains blocked.**
 
 Recommended next action from the readiness coordinator:
 `wait_or_resolve_blockers`.
+
+The blocker for the 14 non-TEF tickers is **not** "fresh
+provider data unavailable." yfinance returned data
+through `2026-05-14` for all 14. The blocker is that the
+current harness rule requires
+`new_cache_date_range_end > current_as_of_date` (strict),
+while the observed state is
+`new_cache_date_range_end == current_as_of_date`. See
+§ 3 for the policy ambiguity this exposes — it is the
+next concrete decision required of the operator. TEF is
+a separate persistent vendor-side blocker; see § 4 (2).
 
 ### 1.1 Per-classification counts
 
@@ -22,7 +35,19 @@ Recommended next action from the readiness coordinator:
 | `source_ready_for_refresh` | 0 |
 | `manual_blocker` | 0 |
 
-### 1.2 What changed since Phase 6I-33
+### 1.2 What changed since Phase 6I-33 (and what did NOT)
+
+**Important precision** (Codex audit, amendment-1): the
+14 non-TEF equities now have yfinance data through
+`2026-05-14`. The blocker for those 14 tickers is NOT
+"fresh data unavailable." It is the existing Phase 6I-33
+**strict-greater** predicate requiring
+`new_cache_date_range_end > current_as_of_date` while the
+observed source data is `==` `current_as_of_date`. The
+production cache for these tickers is stale (SPY at
+`2026-05-12`; other 13 at `2026-05-04`) and the provider
+has the target bar — the harness simply does not allow a
+refresh up to the cutoff under its current rule.
 
 - **14 equities advanced.** In Phase 6I-33, every one of
   the 14 non-TEF equities reported
@@ -30,16 +55,25 @@ Recommended next action from the readiness coordinator:
   → `source_behind_or_error`. They are now reporting
   `new_cache_date_range_end=2026-05-14 ==
   current_as_of_date=2026-05-14` → `source_equal_cutoff_wait`.
-  yfinance has caught up to the cutoff, BUT the predicate
-  requires STRICT `new_cache_date_range_end > cutoff`. The
-  Phase 6I-15 / 6I-17 operator discipline says **WAIT** —
-  a refresh would not advance the predicate.
+  The current Phase 6I-33 readiness harness says **WAIT**
+  under its existing strict-greater predicate. *This does
+  NOT mean yfinance lacks the 2026-05-14 bar for those
+  tickers.* For 14 tickers, source data equals the target
+  cutoff while cache is stale; the next phase should
+  explicitly decide whether equal-cutoff-after-close is
+  sufficient for supervised refresh.
 - **TEF unchanged.** TEF still classifies as
   `source_behind_or_error` with the same yfinance
   "delisted" telemetry as Phase 6I-33 (cache stuck at
   `2026-01-28`; `new_cache_date_range_end=null`;
   `fetch_succeeded=false`; `rows=0`; `error=null`). This is
-  a persistent vendor-side blocker, not a transient one.
+  a persistent vendor-side blocker, not a transient one,
+  and is **a separate question from the
+  source-equal-cutoff-after-close policy decision above**.
+  Even if the equal-cutoff policy is later relaxed, TEF
+  still needs triage: replacement ticker, exclusion
+  policy, alternate provider, or K-universe rebuild
+  without TEF.
 
 ## 2. Per-ticker readiness
 
@@ -156,80 +190,152 @@ blocker, not a transient hiccup.
 ```
 
 yfinance fetch succeeded for SPY and reports the latest
-bar at `2026-05-14`. The cache is at `2026-05-12` (one
-trading day behind a prior `current_as_of_date` resolution).
-The predicate `new_cache_date_range_end > current_as_of_date`
-is NOT satisfied because `2026-05-14 == 2026-05-14`. Per
-the Phase 6I-15 / 6I-17 operator discipline the correct
-action is WAIT.
+bar at `2026-05-14`. **The cache is at `2026-05-12`** (two
+trading days stale relative to the resolved
+`current_as_of_date=2026-05-14`). The current harness
+predicate `new_cache_date_range_end > current_as_of_date`
+is NOT satisfied because `2026-05-14 == 2026-05-14`. The
+Phase 6I-33 readiness harness says **WAIT** under the
+existing strict-greater predicate. **This does NOT mean
+yfinance lacks the 2026-05-14 bar for SPY** — it returned
+8,380 rows including the `2026-05-14` bar with
+`fetch_succeeded=true`. The harness rule simply forbids a
+refresh under the strict-greater predicate at the moment
+the provider's latest bar equals the cutoff.
 
-## 3. Refresh remains blocked
+## 3. Policy ambiguity exposed by Phase 6I-38
 
-The aggregate verdict is **`refresh_candidate_ready=false`**.
-Blockers come in two distinct shapes:
+Phase 6I-38 is the first re-run where the harness probed
+a state in which the provider has the **target cutoff
+bar** while the production cache is **strictly behind the
+cutoff** for 14 tickers. That exposes a policy question
+that the Phase 6I-33 readiness rule does not currently
+answer:
 
-1. **14 equities — `source_equal_cutoff_wait`.** Source has
-   matched the cutoff but has not advanced past it. A
-   supervised refresh now would not change the cache state
-   in a way that would advance the strict-greater predicate.
-   The Phase 6E-5 refresher's published / unpublished
-   classification under the Phase 6I-15 discipline therefore
-   says WAIT.
+- **Current harness readiness rule:**
+  `source_ready_for_refresh` fires ONLY when
+  `new_cache_date_range_end > current_as_of_date` (strict).
+  Anything else, including the equal-cutoff case, classifies
+  as `source_equal_cutoff_wait` and demotes the aggregate
+  verdict to `refresh_candidate_ready=false`.
+
+- **Observed state for 14 tickers in this run:**
+  `cache_date_range_end < current_as_of_date` AND
+  `new_cache_date_range_end == current_as_of_date`. The
+  provider has the target bar; the production cache does
+  not. A refresh now would advance the cache from a
+  stale state to the target cutoff. The strict-greater
+  predicate forbids it.
+
+- **Operational question (NOT decided in this PR):**
+  Should stale cache be allowed to refresh **to the target
+  cutoff after market close** when the provider has that
+  target bar — i.e., should the readiness rule accept
+  `new_cache_date_range_end >= current_as_of_date` when
+  `cache_date_range_end < current_as_of_date`, or should
+  it preserve the strict-greater rule because of an
+  intraday / partial-bar concern that may still apply
+  even after the official close?
+
+- **No rule change in this PR.** Phase 6I-38 is an
+  evidence-only re-run; the readiness predicate is
+  unchanged from Phase 6I-33. The policy decision above
+  is recorded here as **the next concrete decision** the
+  operator should make before another readiness re-run,
+  separate from the trading-day-rollover wait. The
+  decision and any rule change would be a future phase
+  (Phase 6I-N) with its own preflight, audit, and tests
+  — including any new classification (for example
+  `source_equal_cutoff_publishable_for_refresh`) and any
+  new aggregate-verdict semantics.
+
+## 4. Refresh remains blocked
+
+The aggregate verdict is **`refresh_candidate_ready=false`
+under the current strict-greater harness rule**. Blockers
+come in two distinct shapes, and they are independent:
+
+1. **14 equities — `source_equal_cutoff_wait`.** Source
+   has reached the cutoff but has not advanced past it.
+   The current harness rule (strict-greater) forbids the
+   refresh. *The blocker is the readiness rule, not the
+   provider's data availability.* See § 3 above for the
+   policy ambiguity this exposes.
 
 2. **TEF — `source_behind_or_error`.** Vendor-side
    "possibly delisted" classification. Refreshing TEF
    currently yields zero rows from yfinance and the
    readiness predicate cannot fire while TEF is in the
-   universe.
+   universe with this telemetry. **TEF is a separate
+   issue from the equal-cutoff policy decision above.**
+   Even if the equal-cutoff policy is later relaxed, TEF
+   still needs triage independently: replacement ticker,
+   exclusion policy, alternate provider, or K-universe
+   rebuild without TEF.
 
-## 4. Recommended next concrete actions
+## 5. Recommended next concrete actions
 
 **No supervised refresh command is prepared by this PR**
 per the operator discipline: when
 `refresh_candidate_ready=false`, this evidence pass does
 NOT emit an executable future refresh command block.
 
-Concrete next actions the operator may pick from:
+Concrete next actions the operator may pick from
+(independent paths):
 
-1. **Wait for the next trading day.** When the cutoff
-   resolves to 2026-05-15 (or later) AND yfinance has
-   published that trading day's bar for the 14 equities,
-   re-run this readiness module. If the verdict flips to
-   `refresh_candidate_ready=true` (or every equity flips
-   to `source_ready_for_refresh` and TEF stays as the only
-   blocker), request a separate operator-authorized
-   supervised source-cache refresh prompt.
+1. **Decide the equal-cutoff policy (the question
+   surfaced in § 3).** Should the readiness rule treat
+   `new_cache_date_range_end == current_as_of_date` (with
+   `cache_date_range_end < current_as_of_date`) as
+   sufficient for supervised refresh? A future phase
+   (Phase 6I-N) with its own preflight, audit, and tests
+   would amend the readiness coordinator + supervised
+   refresh gate accordingly. **This PR does not change
+   the rule.**
 
-2. **Triage TEF independently.** TEF has now persisted
+2. **Wait for the next trading day.** Without changing
+   the rule, when the cutoff resolves to 2026-05-15 (or
+   later) AND yfinance has published that trading day's
+   bar for the 14 equities, re-run this readiness module.
+   The 14 non-TEF equities would flip to
+   `source_ready_for_refresh` (strict-greater satisfied)
+   and the aggregate could then approach
+   `refresh_candidate_ready=true` (modulo TEF).
+
+3. **Triage TEF independently.** TEF has now persisted
    across Phase 6I-33 and Phase 6I-38 with the same
    "possibly delisted" yfinance telemetry (cache stuck at
    `2026-01-28`; `new_cache_date_range_end=null` in both
    runs). Options:
    - Confirm whether TEF is genuinely delisted on Yahoo
      (manually, via the operator's separate channels).
-   - If delisted, decide whether to drop TEF from the SPY
-     K-universe (membership change) or pin its evaluation
-     cutoff to its last available trading date
-     (2026-01-28).
-   - Until TEF is resolved, the aggregate predicate cannot
-     reach `refresh_candidate_ready=true` while TEF is in
-     the universe. Note that the downstream Phase 6I-22
-     adapter / Phase 6I-32 sandbox builder ALREADY
-     accommodates TEF's earlier cutoff for sandbox proofs
-     (sandbox binding cutoff 2026-01-28 for TEF was used
-     during Phase 6I-30), so a SPY-pilot refresh that
-     excludes TEF from the K-universe is technically
-     feasible if the operator decides to scope it that
-     way.
+   - If delisted, decide on replacement ticker, exclusion
+     policy, alternate provider, or K-universe rebuild
+     without TEF.
+   - Pin TEF's evaluation cutoff to its last available
+     trading date (`2026-01-28`).
+   - Until TEF is resolved, the aggregate predicate
+     cannot reach `refresh_candidate_ready=true` while
+     TEF is in the universe — and this is **separate**
+     from the equal-cutoff policy in § 3. Even if the
+     equal-cutoff policy is later relaxed, TEF still
+     needs its own decision. Note that the downstream
+     Phase 6I-22 adapter / Phase 6I-32 sandbox builder
+     ALREADY accommodates TEF's earlier cutoff for
+     sandbox proofs (sandbox binding cutoff 2026-01-28
+     for TEF was used during Phase 6I-30), so a SPY-pilot
+     refresh that excludes TEF from the K-universe is
+     technically feasible if the operator decides to
+     scope it that way.
 
-3. **Continue parallel website-renderer / scoring work.**
+4. **Continue parallel website-renderer / scoring work.**
    The SPY pilot remains parked. Other work (Phase 6I-37
    already-merged current-build signal surface → website
    renderer / Dash UI shell; researched scoring contract
    to replace the first-pass ranking rule) can proceed
    independently while waiting on source readiness.
 
-## 5. Exact command executed
+## 6. Exact command executed
 
 ```
 "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
@@ -256,7 +362,7 @@ invocation. The source-availability probe internally
 dry-runs the Phase 6E-5 refresher with `write=False`
 (observable yfinance read; no cache mutation).
 
-## 6. Production-root snapshot — 0/0/0/0/0 diff
+## 7. Production-root snapshot — 0/0/0/0/0 diff
 
 Pre-run vs post-run file counts under all five canonical
 production roots:
@@ -275,7 +381,7 @@ written; no status JSON was touched; no Confluence
 artifact, StackBuilder leaderboard, or stable signal
 library was modified.
 
-## 7. No-production-activity confirmation
+## 8. No-production-activity confirmation
 
 - No writer `--write` invocation (any writer).
 - `PRJCT9_AUTOMATION_WRITE_AUTH` never read or set.
@@ -297,7 +403,7 @@ dry-runs the Phase 6E-5 refresher with `write=False`. This
 follows the Phase 6I-15 / 6I-33 read-only pattern and
 writes nothing.
 
-## 8. SPY remains parked
+## 9. SPY remains parked
 
 The SPY pilot stays **PARKED** at the Phase 6I-33 / 6I-34
 cursor: production
