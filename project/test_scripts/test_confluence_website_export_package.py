@@ -529,6 +529,11 @@ def test_ticker_details_no_fabrication_of_per_window_for_blocked():
 
 
 def test_ticker_details_eligible_row_carries_per_window_summary():
+    """Phase 6I-35 amendment-1: eligible-row detail surfaces
+    ``per_window_summary`` plus ``all_members_firing_windows``
+    as a list. ``build_wide_window_alignment`` must be the
+    actual Phase 6I-20 mapping or null -- it MUST NOT
+    contain the all-members list."""
     fake = _fake_underlying_export(
         ranking_rows=[
             _eligible_row(
@@ -553,9 +558,163 @@ def test_ticker_details_eligible_row_carries_per_window_summary():
     assert pws is not None
     assert pws["windows_firing_count"] == 5
     assert pws["all_windows_firing"] is True
+    # Phase 6I-35 amendment-1: the summary list lives on
+    # all_members_firing_windows, NOT under the misleading
+    # name build_wide_window_alignment.
     assert (
-        spy_detail["build_wide_window_alignment"]
+        spy_detail["all_members_firing_windows"]
         == ["1d", "1wk", "1mo", "3mo", "1y"]
+    )
+    # The actual Phase 6I-20 mapping is NOT embedded in
+    # Phase 6I-35; surface as None.
+    assert spy_detail["build_wide_window_alignment"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-35 amendment-1: ticker_details schema honesty
+# ---------------------------------------------------------------------------
+
+
+def test_amendment1_eligible_detail_full_60_cell_fields_honest():
+    """Eligible row detail must report
+    full_60_cell_detail_embedded=False (Phase 6I-35 does
+    NOT embed the 60-cell payload) and
+    full_60_cell_detail_source=<artifact_path>."""
+    fake = _fake_underlying_export(
+        ranking_rows=[_eligible_row("SPY")],
+        blocked_rows=[],
+    )
+    package = pkg.build_website_export_package(
+        ["SPY"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=pkg.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake,
+    )
+    detail = package["ticker_details"]["SPY"]
+    assert detail["full_60_cell_detail_embedded"] is False
+    assert detail["full_60_cell_detail_source"] == (
+        "/tmp/research/confluence/SPY/"
+        "SPY__MTF_CONSENSUS.research_day.json"
+    )
+    # detail_available is True because the row has a
+    # resolvable artifact_path for the website reader to
+    # fetch full detail from.
+    assert detail["detail_available"] is True
+    assert detail["detail_blocker"] is None
+
+
+def test_amendment1_eligible_detail_all_members_firing_windows_is_list():
+    """``all_members_firing_windows`` is the SUMMARY LIST
+    (separate field from the Phase 6I-20 alignment
+    mapping). It must always be present and equal the
+    Phase 6I-34 row's value for eligible rows."""
+    fake = _fake_underlying_export(
+        ranking_rows=[
+            _eligible_row(
+                "SPY",
+                all_windows_firing=True,
+                windows_firing=[
+                    "1d", "1wk", "1mo", "3mo", "1y",
+                ],
+            ),
+        ],
+        blocked_rows=[],
+    )
+    package = pkg.build_website_export_package(
+        ["SPY"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=pkg.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake,
+    )
+    detail = package["ticker_details"]["SPY"]
+    amfw = detail["all_members_firing_windows"]
+    assert isinstance(amfw, list)
+    assert amfw == ["1d", "1wk", "1mo", "3mo", "1y"]
+
+
+def test_amendment1_build_wide_window_alignment_is_null_in_phase_6i35():
+    """Phase 6I-35 does not embed the Phase 6I-20
+    `build_wide_window_alignment` MAPPING. The field must
+    surface as null on every detail row (eligible or
+    blocked) -- a future revision may thread the mapping
+    through deliberately."""
+    fake = _fake_underlying_export(
+        ranking_rows=[
+            _eligible_row("AAA"),
+            _eligible_row("BBB"),
+        ],
+        blocked_rows=[
+            _blocked_row("CCC", reason="daily_only"),
+        ],
+    )
+    package = pkg.build_website_export_package(
+        ["AAA", "BBB", "CCC"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=pkg.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake,
+    )
+    for ticker in ("AAA", "BBB", "CCC"):
+        detail = package["ticker_details"][ticker]
+        assert (
+            detail["build_wide_window_alignment"] is None
+        ), (
+            f"build_wide_window_alignment must be null for "
+            f"{ticker} in Phase 6I-35"
+        )
+
+
+def test_amendment1_blocked_detail_full_60_cell_source_is_null():
+    """A blocked row MUST NOT carry a
+    full_60_cell_detail_source even when an artifact_path
+    happens to exist -- the row is blocked precisely
+    because its artifact does NOT carry the Phase 6I-20
+    detail. The website reader would have nothing useful
+    to fetch from it."""
+    fake = _fake_underlying_export(
+        ranking_rows=[],
+        blocked_rows=[
+            _blocked_row("SPY", reason="daily_only"),
+        ],
+    )
+    package = pkg.build_website_export_package(
+        ["SPY"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=pkg.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake,
+    )
+    detail = package["ticker_details"]["SPY"]
+    assert detail["rank_eligible"] is False
+    assert detail["full_60_cell_detail_embedded"] is False
+    assert detail["full_60_cell_detail_source"] is None
+    assert detail["detail_available"] is False
+    assert detail["detail_blocker"] == "daily_only"
+
+
+def test_amendment1_eligible_without_artifact_path_blocked_detail():
+    """Defensive: an eligible row whose underlying
+    artifact_path is somehow null surfaces as
+    detail_available=False with detail_blocker=
+    no_phase_6i20_payload. The Phase 6I-34 contract
+    guarantees an artifact_path on eligible rows, but the
+    amendment-1 helper is conservative against a
+    contract change."""
+    elig = _eligible_row("AAA")
+    elig["artifact_path"] = None
+    fake = _fake_underlying_export(
+        ranking_rows=[elig], blocked_rows=[],
+    )
+    package = pkg.build_website_export_package(
+        ["AAA"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=pkg.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake,
+    )
+    detail = package["ticker_details"]["AAA"]
+    assert detail["rank_eligible"] is True
+    assert detail["full_60_cell_detail_source"] is None
+    assert detail["detail_available"] is False
+    assert (
+        detail["detail_blocker"] == "no_phase_6i20_payload"
     )
 
 

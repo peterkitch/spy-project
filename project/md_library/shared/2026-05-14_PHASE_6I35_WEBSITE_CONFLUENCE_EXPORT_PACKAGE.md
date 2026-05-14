@@ -84,9 +84,19 @@ Top-level envelope (`schema_version="confluence_website_export_v1"`):
 
 ### 4.3 Ticker details (per ticker)
 
-`ticker` / `rank_eligible` / `artifact_path` / `data_status` / `ranking_blocked_reason` / `per_window_summary` / `build_wide_window_alignment` / `chart_ready_available` / `chart_ready_source` / `chart_row_count` / `chart_blocker` / `freshness_status` / `issue_codes` / `detail_available` / `detail_blocker`.
+Fields: `ticker` / `rank_eligible` / `artifact_path` / `data_status` / `ranking_blocked_reason` / `per_window_summary` / `all_members_firing_windows` / `build_wide_window_alignment` / `full_60_cell_detail_embedded` / `full_60_cell_detail_source` / `chart_ready_available` / `chart_ready_source` / `chart_row_count` / `chart_blocker` / `freshness_status` / `issue_codes` / `detail_available` / `detail_blocker`.
 
-**No fabrication.** When a row is blocked (or otherwise missing per-window data), `per_window_summary` is `null` and `build_wide_window_alignment` is `null`. `detail_available=False` is paired with a stable `detail_blocker` string carrying the underlying `ranking_blocked_reason` (or `no_phase_6i20_payload` as a fallback).
+**Phase 6I-35 amendment-1 schema honesty (PR #252):**
+
+- `per_window_summary` — per-row summary block (`windows_firing` / `windows_firing_count` / `all_windows_firing` / etc) when the Phase 6I-34 row carries window-firing data; `null` otherwise.
+- **`all_members_firing_windows`** — SUMMARY LIST from the Phase 6I-34 row (windows where all members fire). Always present (empty list for blocked rows).
+- **`build_wide_window_alignment`** — the actual Phase 6I-20 MAPPING (`{window: {all_members_firing, firing_member_count, total_member_count}, ...}`). Phase 6I-35 **does NOT embed this mapping**; the field surfaces as `null` here. A future revision may thread the actual mapping through deliberately. The summary list above does NOT substitute — they are different schemas.
+- **`full_60_cell_detail_embedded`** — `False` by default (Phase 6I-35 does NOT embed the full `per_window_k_metrics` 60-cell list either).
+- **`full_60_cell_detail_source`** — the `artifact_path` for eligible rows that carry a resolvable on-disk artifact; `null` otherwise. The future website / API reader uses this path to fetch the full payload directly from the underlying Confluence artifact.
+- **`detail_available`** — `True` iff `full_60_cell_detail_embedded=True` OR (`rank_eligible=True` AND `full_60_cell_detail_source` is non-null). That is, **"the website has a path to detail"**, NOT "the full detail is embedded in this package".
+- **`detail_blocker`** — `null` when `detail_available=True`; else carries the underlying `ranking_blocked_reason` or the fallback `no_phase_6i20_payload` string.
+
+**No fabrication.** When a row is blocked, `per_window_summary` is `null`, `all_members_firing_windows` is an empty list, `build_wide_window_alignment` is `null`, `full_60_cell_detail_embedded=False`, `full_60_cell_detail_source=null`, `detail_available=False`, and `detail_blocker` carries the underlying reason.
 
 ### 4.4 Chart-readiness summary
 
@@ -157,7 +167,7 @@ This is the **expected honest output** for current sprint state: production Conf
 
 ---
 
-## 7. Tests added (20 new)
+## 7. Tests added (25 new — 20 original + 5 amendment-1 schema honesty)
 
 `project/test_scripts/test_confluence_website_export_package.py` (new). Each test uses fakes for the underlying Phase 6I-34 export:
 
@@ -181,8 +191,15 @@ This is the **expected honest output** for current sprint state: production Conf
 | 18 | No forbidden top-level imports | strictly bounded |
 | 19 | No on-disk write call sites (`write_text` / `write_bytes` / `json.dump`) | stdout-only contract |
 | 20 | AST has no `write=True` keyword arg | belt-and-braces dry-run guard |
+| 21 | Eligible-row detail's `full_60_cell_detail_embedded=False` + `full_60_cell_detail_source=<artifact_path>` + `detail_available=True` | amendment-1 schema honesty |
+| 22 | Eligible-row detail's `all_members_firing_windows` is a SUMMARY LIST (separate from the Phase 6I-20 alignment mapping) | amendment-1 list vs mapping distinction |
+| 23 | `build_wide_window_alignment` is `null` on every detail row in Phase 6I-35 (eligible AND blocked) | amendment-1 no-misleading-mapping pin |
+| 24 | Blocked-row detail's `full_60_cell_detail_source=null` even when `artifact_path` exists (blocked = artifact lacks the Phase 6I-20 detail) | amendment-1 honest blocker |
+| 25 | Defensive: eligible row whose `artifact_path` is somehow null → `detail_available=False`, `detail_blocker=no_phase_6i20_payload` | amendment-1 defensive fallback |
 
 The repo-wide B12 raw-pickle static regression guard continues to pass without an allowlist entry.
+
+The Phase 6I-35 package **does NOT embed the full 60-cell payload**. The website package includes summary rows plus `artifact_path`-backed detail references — the future website / API reader is expected to fetch the full `per_window_k_metrics` / `build_wide_window_alignment` mapping from the underlying Confluence artifact when needed.
 
 ---
 

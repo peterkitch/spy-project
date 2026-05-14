@@ -284,30 +284,100 @@ def _build_ticker_detail(
     row: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Project a Phase 6I-34 row (eligible or blocked) into
-    the per-ticker ticker_details shape."""
+    the per-ticker ticker_details shape.
+
+    Phase 6I-35 amendment-1 schema honesty (PR #252):
+
+      * ``all_members_firing_windows`` is a SUMMARY LIST
+        from the Phase 6I-34 row.
+      * ``build_wide_window_alignment`` is the actual
+        Phase 6I-20 mapping (``{window:
+        {all_members_firing, firing_member_count,
+        total_member_count}, ...}``). Phase 6I-35 does NOT
+        embed that mapping; this field is ``null`` here
+        unless a future revision deliberately threads the
+        actual mapping through. The summary list does NOT
+        substitute -- they are different schemas.
+      * ``full_60_cell_detail_embedded`` is ``False`` by
+        default (Phase 6I-35 does not embed the full
+        ``per_window_k_metrics`` 60-cell list either).
+      * ``full_60_cell_detail_source`` is the
+        ``artifact_path`` for eligible rows that carry a
+        resolvable on-disk artifact; ``None`` otherwise.
+        The future website / API reader uses this path to
+        fetch the full payload directly from the underlying
+        Confluence artifact.
+      * ``detail_available`` is ``True`` iff
+        ``full_60_cell_detail_embedded=True`` OR
+        (``rank_eligible=True`` AND
+        ``full_60_cell_detail_source`` is non-null). That
+        is, "the website has a path to detail" -- NOT
+        "the full detail is embedded in this package".
+      * ``detail_blocker`` is ``None`` when
+        ``detail_available=True``; else carries the
+        underlying ``ranking_blocked_reason`` or the
+        fallback ``no_phase_6i20_payload`` string.
+    """
     rank_eligible = bool(row.get("rank_eligible", False))
     per_window_summary = _build_per_window_summary(row)
-    if rank_eligible and per_window_summary is not None:
-        detail_available = True
+    all_members_firing_windows = list(
+        row.get("all_members_firing_windows", []) or [],
+    )
+
+    # Phase 6I-35 amendment-1: build_wide_window_alignment
+    # MUST be the actual Phase 6I-20 mapping when present.
+    # The Phase 6I-34 ranking row does not carry it in this
+    # version; surface None rather than a misleading list.
+    build_wide_window_alignment = None
+
+    full_60_cell_detail_embedded = False
+    artifact_path = row.get("artifact_path")
+    if (
+        rank_eligible
+        and isinstance(artifact_path, str)
+        and artifact_path
+    ):
+        full_60_cell_detail_source: Optional[str] = (
+            artifact_path
+        )
+    else:
+        full_60_cell_detail_source = None
+
+    detail_available = bool(
+        full_60_cell_detail_embedded
+        or (
+            rank_eligible
+            and full_60_cell_detail_source is not None
+        )
+    )
+    if detail_available:
         detail_blocker: Optional[str] = None
     else:
-        detail_available = False
         detail_blocker = (
             row.get("ranking_blocked_reason")
             or DETAIL_BLOCKER_NO_PHASE_6I20_PAYLOAD
         )
+
     return {
         "ticker": row.get("ticker"),
         "rank_eligible": rank_eligible,
-        "artifact_path": row.get("artifact_path"),
+        "artifact_path": artifact_path,
         "data_status": row.get("data_status"),
         "ranking_blocked_reason": row.get(
             "ranking_blocked_reason",
         ),
         "per_window_summary": per_window_summary,
+        "all_members_firing_windows": (
+            all_members_firing_windows
+        ),
         "build_wide_window_alignment": (
-            list(row.get("all_members_firing_windows", []) or [])
-            if rank_eligible else None
+            build_wide_window_alignment
+        ),
+        "full_60_cell_detail_embedded": (
+            full_60_cell_detail_embedded
+        ),
+        "full_60_cell_detail_source": (
+            full_60_cell_detail_source
         ),
         "chart_ready_available": bool(
             row.get("chart_ready_available", False),
