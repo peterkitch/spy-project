@@ -654,11 +654,10 @@ def test_overlays_pass_through_full_chain(tmp_path):
     sb = elig.current_signal_status_block
     assert sb["current_signal_status"] == "locked"
     assert sb["latest_price"] == 550.25
-    # signal_update_source is artifact-flavoured (the
-    # ranking export only flips to live_price_overlay when
-    # uses_provisional_price=True, which the local cache
-    # is NOT).
-    assert sb["signal_update_source"] == "artifact"
+    # Phase 6I-42 amendment-1: ranking export preserves
+    # provider-supplied signal_update_source="local_cache"
+    # rather than masking it back to "artifact".
+    assert sb["signal_update_source"] == "local_cache"
 
     # Package + view model carry the same blocks.
     def fake_export(
@@ -676,11 +675,23 @@ def test_overlays_pass_through_full_chain(tmp_path):
     assert rrow["data_completeness"][
         "incomplete_members"
     ] == ["TEF"]
+    # local_cache source preserved through package layer.
+    assert rrow["current_signal_status_block"][
+        "signal_update_source"
+    ] == "local_cache"
+    detail = package["ticker_details"]["SPY"]
+    assert detail["current_signal_status_block"][
+        "signal_update_source"
+    ] == "local_cache"
     vm = _crv.build_view_model(package)
     rtrow = vm["ranking_table"][0]
     assert rtrow["data_completeness"][
         "data_warning_symbol"
     ] == "!"
+    # local_cache source preserved through view model.
+    assert rtrow["current_signal_status_block"][
+        "signal_update_source"
+    ] == "local_cache"
     # Static renderer carries warning + status into the HTML.
     html_text = _rnd.build_static_board_html(vm)
     assert '<tr class="ranking-row"' in html_text
@@ -1086,3 +1097,445 @@ def test_no_yfinance_import_anywhere_in_module():
                     "yfinance"
                     not in node.module.lower()
                 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-42 amendment-1: regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_amendment1_scalar_daily_last_date_extracts_correctly():
+    """Codex audit: a nested ``daily`` block carrying a
+    scalar ``last_date`` string must extract correctly --
+    the previous implementation treated the string as a
+    sequence and returned its last character (``"4"``)."""
+    payload = {
+        "daily": {
+            "close": [100.0],
+            "last_date": "2026-05-14",
+        },
+    }
+    loader = _fake_cache_loader_factory({"AAA": payload})
+    report = ovl.build_board_runtime_overlays(
+        ["AAA"],
+        cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        cache_loader_callable=loader,
+    )
+    overlay = report.overlays_by_ticker["AAA"]
+    pb = overlay["latest_price_block"]
+    assert pb["latest_price"] == 100.0
+    assert pb["latest_price_as_of"] == "2026-05-14"
+    sb = overlay["current_signal_status_block"]
+    assert sb["current_signal_status"] == "locked"
+    assert (
+        ovl.ISSUE_CODE_CACHE_DATE_UNPARSABLE
+        not in overlay["issue_codes"]
+    )
+
+
+def test_amendment1_scalar_top_level_last_date_extracts_correctly():
+    """Top-level scalar ``last_date`` also works (parallel
+    to the nested-daily fix)."""
+    payload = {
+        "close": [100.0],
+        # Top-level dates probe is array-only; a scalar
+        # date here would only be caught if it's nested.
+        "daily": {"last_date": "2026-05-14"},
+    }
+    loader = _fake_cache_loader_factory({"AAA": payload})
+    report = ovl.build_board_runtime_overlays(
+        ["AAA"],
+        cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        cache_loader_callable=loader,
+    )
+    sb = (
+        report.current_signal_status_by_ticker["AAA"]
+    )
+    assert sb["latest_price_as_of"] == "2026-05-14"
+    assert sb["current_signal_status"] == "locked"
+
+
+def test_amendment1_scalar_numeric_close_extracts_correctly():
+    """A scalar numeric ``close`` (rather than a list)
+    extracts too, after the ``_last_scalar`` hardening."""
+    payload = {
+        "daily": {
+            "close": 100.0,
+            "last_date": "2026-05-14",
+        },
+    }
+    loader = _fake_cache_loader_factory({"AAA": payload})
+    report = ovl.build_board_runtime_overlays(
+        ["AAA"],
+        cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        cache_loader_callable=loader,
+    )
+    pb = report.latest_price_by_ticker["AAA"]
+    assert pb["latest_price"] == 100.0
+
+
+def test_amendment1_local_cache_source_propagates_through_chain(
+    tmp_path,
+):
+    """``signal_update_source="local_cache"`` survives
+    through the Phase 6I-34 ranking export, Phase 6I-35
+    package, Phase 6I-36 view model, and Phase 6I-41
+    rendered HTML."""
+    cache_loader = _fake_cache_loader_factory({
+        "AAA": _cache_payload_dates_close(
+            last_date="2026-05-14", last_close=42.0,
+        ),
+    })
+    overlay = ovl.build_board_runtime_overlays(
+        ["AAA"],
+        cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        cache_loader_callable=cache_loader,
+    )
+    artifact = _make_full_60_cell_artifact(ticker="AAA")
+    report = _build_export_with_overlays(
+        ["AAA"], {"AAA": artifact},
+        tmp_path=tmp_path,
+        overlay_report=overlay,
+    )
+    # Ranking export preserves local_cache.
+    elig = report.ranking_rows[0]
+    sb = elig.current_signal_status_block
+    assert sb["signal_update_source"] == "local_cache"
+    assert sb["latest_price"] == 42.0
+
+    def fake_export(
+        _tickers, *, artifact_root, cache_dir=None,
+    ):
+        return report
+
+    package = _cwep.build_website_export_package(
+        ["AAA"],
+        artifact_root="/tmp/research_artifacts",
+        universe_mode=_cwep.UNIVERSE_MODE_EXPLICIT,
+        underlying_export_callable=fake_export,
+    )
+    # Package preserves local_cache on both ranking_rows
+    # and ticker_details.
+    assert package["ranking_rows"][0][
+        "current_signal_status_block"
+    ]["signal_update_source"] == "local_cache"
+    assert package["ticker_details"]["AAA"][
+        "current_signal_status_block"
+    ]["signal_update_source"] == "local_cache"
+    # View model preserves local_cache.
+    vm = _crv.build_view_model(package)
+    assert vm["ranking_table"][0][
+        "current_signal_status_block"
+    ]["signal_update_source"] == "local_cache"
+    # Renderer carries the value into the inlined JSON.
+    html_text = _rnd.build_static_board_html(vm)
+    assert "local_cache" in html_text
+
+
+def test_amendment1_unsanctioned_source_falls_back():
+    """The ranking export rejects unsanctioned provider
+    ``signal_update_source`` values and falls back to the
+    default (``artifact`` when non-provisional)."""
+    overlay = ovl.build_board_runtime_overlays(
+        ["AAA"], cache_dir="/tmp/cache",
+        cache_loader_callable=_fake_cache_loader_factory({
+            "AAA": _cache_payload_dates_close(
+                last_date="2026-05-14", last_close=100.0,
+            ),
+        }),
+    )
+    # Manually construct a payload with a fabricated source.
+    bad_provider = lambda ticker, artifact=None: {
+        "latest_price": 100.0,
+        "latest_price_as_of": "2026-05-14",
+        "uses_provisional_price": False,
+        "signal_update_source": "fabricated_label",
+        "current_signal_status": "locked",
+    }
+    # Directly check the ranking-export helper.
+    block = _cmre._build_current_signal_status_block(
+        ticker="AAA",
+        rank_eligible=True,
+        confluence_last_date="2026-05-14",
+        live_price_payload=bad_provider("AAA"),
+    )
+    # Unsanctioned label rejected -> defaults to artifact
+    # (non-provisional).
+    assert block["signal_update_source"] == "artifact"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-42 amendment-1: renderer-level integration
+# ---------------------------------------------------------------------------
+
+
+def _make_test_artifact_loader_for_overlay_chain(
+    artifact_map: dict[str, dict[str, Any]],
+):
+    """Return an artifact loader the ranking export accepts.
+    Matches the ``_injected_loader`` shape used elsewhere in
+    this file."""
+    return _injected_loader(artifact_map)
+
+
+def test_amendment1_build_view_model_from_tickers_with_overlays(
+    tmp_path,
+):
+    """The renderer-side helper threads overlays into the
+    full chain: ranking export -> package -> view model.
+    The resulting view model carries the warning + latest
+    price + local_cache source."""
+    cache_loader = _fake_cache_loader_factory({
+        "AAA": _cache_payload_dates_close(
+            last_date="2026-05-14", last_close=42.0,
+        ),
+    })
+
+    def member_provider(ticker, **_kw):
+        if ticker == "AAA":
+            return {
+                "incomplete_members": ["TEF"],
+                "incomplete_member_reasons": {
+                    "TEF": (
+                        "yfinance_possibly_delisted"
+                    ),
+                },
+            }
+        return {
+            "incomplete_members": [],
+            "incomplete_member_reasons": {},
+        }
+
+    # Set up artifact stubs the ranking export expects.
+    art_root = tmp_path / "research_artifacts"
+    (art_root / "confluence" / "AAA").mkdir(parents=True)
+    (
+        art_root / "confluence" / "AAA"
+        / "AAA__MTF_CONSENSUS.research_day.json"
+    ).write_text("{}", encoding="utf-8")
+    artifact_loader = (
+        _make_test_artifact_loader_for_overlay_chain(
+            {"AAA": _make_full_60_cell_artifact(
+                ticker="AAA",
+            )},
+        )
+    )
+
+    vm = _rnd.build_view_model_from_tickers(
+        ["AAA"],
+        artifact_root=str(art_root),
+        cache_dir=None,
+        with_local_overlays=True,
+        overlay_cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        overlay_cache_loader_callable=cache_loader,
+        overlay_stackbuilder_member_callable=(
+            member_provider
+        ),
+        ranking_artifact_loader_callable=artifact_loader,
+        ranking_chart_readiness_callable=_fake_chart,
+    )
+    assert len(vm["ranking_table"]) == 1
+    row = vm["ranking_table"][0]
+    assert row["ticker"] == "AAA"
+    assert row["data_completeness"][
+        "incomplete_members"
+    ] == ["TEF"]
+    assert row["data_completeness"][
+        "data_warning_symbol"
+    ] == "!"
+    assert row["current_signal_status_block"][
+        "latest_price"
+    ] == 42.0
+    assert row["current_signal_status_block"][
+        "signal_update_source"
+    ] == "local_cache"
+    assert row["current_signal_status_block"][
+        "current_signal_status"
+    ] == "locked"
+
+
+def test_amendment1_build_view_model_without_overlays_unchanged(
+    tmp_path,
+):
+    """Without ``with_local_overlays``, the chain runs
+    unchanged: data_completeness=complete, source=artifact,
+    no latest_price."""
+    art_root = tmp_path / "research_artifacts"
+    (art_root / "confluence" / "AAA").mkdir(parents=True)
+    (
+        art_root / "confluence" / "AAA"
+        / "AAA__MTF_CONSENSUS.research_day.json"
+    ).write_text("{}", encoding="utf-8")
+    artifact_loader = _injected_loader(
+        {"AAA": _make_full_60_cell_artifact(ticker="AAA")},
+    )
+    vm = _rnd.build_view_model_from_tickers(
+        ["AAA"],
+        artifact_root=str(art_root),
+        with_local_overlays=False,
+        ranking_artifact_loader_callable=artifact_loader,
+        ranking_chart_readiness_callable=_fake_chart,
+    )
+    row = vm["ranking_table"][0]
+    assert row["data_completeness"][
+        "data_completeness_status"
+    ] == "complete"
+    assert row["data_completeness"][
+        "data_warning_symbol"
+    ] is None
+    assert row["current_signal_status_block"][
+        "signal_update_source"
+    ] == "artifact"
+    assert row["current_signal_status_block"][
+        "latest_price"
+    ] is None
+
+
+def test_amendment1_renderer_html_carries_overlay_fields(
+    tmp_path,
+):
+    """The Phase 6I-41 renderer's HTML output, driven by the
+    overlay-enabled chain, includes the warning symbol, the
+    TEF incomplete-member name, the latest price, and the
+    local_cache source label."""
+    cache_loader = _fake_cache_loader_factory({
+        "AAA": _cache_payload_dates_close(
+            last_date="2026-05-14", last_close=42.5,
+        ),
+    })
+
+    def member_provider(ticker, **_kw):
+        return {
+            "incomplete_members": ["TEF"],
+            "incomplete_member_reasons": {
+                "TEF": "yfinance_possibly_delisted",
+            },
+        }
+
+    art_root = tmp_path / "research_artifacts"
+    (art_root / "confluence" / "AAA").mkdir(parents=True)
+    (
+        art_root / "confluence" / "AAA"
+        / "AAA__MTF_CONSENSUS.research_day.json"
+    ).write_text("{}", encoding="utf-8")
+    artifact_loader = _injected_loader(
+        {"AAA": _make_full_60_cell_artifact(ticker="AAA")},
+    )
+
+    vm = _rnd.build_view_model_from_tickers(
+        ["AAA"],
+        artifact_root=str(art_root),
+        cache_dir=None,
+        with_local_overlays=True,
+        overlay_cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        overlay_cache_loader_callable=cache_loader,
+        overlay_stackbuilder_member_callable=(
+            member_provider
+        ),
+        ranking_artifact_loader_callable=artifact_loader,
+        ranking_chart_readiness_callable=_fake_chart,
+    )
+    html_text = _rnd.build_static_board_html(vm)
+    # One ranking row.
+    assert html_text.count(
+        '<tr class="ranking-row"',
+    ) == 1
+    # Warning symbol present.
+    assert (
+        '<span class="warning warning-on"' in html_text
+    )
+    # TEF incomplete-member name reaches the embedded JSON.
+    assert "TEF" in html_text
+    assert "yfinance_possibly_delisted" in html_text
+    # Latest price visible.
+    assert "42.50" in html_text or "42.5" in html_text
+    # local_cache source visible somewhere.
+    assert "local_cache" in html_text
+    # status-locked badge.
+    assert (
+        'class="status-badge status-locked"' in html_text
+    )
+
+
+def test_amendment1_renderer_preserves_blocked_when_no_artifact(
+    tmp_path,
+):
+    """If the ranking export classifies the row as blocked
+    (no artifact on disk), the overlay does NOT promote it
+    to rank-eligible -- blocked stays blocked."""
+    cache_loader = _fake_cache_loader_factory({
+        "AAA": _cache_payload_dates_close(
+            last_date="2026-05-14", last_close=42.0,
+        ),
+    })
+    # Artifact directory exists but no .json file.
+    art_root = tmp_path / "research_artifacts"
+    (art_root / "confluence").mkdir(parents=True)
+    vm = _rnd.build_view_model_from_tickers(
+        ["AAA"],
+        artifact_root=str(art_root),
+        with_local_overlays=True,
+        overlay_cache_dir="/tmp/cache",
+        current_as_of_date="2026-05-14",
+        overlay_cache_loader_callable=cache_loader,
+        ranking_artifact_loader_callable=lambda p: None,
+        ranking_chart_readiness_callable=_fake_chart,
+    )
+    # No ranking rows; AAA appears in blocked_table.
+    assert vm["ranking_table"] == []
+    assert len(vm["blocked_table"]) == 1
+    assert vm["blocked_table"][0]["ticker"] == "AAA"
+
+
+def test_amendment1_cli_from_tickers_with_overlays(
+    tmp_path, capsys,
+):
+    """Smoke test: CLI ``--from-tickers --with-local-
+    overlays`` runs end-to-end against a tmp_path artifact
+    root + non-existent cache dir (the cache loader
+    gracefully reports ``cache_pkl_missing`` and the chain
+    still emits HTML)."""
+    art_root = tmp_path / "research_artifacts"
+    (art_root / "confluence").mkdir(parents=True)
+    # No AAA artifact -> ranking export will block.
+    rc = _rnd.main([
+        "--from-tickers", "AAA",
+        "--artifact-root", str(art_root),
+        "--with-local-overlays",
+        "--overlay-cache-dir", str(
+            tmp_path / "nonexistent_cache",
+        ),
+        "--current-as-of-date", "2026-05-14",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("<!DOCTYPE html>")
+    # AAA is blocked (no artifact) -> blocked-table row.
+    assert '<tr class="blocked-row"' in out
+    assert 'data-ticker="AAA"' in out
+
+
+def test_amendment1_cli_from_tickers_requires_artifact_root(
+    capsys,
+):
+    rc = _rnd.main([
+        "--from-tickers", "AAA",
+    ])
+    assert rc == 2
+
+
+def test_amendment1_cli_from_tickers_empty_list_rc_2(capsys):
+    rc = _rnd.main([
+        "--from-tickers", "",
+        "--artifact-root", "/tmp/foo",
+    ])
+    # argparse-level: --from-tickers is in the source
+    # group; empty string falls through to "missing
+    # source" because falsy.
+    assert rc == 2

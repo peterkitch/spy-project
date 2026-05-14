@@ -308,22 +308,52 @@ _DATE_KEYS: tuple[str, ...] = (
 )
 
 
-def _last_scalar(seq: Any) -> Optional[float]:
+def _last_scalar(value: Any) -> Optional[float]:
     """Defensively return the last numeric value of a
-    sequence-like object. Returns ``None`` on any failure."""
-    if seq is None:
+    sequence-like object, OR the scalar numeric value
+    itself when ``value`` is already a number. Returns
+    ``None`` on any failure.
+
+    Phase 6I-42 amendment-1: intercepts scalar
+    ``int`` / ``float`` (and string-formatted numerics)
+    BEFORE the ``len() / seq[-1]`` path to avoid the
+    same "str-treated-as-sequence" footgun the
+    ``_last_date_label`` helper had.
+    """
+    if value is None:
         return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    # Scalar numeric-string (e.g. "100.0"). DON'T fall
+    # through to the sequence path -- ``"100.0"`` would
+    # otherwise return its last character.
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+    if isinstance(value, bytes):
+        try:
+            return float(value.decode("ascii", "replace"))
+        except Exception:
+            return None
+    # Sequence path.
     try:
-        n = len(seq)
+        n = len(value)
     except Exception:
         return None
     if n == 0:
         return None
     try:
-        v = seq[-1]
+        v = value[-1]
     except Exception:
         try:
-            v = list(seq)[-1]
+            v = list(value)[-1]
         except Exception:
             return None
     if isinstance(v, bool):
@@ -336,20 +366,57 @@ def _last_scalar(seq: Any) -> Optional[float]:
         return None
 
 
-def _last_date_label(seq: Any) -> Optional[str]:
-    if seq is None:
+def _last_date_label(value: Any) -> Optional[str]:
+    """Defensively return the last date label from a
+    sequence-like input OR the scalar date itself when
+    ``value`` is a scalar string / bytes / datetime.
+
+    Codex audit (Phase 6I-42 amendment-1): the previous
+    implementation treated a scalar string like
+    ``"2026-05-14"`` as a sequence and returned its
+    last character (``"4"``). The scalar paths below
+    guard that case explicitly so a nested ``daily``
+    block carrying ``{"close": [...], "last_date":
+    "2026-05-14"}`` extracts the date correctly.
+    """
+    if value is None:
         return None
+    # Scalar string. ``str`` IS a sequence in Python, so
+    # we must intercept it BEFORE the ``len(seq) -> seq[-1]``
+    # path or we'd return the last character.
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("ascii", "replace")
+        except Exception:
+            return None
+    # Scalar datetime / date / pandas Timestamp (none of
+    # these are list/tuple/range; all of them have
+    # ``isoformat()``).
+    if (
+        hasattr(value, "isoformat")
+        and not isinstance(value, (list, tuple, range))
+    ):
+        try:
+            return value.isoformat()
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return None
+    # Sequence path.
     try:
-        n = len(seq)
+        n = len(value)
     except Exception:
         return None
     if n == 0:
         return None
     try:
-        v = seq[-1]
+        v = value[-1]
     except Exception:
         try:
-            v = list(seq)[-1]
+            v = list(value)[-1]
         except Exception:
             return None
     # Some pandas-flavored Timestamp / datetime objects
@@ -359,6 +426,8 @@ def _last_date_label(seq: Any) -> Optional[str]:
             return v.isoformat()
         except Exception:
             pass
+    if isinstance(v, str):
+        return v
     return str(v)
 
 
@@ -1080,6 +1149,20 @@ def make_live_price_provider(
             SIGNAL_STATUS_UNKNOWN,
         ):
             payload["current_signal_status"] = status
+        # Phase 6I-42 amendment-1: propagate
+        # signal_update_source so the ranking export can
+        # preserve "local_cache" (instead of masking
+        # everything non-provisional back to "artifact").
+        # The ranking export now sanctions {artifact,
+        # live_price_overlay, local_cache, unavailable}.
+        provided_source = sb.get("signal_update_source")
+        if provided_source in (
+            SIGNAL_UPDATE_SOURCE_ARTIFACT,
+            SIGNAL_UPDATE_SOURCE_LOCAL_CACHE,
+        ):
+            payload["signal_update_source"] = (
+                provided_source
+            )
         return payload
 
     return provider

@@ -2,6 +2,55 @@
 
 **Branch:** `phase-6i-42-local-runtime-overlays`
 
+## Amendment-1 summary (Codex audit response)
+
+Three substantive fixes on top of the initial PR head:
+
+1. **Fixed scalar `daily.last_date` parsing bug.**
+   `_last_date_label("2026-05-14")` previously returned
+   `"4"` (the last character of the string) because the
+   helper treated the scalar string as a sequence. The
+   fix intercepts scalar `str` / `bytes` / `date` /
+   `datetime` / `Timestamp` values BEFORE the
+   `len() / seq[-1]` path. `_last_scalar` got the same
+   hardening for symmetry — a scalar numeric `close`
+   value now extracts correctly too.
+2. **Made overlays reachable from the real renderer
+   path.** Added `build_view_model_from_tickers(...)` to
+   `confluence_static_board_renderer.py` plus a
+   `--from-tickers / --with-local-overlays /
+   --overlay-cache-dir / --overlay-artifact-root /
+   --overlay-stackbuilder-root /
+   --overlay-signal-library-dir /
+   --current-as-of-date / --artifact-root / --cache-dir`
+   CLI surface. The helper threads
+   Phase 6I-42 overlay → Phase 6I-34 ranking export →
+   Phase 6I-35 package → Phase 6I-36 reader/view in-
+   process. All deeper imports are deferred so the
+   renderer's top-level import surface stays small.
+3. **Preserved `local_cache` as a sanctioned
+   `signal_update_source`.** Added
+   `SIGNAL_UPDATE_SOURCE_LOCAL_CACHE = "local_cache"` and
+   `ALL_SANCTIONED_SIGNAL_UPDATE_SOURCES` to
+   `confluence_multiwindow_ranking_export.py`. Updated
+   `_build_current_signal_status_block` so a
+   provider-supplied `signal_update_source` is preserved
+   when it is one of `{artifact, live_price_overlay,
+   local_cache, unavailable}`; unsanctioned values fall
+   back to the default rule. Updated
+   `make_live_price_provider` to emit
+   `signal_update_source` so the local-cache overlay
+   reaches the ranking export, package, view model, and
+   rendered HTML without being masked back to
+   `"artifact"`.
+
+12 new amendment-1 tests pin all three fixes end-to-end.
+Existing-test count unchanged. Full focused suite:
+**241 passed in 4.32s** (39 overlay + 32 renderer + 22
+Phase 6I-40 + 18 primary-build + 30 current-signal + 30
+reader/view + 25 package + 36 ranking export + 9 static
+regression).
+
 ## 1. ELI5
 
 The Phase 6I-40 board contract added stable per-row sub-
