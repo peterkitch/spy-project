@@ -1,0 +1,392 @@
+{
+  "schema_version": "confluence_stackbuilder_pilot_preflight_v1",
+  "generated_at": "2026-05-15T10:47:58+00:00",
+  "price_cache_dir_used": "price_cache\\daily",
+  "price_cache_dir_exists": true,
+  "default_price_cache_dir_relative": "price_cache/daily",
+  "ticker_count": 25,
+  "pass_count": 6,
+  "skip_count": 19,
+  "tickers_passing_preflight": [
+    "AAPL",
+    "HD",
+    "JNJ",
+    "MCD",
+    "SPY",
+    "WMT"
+  ],
+  "tickers_skipped_missing_cache": [
+    "ADBE",
+    "AMD",
+    "AMZN",
+    "AVGO",
+    "BRK-B",
+    "CRM",
+    "CSCO",
+    "GOOGL",
+    "JPM",
+    "KO",
+    "MA",
+    "META",
+    "MSFT",
+    "NVDA",
+    "ORCL",
+    "PG",
+    "QCOM",
+    "TSLA",
+    "V"
+  ],
+  "rows": [
+    {
+      "ticker": "SPY",
+      "local_price_cache_available": true,
+      "resolved_cache_path": "price_cache\\daily\\SPY.csv",
+      "would_fetch_yfinance": false,
+      "preflight_status": "pass",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\SPY.parquet",
+        "price_cache\\daily\\SPY.csv",
+        "price_cache\\daily\\SPY.parquet",
+        "price_cache\\daily\\SPY.csv",
+        "price_cache\\daily\\SPY\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "AAPL",
+      "local_price_cache_available": true,
+      "resolved_cache_path": "price_cache\\daily\\AAPL.csv",
+      "would_fetch_yfinance": false,
+      "preflight_status": "pass",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\AAPL.parquet",
+        "price_cache\\daily\\AAPL.csv",
+        "price_cache\\daily\\AAPL.parquet",
+        "price_cache\\daily\\AAPL.csv",
+        "price_cache\\daily\\AAPL\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "MSFT",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\MSFT.parquet",
+        "price_cache\\daily\\MSFT.csv",
+        "price_cache\\daily\\MSFT.parquet",
+        "price_cache\\daily\\MSFT.csv",
+        "price_cache\\daily\\MSFT\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "GOOGL",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\GOOGL.parquet",
+        "price_cache\\daily\\GOOGL.csv",
+        "price_cache\\daily\\GOOGL.parquet",
+        "price_cache\\daily\\GOOGL.csv",
+        "price_cache\\daily\\GOOGL\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "AMZN",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\AMZN.parquet",
+        "price_cache\\daily\\AMZN.csv",
+        "price_cache\\daily\\AMZN.parquet",
+        "price_cache\\daily\\AMZN.csv",
+        "price_cache\\daily\\AMZN\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "NVDA",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\NVDA.parquet",
+        "price_cache\\daily\\NVDA.csv",
+        "price_cache\\daily\\NVDA.parquet",
+        "price_cache\\daily\\NVDA.csv",
+        "price_cache\\daily\\NVDA\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "META",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\META.parquet",
+        "price_cache\\daily\\META.csv",
+        "price_cache\\daily\\META.parquet",
+        "price_cache\\daily\\META.csv",
+        "price_cache\\daily\\META\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "TSLA",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\TSLA.parquet",
+        "price_cache\\daily\\TSLA.csv",
+        "price_cache\\daily\\TSLA.parquet",
+        "price_cache\\daily\\TSLA.csv",
+        "price_cache\\daily\\TSLA\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "AVGO",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\AVGO.parquet",
+        "price_cache\\daily\\AVGO.csv",
+        "price_cache\\daily\\AVGO.parquet",
+        "price_cache\\daily\\AVGO.csv",
+        "price_cache\\daily\\AVGO\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "ORCL",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\ORCL.parquet",
+        "price_cache\\daily\\ORCL.csv",
+        "price_cache\\daily\\ORCL.parquet",
+        "price_cache\\daily\\ORCL.csv",
+        "price_cache\\daily\\ORCL\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "ADBE",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\ADBE.parquet",
+        "price_cache\\daily\\ADBE.csv",
+        "price_cache\\daily\\ADBE.parquet",
+        "price_cache\\daily\\ADBE.csv",
+        "price_cache\\daily\\ADBE\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "CRM",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\CRM.parquet",
+        "price_cache\\daily\\CRM.csv",
+        "price_cache\\daily\\CRM.parquet",
+        "price_cache\\daily\\CRM.csv",
+        "price_cache\\daily\\CRM\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "AMD",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\AMD.parquet",
+        "price_cache\\daily\\AMD.csv",
+        "price_cache\\daily\\AMD.parquet",
+        "price_cache\\daily\\AMD.csv",
+        "price_cache\\daily\\AMD\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "QCOM",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\QCOM.parquet",
+        "price_cache\\daily\\QCOM.csv",
+        "price_cache\\daily\\QCOM.parquet",
+        "price_cache\\daily\\QCOM.csv",
+        "price_cache\\daily\\QCOM\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "CSCO",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\CSCO.parquet",
+        "price_cache\\daily\\CSCO.csv",
+        "price_cache\\daily\\CSCO.parquet",
+        "price_cache\\daily\\CSCO.csv",
+        "price_cache\\daily\\CSCO\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "JPM",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\JPM.parquet",
+        "price_cache\\daily\\JPM.csv",
+        "price_cache\\daily\\JPM.parquet",
+        "price_cache\\daily\\JPM.csv",
+        "price_cache\\daily\\JPM\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "BRK-B",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\BRK-B.parquet",
+        "price_cache\\daily\\BRK-B.csv",
+        "price_cache\\daily\\BRK-B.parquet",
+        "price_cache\\daily\\BRK-B.csv",
+        "price_cache\\daily\\BRK-B\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "V",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\V.parquet",
+        "price_cache\\daily\\V.csv",
+        "price_cache\\daily\\V.parquet",
+        "price_cache\\daily\\V.csv",
+        "price_cache\\daily\\V\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "MA",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\MA.parquet",
+        "price_cache\\daily\\MA.csv",
+        "price_cache\\daily\\MA.parquet",
+        "price_cache\\daily\\MA.csv",
+        "price_cache\\daily\\MA\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "JNJ",
+      "local_price_cache_available": true,
+      "resolved_cache_path": "price_cache\\daily\\JNJ.csv",
+      "would_fetch_yfinance": false,
+      "preflight_status": "pass",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\JNJ.parquet",
+        "price_cache\\daily\\JNJ.csv",
+        "price_cache\\daily\\JNJ.parquet",
+        "price_cache\\daily\\JNJ.csv",
+        "price_cache\\daily\\JNJ\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "WMT",
+      "local_price_cache_available": true,
+      "resolved_cache_path": "price_cache\\daily\\WMT.csv",
+      "would_fetch_yfinance": false,
+      "preflight_status": "pass",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\WMT.parquet",
+        "price_cache\\daily\\WMT.csv",
+        "price_cache\\daily\\WMT.parquet",
+        "price_cache\\daily\\WMT.csv",
+        "price_cache\\daily\\WMT\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "PG",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\PG.parquet",
+        "price_cache\\daily\\PG.csv",
+        "price_cache\\daily\\PG.parquet",
+        "price_cache\\daily\\PG.csv",
+        "price_cache\\daily\\PG\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "HD",
+      "local_price_cache_available": true,
+      "resolved_cache_path": "price_cache\\daily\\HD.csv",
+      "would_fetch_yfinance": false,
+      "preflight_status": "pass",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\HD.parquet",
+        "price_cache\\daily\\HD.csv",
+        "price_cache\\daily\\HD.parquet",
+        "price_cache\\daily\\HD.csv",
+        "price_cache\\daily\\HD\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "KO",
+      "local_price_cache_available": false,
+      "resolved_cache_path": null,
+      "would_fetch_yfinance": true,
+      "preflight_status": "skip_missing_cache_would_fetch_yfinance",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\KO.parquet",
+        "price_cache\\daily\\KO.csv",
+        "price_cache\\daily\\KO.parquet",
+        "price_cache\\daily\\KO.csv",
+        "price_cache\\daily\\KO\\daily.parquet"
+      ]
+    },
+    {
+      "ticker": "MCD",
+      "local_price_cache_available": true,
+      "resolved_cache_path": "price_cache\\daily\\MCD.csv",
+      "would_fetch_yfinance": false,
+      "preflight_status": "pass",
+      "candidate_paths_checked": [
+        "price_cache\\daily\\MCD.parquet",
+        "price_cache\\daily\\MCD.csv",
+        "price_cache\\daily\\MCD.parquet",
+        "price_cache\\daily\\MCD.csv",
+        "price_cache\\daily\\MCD\\daily.parquet"
+      ]
+    }
+  ],
+  "stackbuilder_load_secondary_prices_source": "stackbuilder.py:530-556 -- the helper checks five candidate paths in PRICE_CACHE_DIR (default 'price_cache/daily'), then falls through to _fetch_secondary_from_yf (stackbuilder.py:506). Phase 6I-53 preflight MUST be cache-pass for every ticker before StackBuilder is invoked, otherwise the run will trigger a live yfinance fetch."
+}

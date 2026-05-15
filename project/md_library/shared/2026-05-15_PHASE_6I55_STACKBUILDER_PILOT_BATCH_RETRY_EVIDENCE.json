@@ -1,0 +1,268 @@
+{
+  "schema_version": "stackbuilder_pilot_batch_retry_evidence_v1",
+  "phase": "phase_6i_55",
+  "phase_label": "stackbuilder_pilot_batch_retry_blocked_on_policy_gap",
+  "generated_at": "2026-05-15T10:52:21+00:00",
+  "base_main_commit": "63b06c9",
+  "authorized_tickers": [
+    "SPY",
+    "AAPL",
+    "JNJ",
+    "WMT",
+    "HD",
+    "MCD"
+  ],
+  "preflight_summary": {
+    "pcd_exists": true,
+    "pass_count": 6,
+    "skip_count": 19,
+    "passing": [
+      "AAPL",
+      "HD",
+      "JNJ",
+      "MCD",
+      "SPY",
+      "WMT"
+    ],
+    "preflight_passed_gate": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I55_PRE_RUN_PREFLIGHT.json"
+  },
+  "locked_command_template": "\"<PINNED_PYTHON>\" stackbuilder.py --secondary <TICKER> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --optimize-by total_capture --min-trigger-days 30 --combine-mode intersection --signal-lib-dir signal_library/data/stable",
+  "execution_log": {
+    "attempted_count": 1,
+    "succeeded_count": 0,
+    "failed_count": 1,
+    "remaining_skipped_per_stop_and_report": [
+      "AAPL",
+      "JNJ",
+      "WMT",
+      "HD",
+      "MCD"
+    ],
+    "stop_reason": "Per the Phase 6I-55 prompt: 'If any of the 6 no longer pass, STOP and report.' The first command (SPY) exited with rc=1 FATAL because the Phase 6I-52 locked command shape lacks --primaries and stackbuilder.py explicitly refuses to fall back to the 72k-ticker auto-discovery (phase1_preflight ~L869: 'CRITICAL: Strictly require user primaries; no 72k fallback'). Running the remaining 5 tickers would produce 5 identical FATAL exits with the same policy gap. Stopping after the first ticker is the operationally honest outcome.",
+    "per_ticker_results": [
+      {
+        "ticker": "SPY",
+        "rc": 1,
+        "stdout_tail": [
+          "[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE=False)"
+        ],
+        "stderr_tail": [
+          "[FATAL] Primary tickers field is empty. Please supply one or more primaries."
+        ],
+        "wrote_files": false,
+        "issue": "primaries_not_specified",
+        "yfinance_fetched": false,
+        "stdout_stderr_capture": "embedded_only",
+        "stdout_stderr_capture_note": "Raw stdout/stderr files are not committed (.gitignore *.txt). The 10-line tails in stdout_tail / stderr_tail above are the authoritative on-disk record of the SPY FATAL run."
+      }
+    ]
+  },
+  "policy_gap": {
+    "gap": "Phase 6I-52 locked policy command shape lacks --primaries. stackbuilder.py phase1_preflight (~L869) raises FATAL when no primaries are supplied AND --prefer-impact-xlsx is not set: '[FATAL] Primary tickers field is empty.' This guard is explicitly documented as 'CRITICAL: Strictly require user primaries; no 72k fallback.' The Phase 6I-52 locked policy did NOT include --primaries; this was an unresolved item the STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS list deferred under 'per_ticker_member_universe_sizing'.",
+    "evidence_in_codebase": "stackbuilder.py:869-889 -- phase1_preflight; raises SystemExit with the FATAL message when no primaries are specified.",
+    "legacy_seed_run_examples": {
+      "SPY": "seedTC__AWR-D_CP-I_EXPO-D_LLY-I_CLH-D_GBCI-D_HCSG-D_TEF-I_JNJ-I_MO-I_AROW-D_PRA-D (12 primaries; matches the Phase 6I-43/44/49 SPY K-universe)",
+      "AAPL": "seedTC__EXC-D_HD-D_JFJ.L-D_MWY.L-D_JCH.L-D_ATR.L-D_ETE.AT-I_HGT.L-D_CSL.AX-D_MGR.AX-I_TTE-I_AAPL-D (12 primaries; a different international set chosen by an earlier ImpactSearch / curated workflow)"
+    },
+    "options_for_resolution": [
+      "PREFERRED: Phase 6I-55a -- read-only ImpactSearch / primary-universe readiness planner. Mirrors the Phase 6I-53 / 6I-54a pattern. Inspects output/impactsearch/<TICKER>_analysis.xlsx per ready secondary, verifies manifest sidecar + freshness, extracts the primary universe StackBuilder would consume via try_load_rank_from_impact_xlsx, and classifies each ticker as one of {ready_for_stackbuilder_with_impact_xlsx, needs_impactsearch_run, manual_review}. Read-only: no ImpactSearch / OnePass / StackBuilder / yfinance / subprocess / raw pickle.load.",
+      "Option A -- explicit --primaries <CSV> per ticker: MANUAL OVERRIDE ONLY. Skips the curated upstream ranking and the audit trail the OnePass -> ImpactSearch -> StackBuilder chain provides. Not equivalent to the intended app chain.",
+      "Option B -- add --prefer-impact-xlsx to the Phase 6I-52 locked command: gated on Phase 6I-55a output. Today the workbook is MISSING entirely for 4 of the 6 ready tickers (JNJ, WMT, HD, MCD) and the SPY + AAPL workbooks are dated 2026-01-09 (~4 months old). Operator must decide a freshness rule before this option becomes usable.",
+      "Option C -- run ImpactSearch first as its own authorized phase, then retry Phase 6I-55 with option B. This is the natural path Phase 6I-55a directs to for needs_impactsearch_run tickers.",
+      "Option D -- uniform SPY K-universe fallback (AWR, CP, EXPO, LLY, CLH, GBCI, HCSG, TEF, JNJ, MO, AROW, PRA): NOT RECOMMENDED / emergency-manual only. No economic basis for AAPL / JNJ / WMT / HD / MCD using the SPY K-universe. Includes TEF (the Phase 6I-43-flagged known-invalid ticker), which would propagate through the partial-payload path."
+    ],
+    "recommended_resolution": "Write a read-only Phase 6I-55a ImpactSearch / primary-universe readiness planner that mirrors the Phase 6I-53 / 6I-54a pattern. Operator reviews its per-ticker classification. For needs_impactsearch_run tickers, the operator either authorizes a separate ImpactSearch batch or defers those tickers. Once Phase 6I-55a confirms the upstream chain, a Phase 6I-52 amendment-3 locks --prefer-impact-xlsx (plus any freshness criteria) into the StackBuilder command shape, and Phase 6I-55c retries the supervised batch against the ready_for_stackbuilder_with_impact_xlsx subset. Explicit --primaries remains documented as the manual override path. The uniform SPY K-universe fallback (option D) is NOT recommended (no economic basis for the other 5 tickers; includes TEF). See amendment_1_revised_options_summary for the canonical option table."
+  },
+  "production_root_inventory_pre_run": {
+    "cache/results": 3239,
+    "cache/status": 1634,
+    "output/research_artifacts": 35,
+    "output/stackbuilder": 5229,
+    "signal_library/data/stable": 72899,
+    "price_cache/daily": 6,
+    "combined_five_documented": 83036
+  },
+  "production_root_inventory_post_run": {
+    "cache/results": 3239,
+    "cache/status": 1634,
+    "output/research_artifacts": 35,
+    "output/stackbuilder": 5229,
+    "signal_library/data/stable": 72899,
+    "price_cache/daily": 6,
+    "combined_five_documented": 83036
+  },
+  "production_root_diff": {
+    "cache/results": 0,
+    "cache/status": 0,
+    "output/research_artifacts": 0,
+    "output/stackbuilder": 0,
+    "signal_library/data/stable": 0,
+    "price_cache/daily": 0,
+    "combined_five_documented": 0
+  },
+  "per_ticker_output_stackbuilder_diff": {
+    "SPY": "19 files pre = 19 files post (no change; FATAL exit before any write)",
+    "AAPL": "19 files pre = 19 files post (no run attempted)",
+    "JNJ": "dir missing pre = dir missing post (no run attempted)",
+    "WMT": "dir missing pre = dir missing post (no run attempted)",
+    "HD": "dir missing pre = dir missing post (no run attempted)",
+    "MCD": "dir missing pre = dir missing post (no run attempted)"
+  },
+  "post_run_phase_6i_50_reclassification": {
+    "inspected_count": 2,
+    "rows": [
+      {
+        "ticker": "SPY",
+        "recommended_next_action": "already_board_ranked"
+      },
+      {
+        "ticker": "_GSPC",
+        "recommended_next_action": "blocked_missing_inputs"
+      }
+    ],
+    "verdict_unchanged_vs_pre_phase_6i_55": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I55_POST_RUN_6I50_LAUNCH_PLAN.json"
+  },
+  "post_run_phase_6i_51_reclassification": {
+    "batches": {
+      "board_render_now": [
+        "SPY"
+      ],
+      "partial_artifact_write_candidates": [],
+      "strict_artifact_write_candidates": [],
+      "source_refresh_candidates": [],
+      "signal_library_rebuild_or_promotion_candidates": [],
+      "stackbuilder_rerun_candidates": [],
+      "blocked_or_manual_review": [
+        "_GSPC"
+      ]
+    },
+    "verdict_unchanged_vs_pre_phase_6i_55": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I55_POST_RUN_6I51_ROLLOUT_PLAN.json"
+  },
+  "no_yfinance_confirmation": {
+    "yfinance_fetched_anywhere": false,
+    "evidence": "stackbuilder.py exited with FATAL BEFORE reaching the secondary-price load (phase1_preflight returns at L889 before line L864 load_secondary_prices, which is the only path to _fetch_secondary_from_yf). Even if the FATAL had not fired, the Phase 6I-53 preflight already confirmed SPY/AAPL/JNJ/WMT/HD/MCD have local price_cache/daily CSVs and would NOT fall through to yfinance."
+  },
+  "no_production_activity_confirmation": {
+    "invoked_yfinance": false,
+    "invoked_source_cache_refresher": false,
+    "invoked_signal_library_promotion_writer": false,
+    "invoked_multiwindow_k_confluence_patch_writer": false,
+    "invoked_confluence_pipeline_runner": false,
+    "invoked_onepass_impactsearch_trafficflow_spymaster_batch": false,
+    "set_PRJCT9_AUTOMATION_WRITE_AUTH": false,
+    "stackbuilder_runs_attempted": 1,
+    "stackbuilder_runs_succeeded": 0,
+    "stackbuilder_wrote_any_file": false,
+    "subprocess_wrappers_added": false
+  },
+  "next_step_recommendation": "Phase 6I-55 cannot proceed until the --primaries gap in the Phase 6I-52 locked policy is resolved. Recommended next phase: a Phase 6I-55a (or Phase 6I-52 amendment-3) that explicitly decides the --primaries axis -- preferably option (A) or (C) above. After that lands, Phase 6I-55b retries the supervised batch for the 6 ready tickers using the updated locked command shape. This is the same stop-and-resolve pattern Phase 6I-53 established for the cache-rebuild gap.",
+  "amendment_1_verified_upstream_chain": {
+    "chain_summary": "OnePass / signal_library -> ImpactSearch -> StackBuilder -> Confluence",
+    "code_path_citations": [
+      {
+        "stage": "OnePass writes signal libraries",
+        "file_line": "onepass.py:1154 save_signal_library",
+        "output_root": "signal_library/data/stable"
+      },
+      {
+        "stage": "ImpactSearch reads signal libraries (per primary)",
+        "file_line": "impactsearch.py:1525 load_signal_library",
+        "output_root": "(in-memory)"
+      },
+      {
+        "stage": "ImpactSearch writes per-secondary ranking workbooks",
+        "file_line": "impactsearch.py:2491 export_results_to_excel (output_dir 1355 = output/impactsearch)",
+        "output_root": "output/impactsearch/<TICKER>_analysis.xlsx"
+      },
+      {
+        "stage": "StackBuilder consumes ImpactSearch workbook",
+        "file_line": "stackbuilder.py:583 try_load_rank_from_impact_xlsx (used at :1105 when --prefer-impact-xlsx)",
+        "output_root": "(in-memory rank_direct / rank_inverse)"
+      },
+      {
+        "stage": "StackBuilder authorization gate",
+        "file_line": "stackbuilder.py:889 phase1_preflight FATAL when no primaries and no --prefer-impact-xlsx (comment at :869: CRITICAL: Strictly require user primaries; no 72k fallback)",
+        "output_root": "(blocks before write)"
+      },
+      {
+        "stage": "StackBuilder K-build iteration",
+        "file_line": "stackbuilder.py:1487 phase3_build_stacks (called from :2431 and :2866)",
+        "output_root": "output/stackbuilder/<TICKER>/seedTC__..."
+      },
+      {
+        "stage": "StackBuilder --prefer-impact-xlsx flag declaration",
+        "file_line": "stackbuilder.py:3361 add_argument",
+        "output_root": "(CLI surface)"
+      }
+    ],
+    "intended_bridge_flag": "--prefer-impact-xlsx",
+    "manual_override_flag": "--primaries <CSV>"
+  },
+  "amendment_1_concrete_upstream_state": {
+    "per_ticker_impactsearch_workbook": {
+      "SPY": {
+        "present": true,
+        "size_bytes": 5430811,
+        "mtime": "2026-01-09 23:38:35",
+        "freshness": "likely_stale_4_months_old"
+      },
+      "AAPL": {
+        "present": true,
+        "size_bytes": 5439393,
+        "mtime": "2026-01-09 23:38:31",
+        "freshness": "likely_stale_4_months_old"
+      },
+      "JNJ": {
+        "present": false,
+        "note": "workbook missing entirely; cannot use --prefer-impact-xlsx for this ticker"
+      },
+      "WMT": {
+        "present": false,
+        "note": "workbook missing entirely"
+      },
+      "HD": {
+        "present": false,
+        "note": "workbook missing entirely"
+      },
+      "MCD": {
+        "present": false,
+        "note": "workbook missing entirely"
+      }
+    },
+    "summary": "2 of 6 ready tickers have ImpactSearch workbooks (both ~4 months old); 4 of 6 have no workbook at all. Even option B (--prefer-impact-xlsx) cannot serve JNJ/WMT/HD/MCD today."
+  },
+  "amendment_1_revised_options_summary": {
+    "preferred_path": "Phase 6I-55a read-only ImpactSearch / primary-universe readiness planner",
+    "phase_6i_55a_taxonomy": [
+      "ready_for_stackbuilder_with_impact_xlsx",
+      "needs_impactsearch_run",
+      "manual_review"
+    ],
+    "option_table_revised": {
+      "A_explicit_primaries_csv": "manual override only; skips the curated upstream ranking and audit trail",
+      "B_add_prefer_impact_xlsx_to_locked_command": "cannot serve JNJ/WMT/HD/MCD today; operator-decision blocker on SPY/AAPL freshness",
+      "C_run_impactsearch_first": "natural path 6I-55a directs to for needs_impactsearch_run tickers",
+      "D_uniform_spy_k_universe": "NOT RECOMMENDED -- no economic basis for AAPL/JNJ/WMT/HD/MCD using SPY K-universe; includes TEF"
+    },
+    "concrete_next_steps": [
+      "Phase 6I-55a -- read-only ImpactSearch readiness planner (mirroring Phase 6I-53 / 6I-54a)",
+      "Operator review of 6I-55a output per ticker",
+      "Phase 6I-52 amendment-3 locks --prefer-impact-xlsx + freshness criteria",
+      "Phase 6I-55c retries the supervised StackBuilder batch for the ready_for_stackbuilder_with_impact_xlsx subset"
+    ]
+  },
+  "amendment_1_no_production_activity": {
+    "documentation_only": true,
+    "no_yfinance": true,
+    "no_stackbuilder_invocation": true,
+    "no_onepass_invocation": true,
+    "no_impactsearch_invocation": true,
+    "no_source_refresh": true,
+    "no_promotion": true,
+    "no_confluence_patch_writer": true,
+    "no_pipeline_runner": true
+  }
+}
