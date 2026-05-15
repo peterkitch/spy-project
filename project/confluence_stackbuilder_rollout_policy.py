@@ -17,6 +17,22 @@ the batch engines. It is a policy + seed-universe lock
 that downstream phases (Phase 6I-53 supervised batch
 execution) consume.
 
+IMPORTANT (Phase 6I-52 amendment-1): stackbuilder.py has
+NO ``--write`` flag and does NOT use the
+``PRJCT9_AUTOMATION_WRITE_AUTH`` two-key gate that the
+Phase 6H-5 / 6I-25 / 6I-31 writer family relies on. When
+stackbuilder.py is invoked it writes outputs to
+``output/stackbuilder/<TICKER>/`` by default; the only
+authorization gate is the separate operator decision to
+run the command. Phase 6I-52 does not invoke it.
+Phase 6I-53 (the supervised batch execution phase) must
+preflight local secondary-price-cache availability
+before running each candidate command, because
+stackbuilder.py has a yfinance fallback path
+(``_fetch_secondary_from_yf``) that kicks in when the
+local price source is missing -- running a candidate
+without a cache preflight could trigger a network fetch.
+
 What this module IS
 -------------------
 
@@ -69,7 +85,12 @@ Public surface
     POLICY_COMBINE_MODE
     POLICY_SEED_BY
     POLICY_OPTIMIZE_BY
-    POLICY_MEMBER_UNIVERSE_SIZE
+    POLICY_TOP_N
+    POLICY_BOTTOM_N
+    POLICY_MAX_K
+    POLICY_SEARCH
+    POLICY_BEAM_WIDTH
+    POLICY_MIN_TRIGGER_DAYS
     POLICY_RERUN_CADENCE
     POLICY_INVALID_MEMBER_ROTATION
 
@@ -173,12 +194,26 @@ POLICY_COMBINE_MODE: str = "intersection"
 POLICY_SEED_BY: str = "total_capture"
 POLICY_OPTIMIZE_BY: str = "total_capture"
 
-# Locked policy decision #4: per-ticker member-universe
-# size. Pinned to 12 (matches the existing SPY seed-run
-# shape ``seedTC__<T1>-<M1>_<T2>-<M2>_..._<T12>-<M12>``).
-# The first rollout does NOT introduce per-ticker
-# size policy.
-POLICY_MEMBER_UNIVERSE_SIZE: int = 12
+# Phase 6I-52 amendment-1: the original block claimed a
+# ``member_universe_size=12`` locked decision (because the
+# legacy SPY seed-run directory name carries 12 ticker-
+# mode tokens). That value is NOT enforced by any command
+# the planner emits -- the generated argv pins
+# ``--top-n 20 --bottom-n 20 --max-k 6 --search beam
+# --beam-width 12``, which is the StackBuilder
+# candidate-selection setting, not a member-count
+# guarantee. Amendment-1 replaces the misleading
+# ``member_universe_size=12`` decision with explicit
+# StackBuilder command-parameter locks (below). The "SPY
+# historical seed run had 12 members" observation is now
+# background context only, NOT a locked launch
+# guarantee.
+POLICY_TOP_N: int = 20
+POLICY_BOTTOM_N: int = 20
+POLICY_MAX_K: int = 6
+POLICY_SEARCH: str = "beam"
+POLICY_BEAM_WIDTH: int = 12
+POLICY_MIN_TRIGGER_DAYS: int = 30
 
 # Locked policy decision #5: re-run cadence. Pinned to
 # ``manual_supervised`` -- no scheduler. Phase 6I-53 will
@@ -244,16 +279,33 @@ LOCKED_POLICY_DECISIONS: dict[str, dict[str, Any]] = {
             "explicitly for auditability."
         ),
     },
-    "member_universe_size": {
-        "value": POLICY_MEMBER_UNIVERSE_SIZE,
+    "stackbuilder_command_parameters": {
+        "top_n": POLICY_TOP_N,
+        "bottom_n": POLICY_BOTTOM_N,
+        "max_k": POLICY_MAX_K,
+        "search": POLICY_SEARCH,
+        "beam_width": POLICY_BEAM_WIDTH,
+        "min_trigger_days": POLICY_MIN_TRIGGER_DAYS,
         "rationale": (
-            "Pinned to 12 candidate members per ticker. "
-            "Matches the existing SPY seed-run shape "
-            "``seedTC__<T1>-<M1>_..._<T12>-<M12>``. The "
-            "first rollout does NOT introduce per-ticker "
-            "sizing policy (market-cap-tuned, liquidity-"
-            "tuned, etc.) -- that's a future-phase "
-            "decision."
+            "Phase 6I-52 amendment-1: locks the actual "
+            "StackBuilder candidate-selection parameters "
+            "that the generated argv pins. ``top_n=20`` "
+            "and ``bottom_n=20`` are the candidate ranks "
+            "stackbuilder.py considers; ``max_k=6`` is "
+            "the maximum stack size; ``search='beam'`` + "
+            "``beam_width=12`` are the beam-search "
+            "controls; ``min_trigger_days=30`` is the "
+            "minimum trigger-day floor. These are the "
+            "stackbuilder.py argparse defaults and the "
+            "Phase 6I-50 proposed launch defaults. The "
+            "original Phase 6I-52 block instead claimed a "
+            "``member_universe_size=12`` decision -- a "
+            "background observation about the legacy SPY "
+            "seed-run directory shape, NOT something any "
+            "generated command enforces. Amendment-1 "
+            "rephrases the lock as command parameters so "
+            "the test suite + evidence JSON match the "
+            "actual argv."
         ),
     },
     "rerun_cadence": {
@@ -515,12 +567,24 @@ def build_stackbuilder_rollout_policy_manifest(
                 "run for the first large-universe rollout "
                 "pilot. The command is READY_FOR_"
                 "AUTHORIZATION but STILL is not executed "
-                "by this policy module. The operator runs "
-                "each command in a separate, explicitly "
-                "authorized session (the writer side has "
-                "its own --write gate; this module does "
-                "not pre-set PRJCT9_AUTOMATION_WRITE_AUTH "
-                "and does not invoke any subprocess)."
+                "by this policy module. IMPORTANT: "
+                "stackbuilder.py has NO --write flag and "
+                "does NOT use PRJCT9_AUTOMATION_WRITE_AUTH "
+                "-- it writes outputs to "
+                "output/stackbuilder/<TICKER>/ by default "
+                "WHENEVER INVOKED. The only authorization "
+                "gate is the separate operator decision "
+                "to actually run the command. Phase 6I-52 "
+                "does not invoke it. Phase 6I-53 must "
+                "preflight local secondary-price-cache "
+                "availability before running each "
+                "command, because stackbuilder.py falls "
+                "back to a live yfinance fetch "
+                "(``_fetch_secondary_from_yf``) when the "
+                "local price source is missing -- so "
+                "running a candidate command without a "
+                "cache preflight could trigger a network "
+                "fetch."
             ),
         })
 

@@ -3,7 +3,7 @@
   "policy_name": "phase_6i_52_locked_policy",
   "policy_version": "v1",
   "policy_basis": "phase_6i_52_locked_policy",
-  "generated_at": "2026-05-15T08:44:37+00:00",
+  "generated_at": "2026-05-15T08:56:18+00:00",
   "seed_universe_source": "phase_6i_52_first_rollout_pilot_universe_v1",
   "seed_universe_count": 25,
   "seed_universe_tickers": [
@@ -50,9 +50,14 @@
       "value": "total_capture",
       "rationale": "Pinned to ``total_capture`` (matches seed_by). stackbuilder.py treats unset ``--optimize-by`` as auto-resolving to ``--seed-by``; the first rollout pins both explicitly for auditability."
     },
-    "member_universe_size": {
-      "value": 12,
-      "rationale": "Pinned to 12 candidate members per ticker. Matches the existing SPY seed-run shape ``seedTC__<T1>-<M1>_..._<T12>-<M12>``. The first rollout does NOT introduce per-ticker sizing policy (market-cap-tuned, liquidity-tuned, etc.) -- that's a future-phase decision."
+    "stackbuilder_command_parameters": {
+      "top_n": 20,
+      "bottom_n": 20,
+      "max_k": 6,
+      "search": "beam",
+      "beam_width": 12,
+      "min_trigger_days": 30,
+      "rationale": "Phase 6I-52 amendment-1: locks the actual StackBuilder candidate-selection parameters that the generated argv pins. ``top_n=20`` and ``bottom_n=20`` are the candidate ranks stackbuilder.py considers; ``max_k=6`` is the maximum stack size; ``search='beam'`` + ``beam_width=12`` are the beam-search controls; ``min_trigger_days=30`` is the minimum trigger-day floor. These are the stackbuilder.py argparse defaults and the Phase 6I-50 proposed launch defaults. The original Phase 6I-52 block instead claimed a ``member_universe_size=12`` decision -- a background observation about the legacy SPY seed-run directory shape, NOT something any generated command enforces. Amendment-1 rephrases the lock as command parameters so the test suite + evidence JSON match the actual argv."
     },
     "rerun_cadence": {
       "value": "manual_supervised",
@@ -106,7 +111,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "AAPL",
@@ -142,7 +147,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "MSFT",
@@ -178,7 +183,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "GOOGL",
@@ -214,7 +219,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "AMZN",
@@ -250,7 +255,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "NVDA",
@@ -286,7 +291,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "META",
@@ -322,7 +327,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "TSLA",
@@ -358,7 +363,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "AVGO",
@@ -394,7 +399,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "ORCL",
@@ -430,7 +435,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "ADBE",
@@ -466,7 +471,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "CRM",
@@ -502,7 +507,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "AMD",
@@ -538,7 +543,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "QCOM",
@@ -574,7 +579,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "CSCO",
@@ -610,7 +615,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "JPM",
@@ -646,7 +651,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "BRK-B",
@@ -682,7 +687,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "V",
@@ -718,7 +723,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "MA",
@@ -754,7 +759,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "JNJ",
@@ -790,7 +795,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "WMT",
@@ -826,7 +831,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "PG",
@@ -862,7 +867,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "HD",
@@ -898,7 +903,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "KO",
@@ -934,7 +939,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     },
     {
       "ticker": "MCD",
@@ -970,7 +975,7 @@
       "requires_separate_operator_authorization": true,
       "policy_basis": "phase_6i_52_locked_policy",
       "blocked_by_policy_decision": false,
-      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. The operator runs each command in a separate, explicitly authorized session (the writer side has its own --write gate; this module does not pre-set PRJCT9_AUTOMATION_WRITE_AUTH and does not invoke any subprocess)."
+      "notes": "Phase 6I-52 locked-policy StackBuilder run for the first large-universe rollout pilot. The command is READY_FOR_AUTHORIZATION but STILL is not executed by this policy module. IMPORTANT: stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH -- it writes outputs to output/stackbuilder/<TICKER>/ by default WHENEVER INVOKED. The only authorization gate is the separate operator decision to actually run the command. Phase 6I-52 does not invoke it. Phase 6I-53 must preflight local secondary-price-cache availability before running each command, because stackbuilder.py falls back to a live yfinance fetch (``_fetch_secondary_from_yf``) when the local price source is missing -- so running a candidate command without a cache preflight could trigger a network fetch."
     }
   ],
   "remaining_limitations": [
