@@ -1,0 +1,252 @@
+{
+  "schema_version": "confluence_large_universe_launch_planner_v1",
+  "generated_at": "2026-05-15T07:09:49+00:00",
+  "universe_mode": "all_artifacts",
+  "artifact_root": "output\\research_artifacts",
+  "cache_dir": "cache\\results",
+  "signal_library_dir": "signal_library\\data\\stable",
+  "stackbuilder_root": "output\\stackbuilder",
+  "target_tickers": [
+    "SPY",
+    "_GSPC"
+  ],
+  "invalid_members": {
+    "TEF": {
+      "reason": "invalid_or_delisted",
+      "telemetry_reason": "provider_fetch_failed_zero_rows",
+      "source_classification": "phase_6i_43_invalid_or_delisted"
+    }
+  },
+  "rows": [
+    {
+      "ticker": "SPY",
+      "artifact_status": "partial_multiwindow",
+      "current_board_status": "rank_eligible_partial",
+      "ranking_eligibility_basis": "partial_effective_members",
+      "data_warning_symbol": "!",
+      "incomplete_members": [
+        "TEF"
+      ],
+      "invalid_or_delisted_members": [
+        "TEF"
+      ],
+      "k_cells_available": 30,
+      "k_cells_total": 60,
+      "windows_available": [
+        "1d",
+        "1mo",
+        "1wk",
+        "1y",
+        "3mo"
+      ],
+      "has_current_build_signal_surface": true,
+      "has_primary_build_summary": true,
+      "chart_ready_available": false,
+      "freshness_status": "unknown",
+      "cache_status": "cache_ready",
+      "cache_path": "cache\\results\\SPY_precomputed_results.pkl",
+      "cache_exists": true,
+      "signal_library_status": "stable_ready",
+      "signal_library_base_present": true,
+      "signal_library_intervals_present": [
+        "1wk",
+        "1mo",
+        "3mo",
+        "1y"
+      ],
+      "stackbuilder_status": "contains_invalid_members",
+      "selected_stackbuilder_run_id": "seedTC__AWR-D_CP-I_EXPO-D_LLY-I_CLH-D_GBCI-D_HCSG-D_TEF-I_JNJ-I_MO-I_AROW-D_PRA-D",
+      "selected_stackbuilder_run_dir": "output\\stackbuilder\\SPY\\seedTC__AWR-D_CP-I_EXPO-D_LLY-I_CLH-D_GBCI-D_HCSG-D_TEF-I_JNJ-I_MO-I_AROW-D_PRA-D",
+      "selected_stackbuilder_run_members": [
+        [
+          "AWR",
+          "D"
+        ],
+        [
+          "CP",
+          "I"
+        ],
+        [
+          "EXPO",
+          "D"
+        ],
+        [
+          "LLY",
+          "I"
+        ],
+        [
+          "CLH",
+          "D"
+        ],
+        [
+          "GBCI",
+          "D"
+        ],
+        [
+          "HCSG",
+          "D"
+        ],
+        [
+          "TEF",
+          "I"
+        ],
+        [
+          "JNJ",
+          "I"
+        ],
+        [
+          "MO",
+          "I"
+        ],
+        [
+          "AROW",
+          "D"
+        ],
+        [
+          "PRA",
+          "D"
+        ]
+      ],
+      "stackbuilder_ambiguous_selection": false,
+      "stackbuilder_seed_run_dirs": [
+        "seedTC__AWR-D_CP-I_EXPO-D_LLY-I_CLH-D_GBCI-D_HCSG-D_TEF-I_JNJ-I_MO-I_AROW-D_PRA-D"
+      ],
+      "artifact_path": "output\\research_artifacts\\confluence\\SPY\\SPY__MTF_CONSENSUS.research_day.json",
+      "artifact_issue_codes": [
+        "missing_per_window_k_metrics",
+        "missing_build_wide_window_alignment",
+        "missing_multiwindow_payload_metadata"
+      ],
+      "recommended_next_action": "already_board_ranked"
+    },
+    {
+      "ticker": "_GSPC",
+      "artifact_status": "daily_only",
+      "current_board_status": "blocked",
+      "ranking_eligibility_basis": null,
+      "data_warning_symbol": "!",
+      "incomplete_members": [],
+      "invalid_or_delisted_members": [],
+      "k_cells_available": 0,
+      "k_cells_total": 60,
+      "windows_available": [],
+      "has_current_build_signal_surface": false,
+      "has_primary_build_summary": false,
+      "chart_ready_available": false,
+      "freshness_status": "unknown",
+      "cache_status": "cache_missing",
+      "cache_path": "cache\\results\\_GSPC_precomputed_results.pkl",
+      "cache_exists": false,
+      "signal_library_status": "stable_missing",
+      "signal_library_base_present": false,
+      "signal_library_intervals_present": [],
+      "stackbuilder_status": "run_missing",
+      "selected_stackbuilder_run_id": null,
+      "selected_stackbuilder_run_dir": null,
+      "selected_stackbuilder_run_members": [],
+      "stackbuilder_ambiguous_selection": false,
+      "stackbuilder_seed_run_dirs": [],
+      "artifact_path": "output\\research_artifacts\\confluence\\_GSPC\\_GSPC.research_day.json",
+      "artifact_issue_codes": [
+        "missing_per_window_k_metrics",
+        "missing_build_wide_window_alignment",
+        "missing_multiwindow_payload_metadata"
+      ],
+      "recommended_next_action": "blocked_missing_inputs"
+    }
+  ],
+  "counts": {
+    "inspected_count": 2,
+    "rank_eligible_strict_count": 0,
+    "rank_eligible_partial_count": 1,
+    "blocked_count": 1,
+    "missing_artifact_count": 0,
+    "daily_only_count": 1,
+    "needs_partial_write_count": 0,
+    "needs_strict_write_count": 0,
+    "needs_source_refresh_count": 0,
+    "needs_signal_library_rebuild_count": 0,
+    "needs_signal_library_promotion_count": 0,
+    "needs_stackbuilder_rerun_count": 0,
+    "invalid_member_count": 1
+  },
+  "counts_by_recommended_next_action": {
+    "already_board_ranked": 1,
+    "blocked_missing_inputs": 1
+  },
+  "top_blocker_issue_codes": {
+    "missing_build_wide_window_alignment": 1,
+    "missing_multiwindow_payload_metadata": 1,
+    "missing_per_window_k_metrics": 1
+  },
+  "proposed_next_batches": {
+    "batch_1_no_write_board_render": [
+      "SPY"
+    ],
+    "batch_2_partial_writes": [],
+    "batch_3_signal_library_refresh_or_promotion": [],
+    "batch_4_stackbuilder_reruns": [],
+    "remaining_manual_or_missing_inputs": [
+      "_GSPC"
+    ]
+  },
+  "stackbuilder_policy": {
+    "observed_defaults_from_source": {
+      "top_n": 20,
+      "bottom_n": 20,
+      "max_k": 6,
+      "search": "beam",
+      "beam_width": 12,
+      "exhaustive_k": 4,
+      "both_modes": false,
+      "alpha": 0.05,
+      "min_marginal_capture": 0.0,
+      "k_patience": 1,
+      "dashboard_seed_by": "total_capture",
+      "dashboard_optimize_by": "auto_resolves_to_seed_by_when_unset",
+      "dashboard_min_trigger_days": 30,
+      "seed_run_dir_template": "seedTC__<TICKER>-<MODE>[_<TICKER>-<MODE>]*",
+      "seed_run_dir_mode_codes": [
+        "D",
+        "I"
+      ]
+    },
+    "proposed_launch_defaults": {
+      "search": "beam",
+      "beam_width": 12,
+      "max_k": 6,
+      "seed_by": "total_capture",
+      "optimize_by": "total_capture",
+      "min_trigger_days": 30,
+      "combine_mode": "intersection",
+      "top_n": 20,
+      "bottom_n": 20
+    },
+    "unresolved_policy_questions": [
+      "both_modes: observed default is False. Should the large-universe launch run both Buy + Short pairs (``both_modes=True``) or stick with the current single-direction default? The Phase 6I-50 prompt asked the planner to leave this unresolved.",
+      "combine_mode: stackbuilder.py defines COMBINE_INTERSECTION as a private constant but does NOT expose ``combine_mode`` as a CLI argument with a documented default. The Phase 6I-50 proposed default (``intersection``) needs operator confirmation that the engine actually uses that combine mode in the default path, AND that the same setting carries through into the Phase 6I-22 multi-window K input adapter.",
+      "seed_by / optimize_by: stackbuilder.py treats these as dashboard-layer settings, with optimize_by auto-resolving to seed_by when unset. The planner's proposal (both set to ``total_capture``) needs operator confirmation that ``total_capture`` is the intended large-universe launch metric (vs. ``sharpe_ratio`` or another seed/optimize axis).",
+      "Per-ticker member-universe sizing: each StackBuilder run encodes a fixed member set (12 for the SPY K-universe). The planner does NOT yet have a policy for how to choose member-universe size per ticker for a large-universe launch. Operator decision: fixed 12, fixed N, per-ticker N tuned by market-cap / liquidity, or other criterion.",
+      "Re-run cadence: the planner does NOT yet have a policy for how often a ticker's StackBuilder run should be regenerated (daily / weekly / on invalid-member-detected). Operator decision.",
+      "Invalid-member rotation: when a member is flagged ``invalid_or_delisted`` (Phase 6I-43), should the next StackBuilder run for the affected ticker(s) auto-substitute another candidate member, or stay with the partial-multiwindow contract until manual review? Operator decision."
+    ],
+    "tickers_with_stackbuilder_run": [
+      "SPY"
+    ],
+    "tickers_missing_stackbuilder_run": [
+      "_GSPC"
+    ],
+    "tickers_with_invalid_members_in_run": [
+      "SPY"
+    ],
+    "tickers_with_ambiguous_stackbuilder_selection": [],
+    "documented_stackbuilder_command_template": "\"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe\" stackbuilder.py --ticker <TICKER> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --min-trigger-days 30"
+  },
+  "remaining_limitations": [
+    "This planner is read-only. It inspects production roots and the existing Phase 6I-34 / 6I-43 / 6I-47 / 6I-48 surfaces; it does NOT run StackBuilder, yfinance, the source-cache refresher, the stable-promotion writer, the Confluence patch writer, or any pipeline runner.",
+    "Cache status reflects ON-DISK existence + mtime only. ``cache_ready`` here means the PKL exists; it does NOT confirm the cache's date_range_end matches the intended current_as_of_date. A future phase can integrate Phase 6I-43 policy v2 to refine ``cache_ready`` into stale vs ready against a cutoff.",
+    "Invalid-member detection is by string-match on StackBuilder seed-run-dir names against the supplied ``invalid_members`` set. When the operator does not pass an explicit mapping the planner falls back to ``DEFAULT_KNOWN_INVALID_MEMBERS`` (currently ``{TEF}``). Adding tickers to this list does NOT require a code change: the operator passes them via ``--invalid-members-json`` or via the function-level ``invalid_members`` argument.",
+    "Selected StackBuilder run is the lexicographic-last seed-run dir for the ticker -- this is the planner's DOCUMENTATION choice for reporting selection. The Phase 6I-22 adapter uses mtime ordering at engine runtime; the two choices may diverge when a ticker has more than one seed-run dir.",
+    "The StackBuilder policy section's ``proposed_launch_defaults`` are PROPOSALS, NOT decisions. ``unresolved_policy_questions`` lists the items that need an explicit operator decision before a large-universe StackBuilder rerun should be authorized."
+  ]
+}
