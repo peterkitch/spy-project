@@ -1,6 +1,6 @@
 # Phase 6I-55a: ImpactSearch / primary-universe readiness planner
 
-**Date:** 2026-05-15 (amendment-1 same day, docs-only precision pass)
+**Date:** 2026-05-15 (amendment-1 + amendment-2 same day, docs-only precision passes)
 **Base commit (main):** `4e0b42f` (Phase 6I-55 squash-merge)
 **Branch:** `phase-6i-55a-impactsearch-primary-universe-readiness-planner`
 **Status:** Read-only planner. No production writes. **Do not merge** until operator approval.
@@ -9,13 +9,15 @@
 
 Codex audit asked for three precision fixes to the evidence narrative:
 
-1. The test counts originally said "18 focused tests, all passing" and "18 passed in 1.36s" without distinguishing the **production-present** writer worktree from a **cacheless / audit** worktree (where `output/impactsearch` is absent and the production-state smoke skips cleanly). Amendment-1 rewrites Section 7 to record both branches explicitly.
-2. The combined-regression total in the original Section 7 used a deferred-to-PR placeholder line instead of explicit numbers. Amendment-1 replaces it with explicit production-present (165 passed) and cacheless/audit (163 passed / 2 skipped) totals, and explains that the skipped tests are environment-dependent production-state smokes, not functional regressions.
-3. Section 8's heading carried a stale 3-count file-list summary while the bullet list below it already enumerated 4 entries. Amendment-1 corrects the heading to "Files added (4)" so the count matches the enumeration.
+1. The test counts originally said the focused suite ran "all passing" without distinguishing the **production-present** writer worktree from a **cacheless / audit** worktree (where `output/impactsearch` is absent and the production-state smoke skips cleanly). Amendment-1 rewrote Section 7 to record both branches explicitly.
+2. The combined-regression total in the original Section 7 used a deferred-to-PR placeholder line instead of explicit numbers. Amendment-1 replaced it with explicit production-present and cacheless/audit totals, and explained that the skipped tests are environment-dependent production-state smokes, not functional regressions.
+3. Section 8's heading carried a stale 3-count file-list summary while the bullet list below it already enumerated 4 entries. Amendment-1 corrected the heading to "Files added (4)" so the count matches the enumeration.
 
-Amendment-1 also adds one **doc-guard regression test** (`test_evidence_doc_carries_amendment_1_precision_wording` in the existing 6I-55a test file) that pins the corrected wording so future doc rewrites cannot regress it.
+Amendment-1 also added one **doc-guard regression test** (`test_evidence_doc_carries_amendment_1_precision_wording` in the existing 6I-55a test file) that pins the corrected wording so future doc rewrites cannot regress it.
 
-No code changes outside the new doc-guard test. No production activity (no StackBuilder, ImpactSearch, OnePass, yfinance, source refresh, promotion, Confluence patch writer, pipeline runner, batch engine).
+**Amendment-2 follow-on (same day):** the amendment-1 guard added one unconditional test to the focused suite, so the test totals moved by +1. The numbers initially recorded in amendment-1 (the pre-guard counts) were stale by the time amendment-1 itself landed. Amendment-2 fixes the drift: Section 7 + the guard's required-phrase list now use the post-amendment-1 totals (focused: 19 / 18+1 skipped; combined: 166 / 164+2 skipped). The guard's docstring/header is rewritten as "amendment precision wording" so future readers understand why the count moved.
+
+No code changes outside the doc-guard test. No production activity (no StackBuilder, ImpactSearch, OnePass, yfinance, source refresh, promotion, Confluence patch writer, pipeline runner, batch engine).
 
 ---
 
@@ -181,8 +183,8 @@ For JNJ/WMT/HD/MCD the comment is the same except the reason is `"no matching wo
 
 | Worktree state | Result |
 |---|---|
-| **Production-present** (writer worktree; `output/impactsearch/` populated): | **18 passed**. |
-| **Cacheless / audit** (clean Codex worktree where `output/impactsearch/` is absent): | **17 passed / 1 skipped.** The skipped test is `test_production_state_smoke_skips_when_impact_xlsx_dir_absent` (informational production-state smoke); the deterministic-classification fixture tests pin the cascade in every worktree. |
+| **Production-present** (writer worktree; `output/impactsearch/` populated): | **19 passed**. (18 cascade tests + 1 amendment-1 doc-guard regression test, both running unconditionally.) |
+| **Cacheless / audit** (clean Codex worktree where `output/impactsearch/` is absent): | **18 passed / 1 skipped.** The skipped test is `test_production_state_smoke_skips_when_impact_xlsx_dir_absent` (informational production-state smoke); the deterministic-classification fixture tests + the amendment-1 doc-guard pin the cascade in every worktree. |
 
 The skip is expected behavior, not a functional regression — the test calls `pytest.skip(...)` cleanly when `output/impactsearch` is absent so a fresh checkout never sees a hard failure.
 
@@ -202,8 +204,8 @@ The skip is expected behavior, not a functional regression — the test calls `p
 
 | Worktree state | Result |
 |---|---|
-| **Production-present** (writer worktree): | **165 passed.** |
-| **Cacheless / audit** (clean Codex worktree where `output/impactsearch/` and `price_cache/daily/` are absent): | **163 passed / 2 skipped.** The 2 skipped tests are the environment-dependent production-state smokes (Phase 6I-53 preflight + Phase 6I-55a readiness). Both skips are deliberate, gated on missing on-disk evidence roots, and **not functional regressions**. |
+| **Production-present** (writer worktree): | **166 passed.** (165 cascade tests + 1 amendment-1 doc-guard regression test.) |
+| **Cacheless / audit** (clean Codex worktree where `output/impactsearch/` and `price_cache/daily/` are absent): | **164 passed / 2 skipped.** The 2 skipped tests are the environment-dependent production-state smokes (Phase 6I-53 preflight + Phase 6I-55a readiness). Both skips are deliberate, gated on missing on-disk evidence roots, and **not functional regressions**. |
 
 `py_compile` clean on the new module + test file. `git diff --check` clean.
 

@@ -910,16 +910,24 @@ def test_upstream_chain_citations_present(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Phase 6I-55a amendment-1: evidence-doc precision guard.
+# Phase 6I-55a amendment precision-wording guard.
 #
 # Codex audit asked for three precision fixes to the
 # evidence narrative: (a) distinguish production-present
 # vs cacheless/audit worktree test counts; (b) replace a
 # "see PR description for the green total" placeholder
 # with exact totals; (c) fix "Files added (3)" to (4)
-# matching the actual PR shape. This guard pins all
-# three corrections so a future doc edit cannot regress
-# them.
+# matching the actual PR shape.
+#
+# Amendment-2 follow-on (same day): amendment-1 added
+# this very guard as one unconditional test, which moved
+# the focused suite total from 18 -> 19 (production-
+# present) / 17+1 -> 18+1 skipped (cacheless), and the
+# combined regression total from 165 -> 166 / 163+2 ->
+# 164+2 skipped. Amendment-2 updates the required-
+# phrase list below to the post-amendment-1 numbers and
+# renames this section header to "amendment precision
+# wording" so future readers see why the count moved.
 # ---------------------------------------------------------------------------
 
 
@@ -936,9 +944,13 @@ def test_evidence_doc_carries_amendment_1_precision_wording():
         for the green total' placeholder is NOT used
         as a substitute for exact results;
       * explicit production-present + cacheless totals
-        appear for both the focused suite (18 / 17+1
-        skipped) and the combined regression (165 /
-        163+2 skipped).
+        appear for both the focused suite and the
+        combined regression. **Amendment-2 update:**
+        the totals are now the post-amendment-1
+        numbers (focused 19 / 18+1 skipped; combined
+        166 / 164+2 skipped) because the amendment-1
+        guard added one unconditional test to each
+        suite.
     """
     here = Path(__file__).resolve().parent.parent
     doc = (
@@ -969,15 +981,16 @@ def test_evidence_doc_carries_amendment_1_precision_wording():
             f"stale wording: {phrase!r}"
         )
 
-    # New required wording must be present.
+    # New required wording must be present. Amendment-2:
+    # totals reflect the post-amendment-1 +1 shift.
     required = (
         "Files added (4)",
-        # Focused-suite counts.
-        "18 passed",
-        "17 passed / 1 skipped",
-        # Combined-regression counts.
-        "165 passed",
-        "163 passed / 2 skipped",
+        # Focused-suite counts (amendment-2).
+        "19 passed",
+        "18 passed / 1 skipped",
+        # Combined-regression counts (amendment-2).
+        "166 passed",
+        "164 passed / 2 skipped",
         # Explicit naming of the production-state smoke
         # and its skip condition.
         "test_production_state_smoke_skips_when_"
@@ -990,6 +1003,6 @@ def test_evidence_doc_carries_amendment_1_precision_wording():
         if phrase not in body
     ]
     assert not missing, (
-        "Phase 6I-55a evidence doc missing amendment-1 "
+        "Phase 6I-55a evidence doc missing amendment "
         f"required wording: {missing!r}"
     )
