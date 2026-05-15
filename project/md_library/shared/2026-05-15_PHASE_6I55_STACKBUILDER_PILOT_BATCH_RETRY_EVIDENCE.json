@@ -1,0 +1,161 @@
+{
+  "schema_version": "stackbuilder_pilot_batch_retry_evidence_v1",
+  "phase": "phase_6i_55",
+  "phase_label": "stackbuilder_pilot_batch_retry_blocked_on_policy_gap",
+  "generated_at": "2026-05-15T10:52:21+00:00",
+  "base_main_commit": "63b06c9",
+  "authorized_tickers": [
+    "SPY",
+    "AAPL",
+    "JNJ",
+    "WMT",
+    "HD",
+    "MCD"
+  ],
+  "preflight_summary": {
+    "pcd_exists": true,
+    "pass_count": 6,
+    "skip_count": 19,
+    "passing": [
+      "AAPL",
+      "HD",
+      "JNJ",
+      "MCD",
+      "SPY",
+      "WMT"
+    ],
+    "preflight_passed_gate": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I55_PRE_RUN_PREFLIGHT.json"
+  },
+  "locked_command_template": "\"<PINNED_PYTHON>\" stackbuilder.py --secondary <TICKER> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --optimize-by total_capture --min-trigger-days 30 --combine-mode intersection --signal-lib-dir signal_library/data/stable",
+  "execution_log": {
+    "attempted_count": 1,
+    "succeeded_count": 0,
+    "failed_count": 1,
+    "remaining_skipped_per_stop_and_report": [
+      "AAPL",
+      "JNJ",
+      "WMT",
+      "HD",
+      "MCD"
+    ],
+    "stop_reason": "Per the Phase 6I-55 prompt: 'If any of the 6 no longer pass, STOP and report.' The first command (SPY) exited with rc=1 FATAL because the Phase 6I-52 locked command shape lacks --primaries and stackbuilder.py explicitly refuses to fall back to the 72k-ticker auto-discovery (phase1_preflight ~L869: 'CRITICAL: Strictly require user primaries; no 72k fallback'). Running the remaining 5 tickers would produce 5 identical FATAL exits with the same policy gap. Stopping after the first ticker is the operationally honest outcome.",
+    "per_ticker_results": [
+      {
+        "ticker": "SPY",
+        "rc": 1,
+        "stdout_tail": [
+          "[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE=False)"
+        ],
+        "stderr_tail": [
+          "[FATAL] Primary tickers field is empty. Please supply one or more primaries."
+        ],
+        "wrote_files": false,
+        "issue": "primaries_not_specified",
+        "yfinance_fetched": false,
+        "stdout_path": "md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDOUT.txt",
+        "stderr_path": "md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDERR.txt"
+      }
+    ]
+  },
+  "policy_gap": {
+    "gap": "Phase 6I-52 locked policy command shape lacks --primaries. stackbuilder.py phase1_preflight (~L869) raises FATAL when no primaries are supplied AND --prefer-impact-xlsx is not set: '[FATAL] Primary tickers field is empty.' This guard is explicitly documented as 'CRITICAL: Strictly require user primaries; no 72k fallback.' The Phase 6I-52 locked policy did NOT include --primaries; this was an unresolved item the STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS list deferred under 'per_ticker_member_universe_sizing'.",
+    "evidence_in_codebase": "stackbuilder.py:869-889 -- phase1_preflight; raises SystemExit with the FATAL message when no primaries are specified.",
+    "legacy_seed_run_examples": {
+      "SPY": "seedTC__AWR-D_CP-I_EXPO-D_LLY-I_CLH-D_GBCI-D_HCSG-D_TEF-I_JNJ-I_MO-I_AROW-D_PRA-D (12 primaries; matches the Phase 6I-43/44/49 SPY K-universe)",
+      "AAPL": "seedTC__EXC-D_HD-D_JFJ.L-D_MWY.L-D_JCH.L-D_ATR.L-D_ETE.AT-I_HGT.L-D_CSL.AX-D_MGR.AX-I_TTE-I_AAPL-D (12 primaries; a different international set chosen by an earlier ImpactSearch / curated workflow)"
+    },
+    "options_for_resolution": [
+      "Option A: Amend Phase 6I-52 locked policy to include an explicit --primaries decision per ticker, drawn from the operator's curated ImpactSearch / GTL output. This is the most explicit + auditable path.",
+      "Option B: Add --prefer-impact-xlsx to the Phase 6I-52 locked policy if each pilot ticker has an ImpactSearch XLSX on disk. The Phase 6I-52 amendment-1 evidence did NOT verify whether such XLSXs exist for AAPL/JNJ/WMT/HD/MCD.",
+      "Option C: Run ImpactSearch first (its own explicitly-authorized phase) to produce per-ticker XLSXs, then run Phase 6I-55 with --prefer-impact-xlsx.",
+      "Option D: Adopt a single curated primaries list for the first rollout (e.g. the SPY K-universe AWR, CP, EXPO, LLY, CLH, GBCI, HCSG, TEF, JNJ, MO, AROW, PRA) used uniformly for all 6 tickers. Cheapest, but ties every secondary to the SPY-shaped K-universe, which may not be representative."
+    ],
+    "recommended_resolution": "Operator decision required. The Phase 6I-55 implementation cannot responsibly pick from A/B/C/D on its own -- each option is a real policy choice. The next-step is a Phase 6I-52 amendment-3 (or a new Phase 6I-55a) that locks the --primaries decision before Phase 6I-55b retries the supervised batch."
+  },
+  "production_root_inventory_pre_run": {
+    "cache/results": 3239,
+    "cache/status": 1634,
+    "output/research_artifacts": 35,
+    "output/stackbuilder": 5229,
+    "signal_library/data/stable": 72899,
+    "price_cache/daily": 6,
+    "combined_five_documented": 83036
+  },
+  "production_root_inventory_post_run": {
+    "cache/results": 3239,
+    "cache/status": 1634,
+    "output/research_artifacts": 35,
+    "output/stackbuilder": 5229,
+    "signal_library/data/stable": 72899,
+    "price_cache/daily": 6,
+    "combined_five_documented": 83036
+  },
+  "production_root_diff": {
+    "cache/results": 0,
+    "cache/status": 0,
+    "output/research_artifacts": 0,
+    "output/stackbuilder": 0,
+    "signal_library/data/stable": 0,
+    "price_cache/daily": 0,
+    "combined_five_documented": 0
+  },
+  "per_ticker_output_stackbuilder_diff": {
+    "SPY": "19 files pre = 19 files post (no change; FATAL exit before any write)",
+    "AAPL": "19 files pre = 19 files post (no run attempted)",
+    "JNJ": "dir missing pre = dir missing post (no run attempted)",
+    "WMT": "dir missing pre = dir missing post (no run attempted)",
+    "HD": "dir missing pre = dir missing post (no run attempted)",
+    "MCD": "dir missing pre = dir missing post (no run attempted)"
+  },
+  "post_run_phase_6i_50_reclassification": {
+    "inspected_count": 2,
+    "rows": [
+      {
+        "ticker": "SPY",
+        "recommended_next_action": "already_board_ranked"
+      },
+      {
+        "ticker": "_GSPC",
+        "recommended_next_action": "blocked_missing_inputs"
+      }
+    ],
+    "verdict_unchanged_vs_pre_phase_6i_55": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I55_POST_RUN_6I50_LAUNCH_PLAN.json"
+  },
+  "post_run_phase_6i_51_reclassification": {
+    "batches": {
+      "board_render_now": [
+        "SPY"
+      ],
+      "partial_artifact_write_candidates": [],
+      "strict_artifact_write_candidates": [],
+      "source_refresh_candidates": [],
+      "signal_library_rebuild_or_promotion_candidates": [],
+      "stackbuilder_rerun_candidates": [],
+      "blocked_or_manual_review": [
+        "_GSPC"
+      ]
+    },
+    "verdict_unchanged_vs_pre_phase_6i_55": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I55_POST_RUN_6I51_ROLLOUT_PLAN.json"
+  },
+  "no_yfinance_confirmation": {
+    "yfinance_fetched_anywhere": false,
+    "evidence": "stackbuilder.py exited with FATAL BEFORE reaching the secondary-price load (phase1_preflight returns at L889 before line L864 load_secondary_prices, which is the only path to _fetch_secondary_from_yf). Even if the FATAL had not fired, the Phase 6I-53 preflight already confirmed SPY/AAPL/JNJ/WMT/HD/MCD have local price_cache/daily CSVs and would NOT fall through to yfinance."
+  },
+  "no_production_activity_confirmation": {
+    "invoked_yfinance": false,
+    "invoked_source_cache_refresher": false,
+    "invoked_signal_library_promotion_writer": false,
+    "invoked_multiwindow_k_confluence_patch_writer": false,
+    "invoked_confluence_pipeline_runner": false,
+    "invoked_onepass_impactsearch_trafficflow_spymaster_batch": false,
+    "set_PRJCT9_AUTOMATION_WRITE_AUTH": false,
+    "stackbuilder_runs_attempted": 1,
+    "stackbuilder_runs_succeeded": 0,
+    "stackbuilder_wrote_any_file": false,
+    "subprocess_wrappers_added": false
+  },
+  "next_step_recommendation": "Phase 6I-55 cannot proceed until the --primaries gap in the Phase 6I-52 locked policy is resolved. Recommended next phase: a Phase 6I-55a (or Phase 6I-52 amendment-3) that explicitly decides the --primaries axis -- preferably option (A) or (C) above. After that lands, Phase 6I-55b retries the supervised batch for the 6 ready tickers using the updated locked command shape. This is the same stop-and-resolve pattern Phase 6I-53 established for the cache-rebuild gap."
+}
