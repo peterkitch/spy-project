@@ -1,0 +1,130 @@
+{
+  "schema_version": "stackbuilder_price_cache_writer_v1",
+  "phase": "phase_6i_54b",
+  "phase_label": "stackbuilder_price_cache_writer",
+  "generated_at": "2026-05-15T10:10:51+00:00",
+  "signal_cache_dir": "cache\\results",
+  "stackbuilder_price_cache_dir": "price_cache\\daily",
+  "format": "csv",
+  "write": false,
+  "overwrite": false,
+  "ticker_count": 6,
+  "verification_pass_count": 6,
+  "write_count": 0,
+  "rows": [
+    {
+      "ticker": "SPY",
+      "source_pkl": "cache\\results\\SPY_precomputed_results.pkl",
+      "manifest_path": "cache\\results\\SPY_precomputed_results.pkl.manifest.json",
+      "source_producer_engine": "signal_engine_cache_refresher",
+      "source_engine_version": "6E-5.0.0",
+      "rows_read": 8380,
+      "first_date": "1993-01-29",
+      "last_date": "2026-05-14",
+      "issue_codes": [],
+      "output_path": "price_cache\\daily\\SPY.csv",
+      "rows_written": 0,
+      "wrote_file": false
+    },
+    {
+      "ticker": "AAPL",
+      "source_pkl": "cache\\results\\AAPL_precomputed_results.pkl",
+      "manifest_path": "cache\\results\\AAPL_precomputed_results.pkl.manifest.json",
+      "source_producer_engine": "spymaster",
+      "source_engine_version": "1.0.0",
+      "rows_read": 11439,
+      "first_date": "1980-12-12",
+      "last_date": "2026-05-04",
+      "issue_codes": [],
+      "output_path": "price_cache\\daily\\AAPL.csv",
+      "rows_written": 0,
+      "wrote_file": false
+    },
+    {
+      "ticker": "JNJ",
+      "source_pkl": "cache\\results\\JNJ_precomputed_results.pkl",
+      "manifest_path": "cache\\results\\JNJ_precomputed_results.pkl.manifest.json",
+      "source_producer_engine": "signal_engine_cache_refresher",
+      "source_engine_version": "6E-5.0.0",
+      "rows_read": 16200,
+      "first_date": "1962-01-02",
+      "last_date": "2026-05-14",
+      "issue_codes": [],
+      "output_path": "price_cache\\daily\\JNJ.csv",
+      "rows_written": 0,
+      "wrote_file": false
+    },
+    {
+      "ticker": "WMT",
+      "source_pkl": "cache\\results\\WMT_precomputed_results.pkl",
+      "manifest_path": "cache\\results\\WMT_precomputed_results.pkl.manifest.json",
+      "source_producer_engine": "spymaster",
+      "source_engine_version": "1.0.0",
+      "rows_read": 13533,
+      "first_date": "1972-08-25",
+      "last_date": "2026-05-04",
+      "issue_codes": [],
+      "output_path": "price_cache\\daily\\WMT.csv",
+      "rows_written": 0,
+      "wrote_file": false
+    },
+    {
+      "ticker": "HD",
+      "source_pkl": "cache\\results\\HD_precomputed_results.pkl",
+      "manifest_path": "cache\\results\\HD_precomputed_results.pkl.manifest.json",
+      "source_producer_engine": "spymaster",
+      "source_engine_version": "1.0.0",
+      "rows_read": 11244,
+      "first_date": "1981-09-22",
+      "last_date": "2026-05-04",
+      "issue_codes": [],
+      "output_path": "price_cache\\daily\\HD.csv",
+      "rows_written": 0,
+      "wrote_file": false
+    },
+    {
+      "ticker": "MCD",
+      "source_pkl": "cache\\results\\MCD_precomputed_results.pkl",
+      "manifest_path": "cache\\results\\MCD_precomputed_results.pkl.manifest.json",
+      "source_producer_engine": "spymaster",
+      "source_engine_version": "1.0.0",
+      "rows_read": 15057,
+      "first_date": "1966-07-05",
+      "last_date": "2026-05-04",
+      "issue_codes": [],
+      "output_path": "price_cache\\daily\\MCD.csv",
+      "rows_written": 0,
+      "wrote_file": false
+    }
+  ],
+  "provenance_summary": {
+    "groups": [
+      {
+        "producer_engine": "signal_engine_cache_refresher",
+        "engine_version": "6E-5.0.0",
+        "ticker_count": 2,
+        "tickers": [
+          "JNJ",
+          "SPY"
+        ]
+      },
+      {
+        "producer_engine": "spymaster",
+        "engine_version": "1.0.0",
+        "ticker_count": 4,
+        "tickers": [
+          "AAPL",
+          "HD",
+          "MCD",
+          "WMT"
+        ]
+      }
+    ],
+    "distinct_provenance_count": 2
+  },
+  "remaining_limitations": [
+    "Phase 6I-54b writer scope is STRICTLY the StackBuilder secondary price cache (price_cache/daily/). It does NOT refresh the signal-engine cache (cache/results/), does NOT invoke yfinance, does NOT call StackBuilder, OnePass, ImpactSearch, TrafficFlow, or Spymaster, and does NOT touch the Confluence patch writer / signal-library promotion writer / pipeline runner.",
+    "The default --format=parquet path requires pyarrow or fastparquet to be installed. When neither is available the per-ticker row carries the ``parquet_engine_unavailable`` issue code and ``wrote_file=False`` -- the operator can re-run with --format csv to fall through to the CSV branch (StackBuilder's load_secondary_prices accepts both .parquet and .csv).",
+    "--write is the single authorization gate. There is NO PRJCT9_AUTOMATION_WRITE_AUTH requirement for this writer (the two-key gate applies to the Phase 6H-5 / 6I-25 / 6I-31 writer family, NOT to the StackBuilder secondary price cache)."
+  ]
+}

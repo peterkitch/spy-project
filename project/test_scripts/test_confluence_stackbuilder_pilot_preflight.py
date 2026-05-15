@@ -395,32 +395,92 @@ def test_output_path_guard_rejects_production_root_paths(
 
 
 # ---------------------------------------------------------------------------
-# 10. Production-state smoke: against the real on-disk
-#     price_cache/daily (which does NOT exist today), every
-#     Phase 6I-52 pilot ticker must classify as
-#     skip-missing-cache. This is the actual Phase 6I-53
-#     authorization gate.
+# 10. Production-state smoke. Phase 6I-54b updated this
+#     to handle the post-write state: with the writer
+#     branch's CSV files landed in ``price_cache/daily/``,
+#     the 6 ready tickers should now classify as pass
+#     and the 19 needing source refresh should still skip.
+#     The test SKIPS cleanly in any worktree that does not
+#     match either the pre-Phase-6I-54b state (no
+#     price_cache/daily) or the post-Phase-6I-54b state
+#     (6 CSV files for SPY/AAPL/JNJ/WMT/HD/MCD).
 # ---------------------------------------------------------------------------
 
 
-def test_production_state_all_pilot_tickers_currently_skip():
-    """The current production state has no
-    ``price_cache/daily/`` directory; every Phase 6I-52
-    pilot ticker must classify as skip. Phase 6I-53's
-    supervised batch is therefore evidence-only until
-    the cache is rebuilt."""
-    # Use the real default resolution path (env var or
-    # ``price_cache/daily``); do NOT inject env_overrides.
+def test_production_state_preflight_matches_known_states():
+    """Informational production smoke. Two recognized
+    states:
+
+      * **Pre-Phase-6I-54b**: ``price_cache/daily/`` does
+        not exist; every Phase 6I-52 pilot ticker
+        classifies as ``skip_missing_cache_would_fetch_
+        yfinance`` (pass=0 / skip=25).
+      * **Post-Phase-6I-54b**: the 6 ready tickers
+        (SPY, AAPL, JNJ, WMT, HD, MCD) have CSV files in
+        ``price_cache/daily/``; pass=6 / skip=19.
+
+    Any other state (partial write, parquet-only,
+    mismatched ticker set) skips cleanly. This makes
+    the test portable across the Codex clean-worktree,
+    the pre-write worktree, AND the post-write worktree.
+    """
+    import pytest
+
+    here = Path(__file__).resolve().parent.parent
+    pcd = here / "price_cache" / "daily"
     table = pf.build_preflight_table()
     assert table["ticker_count"] == 25
-    assert table["pass_count"] == 0
-    assert table["skip_count"] == 25
-    # Every row carries the SKIP status + the
-    # would_fetch_yfinance flag.
-    for row in table["rows"]:
-        assert (
-            row["preflight_status"]
-            == pf.PREFLIGHT_STATUS_SKIP_MISSING_CACHE
+
+    if not pcd.exists():
+        # Pre-Phase-6I-54b state.
+        assert table["pass_count"] == 0
+        assert table["skip_count"] == 25
+        for row in table["rows"]:
+            assert (
+                row["preflight_status"]
+                == pf.PREFLIGHT_STATUS_SKIP_MISSING_CACHE
+            )
+            assert row["would_fetch_yfinance"] is True
+            assert row["resolved_cache_path"] is None
+        return
+
+    # price_cache/daily exists. Recognize the
+    # post-Phase-6I-54b state when the 6 ready ticker
+    # CSV (or parquet) files are all present.
+    expected_ready = {
+        "SPY", "AAPL", "JNJ", "WMT", "HD", "MCD",
+    }
+    ready_in_pcd = {
+        t for t in expected_ready
+        if (pcd / f"{t}.csv").is_file()
+        or (pcd / f"{t}.parquet").is_file()
+    }
+    if ready_in_pcd != expected_ready:
+        pytest.skip(
+            "price_cache/daily present but the 6 "
+            "Phase-6I-54b ready tickers are not all "
+            "materialized; skipping informational smoke."
         )
-        assert row["would_fetch_yfinance"] is True
-        assert row["resolved_cache_path"] is None
+
+    # Post-Phase-6I-54b state.
+    assert table["pass_count"] == 6
+    assert table["skip_count"] == 19
+    assert sorted(table["tickers_passing_preflight"]) == [
+        "AAPL", "HD", "JNJ", "MCD", "SPY", "WMT",
+    ]
+    # The 19 needing source refresh still skip.
+    for row in table["rows"]:
+        if row["ticker"] in expected_ready:
+            assert (
+                row["preflight_status"]
+                == pf.PREFLIGHT_STATUS_PASS
+            )
+            assert row["would_fetch_yfinance"] is False
+            assert (
+                row["resolved_cache_path"] is not None
+            )
+        else:
+            assert (
+                row["preflight_status"]
+                == pf.PREFLIGHT_STATUS_SKIP_MISSING_CACHE
+            )
