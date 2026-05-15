@@ -253,6 +253,22 @@ ISSUE_CONFLUENCE_ARTIFACT_UNREADABLE = (
 # between the upstream builder's readiness claim and
 # the actual payload shape is a real operator-review
 # signal, not a near-miss the planner should mask.
+# Phase 6I-46 TrafficFlow-compatible invalid-member
+# handling. When the upstream builder surfaces
+# ``data_completeness_status='partial'`` (the SPY/TEF case
+# from Phase 6I-45), the planner refuses to mark
+# ``patch_ready=True`` and emits this stable issue code +
+# the ``ACTION_PARTIAL_PAYLOAD_NOT_PROMOTABLE`` next-action
+# string. The partial payload is still surfaced
+# DOWNSTREAM (ranking export / website package / view /
+# renderer / overlays render the warning), but the strict
+# Phase 6I-20 Confluence artifact contract does NOT accept
+# partial / incomplete-member payloads. A future phase may
+# define a separate partial-payload artifact path; until
+# then, partial payloads are display-only.
+ISSUE_PARTIAL_PAYLOAD_NOT_PROMOTABLE = (
+    "partial_payload_not_promotable"
+)
 ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID = (
     "planned_payload_contract_invalid"
 )
@@ -261,6 +277,7 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_PAYLOAD_NOT_READY,
     ISSUE_CONFLUENCE_ARTIFACT_MISSING,
     ISSUE_CONFLUENCE_ARTIFACT_UNREADABLE,
+    ISSUE_PARTIAL_PAYLOAD_NOT_PROMOTABLE,
     ISSUE_PLANNED_PAYLOAD_CONTRACT_INVALID,
 )
 
@@ -274,12 +291,21 @@ ACTION_READY_FOR_REVIEWED_ARTIFACT_WRITE = (
     "ready_for_reviewed_artifact_write"
 )
 ACTION_MANUAL_REVIEW_REQUIRED = "manual_review_required"
+# Phase 6I-46: surfaced when the upstream payload is partial
+# (TrafficFlow-style invalid-member exclusion). The partial
+# payload is display-only -- the planner refuses to mark
+# patch_ready=True and the writer continues to refuse the
+# mutation.
+ACTION_PARTIAL_PAYLOAD_NOT_PROMOTABLE = (
+    "partial_payload_not_promotable"
+)
 
 ALL_ACTIONS: tuple[str, ...] = (
     ACTION_BUILD_PAYLOAD_FIRST,
     ACTION_CREATE_CONFLUENCE_ARTIFACT_FIRST,
     ACTION_READY_FOR_REVIEWED_ARTIFACT_WRITE,
     ACTION_MANUAL_REVIEW_REQUIRED,
+    ACTION_PARTIAL_PAYLOAD_NOT_PROMOTABLE,
 )
 
 
@@ -372,6 +398,19 @@ class MultiWindowKConfluencePatchPlan:
     issue_codes: tuple[str, ...] = ()
     recommended_next_action: str = ""
     remaining_limitations: tuple[str, ...] = ()
+    # Phase 6I-46 TrafficFlow-compatible invalid-member
+    # handling. Mirrored from the upstream payload report
+    # so a planner consumer (typically the ranking export
+    # / website package / view / renderer / overlays) can
+    # render the partial / blocked warning without having
+    # to re-run the payload builder. Defaults preserve the
+    # legacy "complete" / no-warning shape.
+    data_completeness_status: str = "complete"
+    data_warning_symbol: str = ""
+    incomplete_member_detail: tuple[
+        dict[str, Any], ...
+    ] = ()
+    partial_payload_available: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
         return _plan_to_json_dict(self)
@@ -400,6 +439,27 @@ def _plan_to_json_dict(
         "recommended_next_action": p.recommended_next_action,
         "remaining_limitations": list(
             p.remaining_limitations,
+        ),
+        # Phase 6I-46 fields.
+        "data_completeness_status": str(
+            getattr(
+                p, "data_completeness_status", "complete",
+            ) or "complete",
+        ),
+        "data_warning_symbol": str(
+            getattr(p, "data_warning_symbol", "") or "",
+        ),
+        "incomplete_member_detail": [
+            dict(d) for d in (
+                getattr(
+                    p, "incomplete_member_detail", ()
+                ) or ()
+            )
+        ],
+        "partial_payload_available": bool(
+            getattr(
+                p, "partial_payload_available", False,
+            ),
         ),
     }
 
@@ -848,6 +908,9 @@ def plan_multiwindow_k_confluence_patch(
     artifact_locator_callable: Optional[
         Callable[..., Optional[Path]]
     ] = None,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> MultiWindowKConfluencePatchPlan:
     """Plan the future multi-window K engine payload
     patch for one target ticker's on-disk Confluence
@@ -889,14 +952,21 @@ def plan_multiwindow_k_confluence_patch(
     # Phase 6I-28: the optional read-only ``close_source_root``
     # is forwarded straight through to the Phase 6I-23 builder
     # (which in turn forwards it to the Phase 6I-22 adapter).
+    # Phase 6I-46: ``invalid_members`` is forwarded only when
+    # non-empty so existing test fakes that don't accept the
+    # new kwarg still work.
+    payload_kwargs: dict[str, Any] = {
+        "stackbuilder_root": stackbuilder_root,
+        "signal_library_dir": signal_library_dir,
+        "K_values": K_values,
+        "windows": windows,
+        "run_dir": run_dir,
+        "close_source_root": close_source_root,
+    }
+    if invalid_members:
+        payload_kwargs["invalid_members"] = invalid_members
     payload_report = payload_fn(
-        target_clean,
-        stackbuilder_root=stackbuilder_root,
-        signal_library_dir=signal_library_dir,
-        K_values=K_values,
-        windows=windows,
-        run_dir=run_dir,
-        close_source_root=close_source_root,
+        target_clean, **payload_kwargs,
     )
     payload_ready = bool(
         getattr(payload_report, "payload_ready", False),
@@ -999,8 +1069,65 @@ def plan_multiwindow_k_confluence_patch(
         else {}
     )
 
+    # Phase 6I-46 TrafficFlow-compatible invalid-member
+    # handling: read the upstream payload report's
+    # completeness fields. When the upstream reports a
+    # partial / blocked payload, emit the new
+    # ``ISSUE_PARTIAL_PAYLOAD_NOT_PROMOTABLE`` issue code.
+    # The strict patch_ready gate already refuses any
+    # payload with ``payload_ready=False`` so this is
+    # additive surface (the new issue code is a more
+    # precise reason than the legacy
+    # ``ISSUE_PAYLOAD_NOT_READY``).
+    upstream_completeness_status = str(
+        getattr(
+            payload_report,
+            "data_completeness_status",
+            "complete",
+        ) or "complete",
+    )
+    upstream_warning_symbol = str(
+        getattr(
+            payload_report,
+            "data_warning_symbol",
+            "",
+        ) or "",
+    )
+    upstream_incomplete_detail = tuple(
+        dict(d) for d in (
+            getattr(
+                payload_report,
+                "incomplete_member_detail",
+                (),
+            ) or ()
+        )
+    )
+    upstream_partial_payload_available = bool(
+        getattr(
+            payload_report,
+            "partial_payload_available",
+            False,
+        ),
+    )
+    if upstream_completeness_status in (
+        "partial", "blocked",
+    ):
+        _append_unique(
+            issues, ISSUE_PARTIAL_PAYLOAD_NOT_PROMOTABLE,
+        )
+
     # Recommended-action cascade.
-    if not payload_ready:
+    if upstream_completeness_status in (
+        "partial", "blocked",
+    ):
+        # Phase 6I-46: partial / blocked payloads take
+        # precedence over the strict "build payload first"
+        # action. The honest next step is to surface the
+        # partial-not-promotable signal to the operator.
+        recommended = (
+            ACTION_PARTIAL_PAYLOAD_NOT_PROMOTABLE
+        )
+    elif not payload_ready:
         recommended = ACTION_BUILD_PAYLOAD_FIRST
     elif not artifact_exists:
         recommended = ACTION_CREATE_CONFLUENCE_ARTIFACT_FIRST
@@ -1038,6 +1165,16 @@ def plan_multiwindow_k_confluence_patch(
         recommended_next_action=recommended,
         remaining_limitations=(
             _DEFAULT_REMAINING_LIMITATIONS
+        ),
+        data_completeness_status=(
+            upstream_completeness_status
+        ),
+        data_warning_symbol=upstream_warning_symbol,
+        incomplete_member_detail=(
+            upstream_incomplete_detail
+        ),
+        partial_payload_available=(
+            upstream_partial_payload_available
         ),
     )
 

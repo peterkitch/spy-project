@@ -247,6 +247,21 @@ REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE = (
 REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING = (
     "member_signal_date_axis_missing"
 )
+# Phase 6I-46 TrafficFlow-compatible invalid-member
+# handling: a member of the K row is in the caller-
+# supplied ``invalid_members`` map (e.g. flagged
+# ``invalid_or_delisted`` by Phase 6I-43 policy v2). The
+# cell's authored ``members_attempted`` is preserved, the
+# excluded members surface in the per-cell
+# ``excluded_members`` tuple + the report-level
+# ``excluded_members_by_K`` / ``incomplete_member_detail``,
+# and the cell is NOT silently dropped: it is marked with
+# this stable skipped reason so a partial-payload consumer
+# can render an explicit incomplete-member warning rather
+# than mistaking the absence for strict complete coverage.
+REASON_UNPREPARED_DUE_TO_EXCLUDED_MEMBERS = (
+    "unprepared_due_to_excluded_members"
+)
 
 ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_NO_K_ROW_IN_LEADERBOARD,
@@ -264,6 +279,7 @@ ALL_SKIPPED_REASON_CODES: tuple[str, ...] = (
     REASON_TARGET_CLOSE_JOIN_INCOMPLETE,
     REASON_MEMBER_DATE_ALIGNMENT_INCOMPLETE,
     REASON_MEMBER_SIGNAL_DATE_AXIS_MISSING,
+    REASON_UNPREPARED_DUE_TO_EXCLUDED_MEMBERS,
 )
 
 
@@ -296,6 +312,16 @@ ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE = (
 ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING = (
     "member_signal_date_axis_missing"
 )
+# Phase 6I-46: an invalid member appeared in at least one
+# K row's authored ``members_attempted`` and was excluded
+# from the effective member set (cell marked
+# ``unprepared_due_to_excluded_members``). Aggregate code
+# surfaced at the report level so downstream callers can
+# tell apart the new partial-payload state from the legacy
+# ``incomplete_member_coverage`` strict skip.
+ISSUE_EXCLUDED_INVALID_MEMBER = (
+    "excluded_invalid_member"
+)
 
 ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_NO_STACKBUILDER_RUN,
@@ -312,7 +338,34 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_TARGET_CLOSE_JOIN_INCOMPLETE,
     ISSUE_MEMBER_DATE_ALIGNMENT_INCOMPLETE,
     ISSUE_MEMBER_SIGNAL_DATE_AXIS_MISSING,
+    ISSUE_EXCLUDED_INVALID_MEMBER,
 )
+
+
+# Phase 6I-46 TrafficFlow-compatible invalid-member handling:
+# stable completeness-status values surfaced at the adapter /
+# payload / planner / ranking / view / renderer level. A
+# build is ``complete`` only when there are no excluded
+# members AND the strict full-member-coverage contract
+# holds across every canonical (K, window) cell. A build is
+# ``partial`` when at least one authored member is excluded
+# AND at least one cell still prepares on the effective
+# (non-excluded) member set. A build is ``blocked`` when
+# exclusions are present AND zero cells prepare. The strict
+# ``payload_ready`` gate is unaffected by these values: a
+# partial payload is never silently promoted to the strict
+# Phase 6I-20 complete contract.
+DATA_COMPLETENESS_STATUS_COMPLETE = "complete"
+DATA_COMPLETENESS_STATUS_PARTIAL = "partial"
+DATA_COMPLETENESS_STATUS_BLOCKED = "blocked"
+ALL_DATA_COMPLETENESS_STATUSES: tuple[str, ...] = (
+    DATA_COMPLETENESS_STATUS_COMPLETE,
+    DATA_COMPLETENESS_STATUS_PARTIAL,
+    DATA_COMPLETENESS_STATUS_BLOCKED,
+)
+
+DATA_WARNING_SYMBOL_NONE = ""
+DATA_WARNING_SYMBOL_INCOMPLETE = "!"
 
 
 # Phase 6I-28: close-source resolution states.
@@ -332,6 +385,25 @@ ALL_CLOSE_SOURCE_STATUSES: tuple[str, ...] = (
 
 
 @dataclass(frozen=True)
+class ExclusionRecord:
+    """Phase 6I-46 record describing why one authored member
+    was excluded from the effective member set on a given K
+    row. The adapter never invents an exclusion; an entry
+    here always reflects a caller-supplied
+    ``invalid_members`` mapping (typically Phase 6I-43
+    policy v2 telemetry). The record is structured so the
+    downstream warning UI can tell apart "delisted by
+    upstream provider" from "operator-marked unloadable"
+    without re-parsing free-text strings.
+    """
+
+    ticker: str
+    reason: str
+    telemetry_reason: Optional[str] = None
+    source_classification: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class PerCellAdapterState:
     """Per-``(K, window)`` cell diagnostic state.
 
@@ -339,6 +411,13 @@ class PerCellAdapterState:
     fully resolved AND added to the aggregate report's
     ``per_cell_inputs`` map. ``prepared=False`` carries a
     stable ``skipped_reason`` from ``ALL_SKIPPED_REASON_CODES``.
+
+    Phase 6I-46: ``excluded_members`` is non-empty when the
+    K row's authored members intersect a caller-supplied
+    ``invalid_members`` mapping. The cell is then marked
+    with ``skipped_reason='unprepared_due_to_excluded_members'``
+    and the excluded member tickers + reasons are preserved
+    on this state for downstream warning surfaces.
     """
 
     K: int
@@ -351,6 +430,7 @@ class PerCellAdapterState:
     members_prepared: tuple[str, ...]
     members_missing: tuple[str, ...]
     skipped_reason: Optional[str]
+    excluded_members: tuple[ExclusionRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -410,6 +490,38 @@ class MultiWindowKInputAdapterReport:
         tuple[int, str, str], ...
     ] = ()
     issue_codes: tuple[str, ...] = ()
+    # Phase 6I-46 TrafficFlow-compatible invalid-member
+    # handling. ``original_members_by_K`` records the
+    # authored member list per K row (preserved verbatim
+    # from the StackBuilder leaderboard, even when some
+    # members are later excluded by ``invalid_members``).
+    # ``effective_members_by_K`` records that list minus
+    # any excluded members. ``excluded_members_by_K`` and
+    # ``incomplete_member_detail`` carry the structured
+    # exclusion records for downstream warning surfaces.
+    # ``data_completeness_status`` is one of
+    # ``ALL_DATA_COMPLETENESS_STATUSES``;
+    # ``data_warning_symbol`` is ``"!"`` when status is
+    # ``partial`` or ``blocked``, else the empty string.
+    # All five fields default to the no-exclusion / strict
+    # complete shape so the report contract is unchanged
+    # when the caller does not pass ``invalid_members``.
+    original_members_by_K: dict[
+        int, tuple[tuple[str, Optional[str]], ...]
+    ] = field(default_factory=dict)
+    effective_members_by_K: dict[
+        int, tuple[tuple[str, Optional[str]], ...]
+    ] = field(default_factory=dict)
+    excluded_members_by_K: dict[
+        int, tuple[ExclusionRecord, ...]
+    ] = field(default_factory=dict)
+    incomplete_member_detail: tuple[
+        dict[str, Any], ...
+    ] = ()
+    data_completeness_status: str = (
+        DATA_COMPLETENESS_STATUS_COMPLETE
+    )
+    data_warning_symbol: str = DATA_WARNING_SYMBOL_NONE
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +1084,9 @@ def prepare_multiwindow_k_inputs(
     close_loader: Optional[
         Callable[..., CloseSourceResolution]
     ] = None,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> MultiWindowKInputAdapterReport:
     """Prepare per-``(K, window)`` inputs for the Phase 6I-21
     core evaluator from real StackBuilder K rows and saved
@@ -1003,10 +1118,70 @@ def prepare_multiwindow_k_inputs(
     that verdict requires the strict default semantics
     end-to-end. Partial-mode is a diagnostic aid only —
     NOT a production engine path.
+
+    Phase 6I-46 TrafficFlow-compatible invalid-member
+    handling — ``invalid_members``: an optional mapping
+    of ``{ticker: {reason, telemetry_reason,
+    source_classification}}`` (typically built from the
+    Phase 6I-43 policy v2 ``invalid_tickers`` /
+    ``warning_members`` output). When supplied, K rows
+    whose authored members intersect this mapping are
+    marked with ``skipped_reason='unprepared_due_to_excluded_members'``
+    and the excluded members surface on the per-cell
+    ``excluded_members`` tuple + the report-level
+    ``original_members_by_K`` / ``effective_members_by_K`` /
+    ``excluded_members_by_K`` / ``incomplete_member_detail`` /
+    ``data_completeness_status`` / ``data_warning_symbol``
+    fields. The strict ``payload_ready`` /
+    ``can_evaluate_full_60_cell_grid`` semantics are NOT
+    weakened: a partial payload is never silently
+    promoted. When ``invalid_members`` is ``None`` or
+    empty the behaviour is byte-identical to the pre-
+    Phase 6I-46 contract.
     """
     K_list = [int(k) for k in K_values]
     W_list = [str(w) for w in windows]
     attempted = len(K_list) * len(W_list)
+    # Phase 6I-46 invalid-member normalization. Build a
+    # case-insensitive mapping ``ticker -> ExclusionRecord``
+    # so the per-cell loop can look up exclusions in O(1).
+    invalid_records: dict[str, ExclusionRecord] = {}
+    if invalid_members:
+        for raw_t, raw_v in dict(invalid_members).items():
+            tk = str(raw_t or "").strip().upper()
+            if not tk:
+                continue
+            if isinstance(raw_v, Mapping):
+                reason = str(
+                    raw_v.get("reason", "invalid_member"),
+                )
+                telemetry_reason = raw_v.get(
+                    "telemetry_reason",
+                )
+                source_classification = raw_v.get(
+                    "source_classification",
+                )
+                invalid_records[tk] = ExclusionRecord(
+                    ticker=tk,
+                    reason=reason,
+                    telemetry_reason=(
+                        str(telemetry_reason)
+                        if telemetry_reason is not None
+                        else None
+                    ),
+                    source_classification=(
+                        str(source_classification)
+                        if source_classification is not None
+                        else None
+                    ),
+                )
+            else:
+                invalid_records[tk] = ExclusionRecord(
+                    ticker=tk,
+                    reason=str(
+                        raw_v or "invalid_member",
+                    ),
+                )
 
     stack_root = (
         Path(stackbuilder_root)
@@ -1268,6 +1443,53 @@ def prepare_multiwindow_k_inputs(
             continue
 
         members_attempted = tuple(members)
+
+        # Phase 6I-46 TrafficFlow-compatible invalid-member
+        # check. If any authored member of this K row is in
+        # ``invalid_members``, mark every (K, window) cell in
+        # this row as ``unprepared_due_to_excluded_members``
+        # and skip the strict member-coverage path below. The
+        # original ``members_attempted`` is preserved on the
+        # per-cell state so the warning UI can show the
+        # original member list + the exclusion reasons. The
+        # adapter does NOT silently drop the excluded
+        # members from the cell, and it does NOT compute on
+        # the effective subset -- the Phase 6I-20 strict
+        # 60-cell contract requires the full authored member
+        # set, so the honest behaviour is to skip the cell
+        # with the explicit exclusion reason.
+        excluded_records_for_row = tuple(
+            invalid_records[m_t]
+            for (m_t, _proto) in members_attempted
+            if m_t in invalid_records
+        )
+        if excluded_records_for_row:
+            _append_unique(
+                issues, ISSUE_EXCLUDED_INVALID_MEMBER,
+            )
+            for window in W_list:
+                state = PerCellAdapterState(
+                    K=K,
+                    window=window,
+                    prepared=False,
+                    target_library_present=False,
+                    members_attempted=members_attempted,
+                    members_prepared=(),
+                    members_missing=tuple(
+                        rec.ticker
+                        for rec in excluded_records_for_row
+                    ),
+                    skipped_reason=(
+                        REASON_UNPREPARED_DUE_TO_EXCLUDED_MEMBERS
+                    ),
+                    excluded_members=excluded_records_for_row,
+                )
+                per_cell_states.append(state)
+                skipped.append((
+                    K, window,
+                    REASON_UNPREPARED_DUE_TO_EXCLUDED_MEMBERS,
+                ))
+            continue
 
         for window in W_list:
             # Step 4a: load the target's per-window library.
@@ -1684,6 +1906,87 @@ def _finalize_report(
         and set(W_list) >= canonical_w_set
         and all_canonical_cells_full
     )
+
+    # Phase 6I-46 TrafficFlow-compatible completeness
+    # aggregation. The states that carry a non-empty
+    # ``excluded_members`` tuple drive the report-level
+    # ``original_members_by_K`` / ``effective_members_by_K`` /
+    # ``excluded_members_by_K`` / ``incomplete_member_detail``
+    # / ``data_completeness_status`` / ``data_warning_symbol``
+    # fields. When no cell has exclusions the values default
+    # to empty dicts / the legacy "complete" status / the
+    # empty warning symbol, so the report contract is
+    # unchanged vs the pre-Phase 6I-46 behaviour.
+    original_members_by_K: dict[
+        int, tuple[tuple[str, Optional[str]], ...]
+    ] = {}
+    effective_members_by_K: dict[
+        int, tuple[tuple[str, Optional[str]], ...]
+    ] = {}
+    excluded_members_by_K: dict[
+        int, tuple[ExclusionRecord, ...]
+    ] = {}
+    incomplete_member_detail: list[dict[str, Any]] = []
+    exclusion_K_with_any_prepared: set[int] = set()
+    excluded_set_K: set[int] = set()
+    for s in per_cell_states:
+        if not s.excluded_members:
+            continue
+        K_val = int(s.K)
+        excluded_set_K.add(K_val)
+        if K_val not in original_members_by_K:
+            original_members_by_K[K_val] = tuple(
+                s.members_attempted,
+            )
+            excluded_set_for_row = {
+                rec.ticker for rec in s.excluded_members
+            }
+            effective_members_by_K[K_val] = tuple(
+                (m_t, proto)
+                for (m_t, proto) in s.members_attempted
+                if m_t not in excluded_set_for_row
+            )
+            excluded_members_by_K[K_val] = tuple(
+                s.excluded_members,
+            )
+            for rec in s.excluded_members:
+                incomplete_member_detail.append({
+                    "K": K_val,
+                    "ticker": rec.ticker,
+                    "reason": rec.reason,
+                    "telemetry_reason": (
+                        rec.telemetry_reason
+                    ),
+                    "source_classification": (
+                        rec.source_classification
+                    ),
+                })
+    # A K row with exclusions never has prepared cells under
+    # Phase 6I-46 (the entire row is short-circuited to
+    # ``unprepared_due_to_excluded_members``). So
+    # ``data_completeness_status`` depends on whether ANY
+    # canonical K row still produced prepared cells.
+    any_prepared = prepared > 0
+    if not excluded_set_K:
+        data_completeness_status = (
+            DATA_COMPLETENESS_STATUS_COMPLETE
+        )
+        data_warning_symbol = DATA_WARNING_SYMBOL_NONE
+    elif any_prepared:
+        data_completeness_status = (
+            DATA_COMPLETENESS_STATUS_PARTIAL
+        )
+        data_warning_symbol = (
+            DATA_WARNING_SYMBOL_INCOMPLETE
+        )
+    else:
+        data_completeness_status = (
+            DATA_COMPLETENESS_STATUS_BLOCKED
+        )
+        data_warning_symbol = (
+            DATA_WARNING_SYMBOL_INCOMPLETE
+        )
+
     return MultiWindowKInputAdapterReport(
         generated_at=datetime.now(timezone.utc).isoformat(
             timespec="seconds",
@@ -1713,4 +2016,12 @@ def _finalize_report(
         ),
         skipped_cells=tuple(skipped),
         issue_codes=tuple(issues),
+        original_members_by_K=original_members_by_K,
+        effective_members_by_K=effective_members_by_K,
+        excluded_members_by_K=excluded_members_by_K,
+        incomplete_member_detail=tuple(
+            incomplete_member_detail,
+        ),
+        data_completeness_status=data_completeness_status,
+        data_warning_symbol=data_warning_symbol,
     )
