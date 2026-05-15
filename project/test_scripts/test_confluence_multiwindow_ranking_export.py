@@ -1037,13 +1037,18 @@ def test_chart_rows_missing_value_field_rejected(tmp_path):
 
 def test_all_ranking_blocked_reasons_taxonomy_size():
     """Pins the documented runtime taxonomy size. The
-    evidence doc must list exactly this many reason codes."""
-    assert len(cmre.ALL_RANKING_BLOCKED_REASONS) == 9
-    # Plus a stable spot-check that
-    # projected_or_bridge_only is present (reserved future
-    # field; not currently emitted by the classifier).
+    evidence doc must list exactly this many reason codes.
+    Phase 6I-47 added ``partial_multiwindow_only`` for the
+    partial-payload artifact contract, taking the count
+    from 9 to 10."""
+    assert len(cmre.ALL_RANKING_BLOCKED_REASONS) == 10
+    # Stable spot-checks for two reserved / new codes.
     assert (
         cmre.RANKING_BLOCKED_REASON_PROJECTED_OR_BRIDGE_ONLY
+        in cmre.ALL_RANKING_BLOCKED_REASONS
+    )
+    assert (
+        cmre.RANKING_BLOCKED_REASON_PARTIAL_MULTIWINDOW_ONLY
         in cmre.ALL_RANKING_BLOCKED_REASONS
     )
 

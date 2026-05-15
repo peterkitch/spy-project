@@ -147,6 +147,11 @@ DATA_STATUS_INCOMPLETE_MULTIWINDOW = "incomplete_multiwindow"
 DATA_STATUS_DAILY_ONLY = "daily_only"
 DATA_STATUS_MISSING = "missing"
 DATA_STATUS_UNREADABLE = "unreadable"
+# Phase 6I-47 partial-payload artifact contract status.
+# Artifact carries the partial namespaced block
+# (``multiwindow_k_partial_payload_metadata``) but does
+# NOT carry the strict Phase 6I-20 keys.
+DATA_STATUS_PARTIAL_MULTIWINDOW = "partial_multiwindow"
 
 ALL_DATA_STATUSES: tuple[str, ...] = (
     DATA_STATUS_FULL_60_CELL,
@@ -154,6 +159,7 @@ ALL_DATA_STATUSES: tuple[str, ...] = (
     DATA_STATUS_DAILY_ONLY,
     DATA_STATUS_MISSING,
     DATA_STATUS_UNREADABLE,
+    DATA_STATUS_PARTIAL_MULTIWINDOW,
 )
 
 
@@ -195,6 +201,18 @@ RANKING_BLOCKED_REASON_DAILY_ONLY = "daily_only"
 RANKING_BLOCKED_REASON_PROJECTED_OR_BRIDGE_ONLY = (
     "projected_or_bridge_only"
 )
+# Phase 6I-47 partial-payload artifact contract. When the
+# on-disk artifact carries only the partial namespaced
+# block (no strict per_window_k_metrics /
+# build_wide_window_alignment /
+# multiwindow_k_engine_payload_metadata), the row is
+# classified as ``partial_multiwindow``. The row is NOT
+# strict-eligible, but it carries the partial fields so
+# the website can render an honest warning row /
+# warning card.
+RANKING_BLOCKED_REASON_PARTIAL_MULTIWINDOW_ONLY = (
+    "partial_multiwindow_only"
+)
 
 ALL_RANKING_BLOCKED_REASONS: tuple[str, ...] = (
     RANKING_BLOCKED_REASON_ARTIFACT_MISSING,
@@ -206,6 +224,7 @@ ALL_RANKING_BLOCKED_REASONS: tuple[str, ...] = (
     RANKING_BLOCKED_REASON_INCOMPLETE_60_CELL_GRID,
     RANKING_BLOCKED_REASON_DAILY_ONLY,
     RANKING_BLOCKED_REASON_PROJECTED_OR_BRIDGE_ONLY,
+    RANKING_BLOCKED_REASON_PARTIAL_MULTIWINDOW_ONLY,
 )
 
 
@@ -808,6 +827,27 @@ def _classify_artifact_data_status(
                 RANKING_BLOCKED_REASON_MISSING_MULTIWINDOW_PAYLOAD_METADATA
             ),
         )
+
+    # Phase 6I-47: detect the partial-payload artifact
+    # contract block. When the strict Phase 6I-20 keys are
+    # absent AND the partial namespaced block is present,
+    # surface ``partial_multiwindow`` as the data_status
+    # so the row classifies honestly as a partial /
+    # warning row rather than a generic
+    # ``incomplete_multiwindow`` blocked row.
+    partial_block = artifact.get(
+        "multiwindow_k_partial_payload_metadata",
+    )
+    has_strict_anything = (
+        pwk is not None
+        or bwwa is not None
+        or meta is not None
+    )
+    if (
+        isinstance(partial_block, Mapping)
+        and not has_strict_anything
+    ):
+        return DATA_STATUS_PARTIAL_MULTIWINDOW, issues
 
     # If everything is missing AND the artifact carries the
     # daily-only Phase 6C shape (``timeframes`` list +
@@ -2186,14 +2226,23 @@ def _default_member_completeness_provider(
     # onto the payload report; the Phase 6I-25 patch writer
     # (when later authorized to land partial-payload metadata)
     # would merge them into ``multiwindow_k_engine_payload_metadata``.
-    # Read from both locations so a future on-disk shape is
-    # already supported.
+    # The Phase 6I-47 partial-payload artifact contract
+    # places the same fields under
+    # ``multiwindow_k_partial_payload_metadata``. Read from
+    # all three locations so the partial state surfaces
+    # honestly regardless of which surface the artifact
+    # carries.
     meta = artifact.get(
         "multiwindow_k_engine_payload_metadata",
+    )
+    partial_block = artifact.get(
+        "multiwindow_k_partial_payload_metadata",
     )
     sources: list[Mapping[str, Any]] = []
     if isinstance(meta, Mapping):
         sources.append(meta)
+    if isinstance(partial_block, Mapping):
+        sources.append(partial_block)
     sources.append(artifact)
     status_raw: Optional[str] = None
     incomplete_detail_raw: Any = None
@@ -2952,6 +3001,12 @@ def _build_one_ticker_row(
         if data_status == DATA_STATUS_DAILY_ONLY:
             blocked_reason = (
                 RANKING_BLOCKED_REASON_DAILY_ONLY
+            )
+        elif data_status == DATA_STATUS_PARTIAL_MULTIWINDOW:
+            # Phase 6I-47: explicit blocked reason for the
+            # partial-payload artifact contract.
+            blocked_reason = (
+                RANKING_BLOCKED_REASON_PARTIAL_MULTIWINDOW_ONLY
             )
         elif issue_codes:
             blocked_reason = issue_codes[0]

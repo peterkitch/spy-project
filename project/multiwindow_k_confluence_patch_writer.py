@@ -221,6 +221,18 @@ CANONICAL_K_VALUES: tuple[int, ...] = _mw_core.CANONICAL_K_VALUES
 PLANNED_PAYLOAD_KEYS: tuple[str, ...] = (
     _mw_planner.PLANNED_PAYLOAD_KEYS
 )
+# Phase 6I-47 partial-payload artifact contract constants
+# re-exported from the planner so this module is the
+# canonical writer-side reference for both surfaces.
+PARTIAL_PAYLOAD_METADATA_KEY: str = (
+    _mw_planner.PARTIAL_PAYLOAD_METADATA_KEY
+)
+PARTIAL_PAYLOAD_SCHEMA_VERSION: str = (
+    _mw_planner.PARTIAL_PAYLOAD_SCHEMA_VERSION
+)
+PARTIAL_PLANNED_PAYLOAD_KEYS: tuple[str, ...] = (
+    _mw_planner.PARTIAL_PLANNED_PAYLOAD_KEYS
+)
 
 
 # Two-key writer authorization (Phase 6H-5 pattern).
@@ -249,6 +261,16 @@ ISSUE_ARTIFACT_WRITE_FAILED = "artifact_write_failed"
 # mutation boundary; an injected or buggy planner object
 # cannot drive a partial / malformed write through this
 # layer.
+# Phase 6I-47 partial-payload writer issue codes.
+ISSUE_PARTIAL_PATCH_PLAN_NOT_READY = (
+    "partial_patch_plan_not_ready"
+)
+ISSUE_PARTIAL_PATCH_PLAN_CONTRACT_INVALID = (
+    "partial_patch_plan_contract_invalid"
+)
+ISSUE_PARTIAL_WRITE_NOT_ALLOWED = (
+    "partial_write_not_allowed_by_planner_flag"
+)
 ISSUE_PATCH_PLAN_CONTRACT_INVALID = (
     "patch_plan_contract_invalid"
 )
@@ -261,6 +283,9 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_ARTIFACT_READ_FAILED,
     ISSUE_ARTIFACT_WRITE_FAILED,
     ISSUE_PATCH_PLAN_CONTRACT_INVALID,
+    ISSUE_PARTIAL_PATCH_PLAN_NOT_READY,
+    ISSUE_PARTIAL_PATCH_PLAN_CONTRACT_INVALID,
+    ISSUE_PARTIAL_WRITE_NOT_ALLOWED,
 )
 
 
@@ -308,6 +333,16 @@ ACTION_ARTIFACT_WRITE_COMPLETE = (
     "artifact_write_complete"
 )
 ACTION_MANUAL_REVIEW_REQUIRED = "manual_review_required"
+# Phase 6I-47 partial-payload writer actions.
+ACTION_DRY_RUN_REVIEW_PARTIAL_PATCH_PLAN = (
+    "dry_run_review_partial_patch_plan"
+)
+ACTION_PARTIAL_ARTIFACT_WRITE_COMPLETE = (
+    "partial_artifact_write_complete"
+)
+ACTION_RESOLVE_PARTIAL_PATCH_PLAN_FIRST = (
+    "resolve_partial_patch_plan_first"
+)
 
 ALL_ACTIONS: tuple[str, ...] = (
     ACTION_DRY_RUN_REVIEW_PATCH_PLAN,
@@ -315,6 +350,9 @@ ALL_ACTIONS: tuple[str, ...] = (
     ACTION_RESOLVE_PATCH_PLAN_FIRST,
     ACTION_ARTIFACT_WRITE_COMPLETE,
     ACTION_MANUAL_REVIEW_REQUIRED,
+    ACTION_DRY_RUN_REVIEW_PARTIAL_PATCH_PLAN,
+    ACTION_PARTIAL_ARTIFACT_WRITE_COMPLETE,
+    ACTION_RESOLVE_PARTIAL_PATCH_PLAN_FIRST,
 )
 
 
@@ -385,6 +423,31 @@ class MultiWindowKConfluencePatchWriteResult:
         default_factory=dict,
     )
     remaining_limitations: tuple[str, ...] = ()
+    # Phase 6I-47 partial-payload artifact contract.
+    # ``strict_wrote_artifact`` always equals
+    # ``wrote_artifact`` for strict (Phase 6I-25) writes;
+    # ``partial_wrote_artifact`` is True iff the writer
+    # merged the partial namespaced block (under
+    # ``multiwindow_k_partial_payload_metadata``) into
+    # the artifact in this invocation. The two flags are
+    # disjoint by design -- one invocation handles either
+    # the strict surface OR the partial surface, never
+    # both. ``partial_planner_patch_ready`` mirrors the
+    # planner's partial-readiness gate so a consumer can
+    # tell why a partial write was refused.
+    # ``partial_fields_added`` /
+    # ``partial_fields_replaced`` /
+    # ``partial_planned_payload_keys`` carry the partial
+    # add / replace surface separately from the strict
+    # ``fields_added`` / ``fields_replaced`` /
+    # ``planned_payload_keys``.
+    strict_wrote_artifact: bool = False
+    partial_wrote_artifact: bool = False
+    partial_planner_patch_ready: bool = False
+    partial_fields_added: tuple[str, ...] = ()
+    partial_fields_replaced: tuple[str, ...] = ()
+    partial_planned_payload_keys: tuple[str, ...] = ()
+    allow_partial_payload_plan: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
         return _result_to_json_dict(self)
@@ -414,6 +477,31 @@ def _result_to_json_dict(
         "planner_summary": dict(r.planner_summary),
         "remaining_limitations": list(
             r.remaining_limitations,
+        ),
+        # Phase 6I-47 partial fields.
+        "strict_wrote_artifact": bool(
+            getattr(r, "strict_wrote_artifact", False),
+        ),
+        "partial_wrote_artifact": bool(
+            getattr(r, "partial_wrote_artifact", False),
+        ),
+        "partial_planner_patch_ready": bool(
+            getattr(
+                r, "partial_planner_patch_ready", False,
+            ),
+        ),
+        "partial_fields_added": list(
+            getattr(r, "partial_fields_added", ()) or ()
+        ),
+        "partial_fields_replaced": list(
+            getattr(r, "partial_fields_replaced", ()) or ()
+        ),
+        "partial_planned_payload_keys": list(
+            getattr(r, "partial_planned_payload_keys", ())
+            or ()
+        ),
+        "allow_partial_payload_plan": bool(
+            getattr(r, "allow_partial_payload_plan", False),
         ),
     }
 
@@ -712,6 +800,144 @@ def _merge_planned_payload(
     return merged
 
 
+# ---------------------------------------------------------------------------
+# Phase 6I-47 partial-payload writer helpers
+# ---------------------------------------------------------------------------
+
+
+def _writer_partial_payload_is_consistent(plan: Any) -> bool:
+    """Phase 6I-47 partial-payload writer-side validator.
+
+    Requires ALL of:
+
+      - ``plan.partial_patch_ready=True``;
+      - ``plan.partial_planned_payload`` is a Mapping with
+        exactly one top-level key
+        (``PARTIAL_PAYLOAD_METADATA_KEY``);
+      - the partial block carries the expected required
+        keys (schema_version equal to
+        ``PARTIAL_PAYLOAD_SCHEMA_VERSION``,
+        ``strict_payload_ready=False``,
+        ``strict_patch_ready=False``, status in
+        ``{partial, blocked}``);
+      - the partial block does NOT carry any of the strict
+        ``PLANNED_PAYLOAD_KEYS``;
+      - ``plan.partial_fields_to_add`` /
+        ``plan.partial_fields_to_replace`` partition
+        ``PARTIAL_PLANNED_PAYLOAD_KEYS`` exactly and are
+        disjoint.
+
+    The writer refuses to merge the partial namespaced
+    block onto the artifact otherwise. This is the
+    Phase 6I-47 analogue of
+    ``_writer_plan_payload_is_consistent`` for the
+    strict path -- the two paths NEVER share validators."""
+    if not bool(
+        getattr(plan, "partial_patch_ready", False),
+    ):
+        return False
+    planned_payload = getattr(
+        plan, "partial_planned_payload", None,
+    )
+    if not isinstance(planned_payload, Mapping):
+        return False
+    expected_partial_keys = set(PARTIAL_PLANNED_PAYLOAD_KEYS)
+    if (
+        set(planned_payload.keys())
+        != expected_partial_keys
+    ):
+        return False
+    block = planned_payload.get(
+        PARTIAL_PAYLOAD_METADATA_KEY,
+    )
+    if not isinstance(block, Mapping):
+        return False
+    # The partial block MUST NOT carry strict keys.
+    for forbidden in PLANNED_PAYLOAD_KEYS:
+        if forbidden in block:
+            return False
+    required = (
+        "schema_version",
+        "data_completeness_status",
+        "data_warning_symbol",
+        "strict_payload_ready",
+        "strict_patch_ready",
+        "reason",
+        "prepared_cell_count",
+        "skipped_cell_count",
+        "expected_canonical_cell_count",
+    )
+    for k in required:
+        if k not in block:
+            return False
+    if str(
+        block.get("schema_version") or "",
+    ) != PARTIAL_PAYLOAD_SCHEMA_VERSION:
+        return False
+    if block.get("data_completeness_status") not in (
+        "partial", "blocked",
+    ):
+        return False
+    if block.get("strict_payload_ready") is not False:
+        return False
+    if block.get("strict_patch_ready") is not False:
+        return False
+    # Add / replace partition.
+    keys_attr = getattr(
+        plan, "partial_planned_payload_keys", None,
+    )
+    if keys_attr is None:
+        return False
+    try:
+        keys_seq = tuple(keys_attr)
+    except TypeError:
+        return False
+    if set(keys_seq) != expected_partial_keys:
+        return False
+    if len(keys_seq) != len(PARTIAL_PLANNED_PAYLOAD_KEYS):
+        return False
+    add_attr = getattr(plan, "partial_fields_to_add", None)
+    rep_attr = getattr(
+        plan, "partial_fields_to_replace", None,
+    )
+    if add_attr is None or rep_attr is None:
+        return False
+    try:
+        adds = tuple(add_attr)
+        reps = tuple(rep_attr)
+    except TypeError:
+        return False
+    add_set = set(adds)
+    rep_set = set(reps)
+    if add_set - expected_partial_keys:
+        return False
+    if rep_set - expected_partial_keys:
+        return False
+    if add_set & rep_set:
+        return False
+    if (add_set | rep_set) != expected_partial_keys:
+        return False
+    return True
+
+
+def _merge_partial_planned_payload(
+    existing: Mapping[str, Any],
+    partial_planned_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge the partial namespaced block onto a copy of
+    the existing artifact. Only
+    ``PARTIAL_PAYLOAD_METADATA_KEY`` is touched; every
+    other top-level key on the existing artifact is
+    preserved verbatim. The strict
+    ``PLANNED_PAYLOAD_KEYS`` are NOT touched -- a partial
+    write NEVER mutates the strict surface."""
+    merged: dict[str, Any] = dict(existing)
+    for key in PARTIAL_PLANNED_PAYLOAD_KEYS:
+        if key in partial_planned_payload:
+            merged[key] = partial_planned_payload[key]
+    return merged
+
+
 def _atomic_write_artifact(
     artifact_path: Path,
     merged: Mapping[str, Any],
@@ -799,6 +1025,10 @@ def apply_multiwindow_k_confluence_patch(
     patch_planner_callable: Optional[
         Callable[..., Any]
     ] = None,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
+    allow_partial_payload_plan: bool = False,
 ) -> MultiWindowKConfluencePatchWriteResult:
     """Apply (or dry-run-plan) the multi-window K engine
     patch onto the Confluence artifact.
@@ -807,6 +1037,17 @@ def apply_multiwindow_k_confluence_patch(
     ``write=True`` AND the env var
     ``PRJCT9_AUTOMATION_WRITE_AUTH == "phase_6h5_explicit"``.
     Either key absent / wrong refuses the mutation.
+
+    Phase 6I-47 partial-payload artifact contract: when
+    ``allow_partial_payload_plan=True`` AND the planner
+    produces ``partial_patch_ready=True``, the writer
+    routes to the PARTIAL cascade INSTEAD of the strict
+    one. The strict and partial paths are mutually
+    exclusive within a single invocation. Partial writes
+    require ALL of: ``write=True`` + env var +
+    ``allow_partial_payload_plan=True`` +
+    ``partial_patch_ready=True`` + writer-side
+    ``_writer_partial_payload_is_consistent`` check.
 
     Returns a structured result. Never raises out of the
     authorization cascade or write path on disk I/O
@@ -824,21 +1065,64 @@ def apply_multiwindow_k_confluence_patch(
     )
     # Phase 6I-28: the optional read-only ``close_source_root``
     # is forwarded straight through to the Phase 6I-24 planner.
+    # Phase 6I-47: ``invalid_members`` +
+    # ``allow_partial_payload_plan`` are forwarded only when
+    # the writer caller opted in, so test fakes that don't
+    # accept those kwargs still work.
+    planner_kwargs: dict[str, Any] = {
+        "artifact_root": artifact_root,
+        "stackbuilder_root": stackbuilder_root,
+        "signal_library_dir": signal_library_dir,
+        "K_values": K_values,
+        "windows": windows,
+        "run_dir": run_dir,
+        "current_as_of_date": current_as_of_date,
+        "close_source_root": close_source_root,
+    }
+    if invalid_members:
+        planner_kwargs["invalid_members"] = invalid_members
+    if allow_partial_payload_plan:
+        planner_kwargs[
+            "allow_partial_payload_plan"
+        ] = True
     plan = planner_fn(
         target_clean,
-        artifact_root=artifact_root,
-        stackbuilder_root=stackbuilder_root,
-        signal_library_dir=signal_library_dir,
-        K_values=K_values,
-        windows=windows,
-        run_dir=run_dir,
-        current_as_of_date=current_as_of_date,
-        close_source_root=close_source_root,
+        **planner_kwargs,
     )
 
     planner_patch_ready = bool(
         getattr(plan, "patch_ready", False),
     )
+    # Phase 6I-47 partial-payload artifact contract.
+    partial_planner_patch_ready = bool(
+        getattr(plan, "partial_patch_ready", False),
+    )
+    partial_planned_payload = dict(
+        getattr(plan, "partial_planned_payload", {})
+        or {}
+    )
+    partial_planned_payload_keys_attr = tuple(
+        getattr(plan, "partial_planned_payload_keys", ())
+        or ()
+    )
+    partial_plan_fields_to_add = tuple(
+        getattr(plan, "partial_fields_to_add", ()) or ()
+    )
+    partial_plan_fields_to_replace = tuple(
+        getattr(plan, "partial_fields_to_replace", ())
+        or ()
+    )
+    # Phase 6I-47: the partial branch is gated by the
+    # caller-supplied opt-in flag AND the planner's
+    # partial-readiness boolean. Strict and partial are
+    # mutually exclusive in a single invocation -- when
+    # ``use_partial_branch=True`` the strict cascade is
+    # skipped entirely.
+    use_partial_branch = bool(
+        allow_partial_payload_plan
+        and partial_planner_patch_ready
+    )
+
     artifact_path_str = getattr(plan, "artifact_path", None)
     artifact_path = (
         Path(artifact_path_str)
@@ -878,6 +1162,11 @@ def apply_multiwindow_k_confluence_patch(
     post_sha: Optional[str] = pre_sha
     fields_added: tuple[str, ...] = ()
     fields_replaced: tuple[str, ...] = ()
+    # Phase 6I-47 partial-write outcome tracking.
+    strict_wrote_artifact = False
+    partial_wrote_artifact = False
+    partial_fields_added: tuple[str, ...] = ()
+    partial_fields_replaced: tuple[str, ...] = ()
 
     if not write_requested:
         _append_unique(issues, ISSUE_WRITE_NOT_REQUESTED)
@@ -887,11 +1176,62 @@ def apply_multiwindow_k_confluence_patch(
             ISSUE_ENV_AUTHORIZATION_MISSING_OR_INVALID,
         )
 
-    if write_authorized:
-        # Both keys present -- now gate on patch readiness,
-        # artifact-path resolution, AND writer-side
-        # plan/payload consistency validation (Phase 6I-25
-        # Codex amendment).
+    if write_authorized and use_partial_branch:
+        # Phase 6I-47 partial cascade. Strict cascade is
+        # bypassed entirely.
+        if artifact_path is None:
+            _append_unique(
+                issues, ISSUE_ARTIFACT_PATH_MISSING,
+            )
+        elif not _writer_partial_payload_is_consistent(
+            plan,
+        ):
+            _append_unique(
+                issues,
+                ISSUE_PARTIAL_PATCH_PLAN_CONTRACT_INVALID,
+            )
+        else:
+            try:
+                with artifact_path.open(
+                    "r", encoding="utf-8",
+                ) as fh:
+                    existing = json.load(fh)
+                if not isinstance(existing, Mapping):
+                    raise ValueError(
+                        "existing artifact top-level is "
+                        "not a dict",
+                    )
+            except Exception:
+                _append_unique(
+                    issues, ISSUE_ARTIFACT_READ_FAILED,
+                )
+                existing = None
+            if existing is not None:
+                merged = _merge_partial_planned_payload(
+                    existing, partial_planned_payload,
+                )
+                try:
+                    _atomic_write_artifact(
+                        artifact_path, merged,
+                    )
+                    wrote_artifact = True
+                    partial_wrote_artifact = True
+                    partial_fields_added = (
+                        partial_plan_fields_to_add
+                    )
+                    partial_fields_replaced = (
+                        partial_plan_fields_to_replace
+                    )
+                    post_sha = _sha256_of_file(
+                        artifact_path,
+                    )
+                except Exception:
+                    _append_unique(
+                        issues, ISSUE_ARTIFACT_WRITE_FAILED,
+                    )
+
+    elif write_authorized:
+        # Strict cascade unchanged from Phase 6I-25.
         if not planner_patch_ready:
             _append_unique(
                 issues, ISSUE_PATCH_PLAN_NOT_READY,
@@ -939,6 +1279,7 @@ def apply_multiwindow_k_confluence_patch(
                         artifact_path, merged,
                     )
                     wrote_artifact = True
+                    strict_wrote_artifact = True
                     fields_added = plan_fields_to_add
                     fields_replaced = (
                         plan_fields_to_replace
@@ -955,8 +1296,58 @@ def apply_multiwindow_k_confluence_patch(
                     # _atomic_write_artifact's except
                     # path.
 
+    # Phase 6I-47: if the caller opted in to partial but
+    # the planner didn't produce partial_patch_ready=True,
+    # surface that as a distinct issue code separate from
+    # the strict ISSUE_PATCH_PLAN_NOT_READY (which still
+    # fires for write_authorized + strict path).
+    if (
+        allow_partial_payload_plan
+        and not partial_planner_patch_ready
+        and (write_requested or not planner_patch_ready)
+    ):
+        _append_unique(
+            issues, ISSUE_PARTIAL_PATCH_PLAN_NOT_READY,
+        )
+    if (
+        write_requested
+        and partial_planner_patch_ready
+        and not allow_partial_payload_plan
+    ):
+        # Operator requested write while planner has a
+        # partial plan ready but did NOT explicitly enable
+        # the partial branch. Surface this so the writer
+        # refusal reason is unambiguous.
+        _append_unique(
+            issues, ISSUE_PARTIAL_WRITE_NOT_ALLOWED,
+        )
+
     # Recommended-action cascade.
-    if not planner_patch_ready and not write_requested:
+    if use_partial_branch:
+        # Phase 6I-47 partial cascade actions.
+        if partial_wrote_artifact:
+            recommended = (
+                ACTION_PARTIAL_ARTIFACT_WRITE_COMPLETE
+            )
+        elif not write_requested:
+            recommended = (
+                ACTION_DRY_RUN_REVIEW_PARTIAL_PATCH_PLAN
+            )
+        elif not env_ok:
+            recommended = (
+                ACTION_SET_WRITE_AUTHORIZATION_AND_RERUN
+            )
+        elif (
+            ISSUE_PARTIAL_PATCH_PLAN_CONTRACT_INVALID
+            in issues
+            or ISSUE_ARTIFACT_PATH_MISSING in issues
+            or ISSUE_ARTIFACT_READ_FAILED in issues
+            or ISSUE_ARTIFACT_WRITE_FAILED in issues
+        ):
+            recommended = ACTION_MANUAL_REVIEW_REQUIRED
+        else:
+            recommended = ACTION_MANUAL_REVIEW_REQUIRED
+    elif not planner_patch_ready and not write_requested:
         # Dry-run on a not-ready plan: surface that the
         # plan needs resolution but still describe the
         # dry-run review state.
@@ -1016,6 +1407,20 @@ def apply_multiwindow_k_confluence_patch(
         planner_summary=planner_summary,
         remaining_limitations=(
             _DEFAULT_REMAINING_LIMITATIONS
+        ),
+        # Phase 6I-47 partial fields.
+        strict_wrote_artifact=strict_wrote_artifact,
+        partial_wrote_artifact=partial_wrote_artifact,
+        partial_planner_patch_ready=(
+            partial_planner_patch_ready
+        ),
+        partial_fields_added=partial_fields_added,
+        partial_fields_replaced=partial_fields_replaced,
+        partial_planned_payload_keys=(
+            partial_planned_payload_keys_attr
+        ),
+        allow_partial_payload_plan=(
+            bool(allow_partial_payload_plan)
         ),
     )
 
@@ -1092,6 +1497,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "write attempts)."
         ),
     )
+    # Phase 6I-47 partial-payload artifact contract.
+    parser.add_argument(
+        "--allow-partial-payload-plan",
+        action="store_true",
+        help=(
+            "Phase 6I-47: route to the PARTIAL writer "
+            "cascade when the planner produces "
+            "partial_patch_ready=True. Default off "
+            "preserves strict-only behaviour. Partial "
+            "writes still require --write + "
+            "PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit "
+            "AND this flag AND planner "
+            "partial_patch_ready=True."
+        ),
+    )
+    parser.add_argument(
+        "--invalid-members-json", default=None,
+        help=(
+            "Optional Phase 6I-46 JSON for invalid-member "
+            "exclusion. Use '@PATH' to read from a file."
+        ),
+    )
     return parser
 
 
@@ -1123,6 +1550,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.close_source_root is not None
         else args.cache_dir
     )
+    invalid_members_arg: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None
+    raw_im = args.invalid_members_json
+    if raw_im:
+        raw = raw_im.strip()
+        if raw:
+            try:
+                if raw.startswith("@"):
+                    text = Path(raw[1:]).read_text(
+                        encoding="utf-8",
+                    )
+                else:
+                    text = raw
+                parsed = json.loads(text)
+            except Exception as exc:
+                print(
+                    json.dumps({
+                        "error": (
+                            "invalid_members_json_parse_error"
+                        ),
+                        "detail": str(exc),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            if not isinstance(parsed, dict):
+                print(
+                    json.dumps({
+                        "error": (
+                            "invalid_members_json_shape_error"
+                        ),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            invalid_members_arg = parsed
+
     try:
         result = apply_multiwindow_k_confluence_patch(
             ticker,
@@ -1134,6 +1599,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             close_source_root=effective_close_source_root,
             write=bool(args.write),
             execution_log=args.execution_log,
+            invalid_members=invalid_members_arg,
+            allow_partial_payload_plan=bool(
+                args.allow_partial_payload_plan,
+            ),
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

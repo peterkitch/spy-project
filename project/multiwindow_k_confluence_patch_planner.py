@@ -300,17 +300,23 @@ ACTION_PARTIAL_PAYLOAD_NOT_PROMOTABLE = (
     "partial_payload_not_promotable"
 )
 
+ACTION_READY_FOR_REVIEWED_PARTIAL_ARTIFACT_WRITE = (
+    "ready_for_reviewed_partial_artifact_write"
+)
+
 ALL_ACTIONS: tuple[str, ...] = (
     ACTION_BUILD_PAYLOAD_FIRST,
     ACTION_CREATE_CONFLUENCE_ARTIFACT_FIRST,
     ACTION_READY_FOR_REVIEWED_ARTIFACT_WRITE,
     ACTION_MANUAL_REVIEW_REQUIRED,
     ACTION_PARTIAL_PAYLOAD_NOT_PROMOTABLE,
+    ACTION_READY_FOR_REVIEWED_PARTIAL_ARTIFACT_WRITE,
 )
 
 
 # The three top-level keys a future writer phase would
-# attach to the Confluence artifact.
+# attach to the Confluence artifact under the strict
+# Phase 6I-20 complete-payload contract.
 _PER_WINDOW_K_METRICS_KEY = "per_window_k_metrics"
 _BUILD_WIDE_ALIGNMENT_KEY = "build_wide_window_alignment"
 _METADATA_KEY = "multiwindow_k_engine_payload_metadata"
@@ -320,6 +326,291 @@ PLANNED_PAYLOAD_KEYS: tuple[str, ...] = (
     _BUILD_WIDE_ALIGNMENT_KEY,
     _METADATA_KEY,
 )
+
+
+# Phase 6I-47 partial-payload artifact contract.
+# A SEPARATE namespaced top-level key on the on-disk
+# Confluence artifact. Partial data NEVER lives in the
+# strict Phase 6I-20 keys above -- the strict / partial
+# surfaces are deliberately disjoint so a website
+# consumer that reads ``per_window_k_metrics`` can never
+# accidentally pick up a partial-multiwindow row as if
+# it were strict complete.
+PARTIAL_PAYLOAD_METADATA_KEY = (
+    "multiwindow_k_partial_payload_metadata"
+)
+PARTIAL_PAYLOAD_SCHEMA_VERSION = (
+    "phase_6i_47_partial_multiwindow_v1"
+)
+PARTIAL_PAYLOAD_REASON = (
+    "partial_payload_not_promotable"
+)
+
+PARTIAL_PLANNED_PAYLOAD_KEYS: tuple[str, ...] = (
+    PARTIAL_PAYLOAD_METADATA_KEY,
+)
+
+
+def _members_by_K_to_json(
+    members_by_K: Mapping[Any, Any],
+) -> dict[str, list[list[Any]]]:
+    """Serialize a ``{K: tuple[(ticker, proto), ...]}``
+    map into JSON-friendly stringified-int keys + flat
+    [ticker, proto] pairs. Used for the partial namespaced
+    block."""
+    out: dict[str, list[list[Any]]] = {}
+    for K_raw, members in (members_by_K or {}).items():
+        try:
+            K_key = str(int(K_raw))
+        except Exception:
+            continue
+        flat: list[list[Any]] = []
+        for entry in members or ():
+            if (
+                isinstance(entry, (list, tuple))
+                and len(entry) == 2
+            ):
+                ticker, proto = entry
+                flat.append([str(ticker), proto])
+            else:
+                flat.append([str(entry), None])
+        out[K_key] = flat
+    return out
+
+
+def _exclusion_records_to_json(
+    records: Any,
+) -> list[dict[str, Any]]:
+    """Serialize an iterable of ``ExclusionRecord``
+    (or duck-typed objects with the same attributes)
+    into a JSON-friendly list."""
+    out: list[dict[str, Any]] = []
+    for rec in records or ():
+        out.append({
+            "ticker": str(
+                getattr(rec, "ticker", "") or "",
+            ),
+            "reason": str(
+                getattr(rec, "reason", "") or "",
+            ),
+            "telemetry_reason": getattr(
+                rec, "telemetry_reason", None,
+            ),
+            "source_classification": getattr(
+                rec, "source_classification", None,
+            ),
+        })
+    return out
+
+
+def _excluded_members_by_K_to_json(
+    excluded: Mapping[Any, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for K_raw, recs in (excluded or {}).items():
+        try:
+            K_key = str(int(K_raw))
+        except Exception:
+            continue
+        out[K_key] = _exclusion_records_to_json(recs)
+    return out
+
+
+def _build_partial_payload_block(
+    *,
+    target_ticker: str,
+    current_as_of_date: Optional[str],
+    payload_report: Any,
+) -> dict[str, Any]:
+    """Phase 6I-47: build the partial namespaced block.
+
+    The block is a single dict that callers attach to the
+    Confluence artifact under
+    ``multiwindow_k_partial_payload_metadata``. It NEVER
+    contains the strict Phase 6I-20 keys
+    (``per_window_k_metrics`` /
+    ``build_wide_window_alignment`` /
+    ``multiwindow_k_engine_payload_metadata``), and it
+    explicitly carries ``strict_payload_ready=False`` so
+    a reader can never confuse it with a strict complete
+    payload.
+    """
+    adapter_summary = getattr(
+        payload_report, "adapter_summary", None,
+    )
+    selected_run_dir = (
+        getattr(
+            adapter_summary, "selected_run_dir", None,
+        )
+        if adapter_summary is not None else None
+    )
+    selected_run_id = (
+        getattr(
+            adapter_summary, "selected_run_id", None,
+        )
+        if adapter_summary is not None else None
+    )
+    prepared = int(
+        getattr(
+            adapter_summary, "prepared_cell_count", 0,
+        ) or 0
+        if adapter_summary is not None else 0
+    )
+    skipped = int(
+        getattr(
+            adapter_summary, "missing_cell_count", 0,
+        ) or 0
+        if adapter_summary is not None else 0
+    )
+    expected = int(
+        getattr(
+            adapter_summary, "attempted_cell_count", 60,
+        ) or 60
+        if adapter_summary is not None else 60
+    )
+    skipped_cells_raw = (
+        getattr(adapter_summary, "skipped_cells", ())
+        if adapter_summary is not None else ()
+    )
+    skipped_cells = [
+        [int(k), str(w), str(r)]
+        for (k, w, r) in (skipped_cells_raw or ())
+    ]
+    counts_by_skipped_reason: dict[str, int] = {}
+    for _k, _w, reason in skipped_cells:
+        counts_by_skipped_reason[reason] = (
+            counts_by_skipped_reason.get(reason, 0) + 1
+        )
+    return {
+        "schema_version": PARTIAL_PAYLOAD_SCHEMA_VERSION,
+        "generated_at": _iso_now(),
+        "target_ticker": str(
+            target_ticker or "",
+        ).strip().upper(),
+        "current_as_of_date": current_as_of_date,
+        "selected_run_dir": selected_run_dir,
+        "selected_run_id": selected_run_id,
+        "data_completeness_status": str(
+            getattr(
+                payload_report,
+                "data_completeness_status",
+                "partial",
+            ) or "partial",
+        ),
+        "data_warning_symbol": str(
+            getattr(
+                payload_report,
+                "data_warning_symbol",
+                "!",
+            ) or "!",
+        ),
+        "original_members_by_K": _members_by_K_to_json(
+            getattr(
+                adapter_summary, "original_members_by_K", {},
+            ) if adapter_summary is not None else (
+                getattr(
+                    payload_report,
+                    "original_members_by_K",
+                    {},
+                )
+            )
+        ),
+        "effective_members_by_K": _members_by_K_to_json(
+            getattr(
+                adapter_summary,
+                "effective_members_by_K", {},
+            ) if adapter_summary is not None else (
+                getattr(
+                    payload_report,
+                    "effective_members_by_K",
+                    {},
+                )
+            )
+        ),
+        "excluded_members_by_K": (
+            _excluded_members_by_K_to_json(
+                getattr(
+                    adapter_summary,
+                    "excluded_members_by_K", {},
+                ) if adapter_summary is not None else (
+                    getattr(
+                        payload_report,
+                        "excluded_members_by_K",
+                        {},
+                    )
+                )
+            )
+        ),
+        "incomplete_member_detail": [
+            dict(d) for d in (
+                getattr(
+                    payload_report,
+                    "incomplete_member_detail",
+                    (),
+                ) or ()
+            )
+        ],
+        "prepared_cell_count": prepared,
+        "skipped_cell_count": skipped,
+        "expected_canonical_cell_count": expected,
+        "counts_by_skipped_reason": (
+            counts_by_skipped_reason
+        ),
+        "skipped_cells": skipped_cells,
+        "partial_payload_available": bool(
+            getattr(
+                payload_report,
+                "partial_payload_available",
+                False,
+            ),
+        ),
+        "strict_payload_ready": False,
+        "strict_patch_ready": False,
+        "reason": PARTIAL_PAYLOAD_REASON,
+    }
+
+
+def _planner_partial_payload_is_valid(
+    block: Any,
+) -> bool:
+    """Planner-side validation of the partial namespaced
+    block before it is marked promotable. The strict
+    Phase 6I-20 keys MUST NOT appear on the block; the
+    minimum shape MUST carry status / warning / strict-
+    ready=False / reason / counts."""
+    if not isinstance(block, Mapping):
+        return False
+    for forbidden in PLANNED_PAYLOAD_KEYS:
+        if forbidden in block:
+            return False
+    required_keys = (
+        "schema_version",
+        "data_completeness_status",
+        "data_warning_symbol",
+        "strict_payload_ready",
+        "strict_patch_ready",
+        "reason",
+        "prepared_cell_count",
+        "skipped_cell_count",
+        "expected_canonical_cell_count",
+    )
+    for k in required_keys:
+        if k not in block:
+            return False
+    if str(
+        block.get("schema_version") or "",
+    ) != PARTIAL_PAYLOAD_SCHEMA_VERSION:
+        return False
+    status = str(
+        block.get("data_completeness_status") or "",
+    )
+    if status not in ("partial", "blocked"):
+        return False
+    if block.get("strict_payload_ready") is not False:
+        return False
+    if block.get("strict_patch_ready") is not False:
+        return False
+    return True
 
 
 _DEFAULT_REMAINING_LIMITATIONS: tuple[str, ...] = (
@@ -411,6 +702,23 @@ class MultiWindowKConfluencePatchPlan:
         dict[str, Any], ...
     ] = ()
     partial_payload_available: bool = False
+    # Phase 6I-47 partial-payload artifact contract. The
+    # five ``partial_*`` fields populate ONLY when
+    # ``allow_partial_payload_plan=True`` AND upstream
+    # ``partial_payload_available=True``. Defaults
+    # preserve the legacy strict-only shape. The
+    # ``partial_planned_payload`` carries the SEPARATE
+    # namespaced block (under
+    # ``multiwindow_k_partial_payload_metadata``) that the
+    # writer would attach -- it NEVER contains the strict
+    # Phase 6I-20 keys.
+    partial_patch_ready: bool = False
+    partial_fields_to_add: tuple[str, ...] = ()
+    partial_fields_to_replace: tuple[str, ...] = ()
+    partial_planned_payload_keys: tuple[str, ...] = ()
+    partial_planned_payload: dict[str, Any] = field(
+        default_factory=dict,
+    )
 
     def to_json_dict(self) -> dict[str, Any]:
         return _plan_to_json_dict(self)
@@ -460,6 +768,25 @@ def _plan_to_json_dict(
             getattr(
                 p, "partial_payload_available", False,
             ),
+        ),
+        # Phase 6I-47 partial fields.
+        "partial_patch_ready": bool(
+            getattr(p, "partial_patch_ready", False),
+        ),
+        "partial_fields_to_add": list(
+            getattr(p, "partial_fields_to_add", ()) or ()
+        ),
+        "partial_fields_to_replace": list(
+            getattr(p, "partial_fields_to_replace", ())
+            or ()
+        ),
+        "partial_planned_payload_keys": list(
+            getattr(p, "partial_planned_payload_keys", ())
+            or ()
+        ),
+        "partial_planned_payload": dict(
+            getattr(p, "partial_planned_payload", {})
+            or {}
         ),
     }
 
@@ -911,6 +1238,7 @@ def plan_multiwindow_k_confluence_patch(
     invalid_members: Optional[
         Mapping[str, Mapping[str, Any]]
     ] = None,
+    allow_partial_payload_plan: bool = False,
 ) -> MultiWindowKConfluencePatchPlan:
     """Plan the future multi-window K engine payload
     patch for one target ticker's on-disk Confluence
@@ -1116,8 +1444,62 @@ def plan_multiwindow_k_confluence_patch(
             issues, ISSUE_PARTIAL_PAYLOAD_NOT_PROMOTABLE,
         )
 
+    # Phase 6I-47 partial-payload artifact contract: build
+    # the separate namespaced block + add/replace
+    # classification ONLY when ``allow_partial_payload_plan``
+    # is explicitly enabled by the caller AND the upstream
+    # report carries an available partial payload. Defaults
+    # preserve strict-only behaviour.
+    partial_patch_ready = False
+    partial_fields_to_add: list[str] = []
+    partial_fields_to_replace: list[str] = []
+    partial_planned_payload: dict[str, Any] = {}
+    partial_planned_payload_keys: tuple[str, ...] = ()
+    if (
+        allow_partial_payload_plan
+        and upstream_partial_payload_available
+        and artifact_exists
+        and not artifact_unreadable
+        and isinstance(artifact, Mapping)
+    ):
+        partial_block = _build_partial_payload_block(
+            target_ticker=target_clean,
+            current_as_of_date=current_as_of_date,
+            payload_report=payload_report,
+        )
+        if _planner_partial_payload_is_valid(
+            partial_block,
+        ):
+            partial_planned_payload = {
+                PARTIAL_PAYLOAD_METADATA_KEY: partial_block,
+            }
+            partial_planned_payload_keys = tuple(
+                partial_planned_payload.keys(),
+            )
+            for key in partial_planned_payload_keys:
+                if (
+                    isinstance(artifact, Mapping)
+                    and key in artifact
+                ):
+                    partial_fields_to_replace.append(key)
+                else:
+                    partial_fields_to_add.append(key)
+            partial_patch_ready = True
+
     # Recommended-action cascade.
-    if upstream_completeness_status in (
+    if (
+        allow_partial_payload_plan
+        and partial_patch_ready
+    ):
+        # Phase 6I-47: when the partial artifact contract
+        # is explicitly enabled AND the partial plan is
+        # ready, that becomes the recommended next action.
+        # Strict ``patch_ready`` remains False -- the
+        # partial path NEVER flips the strict gate.
+        recommended = (
+            ACTION_READY_FOR_REVIEWED_PARTIAL_ARTIFACT_WRITE
+        )
+    elif upstream_completeness_status in (
         "partial", "blocked",
     ):
         # Phase 6I-46: partial / blocked payloads take
@@ -1176,6 +1558,17 @@ def plan_multiwindow_k_confluence_patch(
         partial_payload_available=(
             upstream_partial_payload_available
         ),
+        partial_patch_ready=partial_patch_ready,
+        partial_fields_to_add=tuple(
+            partial_fields_to_add,
+        ),
+        partial_fields_to_replace=tuple(
+            partial_fields_to_replace,
+        ),
+        partial_planned_payload_keys=(
+            partial_planned_payload_keys
+        ),
+        partial_planned_payload=partial_planned_payload,
     )
 
 
@@ -1220,6 +1613,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--close-source-root", default=None,
     )
+    # Phase 6I-47: explicit opt-in for the partial-payload
+    # artifact contract. Default False preserves the
+    # strict-only planner contract.
+    parser.add_argument(
+        "--allow-partial-payload-plan",
+        action="store_true",
+        help=(
+            "Phase 6I-47: build the partial namespaced "
+            "block (multiwindow_k_partial_payload_metadata) "
+            "for a partial upstream payload. Default off "
+            "preserves strict-only behaviour."
+        ),
+    )
+    # Phase 6I-47: optional invalid-members JSON.
+    parser.add_argument(
+        "--invalid-members-json", default=None,
+        help=(
+            "Optional Phase 6I-46 JSON for invalid-member "
+            "exclusion. Use '@PATH' to read from a file."
+        ),
+    )
     return parser
 
 
@@ -1251,6 +1665,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.close_source_root is not None
         else args.cache_dir
     )
+    invalid_members_arg: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None
+    raw_im = args.invalid_members_json
+    if raw_im:
+        raw = raw_im.strip()
+        if raw:
+            try:
+                if raw.startswith("@"):
+                    text = Path(raw[1:]).read_text(
+                        encoding="utf-8",
+                    )
+                else:
+                    text = raw
+                parsed = json.loads(text)
+            except Exception as exc:
+                print(
+                    json.dumps({
+                        "error": (
+                            "invalid_members_json_parse_error"
+                        ),
+                        "detail": str(exc),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            if not isinstance(parsed, dict):
+                print(
+                    json.dumps({
+                        "error": (
+                            "invalid_members_json_shape_error"
+                        ),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            invalid_members_arg = parsed
+
     try:
         plan = plan_multiwindow_k_confluence_patch(
             ticker,
@@ -1260,6 +1712,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_dir=args.run_dir,
             current_as_of_date=args.current_as_of_date,
             close_source_root=effective_close_source_root,
+            invalid_members=invalid_members_arg,
+            allow_partial_payload_plan=bool(
+                args.allow_partial_payload_plan,
+            ),
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(
