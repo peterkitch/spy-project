@@ -1210,3 +1210,242 @@ def test_phase_6i_54a_planner_rejects_path_unsafe_ticker(
         rows_by_ticker["SPY"]["recommended_action"]
         == pcp.ACTION_NEEDS_SOURCE_REFRESH
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-54b amendment-2: lazy directory creation.
+#
+# Codex re-audit caught that amendment-1's eager
+# ``pcd.mkdir(parents=True, exist_ok=True)`` at the start
+# of build_price_cache_write_report left an empty
+# ``price_cache/daily/`` directory behind for write=True
+# invocations that produced zero passing tickers
+# (unsafe-only, missing-source-only, verification-fail-
+# only). Amendment-2 defers mkdir to immediately before
+# each authorized atomic write so a rejected-only
+# invocation creates NO directory at all.
+# ---------------------------------------------------------------------------
+
+
+def test_unsafe_only_write_does_not_create_pcd(tmp_path):
+    """``--write`` with only an unsafe ticker creates
+    NO output directory and NO file -- amendment-2
+    lazy-mkdir contract."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd_unsafe_only"
+    # pcd does not exist pre-call.
+    assert not pcd.exists()
+    call_log, recording_loader = _recording_loader()
+    report = pcw.build_price_cache_write_report(
+        ["../ESCAPE"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=recording_loader,
+    )
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    # PCD must NOT exist post-call.
+    assert not pcd.exists(), (
+        "amendment-2: unsafe-only --write must not "
+        "create the output directory"
+    )
+    # And the loader was never invoked.
+    assert call_log == []
+
+
+def test_backslash_unsafe_only_write_does_not_create_pcd(
+    tmp_path,
+):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd_backslash_only"
+    assert not pcd.exists()
+    call_log, recording_loader = _recording_loader()
+    pcw.build_price_cache_write_report(
+        ["..\\ESCAPE"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=recording_loader,
+    )
+    assert not pcd.exists(), (
+        "amendment-2: backslash-unsafe --write must not "
+        "create the output directory"
+    )
+    assert call_log == []
+
+
+def test_missing_source_only_write_does_not_create_pcd(
+    tmp_path,
+):
+    """A safe ticker whose source PKL is missing on disk
+    must NOT cause the output directory to be created --
+    the verification cascade rejects it before any write
+    is attempted."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd_missing_source"
+    # scd exists but has no PKL fixtures for the ticker.
+    scd.mkdir(parents=True, exist_ok=True)
+    assert not pcd.exists()
+    loader = _make_loader({})
+    report = pcw.build_price_cache_write_report(
+        ["NOPE"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=loader,
+    )
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_PKL_MISSING in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    assert not pcd.exists(), (
+        "amendment-2: missing-source --write must not "
+        "create the output directory"
+    )
+
+
+def test_mixed_invalid_and_valid_write_creates_pcd_only_for_valid(
+    tmp_path,
+):
+    """Mixed run: one unsafe ticker + one valid ticker
+    with --write. The output directory IS created
+    (because the valid write needs it), but it contains
+    ONLY the valid ticker's CSV. The unsafe ticker
+    leaves no trace."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd_mixed"
+    _make_pkl_fixture(scd, "SPY")
+    assert not pcd.exists()
+    loader = _make_loader({"SPY": _good_payload(rows=4)})
+    report = pcw.build_price_cache_write_report(
+        ["../ESCAPE", "SPY"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=loader,
+    )
+    # The unsafe ticker is rejected; the valid ticker
+    # writes successfully.
+    rows_by_ticker = {
+        r["ticker"]: r for r in report["rows"]
+    }
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in rows_by_ticker["../ESCAPE"]["issue_codes"]
+    )
+    assert (
+        rows_by_ticker["SPY"]["wrote_file"] is True
+    )
+    # PCD now exists (the valid write needed it) and
+    # contains EXACTLY one file: SPY.csv.
+    assert pcd.exists() and pcd.is_dir()
+    contents = sorted(p.name for p in pcd.iterdir())
+    assert contents == ["SPY.csv"], (
+        f"amendment-2: pcd must contain ONLY SPY.csv; "
+        f"got {contents}"
+    )
+
+
+def test_dry_run_does_not_create_pcd(tmp_path):
+    """Dry-run with a verification-passing ticker still
+    creates NO directory (the amendment-2 lazy-mkdir
+    only fires inside the authorized-write branch)."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd_dryrun"
+    _make_pkl_fixture(scd, "AAA")
+    assert not pcd.exists()
+    loader = _make_loader({"AAA": _good_payload()})
+    report = pcw.build_price_cache_write_report(
+        ["AAA"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=False,
+        verified_loader=loader,
+    )
+    row = report["rows"][0]
+    assert row["issue_codes"] == []
+    assert row["wrote_file"] is False
+    assert not pcd.exists(), (
+        "amendment-2: dry-run --write=False must not "
+        "create the output directory"
+    )
+
+
+def test_verification_failure_only_write_does_not_create_pcd(
+    tmp_path,
+):
+    """A safe ticker whose verification cascade fails
+    (e.g. price_source != Close) must NOT cause the
+    output directory to be created."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd_verif_fail_only"
+    _make_pkl_fixture(
+        scd, "ADJ", price_source="AdjClose",
+    )
+    assert not pcd.exists()
+    loader = _make_loader({"ADJ": _good_payload()})
+    report = pcw.build_price_cache_write_report(
+        ["ADJ"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=loader,
+    )
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_PRICE_SOURCE_NOT_CLOSE
+        in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    assert not pcd.exists(), (
+        "amendment-2: verification-failure --write must "
+        "not create the output directory"
+    )
+
+
+def test_directory_create_failed_issue_code(tmp_path):
+    """When the lazy mkdir itself fails (e.g. the parent
+    path resolves to a file, not a dir), the writer must
+    surface ``directory_create_failed`` per-ticker and
+    NOT crash."""
+    scd = tmp_path / "scd"
+    # Create a FILE where the price-cache dir would go,
+    # which forces mkdir to fail with FileExistsError /
+    # NotADirectoryError.
+    blocker_path = tmp_path / "pcd_blocked"
+    blocker_path.write_text("not a dir", encoding="utf-8")
+    pcd = blocker_path  # same path -> mkdir(exist_ok)
+                        # will fail because it's a file
+    _make_pkl_fixture(scd, "AAA")
+    loader = _make_loader({"AAA": _good_payload()})
+    report = pcw.build_price_cache_write_report(
+        ["AAA"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=loader,
+    )
+    row = report["rows"][0]
+    assert row["wrote_file"] is False
+    assert (
+        pcw.ISSUE_DIRECTORY_CREATE_FAILED
+        in row["issue_codes"]
+    )
+    # And the blocker file itself is untouched.
+    assert (
+        blocker_path.read_text(encoding="utf-8")
+        == "not a dir"
+    )

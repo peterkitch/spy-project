@@ -1,9 +1,67 @@
 # Phase 6I-54b: supervised StackBuilder price-cache writer + write for the 6 ready tickers
 
-**Date:** 2026-05-15 (amendment-1 same day)
+**Date:** 2026-05-15 (amendment-1 + amendment-2 same day)
 **Base commit (main):** `13a707f` (Phase 6I-54a squash-merge)
 **Branch:** `phase-6i-54b-stackbuilder-price-cache-write`
 **Status:** **Authorized write completed.** 6 CSV files landed in `price_cache/daily/`. Other 5 production roots unchanged. **Do not merge** until operator approval.
+
+## Amendment-2: lazy directory creation (code/test safety)
+
+Codex re-audit confirmed amendment-1's path-traversal fix works, but found that the writer still eagerly created the output directory at the start of `build_price_cache_write_report` whenever `write=True`:
+
+```python
+# pre-amendment-2:
+if write:
+    pcd.mkdir(parents=True, exist_ok=True)
+```
+
+This meant an unsafe-only invocation like `--tickers "../ESCAPE" --write` no longer wrote an escaped file (amendment-1 fixed that) but **still created an empty `price_cache/daily/` directory** — contradicting the amendment-1 contract that rejected tickers create no output directory/file.
+
+### What amendment-2 does
+
+1. **Removes the eager `pcd.mkdir(...)`** at the start of `build_price_cache_write_report`.
+2. **Adds a lazy `pcd.mkdir(parents=True, exist_ok=True)`** immediately before each authorized atomic write — **only** after the ticker has passed:
+   - path-safety validation (`_is_safe_ticker`);
+   - source PKL + manifest existence;
+   - verified loader (`result.ok=True`);
+   - manifest `price_source = "Close"`;
+   - DataFrame / Close-column / DatetimeIndex / numeric / non-null / sorted checks;
+   - the output-root containment check (`is_relative_to`);
+   - the no-overwrite guard;
+   - and the writer is in the `--write` (not dry-run) branch.
+3. **Adds `ISSUE_DIRECTORY_CREATE_FAILED`** as a clean per-row issue code for the case where the lazy mkdir itself fails (e.g. the parent path resolves to a file). No crash; the row is recorded with `wrote_file=False` and the new issue code.
+
+### Files changed in amendment-2
+
+- `project/stackbuilder_price_cache_writer.py` — removed eager mkdir; added lazy mkdir with `ISSUE_DIRECTORY_CREATE_FAILED` issue code.
+- `project/test_scripts/test_stackbuilder_price_cache_writer.py` — 7 new amendment-2 regression tests:
+  - `test_unsafe_only_write_does_not_create_pcd`
+  - `test_backslash_unsafe_only_write_does_not_create_pcd`
+  - `test_missing_source_only_write_does_not_create_pcd`
+  - `test_mixed_invalid_and_valid_write_creates_pcd_only_for_valid` (the mixed-run case: pcd is created because the valid write needs it, but contains ONLY the valid CSV — the unsafe ticker leaves no trace)
+  - `test_dry_run_does_not_create_pcd`
+  - `test_verification_failure_only_write_does_not_create_pcd`
+  - `test_directory_create_failed_issue_code`
+
+### Test results
+
+- **40 / 40 focused writer tests pass** (23 original + 10 amendment-1 + 7 amendment-2).
+- **Combined Phase 6I planner regression: 141 / 141** in 2.11s.
+
+### No production rerun
+
+Amendment-2 is a **code/test safety amendment only.** No writer invoked against production. No yfinance, no StackBuilder, no source refresh, no `PRJCT9_AUTOMATION_WRITE_AUTH`. The 6 CSV files from the original Phase 6I-54b authorized write are preserved bit-for-bit; amendment-2 did NOT regenerate them.
+
+| Surface | Pre-amendment-2 | Post-amendment-2 | Diff |
+|---|---|---|---|
+| `cache/results` | 3239 | 3239 | 0 |
+| `cache/status` | 1634 | 1634 | 0 |
+| `output/research_artifacts` | 35 | 35 | 0 |
+| `output/stackbuilder` | 5229 | 5229 | 0 |
+| `signal_library/data/stable` | 72899 | 72899 | 0 |
+| `price_cache/daily` | 6 CSV files | 6 CSV files (unchanged) | 0 |
+
+---
 
 ## Amendment-1: ticker path-safety validation (code/test safety)
 
@@ -101,7 +159,7 @@ Phase 6I-54b's writer therefore uses **single-key `--write` authorization** (the
 
 ### Tests
 
-`project/test_scripts/test_stackbuilder_price_cache_writer.py` — 33 focused tests (23 original + 10 amendment-1 path-safety), all passing.
+`project/test_scripts/test_stackbuilder_price_cache_writer.py` — 40 focused tests (23 original + 10 amendment-1 path-safety + 7 amendment-2 lazy-dir), all passing.
 
 Coverage:
 
@@ -131,7 +189,7 @@ Coverage:
 | 22 | `test_execution_log_allows_md_library_path` | `md_library/shared/...` paths allowed; JSONL is well-formed. |
 | 23 | `test_cli_rejects_empty_tickers` | `--tickers " , "` → rc=2 `no_tickers_supplied`. |
 
-**Combined Phase 6I planner/policy/preflight/rebuild-planner/writer regression: 134 / 134 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 16 from 6I-53 + 23 from 6I-54a + 33 from 6I-54b including 10 amendment-1 path-safety tests).
+**Combined Phase 6I planner/policy/preflight/rebuild-planner/writer regression: 141 / 141 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 16 from 6I-53 + 23 from 6I-54a + 40 from 6I-54b including 10 amendment-1 path-safety tests + 7 amendment-2 lazy-dir tests).
 
 The Phase 6I-53 production-state smoke + Phase 6I-54a production-state smoke were both updated to be **state-aware**: they now recognize both pre-Phase-6I-54b (no `price_cache/daily/`) and post-Phase-6I-54b (6 CSV files for the ready tickers) states, with appropriate assertions per branch.
 
@@ -283,7 +341,7 @@ The 6 written tickers correctly flip from `use_existing_signal_cache` → `manua
 ## 10. Files added (8)
 
 - `project/stackbuilder_price_cache_writer.py` — new writer module (~700 lines).
-- `project/test_scripts/test_stackbuilder_price_cache_writer.py` — 33 focused tests (23 original + 10 amendment-1 path-safety).
+- `project/test_scripts/test_stackbuilder_price_cache_writer.py` — 40 focused tests (23 original + 10 amendment-1 path-safety + 7 amendment-2 lazy-dir).
 - `project/md_library/shared/2026-05-15_PHASE_6I54B_STACKBUILDER_PRICE_CACHE_WRITE.md` (this doc).
 - `project/md_library/shared/2026-05-15_PHASE_6I54B_STACKBUILDER_PRICE_CACHE_WRITE_EVIDENCE.json` — consolidated evidence.
 - `project/md_library/shared/2026-05-15_PHASE_6I54B_DRYRUN.json` — raw dry-run JSON.

@@ -211,6 +211,9 @@ ISSUE_INVALID_TICKER_PATH_UNSAFE: str = (
 ISSUE_OUTPUT_PATH_ESCAPES_ROOT: str = (
     "output_path_escapes_root"
 )
+ISSUE_DIRECTORY_CREATE_FAILED: str = (
+    "directory_create_failed"
+)
 
 
 # Production-root relative paths guarded against by
@@ -746,9 +749,14 @@ def build_price_cache_write_report(
 
     normalized = _normalize_tickers(tickers)
 
-    # Ensure output dir exists when writing.
-    if write:
-        pcd.mkdir(parents=True, exist_ok=True)
+    # Phase 6I-54b amendment-2: directory creation is
+    # deferred to immediately before each authorized
+    # atomic write. Eager mkdir here would leave an empty
+    # ``price_cache/daily/`` directory behind whenever a
+    # ``--write`` invocation produced zero passing
+    # tickers (e.g. unsafe-only or missing-source-only
+    # runs), contradicting the amendment-1 contract that
+    # rejected tickers create no output directory/file.
 
     rows: list[dict[str, Any]] = []
     for ticker in normalized:
@@ -807,6 +815,23 @@ def build_price_cache_write_report(
         if not write:
             # Dry-run: no actual write. Record what would
             # have happened.
+            rows.append(record)
+            continue
+
+        # Phase 6I-54b amendment-2: lazy directory
+        # creation immediately before the atomic write.
+        # The mkdir runs only AFTER all per-ticker checks
+        # have passed (path safety + verification cascade
+        # + output-root containment + no-overwrite),
+        # which means an unsafe-only / missing-source-only
+        # / verification-failure-only invocation never
+        # creates the price-cache directory at all.
+        try:
+            pcd.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            record["issue_codes"].append(
+                ISSUE_DIRECTORY_CREATE_FAILED,
+            )
             rows.append(record)
             continue
 
