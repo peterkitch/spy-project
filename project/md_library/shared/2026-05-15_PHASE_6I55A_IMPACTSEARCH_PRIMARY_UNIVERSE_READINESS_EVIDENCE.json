@@ -1,0 +1,338 @@
+{
+  "schema_version": "confluence_impactsearch_primary_universe_readiness_planner_v1",
+  "generated_at": "2026-05-15T11:30:17+00:00",
+  "phase": "phase_6i_55a",
+  "phase_label": "impactsearch_primary_universe_readiness_planner",
+  "inspected_tickers": [
+    "SPY",
+    "AAPL",
+    "JNJ",
+    "WMT",
+    "HD",
+    "MCD"
+  ],
+  "impact_xlsx_dir": "output\\impactsearch",
+  "impact_xlsx_dir_exists": true,
+  "signal_lib_dir": "signal_library\\data\\stable",
+  "price_cache_dir": "price_cache\\daily",
+  "impact_xlsx_max_age_days": 45,
+  "strict_manifests": false,
+  "bottom_n_coverage_threshold": 20,
+  "counts_by_classification": {
+    "ready_for_stackbuilder_with_impact_xlsx": 0,
+    "needs_impactsearch_run": 6,
+    "manual_review": 0
+  },
+  "rows_by_ticker": [
+    {
+      "ticker": "SPY",
+      "classification": "needs_impactsearch_run",
+      "recommended_next_action": "run_impactsearch_for_this_secondary",
+      "issue_codes": [
+        "impact_xlsx_stale"
+      ],
+      "workbook_path": "output\\impactsearch\\SPY_analysis.xlsx",
+      "workbook_mtime": "2026-01-10T07:38:35+00:00",
+      "workbook_age_days": 125.16,
+      "workbook_manifest_status": "skipped_stale_workbook",
+      "workbook_row_count": 0,
+      "usable_row_count": 0,
+      "primary_count": 0,
+      "primary_universe_preview": [],
+      "top_direct_preview": [],
+      "secondary_price_cache_status": "ok",
+      "secondary_price_cache_resolved_path": "price_cache\\daily\\SPY.csv",
+      "primary_signal_library_coverage": {
+        "primary_signal_library_candidate_count": 0,
+        "missing_primary_signal_libraries": [],
+        "missing_primary_signal_libraries_truncated": false,
+        "coverage_pct": 0.0,
+        "enough_for_bottom_n": false,
+        "bottom_n_threshold_used": 20
+      }
+    },
+    {
+      "ticker": "AAPL",
+      "classification": "needs_impactsearch_run",
+      "recommended_next_action": "run_impactsearch_for_this_secondary",
+      "issue_codes": [
+        "impact_xlsx_stale"
+      ],
+      "workbook_path": "output\\impactsearch\\AAPL_analysis.xlsx",
+      "workbook_mtime": "2026-01-10T07:38:31+00:00",
+      "workbook_age_days": 125.16,
+      "workbook_manifest_status": "skipped_stale_workbook",
+      "workbook_row_count": 0,
+      "usable_row_count": 0,
+      "primary_count": 0,
+      "primary_universe_preview": [],
+      "top_direct_preview": [],
+      "secondary_price_cache_status": "ok",
+      "secondary_price_cache_resolved_path": "price_cache\\daily\\AAPL.csv",
+      "primary_signal_library_coverage": {
+        "primary_signal_library_candidate_count": 0,
+        "missing_primary_signal_libraries": [],
+        "missing_primary_signal_libraries_truncated": false,
+        "coverage_pct": 0.0,
+        "enough_for_bottom_n": false,
+        "bottom_n_threshold_used": 20
+      }
+    },
+    {
+      "ticker": "JNJ",
+      "classification": "needs_impactsearch_run",
+      "recommended_next_action": "run_impactsearch_for_this_secondary",
+      "issue_codes": [
+        "impact_xlsx_missing"
+      ],
+      "workbook_path": null,
+      "workbook_mtime": null,
+      "workbook_age_days": null,
+      "workbook_manifest_status": null,
+      "workbook_row_count": 0,
+      "usable_row_count": 0,
+      "primary_count": 0,
+      "primary_universe_preview": [],
+      "top_direct_preview": [],
+      "secondary_price_cache_status": "ok",
+      "secondary_price_cache_resolved_path": "price_cache\\daily\\JNJ.csv",
+      "primary_signal_library_coverage": {
+        "primary_signal_library_candidate_count": 0,
+        "missing_primary_signal_libraries": [],
+        "missing_primary_signal_libraries_truncated": false,
+        "coverage_pct": 0.0,
+        "enough_for_bottom_n": false,
+        "bottom_n_threshold_used": 20
+      }
+    },
+    {
+      "ticker": "WMT",
+      "classification": "needs_impactsearch_run",
+      "recommended_next_action": "run_impactsearch_for_this_secondary",
+      "issue_codes": [
+        "impact_xlsx_missing"
+      ],
+      "workbook_path": null,
+      "workbook_mtime": null,
+      "workbook_age_days": null,
+      "workbook_manifest_status": null,
+      "workbook_row_count": 0,
+      "usable_row_count": 0,
+      "primary_count": 0,
+      "primary_universe_preview": [],
+      "top_direct_preview": [],
+      "secondary_price_cache_status": "ok",
+      "secondary_price_cache_resolved_path": "price_cache\\daily\\WMT.csv",
+      "primary_signal_library_coverage": {
+        "primary_signal_library_candidate_count": 0,
+        "missing_primary_signal_libraries": [],
+        "missing_primary_signal_libraries_truncated": false,
+        "coverage_pct": 0.0,
+        "enough_for_bottom_n": false,
+        "bottom_n_threshold_used": 20
+      }
+    },
+    {
+      "ticker": "HD",
+      "classification": "needs_impactsearch_run",
+      "recommended_next_action": "run_impactsearch_for_this_secondary",
+      "issue_codes": [
+        "impact_xlsx_missing"
+      ],
+      "workbook_path": null,
+      "workbook_mtime": null,
+      "workbook_age_days": null,
+      "workbook_manifest_status": null,
+      "workbook_row_count": 0,
+      "usable_row_count": 0,
+      "primary_count": 0,
+      "primary_universe_preview": [],
+      "top_direct_preview": [],
+      "secondary_price_cache_status": "ok",
+      "secondary_price_cache_resolved_path": "price_cache\\daily\\HD.csv",
+      "primary_signal_library_coverage": {
+        "primary_signal_library_candidate_count": 0,
+        "missing_primary_signal_libraries": [],
+        "missing_primary_signal_libraries_truncated": false,
+        "coverage_pct": 0.0,
+        "enough_for_bottom_n": false,
+        "bottom_n_threshold_used": 20
+      }
+    },
+    {
+      "ticker": "MCD",
+      "classification": "needs_impactsearch_run",
+      "recommended_next_action": "run_impactsearch_for_this_secondary",
+      "issue_codes": [
+        "impact_xlsx_missing"
+      ],
+      "workbook_path": null,
+      "workbook_mtime": null,
+      "workbook_age_days": null,
+      "workbook_manifest_status": null,
+      "workbook_row_count": 0,
+      "usable_row_count": 0,
+      "primary_count": 0,
+      "primary_universe_preview": [],
+      "top_direct_preview": [],
+      "secondary_price_cache_status": "ok",
+      "secondary_price_cache_resolved_path": "price_cache\\daily\\MCD.csv",
+      "primary_signal_library_coverage": {
+        "primary_signal_library_candidate_count": 0,
+        "missing_primary_signal_libraries": [],
+        "missing_primary_signal_libraries_truncated": false,
+        "coverage_pct": 0.0,
+        "enough_for_bottom_n": false,
+        "bottom_n_threshold_used": 20
+      }
+    }
+  ],
+  "command_manifest": [
+    {
+      "ticker": "SPY",
+      "command_label": "impactsearch_run_required",
+      "argv": null,
+      "command": "# SPY: workbook present but stale (age_days=125.2 > max_age_days=45). Phase 6I-55a recommends running ImpactSearch in a separate, explicitly-authorized phase to produce a fresh output\\impactsearch/SPY_<...>.xlsx workbook. This planner does NOT emit an ImpactSearch CLI invocation -- the ImpactSearch entry surface has not been audited by Phase 6I-55a, so a fabricated argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "policy_basis": "needs_impactsearch_run",
+      "blocked_by_policy_decision": false,
+      "notes": "Documentation only. Operator decides whether to run ImpactSearch for this ticker, defer it, or substitute another primary-universe source."
+    },
+    {
+      "ticker": "AAPL",
+      "command_label": "impactsearch_run_required",
+      "argv": null,
+      "command": "# AAPL: workbook present but stale (age_days=125.2 > max_age_days=45). Phase 6I-55a recommends running ImpactSearch in a separate, explicitly-authorized phase to produce a fresh output\\impactsearch/AAPL_<...>.xlsx workbook. This planner does NOT emit an ImpactSearch CLI invocation -- the ImpactSearch entry surface has not been audited by Phase 6I-55a, so a fabricated argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "policy_basis": "needs_impactsearch_run",
+      "blocked_by_policy_decision": false,
+      "notes": "Documentation only. Operator decides whether to run ImpactSearch for this ticker, defer it, or substitute another primary-universe source."
+    },
+    {
+      "ticker": "JNJ",
+      "command_label": "impactsearch_run_required",
+      "argv": null,
+      "command": "# JNJ: no matching workbook on disk. Phase 6I-55a recommends running ImpactSearch in a separate, explicitly-authorized phase to produce a fresh output\\impactsearch/JNJ_<...>.xlsx workbook. This planner does NOT emit an ImpactSearch CLI invocation -- the ImpactSearch entry surface has not been audited by Phase 6I-55a, so a fabricated argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "policy_basis": "needs_impactsearch_run",
+      "blocked_by_policy_decision": false,
+      "notes": "Documentation only. Operator decides whether to run ImpactSearch for this ticker, defer it, or substitute another primary-universe source."
+    },
+    {
+      "ticker": "WMT",
+      "command_label": "impactsearch_run_required",
+      "argv": null,
+      "command": "# WMT: no matching workbook on disk. Phase 6I-55a recommends running ImpactSearch in a separate, explicitly-authorized phase to produce a fresh output\\impactsearch/WMT_<...>.xlsx workbook. This planner does NOT emit an ImpactSearch CLI invocation -- the ImpactSearch entry surface has not been audited by Phase 6I-55a, so a fabricated argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "policy_basis": "needs_impactsearch_run",
+      "blocked_by_policy_decision": false,
+      "notes": "Documentation only. Operator decides whether to run ImpactSearch for this ticker, defer it, or substitute another primary-universe source."
+    },
+    {
+      "ticker": "HD",
+      "command_label": "impactsearch_run_required",
+      "argv": null,
+      "command": "# HD: no matching workbook on disk. Phase 6I-55a recommends running ImpactSearch in a separate, explicitly-authorized phase to produce a fresh output\\impactsearch/HD_<...>.xlsx workbook. This planner does NOT emit an ImpactSearch CLI invocation -- the ImpactSearch entry surface has not been audited by Phase 6I-55a, so a fabricated argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "policy_basis": "needs_impactsearch_run",
+      "blocked_by_policy_decision": false,
+      "notes": "Documentation only. Operator decides whether to run ImpactSearch for this ticker, defer it, or substitute another primary-universe source."
+    },
+    {
+      "ticker": "MCD",
+      "command_label": "impactsearch_run_required",
+      "argv": null,
+      "command": "# MCD: no matching workbook on disk. Phase 6I-55a recommends running ImpactSearch in a separate, explicitly-authorized phase to produce a fresh output\\impactsearch/MCD_<...>.xlsx workbook. This planner does NOT emit an ImpactSearch CLI invocation -- the ImpactSearch entry surface has not been audited by Phase 6I-55a, so a fabricated argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "policy_basis": "needs_impactsearch_run",
+      "blocked_by_policy_decision": false,
+      "notes": "Documentation only. Operator decides whether to run ImpactSearch for this ticker, defer it, or substitute another primary-universe source."
+    }
+  ],
+  "unresolved_items": [
+    "Phase 6I-55a does NOT fabricate an ImpactSearch CLI invocation. The ImpactSearch entry surface has not been audited by this phase; emitting an unverified argv would risk repeating the Phase 6I-55 stackbuilder-locked-shape gap. The ``needs_impactsearch_run`` records are deliberately comment-only.",
+    "Workbook freshness: the default 45-day cap mirrors stackbuilder.py's --impact-xlsx-max-age-days default. Operator may override per ticker via --impact-xlsx-max-age-days (rolling forward) -- but increasing the cap without checking that the workbook's primaries still reflect the current secondary-vs-primary universe is the operator's responsibility.",
+    "Primary signal-library coverage: the Phase 6I-52 locked --bottom-n=20 default requires 20+ primaries with candidate signal-library PKLs. The planner does NOT load the PKLs; Phase 6I-55c's StackBuilder run will validate them at consumption time."
+  ],
+  "no_production_activity_contract": {
+    "reads_only": [
+      "output/impactsearch/<TICKER>_*.xlsx + manifest sidecar (via verified loader)",
+      "price_cache/daily/<TICKER>.{csv,parquet} (Path.exists() only)",
+      "signal_library/data/stable/<TICKER>_stable_v*.pkl + sharded variant (glob only; no PKL load)"
+    ],
+    "never_writes_to": [
+      "cache/results",
+      "cache/status",
+      "output/research_artifacts",
+      "output/stackbuilder",
+      "signal_library/data/stable",
+      "price_cache/daily",
+      "output/impactsearch"
+    ],
+    "never_invokes": [
+      "stackbuilder",
+      "impactsearch",
+      "onepass",
+      "trafficflow",
+      "spymaster",
+      "confluence",
+      "yfinance",
+      "signal_engine_cache_refresher",
+      "signal_library_stable_promotion_writer",
+      "multiwindow_k_confluence_patch_writer",
+      "confluence_pipeline_runner",
+      "daily_board_automation_writer",
+      "daily_board_automation_executor",
+      "subprocess"
+    ],
+    "no_raw_pickle_load": true
+  },
+  "upstream_chain_citations": [
+    {
+      "stage": "OnePass writes signal libraries",
+      "file_line": "onepass.py:1154 save_signal_library"
+    },
+    {
+      "stage": "ImpactSearch reads signal libraries",
+      "file_line": "impactsearch.py:1525 load_signal_library"
+    },
+    {
+      "stage": "ImpactSearch writes per-secondary workbook",
+      "file_line": "impactsearch.py:2491 export_results_to_excel (output_dir at impactsearch.py:1355)"
+    },
+    {
+      "stage": "StackBuilder consumes workbook",
+      "file_line": "stackbuilder.py:583 try_load_rank_from_impact_xlsx"
+    },
+    {
+      "stage": "StackBuilder workbook column standardization",
+      "file_line": "stackbuilder.py:570 _standardize_rank_columns + _RANK_COLMAP at :562"
+    },
+    {
+      "stage": "StackBuilder FATAL guard if no primaries / no --prefer-impact-xlsx",
+      "file_line": "stackbuilder.py:889 phase1_preflight"
+    },
+    {
+      "stage": "StackBuilder K-build",
+      "file_line": "stackbuilder.py:1487 phase3_build_stacks"
+    },
+    {
+      "stage": "StackBuilder CLI --prefer-impact-xlsx flag",
+      "file_line": "stackbuilder.py:3361 + --impact-xlsx-dir at :3362 + --impact-xlsx-max-age-days at :3363"
+    },
+    {
+      "stage": "StackBuilder signal-library candidate paths",
+      "file_line": "stackbuilder.py:702 list_signal_library_candidates"
+    },
+    {
+      "stage": "Verified XLSX loader (provenance)",
+      "file_line": "provenance_manifest.py:1821 load_verified_xlsx_artifact"
+    }
+  ]
+}
