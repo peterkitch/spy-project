@@ -31,6 +31,74 @@ populated `current_build_signals` / `current_build_signal_summary` /
 
 ---
 
+## Command invocation precision (amendment-1)
+
+**Codex audit found that the command blocks in this doc displayed
+`python` rather than the repo's pinned interpreter path.** This
+amendment addresses that.
+
+**What actually ran.** Every executable command in this phase
+— dry-run, authorized write, ranking export, website chain
+verification — was issued via the pinned `spyproject2` audit
+interpreter:
+
+```
+C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
+```
+
+The audit log (`git` shell history + the `Bash` tool transcript of
+this session) shows every Python invocation prefixed with that
+absolute path, including the authorized-write line. The doc's
+`python ...` notation was display shorthand in the originally-
+committed markdown — **NOT** the actual command. There was no
+production-write process deviation: the production write was
+performed under the pinned interpreter contract from the start.
+
+**What this amendment changes:**
+
+  1. Every `python ...` command block in §§ 1, 2, 9 of this doc has
+     been replaced with the full pinned-interpreter path so the
+     written record matches the executed reality exactly.
+  2. A fresh **pinned read-only verification pass** (no production
+     write; no env var) was run at amendment time and is recorded
+     below in § Amendment-1 verification. It confirms the on-disk
+     SPY artifact state is unchanged since the Phase 6I-49 write.
+
+The production-data state was NOT modified during this amendment.
+The doc + this section are the only deliverables.
+
+### Amendment-1 verification (pinned interpreter, read-only)
+
+| Check | Command | Result |
+|---|---|---|
+| SHA-256 of SPY MTF artifact | `"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -c "import hashlib; print(hashlib.sha256(open('output/research_artifacts/confluence/SPY/SPY__MTF_CONSENSUS.research_day.json','rb').read()).hexdigest())"` | `39cd024733ded9eb4ff8490f84cbd2cb4ec1c6e7a53d67d423017c0288e6ec92` (unchanged from Phase 6I-49 post-write SHA) |
+| Partial namespaced block present | `"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -c "import json; d=json.load(open('output/research_artifacts/confluence/SPY/SPY__MTF_CONSENSUS.research_day.json')); print('multiwindow_k_partial_payload_metadata' in d)"` | `True` |
+| Strict `per_window_k_metrics` absent | same shape | `True` (absent) |
+| Strict `build_wide_window_alignment` absent | same shape | `True` (absent) |
+| Strict `multiwindow_k_engine_payload_metadata` absent | same shape | `True` (absent) |
+| Partial block `schema_version` | Pinned read | `phase_6i_47_partial_multiwindow_v1` |
+| Partial block `data_completeness_status` | Pinned read | `partial` |
+| Partial block `data_warning_symbol` | Pinned read | `!` |
+| Partial block `strict_payload_ready` | Pinned read | `False` |
+| Partial block `strict_patch_ready` | Pinned read | `False` |
+| Partial block `partial_payload_available` | Pinned read | `True` |
+| Partial block `prepared_cell_count` | Pinned read | `30` |
+| Partial block `effective_cell_count` | Pinned read | `30` |
+| Partial block `len(effective_per_window_k_metrics)` | Pinned read | `30` |
+| Partial block `incomplete_member_detail` tickers | Pinned read | `['TEF']` |
+| Block-level strict-key smuggle check | Pinned read (defensive `assert`) | **PASS** (none of the 3 strict-key names inside the block) |
+| Ranking export `SPY.rank_eligible` | `"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" confluence_multiwindow_ranking_export.py --tickers SPY,_GSPC --artifact-root output/research_artifacts --cache-dir cache/results` | `True` |
+| Ranking export `SPY.data_status` | same | `partial_multiwindow` |
+| Ranking export `SPY.ranking_eligibility_basis` | same | `partial_effective_members` |
+| Ranking export `SPY.data_completeness.data_warning_symbol` | same | `!` |
+| Ranking export `SPY.data_completeness.incomplete_members` | same | `['TEF']` |
+| Ranking export `_GSPC` (control) | same | `daily_only` / blocked (unchanged) |
+
+`PRJCT9_AUTOMATION_WRITE_AUTH` was NOT set during this amendment.
+No production write was performed. The amendment is docs-only.
+
+---
+
 ## 0. Top-line summary
 
 | Stage | Result |
@@ -96,7 +164,8 @@ PRE  counts (file totals across the 5 production roots):
 ### 1.4 Re-staged signal libraries
 
 ```
-$ python signal_library_fresh_staging_readiness.py \
+$ "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+    signal_library_fresh_staging_readiness.py \
     --tickers SPY,AROW,AWR,CLH,CP,EXPO,FCFS,GBCI,HCSG,JNJ,LLY,MO,PRA,PRGO \
     --primary-ticker SPY \
     --staged-dir _phase_6i_49_staged_libraries \
@@ -114,7 +183,8 @@ correctly excluded (Phase 6I-43 `invalid_or_delisted`).
 ### 1.5 Dry-run (no `--write`, no env var)
 
 ```
-$ python multiwindow_k_confluence_patch_writer.py \
+$ "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+    multiwindow_k_confluence_patch_writer.py \
     --ticker SPY \
     --artifact-root output/research_artifacts \
     --stackbuilder-root output/stackbuilder \
@@ -166,7 +236,8 @@ invocation. The env var was NOT exported into the shell session.
 
 ```
 $ PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit \
-    python multiwindow_k_confluence_patch_writer.py \
+    "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+      multiwindow_k_confluence_patch_writer.py \
       --ticker SPY \
       --artifact-root output/research_artifacts \
       --stackbuilder-root output/stackbuilder \
@@ -180,7 +251,8 @@ $ PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit \
 ```
 
 Post-command check: `PRJCT9_AUTOMATION_WRITE_AUTH` is **not present**
-in the shell environment (confirmed via `python -c "import os; print('PRJCT9_AUTOMATION_WRITE_AUTH' in os.environ)"` → `False`).
+in the shell environment (confirmed via
+`"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" -c "import os; print('PRJCT9_AUTOMATION_WRITE_AUTH' in os.environ)"` → `False`).
 
 ### 2.2 Authorized-write result
 
@@ -217,7 +289,8 @@ NEVER appeared in `fields_added` / `fields_replaced` /
 ## 3. Post-write on-disk verification
 
 ```
-$ python -c "import hashlib; print(hashlib.sha256(open('output/research_artifacts/confluence/SPY/SPY__MTF_CONSENSUS.research_day.json','rb').read()).hexdigest())"
+$ "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+    -c "import hashlib; print(hashlib.sha256(open('output/research_artifacts/confluence/SPY/SPY__MTF_CONSENSUS.research_day.json','rb').read()).hexdigest())"
 39cd024733ded9eb4ff8490f84cbd2cb4ec1c6e7a53d67d423017c0288e6ec92
 ```
 
@@ -255,7 +328,8 @@ Partial namespaced block contents:
 ## 4. Live ranking-export verdict (SPY + `_GSPC` post-write)
 
 ```
-$ python confluence_multiwindow_ranking_export.py \
+$ "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+    confluence_multiwindow_ranking_export.py \
     --tickers SPY,_GSPC \
     --artifact-root output/research_artifacts \
     --cache-dir cache/results
@@ -385,13 +459,15 @@ writer / ranking / package / view / renderer layers): **220 / 220
 passed**.
 
 ```
-$ pytest test_scripts/test_phase_6i48_partial_multiwindow_ranking_eligibility.py \
-         test_scripts/test_phase_6i47_partial_multiwindow_artifact_contract.py \
-         test_scripts/test_multiwindow_k_confluence_patch_writer.py \
-         test_scripts/test_confluence_multiwindow_ranking_export.py \
-         test_scripts/test_confluence_website_export_package.py \
-         test_scripts/test_confluence_website_reader_view.py \
-         test_scripts/test_confluence_static_board_renderer.py -q
+$ "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+    -m pytest \
+      test_scripts/test_phase_6i48_partial_multiwindow_ranking_eligibility.py \
+      test_scripts/test_phase_6i47_partial_multiwindow_artifact_contract.py \
+      test_scripts/test_multiwindow_k_confluence_patch_writer.py \
+      test_scripts/test_confluence_multiwindow_ranking_export.py \
+      test_scripts/test_confluence_website_export_package.py \
+      test_scripts/test_confluence_website_reader_view.py \
+      test_scripts/test_confluence_static_board_renderer.py -q
 220 passed in 2.02s
 ```
 
