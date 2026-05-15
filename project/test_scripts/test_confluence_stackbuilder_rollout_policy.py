@@ -1,0 +1,821 @@
+"""Phase 6I-52 tests for the locked StackBuilder rollout
+policy + first seed-universe manifest.
+
+Pins:
+
+  * Schema-version + policy name + policy version are
+    stable constants.
+  * The six locked policy decisions are pinned EXACTLY
+    (both_modes=False, combine_mode='intersection',
+    seed_by=optimize_by='total_capture', member-universe
+    size 12, rerun cadence 'manual_supervised',
+    invalid-member rotation
+    'partial_effective_members_with_warning').
+  * Every generated StackBuilder command uses
+    ``--secondary <TICKER>`` (NOT ``--ticker``), includes
+    ``--combine-mode intersection`` + ``--seed-by
+    total_capture`` + ``--optimize-by total_capture``,
+    and does NOT include ``--both-modes``.
+  * Every command's ``command`` field starts with the
+    pinned interpreter.
+  * The seed universe is deduped + uppercased + stripped
+    (the committed tuple intentionally includes a
+    duplicate to pin the normalizer behaviour).
+  * The manifest count equals the deduped ticker count.
+  * Each command record carries the locked taxonomy:
+    ``authorization_class='stackbuilder_write'``,
+    ``requires_separate_operator_authorization=True``,
+    ``policy_basis='phase_6i_52_locked_policy'``,
+    ``blocked_by_policy_decision=False``.
+  * The generated argv parses cleanly against the real
+    ``stackbuilder.parse_args`` argparse surface.
+  * Static guard: no forbidden top-level imports (no
+    subprocess / yfinance / dash / writer modules / engine
+    modules). The module does NOT execute any candidate
+    command.
+  * ``--output`` rejects paths inside any production root.
+"""
+from __future__ import annotations
+
+import ast
+import io
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+_HERE = Path(__file__).resolve().parent.parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+
+import confluence_stackbuilder_rollout_policy as srp  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 1. Schema-version + policy-name + policy-version stability
+# ---------------------------------------------------------------------------
+
+
+def test_schema_and_policy_constants_are_stable():
+    assert (
+        srp.SCHEMA_VERSION
+        == "confluence_stackbuilder_rollout_policy_v1"
+    )
+    assert srp.POLICY_NAME == "phase_6i_52_locked_policy"
+    assert srp.POLICY_VERSION == "v1"
+    assert srp.POLICY_BASIS == srp.POLICY_NAME
+    assert srp.PINNED_INTERPRETER == (
+        "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/"
+        "envs/spyproject2/python.exe"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. The six locked policy decisions are pinned EXACTLY.
+# ---------------------------------------------------------------------------
+
+
+def test_locked_policy_decisions_are_pinned_exactly():
+    """Phase 6I-52 amendment-1: ``member_universe_size``
+    was a misleading observation about the legacy SPY
+    seed-run directory shape -- it is NOT enforced by any
+    generated command. Amendment-1 replaces it with the
+    explicit StackBuilder command-parameter locks
+    (top_n=20 / bottom_n=20 / max_k=6 / search='beam' /
+    beam_width=12 / min_trigger_days=30)."""
+    assert srp.POLICY_BOTH_MODES is False
+    assert srp.POLICY_COMBINE_MODE == "intersection"
+    assert srp.POLICY_SEED_BY == "total_capture"
+    assert srp.POLICY_OPTIMIZE_BY == "total_capture"
+    assert srp.POLICY_TOP_N == 20
+    assert srp.POLICY_BOTTOM_N == 20
+    assert srp.POLICY_MAX_K == 6
+    assert srp.POLICY_SEARCH == "beam"
+    assert srp.POLICY_BEAM_WIDTH == 12
+    assert srp.POLICY_MIN_TRIGGER_DAYS == 30
+    assert srp.POLICY_RERUN_CADENCE == "manual_supervised"
+    assert (
+        srp.POLICY_INVALID_MEMBER_ROTATION
+        == "partial_effective_members_with_warning"
+    )
+    # The mapping form carries each decision's rationale.
+    decisions = srp.LOCKED_POLICY_DECISIONS
+    # Amendment-1: ``member_universe_size`` removed;
+    # ``stackbuilder_command_parameters`` added.
+    assert "member_universe_size" not in decisions
+    assert "stackbuilder_command_parameters" in decisions
+    sb_params = decisions["stackbuilder_command_parameters"]
+    for key, expected in (
+        ("top_n", 20),
+        ("bottom_n", 20),
+        ("max_k", 6),
+        ("search", "beam"),
+        ("beam_width", 12),
+        ("min_trigger_days", 30),
+    ):
+        assert sb_params[key] == expected, (
+            f"stackbuilder_command_parameters.{key}={sb_params[key]!r} "
+            f"!= {expected!r}"
+        )
+    # The remaining single-value decisions still expose
+    # ``value`` + ``rationale``.
+    for key in (
+        "both_modes",
+        "combine_mode",
+        "seed_by",
+        "optimize_by",
+        "rerun_cadence",
+        "invalid_member_rotation",
+    ):
+        assert key in decisions, f"missing decision: {key}"
+        assert "value" in decisions[key]
+        assert "rationale" in decisions[key]
+        assert isinstance(
+            decisions[key]["rationale"], str,
+        )
+        assert decisions[key]["rationale"], (
+            f"{key} rationale is empty"
+        )
+    # stackbuilder_command_parameters carries its own
+    # rationale (no per-parameter ``value`` field because
+    # it is a structured block).
+    assert "rationale" in sb_params
+    assert sb_params["rationale"]
+
+
+# ---------------------------------------------------------------------------
+# 3. Every command uses --secondary (NOT --ticker) +
+#    locked policy flags.
+# ---------------------------------------------------------------------------
+
+
+def test_every_command_uses_secondary_and_locked_flags():
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        argv = cmd["argv"]
+        # --secondary, NOT --ticker.
+        assert "--secondary" in argv
+        assert "--ticker" not in argv
+        sec_idx = argv.index("--secondary")
+        # The ticker right after --secondary matches the
+        # row's ticker.
+        assert argv[sec_idx + 1] == cmd["ticker"]
+        # --combine-mode intersection.
+        assert "--combine-mode" in argv
+        cm_idx = argv.index("--combine-mode")
+        assert argv[cm_idx + 1] == "intersection"
+        # --seed-by total_capture.
+        assert "--seed-by" in argv
+        sb_idx = argv.index("--seed-by")
+        assert argv[sb_idx + 1] == "total_capture"
+        # --optimize-by total_capture.
+        assert "--optimize-by" in argv
+        ob_idx = argv.index("--optimize-by")
+        assert argv[ob_idx + 1] == "total_capture"
+        # Other pinned launch defaults.
+        for flag, val in (
+            ("--top-n", "20"),
+            ("--bottom-n", "20"),
+            ("--max-k", "6"),
+            ("--search", "beam"),
+            ("--beam-width", "12"),
+            ("--min-trigger-days", "30"),
+        ):
+            assert flag in argv
+            assert (
+                argv[argv.index(flag) + 1] == val
+            )
+
+
+def test_no_command_includes_both_modes():
+    """The first-rollout policy pins both_modes=False; the
+    flag absence matches the store_true default. This test
+    is a hard regression guard."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        assert "--both-modes" not in cmd["argv"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Every command's display string starts with the pinned
+#    interpreter.
+# ---------------------------------------------------------------------------
+
+
+def test_every_command_starts_with_pinned_interpreter():
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        assert cmd["argv"][0] == srp.PINNED_INTERPRETER
+        assert cmd["command"].startswith(
+            srp.PINNED_INTERPRETER,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Seed universe is deduped + uppercased + stripped.
+# ---------------------------------------------------------------------------
+
+
+def test_seed_universe_dedupes_and_normalizes():
+    """The committed FIRST_ROLLOUT_PILOT_UNIVERSE_V1
+    intentionally includes a duplicate JPM entry to pin
+    that the normalizer dedupes. Caller-supplied tickers
+    with whitespace / mixed case must also normalize."""
+    # Default universe: the committed tuple has 26 entries
+    # (one duplicate JPM); the normalizer dedupes to 25.
+    assert (
+        len(srp.FIRST_ROLLOUT_PILOT_UNIVERSE_V1) == 26
+    )
+    assert (
+        srp.FIRST_ROLLOUT_PILOT_UNIVERSE_V1.count("JPM")
+        == 2
+    )
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    tickers = manifest["seed_universe_tickers"]
+    assert len(tickers) == 25
+    assert tickers.count("JPM") == 1
+    # Caller-supplied path: whitespace + lowercase get
+    # normalized; duplicates collapse.
+    manifest2 = (
+        srp.build_stackbuilder_rollout_policy_manifest(
+            tickers=[
+                "  aapl  ", "AAPL", "msft",
+                " googl ", "GOOGL", "",
+            ],
+        )
+    )
+    assert manifest2["seed_universe_tickers"] == [
+        "AAPL", "MSFT", "GOOGL",
+    ]
+    assert manifest2["seed_universe_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 6. Manifest count equals deduped ticker count.
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_count_matches_ticker_count():
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    assert (
+        len(manifest["command_manifest"])
+        == manifest["seed_universe_count"]
+    )
+    assert manifest["seed_universe_count"] == 25
+    # And every manifest row's ticker is in the seed list.
+    tickers = set(manifest["seed_universe_tickers"])
+    for cmd in manifest["command_manifest"]:
+        assert cmd["ticker"] in tickers
+
+
+# ---------------------------------------------------------------------------
+# 7. Each command record carries the locked taxonomy.
+# ---------------------------------------------------------------------------
+
+
+def test_each_command_carries_locked_taxonomy():
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        assert (
+            cmd["authorization_class"]
+            == "stackbuilder_write"
+        )
+        assert (
+            cmd["requires_separate_operator_authorization"]
+            is True
+        )
+        assert (
+            cmd["policy_basis"]
+            == "phase_6i_52_locked_policy"
+        )
+        assert (
+            cmd["blocked_by_policy_decision"] is False
+        )
+        assert (
+            cmd["command_label"]
+            == "stackbuilder_first_rollout_run"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. Generated argv parses against the real stackbuilder
+#    argparse surface (catches future CLI drift).
+# ---------------------------------------------------------------------------
+
+
+def test_generated_argv_parses_against_real_stackbuilder_cli():
+    """Deferred-import stackbuilder + run parse_args on
+    the generated argv (minus the leading interpreter +
+    script-name). This catches future stackbuilder.py CLI
+    drift the moment it lands."""
+    import stackbuilder
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        argv = cmd["argv"]
+        # argv = [interpreter, script.py, --flag, val, ...]
+        # parse_args wants only the flags.
+        parsed = stackbuilder.parse_args(argv[2:])
+        assert parsed.secondary == cmd["ticker"]
+        assert parsed.combine_mode == "intersection"
+        assert parsed.seed_by == "total_capture"
+        assert parsed.optimize_by == "total_capture"
+        assert parsed.both_modes is False
+        assert parsed.top_n == 20
+        assert parsed.bottom_n == 20
+        assert parsed.max_k == 6
+        assert parsed.search == "beam"
+        assert parsed.beam_width == 12
+        assert parsed.min_trigger_days == 30
+
+
+# ---------------------------------------------------------------------------
+# 9. Static guard: no forbidden top-level imports.
+#    The module must not execute any candidate command.
+# ---------------------------------------------------------------------------
+
+
+_FORBIDDEN_TOP_LEVEL_IMPORTS = frozenset({
+    "subprocess",
+    "yfinance",
+    "dash",
+    "signal_engine_cache_refresher",
+    "signal_library_stable_promotion_writer",
+    "multiwindow_k_confluence_patch_writer",
+    "confluence_pipeline_runner",
+    "daily_board_automation_writer",
+    "daily_board_automation_executor",
+    "spymaster",
+    "trafficflow",
+    "stackbuilder",
+    "onepass",
+    "impactsearch",
+    "confluence",
+    "cross_ticker_confluence",
+    "daily_signal_board",
+})
+
+
+def test_no_forbidden_top_level_imports():
+    here = Path(__file__).resolve().parent.parent
+    src = (
+        here
+        / "confluence_stackbuilder_rollout_policy.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    top_level_names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for n in node.names:
+                top_level_names.add(
+                    n.name.split(".")[0],
+                )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top_level_names.add(
+                    node.module.split(".")[0],
+                )
+    leaked = (
+        top_level_names & _FORBIDDEN_TOP_LEVEL_IMPORTS
+    )
+    assert not leaked, (
+        f"Forbidden top-level imports in rollout policy: "
+        f"{sorted(leaked)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. --output rejects paths inside any production root.
+# ---------------------------------------------------------------------------
+
+
+def test_output_path_guard_rejects_production_root_paths(
+    capsys,
+):
+    forbidden_outputs = [
+        "cache/results/policy.json",
+        "cache\\status\\policy.json",
+        "output/research_artifacts/policy.json",
+        "output/stackbuilder/policy.json",
+        "signal_library/data/stable/policy.json",
+    ]
+    for forbidden in forbidden_outputs:
+        rc = srp.main(["--output", forbidden])
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "output_path_inside_production_root" in err
+
+
+# ---------------------------------------------------------------------------
+# 11. --tickers CLI override + --signal-library-dir
+#     threading.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_tickers_override_and_signal_lib_dir(
+    tmp_path, capsys,
+):
+    out = tmp_path / "policy.json"
+    rc = srp.main([
+        "--tickers", "spy,aapl,aapl",  # dedup test
+        "--signal-library-dir",
+        "signal_library/data/stable",
+        "--output", str(out),
+    ])
+    assert rc == 0
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    assert parsed["seed_universe_tickers"] == [
+        "SPY", "AAPL",
+    ]
+    assert parsed["seed_universe_count"] == 2
+    assert len(parsed["command_manifest"]) == 2
+    for cmd in parsed["command_manifest"]:
+        assert (
+            "--signal-lib-dir" in cmd["argv"]
+        )
+        sl_idx = cmd["argv"].index("--signal-lib-dir")
+        assert (
+            cmd["argv"][sl_idx + 1]
+            == "signal_library/data/stable"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12. SPY appears in the seed universe (continuity with
+#     the Phase 6I-49 pilot).
+# ---------------------------------------------------------------------------
+
+
+def test_seed_universe_includes_spy_for_continuity():
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    assert "SPY" in manifest["seed_universe_tickers"]
+    # And appears as the first ticker (matching the
+    # committed tuple's deliberate ordering).
+    assert (
+        manifest["seed_universe_tickers"][0] == "SPY"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 13. unresolved_or_deferred_policy_items carries through
+#     so downstream consumers (Phase 6I-53) can audit them.
+# ---------------------------------------------------------------------------
+
+
+def test_unresolved_or_deferred_policy_items_present():
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    items = manifest["unresolved_or_deferred_policy_items"]
+    assert isinstance(items, list)
+    # Five-ish deliberately-deferred items (per-ticker
+    # member sizing, automated cadence, auto-substitution,
+    # combine_mode union eval, seed_by sharpe eval,
+    # second-rollout universe size).
+    assert len(items) >= 5
+    assert any(
+        i.startswith("per_ticker_member_universe_sizing")
+        for i in items
+    )
+    assert any(
+        i.startswith("automated_rerun_cadence")
+        for i in items
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-52 amendment-1 regression tests.
+#
+# Codex audit caught two material contract issues that
+# amendment-1 fixes:
+#   * No command-record ``notes`` may claim
+#     stackbuilder.py has a ``--write`` flag, a two-key
+#     gate, or a ``PRJCT9_AUTOMATION_WRITE_AUTH``
+#     requirement. stackbuilder.py has none of those; it
+#     writes outputs by default WHENEVER INVOKED.
+#   * The locked policy no longer claims a
+#     ``member_universe_size=12`` decision. That claim
+#     was a misleading restatement of the legacy SPY
+#     seed-run directory shape; no generated command
+#     enforces it. Amendment-1 replaces it with explicit
+#     StackBuilder command-parameter locks (top_n=20 /
+#     bottom_n=20 / max_k=6 / search='beam' /
+#     beam_width=12 / min_trigger_days=30).
+# ---------------------------------------------------------------------------
+
+
+def test_no_command_notes_mention_write_or_two_key_gate():
+    """Notes must NOT claim stackbuilder.py has its own
+    --write flag, a two-key gate, or a
+    PRJCT9_AUTOMATION_WRITE_AUTH requirement."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        notes = cmd.get("notes", "")
+        assert (
+            "--write gate" not in notes
+        ), f"notes leak --write gate: {notes!r}"
+        assert (
+            "two-key gate" not in notes
+        ), f"notes leak two-key gate: {notes!r}"
+        # The corrected notes MAY contain the phrase
+        # ``no --write flag`` (an affirmative statement
+        # that the flag does NOT exist on stackbuilder),
+        # so we don't ban the substring ``--write``
+        # entirely. We DO ban the wrong claim that
+        # stackbuilder relies on the env var.
+        assert (
+            "uses PRJCT9_AUTOMATION_WRITE_AUTH" not in notes
+        ), (
+            f"notes incorrectly claim stackbuilder uses "
+            f"PRJCT9_AUTOMATION_WRITE_AUTH: {notes!r}"
+        )
+        # And the corrected notes carry the explicit
+        # "writes by default when invoked" wording.
+        assert (
+            "by default" in notes
+            and "INVOKED" in notes.upper()
+        ), (
+            f"notes missing the explicit 'writes by "
+            f"default when invoked' wording: {notes!r}"
+        )
+
+
+def test_command_notes_mention_yfinance_fallback_preflight():
+    """Amendment-1 added an explicit yfinance-fallback
+    preflight callout so Phase 6I-53 sees the warning
+    without re-reading the doc."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        notes = cmd.get("notes", "")
+        assert "yfinance" in notes.lower(), (
+            f"notes missing yfinance-fallback callout: "
+            f"{notes!r}"
+        )
+        assert "preflight" in notes.lower(), (
+            f"notes missing preflight callout: "
+            f"{notes!r}"
+        )
+
+
+def test_no_member_universe_size_claim_anywhere():
+    """The misleading ``member_universe_size=12`` decision
+    must not appear in any public surface."""
+    # Module no longer exposes the constant.
+    assert not hasattr(srp, "POLICY_MEMBER_UNIVERSE_SIZE")
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    # LOCKED_POLICY_DECISIONS no longer has the key.
+    assert (
+        "member_universe_size"
+        not in manifest["locked_policy_decisions"]
+    )
+    # Replacement block is present.
+    assert (
+        "stackbuilder_command_parameters"
+        in manifest["locked_policy_decisions"]
+    )
+    sb_params = manifest["locked_policy_decisions"][
+        "stackbuilder_command_parameters"
+    ]
+    # Pin all six command parameters in the structured
+    # block.
+    assert sb_params["top_n"] == 20
+    assert sb_params["bottom_n"] == 20
+    assert sb_params["max_k"] == 6
+    assert sb_params["search"] == "beam"
+    assert sb_params["beam_width"] == 12
+    assert sb_params["min_trigger_days"] == 30
+
+
+def test_stackbuilder_command_parameters_match_generated_argv():
+    """The locked command parameters must match the
+    actual argv tokens the planner generates. This is a
+    contract test: drift between the policy block and the
+    real argv has historically been the most common
+    failure mode."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    sb_params = manifest["locked_policy_decisions"][
+        "stackbuilder_command_parameters"
+    ]
+    for cmd in manifest["command_manifest"]:
+        argv = cmd["argv"]
+        for flag, key in (
+            ("--top-n", "top_n"),
+            ("--bottom-n", "bottom_n"),
+            ("--max-k", "max_k"),
+            ("--search", "search"),
+            ("--beam-width", "beam_width"),
+            ("--min-trigger-days", "min_trigger_days"),
+        ):
+            assert flag in argv, (
+                f"argv missing locked flag {flag}: {argv}"
+            )
+            argv_val = argv[argv.index(flag) + 1]
+            policy_val = str(sb_params[key])
+            assert argv_val == policy_val, (
+                f"argv {flag}={argv_val} but policy "
+                f"says {key}={policy_val}"
+            )
+
+
+def test_amendment_1_pins_still_hold_secondary_and_no_both_modes():
+    """Amendment-1 must not regress the Phase 6I-50
+    amendment-1 + original Phase 6I-52 invariants."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        argv = cmd["argv"]
+        # Phase 6I-50 amendment-1: --secondary, not
+        # --ticker.
+        assert "--secondary" in argv
+        assert "--ticker" not in argv
+        # Phase 6I-52 original: no --both-modes.
+        assert "--both-modes" not in argv
+        # Phase 6I-52 original: pinned interpreter at
+        # position 0.
+        assert argv[0] == srp.PINNED_INTERPRETER
+
+
+def test_generated_argv_still_parses_against_real_stackbuilder():
+    """Amendment-1 must keep the real-argparse round-trip
+    working (this is the contract test against
+    stackbuilder.parse_args)."""
+    import stackbuilder
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    for cmd in manifest["command_manifest"]:
+        parsed = stackbuilder.parse_args(cmd["argv"][2:])
+        # Spot-check three of the locked command params
+        # plus the entry argument.
+        assert parsed.secondary == cmd["ticker"]
+        assert parsed.top_n == 20
+        assert parsed.max_k == 6
+        assert parsed.combine_mode == "intersection"
+        assert parsed.both_modes is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-52 amendment-2 regression tests.
+#
+# Codex re-audit caught two stale strings that survived
+# amendment-1:
+#   1. The module's POLICY_RERUN_CADENCE comment block
+#      claimed the Phase 6I-53 StackBuilder run is "gated
+#      by the existing two-key writer authorization at
+#      invocation time" -- false. stackbuilder.py has no
+#      such gate.
+#   2. The UNRESOLVED_OR_DEFERRED_POLICY_ITEMS entry for
+#      per_ticker_member_universe_sizing claimed "the
+#      first rollout fixes member universe size at 12 for
+#      every ticker", contradicting amendment-1's removal
+#      of the member_universe_size=12 decision.
+#
+# Both stale strings ended up in the SERIALIZED JSON
+# evidence. Amendment-2's negative-assertion tests run
+# against ``json.dumps(manifest)`` so any regression of
+# either stale phrase is caught the moment it ships.
+# Historical doc prose that explicitly says "the old
+# claim was wrong" is intentionally NOT covered by these
+# tests -- the doc may keep that framing.
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_manifest_does_not_carry_stale_member_size_claim():
+    """The regenerated evidence JSON must not contain the
+    pre-amendment-1 wording that claimed the first
+    rollout fixes member universe size at 12. Negative-
+    substring assertion against the actual serialized
+    payload, since the offending string lived in
+    UNRESOLVED_OR_DEFERRED_POLICY_ITEMS (passed through to
+    the JSON output)."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    payload = json.dumps(manifest)
+    forbidden_phrases = (
+        "fixes member universe size at 12",
+        "fixes member universe size",
+    )
+    for phrase in forbidden_phrases:
+        assert phrase not in payload, (
+            f"serialized manifest still contains "
+            f"forbidden stale phrase {phrase!r}"
+        )
+    # And the corrective replacement IS present (so a
+    # future drift that simply deletes the entry instead
+    # of correcting it gets caught).
+    assert (
+        "locks StackBuilder command parameters"
+        in payload
+    )
+    assert (
+        "does NOT fix per-ticker member universe size"
+        in payload
+    )
+
+
+def test_serialized_manifest_does_not_claim_stackbuilder_two_key_gate():
+    """The regenerated evidence JSON must not carry any
+    forward-looking claim that stackbuilder.py is gated
+    by the two-key writer authorization. The stale
+    POLICY_RERUN_CADENCE module comment did NOT
+    serialize, but the per-command ``notes`` field DOES,
+    so this test guards that path too."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    payload = json.dumps(manifest)
+    forbidden_phrases = (
+        # Pre-amendment-1 module-comment wording:
+        "gated by the existing two-key writer "
+        "authorization",
+        # Reasonable variants the audit might flag next:
+        "two-key writer authorization at invocation",
+        "two-key gate at invocation",
+    )
+    for phrase in forbidden_phrases:
+        assert phrase not in payload, (
+            f"serialized manifest still contains "
+            f"forbidden stale phrase {phrase!r}"
+        )
+    # The corrected affirmative wording is present in
+    # every command's notes (already pinned by
+    # ``test_no_command_notes_mention_write_or_two_key_gate``
+    # but kept here as a safety net).
+    assert (
+        "stackbuilder.py has NO --write flag"
+        in payload
+    )
+    assert (
+        "PRJCT9_AUTOMATION_WRITE_AUTH"
+        in payload
+    )
+    # And the corrective notes also mention the affirmative
+    # operator-decision gate.
+    assert (
+        "separate operator decision" in payload
+    )
+
+
+def test_module_source_does_not_keep_stale_forward_looking_strings():
+    """Belt-and-braces guard against the two stale
+    strings sneaking back into the module source as
+    forward-looking comments (not the historical
+    amendment-1 callout, which IS allowed to mention
+    them in past tense)."""
+    here = Path(__file__).resolve().parent.parent
+    src = (
+        here
+        / "confluence_stackbuilder_rollout_policy.py"
+    ).read_text(encoding="utf-8")
+    # The literal pre-amendment-1 phrase must NOT survive
+    # anywhere in the module source.
+    assert (
+        "fixes member universe size at 12"
+        not in src
+    ), (
+        "module source still contains the stale "
+        "'fixes member universe size at 12' phrase"
+    )
+    # The literal pre-amendment-1 module-comment wording
+    # also must not survive. The affirmative
+    # ``two-key gate that the ... writer family relies on``
+    # framing IS allowed (it says StackBuilder does NOT
+    # use the gate); only the forward-looking
+    # ``gated by the existing two-key writer
+    # authorization`` claim is forbidden.
+    assert (
+        "gated by the existing two-key writer "
+        "authorization at invocation time"
+        not in src
+    ), (
+        "module source still contains the stale "
+        "'gated by the existing two-key writer "
+        "authorization at invocation time' phrase"
+    )
