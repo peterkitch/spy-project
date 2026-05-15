@@ -1,0 +1,146 @@
+{
+  "schema_version": "confluence_large_universe_rollout_batch_planner_v1",
+  "generated_at": "2026-05-15T08:23:53+00:00",
+  "input_universe_summary": {
+    "universe_mode": "all_artifacts",
+    "target_tickers": [
+      "SPY",
+      "_GSPC"
+    ],
+    "inspected_count": 2
+  },
+  "input_launch_planner_schema_version": "confluence_large_universe_launch_planner_v1",
+  "accept_proposed_stackbuilder_defaults": false,
+  "current_as_of_date": null,
+  "invalid_members_json_path": null,
+  "batch_summary": {
+    "board_render_now": 1,
+    "partial_artifact_write_candidates": 0,
+    "strict_artifact_write_candidates": 0,
+    "source_refresh_candidates": 0,
+    "signal_library_rebuild_or_promotion_candidates": 0,
+    "stackbuilder_rerun_candidates": 0,
+    "blocked_or_manual_review": 1
+  },
+  "batches": {
+    "board_render_now": {
+      "tickers": [
+        "SPY"
+      ],
+      "ticker_count": 1
+    },
+    "partial_artifact_write_candidates": {
+      "tickers": [],
+      "ticker_count": 0
+    },
+    "strict_artifact_write_candidates": {
+      "tickers": [],
+      "ticker_count": 0
+    },
+    "source_refresh_candidates": {
+      "tickers": [],
+      "ticker_count": 0
+    },
+    "signal_library_rebuild_or_promotion_candidates": {
+      "tickers": [],
+      "ticker_count": 0
+    },
+    "stackbuilder_rerun_candidates": {
+      "tickers": [],
+      "ticker_count": 0
+    },
+    "blocked_or_manual_review": {
+      "tickers": [
+        "_GSPC"
+      ],
+      "ticker_count": 1
+    }
+  },
+  "command_manifest": [
+    {
+      "ticker": "SPY",
+      "command_label": "static_board_render",
+      "argv": [
+        "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe",
+        "confluence_static_board_renderer.py",
+        "--from-tickers",
+        "SPY",
+        "--artifact-root",
+        "output/research_artifacts",
+        "--cache-dir",
+        "cache/results",
+        "--with-local-overlays",
+        "--overlay-cache-dir",
+        "cache/results",
+        "--overlay-artifact-root",
+        "output/research_artifacts",
+        "--overlay-stackbuilder-root",
+        "output/stackbuilder",
+        "--overlay-signal-library-dir",
+        "signal_library/data/stable"
+      ],
+      "command": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe confluence_static_board_renderer.py --from-tickers SPY --artifact-root output/research_artifacts --cache-dir cache/results --with-local-overlays --overlay-cache-dir cache/results --overlay-artifact-root output/research_artifacts --overlay-stackbuilder-root output/stackbuilder --overlay-signal-library-dir signal_library/data/stable",
+      "authorization_class": "read_only",
+      "requires_separate_operator_authorization": false,
+      "blocked_by_policy_decision": false,
+      "notes": "Read-only static-board re-render for the ticker. Uses --from-tickers + Phase 6I-42 --with-local-overlays so every supplied root is honestly threaded through.",
+      "batch": "board_render_now"
+    },
+    {
+      "ticker": "SPY",
+      "command_label": "website_export_package",
+      "argv": [
+        "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe",
+        "confluence_website_export_package.py",
+        "--tickers",
+        "SPY",
+        "--artifact-root",
+        "output/research_artifacts",
+        "--cache-dir",
+        "cache/results"
+      ],
+      "command": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe confluence_website_export_package.py --tickers SPY --artifact-root output/research_artifacts --cache-dir cache/results",
+      "authorization_class": "read_only",
+      "requires_separate_operator_authorization": false,
+      "blocked_by_policy_decision": false,
+      "notes": "Read-only website export-package rebuild (JSON envelope on stdout). The CLI accepts only --tickers/--all-artifacts/--from-stackbuilder-universe + --top-n + --artifact-root + --cache-dir; other flags are intentionally omitted.",
+      "batch": "board_render_now"
+    },
+    {
+      "ticker": "_GSPC",
+      "command_label": "manual_review",
+      "argv": null,
+      "command": "# Manual review needed for _GSPC: artifact_status=daily_only, cache_status=cache_missing, signal_library_status=stable_missing, stackbuilder_status=run_missing, recommended_next_action=blocked_missing_inputs. The Phase 6I-50 cascade could not pick a single highest-leverage action.",
+      "authorization_class": "manual_review",
+      "requires_separate_operator_authorization": false,
+      "blocked_by_policy_decision": false,
+      "notes": "No command emitted. Operator must inspect the row's per-axis state and decide.",
+      "batch": "blocked_or_manual_review"
+    }
+  ],
+  "blocked_or_manual_review": [
+    {
+      "ticker": "_GSPC",
+      "artifact_status": "daily_only",
+      "cache_status": "cache_missing",
+      "signal_library_status": "stable_missing",
+      "stackbuilder_status": "run_missing",
+      "recommended_next_action": "blocked_missing_inputs"
+    }
+  ],
+  "unresolved_policy_questions": [
+    "both_modes: observed default is False. Should the large-universe launch run both Buy + Short pairs (``both_modes=True``) or stick with the current single-direction default? The Phase 6I-50 prompt asked the planner to leave this unresolved.",
+    "combine_mode: stackbuilder.py exposes ``--combine-mode choices=['intersection','union'] default='intersection'`` (Phase 6I-50 amendment-1 correction; the original Phase 6I-50 block incorrectly claimed the CLI did not expose this argument). The observed default is ``intersection``; the operator must confirm whether the large-universe launch should KEEP intersection (the conservative all-members-agree path) or switch to ``union`` (any-member-agree). The same confirmation should verify the Phase 6I-22 multi-window K input adapter respects the chosen combine mode.",
+    "seed_by / optimize_by: stackbuilder.py treats these as dashboard-layer settings, with optimize_by auto-resolving to seed_by when unset. The planner's proposal (both set to ``total_capture``) needs operator confirmation that ``total_capture`` is the intended large-universe launch metric (vs. ``sharpe_ratio`` or another seed/optimize axis).",
+    "Per-ticker member-universe sizing: each StackBuilder run encodes a fixed member set (12 for the SPY K-universe). The planner does NOT yet have a policy for how to choose member-universe size per ticker for a large-universe launch. Operator decision: fixed 12, fixed N, per-ticker N tuned by market-cap / liquidity, or other criterion.",
+    "Re-run cadence: the planner does NOT yet have a policy for how often a ticker's StackBuilder run should be regenerated (daily / weekly / on invalid-member-detected). Operator decision.",
+    "Invalid-member rotation: when a member is flagged ``invalid_or_delisted`` (Phase 6I-43), should the next StackBuilder run for the affected ticker(s) auto-substitute another candidate member, or stay with the partial-multiwindow contract until manual review? Operator decision."
+  ],
+  "remaining_limitations": [
+    "This planner is read-only. It NEVER executes any candidate command. The candidate command STRINGS live in the JSON output for operator review; running them is a separate, explicitly authorized action.",
+    "StackBuilder rerun candidates are marked blocked_by_policy_decision=True by default. Pass --accept-proposed-stackbuilder-defaults to flip them to ready_for_authorization (but the commands STILL are not executed).",
+    "Partial / strict Confluence artifact writer candidates include the --write flag in the documented argv, but the planner does NOT set PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit. That two-key gate is the operator's responsibility at invocation time.",
+    "Source-cache refresher candidates are per-ticker (the Phase 6E-5 refresher's CLI is single-ticker by contract; --ticker is required). The planner emits ONE refresher command per ticker, NOT a CSV / batch form.",
+    "Signal-library rebuild candidates emit DOCUMENTATION ONLY -- the Phase 6I-30 / 6I-32 staged rebuild is a multi-step operator-staged exercise, not a single CLI invocation. Stable-promotion-write candidates DO emit a single command (Phase 6I-31 writer)."
+  ]
+}
