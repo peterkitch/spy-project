@@ -612,17 +612,58 @@ def test_future_write_contract_is_well_formed(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 15. Production-state smoke: 6/25 use_existing_signal_cache
-#     + 19/25 needs_source_refresh against the real
-#     cache/results and absent price_cache/daily.
+# 15. Production-state smoke: skips cleanly when
+#     cache/results is absent (matches Codex / clean-
+#     worktree behaviour). Replaces the original hard-
+#     failing variant that assumed a populated production
+#     cache.
 # ---------------------------------------------------------------------------
 
 
-def test_production_state_classification_matches_expected():
-    """Pins the actual Phase 6I-54a verdict against the
-    current production state: SPY/AAPL/JNJ/WMT/HD/MCD
-    classify as use_existing_signal_cache; the other 19
-    pilot tickers classify as needs_source_refresh."""
+def test_production_state_classification_skips_when_cache_absent():
+    """Phase 6I-54a amendment-1: this test is the only
+    one that touches the real production cache. It
+    SKIPS cleanly when ``cache/results`` is absent or
+    has none of the 6 currently-ready pilot tickers
+    present, so a clean Codex worktree (no untracked
+    production cache) does not fail the suite. The
+    fixture-based ``test_six_use_existing_and_nineteen_
+    needs_source_refresh_against_fixture`` test (below)
+    pins the same 6/19 classification deterministically.
+    """
+    import pytest
+
+    here = Path(__file__).resolve().parent.parent
+    real_cache_dir = here / "cache" / "results"
+    if not real_cache_dir.exists():
+        pytest.skip(
+            "cache/results not present in this worktree; "
+            "production-state smoke is informational "
+            "only -- see "
+            "test_six_use_existing_and_nineteen_needs_"
+            "source_refresh_against_fixture for the "
+            "deterministic 6/19 pin."
+        )
+    # If cache/results exists but is empty or missing the
+    # 6 known-ready tickers, skip as well -- the test is
+    # an informational smoke against the local writer's
+    # current state.
+    known_ready = (
+        "SPY", "AAPL", "JNJ", "WMT", "HD", "MCD",
+    )
+    if not any(
+        (
+            real_cache_dir
+            / f"{t}_precomputed_results.pkl"
+        ).exists()
+        for t in known_ready
+    ):
+        pytest.skip(
+            "cache/results present but none of the "
+            "expected ready tickers' PKLs are on disk; "
+            "production-state smoke skipped."
+        )
+
     plan = pcp.build_price_cache_rebuild_plan()
     counts = plan["counts_by_recommended_action"]
     by_action = plan["tickers_by_recommended_action"]
@@ -645,6 +686,271 @@ def test_production_state_classification_matches_expected():
     )
     assert sorted(
         by_action[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE]
+    ) == sorted(known_ready)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-54a amendment-1 regression tests.
+#
+# Codex audit caught two blockers in the original commit:
+#   1. ``test_production_state_classification_matches_
+#      expected`` fails in a clean Codex worktree where
+#      ``cache/results`` is absent. Production smokes
+#      cannot be hard-failing -- they must skip.
+#   2. The evidence doc claimed all six
+#      ``use_existing_signal_cache`` tickers were
+#      ``producer_engine="signal_engine_cache_refresher"``
+#      + ``engine_version="6E-5.0.0"``, but the on-disk
+#      reality is mixed (2 x 6E-5 + 4 x spymaster/1.0.0).
+#      The planner now reports provenance honestly via
+#      ``provenance_summary`` and Phase 6I-54b is
+#      explicitly told to verify each candidate.
+#
+# These regression tests pin both fixes.
+# ---------------------------------------------------------------------------
+
+
+def test_six_use_existing_and_nineteen_needs_source_refresh_against_fixture(
+    tmp_path,
+):
+    """Deterministic, portable replacement for the
+    production-state pin. Stages the same 6 ready
+    tickers (SPY, AAPL, JNJ, WMT, HD, MCD) into a
+    fixture signal-cache dir; expects 6 use_existing +
+    19 needs_source_refresh without touching the real
+    cache/results."""
+    scd = tmp_path / "fixture_signal_cache"
+    pcd = tmp_path / "fixture_pcd"
+    for ticker in (
+        "SPY", "AAPL", "JNJ", "WMT", "HD", "MCD",
+    ):
+        _make_signal_cache(scd, ticker)
+    # Default tickers = Phase 6I-52 pilot universe.
+    plan = pcp.build_price_cache_rebuild_plan(
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    counts = plan["counts_by_recommended_action"]
+    by_action = plan["tickers_by_recommended_action"]
+    assert plan["ticker_count"] == 25
+    assert (
+        counts[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE] == 6
+    )
+    assert (
+        counts[pcp.ACTION_NEEDS_SOURCE_REFRESH] == 19
+    )
+    assert (
+        counts[pcp.ACTION_NEEDS_NETWORK_FETCH] == 0
+    )
+    assert (
+        counts[pcp.ACTION_MANUAL_REVIEW] == 0
+    )
+    assert sorted(
+        by_action[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE]
     ) == sorted([
         "SPY", "AAPL", "JNJ", "WMT", "HD", "MCD",
     ])
+
+
+def test_provenance_summary_reports_mixed_groups(
+    tmp_path,
+):
+    """The planner must report provenance HONESTLY when
+    the underlying cache PKLs come from different
+    producers. This test stages 2 x 6E-5 + 4 x spymaster
+    fixtures and asserts the provenance_summary surfaces
+    both groups separately, with the correct ticker
+    membership."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    # 2 x signal_engine_cache_refresher / 6E-5.0.0:
+    for ticker in ("SPY", "JNJ"):
+        pkl = _make_signal_cache(scd, ticker)
+        _write_manifest(
+            pkl,
+            price_source="Close",
+            producer_engine="signal_engine_cache_refresher",
+            engine_version="6E-5.0.0",
+        )
+    # 4 x spymaster / 1.0.0:
+    for ticker in ("AAPL", "HD", "MCD", "WMT"):
+        pkl = _make_signal_cache(scd, ticker)
+        _write_manifest(
+            pkl,
+            price_source="Close",
+            producer_engine="spymaster",
+            engine_version="1.0.0",
+        )
+    plan = pcp.build_price_cache_rebuild_plan(
+        tickers=["SPY", "JNJ", "AAPL", "HD", "MCD", "WMT"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    summary = plan["provenance_summary"]
+    assert summary["distinct_provenance_count"] == 2
+    groups = {
+        (g["producer_engine"], g["engine_version"]): (
+            g["tickers"]
+        )
+        for g in summary["groups"]
+    }
+    assert sorted(groups[
+        ("signal_engine_cache_refresher", "6E-5.0.0")
+    ]) == ["JNJ", "SPY"]
+    assert sorted(groups[
+        ("spymaster", "1.0.0")
+    ]) == ["AAPL", "HD", "MCD", "WMT"]
+    # Phase 6I-54b verification requirement is surfaced.
+    assert (
+        "Phase 6I-54b MUST load and verify"
+        in summary["phase_6i_54b_verification_requirement"]
+    )
+
+
+def test_provenance_summary_single_group_when_uniform(
+    tmp_path,
+):
+    """When all use_existing tickers come from the same
+    builder/version, distinct_provenance_count is 1."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    for ticker in ("AAA", "BBB", "CCC"):
+        pkl = _make_signal_cache(scd, ticker)
+        _write_manifest(
+            pkl,
+            price_source="Close",
+            producer_engine=(
+                "signal_engine_cache_refresher"
+            ),
+            engine_version="6E-5.0.0",
+        )
+    plan = pcp.build_price_cache_rebuild_plan(
+        tickers=["AAA", "BBB", "CCC"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    summary = plan["provenance_summary"]
+    assert summary["distinct_provenance_count"] == 1
+    assert len(summary["groups"]) == 1
+    assert (
+        summary["groups"][0]["producer_engine"]
+        == "signal_engine_cache_refresher"
+    )
+    assert summary["groups"][0]["ticker_count"] == 3
+
+
+def test_provenance_summary_excludes_non_use_existing_rows(
+    tmp_path,
+):
+    """The provenance_summary covers ONLY
+    use_existing_signal_cache rows. needs_source_refresh
+    rows (no PKL on disk) must not leak into it."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pkl = _make_signal_cache(scd, "DDD")
+    _write_manifest(
+        pkl,
+        price_source="Close",
+        producer_engine="spymaster",
+        engine_version="1.0.0",
+    )
+    # EEE has no PKL -> needs_source_refresh.
+    plan = pcp.build_price_cache_rebuild_plan(
+        tickers=["DDD", "EEE"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    summary = plan["provenance_summary"]
+    assert summary["distinct_provenance_count"] == 1
+    assert summary["groups"][0]["tickers"] == ["DDD"]
+    assert "EEE" not in summary["groups"][0]["tickers"]
+
+
+def test_generated_evidence_does_not_carry_stale_uniform_provenance_claim(
+    tmp_path,
+):
+    """The serialized planner JSON must NOT carry the
+    pre-amendment-1 overclaim (something like 'all six
+    signal_engine_cache_refresher / 6E-5.0.0'). Codex
+    flagged that the evidence doc made this claim while
+    the data actually showed mixed provenance."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    # Stage the same mixed-provenance set as the real
+    # production state.
+    for ticker in ("SPY", "JNJ"):
+        pkl = _make_signal_cache(scd, ticker)
+        _write_manifest(
+            pkl,
+            producer_engine=(
+                "signal_engine_cache_refresher"
+            ),
+            engine_version="6E-5.0.0",
+        )
+    for ticker in ("AAPL", "HD", "MCD", "WMT"):
+        pkl = _make_signal_cache(scd, ticker)
+        _write_manifest(
+            pkl,
+            producer_engine="spymaster",
+            engine_version="1.0.0",
+        )
+    plan = pcp.build_price_cache_rebuild_plan(
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    payload = json.dumps(plan)
+    # Forbidden stale claims from the pre-amendment-1
+    # evidence doc.
+    forbidden_phrases = (
+        "all six are signal_engine_cache_refresher",
+        "all six 6E-5.0.0",
+        "all 6 are signal_engine_cache_refresher",
+    )
+    for phrase in forbidden_phrases:
+        assert phrase not in payload
+    # Affirmative: provenance_summary is present + carries
+    # at least two distinct groups (mirrors mixed
+    # production state).
+    assert "provenance_summary" in payload
+    assert plan["provenance_summary"][
+        "distinct_provenance_count"
+    ] == 2
+
+
+def test_planner_works_when_cache_results_directory_missing(
+    tmp_path,
+):
+    """The PLANNER itself must produce a valid (no-
+    exception) report even when ``signal_cache_dir`` does
+    not exist on disk. Every row classifies as
+    ``needs_source_refresh``; the test never touches the
+    real cache/results directory."""
+    missing_scd = tmp_path / "definitely_does_not_exist"
+    pcd = tmp_path / "definitely_does_not_exist_either"
+    # Sanity: neither dir exists.
+    assert not missing_scd.exists()
+    assert not pcd.exists()
+    plan = pcp.build_price_cache_rebuild_plan(
+        signal_cache_dir=missing_scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    assert plan["signal_cache_dir_exists"] is False
+    assert (
+        plan["stackbuilder_price_cache_dir_exists"]
+        is False
+    )
+    assert plan["ticker_count"] == 25
+    counts = plan["counts_by_recommended_action"]
+    # Every default-universe ticker should classify as
+    # needs_source_refresh when nothing is on disk.
+    assert (
+        counts[pcp.ACTION_NEEDS_SOURCE_REFRESH] == 25
+    )
+    # provenance_summary is empty (no use_existing rows).
+    assert (
+        plan["provenance_summary"][
+            "distinct_provenance_count"
+        ]
+        == 0
+    )
+    assert plan["provenance_summary"]["groups"] == []

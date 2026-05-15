@@ -1,11 +1,52 @@
 # Phase 6I-54a: Local secondary-price cache rebuild planner for StackBuilder pilot universe
 
-**Date:** 2026-05-15
+**Date:** 2026-05-15 (amendment-1 same day)
 **Base commit (main):** `5106375` (Phase 6I-53 squash-merge)
 **Branch:** `phase-6i-54a-stackbuilder-price-cache-rebuild-planner`
 **Status:** Read-only planner. No production writes. **Do not merge** until operator approval.
 
 `<PINNED_PYTHON> = C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`
+
+---
+
+## Amendment-1: portable tests + honest mixed-provenance reporting
+
+Codex audit caught two blockers in the original Phase 6I-54a commit (`a55ef10`):
+
+### Issue 1: production-state test was non-portable
+
+`test_production_state_classification_matches_expected` hard-failed in a clean Codex worktree where `project/cache/results` is absent (1 failed / 16 passed). Amendment-1 fixes this in two ways:
+
+1. The production-state test is renamed to `test_production_state_classification_skips_when_cache_absent` and **skips cleanly** via `pytest.skip(...)` when `cache/results` is missing OR when none of the 6 known-ready tickers have PKLs on disk. The smoke is now informational, never a hard failure.
+2. A new **fixture-based test** `test_six_use_existing_and_nineteen_needs_source_refresh_against_fixture` pins the same 6/19 classification deterministically using only `tmp_path` fixtures. This test works identically in any worktree.
+
+A separate test (`test_planner_works_when_cache_results_directory_missing`) explicitly pins that the **planner itself** produces a valid report when both cache dirs are missing — every default-universe ticker classifies as `needs_source_refresh` with an empty `provenance_summary`.
+
+### Issue 2: evidence doc overclaimed uniform provenance
+
+The original evidence doc said *all six* `use_existing_signal_cache` tickers were `producer_engine="signal_engine_cache_refresher"` / `engine_version="6E-5.0.0"`. The evidence JSON actually showed mixed provenance. The reality (verified by direct inspection of the per-row JSON):
+
+| Producer engine | Engine version | Ticker count | Tickers |
+|---|---|---|---|
+| `signal_engine_cache_refresher` | `6E-5.0.0` | 2 | `SPY, JNJ` |
+| `spymaster` | `1.0.0` | 4 | `AAPL, HD, MCD, WMT` |
+
+Amendment-1 adds a `provenance_summary` block to the planner output that surfaces this honestly. The block carries `distinct_provenance_count` and a `groups[]` list with `(producer_engine, engine_version, ticker_count, tickers)` per group. The summary covers ONLY `use_existing_signal_cache` rows (verified by `test_provenance_summary_excludes_non_use_existing_rows`).
+
+The 6 ready tickers remain `use_existing_signal_cache` candidates — Phase 6I-54a does NOT downgrade the four `spymaster/1.0.0` files to `manual_review` because both producer paths write Close prices into the same PKL shape (per the manifest's `params.price_source="Close"`). **However**, the planner now explicitly tells Phase 6I-54b:
+
+> `Phase 6I-54b MUST load and verify each candidate file via the approved provenance/loader path (NOT raw pickle.load) and perform actual Close-series extraction per ticker. Files produced by different builders / engine versions are NOT silently treated as identical -- the writer should record per-ticker provenance in its own evidence.`
+
+This is exposed both as a free-text field on `provenance_summary.phase_6i_54b_verification_requirement` and as a stable invariant in `future_write_contract` (already present pre-amendment-1).
+
+### Files changed in amendment-1
+
+- `project/stackbuilder_price_cache_rebuild_planner.py` — new `provenance_summary` block added to `build_price_cache_rebuild_plan` output. No other behaviour change.
+- `project/test_scripts/test_stackbuilder_price_cache_rebuild_planner.py` — 6 new amendment-1 tests + the original production smoke renamed + reworked to skip cleanly when cache/results is absent.
+- `project/md_library/shared/2026-05-15_PHASE_6I54A_STACKBUILDER_PRICE_CACHE_REBUILD_PLAN.md` (this doc) — amendment-1 section + Section 4 rewrite.
+- `project/md_library/shared/2026-05-15_PHASE_6I54A_STACKBUILDER_PRICE_CACHE_REBUILD_PLAN_EVIDENCE.json` — regenerated.
+
+**23 / 23 Phase 6I-54a tests pass** (17 original + 6 amendment-1). Combined Phase 6I-50/51/52/53/54a regression: 100 / 100. Production roots untouched (combined 83036, pre = post).
 
 ---
 
@@ -38,7 +79,7 @@ The planner module is explicit about which cache it is touching at every step; t
 
 ### Tests
 
-`project/test_scripts/test_stackbuilder_price_cache_rebuild_planner.py` — 17 focused tests, all passing.
+`project/test_scripts/test_stackbuilder_price_cache_rebuild_planner.py` — 23 focused tests (17 original + 6 amendment-1), all passing.
 
 | # | Test | Pins |
 |---|---|---|
@@ -60,7 +101,7 @@ The planner module is explicit about which cache it is touching at every step; t
 | 16 | `test_future_write_contract_is_well_formed` | Phase 6I-54b write contract carries destination, formats, required columns. |
 | 17 | `test_production_state_classification_matches_expected` | 6/25 `use_existing_signal_cache` (SPY, AAPL, JNJ, WMT, HD, MCD); 19/25 `needs_source_refresh`; 0 `manual_review` / `needs_network_fetch`. |
 
-Combined Phase 6I planner regression: **94 / 94 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 15 from 6I-53 + 17 from 6I-54a).
+Combined Phase 6I planner regression: **100 / 100 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 15 from 6I-53 + 23 from 6I-54a).
 
 ## 4. Per-ticker planner summary (production state, 2026-05-15)
 
@@ -92,9 +133,16 @@ For all six `use_existing_signal_cache` tickers, the planner confirmed:
 - `cache/results/<TICKER>_precomputed_results.pkl` exists.
 - `cache/results/<TICKER>_precomputed_results.pkl.manifest.json` exists and parses as JSON.
 - `params.price_source = "Close"`.
-- `producer_engine = "signal_engine_cache_refresher"`.
-- `engine_version = "6E-5.0.0"`.
 - `transformation_possible_without_network = True`.
+
+**Provenance is MIXED across the six tickers (post amendment-1 correction).** The original Phase 6I-54a evidence doc incorrectly claimed all six were `producer_engine="signal_engine_cache_refresher"` / `engine_version="6E-5.0.0"`. The actual on-disk distribution (verified by direct inspection of the per-row evidence JSON):
+
+| Producer engine | Engine version | Ticker count | Tickers |
+|---|---|---|---|
+| `signal_engine_cache_refresher` | `6E-5.0.0` | **2** | `SPY, JNJ` |
+| `spymaster` | `1.0.0` | **4** | `AAPL, HD, MCD, WMT` |
+
+The four `spymaster/1.0.0` files are **legacy** outputs of the original Spymaster path; the two `6E-5.0.0` files are recent outputs of the Phase 6E-5 refresher. The planner does NOT downgrade the legacy files because both producers write Close-price PKLs (per the manifest contract), but **Phase 6I-54b must verify each candidate independently** via the approved provenance/loader path and per-ticker Close-series extraction. Mixed provenance is recorded in the `provenance_summary` block of the evidence JSON.
 
 For all 19 `needs_source_refresh` tickers:
 - `cache/results/<TICKER>_precomputed_results.pkl` is missing.

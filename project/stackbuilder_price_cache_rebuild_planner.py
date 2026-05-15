@@ -518,6 +518,62 @@ def build_price_cache_rebuild_plan(
             r["ticker"],
         )
 
+    # Phase 6I-54a amendment-1: provenance summary over the
+    # ``use_existing_signal_cache`` rows. Codex audit
+    # observed that the on-disk cache/results PKLs are NOT
+    # all produced by the same builder -- some are legacy
+    # ``spymaster`` outputs, others are
+    # ``signal_engine_cache_refresher`` outputs. The
+    # planner does NOT pick one over the other; both are
+    # candidates. Phase 6I-54b MUST verify each candidate
+    # file via the approved provenance/loader path and
+    # actual Close extraction before producing
+    # ``price_cache/daily/<TICKER>.parquet``.
+    provenance_groups: dict[
+        tuple[str, str], list[str]
+    ] = {}
+    for r in rows:
+        if r["recommended_action"] != (
+            ACTION_USE_EXISTING_SIGNAL_CACHE
+        ):
+            continue
+        engine = r.get(
+            "signal_cache_producer_engine",
+        ) or "unknown_engine"
+        version = r.get(
+            "signal_cache_engine_version",
+        ) or "unknown_version"
+        key = (str(engine), str(version))
+        provenance_groups.setdefault(key, []).append(
+            r["ticker"],
+        )
+    provenance_summary = {
+        "groups": [
+            {
+                "producer_engine": engine,
+                "engine_version": version,
+                "ticker_count": len(tix),
+                "tickers": sorted(tix),
+            }
+            for (engine, version), tix
+            in sorted(provenance_groups.items())
+        ],
+        "distinct_provenance_count": len(
+            provenance_groups,
+        ),
+        "phase_6i_54b_verification_requirement": (
+            "Phase 6I-54b MUST load and verify each "
+            "candidate file via the approved "
+            "provenance/loader path (NOT raw "
+            "pickle.load) and perform actual Close-"
+            "series extraction per ticker. Files "
+            "produced by different builders / engine "
+            "versions are NOT silently treated as "
+            "identical -- the writer should record "
+            "per-ticker provenance in its own evidence."
+        ),
+    }
+
     # Future-write command template Phase 6I-54b will
     # implement. The template is DOCUMENTATION ONLY; this
     # planner never invokes it.
@@ -551,6 +607,7 @@ def build_price_cache_rebuild_plan(
         "tickers_by_recommended_action": (
             tickers_by_action
         ),
+        "provenance_summary": provenance_summary,
         "rows": rows,
         "documented_next_write_command_template": (
             documented_next_write_command_template

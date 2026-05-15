@@ -1,6 +1,6 @@
 {
   "schema_version": "stackbuilder_price_cache_rebuild_planner_v1",
-  "generated_at": "2026-05-15T09:33:15+00:00",
+  "generated_at": "2026-05-15T09:45:48+00:00",
   "phase": "phase_6i_54a",
   "phase_label": "stackbuilder_price_cache_rebuild_planner",
   "signal_cache_dir": "cache\\results",
@@ -46,6 +46,32 @@
     ],
     "needs_network_fetch": [],
     "manual_review": []
+  },
+  "provenance_summary": {
+    "groups": [
+      {
+        "producer_engine": "signal_engine_cache_refresher",
+        "engine_version": "6E-5.0.0",
+        "ticker_count": 2,
+        "tickers": [
+          "JNJ",
+          "SPY"
+        ]
+      },
+      {
+        "producer_engine": "spymaster",
+        "engine_version": "1.0.0",
+        "ticker_count": 4,
+        "tickers": [
+          "AAPL",
+          "HD",
+          "MCD",
+          "WMT"
+        ]
+      }
+    ],
+    "distinct_provenance_count": 2,
+    "phase_6i_54b_verification_requirement": "Phase 6I-54b MUST load and verify each candidate file via the approved provenance/loader path (NOT raw pickle.load) and perform actual Close-series extraction per ticker. Files produced by different builders / engine versions are NOT silently treated as identical -- the writer should record per-ticker provenance in its own evidence."
   },
   "rows": [
     {
