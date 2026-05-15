@@ -678,3 +678,144 @@ def test_generated_argv_still_parses_against_real_stackbuilder():
         assert parsed.max_k == 6
         assert parsed.combine_mode == "intersection"
         assert parsed.both_modes is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-52 amendment-2 regression tests.
+#
+# Codex re-audit caught two stale strings that survived
+# amendment-1:
+#   1. The module's POLICY_RERUN_CADENCE comment block
+#      claimed the Phase 6I-53 StackBuilder run is "gated
+#      by the existing two-key writer authorization at
+#      invocation time" -- false. stackbuilder.py has no
+#      such gate.
+#   2. The UNRESOLVED_OR_DEFERRED_POLICY_ITEMS entry for
+#      per_ticker_member_universe_sizing claimed "the
+#      first rollout fixes member universe size at 12 for
+#      every ticker", contradicting amendment-1's removal
+#      of the member_universe_size=12 decision.
+#
+# Both stale strings ended up in the SERIALIZED JSON
+# evidence. Amendment-2's negative-assertion tests run
+# against ``json.dumps(manifest)`` so any regression of
+# either stale phrase is caught the moment it ships.
+# Historical doc prose that explicitly says "the old
+# claim was wrong" is intentionally NOT covered by these
+# tests -- the doc may keep that framing.
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_manifest_does_not_carry_stale_member_size_claim():
+    """The regenerated evidence JSON must not contain the
+    pre-amendment-1 wording that claimed the first
+    rollout fixes member universe size at 12. Negative-
+    substring assertion against the actual serialized
+    payload, since the offending string lived in
+    UNRESOLVED_OR_DEFERRED_POLICY_ITEMS (passed through to
+    the JSON output)."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    payload = json.dumps(manifest)
+    forbidden_phrases = (
+        "fixes member universe size at 12",
+        "fixes member universe size",
+    )
+    for phrase in forbidden_phrases:
+        assert phrase not in payload, (
+            f"serialized manifest still contains "
+            f"forbidden stale phrase {phrase!r}"
+        )
+    # And the corrective replacement IS present (so a
+    # future drift that simply deletes the entry instead
+    # of correcting it gets caught).
+    assert (
+        "locks StackBuilder command parameters"
+        in payload
+    )
+    assert (
+        "does NOT fix per-ticker member universe size"
+        in payload
+    )
+
+
+def test_serialized_manifest_does_not_claim_stackbuilder_two_key_gate():
+    """The regenerated evidence JSON must not carry any
+    forward-looking claim that stackbuilder.py is gated
+    by the two-key writer authorization. The stale
+    POLICY_RERUN_CADENCE module comment did NOT
+    serialize, but the per-command ``notes`` field DOES,
+    so this test guards that path too."""
+    manifest = (
+        srp.build_stackbuilder_rollout_policy_manifest()
+    )
+    payload = json.dumps(manifest)
+    forbidden_phrases = (
+        # Pre-amendment-1 module-comment wording:
+        "gated by the existing two-key writer "
+        "authorization",
+        # Reasonable variants the audit might flag next:
+        "two-key writer authorization at invocation",
+        "two-key gate at invocation",
+    )
+    for phrase in forbidden_phrases:
+        assert phrase not in payload, (
+            f"serialized manifest still contains "
+            f"forbidden stale phrase {phrase!r}"
+        )
+    # The corrected affirmative wording is present in
+    # every command's notes (already pinned by
+    # ``test_no_command_notes_mention_write_or_two_key_gate``
+    # but kept here as a safety net).
+    assert (
+        "stackbuilder.py has NO --write flag"
+        in payload
+    )
+    assert (
+        "PRJCT9_AUTOMATION_WRITE_AUTH"
+        in payload
+    )
+    # And the corrective notes also mention the affirmative
+    # operator-decision gate.
+    assert (
+        "separate operator decision" in payload
+    )
+
+
+def test_module_source_does_not_keep_stale_forward_looking_strings():
+    """Belt-and-braces guard against the two stale
+    strings sneaking back into the module source as
+    forward-looking comments (not the historical
+    amendment-1 callout, which IS allowed to mention
+    them in past tense)."""
+    here = Path(__file__).resolve().parent.parent
+    src = (
+        here
+        / "confluence_stackbuilder_rollout_policy.py"
+    ).read_text(encoding="utf-8")
+    # The literal pre-amendment-1 phrase must NOT survive
+    # anywhere in the module source.
+    assert (
+        "fixes member universe size at 12"
+        not in src
+    ), (
+        "module source still contains the stale "
+        "'fixes member universe size at 12' phrase"
+    )
+    # The literal pre-amendment-1 module-comment wording
+    # also must not survive. The affirmative
+    # ``two-key gate that the ... writer family relies on``
+    # framing IS allowed (it says StackBuilder does NOT
+    # use the gate); only the forward-looking
+    # ``gated by the existing two-key writer
+    # authorization`` claim is forbidden.
+    assert (
+        "gated by the existing two-key writer "
+        "authorization at invocation time"
+        not in src
+    ), (
+        "module source still contains the stale "
+        "'gated by the existing two-key writer "
+        "authorization at invocation time' phrase"
+    )

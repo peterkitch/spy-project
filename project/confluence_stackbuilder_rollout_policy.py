@@ -218,8 +218,12 @@ POLICY_MIN_TRIGGER_DAYS: int = 30
 # Locked policy decision #5: re-run cadence. Pinned to
 # ``manual_supervised`` -- no scheduler. Phase 6I-53 will
 # be the FIRST supervised batch execution, one command per
-# ticker, gated by the existing two-key writer
-# authorization at invocation time.
+# ticker. stackbuilder.py has NO ``--write`` flag and does
+# NOT use ``PRJCT9_AUTOMATION_WRITE_AUTH`` (those gates
+# apply to the Phase 6H-5 / 6I-25 / 6I-31 writer family,
+# NOT to StackBuilder). The only authorization gate on a
+# StackBuilder invocation is the operator's separate
+# decision to actually run the command.
 POLICY_RERUN_CADENCE: str = "manual_supervised"
 
 # Locked policy decision #6: invalid-member rotation
@@ -407,10 +411,17 @@ PRODUCTION_ROOT_RELATIVE_PATHS: tuple[str, ...] = (
 # locked policy; future phases may revisit these.
 UNRESOLVED_OR_DEFERRED_POLICY_ITEMS: tuple[str, ...] = (
     "per_ticker_member_universe_sizing: the first rollout "
-    "fixes member universe size at 12 for every ticker. "
-    "A future phase may introduce market-cap-tuned or "
-    "liquidity-tuned per-ticker sizing once we have "
-    "operational evidence from the supervised batch.",
+    "locks StackBuilder command parameters (top_n=20, "
+    "bottom_n=20, max_k=6, search='beam', beam_width=12, "
+    "min_trigger_days=30) but does NOT fix per-ticker "
+    "member universe size at any specific number. The "
+    "legacy SPY seed-run directory shape carried 12 "
+    "ticker-mode tokens; that historical observation is "
+    "NOT a current command-line guarantee. A future phase "
+    "may introduce explicit per-ticker member-universe "
+    "sizing (market-cap-tuned, liquidity-tuned, etc.) "
+    "once we have operational evidence from the "
+    "supervised batch.",
     "automated_rerun_cadence: the first rollout is "
     "manual / supervised. A future phase may introduce a "
     "scheduler (daily / weekly / on-invalid-member-"

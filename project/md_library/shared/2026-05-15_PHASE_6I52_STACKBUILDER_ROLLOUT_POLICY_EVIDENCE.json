@@ -3,7 +3,7 @@
   "policy_name": "phase_6i_52_locked_policy",
   "policy_version": "v1",
   "policy_basis": "phase_6i_52_locked_policy",
-  "generated_at": "2026-05-15T08:56:18+00:00",
+  "generated_at": "2026-05-15T09:05:10+00:00",
   "seed_universe_source": "phase_6i_52_first_rollout_pilot_universe_v1",
   "seed_universe_count": 25,
   "seed_universe_tickers": [
@@ -69,7 +69,7 @@
     }
   },
   "unresolved_or_deferred_policy_items": [
-    "per_ticker_member_universe_sizing: the first rollout fixes member universe size at 12 for every ticker. A future phase may introduce market-cap-tuned or liquidity-tuned per-ticker sizing once we have operational evidence from the supervised batch.",
+    "per_ticker_member_universe_sizing: the first rollout locks StackBuilder command parameters (top_n=20, bottom_n=20, max_k=6, search='beam', beam_width=12, min_trigger_days=30) but does NOT fix per-ticker member universe size at any specific number. The legacy SPY seed-run directory shape carried 12 ticker-mode tokens; that historical observation is NOT a current command-line guarantee. A future phase may introduce explicit per-ticker member-universe sizing (market-cap-tuned, liquidity-tuned, etc.) once we have operational evidence from the supervised batch.",
     "automated_rerun_cadence: the first rollout is manual / supervised. A future phase may introduce a scheduler (daily / weekly / on-invalid-member-detected) once the supervised batch path is proven.",
     "invalid_member_auto_substitution: the first rollout uses the existing partial-effective-members + ``!`` warning path. A future phase may auto-substitute another candidate when a member is flagged ``invalid_or_delisted`` -- but only after the supervised batch confirms the partial path is stable at scale.",
     "combine_mode_union_evaluation: the first rollout pins ``intersection``. A future evaluation phase may A/B the ``union`` mode against the same ticker universe before deciding whether to switch.",
