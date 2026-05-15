@@ -337,8 +337,10 @@ DEFAULT_KNOWN_INVALID_MEMBERS: dict[str, dict[str, Any]] = {
 # launch-planner consumer can tell observed-from-source
 # apart from "we propose this but haven't validated it".
 STACKBUILDER_OBSERVED_DEFAULTS: dict[str, Any] = {
-    # From stackbuilder.py constructor defaults (the
-    # Phase 6I-50 survey quoted these from source):
+    # From stackbuilder.py ``parse_args`` argparse defaults
+    # (Phase 6I-50 amendment-1 verified these by reading
+    # the actual ``p.add_argument(...)`` lines in
+    # stackbuilder.py around L3311-L3351):
     "top_n": 20,
     "bottom_n": 20,
     "max_k": 6,
@@ -348,14 +350,27 @@ STACKBUILDER_OBSERVED_DEFAULTS: dict[str, Any] = {
     "both_modes": False,
     "alpha": 0.05,
     "min_marginal_capture": 0.0,
-    "k_patience": 1,
-    # Dashboard-layer defaults (NOT core engine defaults;
-    # documented separately because the operator may
-    # override them per-run):
-    "dashboard_seed_by": "total_capture",
-    "dashboard_optimize_by": (
-        "auto_resolves_to_seed_by_when_unset"
+    # Phase 6I-50 amendment-1 correction: k_patience
+    # default is 0 (not 1 as the original block
+    # claimed). Source: ``--k-patience type=int default=0``.
+    "k_patience": 0,
+    # Phase 6I-50 amendment-1 correction: combine_mode IS
+    # exposed as a CLI argument with documented default
+    # ``intersection``. Source:
+    # ``--combine-mode choices=['intersection','union']
+    # default='intersection'``.
+    "combine_mode": "intersection",
+    # Seed / optimize axis (exposed at the engine CLI in
+    # addition to the dashboard layer):
+    "seed_by": "total_capture",
+    "optimize_by": (
+        "none_resolves_to_seed_by_when_unset"
     ),
+    # Dashboard-layer defaults (NOT distinct from the
+    # engine ``--seed-by`` / ``--min-trigger-days``
+    # arguments above; kept for back-compat with the
+    # original block):
+    "dashboard_seed_by": "total_capture",
     "dashboard_min_trigger_days": 30,
     # Run-directory convention observed in production
     # (Phase 6I-49 SPY artifact):
@@ -363,6 +378,13 @@ STACKBUILDER_OBSERVED_DEFAULTS: dict[str, Any] = {
         "seedTC__<TICKER>-<MODE>[_<TICKER>-<MODE>]*"
     ),
     "seed_run_dir_mode_codes": ("D", "I"),
+    # Entry-argument observed at the CLI. The
+    # large-universe launch planner originally documented
+    # this as ``--ticker``; Phase 6I-50 amendment-1
+    # corrects it to ``--secondary`` (the actual entry
+    # flag; ``--secondaries`` is the comma-separated
+    # variant).
+    "entry_argument": "--secondary",
 }
 
 
@@ -400,15 +422,18 @@ STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS: tuple[
     "(``both_modes=True``) or stick with the current "
     "single-direction default? The Phase 6I-50 prompt "
     "asked the planner to leave this unresolved.",
-    "combine_mode: stackbuilder.py defines "
-    "COMBINE_INTERSECTION as a private constant but does "
-    "NOT expose ``combine_mode`` as a CLI argument with a "
-    "documented default. The Phase 6I-50 proposed default "
-    "(``intersection``) needs operator confirmation that "
-    "the engine actually uses that combine mode in the "
-    "default path, AND that the same setting carries "
-    "through into the Phase 6I-22 multi-window K input "
-    "adapter.",
+    "combine_mode: stackbuilder.py exposes "
+    "``--combine-mode choices=['intersection','union'] "
+    "default='intersection'`` (Phase 6I-50 amendment-1 "
+    "correction; the original Phase 6I-50 block "
+    "incorrectly claimed the CLI did not expose this "
+    "argument). The observed default is ``intersection``; "
+    "the operator must confirm whether the large-universe "
+    "launch should KEEP intersection (the conservative "
+    "all-members-agree path) or switch to ``union`` "
+    "(any-member-agree). The same confirmation should "
+    "verify the Phase 6I-22 multi-window K input adapter "
+    "respects the chosen combine mode.",
     "seed_by / optimize_by: stackbuilder.py treats these "
     "as dashboard-layer settings, with optimize_by "
     "auto-resolving to seed_by when unset. The planner's "
@@ -1610,13 +1635,24 @@ def build_large_universe_launch_plan(
                 if r["stackbuilder_ambiguous_selection"]
             )
         ),
-        # Documentation-only stackbuilder command template:
+        # Documentation-only stackbuilder command template.
+        # Phase 6I-50 amendment-1 corrections:
+        #   * ``--ticker`` -> ``--secondary`` (the original
+        #     value did NOT match the actual CLI; the entry
+        #     flag is ``--secondary``, with ``--secondaries``
+        #     as the comma-separated variant).
+        #   * Added ``--combine-mode intersection``
+        #     explicitly (the engine default; documenting
+        #     it in the template makes the intended
+        #     combine semantics auditable in the
+        #     command line itself).
         "documented_stackbuilder_command_template": (
             '"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/'
             'spyproject2/python.exe" stackbuilder.py '
-            '--ticker <TICKER> --top-n 20 --bottom-n 20 '
+            '--secondary <TICKER> --top-n 20 --bottom-n 20 '
             '--max-k 6 --search beam --beam-width 12 '
-            '--seed-by total_capture --min-trigger-days 30'
+            '--seed-by total_capture --min-trigger-days 30 '
+            '--combine-mode intersection'
         ),
     }
 

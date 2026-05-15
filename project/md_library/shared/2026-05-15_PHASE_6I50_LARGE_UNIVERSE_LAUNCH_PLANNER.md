@@ -1,9 +1,30 @@
 # Phase 6I-50: Large-universe Confluence launch planner + StackBuilder automation policy planner
 
-**Date:** 2026-05-15
+**Date:** 2026-05-15 (amendment-1 same day)
 **Base commit (main):** `5fc50f3` (Phase 6I-49 squash-merge)
 **Branch:** `phase-6i-50-large-universe-launch-planner`
 **Status:** Read-only planner. No production writes. **Do not merge** until operator approval.
+
+---
+
+## Amendment-1: corrected StackBuilder CLI / default facts
+
+Codex audit of the original Phase 6I-50 commit (`51ff504`) flagged three material errors in the planner's StackBuilder policy section. Amendment-1 corrects them at module + test + evidence levels.
+
+| Field | Original (wrong) | Corrected |
+|---|---|---|
+| Command-template entry argument | `--ticker <TICKER>` | `--secondary <TICKER>` (the actual `stackbuilder.py` argparse name; `--secondaries` is the comma-separated variant) |
+| `observed_defaults_from_source.k_patience` | `1` | `0` (matches `p.add_argument('--k-patience', type=int, default=0, ...)` in `stackbuilder.py` ~L3348) |
+| `combine_mode` exposure claim | "`stackbuilder.py` defines `COMBINE_INTERSECTION` as a private constant but does NOT expose `combine_mode` as a CLI argument" | **It IS exposed.** `stackbuilder.py` ~L3350 declares `p.add_argument('--combine-mode', choices=['intersection','union'], default='intersection', ...)`. `observed_defaults_from_source` now records `combine_mode: 'intersection'` directly. The unresolved-question entry was reworded to affirm CLI exposure and ask the operator only whether the launch should keep `intersection` or switch to `union`. |
+
+Files changed in amendment-1:
+
+- `project/confluence_large_universe_launch_planner.py` — `STACKBUILDER_OBSERVED_DEFAULTS` (k_patience=0, combine_mode='intersection', entry_argument='--secondary', seed_by surfaced); `STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS` (combine_mode entry reworded); `documented_stackbuilder_command_template` (--ticker → --secondary, --combine-mode intersection added).
+- `project/test_scripts/test_confluence_large_universe_launch_planner.py` — 3 new tests: `test_command_template_uses_secondary_not_ticker`, `test_observed_defaults_match_stackbuilder_parse_args_defaults` (compares against `stackbuilder.parse_args([])` defaults at runtime), `test_unresolved_questions_no_longer_claim_combine_mode_missing`. **16 / 16 tests pass.**
+- `project/md_library/shared/2026-05-15_PHASE_6I50_LAUNCH_PLANNER_EVIDENCE.json` — regenerated.
+- `project/md_library/shared/2026-05-15_PHASE_6I50_LARGE_UNIVERSE_LAUNCH_PLANNER.md` (this doc) — amendment-1 section + Section 5 updates.
+
+Re-running `--all-artifacts` against production for amendment-1 verification: pre/post file counts identical (3239 / 1634 / 35 / 5228 / 72899) across all 5 production roots. **No production activity** — no `--write`, no `PRJCT9_AUTOMATION_WRITE_AUTH`, no yfinance, no source refresh, no pipeline runner, no batch engine.
 
 ---
 
@@ -110,16 +131,25 @@ Universe inspected: 2 tickers (the current contents of `output/research_artifact
 
 The planner's JSON evidence (`2026-05-15_PHASE_6I50_LAUNCH_PLANNER_EVIDENCE.json`) and the empty stderr file land in `md_library/shared/` — **not** in a guarded production root.
 
-## 5. StackBuilder policy section
+## 5. StackBuilder policy section (post amendment-1)
 
-The planner reports three blocks side-by-side:
+The planner reports three blocks side-by-side. Amendment-1 corrected the bolded items.
 
-- **Observed defaults from source:** `top_n=20`, `bottom_n=20`, `max_k=6`, `search='beam'`, `beam_width=12`, `exhaustive_k=4`, `both_modes=False`, `alpha=0.05`, `min_marginal_capture=0.0`, `k_patience=1`, plus dashboard defaults (`seed_by='total_capture'`, `min_trigger_days=30`).
+- **Observed defaults from source (verified against `stackbuilder.parse_args([])`):** `top_n=20`, `bottom_n=20`, `max_k=6`, `search='beam'`, `beam_width=12`, `exhaustive_k=4`, `both_modes=False`, `alpha=0.05`, `min_marginal_capture=0.0`, **`k_patience=0`** (amendment-1 corrected from `1`), **`combine_mode='intersection'`** (amendment-1 added; the CLI does expose `--combine-mode`), `seed_by='total_capture'`, `optimize_by=None_resolves_to_seed_by_when_unset`, **`entry_argument='--secondary'`** (amendment-1 added).
 - **Proposed launch defaults:** `search='beam'`, `beam_width=12`, `max_k=6`, `seed_by='total_capture'`, `optimize_by='total_capture'`, `min_trigger_days=30`, `combine_mode='intersection'`, `top_n=20`, `bottom_n=20`. Clearly labelled as PROPOSALS, NOT decisions.
-- **Unresolved policy questions (6):**
+- **Documented launch command template (post amendment-1):**
+
+  ```
+  "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+      stackbuilder.py --secondary <TICKER> --top-n 20 --bottom-n 20 \
+      --max-k 6 --search beam --beam-width 12 --seed-by total_capture \
+      --min-trigger-days 30 --combine-mode intersection
+  ```
+
+- **Unresolved policy questions (6 — same count as the original block; the `combine_mode` entry was reworded, not removed):**
   1. `both_modes`: observed default `False`; large-universe should-it-be-True needs an operator decision.
-  2. `combine_mode`: `stackbuilder.py` defines `COMBINE_INTERSECTION` privately but does not expose a `--combine-mode` CLI default; the planner's proposed `intersection` needs operator confirmation that the engine actually defaults to it AND that the same setting carries through into the Phase 6I-22 multi-window K input adapter.
-  3. `seed_by` / `optimize_by`: dashboard-layer defaults; `total_capture` proposal needs operator confirmation.
+  2. `combine_mode` (amendment-1 reworded): **the CLI exposes `--combine-mode choices=['intersection','union'] default='intersection'`**. The observed default is `intersection`. The operator must confirm whether the large-universe launch should KEEP `intersection` (conservative all-members-agree path) or switch to `union` (any-member-agree), and verify the Phase 6I-22 multi-window K input adapter respects the chosen combine mode.
+  3. `seed_by` / `optimize_by`: `total_capture` proposal needs operator confirmation.
   4. Per-ticker member-universe sizing (fixed 12 / fixed N / market-cap-tuned / other) — operator decision.
   5. Re-run cadence (daily / weekly / on-invalid-member-detected) — operator decision.
   6. Invalid-member rotation policy when a member is flagged `invalid_or_delisted` (Phase 6I-43) — operator decision.

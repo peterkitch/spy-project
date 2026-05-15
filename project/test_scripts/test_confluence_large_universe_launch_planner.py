@@ -956,3 +956,142 @@ def test_no_forbidden_top_level_imports():
         f"Forbidden top-level imports in planner: "
         f"{sorted(leaked)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-50 amendment-1 tests: pin the corrected
+# StackBuilder CLI facts that Codex flagged.
+#
+#   * The documented command template MUST use ``--secondary
+#     <TICKER>`` (NOT ``--ticker <TICKER>`` -- which is not
+#     a real stackbuilder.py argument).
+#   * Observed defaults k_patience=0 and
+#     combine_mode='intersection' MUST match the actual
+#     argparse defaults in stackbuilder.parse_args.
+#   * Unresolved policy questions MUST NOT claim that
+#     stackbuilder.py lacks a ``--combine-mode`` CLI
+#     argument (since the original Phase 6I-50 block did
+#     make that claim, and it was wrong).
+# ---------------------------------------------------------------------------
+
+
+def test_command_template_uses_secondary_not_ticker():
+    """The documented command template must use the real
+    StackBuilder entry argument ``--secondary <TICKER>``,
+    NOT the fabricated ``--ticker <TICKER>`` that the
+    original Phase 6I-50 block used."""
+    report = lup.build_large_universe_launch_plan(
+        [],
+        artifact_root=None,
+        cache_dir=None,
+        signal_library_dir=None,
+        stackbuilder_root=None,
+    )
+    template = (
+        report["stackbuilder_policy"][
+            "documented_stackbuilder_command_template"
+        ]
+    )
+    assert "--secondary <TICKER>" in template, (
+        f"command template should reference "
+        f"--secondary <TICKER>; got: {template!r}"
+    )
+    # Hard guard against regressions to the wrong flag.
+    assert "--ticker " not in template, (
+        f"command template should NOT use --ticker; "
+        f"got: {template!r}"
+    )
+    # Phase 6I-50 amendment-1 also pins that the
+    # ``--combine-mode intersection`` default is
+    # explicitly surfaced in the template (the operator
+    # asked for it to be present when the proposed launch
+    # default keeps ``intersection``).
+    assert "--combine-mode intersection" in template, (
+        f"command template should pin "
+        f"--combine-mode intersection; got: {template!r}"
+    )
+
+
+def test_observed_defaults_match_stackbuilder_parse_args_defaults():
+    """Compare the planner's
+    ``STACKBUILDER_OBSERVED_DEFAULTS`` block against the
+    actual argparse defaults emitted by
+    ``stackbuilder.parse_args([])``. Pins the
+    Phase 6I-50 amendment-1 corrections so a future drift
+    between the planner doc-block and the real CLI is
+    caught by this test rather than by the next Codex
+    audit."""
+    # Deferred import to keep the planner module's
+    # top-level import surface clean (the planner itself
+    # NEVER imports stackbuilder; this test does, in test
+    # code).
+    import stackbuilder
+
+    ns = stackbuilder.parse_args([])
+    observed = lup.STACKBUILDER_OBSERVED_DEFAULTS
+
+    # Phase 6I-50 amendment-1 pins.
+    assert ns.k_patience == 0
+    assert observed["k_patience"] == ns.k_patience
+    assert ns.combine_mode == "intersection"
+    assert observed["combine_mode"] == ns.combine_mode
+
+    # And the unchanged defaults from the original block.
+    assert observed["top_n"] == ns.top_n == 20
+    assert observed["bottom_n"] == ns.bottom_n == 20
+    assert observed["max_k"] == ns.max_k == 6
+    assert observed["search"] == ns.search == "beam"
+    assert observed["beam_width"] == ns.beam_width == 12
+    assert (
+        observed["exhaustive_k"] == ns.exhaustive_k == 4
+    )
+    assert observed["both_modes"] == ns.both_modes is False
+    assert observed["alpha"] == ns.alpha == 0.05
+    assert (
+        observed["min_marginal_capture"]
+        == ns.min_marginal_capture == 0.0
+    )
+    assert (
+        observed["seed_by"] == ns.seed_by
+        == "total_capture"
+    )
+
+    # The entry argument is ``--secondary`` (not
+    # ``--ticker``). The planner records this explicitly
+    # so an aggregate consumer can read it without parsing
+    # the command template string.
+    assert observed["entry_argument"] == "--secondary"
+
+
+def test_unresolved_questions_no_longer_claim_combine_mode_missing():
+    """Phase 6I-50 amendment-1 reworded the combine_mode
+    unresolved-policy entry so it no longer incorrectly
+    claims the CLI lacks a ``--combine-mode`` argument.
+    The reworded entry should affirm that the argument IS
+    exposed and that the unresolved question is whether
+    the operator wants to keep ``intersection`` or switch
+    to ``union``."""
+    questions = list(
+        lup.STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS,
+    )
+    combine_entries = [
+        q for q in questions
+        if q.startswith("combine_mode")
+    ]
+    # The block still includes a combine_mode entry (the
+    # operator may want to keep it on the unresolved list
+    # so the launch run is explicitly authorized), but
+    # the wording must not claim CLI absence.
+    assert len(combine_entries) == 1
+    entry = combine_entries[0]
+    # Forbidden wording from the original (wrong) block.
+    # The corrective wording may reference the historical
+    # error in past tense, which is allowed; the guards
+    # below pin only the literal regression shapes.
+    assert "does NOT expose" not in entry
+    assert "lacks ``--combine-mode``" not in entry
+    # Affirmative wording: the CLI exposes combine_mode +
+    # the default is intersection.
+    assert "exposes" in entry
+    assert "intersection" in entry
+    assert "union" in entry

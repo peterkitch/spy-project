@@ -1,6 +1,6 @@
 {
   "schema_version": "confluence_large_universe_launch_planner_v1",
-  "generated_at": "2026-05-15T07:09:49+00:00",
+  "generated_at": "2026-05-15T07:21:31+00:00",
   "universe_mode": "all_artifacts",
   "artifact_root": "output\\research_artifacts",
   "cache_dir": "cache\\results",
@@ -201,15 +201,18 @@
       "both_modes": false,
       "alpha": 0.05,
       "min_marginal_capture": 0.0,
-      "k_patience": 1,
+      "k_patience": 0,
+      "combine_mode": "intersection",
+      "seed_by": "total_capture",
+      "optimize_by": "none_resolves_to_seed_by_when_unset",
       "dashboard_seed_by": "total_capture",
-      "dashboard_optimize_by": "auto_resolves_to_seed_by_when_unset",
       "dashboard_min_trigger_days": 30,
       "seed_run_dir_template": "seedTC__<TICKER>-<MODE>[_<TICKER>-<MODE>]*",
       "seed_run_dir_mode_codes": [
         "D",
         "I"
-      ]
+      ],
+      "entry_argument": "--secondary"
     },
     "proposed_launch_defaults": {
       "search": "beam",
@@ -224,7 +227,7 @@
     },
     "unresolved_policy_questions": [
       "both_modes: observed default is False. Should the large-universe launch run both Buy + Short pairs (``both_modes=True``) or stick with the current single-direction default? The Phase 6I-50 prompt asked the planner to leave this unresolved.",
-      "combine_mode: stackbuilder.py defines COMBINE_INTERSECTION as a private constant but does NOT expose ``combine_mode`` as a CLI argument with a documented default. The Phase 6I-50 proposed default (``intersection``) needs operator confirmation that the engine actually uses that combine mode in the default path, AND that the same setting carries through into the Phase 6I-22 multi-window K input adapter.",
+      "combine_mode: stackbuilder.py exposes ``--combine-mode choices=['intersection','union'] default='intersection'`` (Phase 6I-50 amendment-1 correction; the original Phase 6I-50 block incorrectly claimed the CLI did not expose this argument). The observed default is ``intersection``; the operator must confirm whether the large-universe launch should KEEP intersection (the conservative all-members-agree path) or switch to ``union`` (any-member-agree). The same confirmation should verify the Phase 6I-22 multi-window K input adapter respects the chosen combine mode.",
       "seed_by / optimize_by: stackbuilder.py treats these as dashboard-layer settings, with optimize_by auto-resolving to seed_by when unset. The planner's proposal (both set to ``total_capture``) needs operator confirmation that ``total_capture`` is the intended large-universe launch metric (vs. ``sharpe_ratio`` or another seed/optimize axis).",
       "Per-ticker member-universe sizing: each StackBuilder run encodes a fixed member set (12 for the SPY K-universe). The planner does NOT yet have a policy for how to choose member-universe size per ticker for a large-universe launch. Operator decision: fixed 12, fixed N, per-ticker N tuned by market-cap / liquidity, or other criterion.",
       "Re-run cadence: the planner does NOT yet have a policy for how often a ticker's StackBuilder run should be regenerated (daily / weekly / on invalid-member-detected). Operator decision.",
@@ -240,7 +243,7 @@
       "SPY"
     ],
     "tickers_with_ambiguous_stackbuilder_selection": [],
-    "documented_stackbuilder_command_template": "\"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe\" stackbuilder.py --ticker <TICKER> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --min-trigger-days 30"
+    "documented_stackbuilder_command_template": "\"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe\" stackbuilder.py --secondary <TICKER> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --min-trigger-days 30 --combine-mode intersection"
   },
   "remaining_limitations": [
     "This planner is read-only. It inspects production roots and the existing Phase 6I-34 / 6I-43 / 6I-47 / 6I-48 surfaces; it does NOT run StackBuilder, yfinance, the source-cache refresher, the stable-promotion writer, the Confluence patch writer, or any pipeline runner.",
