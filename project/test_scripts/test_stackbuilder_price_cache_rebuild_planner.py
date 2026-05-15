@@ -669,24 +669,61 @@ def test_production_state_classification_skips_when_cache_absent():
     by_action = plan["tickers_by_recommended_action"]
     assert plan["ticker_count"] == 25
     assert (
-        plan["stackbuilder_price_cache_dir_exists"]
-        is False
-    )
-    assert (
-        counts[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE] == 6
-    )
-    assert (
         counts[pcp.ACTION_NEEDS_SOURCE_REFRESH] == 19
     )
     assert (
         counts[pcp.ACTION_NEEDS_NETWORK_FETCH] == 0
     )
-    assert (
-        counts[pcp.ACTION_MANUAL_REVIEW] == 0
+    # Phase 6I-54b state-aware branch. The 6 known-ready
+    # tickers classify as either ``use_existing_signal_
+    # cache`` (pre-Phase-6I-54b state, when
+    # price_cache/daily has NO files for them) or
+    # ``manual_review`` (post-Phase-6I-54b state, when
+    # the writer has materialized CSV files for them
+    # and the planner correctly flags
+    # ``stackbuilder_price_cache_already_present`` as a
+    # blocker so the operator decides overwrite vs keep).
+    pcd = here.parent / "project" / "price_cache" / "daily"
+    if not pcd.exists():
+        pcd = here / "price_cache" / "daily"
+    ready_files_present = (
+        pcd.exists()
+        and all(
+            (
+                (pcd / f"{t}.csv").is_file()
+                or (pcd / f"{t}.parquet").is_file()
+            )
+            for t in known_ready
+        )
     )
-    assert sorted(
-        by_action[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE]
-    ) == sorted(known_ready)
+    if ready_files_present:
+        # Post-Phase-6I-54b state.
+        assert (
+            counts[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE]
+            == 0
+        )
+        assert (
+            counts[pcp.ACTION_MANUAL_REVIEW] == 6
+        )
+        assert sorted(
+            by_action[pcp.ACTION_MANUAL_REVIEW]
+        ) == sorted(known_ready)
+    else:
+        # Pre-Phase-6I-54b state.
+        assert (
+            plan["stackbuilder_price_cache_dir_exists"]
+            is False
+        )
+        assert (
+            counts[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE]
+            == 6
+        )
+        assert (
+            counts[pcp.ACTION_MANUAL_REVIEW] == 0
+        )
+        assert sorted(
+            by_action[pcp.ACTION_USE_EXISTING_SIGNAL_CACHE]
+        ) == sorted(known_ready)
 
 
 # ---------------------------------------------------------------------------

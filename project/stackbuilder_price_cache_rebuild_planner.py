@@ -176,6 +176,51 @@ BLOCKER_PRICE_SOURCE_NOT_CLOSE: str = (
 BLOCKER_PRICE_CACHE_ALREADY_PRESENT: str = (
     "stackbuilder_price_cache_already_present"
 )
+BLOCKER_INVALID_TICKER_PATH_UNSAFE: str = (
+    "invalid_ticker_path_unsafe"
+)
+
+
+# Phase 6I-54b amendment-1 mirror: the same allowed
+# ticker character set the writer uses, kept in sync
+# defensively. Both modules construct file paths from
+# ticker strings, so both need the same protection.
+_TICKER_ALLOWED_CHARSET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-^_",
+)
+
+
+def _is_safe_ticker(ticker: str) -> bool:
+    """Mirror of the Phase 6I-54b writer's ticker path-
+    safety validator. Returns True when the ticker is
+    safe to use as a path component; False otherwise.
+
+    This module is read-only, so the impact of an unsafe
+    ticker is limited to ``Path.exists()`` probes on
+    files outside the declared cache roots -- which is
+    still leakage worth preventing per Codex's guidance.
+    Unsafe tickers route directly to ``manual_review``
+    with the ``invalid_ticker_path_unsafe`` blocker.
+    """
+    if not isinstance(ticker, str):
+        return False
+    raw = ticker
+    if not raw or not raw.strip():
+        return False
+    if "/" in raw or "\\" in raw:
+        return False
+    if ".." in raw:
+        return False
+    if ":" in raw:
+        return False
+    norm = raw.strip().upper()
+    if not norm:
+        return False
+    if not all(c in _TICKER_ALLOWED_CHARSET for c in norm):
+        return False
+    if norm.startswith(".") or norm.startswith("-"):
+        return False
+    return True
 
 
 # Pinned interpreter (matches Phase 6I-50 / 6I-51 / 6I-52
@@ -293,6 +338,36 @@ def _classify_ticker(
 ) -> dict[str, Any]:
     """Per-ticker classification. Read-only: no PKL
     load, no binary file content access, no network."""
+    # Phase 6I-54b amendment-1 mirror: reject path-unsafe
+    # tickers BEFORE any filesystem probe. Even though
+    # this module is read-only, an unsafe ticker can
+    # cause Path.exists()/is_file() calls against paths
+    # outside the declared cache roots (e.g. via
+    # ``../ESCAPE``). Unsafe tickers route directly to
+    # ``manual_review`` with the
+    # ``invalid_ticker_path_unsafe`` blocker.
+    if not _is_safe_ticker(ticker):
+        return {
+            "ticker": ticker,
+            "expected_stackbuilder_cache_paths": [],
+            "current_cache_status": "missing",
+            "existing_stackbuilder_cache_path": None,
+            "signal_cache_pkl_path": None,
+            "signal_cache_manifest_path": None,
+            "signal_cache_pkl_present": False,
+            "signal_cache_manifest_present": False,
+            "signal_cache_price_source": None,
+            "signal_cache_producer_engine": None,
+            "signal_cache_engine_version": None,
+            "signal_cache_build_timestamp": None,
+            "transformation_possible_without_network": (
+                False
+            ),
+            "recommended_action": ACTION_MANUAL_REVIEW,
+            "blocker_codes": [
+                BLOCKER_INVALID_TICKER_PATH_UNSAFE,
+            ],
+        }
     expected_paths = _expected_stackbuilder_cache_paths(
         ticker,
         stackbuilder_price_cache_dir=(
