@@ -29,6 +29,9 @@
         "secondary_price_cache_present_but_unused_by_impactsearch"
       ],
       "output_path": "output/impactsearch\\SPY_analysis.xlsx",
+      "primary_signal_libraries_missing": [],
+      "primary_signal_library_found_count": 25,
+      "primary_signal_library_missing_count": 0,
       "requires_allow_network_fetch_flag": true,
       "requires_separate_operator_authorization": true,
       "requires_write_flag": true,
@@ -63,6 +66,9 @@
         "secondary_price_cache_present_but_unused_by_impactsearch"
       ],
       "output_path": "output/impactsearch\\AAPL_analysis.xlsx",
+      "primary_signal_libraries_missing": [],
+      "primary_signal_library_found_count": 25,
+      "primary_signal_library_missing_count": 0,
       "requires_allow_network_fetch_flag": true,
       "requires_separate_operator_authorization": true,
       "requires_write_flag": true,
@@ -97,6 +103,9 @@
         "secondary_price_cache_present_but_unused_by_impactsearch"
       ],
       "output_path": "output/impactsearch\\JNJ_analysis.xlsx",
+      "primary_signal_libraries_missing": [],
+      "primary_signal_library_found_count": 25,
+      "primary_signal_library_missing_count": 0,
       "requires_allow_network_fetch_flag": true,
       "requires_separate_operator_authorization": true,
       "requires_write_flag": true,
@@ -131,6 +140,9 @@
         "secondary_price_cache_present_but_unused_by_impactsearch"
       ],
       "output_path": "output/impactsearch\\WMT_analysis.xlsx",
+      "primary_signal_libraries_missing": [],
+      "primary_signal_library_found_count": 25,
+      "primary_signal_library_missing_count": 0,
       "requires_allow_network_fetch_flag": true,
       "requires_separate_operator_authorization": true,
       "requires_write_flag": true,
@@ -165,6 +177,9 @@
         "secondary_price_cache_present_but_unused_by_impactsearch"
       ],
       "output_path": "output/impactsearch\\HD_analysis.xlsx",
+      "primary_signal_libraries_missing": [],
+      "primary_signal_library_found_count": 25,
+      "primary_signal_library_missing_count": 0,
       "requires_allow_network_fetch_flag": true,
       "requires_separate_operator_authorization": true,
       "requires_write_flag": true,
@@ -199,13 +214,16 @@
         "secondary_price_cache_present_but_unused_by_impactsearch"
       ],
       "output_path": "output/impactsearch\\MCD_analysis.xlsx",
+      "primary_signal_libraries_missing": [],
+      "primary_signal_library_found_count": 25,
+      "primary_signal_library_missing_count": 0,
       "requires_allow_network_fetch_flag": true,
       "requires_separate_operator_authorization": true,
       "requires_write_flag": true,
       "secondary": "MCD"
     }
   ],
-  "generated_at_utc": "2026-05-15T23:28:10.206843+00:00",
+  "generated_at_utc": "2026-05-15T23:47:04.627027+00:00",
   "pinned_interpreter": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe",
   "schema_version": "impactsearch_workbook_runner_v1",
   "summary": {

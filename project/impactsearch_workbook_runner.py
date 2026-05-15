@@ -119,19 +119,43 @@ any non-``read_only`` class so the supervised-batch
 phase that follows must re-confirm authorization per
 ticker.
 
-Atomicity
----------
+Atomicity (amendment-1: preserves append/dedupe)
+------------------------------------------------
 
-When ``--write`` is supplied, the runner calls
-``export_results_to_excel`` with a sibling
-``<SECONDARY>_analysis.xlsx.runner_partial`` path inside
-the production output directory, then ``os.replace()``s
-the workbook + sidecar to the canonical names on
-success. If the export raises, the partial file is
-removed in a ``finally`` block. This preserves
-ImpactSearch's exact write semantics (same writer
-function, same column order, same sidecar manifest)
-while preventing a half-written canonical workbook.
+When ``--write`` is supplied, the runner stages an
+atomic XLSX + sidecar replacement that **preserves
+ImpactSearch's existing append/dedupe semantics**:
+
+  1. If the canonical workbook
+     (``<SECONDARY>_analysis.xlsx``) exists, copy it to
+     the sibling ``runner_partial`` path. Same for the
+     canonical sidecar (``.manifest.json``).
+  2. Call ``export_results_to_excel(partial_path, ...)``.
+     Because the partial path now carries the prior
+     workbook + sidecar bytes, ImpactSearch's existing
+     read-existing -> append -> dedupe -> sort -> write
+     logic at ``impactsearch.py:2631-2667`` runs
+     normally, and the preexisting manifest inspector at
+     ``impactsearch.py:2629 _inspect_preexisting_xlsx_manifest``
+     observes the same prior state it would have
+     observed if writing directly to the canonical
+     path.
+  3. ``os.replace`` the partial workbook back to the
+     canonical name; ``os.replace`` the partial sidecar
+     to the canonical sidecar if one was written.
+  4. On any failure during steps 1-3, remove the
+     partial workbook + partial sidecar in a
+     ``finally`` block and re-raise. The canonical
+     workbook + sidecar remain byte-identical to their
+     pre-call state because the canonical names are
+     only touched by ``os.replace`` after a successful
+     export.
+
+This restores the exact ImpactSearch write semantics
+the runner doc previously claimed (PR #275
+pre-amendment-1 dropped them by exporting to a fresh
+partial path and then ``os.replace``ing over the
+canonical, which silently discarded preexisting rows).
 
 Public surface
 --------------
@@ -183,6 +207,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -231,6 +256,20 @@ DEFAULT_SIGNAL_LIB_DIR_RELATIVE: str = (
 # Matches stackbuilder.py:3363 default + Phase 6I-52
 # locked policy expectation, and Phase 6I-55a usage.
 DEFAULT_IMPACT_XLSX_MAX_AGE_DAYS: int = 45
+
+
+# Matches ``impactsearch.py:705`` (``ENGINE_VERSION = "1.0.0"``).
+# Pinned at this value because ``impactsearch._lib_path_for``
+# at ``impactsearch.py:1519-1523`` constructs the library
+# filename as ``f"{ticker}_stable_v{ENGINE_VERSION.replace('.', '_')}.pkl"``.
+# Future ENGINE_VERSION drift in impactsearch.py would
+# break the runner's primary-library scan; the focused
+# test ``test_engine_version_matches_impactsearch`` pins
+# this so any future ImpactSearch upgrade surfaces here.
+IMPACTSEARCH_ENGINE_VERSION: str = "1.0.0"
+IMPACTSEARCH_ENGINE_VERSION_WITH_UNDERSCORES: str = (
+    IMPACTSEARCH_ENGINE_VERSION.replace(".", "_")
+)
 
 
 # Primary-universe sources accepted by the runner.
@@ -690,6 +729,118 @@ def resolve_primary_universe(
 
 
 # ---------------------------------------------------------------------------
+# Primary signal-library availability scan
+# ---------------------------------------------------------------------------
+
+
+def _default_primary_library_existence_checker(
+    ticker: str, signal_lib_dir: str,
+) -> bool:
+    """Mirror ``impactsearch._lib_path_for`` /
+    ``impactsearch.load_signal_library`` discovery:
+
+      * Look for
+        ``signal_library/data/stable/{ticker}_stable_v
+        {ENGINE_VERSION_DOTS_TO_UNDERSCORES}.pkl``.
+      * If the ticker contains ``.``, retry with the
+        ``.``-replaced-by-``-`` variant.
+
+    Mirrors ``impactsearch.py:1519`` (path construction)
+    and ``impactsearch.py:1538-1544`` (dot/dash retry
+    cascade). Does NOT load the .pkl bytes -- existence
+    only.
+    """
+    if not is_safe_ticker(ticker):
+        return False
+    if not signal_lib_dir:
+        return False
+    suffix = (
+        IMPACTSEARCH_ENGINE_VERSION_WITH_UNDERSCORES
+    )
+    primary_path = os.path.join(
+        signal_lib_dir,
+        f"{ticker}_stable_v{suffix}.pkl",
+    )
+    if os.path.isfile(primary_path):
+        return True
+    if "." in ticker:
+        dash_variant = ticker.replace(".", "-")
+        dash_path = os.path.join(
+            signal_lib_dir,
+            f"{dash_variant}_stable_v{suffix}.pkl",
+        )
+        if os.path.isfile(dash_path):
+            return True
+    return False
+
+
+def scan_primary_signal_libraries(
+    primaries: Sequence[str],
+    *,
+    signal_lib_dir: str,
+    existence_checker: Optional[
+        Callable[[str, str], bool]
+    ] = None,
+) -> dict[str, Any]:
+    """Scan ``signal_lib_dir`` for each primary's
+    ImpactSearch-loadable library file.
+
+    Returns::
+
+        {
+          "found": list[str],
+          "missing": list[str],
+          "found_count": int,
+          "missing_count": int,
+          "checker_engine_version": str,
+        }
+
+    The default checker mirrors
+    ``impactsearch._lib_path_for`` + the
+    ``load_signal_library`` dot/dash retry. Tests inject
+    their own checker via ``existence_checker``.
+
+    This function is **read-only** and does not import
+    ``impactsearch`` or read any .pkl bytes.
+    """
+    if existence_checker is None:
+        existence_checker = (
+            _default_primary_library_existence_checker
+        )
+    found: list[str] = []
+    missing: list[str] = []
+    for raw in primaries:
+        if not isinstance(raw, str):
+            missing.append(repr(raw))
+            continue
+        ticker = raw.strip().upper()
+        if not is_safe_ticker(ticker):
+            missing.append(ticker or repr(raw))
+            continue
+        try:
+            present = bool(
+                existence_checker(
+                    ticker, signal_lib_dir,
+                )
+            )
+        except Exception:
+            present = False
+        if present:
+            found.append(ticker)
+        else:
+            missing.append(ticker)
+    return {
+        "found": found,
+        "missing": missing,
+        "found_count": len(found),
+        "missing_count": len(missing),
+        "checker_engine_version": (
+            IMPACTSEARCH_ENGINE_VERSION
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Secondary data-source classification
 # ---------------------------------------------------------------------------
 
@@ -1024,10 +1175,25 @@ def classify_eligibility(
     write_requested: bool,
     network_fetch_authorized: bool,
     issue_codes_so_far: Sequence[str],
+    primary_signal_library_found_count: Optional[int] = None,
+    primary_signal_library_missing_count: Optional[int] = None,
 ) -> dict[str, Any]:
     """Combine prior verdicts into a single
     ``eligibility`` field plus a per-ticker issue-code
     list.
+
+    Amendment-1 (Phase 6I-56): two new optional params
+    surface primary signal-library availability.
+
+      * ``primary_signal_library_found_count == 0`` ->
+        BLOCKED with ``primary_signal_library_missing``
+        (a workbook generated against zero primaries
+        would be empty / meaningless).
+      * 0 < found < universe -> keep eligibility but
+        append ``primary_signal_library_missing`` as a
+        warning so the manifest entry surfaces it.
+      * Either / both params ``None`` -> backwards-
+        compatible behavior; no library-coverage check.
     """
     issues: list[str] = list(issue_codes_so_far or [])
 
@@ -1045,6 +1211,33 @@ def classify_eligibility(
             "eligibility": ELIGIBILITY_BLOCKED,
             "issue_codes": issues,
         }
+    if (
+        primary_signal_library_found_count is not None
+        and primary_signal_library_found_count == 0
+    ):
+        if (
+            ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+            not in issues
+        ):
+            issues.append(
+                ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+            )
+        return {
+            "eligibility": ELIGIBILITY_BLOCKED,
+            "issue_codes": issues,
+        }
+    if (
+        primary_signal_library_missing_count
+        is not None
+        and primary_signal_library_missing_count > 0
+        and ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+        not in issues
+    ):
+        # Warning: some libraries missing but at least
+        # one found, so the run can still proceed.
+        issues.append(
+            ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+        )
     if (
         workbook_action == WORKBOOK_ACTION_MANUAL_REVIEW
     ):
@@ -1151,6 +1344,9 @@ def build_impactsearch_workbook_run_plan(
     verified_loader: Optional[
         Callable[..., tuple[Any, Any]]
     ] = None,
+    primary_library_existence_checker: Optional[
+        Callable[[str, str], bool]
+    ] = None,
 ) -> dict[str, Any]:
     """Build a per-ticker run plan.
 
@@ -1196,6 +1392,12 @@ def build_impactsearch_workbook_run_plan(
     universe = list(primary_resolution["universe"])
 
     per_ticker: list[dict[str, Any]] = []
+    _unsafe_row_template_extras = {
+        "primary_signal_libraries_found": [],
+        "primary_signal_libraries_missing": [],
+        "primary_signal_library_found_count": 0,
+        "primary_signal_library_missing_count": 0,
+    }
     for raw in secondaries:
         if not isinstance(raw, str):
             per_ticker.append(
@@ -1218,6 +1420,7 @@ def build_impactsearch_workbook_run_plan(
                     "issue_codes": [ISSUE_UNSAFE_TICKER],
                     "effective_primary_universe_size": 0,
                     "output_path": None,
+                    **_unsafe_row_template_extras,
                 }
             )
             continue
@@ -1243,6 +1446,7 @@ def build_impactsearch_workbook_run_plan(
                     "issue_codes": [ISSUE_UNSAFE_TICKER],
                     "effective_primary_universe_size": 0,
                     "output_path": None,
+                    **_unsafe_row_template_extras,
                 }
             )
             continue
@@ -1269,6 +1473,15 @@ def build_impactsearch_workbook_run_plan(
         # neither compares to the secondary). The runner
         # passes the universe through verbatim.
         effective_primary_universe = list(universe)
+        # Amendment-1: scan signal_library/data/stable
+        # for each primary's ImpactSearch-loadable file.
+        library_scan = scan_primary_signal_libraries(
+            effective_primary_universe,
+            signal_lib_dir=signal_lib_dir_resolved,
+            existence_checker=(
+                primary_library_existence_checker
+            ),
+        )
         elig = classify_eligibility(
             secondary=secondary,
             workbook_action=wb_action["workbook_action"],
@@ -1283,6 +1496,12 @@ def build_impactsearch_workbook_run_plan(
             issue_codes_so_far=(
                 list(wb_action.get("issue_codes", []))
                 + list(sec_source.get("issue_codes", []))
+            ),
+            primary_signal_library_found_count=(
+                library_scan["found_count"]
+            ),
+            primary_signal_library_missing_count=(
+                library_scan["missing_count"]
             ),
         )
         output_path = None
@@ -1326,6 +1545,18 @@ def build_impactsearch_workbook_run_plan(
                 ),
                 "effective_primary_universe_size": len(
                     effective_primary_universe
+                ),
+                "primary_signal_libraries_found": (
+                    library_scan["found"]
+                ),
+                "primary_signal_libraries_missing": (
+                    library_scan["missing"]
+                ),
+                "primary_signal_library_found_count": (
+                    library_scan["found_count"]
+                ),
+                "primary_signal_library_missing_count": (
+                    library_scan["missing_count"]
                 ),
                 "eligibility": elig["eligibility"],
                 "issue_codes": eligibility_issues,
@@ -1501,6 +1732,24 @@ def build_command_manifest(
         eligibility = row.get(
             "eligibility", ELIGIBILITY_BLOCKED
         )
+        # Amendment-1: surface primary library counts +
+        # missing list on every manifest entry so the
+        # supervised batch operator can see exactly which
+        # primaries would silently drop out.
+        library_fields = {
+            "primary_signal_library_found_count": row.get(
+                "primary_signal_library_found_count", 0,
+            ),
+            "primary_signal_library_missing_count": (
+                row.get(
+                    "primary_signal_library_missing_count",
+                    0,
+                )
+            ),
+            "primary_signal_libraries_missing": row.get(
+                "primary_signal_libraries_missing", [],
+            ),
+        }
         if eligibility == ELIGIBILITY_BLOCKED:
             entries.append(
                 {
@@ -1522,6 +1771,7 @@ def build_command_manifest(
                         "issue_codes", []
                     ),
                     "output_path": row.get("output_path"),
+                    **library_fields,
                 }
             )
             continue
@@ -1567,6 +1817,7 @@ def build_command_manifest(
                         "issue_codes", []
                     ),
                     "output_path": row.get("output_path"),
+                    **library_fields,
                 }
             )
             continue
@@ -1608,6 +1859,7 @@ def build_command_manifest(
                     "issue_codes", []
                 ),
                 "output_path": row.get("output_path"),
+                **library_fields,
             }
         )
 
@@ -1647,14 +1899,28 @@ def _atomic_export_workbook(
     sidecar_suffix: str = ".manifest.json",
 ) -> dict[str, Any]:
     """Wrap ``export_results_to_excel`` so the canonical
-    workbook + sidecar appear atomically on the
-    filesystem.
+    workbook + sidecar are replaced atomically AND
+    ImpactSearch's existing append/dedupe semantics are
+    preserved.
 
-    The export is written into a sibling
-    ``<basename>.runner_partial.xlsx`` first, then
-    ``os.replace()``d to the canonical names on success.
-    On any exception, partial files are removed and the
-    exception is re-raised.
+    Amendment-1 (Phase 6I-56): before invoking the
+    export, the canonical workbook and canonical sidecar
+    (if present) are copied to the sibling
+    ``runner_partial`` paths so that
+    ``export_results_to_excel`` sees the same prior state
+    it would see if writing directly to the canonical
+    path. This restores ImpactSearch's existing
+    read-existing -> append -> dedupe -> sort -> write
+    behavior at ``impactsearch.py:2631-2667`` and the
+    preexisting-manifest inspection at
+    ``impactsearch.py:2629``.
+
+    On any failure (copy, export, or replace), the
+    partial workbook + partial sidecar are removed and
+    the exception is re-raised; the canonical workbook
+    + canonical sidecar remain byte-identical to their
+    pre-call state because the canonical names are only
+    written by ``os.replace`` after a successful export.
     """
     out_dir = os.path.dirname(canonical_path) or "."
     base = os.path.basename(canonical_path)
@@ -1669,7 +1935,25 @@ def _atomic_export_workbook(
     partial_sidecar = partial_xlsx + sidecar_suffix
     canonical_sidecar = canonical_path + sidecar_suffix
 
+    os.makedirs(out_dir, exist_ok=True)
+    had_canonical_pre_existing = os.path.isfile(
+        canonical_path,
+    )
+    had_canonical_sidecar_pre_existing = os.path.isfile(
+        canonical_sidecar,
+    )
+
     try:
+        # Stage prior state into the partial paths so
+        # ImpactSearch's append/dedupe sees it.
+        if had_canonical_pre_existing:
+            shutil.copyfile(
+                canonical_path, partial_xlsx,
+            )
+        if had_canonical_sidecar_pre_existing:
+            shutil.copyfile(
+                canonical_sidecar, partial_sidecar,
+            )
         export_callable(
             partial_xlsx,
             list(metrics_list),
@@ -1691,6 +1975,12 @@ def _atomic_export_workbook(
                 else None
             ),
             "atomic": True,
+            "had_canonical_pre_existing": (
+                had_canonical_pre_existing
+            ),
+            "had_canonical_sidecar_pre_existing": (
+                had_canonical_sidecar_pre_existing
+            ),
         }
     except Exception:
         for p in (partial_xlsx, partial_sidecar):

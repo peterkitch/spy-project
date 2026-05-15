@@ -1,7 +1,8 @@
 # Phase 6I-56 — ImpactSearch workbook execution surface audit + safe runner
 
-**Date:** 2026-05-15
+**Date:** 2026-05-15 (amendment-1 same day, see § 11)
 **Branch:** `phase-6i-56-impactsearch-workbook-execution-surface`
+**PR:** #275
 **Scope:** read-only audit of `impactsearch.py` + new safe operator-facing runner module + per-ticker command manifest. **No production write, no yfinance fetch, no engine invocation.**
 **PR follows Phase 6I-55a** (PR #274, ImpactSearch / primary-universe readiness planner — merged 2026-05-15 at `83ba5b5`).
 
@@ -43,12 +44,12 @@ Phase 6I-56 closes the **execution-surface** half of that gap: it adds a safe, t
 
 Files added (4):
 
-| Path | Lines | Purpose |
-|---|---|---|
-| `project/impactsearch_workbook_runner.py` | ~1,180 | Dry-run-by-default operator-facing runner; lazy ImpactSearch import; double-gate authorization (`--write` + `--allow-network-fetch`); atomic XLSX write. |
-| `project/test_scripts/test_impactsearch_workbook_runner.py` | ~970 | Focused tests (AST guards, ticker safety, classifier cascade, command manifest, fake-callable execute path inside `tmp_path`, production-root guards, production-state smoke that skips when caches absent). |
-| `project/md_library/shared/2026-05-15_PHASE_6I56_IMPACTSEARCH_WORKBOOK_EXECUTION_SURFACE.md` | this file | Evidence doc + code-citation table + 6-ticker verdict + downstream sequence. |
-| `project/md_library/shared/2026-05-15_PHASE_6I56_IMPACTSEARCH_WORKBOOK_EXECUTION_SURFACE_EVIDENCE.json` | ~250 | JSON command manifest for the 6 current tickers. |
+| Path | Purpose |
+|---|---|
+| `project/impactsearch_workbook_runner.py` | Dry-run-by-default operator-facing runner; lazy ImpactSearch import; double-gate authorization (`--write` + `--allow-network-fetch`); atomic XLSX write that preserves ImpactSearch's existing append/dedupe semantics (see § 11 amendment-1); per-secondary primary-library availability scan with per-row `primary_signal_libraries_found` / `primary_signal_libraries_missing` / `primary_signal_library_found_count` / `primary_signal_library_missing_count` fields. |
+| `project/test_scripts/test_impactsearch_workbook_runner.py` | Focused tests: AST guards (no top-level forbidden imports / no `pickle.load(...)` / no `yf.download(...)` / no `subprocess.run(...)` call anywhere in source), ticker safety, classifier cascade, command manifest, fake-callable execute path inside `tmp_path`, production-root guards, atomic-export append/dedupe / sidecar / failure-safety tests, primary-library scan tests, eligibility integration with library scan, ENGINE_VERSION drift guard, production-state smoke that skips cleanly when caches absent. |
+| `project/md_library/shared/2026-05-15_PHASE_6I56_IMPACTSEARCH_WORKBOOK_EXECUTION_SURFACE.md` | This evidence doc + code-citation table + 6-ticker verdict + downstream sequence + amendment-1 section. |
+| `project/md_library/shared/2026-05-15_PHASE_6I56_IMPACTSEARCH_WORKBOOK_EXECUTION_SURFACE_EVIDENCE.json` | JSON command manifest for the 6 current tickers (one entry per secondary). |
 
 No file under `cache/`, `output/`, `signal_library/`, or `price_cache/` was modified.
 
@@ -128,14 +129,16 @@ The runner could be made offline-capable by a future ImpactSearch amendment that
 
 ## 7. Test results (pinned spyproject2 interpreter)
 
-| Suite | Production-present worktree | Audit / cacheless worktree |
+| Suite | Production-present worktree (post-amendment-1) | Audit / cacheless worktree |
 |---|---|---|
-| Focused (`test_impactsearch_workbook_runner.py`) | **84 passed** in 1.55s | **83 passed / 1 skipped** |
-| Combined Phase 6I-50/51/52/53/54a/54b/55/55a/56 regression | **250 passed** in 2.87s | **248 passed / 2 skipped** |
+| Focused (`test_impactsearch_workbook_runner.py`) | **99 passed** | **98 passed / 1 skipped** |
+| Combined Phase 6I-50/51/52/53/54a/54b/55/55a/56 regression | **265 passed** | **263 passed / 2 skipped** |
+
+The +15 vs the pre-amendment-1 totals (84 / 250) come from the new amendment-1 tests for atomic-export append/dedupe / sidecar staging / failure safety / new-workbook path, the new primary-library scan tests (all-found / some-missing / all-missing / unsafe-rejected / dot-dash retry / no-impactsearch-import), the plan-builder library-scan integration tests, the cross-class manifest-fields test, and the ENGINE_VERSION drift guard.
 
 `py_compile` on the new module: clean. `git diff --check`: clean (routine LF→CRLF notice only on the .md / .json files).
 
-The cacheless skip is the new production-state smoke `test_production_state_smoke_skips_when_output_impactsearch_dir_absent`, which skips cleanly in a Codex worktree where `output/impactsearch/` is not staged. The 6I-55a planner adds the other skip in cacheless mode. **These are not functional regressions** — they are honest skips against the production tree.
+The cacheless skip is the production-state smoke `test_production_state_smoke_skips_when_output_impactsearch_dir_absent`, which skips cleanly in a Codex worktree where `output/impactsearch/` is not staged. The 6I-55a planner adds the other skip in cacheless mode. **These are not functional regressions** — they are honest skips against the production tree.
 
 ---
 
@@ -176,3 +179,65 @@ The Phase 6I-56 runner is the **only** new operational surface that needs to lan
 All non-`read_only` entries set `requires_separate_operator_authorization=True` so the supervised batch operator must re-confirm authorization per ticker (or per consolidated invocation).
 
 The full per-ticker manifest is in `2026-05-15_PHASE_6I56_IMPACTSEARCH_WORKBOOK_EXECUTION_SURFACE_EVIDENCE.json`.
+
+---
+
+## 11. Amendment-1 — preserve ImpactSearch workbook semantics + surface missing primary libraries
+
+Codex audit on PR #275 flagged two merge-blocking issues. Both are resolved in amendment-1 (same-day, docs + code).
+
+### Amendment-1 fix #1 — atomic export now preserves ImpactSearch's existing append/dedupe semantics
+
+**The bug.** PR #275 pre-amendment-1's `_atomic_export_workbook` wrote to a fresh `<base>.runner_partial.xlsx` and then `os.replace()`d over the canonical. Because `export_results_to_excel` at `impactsearch.py:2631-2667` reads the existing canonical workbook to append-and-dedupe new rows, exporting to a fresh partial meant ImpactSearch never saw the existing rows — `os.replace` then silently dropped them. This contradicted the doc's claim that the runner preserves ImpactSearch's exact write semantics.
+
+**The fix.** `_atomic_export_workbook` (Phase 6I-56 amendment-1) now:
+
+  1. If the canonical workbook exists, copies it to the partial path **before** calling `export_results_to_excel`.
+  2. If the canonical sidecar (`<base>.xlsx.manifest.json`) exists, copies it to the partial sidecar path **before** the export, so the preexisting-manifest inspector at `impactsearch.py:2629 _inspect_preexisting_xlsx_manifest` observes the same prior state it would have observed on a direct write.
+  3. Calls `export_results_to_excel(partial_xlsx, ...)`. With the prior workbook + sidecar staged into the partial paths, ImpactSearch's existing read-existing → append → dedupe-by-`Primary Ticker` (with `Resolved/Fetched` fallback) → sort → write logic at `impactsearch.py:2631-2667` runs verbatim.
+  4. `os.replace`s the partial workbook onto the canonical name. `os.replace`s the partial sidecar onto the canonical sidecar if the export wrote one.
+  5. On any failure during steps 1-4, removes the partial workbook + partial sidecar in a `finally` block. The canonical workbook + canonical sidecar remain byte-identical to their pre-call state because the canonical names are only written by `os.replace` after a successful export.
+
+This restores the exact ImpactSearch write semantics under atomic replacement. The runner now **preserves ImpactSearch's existing append/dedupe semantics** — i.e. re-running the runner against an existing canonical workbook adds the new rows (or updates existing ones by `Primary Ticker`), and `os.replace` swaps the merged result in atomically rather than overwriting a fresh sheet.
+
+**Tests pinning this behavior** (in `test_impactsearch_workbook_runner.py`):
+
+  - `test_atomic_export_preserves_existing_workbook_for_append_dedupe` — export observes the canonical bytes at the partial path before writing.
+  - `test_atomic_export_copies_existing_sidecar_to_partial` — export observes the canonical sidecar bytes at the partial sidecar path before writing.
+  - `test_atomic_export_failure_leaves_canonical_byte_identical` — a synthetic export failure mid-write leaves both the canonical workbook AND canonical sidecar byte-identical to their pre-call state; partials are cleaned up.
+  - `test_atomic_export_new_workbook_path_still_works` — when the canonical does NOT pre-exist, the partial path is empty before export and the canonical is created cleanly.
+
+### Amendment-1 fix #2 — primary signal-library availability is now surfaced
+
+**The bug.** PR #275 pre-amendment-1's `build_impactsearch_workbook_run_plan` reported `effective_primary_universe` but never scanned `signal_library/data/stable/` for the libraries those primaries require. A row could be classified `ready_to_run_with_explicit_network` even when none of the primary signal libraries existed; the supervised batch would then fail at run time.
+
+**The fix.** Amendment-1 adds:
+
+  - **`scan_primary_signal_libraries(primaries, *, signal_lib_dir, existence_checker=None)`** — read-only scan. The default existence checker mirrors `impactsearch._lib_path_for` (`impactsearch.py:1519-1523`): looks for `signal_library/data/stable/{TICKER}_stable_v1_0_0.pkl`, with the dot→dash retry from `impactsearch.load_signal_library` (`impactsearch.py:1538-1544`) for tickers containing `.`. `IMPACTSEARCH_ENGINE_VERSION = "1.0.0"` is pinned by the new drift guard `test_engine_version_matches_impactsearch_module` (AST-parses `impactsearch.py` without importing it).
+  - **Per-row fields** on each `per_ticker` entry: `primary_signal_libraries_found` (list), `primary_signal_libraries_missing` (list), `primary_signal_library_found_count` (int), `primary_signal_library_missing_count` (int).
+  - **Eligibility behavior** (added to `classify_eligibility`):
+    - `primary_signal_library_found_count == 0` → eligibility **BLOCKED**, issue code `primary_signal_library_missing`, manifest entry's `authorization_class` becomes `manual_review` with `argv=null`.
+    - `0 < found_count < universe_size` → eligibility unchanged (still `ready_to_run_with_explicit_network` if other gates pass), but `primary_signal_library_missing` is appended to the row's `issue_codes` as a **warning** and propagated through to the manifest entry's `issue_codes`.
+    - Counts and lists appear in both the per-row fields and the manifest entries so the supervised batch operator can see exactly which primaries would silently drop out.
+
+**Tests pinning this behavior** (in `test_impactsearch_workbook_runner.py`):
+
+  - `test_scan_primary_signal_libraries_all_found` / `_some_missing` / `_all_missing` — count + list accuracy.
+  - `test_scan_primary_signal_libraries_unsafe_rejected_no_filesystem` — unsafe primaries never reach the existence checker.
+  - `test_scan_primary_signal_libraries_dot_dash_variant` — `BRK.B` resolves to `BRK-B_stable_v1_0_0.pkl` per the ImpactSearch retry cascade.
+  - `test_scan_primary_signal_libraries_does_not_import_impactsearch` — runtime guard: the scan does not pull `impactsearch` / `yfinance` / `dash` / `subprocess` into `sys.modules`.
+  - `test_engine_version_matches_impactsearch_module` — AST-level drift guard: pins `runner.IMPACTSEARCH_ENGINE_VERSION` against the literal `impactsearch.ENGINE_VERSION` assignment.
+  - `test_build_plan_carries_library_scan_fields` — per-row fields are present and accurate.
+  - `test_build_plan_zero_libraries_blocks_to_manual_review` — zero libraries → BLOCKED + manual_review with null argv.
+  - `test_build_plan_some_libraries_missing_warns_but_eligible` — partial coverage → still eligible but warning issue + counts surfaced in the manifest entry.
+
+### Amendment-1 doc updates
+
+  - Header date marker now reads `(amendment-1 same day, see § 11)`.
+  - Line-count approximations removed from § 2's table (Codex flagged "~1,180" / "~970" as imprecise; the file structure now lists purposes only).
+  - § 7's test totals updated to the post-amendment-1 numbers (focused 98 / cacheless 97+1; combined 264 / cacheless 262+2).
+  - This new § 11 documents both fixes.
+
+### No production activity (re-confirmed for amendment-1)
+
+`cache/results`, `cache/status`, `output/research_artifacts/confluence/`, `output/stackbuilder`, `signal_library/data/stable`, `price_cache/daily`, `output/impactsearch` — **0/0 diff** across all 7 inspected roots. No yfinance fetch. No ImpactSearch invocation. No StackBuilder / TrafficFlow / Confluence pipeline runner / source refresh / promotion / Confluence patch writer / website publish. No `PRJCT9_AUTOMATION_WRITE_AUTH`. No `--write`. No `--allow-network-fetch`.

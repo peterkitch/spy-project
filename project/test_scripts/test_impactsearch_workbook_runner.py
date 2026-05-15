@@ -824,6 +824,9 @@ def test_command_manifest_uses_pinned_interpreter(
         signal_lib_dir=str(tmp_path / "sld"),
         price_cache_dir=str(tmp_path / "pcd"),
         pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
     )
     manifest = runner.build_command_manifest(plan)
     assert manifest["pinned_interpreter"] == (
@@ -883,6 +886,9 @@ def test_command_manifest_explicit_network_class_includes_both_flags(
         signal_lib_dir=str(tmp_path / "sld"),
         price_cache_dir=str(tmp_path / "pcd"),
         pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
     )
     # Dry-run plan -> per-ticker eligibility is
     # READY_TO_RUN_WITH_EXPLICIT_NETWORK; the emitted
@@ -911,6 +917,9 @@ def test_command_manifest_summary_counts_correct(
         signal_lib_dir=str(tmp_path / "sld"),
         price_cache_dir=str(tmp_path / "pcd"),
         pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
     )
     manifest = runner.build_command_manifest(plan)
     by_class = manifest["summary"]["by_authorization_class"]
@@ -946,6 +955,9 @@ def _authorized_plan(
         write=True,
         allow_network_fetch=True,
         pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
     )
     return plan, ixd
 
@@ -1248,6 +1260,547 @@ def test_atomic_export_workbook_rejects_non_xlsx_path():
 
 
 # ---------------------------------------------------------------------------
+# 11b. Atomic export — amendment-1 append/dedupe semantics
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_export_preserves_existing_workbook_for_append_dedupe(
+    tmp_path,
+):
+    """Canonical workbook must be copied to the partial
+    path BEFORE export_results_to_excel runs, so its
+    existing read-existing -> append -> dedupe -> write
+    logic at impactsearch.py:2631-2667 sees the prior
+    rows. Pins amendment-1 behavior."""
+    out_path = tmp_path / "ixd" / "SPY_analysis.xlsx"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"CANONICAL-XLSX-AB")
+    seen_inputs: list[bytes] = []
+
+    def _export_observes_existing(
+        partial, metrics, *,
+        validation_summary,
+        per_strategy_validation,
+    ):
+        # Verify export saw the prior bytes at partial
+        # path BEFORE it wrote -- this is the entire
+        # append/dedupe contract.
+        seen_inputs.append(Path(partial).read_bytes())
+        # Simulate ImpactSearch's overwrite of the
+        # partial with the merged result.
+        Path(partial).write_bytes(b"MERGED-XLSX-ABC")
+        Path(partial + ".manifest.json").write_bytes(
+            b"{}"
+        )
+
+    runner._atomic_export_workbook(
+        str(out_path),
+        [{"Primary Ticker": "C"}],
+        validation_summary={},
+        per_strategy_validation={},
+        export_callable=_export_observes_existing,
+    )
+    # Export saw the canonical bytes.
+    assert seen_inputs == [b"CANONICAL-XLSX-AB"]
+    # Canonical replaced atomically.
+    assert out_path.read_bytes() == b"MERGED-XLSX-ABC"
+    # No partials left.
+    leftovers = [
+        p
+        for p in out_path.parent.glob("*")
+        if "runner_partial" in p.name
+    ]
+    assert leftovers == []
+
+
+def test_atomic_export_copies_existing_sidecar_to_partial(
+    tmp_path,
+):
+    """Canonical sidecar must be copied to the partial
+    sidecar path BEFORE export, so
+    impactsearch._inspect_preexisting_xlsx_manifest at
+    impactsearch.py:2629 sees the same prior state it
+    would see on a direct write to the canonical
+    path."""
+    out_path = tmp_path / "ixd" / "SPY_analysis.xlsx"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"CANONICAL-XLSX")
+    canonical_sidecar = out_path.parent / (
+        "SPY_analysis.xlsx.manifest.json"
+    )
+    canonical_sidecar.write_text(
+        '{"prior_status": "verified_ok"}',
+        encoding="utf-8",
+    )
+    sidecars_seen: list[str] = []
+
+    def _export(
+        partial, metrics, *,
+        validation_summary,
+        per_strategy_validation,
+    ):
+        partial_sidecar = (
+            partial + ".manifest.json"
+        )
+        if Path(partial_sidecar).exists():
+            sidecars_seen.append(
+                Path(partial_sidecar).read_text(
+                    encoding="utf-8",
+                ),
+            )
+        # Write the merged outputs.
+        Path(partial).write_bytes(b"NEW-XLSX")
+        Path(partial_sidecar).write_text(
+            '{"new_status": "verified_ok"}',
+            encoding="utf-8",
+        )
+
+    runner._atomic_export_workbook(
+        str(out_path),
+        [],
+        validation_summary={},
+        per_strategy_validation={},
+        export_callable=_export,
+    )
+    # Export saw the canonical sidecar bytes.
+    assert sidecars_seen == [
+        '{"prior_status": "verified_ok"}',
+    ]
+    assert (
+        canonical_sidecar.read_text(encoding="utf-8")
+        == '{"new_status": "verified_ok"}'
+    )
+
+
+def test_atomic_export_failure_leaves_canonical_byte_identical(
+    tmp_path,
+):
+    """If export raises after the partial has been
+    staged (or while it is being written), the
+    canonical workbook and canonical sidecar must
+    remain byte-identical to their pre-call state."""
+    out_path = tmp_path / "ixd" / "SPY_analysis.xlsx"
+    out_path.parent.mkdir(parents=True)
+    original_xlsx = b"CANONICAL-XLSX-ORIGINAL"
+    out_path.write_bytes(original_xlsx)
+    canonical_sidecar = out_path.parent / (
+        "SPY_analysis.xlsx.manifest.json"
+    )
+    original_sidecar = (
+        '{"prior_status": "verified_ok"}'
+    )
+    canonical_sidecar.write_text(
+        original_sidecar, encoding="utf-8",
+    )
+
+    def _failing_export(
+        partial, metrics, *,
+        validation_summary,
+        per_strategy_validation,
+    ):
+        # Overwrite the partial (simulates a mid-export
+        # crash after writing some bytes to the partial).
+        Path(partial).write_bytes(b"PARTIAL-XLSX")
+        Path(partial + ".manifest.json").write_text(
+            '{"partial_status": "in_progress"}',
+            encoding="utf-8",
+        )
+        raise RuntimeError("synthetic export failure")
+
+    with pytest.raises(RuntimeError):
+        runner._atomic_export_workbook(
+            str(out_path),
+            [],
+            validation_summary={},
+            per_strategy_validation={},
+            export_callable=_failing_export,
+        )
+    # Canonical bytes unchanged.
+    assert (
+        out_path.read_bytes() == original_xlsx
+    )
+    assert (
+        canonical_sidecar.read_text(encoding="utf-8")
+        == original_sidecar
+    )
+    # No partials left.
+    partials = [
+        p
+        for p in out_path.parent.glob("*")
+        if "runner_partial" in p.name
+    ]
+    assert partials == []
+
+
+def test_atomic_export_new_workbook_path_still_works(
+    tmp_path,
+):
+    """With no canonical workbook, the export still
+    creates the canonical via the partial route."""
+    out_path = tmp_path / "ixd" / "SPY_analysis.xlsx"
+    out_path.parent.mkdir(parents=True)
+    assert not out_path.exists()
+
+    def _export(
+        partial, metrics, *,
+        validation_summary,
+        per_strategy_validation,
+    ):
+        # Export sees no prior file at the partial path
+        # because nothing was copied (canonical absent).
+        assert not Path(partial).exists()
+        Path(partial).write_bytes(b"FRESH-XLSX")
+        Path(partial + ".manifest.json").write_bytes(
+            b"{}"
+        )
+
+    res = runner._atomic_export_workbook(
+        str(out_path),
+        [],
+        validation_summary={},
+        per_strategy_validation={},
+        export_callable=_export,
+    )
+    assert res["had_canonical_pre_existing"] is False
+    assert (
+        res["had_canonical_sidecar_pre_existing"]
+        is False
+    )
+    assert out_path.read_bytes() == b"FRESH-XLSX"
+    assert (
+        out_path.parent
+        / "SPY_analysis.xlsx.manifest.json"
+    ).exists()
+
+
+# ---------------------------------------------------------------------------
+# 11c. Primary signal-library scan (amendment-1)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_version_matches_impactsearch_module():
+    """Pin IMPACTSEARCH_ENGINE_VERSION against the actual
+    ENGINE_VERSION constant in impactsearch.py. AST-level
+    drift catch (does NOT import impactsearch; reads the
+    source and parses for the assignment)."""
+    here = Path(__file__).resolve().parent.parent
+    src = (here / "impactsearch.py").read_text(
+        encoding="utf-8",
+    )
+    tree = ast.parse(src)
+    found_version = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if (
+                    isinstance(tgt, ast.Name)
+                    and tgt.id == "ENGINE_VERSION"
+                ):
+                    if isinstance(
+                        node.value, ast.Constant,
+                    ):
+                        found_version = node.value.value
+    assert found_version is not None, (
+        "could not find ENGINE_VERSION assignment in "
+        "impactsearch.py"
+    )
+    assert (
+        runner.IMPACTSEARCH_ENGINE_VERSION
+        == found_version
+    )
+    assert (
+        runner.IMPACTSEARCH_ENGINE_VERSION_WITH_UNDERSCORES
+        == found_version.replace(".", "_")
+    )
+
+
+def test_scan_primary_signal_libraries_all_found(
+    tmp_path,
+):
+    sld = tmp_path / "sld"
+    sld.mkdir()
+    for t in ("AAPL", "JPM", "SPY"):
+        (sld / f"{t}_stable_v1_0_0.pkl").write_bytes(
+            b""
+        )
+    res = runner.scan_primary_signal_libraries(
+        ["AAPL", "JPM", "SPY"],
+        signal_lib_dir=str(sld),
+    )
+    assert res["found"] == ["AAPL", "JPM", "SPY"]
+    assert res["missing"] == []
+    assert res["found_count"] == 3
+    assert res["missing_count"] == 0
+    assert res["checker_engine_version"] == "1.0.0"
+
+
+def test_scan_primary_signal_libraries_some_missing(
+    tmp_path,
+):
+    sld = tmp_path / "sld"
+    sld.mkdir()
+    (sld / "AAPL_stable_v1_0_0.pkl").write_bytes(b"")
+    res = runner.scan_primary_signal_libraries(
+        ["AAPL", "JPM", "SPY"],
+        signal_lib_dir=str(sld),
+    )
+    assert res["found"] == ["AAPL"]
+    assert sorted(res["missing"]) == ["JPM", "SPY"]
+    assert res["found_count"] == 1
+    assert res["missing_count"] == 2
+
+
+def test_scan_primary_signal_libraries_all_missing(
+    tmp_path,
+):
+    sld = tmp_path / "sld"
+    sld.mkdir()
+    res = runner.scan_primary_signal_libraries(
+        ["AAPL", "JPM"], signal_lib_dir=str(sld),
+    )
+    assert res["found"] == []
+    assert sorted(res["missing"]) == ["AAPL", "JPM"]
+    assert res["found_count"] == 0
+    assert res["missing_count"] == 2
+
+
+def test_scan_primary_signal_libraries_unsafe_rejected_no_filesystem(
+    tmp_path,
+):
+    """Unsafe primary tickers must be rejected BEFORE
+    any filesystem access (no `os.path.isfile` call on
+    a path-like ticker)."""
+    sld = tmp_path / "sld"
+    sld.mkdir()
+    calls: list[tuple[str, str]] = []
+
+    def _instrumented_checker(ticker, root):
+        calls.append((ticker, root))
+        # Default behavior path (mirror _default_)
+        return (
+            runner
+            ._default_primary_library_existence_checker(
+                ticker, root,
+            )
+        )
+
+    res = runner.scan_primary_signal_libraries(
+        ["AAPL", "../etc", "foo/bar", "JPM"],
+        signal_lib_dir=str(sld),
+        existence_checker=_instrumented_checker,
+    )
+    # Checker was called for safe tickers only.
+    safe_calls = [c[0] for c in calls]
+    assert "AAPL" in safe_calls
+    assert "JPM" in safe_calls
+    assert "../etc" not in safe_calls
+    assert "foo/bar" not in safe_calls
+    # Unsafe entries land in `missing`.
+    assert "../etc" in res["missing"] or (
+        "../ETC" in res["missing"]
+    )
+    assert "FOO/BAR" in res["missing"] or (
+        "foo/bar" in res["missing"]
+    )
+
+
+def test_scan_primary_signal_libraries_dot_dash_variant(
+    tmp_path,
+):
+    """impactsearch.py:1538-1544 retries with the
+    `.`-replaced-by-`-` variant. ``BRK.B`` should match
+    a ``BRK-B_stable_v1_0_0.pkl`` file."""
+    sld = tmp_path / "sld"
+    sld.mkdir()
+    (sld / "BRK-B_stable_v1_0_0.pkl").write_bytes(b"")
+    res = runner.scan_primary_signal_libraries(
+        ["BRK.B"], signal_lib_dir=str(sld),
+    )
+    assert res["found"] == ["BRK.B"]
+    assert res["missing"] == []
+
+
+def test_scan_primary_signal_libraries_does_not_import_impactsearch(
+    monkeypatch, tmp_path,
+):
+    """Scanning must not import impactsearch / yfinance /
+    dash / subprocess into sys.modules. (Top-level AST
+    guard already pins import statements; this guard
+    pins runtime behavior.)"""
+    sld = tmp_path / "sld"
+    sld.mkdir()
+    # Capture the modules present before scan.
+    forbidden = {
+        "impactsearch", "yfinance", "dash",
+        "subprocess",
+    }
+    pre = {m for m in sys.modules if m in forbidden}
+    runner.scan_primary_signal_libraries(
+        ["AAPL"], signal_lib_dir=str(sld),
+    )
+    post = {m for m in sys.modules if m in forbidden}
+    newly_loaded = post - pre
+    assert not newly_loaded, (
+        f"scan_primary_signal_libraries newly imported "
+        f"forbidden modules: {sorted(newly_loaded)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11d. Plan builder integration with library scan (amendment-1)
+# ---------------------------------------------------------------------------
+
+
+def test_build_plan_carries_library_scan_fields(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner
+            .PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: t == "SPY"
+        ),
+    )
+    row = plan["per_ticker"][0]
+    assert row["primary_signal_libraries_found"] == ["SPY"]
+    assert row[
+        "primary_signal_libraries_missing"
+    ] == ["AAPL"]
+    assert row[
+        "primary_signal_library_found_count"
+    ] == 1
+    assert row[
+        "primary_signal_library_missing_count"
+    ] == 1
+
+
+def test_build_plan_zero_libraries_blocks_to_manual_review(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner
+            .PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: False
+        ),
+    )
+    row = plan["per_ticker"][0]
+    assert row["eligibility"] == (
+        runner.ELIGIBILITY_BLOCKED
+    )
+    assert (
+        runner.ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+        in row["issue_codes"]
+    )
+    # No executable write command emitted.
+    manifest = runner.build_command_manifest(plan)
+    entry = manifest["entries"][0]
+    assert entry["authorization_class"] == (
+        runner.AUTH_CLASS_MANUAL_REVIEW
+    )
+    assert entry["argv"] is None
+
+
+def test_build_plan_some_libraries_missing_warns_but_eligible(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner
+            .PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: (
+            "SPY", "AAPL", "JPM",
+        ),
+        primary_library_existence_checker=(
+            lambda t, d: t in {"SPY", "AAPL"}
+        ),
+    )
+    row = plan["per_ticker"][0]
+    # Some libraries missing -> still eligible.
+    assert row["eligibility"] == (
+        runner.ELIGIBILITY_READY_TO_RUN_WITH_EXPLICIT_NETWORK
+    )
+    # But the warning issue is surfaced.
+    assert (
+        runner.ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+        in row["issue_codes"]
+    )
+    # And the manifest entry carries the issue + counts.
+    manifest = runner.build_command_manifest(plan)
+    entry = manifest["entries"][0]
+    assert (
+        runner.ISSUE_PRIMARY_SIGNAL_LIBRARY_MISSING
+        in entry["issue_codes"]
+    )
+    # Network-write class is still emitted.
+    assert entry["authorization_class"] == (
+        runner.AUTH_CLASS_IMPACTSEARCH_NETWORK_WRITE
+    )
+    # Amendment-1: counts + missing list appear on the
+    # manifest entry too.
+    assert entry[
+        "primary_signal_library_found_count"
+    ] == 2
+    assert entry[
+        "primary_signal_library_missing_count"
+    ] == 1
+    assert entry[
+        "primary_signal_libraries_missing"
+    ] == ["JPM"]
+
+
+def test_command_manifest_carries_library_counts_on_all_entry_classes(
+    tmp_path,
+):
+    """The four amendment-1 fields appear on every entry
+    class (manual_review / network_write / workbook_write)."""
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY", "../etc"],
+        primary_source=(
+            runner
+            .PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+    )
+    manifest = runner.build_command_manifest(plan)
+    for entry in manifest["entries"]:
+        for key in (
+            "primary_signal_library_found_count",
+            "primary_signal_library_missing_count",
+            "primary_signal_libraries_missing",
+        ):
+            assert key in entry, (
+                f"{entry['secondary']!r} missing "
+                f"manifest field {key!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # 12. CLI smoke + production-root guard
 # ---------------------------------------------------------------------------
 
@@ -1494,9 +2047,9 @@ def test_production_state_smoke_skips_when_output_impactsearch_dir_absent():
 
 
 def test_evidence_doc_carries_runner_precision_wording():
-    """Pin the Section 7 + chain-section wording so any
-    future edit to the evidence doc surfaces in
-    review."""
+    """Pin the Section 7 + chain-section + amendment-1
+    wording so any future edit to the evidence doc
+    surfaces in review."""
     here = Path(__file__).resolve().parent.parent
     doc = (
         here / "md_library" / "shared" / (
@@ -1526,6 +2079,17 @@ def test_evidence_doc_carries_runner_precision_wording():
         "ImpactSearch",
         "StackBuilder",
         "active core scripts",
+        # Amendment-1 anchors.
+        "Amendment-1",
+        "preserves ImpactSearch's existing append/dedupe",
+        "primary_signal_libraries_missing",
+        "primary_signal_libraries_found",
+        "IMPACTSEARCH_ENGINE_VERSION",
+        "_inspect_preexisting_xlsx_manifest",
+        "99 passed",
+        "98 passed / 1 skipped",
+        "265 passed",
+        "263 passed / 2 skipped",
     )
     missing = [
         phrase for phrase in required
