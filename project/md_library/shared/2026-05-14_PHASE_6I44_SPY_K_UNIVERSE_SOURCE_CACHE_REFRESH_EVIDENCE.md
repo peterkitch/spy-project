@@ -18,13 +18,29 @@ changed.
 
 ## 1. Background
 
-Phase 6I-43 (PR #251, merged at `d5ee23b` on 2026-05-14) introduced the
-strict Phase 6I-20 validation surface plus the 9-code blocked-reason
-taxonomy, including a refresh-candidate-command emitter on
-`signal_library_source_refresh_policy_v2.plan_source_refresh_policy_v2()`.
-The emitted command was intended to be the exact, copy-pasteable supervised
-refresher invocation the operator would run when
-`refresh_candidate_ready=true`.
+Two distinct earlier phases set the stage for Phase 6I-44 and must not be
+conflated:
+
+  * **Phase 6I-34** (PR #251, merged at `d5ee23b`) introduced the
+    multi-ticker TrafficFlow-style Confluence ranking / export contract,
+    the strict Phase 6I-20 validation surface, and the 9-code
+    blocked-reason taxonomy. Phase 6I-34 did not touch the source-cache
+    refresh path.
+  * **Phase 6I-43** (PR #260, merged at `b0f7ff3` on 2026-05-14)
+    introduced the read-only source-refresh policy v2 planner
+    (`signal_library_source_refresh_policy_v2.plan_source_refresh_policy_v2()`),
+    the 7-class v2 taxonomy, the explicit
+    `allow_equal_cutoff_after_close` operator policy switch, the
+    invalid-member (TEF-style) handling with
+    `invalid_ticker_policy="warn_and_exclude"`, and the
+    refresh-candidate-command emitter on `SourceRefreshPolicyV2Report`.
+    The emitted command was intended to be the exact, copy-pasteable
+    supervised refresher invocation the operator would run when
+    `refresh_candidate_ready=true`.
+
+Phase 6I-44 is therefore an amendment to the Phase 6I-43 emitter (and a
+supervised production refresh round that exercises the corrected
+emitter), not to the Phase 6I-34 ranking/validation surface.
 
 A first attempt to use that emitted shape against the SPY K-universe in
 this phase failed at the refresher CLI with **rc=2** at argparse time:
