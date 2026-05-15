@@ -205,6 +205,12 @@ ISSUE_PARQUET_ENGINE_UNAVAILABLE: str = (
     "parquet_engine_unavailable"
 )
 ISSUE_WRITE_FAILED: str = "write_failed"
+ISSUE_INVALID_TICKER_PATH_UNSAFE: str = (
+    "invalid_ticker_path_unsafe"
+)
+ISSUE_OUTPUT_PATH_ESCAPES_ROOT: str = (
+    "output_path_escapes_root"
+)
 
 
 # Production-root relative paths guarded against by
@@ -251,7 +257,16 @@ def _iso_now() -> str:
 def _normalize_tickers(
     tickers: Iterable[str],
 ) -> tuple[str, ...]:
-    """Strip + uppercase + dedupe (first-seen order)."""
+    """Strip + uppercase + dedupe (first-seen order).
+
+    Phase 6I-54b amendment-1 NOTE: this normalizer does NOT
+    reject path-unsafe tickers itself -- doing so here
+    would silently drop them, hiding the rejection from
+    the operator. Instead, _is_safe_ticker is called per
+    ticker inside _verify_and_extract; unsafe tickers
+    appear in the report with a stable issue code so the
+    operator can audit what was rejected and why.
+    """
     seen: set[str] = set()
     out: list[str] = []
     for t in tickers:
@@ -263,6 +278,107 @@ def _normalize_tickers(
         seen.add(norm)
         out.append(norm)
     return tuple(out)
+
+
+# Allowed character set in legitimate tickers AFTER
+# strip/upper. Covers domestic equities (SPY, AAPL),
+# multi-class shares (BRK-B), index tickers (^GSPC,
+# ^STOXX50E, _GSPC -- the caret-stripped variant Phase
+# 6I-52/6I-53 already recognises), and international
+# suffixes (0011.HK, 000157.KS). It deliberately
+# excludes path separators, parent-dir tokens, colons
+# (Windows drive letters), and any whitespace.
+_TICKER_ALLOWED_CHARSET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-^_",
+)
+
+
+def _is_safe_ticker(ticker: str) -> tuple[
+    bool, Optional[str],
+]:
+    """Phase 6I-54b amendment-1: ticker path-safety
+    validator.
+
+    Returns ``(True, None)`` when the ticker is safe to
+    use as a path component, or ``(False, issue_code)``
+    when it must be rejected before any source file is
+    read or any output path is built.
+
+    Rejects:
+      * empty / whitespace-only;
+      * path separators ``/`` or ``\\``;
+      * parent-directory tokens ``..``;
+      * absolute-path-looking input (Windows drive
+        letters ``C:``, leading ``/``, leading ``\\``);
+      * any character outside the explicit whitelist
+        ``A-Z 0-9 . - ^ _`` (post strip+upper).
+    Accepts: ``SPY``, ``AAPL``, ``BRK-B``, ``^GSPC``,
+    ``_GSPC``, ``0011.HK``, ``000157.KS``, etc.
+
+    The check is intentionally conservative: anything the
+    project does not have a documented use case for is
+    rejected.
+    """
+    if not isinstance(ticker, str):
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    raw = ticker
+    if not raw or not raw.strip():
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    # Path-traversal / separator detection runs against
+    # the ORIGINAL string (pre-upper) so backslash on
+    # Windows is caught even when the caller passes a
+    # mixed-case form.
+    if "/" in raw or "\\" in raw:
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    if ".." in raw:
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    if ":" in raw:
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    norm = raw.strip().upper()
+    if not norm:
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    # Whitelist check (every char must be allowed).
+    if not all(c in _TICKER_ALLOWED_CHARSET for c in norm):
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    # No leading ``.`` (catches paths like ``./foo``
+    # that survived the separator check; also
+    # forbids unusual leading-dot ticker forms).
+    if norm.startswith("."):
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    # No leading ``-`` (argparse-trap defense; no real
+    # ticker starts with a dash).
+    if norm.startswith("-"):
+        return False, ISSUE_INVALID_TICKER_PATH_UNSAFE
+    return True, None
+
+
+def _output_path_safely_inside_root(
+    output_path: Path,
+    *,
+    root: Path,
+) -> bool:
+    """Defense-in-depth: even after string-level ticker
+    validation, resolve the constructed output path and
+    confirm it stays inside the declared price-cache root.
+    Returns ``True`` when the resolved output is a child
+    (or equal) of the resolved root."""
+    try:
+        op_resolved = output_path.resolve(strict=False)
+        rt_resolved = root.resolve(strict=False)
+    except OSError:
+        return False
+    try:
+        # Path.is_relative_to is Python 3.9+; spyproject2
+        # is 3.12.
+        return op_resolved.is_relative_to(rt_resolved)
+    except (AttributeError, ValueError):
+        # Fallback: string-prefix check against the
+        # parent directory.
+        op_str = str(op_resolved)
+        rt_str = str(rt_resolved)
+        return op_str.startswith(
+            rt_str + os.sep,
+        ) or op_str == rt_str
 
 
 def _default_verified_loader() -> Callable[..., Any]:
@@ -297,6 +413,30 @@ def _verify_and_extract(
     The verified-loader callable is injectable so tests
     can avoid the heavy ``provenance_manifest`` import.
     """
+    # Phase 6I-54b amendment-1: ticker path-safety check
+    # runs BEFORE any filesystem operation. If the ticker
+    # is unsafe, the record carries the issue code and
+    # NULL paths; the verified loader is NOT invoked, no
+    # manifest is read, no output directory is created,
+    # and no file is written downstream.
+    safe, unsafe_issue = _is_safe_ticker(ticker)
+    if not safe:
+        return {
+            "ticker": ticker,
+            "source_pkl": None,
+            "manifest_path": None,
+            "source_producer_engine": None,
+            "source_engine_version": None,
+            "rows_read": 0,
+            "first_date": None,
+            "last_date": None,
+            "issue_codes": [
+                unsafe_issue
+                or ISSUE_INVALID_TICKER_PATH_UNSAFE,
+            ],
+            "_output_dataframe": None,
+        }
+
     pkl_path = (
         signal_cache_dir
         / f"{ticker}_precomputed_results.pkl"
@@ -633,6 +773,22 @@ def build_price_cache_write_report(
         )
 
         if not verification_passed:
+            rows.append(record)
+            continue
+
+        # Phase 6I-54b amendment-1: defense-in-depth
+        # path-safety check on the resolved output path.
+        # The ticker has already passed _is_safe_ticker,
+        # but a future code change that constructs the
+        # output path differently could regress this; the
+        # is_relative_to check stops any write that
+        # somehow resolved outside the declared root.
+        if not _output_path_safely_inside_root(
+            output_path, root=pcd,
+        ):
+            record["issue_codes"].append(
+                ISSUE_OUTPUT_PATH_ESCAPES_ROOT,
+            )
             rows.append(record)
             continue
 

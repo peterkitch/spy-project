@@ -1,9 +1,66 @@
 # Phase 6I-54b: supervised StackBuilder price-cache writer + write for the 6 ready tickers
 
-**Date:** 2026-05-15
+**Date:** 2026-05-15 (amendment-1 same day)
 **Base commit (main):** `13a707f` (Phase 6I-54a squash-merge)
 **Branch:** `phase-6i-54b-stackbuilder-price-cache-write`
 **Status:** **Authorized write completed.** 6 CSV files landed in `price_cache/daily/`. Other 5 production roots unchanged. **Do not merge** until operator approval.
+
+## Amendment-1: ticker path-safety validation (code/test safety)
+
+Codex audit found a real path-traversal vulnerability: the writer's `_normalize_tickers` did strip/upper/dedupe but did NOT reject path-like ticker strings. A ticker such as `"../ESCAPE"` or `"..\\ESCAPE"` would be accepted and used to build:
+
+- `signal_cache_dir / "../ESCAPE_precomputed_results.pkl"`
+- `stackbuilder_price_cache_dir / "../ESCAPE.csv"`
+
+— escaping the intended source/output directories. Amendment-1 closes this at module + test level. **No production rerun**; the Phase 6I-54b authorized-write evidence (the 6 CSV files in `price_cache/daily/`) is preserved as-is.
+
+### What amendment-1 does
+
+1. **New helper** `_is_safe_ticker(ticker)` in `stackbuilder_price_cache_writer.py`. Rejects:
+   - empty / whitespace-only tickers;
+   - `/` or `\\` (path separators);
+   - `..` (parent-dir traversal);
+   - `:` (Windows drive letter / NTFS alternate data stream);
+   - any character outside the whitelist `A-Z 0-9 . - ^ _` (post strip+upper);
+   - leading `.` or `-`.
+   Accepts: `SPY`, `AAPL`, `BRK-B`, `^GSPC`, `_GSPC`, `0011.HK`, `000157.KS`, mixed-case + surrounding-whitespace variants of legitimate forms.
+
+2. **Early-return in `_verify_and_extract`** before any filesystem operation. Unsafe ticker → record with `issue_codes=[invalid_ticker_path_unsafe]`, `source_pkl=None`, `manifest_path=None`, `wrote_file=False`, `rows_written=0`. The verified loader is **NOT** called; no manifest is read; no output directory is created.
+
+3. **Defense-in-depth check** before every write: `_output_path_safely_inside_root(output_path, root=pcd)` verifies the resolved output path stays inside the declared price-cache root (`Path.is_relative_to`). If a future regression bypasses the string-level validation, this stops the write with a new `output_path_escapes_root` issue code.
+
+4. **Phase 6I-54a planner mirror.** The Phase 6I-54a rebuild planner also constructs `Path` objects from ticker strings — it's read-only, but an unsafe ticker would let it probe filesystem existence outside the declared cache roots. The same `_is_safe_ticker` (mirrored) now short-circuits the planner's `_classify_ticker` with the new `BLOCKER_INVALID_TICKER_PATH_UNSAFE` blocker, routing unsafe tickers directly to `manual_review` with no filesystem probe.
+
+5. **CLI behaviour pinned.** Path-like tickers return `rc=0` (matches the existing per-ticker cascade pattern: unsafe tickers appear in the per-row report with the issue code; aggregate `write_count=0`, `verification_pass_count=0`). The unsafe ticker is **visible** in the report so the operator sees what was rejected, rather than silently disappearing.
+
+### Files changed in amendment-1
+
+- `project/stackbuilder_price_cache_writer.py` — `_is_safe_ticker`, `_output_path_safely_inside_root`, `ISSUE_INVALID_TICKER_PATH_UNSAFE`, `ISSUE_OUTPUT_PATH_ESCAPES_ROOT`. Wired into `_verify_and_extract` (early-return) and the write path (defense-in-depth check).
+- `project/stackbuilder_price_cache_rebuild_planner.py` — mirrored `_is_safe_ticker` + `BLOCKER_INVALID_TICKER_PATH_UNSAFE`. Early-return in `_classify_ticker`.
+- `project/test_scripts/test_stackbuilder_price_cache_writer.py` — 10 new amendment-1 tests covering every documented rejection vector + legitimate-ticker acceptance + loader-injection-seam proof that the loader is NOT called for unsafe tickers + CLI rc=0 + Phase 6I-54a planner mirror.
+
+### Test results
+
+- **33 focused writer tests pass** (23 original + 10 amendment-1).
+- **Combined Phase 6I planner regression: 134 / 134** in 2.02s.
+- The Phase 6I-54a planner regression suite picks up the new path-safety blocker via the planner mirror test in the writer suite. No 6I-54a-specific test needed beyond that mirror.
+
+### No production rerun
+
+Amendment-1 is a **code/test safety amendment only.** No writer was run against production. No yfinance, no StackBuilder, no source refresh, no `PRJCT9_AUTOMATION_WRITE_AUTH`. Production roots unchanged:
+
+| Surface | Pre-amendment-1 | Post-amendment-1 | Diff |
+|---|---|---|---|
+| `cache/results` | 3239 | 3239 | 0 |
+| `cache/status` | 1634 | 1634 | 0 |
+| `output/research_artifacts` | 35 | 35 | 0 |
+| `output/stackbuilder` | 5229 | 5229 | 0 |
+| `signal_library/data/stable` | 72899 | 72899 | 0 |
+| `price_cache/daily` | 6 CSV files (from authorized write) | 6 CSV files (unchanged) | 0 |
+
+The 6 CSV files (`AAPL.csv, HD.csv, JNJ.csv, MCD.csv, SPY.csv, WMT.csv`) from the original Phase 6I-54b authorized write are preserved bit-for-bit; amendment-1 did not regenerate them.
+
+---
 
 `<PINNED_PYTHON> = C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`
 
@@ -44,7 +101,7 @@ Phase 6I-54b's writer therefore uses **single-key `--write` authorization** (the
 
 ### Tests
 
-`project/test_scripts/test_stackbuilder_price_cache_writer.py` — 23 focused tests, all passing.
+`project/test_scripts/test_stackbuilder_price_cache_writer.py` — 33 focused tests (23 original + 10 amendment-1 path-safety), all passing.
 
 Coverage:
 
@@ -74,7 +131,7 @@ Coverage:
 | 22 | `test_execution_log_allows_md_library_path` | `md_library/shared/...` paths allowed; JSONL is well-formed. |
 | 23 | `test_cli_rejects_empty_tickers` | `--tickers " , "` → rc=2 `no_tickers_supplied`. |
 
-**Combined Phase 6I planner/policy/preflight/rebuild-planner/writer regression: 124 / 124 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 16 from 6I-53 + 23 from 6I-54a + 23 from 6I-54b).
+**Combined Phase 6I planner/policy/preflight/rebuild-planner/writer regression: 134 / 134 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 16 from 6I-53 + 23 from 6I-54a + 33 from 6I-54b including 10 amendment-1 path-safety tests).
 
 The Phase 6I-53 production-state smoke + Phase 6I-54a production-state smoke were both updated to be **state-aware**: they now recognize both pre-Phase-6I-54b (no `price_cache/daily/`) and post-Phase-6I-54b (6 CSV files for the ready tickers) states, with appropriate assertions per branch.
 
@@ -226,7 +283,7 @@ The 6 written tickers correctly flip from `use_existing_signal_cache` → `manua
 ## 10. Files added (8)
 
 - `project/stackbuilder_price_cache_writer.py` — new writer module (~700 lines).
-- `project/test_scripts/test_stackbuilder_price_cache_writer.py` — 23 focused tests.
+- `project/test_scripts/test_stackbuilder_price_cache_writer.py` — 33 focused tests (23 original + 10 amendment-1 path-safety).
 - `project/md_library/shared/2026-05-15_PHASE_6I54B_STACKBUILDER_PRICE_CACHE_WRITE.md` (this doc).
 - `project/md_library/shared/2026-05-15_PHASE_6I54B_STACKBUILDER_PRICE_CACHE_WRITE_EVIDENCE.json` — consolidated evidence.
 - `project/md_library/shared/2026-05-15_PHASE_6I54B_DRYRUN.json` — raw dry-run JSON.

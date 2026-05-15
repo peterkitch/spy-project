@@ -845,3 +845,368 @@ def test_cli_rejects_empty_tickers(capsys):
     err = capsys.readouterr().err
     assert rc == 2
     assert "no_tickers_supplied" in err
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-54b amendment-1: ticker path-safety
+# validation.
+#
+# Codex audit found that the original writer accepted
+# path-like tickers ("../ESCAPE", "..\ESCAPE", "A/B")
+# and used them verbatim to build source + output
+# paths, which could escape the declared cache roots.
+# These tests pin the corrected contract:
+#   * unsafe ticker -> ISSUE_INVALID_TICKER_PATH_UNSAFE
+#     + wrote_file=False;
+#   * verified loader is NOT called for unsafe tickers
+#     (proven by injecting a sentinel loader that
+#     records every invocation);
+#   * legitimate tickers (SPY, AAPL, BRK-B, ^GSPC,
+#     _GSPC, international .HK/.KS forms) remain
+#     accepted;
+#   * CLI returns rc=0 with a per-row issue code
+#     surfaced in the report (matches the existing
+#     per-ticker cascade pattern; aggregate write_count
+#     is 0).
+# ---------------------------------------------------------------------------
+
+
+def _recording_loader():
+    """Returns a (call_log, loader) pair. The loader
+    raises if invoked, so any call appears in call_log
+    AND the test fails loudly."""
+    call_log: list[str] = []
+
+    def _loader(pkl_path, **kwargs):  # pragma: no cover -
+        # only entered if a test bug allows the unsafe
+        # ticker through.
+        call_log.append(str(pkl_path))
+        raise AssertionError(
+            f"verified loader called for path {pkl_path!r}"
+            f" -- safety check failed to short-circuit"
+        )
+    return call_log, _loader
+
+
+def test_dot_dot_slash_ticker_rejected(tmp_path):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    call_log, recording_loader = _recording_loader()
+    report = pcw.build_price_cache_write_report(
+        ["../ESCAPE"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=recording_loader,
+    )
+    row = report["rows"][0]
+    assert row["ticker"] == "../ESCAPE"
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    assert row["rows_written"] == 0
+    # The unsafe path was NOT recorded in source_pkl /
+    # manifest_path (NULL'd by the safety branch).
+    assert row["source_pkl"] is None
+    assert row["manifest_path"] is None
+    # Verified loader was NEVER invoked.
+    assert call_log == []
+    # And -- critically -- no file landed outside the
+    # declared pcd.
+    assert not (
+        pcd.parent / "ESCAPE.csv"
+    ).exists()
+    assert not (
+        pcd.parent.parent / "ESCAPE.csv"
+    ).exists()
+
+
+def test_dot_dot_backslash_ticker_rejected(tmp_path):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    call_log, recording_loader = _recording_loader()
+    report = pcw.build_price_cache_write_report(
+        ["..\\ESCAPE"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=recording_loader,
+    )
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    assert call_log == []
+    assert not (
+        pcd.parent / "ESCAPE.csv"
+    ).exists()
+
+
+def test_forward_slash_separator_rejected(tmp_path):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    call_log, recording_loader = _recording_loader()
+    report = pcw.build_price_cache_write_report(
+        ["A/B"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=recording_loader,
+    )
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    assert call_log == []
+
+
+def test_backslash_separator_rejected(tmp_path):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    call_log, recording_loader = _recording_loader()
+    report = pcw.build_price_cache_write_report(
+        ["A\\B"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=recording_loader,
+    )
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in row["issue_codes"]
+    )
+    assert call_log == []
+
+
+def test_absolute_path_looking_ticker_rejected(tmp_path):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    call_log, recording_loader = _recording_loader()
+    # All three should be rejected: drive letter, leading
+    # slash, leading backslash.
+    for unsafe in ("C:\\WIN", "/etc/passwd", "\\bad"):
+        report = pcw.build_price_cache_write_report(
+            [unsafe],
+            signal_cache_dir=scd,
+            stackbuilder_price_cache_dir=pcd,
+            format=pcw.FORMAT_CSV,
+            write=True,
+            verified_loader=recording_loader,
+        )
+        row = report["rows"][0]
+        assert (
+            pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+            in row["issue_codes"]
+        ), (
+            f"absolute-path-looking ticker {unsafe!r} "
+            "was not rejected"
+        )
+    assert call_log == []
+
+
+def test_leading_dot_or_dash_ticker_rejected(tmp_path):
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    call_log, recording_loader = _recording_loader()
+    for unsafe in (".hidden", "-flag"):
+        report = pcw.build_price_cache_write_report(
+            [unsafe],
+            signal_cache_dir=scd,
+            stackbuilder_price_cache_dir=pcd,
+            format=pcw.FORMAT_CSV,
+            write=True,
+            verified_loader=recording_loader,
+        )
+        row = report["rows"][0]
+        assert (
+            pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+            in row["issue_codes"]
+        )
+    assert call_log == []
+
+
+def test_legitimate_tickers_accepted(tmp_path):
+    """SPY, AAPL, BRK-B, ^GSPC, _GSPC, 0011.HK, 000157.KS
+    must all PASS the safety check and proceed to the
+    cascade."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    legitimate = (
+        "SPY", "AAPL", "BRK-B", "^GSPC", "_GSPC",
+        "0011.HK", "000157.KS",
+    )
+    for ticker in legitimate:
+        _make_pkl_fixture(scd, ticker)
+    payloads = {t: _good_payload() for t in legitimate}
+    loader = _make_loader(payloads)
+    report = pcw.build_price_cache_write_report(
+        list(legitimate),
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+        format=pcw.FORMAT_CSV,
+        write=True,
+        verified_loader=loader,
+    )
+    assert report["write_count"] == len(legitimate)
+    for row in report["rows"]:
+        assert (
+            pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+            not in row["issue_codes"]
+        )
+        assert row["wrote_file"] is True
+        # Output file lives INSIDE the declared root.
+        out = Path(row["output_path"])
+        assert out.parent == pcd, (
+            f"{row['ticker']} output {out} escaped {pcd}"
+        )
+
+
+def test_helper_is_safe_ticker_unit():
+    """Direct unit test of the _is_safe_ticker helper.
+    Exercises the boundary cases the integration tests
+    above don't reach (empty input, None, mixed-case,
+    etc.)."""
+    for safe in (
+        "SPY", "AAPL", "BRK-B", "^GSPC", "_GSPC",
+        "0011.HK", "000157.KS",
+        "spy",  # mixed case is fine (upper-normalised)
+        "BRK.B",
+    ):
+        ok, issue = pcw._is_safe_ticker(safe)
+        assert ok is True, (
+            f"legitimate ticker {safe!r} rejected: {issue}"
+        )
+        assert issue is None
+    # Note: surrounding whitespace alone is NOT rejected
+    # by ``_is_safe_ticker`` -- the helper strips + uppers
+    # internally, so ``"SPY "`` normalises to ``"SPY"``
+    # and passes. Interior whitespace (``"S P Y"``) IS
+    # rejected (space is outside the whitelist).
+    for unsafe in (
+        "", "   ", "\t",
+        "../ESCAPE", "..\\ESCAPE",
+        "A/B", "A\\B",
+        "..", "../",
+        "C:\\WIN", "/etc/passwd", "\\bad",
+        ".hidden", "-flag",
+        "S P Y",  # interior space
+        "A,B",            # comma (CLI separator leak)
+        "A!B",            # other special chars
+        None,             # type errors handled
+    ):
+        ok, issue = pcw._is_safe_ticker(unsafe)
+        assert ok is False, (
+            f"unsafe ticker {unsafe!r} ACCEPTED"
+        )
+        assert (
+            issue == pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        )
+
+
+def test_cli_rejects_path_like_ticker_with_rc_zero(
+    tmp_path, capsys,
+):
+    """CLI rc behaviour: pick rc=0 with per-row issue
+    code (matches the existing per-ticker cascade
+    pattern; aggregate write_count is 0). The unsafe
+    ticker IS visible in the report's rows + issue
+    codes."""
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    pcd.mkdir(parents=True, exist_ok=True)
+    rc = pcw.main([
+        "--tickers", "../ESCAPE",
+        "--signal-cache-dir", str(scd),
+        "--stackbuilder-price-cache-dir", str(pcd),
+        "--format", "csv",
+        "--write",
+    ])
+    captured = capsys.readouterr()
+    # CLI returns rc=0 (the unsafe ticker did not crash;
+    # the rejection is surfaced per-row in the report).
+    assert rc == 0
+    report = json.loads(captured.out)
+    assert report["write_count"] == 0
+    assert report["verification_pass_count"] == 0
+    row = report["rows"][0]
+    assert (
+        pcw.ISSUE_INVALID_TICKER_PATH_UNSAFE
+        in row["issue_codes"]
+    )
+    assert row["wrote_file"] is False
+    # No file landed outside pcd.
+    assert not (
+        pcd.parent / "ESCAPE.csv"
+    ).exists()
+    assert not (
+        pcd.parent.parent / "ESCAPE.csv"
+    ).exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-54a planner mirror: the same path-safety
+# validation must apply to the rebuild planner, since it
+# also constructs file paths from ticker strings.
+# ---------------------------------------------------------------------------
+
+
+def test_phase_6i_54a_planner_rejects_path_unsafe_ticker(
+    tmp_path,
+):
+    """The Phase 6I-54a planner mirrors the path-safety
+    validation. Unsafe tickers route directly to
+    manual_review with the invalid_ticker_path_unsafe
+    blocker and trigger NO filesystem probes inside the
+    cache roots."""
+    import stackbuilder_price_cache_rebuild_planner as pcp
+
+    scd = tmp_path / "scd"
+    pcd = tmp_path / "pcd"
+    plan = pcp.build_price_cache_rebuild_plan(
+        ["../ESCAPE", "..\\ESCAPE", "A/B", "SPY"],
+        signal_cache_dir=scd,
+        stackbuilder_price_cache_dir=pcd,
+    )
+    # SPY is unstaged but safe -> needs_source_refresh.
+    # The three unsafe tickers route to manual_review.
+    rows_by_ticker = {r["ticker"]: r for r in plan["rows"]}
+    for unsafe in ("../ESCAPE", "..\\ESCAPE", "A/B"):
+        row = rows_by_ticker[unsafe]
+        assert (
+            row["recommended_action"]
+            == pcp.ACTION_MANUAL_REVIEW
+        )
+        assert (
+            pcp.BLOCKER_INVALID_TICKER_PATH_UNSAFE
+            in row["blocker_codes"]
+        )
+        assert row["expected_stackbuilder_cache_paths"] == []
+        assert (
+            row["existing_stackbuilder_cache_path"]
+            is None
+        )
+        assert row["signal_cache_pkl_path"] is None
+        assert row["signal_cache_manifest_path"] is None
+    # SPY (no PKL in fixture) -> needs_source_refresh,
+    # unchanged behaviour.
+    assert (
+        rows_by_ticker["SPY"]["recommended_action"]
+        == pcp.ACTION_NEEDS_SOURCE_REFRESH
+    )
