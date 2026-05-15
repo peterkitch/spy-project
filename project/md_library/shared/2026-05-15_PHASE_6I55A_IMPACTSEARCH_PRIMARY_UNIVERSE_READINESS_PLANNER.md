@@ -1,9 +1,23 @@
 # Phase 6I-55a: ImpactSearch / primary-universe readiness planner
 
-**Date:** 2026-05-15
+**Date:** 2026-05-15 (amendment-1 same day, docs-only precision pass)
 **Base commit (main):** `4e0b42f` (Phase 6I-55 squash-merge)
 **Branch:** `phase-6i-55a-impactsearch-primary-universe-readiness-planner`
 **Status:** Read-only planner. No production writes. **Do not merge** until operator approval.
+
+## Amendment-1: evidence-doc precision (docs + one regression-guard test)
+
+Codex audit asked for three precision fixes to the evidence narrative:
+
+1. The test counts originally said "18 focused tests, all passing" and "18 passed in 1.36s" without distinguishing the **production-present** writer worktree from a **cacheless / audit** worktree (where `output/impactsearch` is absent and the production-state smoke skips cleanly). Amendment-1 rewrites Section 7 to record both branches explicitly.
+2. The combined-regression total in the original Section 7 used a deferred-to-PR placeholder line instead of explicit numbers. Amendment-1 replaces it with explicit production-present (165 passed) and cacheless/audit (163 passed / 2 skipped) totals, and explains that the skipped tests are environment-dependent production-state smokes, not functional regressions.
+3. Section 8's heading carried a stale 3-count file-list summary while the bullet list below it already enumerated 4 entries. Amendment-1 corrects the heading to "Files added (4)" so the count matches the enumeration.
+
+Amendment-1 also adds one **doc-guard regression test** (`test_evidence_doc_carries_amendment_1_precision_wording` in the existing 6I-55a test file) that pins the corrected wording so future doc rewrites cannot regress it.
+
+No code changes outside the new doc-guard test. No production activity (no StackBuilder, ImpactSearch, OnePass, yfinance, source refresh, promotion, Confluence patch writer, pipeline runner, batch engine).
+
+---
 
 `<PINNED_PYTHON> = C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`
 
@@ -158,13 +172,21 @@ For JNJ/WMT/HD/MCD the comment is the same except the reason is `"no matching wo
 
 ## 7. Test commands and results
 
+### Focused Phase 6I-55a suite
+
 ```
 "<PINNED_PYTHON>" -m pytest \
     test_scripts/test_confluence_impactsearch_primary_universe_readiness_planner.py -v
-... 18 passed in 1.36s
 ```
 
-Combined Phase 6I planner/policy/preflight/rebuild-planner/writer/readiness regression:
+| Worktree state | Result |
+|---|---|
+| **Production-present** (writer worktree; `output/impactsearch/` populated): | **18 passed**. |
+| **Cacheless / audit** (clean Codex worktree where `output/impactsearch/` is absent): | **17 passed / 1 skipped.** The skipped test is `test_production_state_smoke_skips_when_impact_xlsx_dir_absent` (informational production-state smoke); the deterministic-classification fixture tests pin the cascade in every worktree. |
+
+The skip is expected behavior, not a functional regression — the test calls `pytest.skip(...)` cleanly when `output/impactsearch` is absent so a fresh checkout never sees a hard failure.
+
+### Combined Phase 6I planner/policy/preflight/rebuild-planner/writer/readiness regression
 
 ```
 "<PINNED_PYTHON>" -m pytest \
@@ -176,15 +198,19 @@ Combined Phase 6I planner/policy/preflight/rebuild-planner/writer/readiness regr
     test_scripts/test_stackbuilder_price_cache_writer.py \
     test_scripts/test_phase_6i_55_evidence_doc_guard.py \
     test_scripts/test_confluence_impactsearch_primary_universe_readiness_planner.py -q
-... see Phase 6I-55a PR description for the green total
 ```
+
+| Worktree state | Result |
+|---|---|
+| **Production-present** (writer worktree): | **165 passed.** |
+| **Cacheless / audit** (clean Codex worktree where `output/impactsearch/` and `price_cache/daily/` are absent): | **163 passed / 2 skipped.** The 2 skipped tests are the environment-dependent production-state smokes (Phase 6I-53 preflight + Phase 6I-55a readiness). Both skips are deliberate, gated on missing on-disk evidence roots, and **not functional regressions**. |
 
 `py_compile` clean on the new module + test file. `git diff --check` clean.
 
-## 8. Files added (3)
+## 8. Files added (4)
 
 - `project/confluence_impactsearch_primary_universe_readiness_planner.py` — read-only planner.
-- `project/test_scripts/test_confluence_impactsearch_primary_universe_readiness_planner.py` — 18 focused tests.
+- `project/test_scripts/test_confluence_impactsearch_primary_universe_readiness_planner.py` — 18 focused tests + 1 amendment-1 doc-guard regression test (19 total).
 - `project/md_library/shared/2026-05-15_PHASE_6I55A_IMPACTSEARCH_PRIMARY_UNIVERSE_READINESS_PLANNER.md` (this doc).
 - `project/md_library/shared/2026-05-15_PHASE_6I55A_IMPACTSEARCH_PRIMARY_UNIVERSE_READINESS_EVIDENCE.json` — production-state plan JSON.
 

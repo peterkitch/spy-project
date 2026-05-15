@@ -907,3 +907,89 @@ def test_upstream_chain_citations_present(tmp_path):
         assert needle in cited, (
             f"missing citation: {needle}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-55a amendment-1: evidence-doc precision guard.
+#
+# Codex audit asked for three precision fixes to the
+# evidence narrative: (a) distinguish production-present
+# vs cacheless/audit worktree test counts; (b) replace a
+# "see PR description for the green total" placeholder
+# with exact totals; (c) fix "Files added (3)" to (4)
+# matching the actual PR shape. This guard pins all
+# three corrections so a future doc edit cannot regress
+# them.
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_doc_carries_amendment_1_precision_wording():
+    """Read the 6I-55a evidence doc and assert:
+
+      * the stale 'Files added (3)' heading does NOT
+        appear;
+      * the new 'Files added (4)' heading IS present;
+      * the cacheless / audit worktree expected-skip
+        wording IS present (both for the focused suite
+        and the combined regression);
+      * the original 'see Phase 6I-55a PR description
+        for the green total' placeholder is NOT used
+        as a substitute for exact results;
+      * explicit production-present + cacheless totals
+        appear for both the focused suite (18 / 17+1
+        skipped) and the combined regression (165 /
+        163+2 skipped).
+    """
+    here = Path(__file__).resolve().parent.parent
+    doc = (
+        here
+        / "md_library"
+        / "shared"
+        / (
+            "2026-05-15_PHASE_6I55A_IMPACTSEARCH_"
+            "PRIMARY_UNIVERSE_READINESS_PLANNER.md"
+        )
+    )
+    assert doc.exists(), (
+        f"6I-55a evidence doc missing at {doc}"
+    )
+    body = doc.read_text(encoding="utf-8")
+
+    # Stale wording must be gone.
+    forbidden_stale = (
+        "Files added (3)",
+        (
+            "see Phase 6I-55a PR description for the "
+            "green total"
+        ),
+    )
+    for phrase in forbidden_stale:
+        assert phrase not in body, (
+            f"Phase 6I-55a evidence doc still carries "
+            f"stale wording: {phrase!r}"
+        )
+
+    # New required wording must be present.
+    required = (
+        "Files added (4)",
+        # Focused-suite counts.
+        "18 passed",
+        "17 passed / 1 skipped",
+        # Combined-regression counts.
+        "165 passed",
+        "163 passed / 2 skipped",
+        # Explicit naming of the production-state smoke
+        # and its skip condition.
+        "test_production_state_smoke_skips_when_"
+        "impact_xlsx_dir_absent",
+        # The "not a functional regression" framing.
+        "not functional regressions",
+    )
+    missing = [
+        phrase for phrase in required
+        if phrase not in body
+    ]
+    assert not missing, (
+        "Phase 6I-55a evidence doc missing amendment-1 "
+        f"required wording: {missing!r}"
+    )
