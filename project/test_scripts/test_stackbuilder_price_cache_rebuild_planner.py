@@ -954,3 +954,71 @@ def test_planner_works_when_cache_results_directory_missing(
         == 0
     )
     assert plan["provenance_summary"]["groups"] == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-54a amendment-2 regression guard.
+#
+# Codex re-audit found that the evidence doc still
+# referenced the pre-amendment-1 test name
+# ``test_production_state_classification_matches_expected``
+# in its test table, even though the test had been
+# renamed to
+# ``test_production_state_classification_skips_when_cache_absent``.
+# Amendment-2 rewrote the doc to match; this regression
+# guard ensures the stale name cannot silently reappear.
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_doc_does_not_reference_stale_old_test_name():
+    """The Phase 6I-54a evidence doc must not reference
+    the pre-amendment-1 test name. Pinned at the doc
+    level so a future doc edit that accidentally
+    reintroduces it is caught. The corrected name MUST
+    appear (regression in either direction is caught)."""
+    here = Path(__file__).resolve().parent.parent
+    doc = (
+        here
+        / "md_library"
+        / "shared"
+        / (
+            "2026-05-15_PHASE_6I54A_STACKBUILDER_PRICE_"
+            "CACHE_REBUILD_PLAN.md"
+        )
+    )
+    src = doc.read_text(encoding="utf-8")
+    # The stale pre-amendment-1 test name must NOT appear
+    # as a current/forward-looking reference. Historical
+    # mention IS allowed when paired with the corrective
+    # framing (the amendment-1 section explicitly
+    # describes the rename), but the test-table row + any
+    # other forward-looking caller MUST use the new
+    # name.
+    stale_name = (
+        "test_production_state_classification_matches_"
+        "expected"
+    )
+    new_name = (
+        "test_production_state_classification_skips_"
+        "when_cache_absent"
+    )
+    # The doc may reference the stale name AT MOST in the
+    # amendment-1 / amendment-2 historical sections. The
+    # corrected name must appear at least once (the test-
+    # table row references it).
+    assert new_name in src, (
+        f"evidence doc does not reference the new test "
+        f"name {new_name!r}"
+    )
+    # Belt-and-braces: count occurrences. The new name
+    # must outnumber the stale one (which can appear at
+    # most in the amendment-1 historical reference).
+    new_count = src.count(new_name)
+    stale_count = src.count(stale_name)
+    assert new_count > stale_count, (
+        f"stale test name {stale_name!r} appears "
+        f"{stale_count} times vs new name "
+        f"{new_name!r} appears {new_count} times; "
+        "the doc must use the new name as the primary "
+        "reference."
+    )

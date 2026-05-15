@@ -1,9 +1,28 @@
 # Phase 6I-54a: Local secondary-price cache rebuild planner for StackBuilder pilot universe
 
-**Date:** 2026-05-15 (amendment-1 same day)
+**Date:** 2026-05-15 (amendment-1 + amendment-2 same day)
 **Base commit (main):** `5106375` (Phase 6I-53 squash-merge)
 **Branch:** `phase-6i-54a-stackbuilder-price-cache-rebuild-planner`
 **Status:** Read-only planner. No production writes. **Do not merge** until operator approval.
+
+## Amendment-2: docs-only precision pass
+
+Codex re-audit confirmed the amendment-1 code/test fixes work but flagged three remaining stale doc strings. Amendment-2 is a **docs-only** precision pass; no code/test behaviour changes:
+
+1. **Cache distinction table** (Section 2) — the "Signal-engine cache" row previously implied every `cache/results/<TICKER>_precomputed_results.pkl` is produced by the Phase 6E-5 `signal_engine_cache_refresher`. Rewritten to say the ready files come from `signal_engine_cache_refresher` OR legacy Spymaster, and that Phase 6I-54b must verify each file independently before writing `price_cache/daily/`.
+2. **Test table row #17** (Section 3) — the row still named the pre-amendment-1 test `test_production_state_classification_matches_expected`. Replaced with `test_production_state_classification_skips_when_cache_absent` + description of the skip-when-cache-absent behaviour, with the fixture-based test row pinning the deterministic 6/19 classification portably.
+3. **Test-result wording** — counts now report the **cacheless-worktree** results as the universal committed-suite outcome. Codex's measurement was 22 passed / 1 skipped focused (and 99 passed / 1 skipped combined) BEFORE amendment-2 added the regression-guard test below; amendment-2 adds exactly one new test, which raises the cacheless-worktree count to **23 passed / 1 skipped** focused (the skipped test is the informational production-state smoke; the new guard runs unconditionally) and **100 passed / 1 skipped** for the combined Phase 6I-50/51/52/53/54a regression. The cache-present numbers from a writer's local worktree are 24/24 focused and 101/101 combined.
+
+Amendment-2 also adds one small regression guard (`test_evidence_doc_does_not_reference_stale_old_test_name`) so the pre-amendment-1 test name cannot silently sneak back into the doc.
+
+**Files changed in amendment-2:**
+
+- `project/md_library/shared/2026-05-15_PHASE_6I54A_STACKBUILDER_PRICE_CACHE_REBUILD_PLAN.md` (this doc) — three precision fixes.
+- `project/test_scripts/test_stackbuilder_price_cache_rebuild_planner.py` — one new regression-guard test.
+
+No code module changes. Production roots remain untouched (combined 83036, pre = post).
+
+---
 
 `<PINNED_PYTHON> = C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe`
 
@@ -46,7 +65,7 @@ This is exposed both as a free-text field on `provenance_summary.phase_6i_54b_ve
 - `project/md_library/shared/2026-05-15_PHASE_6I54A_STACKBUILDER_PRICE_CACHE_REBUILD_PLAN.md` (this doc) — amendment-1 section + Section 4 rewrite.
 - `project/md_library/shared/2026-05-15_PHASE_6I54A_STACKBUILDER_PRICE_CACHE_REBUILD_PLAN_EVIDENCE.json` — regenerated.
 
-**23 / 23 Phase 6I-54a tests pass** (17 original + 6 amendment-1). Combined Phase 6I-50/51/52/53/54a regression: 100 / 100. Production roots untouched (combined 83036, pre = post).
+**Universal committed-suite result (clean Codex worktree, no `cache/results`, post amendment-2):** 23 passed / 1 skipped focused, 100 passed / 1 skipped combined Phase 6I-50/51/52/53/54a regression. The skipped test is the informational production-state smoke (`test_production_state_classification_skips_when_cache_absent`); the deterministic 6/19 classification pin runs unconditionally via the fixture-based test. **Production-cache-present local result** (this writer's worktree, with `cache/results` populated): 24 passed / 101 passed. Production roots untouched (combined 83036, pre = post).
 
 ---
 
@@ -58,7 +77,7 @@ Phase 6I-53 found the StackBuilder secondary price cache at `price_cache/daily/`
 
 | Cache | Path | What it is | Phase 6I-54a treatment |
 |---|---|---|---|
-| Signal-engine cache | `cache/results/<TICKER>_precomputed_results.pkl` + `<TICKER>_precomputed_results.pkl.manifest.json` | Produced by Phase 6E-5 `signal_engine_cache_refresher` ("optimizer_v1" scope, `params.price_source="Close"`). Manifest sidecar is plain JSON; PKL is a numpy/pandas binary. | **READ ONLY:** plain-JSON manifest sidecar is read (`Path.read_text` + `json.loads`). PKL body is NOT loaded — that's Phase 6I-54b's job. |
+| Signal-engine cache | `cache/results/<TICKER>_precomputed_results.pkl` + `<TICKER>_precomputed_results.pkl.manifest.json` | A given file in this root may have been produced by **either** the Phase 6E-5 `signal_engine_cache_refresher` (`engine_version="6E-5.0.0"`) **or** the legacy Spymaster path (`producer_engine="spymaster"`, `engine_version="1.0.0"`). The "optimizer_v1" / `params.price_source="Close"` contract holds across both producers, but Phase 6I-54b must verify each candidate file independently via the approved provenance/loader path before writing `price_cache/daily/<TICKER>.parquet`. Manifest sidecar is plain JSON; PKL is a numpy/pandas binary. | **READ ONLY:** plain-JSON manifest sidecar is read (`Path.read_text` + `json.loads`). PKL body is NOT loaded — that's Phase 6I-54b's job, with mandatory per-file provenance verification. |
 | StackBuilder secondary price cache | `price_cache/daily/<TICKER>.parquet` (and four sibling forms) | Checked by `stackbuilder.load_secondary_prices` (`stackbuilder.py:530-556`). If missing, StackBuilder falls through to `_fetch_secondary_from_yf` (live yfinance). | **DESTINATION:** Phase 6I-54a only enumerates expected paths + checks existence. Phase 6I-54b will write `Date + Close` rows here. |
 
 The planner module is explicit about which cache it is touching at every step; the test suite pins the distinction (`test_cache_dirs_are_distinct`).
@@ -79,7 +98,7 @@ The planner module is explicit about which cache it is touching at every step; t
 
 ### Tests
 
-`project/test_scripts/test_stackbuilder_price_cache_rebuild_planner.py` — 23 focused tests (17 original + 6 amendment-1), all passing.
+`project/test_scripts/test_stackbuilder_price_cache_rebuild_planner.py` — 24 focused tests (17 original + 6 amendment-1 + 1 amendment-2 regression guard). In a clean worktree where `cache/results` is absent the production-state smoke skips: **23 passed / 1 skipped**. In a worktree with the production cache present, the smoke runs and all 24 pass.
 
 | # | Test | Pins |
 |---|---|---|
@@ -99,9 +118,9 @@ The planner module is explicit about which cache it is touching at every step; t
 | 14 | `test_module_source_has_no_pickle_load_call` | No `pickle.load(` or `pickle_load_compat(` call expression. |
 | 15 | `test_output_path_guard_rejects_production_and_pcd` | `--output` rejects all 5 production roots AND `price_cache/daily/`. |
 | 16 | `test_future_write_contract_is_well_formed` | Phase 6I-54b write contract carries destination, formats, required columns. |
-| 17 | `test_production_state_classification_matches_expected` | 6/25 `use_existing_signal_cache` (SPY, AAPL, JNJ, WMT, HD, MCD); 19/25 `needs_source_refresh`; 0 `manual_review` / `needs_network_fetch`. |
+| 17 | `test_production_state_classification_skips_when_cache_absent` | Informational production-state smoke. **Skips cleanly via `pytest.skip(...)`** when `cache/results` is absent or when none of the 6 known-ready tickers have PKLs on disk (which is the state in a clean Codex worktree). When the production cache is present, asserts 6/25 `use_existing_signal_cache` (SPY, AAPL, JNJ, WMT, HD, MCD); 19/25 `needs_source_refresh`; 0 `manual_review` / `needs_network_fetch`. The deterministic, **portable** 6/19 classification is pinned by the fixture-based amendment-1 test `test_six_use_existing_and_nineteen_needs_source_refresh_against_fixture` (uses only `tmp_path`; never touches the real cache). |
 
-Combined Phase 6I planner regression: **100 / 100 tests pass** (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 15 from 6I-53 + 23 from 6I-54a).
+**Combined Phase 6I-50/51/52/53/54a regression — universal committed-suite result (cacheless Codex worktree, post amendment-2):** 100 passed / 1 skipped (16 from 6I-50 + 23 from 6I-51 + 23 from 6I-52 + 15 from 6I-53 + 23 passed + 1 skipped from 6I-54a, where the skipped item is the informational production-state smoke). **Production-cache-present local result:** 101 / 101 (this writer's worktree, with `cache/results` populated). The portability gap recorded by Codex audit is closed: every committed test passes or skips cleanly without relying on untracked production cache files.
 
 ## 4. Per-ticker planner summary (production state, 2026-05-15)
 
