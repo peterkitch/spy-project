@@ -576,6 +576,126 @@ def test_candidate_command_includes_cache_dir_and_cutoff():
 
 
 # ---------------------------------------------------------------------------
+# Phase 6I-43 amendment-1: pinned interpreter
+# ---------------------------------------------------------------------------
+
+
+_PINNED = (
+    "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/"
+    "spyproject2/python.exe"
+)
+
+
+def test_amendment1_pinned_interpreter_constant_exposed():
+    """Phase 6I-43 amendment-1: the module exposes a stable
+    PINNED_PYTHON_INTERPRETER constant that names the
+    spyproject2 audit interpreter."""
+    assert hasattr(pv2, "PINNED_PYTHON_INTERPRETER")
+    assert pv2.PINNED_PYTHON_INTERPRETER == _PINNED
+
+
+def test_amendment1_candidate_command_uses_pinned_interpreter():
+    """The candidate command MUST start with the pinned
+    interpreter path. It MUST NOT start with bare
+    ``python signal_engine_cache_refresher.py`` because
+    bare ``python`` on this machine can resolve to a wrong
+    environment."""
+    cache_probe, source_probe = _fake_probes(
+        cache_states=[_cache_state(ticker="AAA")],
+        source_states=[
+            _source_state(
+                ticker="AAA",
+                source_ahead_of_cutoff=True,
+                new_cache_date_range_end="2026-05-15",
+                provider_fetch_telemetry=_telemetry_ok(
+                    date_range_end="2026-05-15",
+                ),
+            ),
+        ],
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        ["AAA"],
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    cmd = report.refresh_candidate_command
+    assert cmd is not None
+    # Pinned interpreter path appears in the command and
+    # is the FIRST token.
+    assert _PINNED in cmd
+    assert cmd.startswith(_PINNED + " ")
+    # Negative check: command does NOT start with bare
+    # ``python signal_engine_cache_refresher.py``.
+    assert not cmd.startswith(
+        "python signal_engine_cache_refresher.py",
+    )
+    # argv[0] is the pinned interpreter path.
+    argv = report.refresh_candidate_command_argv
+    assert argv is not None
+    assert argv[0] == _PINNED
+    # argv[1] is the refresher script (sanity).
+    assert argv[1] == "signal_engine_cache_refresher.py"
+
+
+def test_amendment1_pinned_interpreter_with_invalid_excluded():
+    """Combined check: pinned interpreter + invalid-ticker
+    exclusion + no env-var wording -- all three contracts
+    hold simultaneously on the realistic SPY-K-universe
+    fixture."""
+    non_tef = [
+        "SPY", "AROW", "AWR", "CLH", "CP", "EXPO", "FCFS",
+        "GBCI", "HCSG", "JNJ", "LLY", "MO", "PRA", "PRGO",
+    ]
+    universe = non_tef + ["TEF"]
+    cache_states = [
+        _cache_state(ticker=t) for t in universe
+    ]
+    source_states = [
+        _source_state(
+            ticker=t,
+            source_equal_to_cutoff=True,
+            new_cache_date_range_end="2026-05-14",
+            provider_fetch_telemetry=_telemetry_ok(),
+        )
+        for t in non_tef
+    ] + [
+        _source_state(
+            ticker="TEF",
+            new_cache_date_range_end=None,
+            provider_fetch_telemetry=_telemetry_delisted(),
+        ),
+    ]
+    cache_probe, source_probe = _fake_probes(
+        cache_states=cache_states,
+        source_states=source_states,
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    assert report.refresh_candidate_ready is True
+    cmd = report.refresh_candidate_command
+    assert cmd is not None
+    # Pinned interpreter first.
+    assert cmd.startswith(_PINNED + " ")
+    # TEF excluded.
+    assert "TEF" not in cmd
+    for t in non_tef:
+        assert t in cmd
+    # No env-var wording.
+    assert "PRJCT9_AUTOMATION_WRITE_AUTH" not in cmd
+    assert "phase_6h5_explicit" not in cmd
+    # --write present.
+    assert " --write" in cmd or cmd.endswith("--write")
+
+
+# ---------------------------------------------------------------------------
 # Cache-already-ready short-circuit
 # ---------------------------------------------------------------------------
 

@@ -2,6 +2,35 @@
 
 **Branch:** `phase-6i-43-source-refresh-policy-v2`
 
+## Amendment-1 summary (Codex audit response)
+
+One focused fix: the candidate command now uses the
+**pinned spyproject2 audit interpreter path** as its
+first token instead of bare `python`. Bare `python` on
+this machine can resolve to the wrong environment (e.g.
+`C:\Python313`) instead of the project audit interpreter,
+so operator-copy commands must name the pinned
+interpreter explicitly.
+
+Changes:
+
+- Added `PINNED_PYTHON_INTERPRETER = "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe"`
+  to `signal_library_source_refresh_policy_v2.py`.
+- `_build_refresh_candidate_command()` now emits the
+  pinned path as `argv[0]`; the joined string starts
+  with the pinned path followed by the rest of the
+  refresher CLI.
+- 3 new amendment-1 tests pin the contract:
+  `test_amendment1_pinned_interpreter_constant_exposed`,
+  `test_amendment1_candidate_command_uses_pinned_interpreter`,
+  `test_amendment1_pinned_interpreter_with_invalid_excluded`.
+- All previous contracts unchanged: TEF still excluded,
+  `--write` still present, no `PRJCT9_AUTOMATION_WRITE_AUTH`
+  wording.
+
+Total test count: 27 (24 original + 3 amendment-1). Full
+focused suite: **165 passed in 4.87s**.
+
 ## 1. ELI5: equal-cutoff vs strict-greater
 
 The Phase 6I-33 readiness coordinator's strict rule
@@ -132,15 +161,24 @@ automation writer) — NOT the refresher CLI.
 The emitted command carries `--write` ONLY. No
 `PRJCT9_AUTOMATION_WRITE_AUTH` wording.
 
-### Candidate command shape
+### Candidate command shape (amendment-1: pinned interpreter)
 
 ```
-python signal_engine_cache_refresher.py \
+"C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+  signal_engine_cache_refresher.py \
   --tickers <non-invalid CSV> \
   --cache-dir <cache_dir> \
   --current-as-of-date <YYYY-MM-DD> \
   --write
 ```
+
+The first token is the **pinned spyproject2 audit
+interpreter path**, NOT bare `python`. Bare `python` on
+this machine can resolve to the wrong environment (e.g.
+`C:\Python313`), which is not the project audit interpreter
+and cannot use the SciPy 1.13.1 wheel set the
+baseline-lock contract depends on. Operator-copy commands
+must therefore name the pinned interpreter explicitly.
 
 Invalid tickers like TEF are excluded from the `--tickers`
 list. The planner NEVER runs the refresher; the operator
@@ -166,7 +204,8 @@ refresh_candidate_tickers: [
 ]
 blocker_reasons: []
 refresh_candidate_command:
-  python signal_engine_cache_refresher.py \
+  "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe" \
+    signal_engine_cache_refresher.py \
     --tickers SPY,AROW,AWR,CLH,CP,EXPO,FCFS,GBCI,HCSG,JNJ,LLY,MO,PRA,PRGO \
     --cache-dir cache/results \
     --current-as-of-date 2026-05-14 \

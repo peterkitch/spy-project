@@ -118,6 +118,19 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 SCHEMA_VERSION: str = "source_refresh_policy_v2"
 
 
+# Phase 6I-43 amendment-1 (Codex audit): the candidate
+# command MUST start with the pinned interpreter path,
+# never bare ``python``. Bare ``python`` on this machine
+# can resolve to a wrong environment (e.g. ``C:\Python313``)
+# instead of the project audit interpreter. Operator-copy
+# commands must therefore name the pinned interpreter
+# explicitly.
+PINNED_PYTHON_INTERPRETER: str = (
+    "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/"
+    "spyproject2/python.exe"
+)
+
+
 # ---------------------------------------------------------------------------
 # Classifications
 # ---------------------------------------------------------------------------
@@ -545,8 +558,13 @@ def _build_refresh_candidate_command(
     if not tickers:
         return None, None
     ticker_csv = ",".join(tickers)
+    # Phase 6I-43 amendment-1: use the pinned interpreter
+    # path. Bare ``python`` can resolve to the wrong
+    # environment on this machine; operator-copy commands
+    # must name the spyproject2 audit interpreter
+    # explicitly.
     argv: list[str] = [
-        "python",
+        PINNED_PYTHON_INTERPRETER,
         "signal_engine_cache_refresher.py",
         "--tickers", ticker_csv,
     ]
