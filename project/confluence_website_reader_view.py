@@ -586,6 +586,14 @@ def _build_ranking_table_row(
             if isinstance(row.get("flip_risk"), Mapping)
             else {}
         ),
+        # Phase 6I-48 amendment-1: thread the
+        # ranking-eligibility-basis through to the
+        # ranking_table row so the renderer can surface
+        # ``strict_full_60_cell`` vs
+        # ``partial_effective_members`` honestly.
+        "ranking_eligibility_basis": row.get(
+            "ranking_eligibility_basis",
+        ),
     }
 
 
@@ -775,6 +783,14 @@ def _build_ticker_card(
             current_signal_status_card
         ),
         "flip_risk": flip_risk_card,
+        # Phase 6I-48 amendment-1: ranking-eligibility-basis
+        # on ticker_cards mirrors the ranking_table surface
+        # so the renderer can render the basis badge in
+        # both the table row and the per-ticker detail
+        # panel.
+        "ranking_eligibility_basis": detail.get(
+            "ranking_eligibility_basis",
+        ),
     }
 
 

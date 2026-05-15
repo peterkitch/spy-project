@@ -3142,6 +3142,38 @@ def _try_build_partial_rankable_row(
     # row never silently claims full coverage.
     k_cells_available = int(prepared_cell_count)
 
+    # Phase 6I-48 amendment-1: populate the current /
+    # primary build surfaces from the effective metrics so
+    # the website renderer can show a partial-ranked row
+    # with the same level of detail as a strict-complete
+    # row (per-cell signal matrix, summary, primary K
+    # build), instead of empty placeholders. The same
+    # helpers used on the strict path (Phase 6I-37 +
+    # Phase 6I-39) accept any per-cell list shaped like
+    # ``per_window_k_metrics``; the effective list lives
+    # under a different field name on the artifact but
+    # shares the per-cell schema. ``effective_alignment``
+    # is the parallel alignment surface (defaults to an
+    # empty dict when absent; the summary helper tolerates
+    # that).
+    current_signal_matrix = _build_current_signal_matrix(
+        effective_metrics,
+        ticker=ticker,
+    )
+    current_signal_summary = _build_current_signal_summary(
+        current_signal_matrix,
+        bwwa=(
+            effective_alignment
+            if isinstance(
+                effective_alignment, Mapping,
+            )
+            else {}
+        ),
+    )
+    primary_build_summary = _build_primary_build_summary(
+        current_signal_matrix,
+    )
+
     return PerTickerRankingRow(
         ticker=ticker,
         artifact_path=str(artifact_path),
@@ -3193,6 +3225,11 @@ def _try_build_partial_rankable_row(
         chart_row_count=chart.get("chart_row_count"),
         chart_blocker=chart.get("chart_blocker"),
         issue_codes=(),
+        current_build_signals=current_signal_matrix,
+        current_build_signal_summary=(
+            current_signal_summary
+        ),
+        primary_build_summary=primary_build_summary,
         row_sort_values=sort_values_block,
         data_completeness=completeness_block,
         current_signal_status_block=signal_status_block,

@@ -16,6 +16,13 @@ production. No production Confluence artifact write. No
 **Verdict:** **READY.** Partial-rankable contract implemented and
 proven against a tmp fixture; strict complete + Phase 6I-47
 blocked-partial behaviour both preserved.
+**Amendment-1 status:** added below in § 11. Closes two Codex audit
+gaps: (1) `ranking_eligibility_basis` now threads end-to-end
+through the export package, reader/view, and renderer (badge + data
+attribute + detail panel); (2) partial-ranked rows now populate
+`current_build_signals` / `current_build_signal_summary` /
+`primary_build_summary` from the effective metrics so the website
+detail card / table cells are at parity with strict-complete rows.
 
 ---
 
@@ -446,3 +453,67 @@ SPY's production Confluence artifact; the ranking export would then
 auto-flip SPY's row from `daily_only` (or `partial_multiwindow_only`)
 to a **rank-eligible** `partial_effective_members` row with the `!`
 warning surfaced on the live website.
+
+---
+
+## 11. Amendment-1 (Codex audit response): basis threaded through the website chain + current/primary surfaces populated for partial rows
+
+Codex audit of the Phase 6I-48 base implementation found two
+website-contract gaps:
+
+  1. `ranking_eligibility_basis` was emitted on `PerTickerRankingRow`
+     but **lost** as soon as the row passed through
+     `confluence_website_export_package` / reader-view / renderer —
+     a consumer reading the website JSON or HTML could not see
+     whether a row was strict-complete or partial.
+  2. Partial-ranked rows had **empty** `current_build_signals`,
+     `current_build_signal_summary`, and `primary_build_summary`
+     even though `effective_per_window_k_metrics` carried enough
+     cell data to populate them.
+
+Amendment-1 closes both gaps. Strict-complete behaviour remains
+byte-identical; the only behaviour change is on the partial-ranked
+row + on the website-surface pass-through of the basis tag.
+
+### 11.1 Changed files (amendment-1)
+
+| File | Change |
+|---|---|
+| `project/confluence_multiwindow_ranking_export.py` | `_try_build_partial_rankable_row` now calls the existing Phase 6I-37 `_build_current_signal_matrix` + `_build_current_signal_summary` + Phase 6I-39 `_build_primary_build_summary` helpers against `effective_per_window_k_metrics` + `effective_build_wide_window_alignment` and sets the corresponding fields on the constructed row. No new cells are fabricated — if the effective metrics contain 30 cells, the matrix has 30 entries and `k_cells_available` still tracks the prepared count, not the canonical 60. |
+| `project/confluence_website_export_package.py` | `_normalize_ranking_row` + `_normalize_blocked_row` + the `ticker_details` normalizer now pass `ranking_eligibility_basis` through verbatim. Blocked rows pass `None`; partial-rankable rows pass `partial_effective_members`; strict-complete rows pass `strict_full_60_cell`. |
+| `project/confluence_website_reader_view.py` | The ranking-table-row normalizer and the ticker-card normalizer now both carry `ranking_eligibility_basis` through to `ranking_table[*]` and `ticker_cards[*]`. |
+| `project/confluence_static_board_renderer.py` | `_ranking_row_html` renders a visible badge in the ticker cell — `Partial (effective members)` (with a tooltip explaining the basis) or `Strict 60-cell` (also tool-tipped) — and adds a `data-ranking-eligibility-basis="..."` attribute to the `<tr>` so a future CSS / JS filter can target partial rows. The inline JS detail-panel renderer (`_INLINE_JS`) shows a new **Ranking eligibility basis** section with both a human label and the internal code, immediately above the existing **Data completeness** section. Strict-only rows render the `Strict 60-cell` badge; partial rows render the `Partial (effective members)` badge and continue to render the `!` warning column from the existing Phase 6I-40 plumbing. |
+| `project/test_scripts/test_phase_6i48_partial_multiwindow_ranking_eligibility.py` | Added 11 new tests covering: partial row's `current_build_signals` length matches the effective-cell count; partial row's `current_build_signal_summary` is non-null and carries Phase 6I-37 keys; partial row's `primary_build_summary` is non-null; partial matrix does NOT fabricate cells to canonical 60; blocked-partial rows still carry empty current/primary surfaces (regression); strict-complete rows still carry `strict_full_60_cell` basis + populated current/primary (regression); export-package `ranking_rows[*]` + `ticker_details[*]` carry the basis (partial + strict); reader-view `ranking_table[*]` + `ticker_cards[*]` carry the basis; rendered HTML contains the `Partial (effective members)` badge + the `!` warning + `data-ranking-eligibility-basis="partial_effective_members"` attribute; rendered HTML contains the `Strict 60-cell` badge + `data-ranking-eligibility-basis="strict_full_60_cell"` attribute. |
+
+### 11.2 Amendment-1 evidence
+
+| Surface | Strict-complete row | Partial-rankable row | Blocked row |
+|---|---|---|---|
+| `PerTickerRankingRow.ranking_eligibility_basis` | `strict_full_60_cell` | `partial_effective_members` | `None` |
+| `PerTickerRankingRow.current_build_signals` length | 60 | **30** (effective cells; no fabrication) | `()` |
+| `PerTickerRankingRow.current_build_signal_summary` | populated | **populated** (Phase 6I-37 schema) | `None` |
+| `PerTickerRankingRow.primary_build_summary` | populated | **populated** (Phase 6I-39 schema) | `None` |
+| Export package `ranking_rows[*].ranking_eligibility_basis` | `strict_full_60_cell` | `partial_effective_members` | `None` |
+| Export package `ticker_details[*].ranking_eligibility_basis` | `strict_full_60_cell` | `partial_effective_members` | `None` |
+| View model `ranking_table[*].ranking_eligibility_basis` | `strict_full_60_cell` | `partial_effective_members` | n/a (blocked uses `blocked_table`) |
+| View model `ticker_cards[*].ranking_eligibility_basis` | `strict_full_60_cell` | `partial_effective_members` | `None` |
+| Renderer HTML `<tr>` data attribute | `data-ranking-eligibility-basis="strict_full_60_cell"` | `data-ranking-eligibility-basis="partial_effective_members"` | (no row in the ranking table) |
+| Renderer HTML ticker-cell badge | `Strict 60-cell` | **`Partial (effective members)`** | — |
+| Renderer HTML warning column | (none) | **`!`** | (n/a) |
+| Renderer detail-panel basis section | "Strict (full 60-cell)" + code | **"Partial (effective members)" + code** | (hidden when basis is `None`) |
+
+### 11.3 Amendment-1 tests
+
+- **Phase 6I-48 focused suite (including amendment-1):** `pytest test_scripts/test_phase_6i48_partial_multiwindow_ranking_eligibility.py -q` → **27 / 27 passed** (was 16 in the base; +11 amendment-1).
+- **Touched-module focused suite:** the ranking export + export package + reader/view + static renderer + overlays suites all pass alongside the new amendment-1 tests; **209 / 209**.
+- **Full regression:** `pytest test_scripts -q` → **2,246 / 2,246 passed** (was 2,235 in the Phase 6I-48 base; +11 amendment-1 tests). 165 pre-existing pandas-fragmentation warnings unchanged. No new warnings.
+- `py_compile` clean on all 4 changed modules (`confluence_multiwindow_ranking_export.py`, `confluence_website_export_package.py`, `confluence_website_reader_view.py`, `confluence_static_board_renderer.py`).
+- `git diff --check` clean.
+
+### 11.4 Amendment-1 no-production-activity confirmation
+
+  * Production roots: **0 / 0 / 0** diff across `cache/results`, `cache/status`, `output/research_artifacts`, `output/stackbuilder`, `signal_library/data/stable`.
+  * No `--write` on any guarded writer against production. No `PRJCT9_AUTOMATION_WRITE_AUTH`.
+  * No source refresh, no yfinance, no `confluence_pipeline_runner`, no batch engines.
+  * No production promotion. No Confluence patch writer.
+  * Tests + evidence runs operated against tmp fixtures only.

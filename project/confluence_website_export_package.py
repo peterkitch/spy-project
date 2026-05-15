@@ -287,6 +287,14 @@ def _normalize_ranking_row(
             current_signal_status_out
         ),
         "flip_risk": flip_risk_out,
+        # Phase 6I-48 amendment-1: ranking-eligibility-basis
+        # threaded through to the website surface so a
+        # consumer can tell apart strict_full_60_cell rows
+        # from partial_effective_members rows at this
+        # layer.
+        "ranking_eligibility_basis": row.get(
+            "ranking_eligibility_basis",
+        ),
     }
 
 
@@ -340,6 +348,12 @@ def _normalize_blocked_row(
         "data_completeness": completeness_out,
         "current_signal_status_block": signal_status_out,
         "flip_risk": flip_risk_out,
+        # Phase 6I-48 amendment-1: ranking-eligibility-basis
+        # is None for a blocked row but threaded through
+        # for surface consistency.
+        "ranking_eligibility_basis": row.get(
+            "ranking_eligibility_basis",
+        ),
     }
 
 
@@ -577,6 +591,17 @@ def _build_ticker_detail(
             current_signal_status_detail
         ),
         "flip_risk": flip_risk_detail,
+        # Phase 6I-48 amendment-1: ranking-eligibility-basis
+        # on the ticker_details surface (mirrors the
+        # ranking_rows[*] surface). A consumer that pulls
+        # a ticker_details entry directly (without the
+        # ranking_rows context) still sees whether the
+        # detail was produced under the strict
+        # Phase 6I-20 contract or the Phase 6I-48 partial
+        # contract.
+        "ranking_eligibility_basis": row.get(
+            "ranking_eligibility_basis",
+        ),
     }
 
 

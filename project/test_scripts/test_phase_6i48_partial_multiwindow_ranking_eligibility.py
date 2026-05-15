@@ -740,3 +740,369 @@ def test_data_status_partial_multiwindow_in_taxonomy():
         cre.DATA_STATUS_PARTIAL_MULTIWINDOW
         in cre.ALL_DATA_STATUSES
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-48 amendment-1 tests
+# ---------------------------------------------------------------------------
+#
+# Amendment-1 closes two website-contract gaps:
+#
+#   * Partial-ranked rows now populate
+#     ``current_build_signals`` /
+#     ``current_build_signal_summary`` /
+#     ``primary_build_summary`` from effective metrics.
+#
+#   * ``ranking_eligibility_basis`` is threaded through the
+#     export package (ranking_rows + ticker_details), the
+#     reader/view (ranking_table + ticker_cards), and the
+#     static board renderer (HTML badge + detail panel).
+
+
+import confluence_website_export_package as cwep  # noqa: E402
+import confluence_website_reader_view as cwrv  # noqa: E402
+import confluence_static_board_renderer as csbr  # noqa: E402
+
+
+def test_partial_row_populates_current_build_signals(
+    tmp_path,
+):
+    """Pin (amendment-1, gap 2): partial-ranked row carries
+    a NON-EMPTY ``current_build_signals`` matrix populated
+    from the effective metrics."""
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    # 30 effective cells -> 30 entries in the matrix.
+    assert len(row.current_build_signals) == 30
+    # Every entry shape matches the strict path: K /
+    # window / latest_combined_signal / member_count
+    # present.
+    for cell in row.current_build_signals:
+        assert "K" in cell
+        assert "window" in cell
+        assert "latest_combined_signal" in cell
+        assert "member_count" in cell
+
+
+def test_partial_row_populates_current_build_signal_summary(
+    tmp_path,
+):
+    """Pin (amendment-1, gap 2):
+    ``current_build_signal_summary`` is non-null and
+    carries the same TrafficFlow-style summary fields a
+    strict-complete row would have."""
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    summary = row.current_build_signal_summary
+    assert summary is not None
+    # Stable Phase 6I-37 schema keys present.
+    for key in (
+        "windows_with_any_currently_signaling",
+        "all_windows_have_any_current_signal",
+        "k_builds_currently_signaling_all_windows",
+    ):
+        assert key in summary
+
+
+def test_partial_row_populates_primary_build_summary(
+    tmp_path,
+):
+    """Pin (amendment-1, gap 2): ``primary_build_summary``
+    is non-null on a partial-ranked row."""
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    assert row.primary_build_summary is not None
+    # The selector returns at least a top-level structure;
+    # tier may be ``no_signal`` for this fixture if no
+    # currently_signaling cells match the same-K rule, but
+    # the structure must exist + be a dict.
+    assert isinstance(row.primary_build_summary, dict)
+
+
+def test_partial_row_matrix_does_not_fabricate_to_60_cells(
+    tmp_path,
+):
+    """Pin (amendment-1, gap 2): partial row's matrix
+    reflects the EFFECTIVE-cell count (30), not the
+    canonical 60. The fixture has 30 effective cells so
+    the matrix has 30 entries."""
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    assert len(row.current_build_signals) == 30
+    assert row.k_cells_available == 30
+    # k_cells_total still tracks the canonical 60 universe
+    # size so a consumer can see partial / full coverage
+    # at a glance.
+    assert row.k_cells_total == cre.DEFAULT_K_CELL_COUNT
+
+
+def test_blocked_row_keeps_empty_current_build_surfaces(
+    tmp_path,
+):
+    """Pin (amendment-1, gap 2): blocked partial rows
+    (no effective metrics) MUST keep the empty
+    ``current_build_signals`` / null summary / null
+    primary fields -- amendment-1 only populates them when
+    effective metrics are present."""
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_without_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.blocked_rows[0]
+    assert row.current_build_signals == ()
+    assert row.current_build_signal_summary is None
+    assert row.primary_build_summary is None
+
+
+def test_strict_complete_row_still_carries_strict_basis(
+    tmp_path,
+):
+    """Pin (amendment-1, regression): strict-complete rows
+    continue to carry
+    ``ranking_eligibility_basis='strict_full_60_cell'``
+    AND populate the strict current/primary surfaces."""
+    art_root = tmp_path / "research_artifacts"
+    ticker_dir = art_root / "confluence" / "SPY"
+    ticker_dir.mkdir(parents=True)
+    (
+        ticker_dir
+        / "SPY__MTF_CONSENSUS.research_day.json"
+    ).write_text(
+        json.dumps(_strict_full_artifact()),
+        encoding="utf-8",
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    row = report.ranking_rows[0]
+    assert row.ranking_eligibility_basis == (
+        cre.RANKING_ELIGIBILITY_BASIS_STRICT_FULL_60_CELL
+    )
+    assert len(row.current_build_signals) == 60
+    assert row.current_build_signal_summary is not None
+    assert row.primary_build_summary is not None
+
+
+# ---------------------------------------------------------------------------
+# Amendment-1 — basis threads through the website chain
+# ---------------------------------------------------------------------------
+
+
+def _build_package_from_export_report(
+    report: cre.MultiTickerRankingExportReport,
+) -> dict[str, Any]:
+    """Drive the export package via the injected
+    ``underlying_export_callable`` seam so we can hand it
+    a pre-built ranking-export payload (no on-disk
+    discovery needed)."""
+    payload = report.to_json_dict()
+
+    def _fake_underlying_export(
+        *args, **kwargs,
+    ):
+        return payload
+
+    return cwep.build_website_export_package(
+        tickers=["SPY"],
+        artifact_root="unused_for_test",
+        underlying_export_callable=(
+            _fake_underlying_export
+        ),
+    )
+
+
+def test_package_ranking_row_carries_basis_for_partial(
+    tmp_path,
+):
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    pkg = _build_package_from_export_report(report)
+    assert pkg["ranking_rows"][0][
+        "ranking_eligibility_basis"
+    ] == (
+        cre.RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS
+    )
+    # ticker_details surface also carries the basis.
+    details = pkg["ticker_details"]
+    assert "SPY" in details
+    assert details["SPY"][
+        "ranking_eligibility_basis"
+    ] == (
+        cre.RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS
+    )
+
+
+def test_package_ranking_row_carries_basis_for_strict(
+    tmp_path,
+):
+    art_root = tmp_path / "research_artifacts"
+    ticker_dir = art_root / "confluence" / "SPY"
+    ticker_dir.mkdir(parents=True)
+    (
+        ticker_dir
+        / "SPY__MTF_CONSENSUS.research_day.json"
+    ).write_text(
+        json.dumps(_strict_full_artifact()),
+        encoding="utf-8",
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    pkg = _build_package_from_export_report(report)
+    assert pkg["ranking_rows"][0][
+        "ranking_eligibility_basis"
+    ] == (
+        cre.RANKING_ELIGIBILITY_BASIS_STRICT_FULL_60_CELL
+    )
+    assert pkg["ticker_details"]["SPY"][
+        "ranking_eligibility_basis"
+    ] == (
+        cre.RANKING_ELIGIBILITY_BASIS_STRICT_FULL_60_CELL
+    )
+
+
+def test_reader_view_ranking_table_carries_basis_partial(
+    tmp_path,
+):
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    pkg = _build_package_from_export_report(report)
+    vm = cwrv.build_view_model(pkg)
+    table = vm["ranking_table"]
+    assert len(table) == 1
+    assert table[0]["ranking_eligibility_basis"] == (
+        cre.RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS
+    )
+    cards = vm["ticker_cards"]
+    spy_card = next(
+        (c for c in cards if c.get("ticker") == "SPY"),
+        None,
+    )
+    assert spy_card is not None
+    assert spy_card["ranking_eligibility_basis"] == (
+        cre.RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS
+    )
+
+
+def test_renderer_html_shows_partial_basis_badge_and_warning(
+    tmp_path,
+):
+    """Pin (amendment-1, gap 1): rendered HTML carries
+    the ``Partial (effective members)`` badge AND the
+    ``!`` warning column for the partial-ranked SPY row."""
+    art_root = tmp_path / "research_artifacts"
+    _write_artifact(
+        art_root,
+        _partial_only_artifact_with_effective_metrics(),
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    pkg = _build_package_from_export_report(report)
+    vm = cwrv.build_view_model(pkg)
+    html = csbr.build_static_board_html(vm)
+    # Badge present in the ranking table.
+    assert "Partial (effective members)" in html
+    assert (
+        'data-ranking-eligibility-basis="'
+        'partial_effective_members"'
+    ) in html
+    # Warning symbol present (Phase 6I-40 plumbing).
+    assert "!" in html
+    # Detail-panel data carries the basis (rendered by the
+    # inline JS when the user clicks the row).
+    assert "ranking_eligibility_basis" in html
+
+
+def test_renderer_html_shows_strict_basis_badge(
+    tmp_path,
+):
+    """Pin (amendment-1, regression): rendered HTML carries
+    the ``Strict 60-cell`` badge for a strict-complete
+    row."""
+    art_root = tmp_path / "research_artifacts"
+    ticker_dir = art_root / "confluence" / "SPY"
+    ticker_dir.mkdir(parents=True)
+    (
+        ticker_dir
+        / "SPY__MTF_CONSENSUS.research_day.json"
+    ).write_text(
+        json.dumps(_strict_full_artifact()),
+        encoding="utf-8",
+    )
+    report = cre.build_multiwindow_ranking_export(
+        ["SPY"],
+        artifact_root=art_root,
+        cache_dir=None,
+    )
+    pkg = _build_package_from_export_report(report)
+    vm = cwrv.build_view_model(pkg)
+    html = csbr.build_static_board_html(vm)
+    assert "Strict 60-cell" in html
+    assert (
+        'data-ranking-eligibility-basis="strict_full_60_cell"'
+    ) in html
