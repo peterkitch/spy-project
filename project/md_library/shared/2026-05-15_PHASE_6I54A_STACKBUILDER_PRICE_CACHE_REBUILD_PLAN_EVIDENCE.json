@@ -1,0 +1,687 @@
+{
+  "schema_version": "stackbuilder_price_cache_rebuild_planner_v1",
+  "generated_at": "2026-05-15T09:33:15+00:00",
+  "phase": "phase_6i_54a",
+  "phase_label": "stackbuilder_price_cache_rebuild_planner",
+  "signal_cache_dir": "cache\\results",
+  "signal_cache_dir_exists": true,
+  "stackbuilder_price_cache_dir": "price_cache\\daily",
+  "stackbuilder_price_cache_dir_exists": false,
+  "ticker_count": 25,
+  "counts_by_recommended_action": {
+    "use_existing_signal_cache": 6,
+    "needs_source_refresh": 19,
+    "needs_network_fetch": 0,
+    "manual_review": 0
+  },
+  "tickers_by_recommended_action": {
+    "use_existing_signal_cache": [
+      "SPY",
+      "AAPL",
+      "JNJ",
+      "WMT",
+      "HD",
+      "MCD"
+    ],
+    "needs_source_refresh": [
+      "MSFT",
+      "GOOGL",
+      "AMZN",
+      "NVDA",
+      "META",
+      "TSLA",
+      "AVGO",
+      "ORCL",
+      "ADBE",
+      "CRM",
+      "AMD",
+      "QCOM",
+      "CSCO",
+      "JPM",
+      "BRK-B",
+      "V",
+      "MA",
+      "PG",
+      "KO"
+    ],
+    "needs_network_fetch": [],
+    "manual_review": []
+  },
+  "rows": [
+    {
+      "ticker": "SPY",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\SPY.parquet",
+        "price_cache\\daily\\SPY.csv",
+        "price_cache\\daily\\SPY.parquet",
+        "price_cache\\daily\\SPY.csv",
+        "price_cache\\daily\\SPY\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": "cache\\results\\SPY_precomputed_results.pkl",
+      "signal_cache_manifest_path": "cache\\results\\SPY_precomputed_results.pkl.manifest.json",
+      "signal_cache_pkl_present": true,
+      "signal_cache_manifest_present": true,
+      "signal_cache_price_source": "Close",
+      "signal_cache_producer_engine": "signal_engine_cache_refresher",
+      "signal_cache_engine_version": "6E-5.0.0",
+      "signal_cache_build_timestamp": "2026-05-15T01:32:16.246077+00:00",
+      "transformation_possible_without_network": true,
+      "recommended_action": "use_existing_signal_cache",
+      "blocker_codes": []
+    },
+    {
+      "ticker": "AAPL",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\AAPL.parquet",
+        "price_cache\\daily\\AAPL.csv",
+        "price_cache\\daily\\AAPL.parquet",
+        "price_cache\\daily\\AAPL.csv",
+        "price_cache\\daily\\AAPL\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": "cache\\results\\AAPL_precomputed_results.pkl",
+      "signal_cache_manifest_path": "cache\\results\\AAPL_precomputed_results.pkl.manifest.json",
+      "signal_cache_pkl_present": true,
+      "signal_cache_manifest_present": true,
+      "signal_cache_price_source": "Close",
+      "signal_cache_producer_engine": "spymaster",
+      "signal_cache_engine_version": "1.0.0",
+      "signal_cache_build_timestamp": "2026-05-04T22:26:24.832095+00:00",
+      "transformation_possible_without_network": true,
+      "recommended_action": "use_existing_signal_cache",
+      "blocker_codes": []
+    },
+    {
+      "ticker": "MSFT",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\MSFT.parquet",
+        "price_cache\\daily\\MSFT.csv",
+        "price_cache\\daily\\MSFT.parquet",
+        "price_cache\\daily\\MSFT.csv",
+        "price_cache\\daily\\MSFT\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "GOOGL",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\GOOGL.parquet",
+        "price_cache\\daily\\GOOGL.csv",
+        "price_cache\\daily\\GOOGL.parquet",
+        "price_cache\\daily\\GOOGL.csv",
+        "price_cache\\daily\\GOOGL\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "AMZN",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\AMZN.parquet",
+        "price_cache\\daily\\AMZN.csv",
+        "price_cache\\daily\\AMZN.parquet",
+        "price_cache\\daily\\AMZN.csv",
+        "price_cache\\daily\\AMZN\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "NVDA",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\NVDA.parquet",
+        "price_cache\\daily\\NVDA.csv",
+        "price_cache\\daily\\NVDA.parquet",
+        "price_cache\\daily\\NVDA.csv",
+        "price_cache\\daily\\NVDA\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "META",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\META.parquet",
+        "price_cache\\daily\\META.csv",
+        "price_cache\\daily\\META.parquet",
+        "price_cache\\daily\\META.csv",
+        "price_cache\\daily\\META\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "TSLA",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\TSLA.parquet",
+        "price_cache\\daily\\TSLA.csv",
+        "price_cache\\daily\\TSLA.parquet",
+        "price_cache\\daily\\TSLA.csv",
+        "price_cache\\daily\\TSLA\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "AVGO",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\AVGO.parquet",
+        "price_cache\\daily\\AVGO.csv",
+        "price_cache\\daily\\AVGO.parquet",
+        "price_cache\\daily\\AVGO.csv",
+        "price_cache\\daily\\AVGO\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "ORCL",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\ORCL.parquet",
+        "price_cache\\daily\\ORCL.csv",
+        "price_cache\\daily\\ORCL.parquet",
+        "price_cache\\daily\\ORCL.csv",
+        "price_cache\\daily\\ORCL\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "ADBE",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\ADBE.parquet",
+        "price_cache\\daily\\ADBE.csv",
+        "price_cache\\daily\\ADBE.parquet",
+        "price_cache\\daily\\ADBE.csv",
+        "price_cache\\daily\\ADBE\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "CRM",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\CRM.parquet",
+        "price_cache\\daily\\CRM.csv",
+        "price_cache\\daily\\CRM.parquet",
+        "price_cache\\daily\\CRM.csv",
+        "price_cache\\daily\\CRM\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "AMD",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\AMD.parquet",
+        "price_cache\\daily\\AMD.csv",
+        "price_cache\\daily\\AMD.parquet",
+        "price_cache\\daily\\AMD.csv",
+        "price_cache\\daily\\AMD\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "QCOM",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\QCOM.parquet",
+        "price_cache\\daily\\QCOM.csv",
+        "price_cache\\daily\\QCOM.parquet",
+        "price_cache\\daily\\QCOM.csv",
+        "price_cache\\daily\\QCOM\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "CSCO",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\CSCO.parquet",
+        "price_cache\\daily\\CSCO.csv",
+        "price_cache\\daily\\CSCO.parquet",
+        "price_cache\\daily\\CSCO.csv",
+        "price_cache\\daily\\CSCO\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "JPM",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\JPM.parquet",
+        "price_cache\\daily\\JPM.csv",
+        "price_cache\\daily\\JPM.parquet",
+        "price_cache\\daily\\JPM.csv",
+        "price_cache\\daily\\JPM\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "BRK-B",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\BRK-B.parquet",
+        "price_cache\\daily\\BRK-B.csv",
+        "price_cache\\daily\\BRK-B.parquet",
+        "price_cache\\daily\\BRK-B.csv",
+        "price_cache\\daily\\BRK-B\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "V",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\V.parquet",
+        "price_cache\\daily\\V.csv",
+        "price_cache\\daily\\V.parquet",
+        "price_cache\\daily\\V.csv",
+        "price_cache\\daily\\V\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "MA",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\MA.parquet",
+        "price_cache\\daily\\MA.csv",
+        "price_cache\\daily\\MA.parquet",
+        "price_cache\\daily\\MA.csv",
+        "price_cache\\daily\\MA\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "JNJ",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\JNJ.parquet",
+        "price_cache\\daily\\JNJ.csv",
+        "price_cache\\daily\\JNJ.parquet",
+        "price_cache\\daily\\JNJ.csv",
+        "price_cache\\daily\\JNJ\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": "cache\\results\\JNJ_precomputed_results.pkl",
+      "signal_cache_manifest_path": "cache\\results\\JNJ_precomputed_results.pkl.manifest.json",
+      "signal_cache_pkl_present": true,
+      "signal_cache_manifest_present": true,
+      "signal_cache_price_source": "Close",
+      "signal_cache_producer_engine": "signal_engine_cache_refresher",
+      "signal_cache_engine_version": "6E-5.0.0",
+      "signal_cache_build_timestamp": "2026-05-15T01:33:53.049853+00:00",
+      "transformation_possible_without_network": true,
+      "recommended_action": "use_existing_signal_cache",
+      "blocker_codes": []
+    },
+    {
+      "ticker": "WMT",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\WMT.parquet",
+        "price_cache\\daily\\WMT.csv",
+        "price_cache\\daily\\WMT.parquet",
+        "price_cache\\daily\\WMT.csv",
+        "price_cache\\daily\\WMT\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": "cache\\results\\WMT_precomputed_results.pkl",
+      "signal_cache_manifest_path": "cache\\results\\WMT_precomputed_results.pkl.manifest.json",
+      "signal_cache_pkl_present": true,
+      "signal_cache_manifest_present": true,
+      "signal_cache_price_source": "Close",
+      "signal_cache_producer_engine": "spymaster",
+      "signal_cache_engine_version": "1.0.0",
+      "signal_cache_build_timestamp": "2026-05-04T22:42:13.194362+00:00",
+      "transformation_possible_without_network": true,
+      "recommended_action": "use_existing_signal_cache",
+      "blocker_codes": []
+    },
+    {
+      "ticker": "PG",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\PG.parquet",
+        "price_cache\\daily\\PG.csv",
+        "price_cache\\daily\\PG.parquet",
+        "price_cache\\daily\\PG.csv",
+        "price_cache\\daily\\PG\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "HD",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\HD.parquet",
+        "price_cache\\daily\\HD.csv",
+        "price_cache\\daily\\HD.parquet",
+        "price_cache\\daily\\HD.csv",
+        "price_cache\\daily\\HD\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": "cache\\results\\HD_precomputed_results.pkl",
+      "signal_cache_manifest_path": "cache\\results\\HD_precomputed_results.pkl.manifest.json",
+      "signal_cache_pkl_present": true,
+      "signal_cache_manifest_present": true,
+      "signal_cache_price_source": "Close",
+      "signal_cache_producer_engine": "spymaster",
+      "signal_cache_engine_version": "1.0.0",
+      "signal_cache_build_timestamp": "2026-05-04T22:33:05.936852+00:00",
+      "transformation_possible_without_network": true,
+      "recommended_action": "use_existing_signal_cache",
+      "blocker_codes": []
+    },
+    {
+      "ticker": "KO",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\KO.parquet",
+        "price_cache\\daily\\KO.csv",
+        "price_cache\\daily\\KO.parquet",
+        "price_cache\\daily\\KO.csv",
+        "price_cache\\daily\\KO\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": null,
+      "signal_cache_manifest_path": null,
+      "signal_cache_pkl_present": false,
+      "signal_cache_manifest_present": false,
+      "signal_cache_price_source": null,
+      "signal_cache_producer_engine": null,
+      "signal_cache_engine_version": null,
+      "signal_cache_build_timestamp": null,
+      "transformation_possible_without_network": false,
+      "recommended_action": "needs_source_refresh",
+      "blocker_codes": [
+        "no_signal_cache_pkl_found"
+      ]
+    },
+    {
+      "ticker": "MCD",
+      "expected_stackbuilder_cache_paths": [
+        "price_cache\\daily\\MCD.parquet",
+        "price_cache\\daily\\MCD.csv",
+        "price_cache\\daily\\MCD.parquet",
+        "price_cache\\daily\\MCD.csv",
+        "price_cache\\daily\\MCD\\daily.parquet"
+      ],
+      "current_cache_status": "missing",
+      "existing_stackbuilder_cache_path": null,
+      "signal_cache_pkl_path": "cache\\results\\MCD_precomputed_results.pkl",
+      "signal_cache_manifest_path": "cache\\results\\MCD_precomputed_results.pkl.manifest.json",
+      "signal_cache_pkl_present": true,
+      "signal_cache_manifest_present": true,
+      "signal_cache_price_source": "Close",
+      "signal_cache_producer_engine": "spymaster",
+      "signal_cache_engine_version": "1.0.0",
+      "signal_cache_build_timestamp": "2026-05-04T22:35:36.722545+00:00",
+      "transformation_possible_without_network": true,
+      "recommended_action": "use_existing_signal_cache",
+      "blocker_codes": []
+    }
+  ],
+  "documented_next_write_command_template": "<PINNED_PYTHON> stackbuilder_price_cache_writer.py --tickers <T1>,<T2>,... --signal-cache-dir cache/results --stackbuilder-price-cache-dir price_cache/daily --format parquet --write",
+  "future_write_contract": {
+    "destination_root": "price_cache\\daily",
+    "output_format_primary": "parquet",
+    "output_format_fallback": "csv",
+    "required_columns": [
+      "Date",
+      "Close"
+    ],
+    "files_per_ticker": 1,
+    "uses_network": false,
+    "uses_yfinance": false,
+    "transformation_source": "cache/results/<TICKER>_precomputed_results.pkl (read via the repo's verified pickle/provenance loader; NOT raw pickle.load)",
+    "authorization_notes": "Phase 6I-54b is an authorized-write phase. Writing to price_cache/daily/ is NOT gated by --write / PRJCT9_AUTOMATION_WRITE_AUTH (those apply to the Phase 6H-5 / 6I-25 / 6I-31 writer family, NOT to StackBuilder's secondary price cache). The Phase 6I-54b writer module should carry its own --write flag mirroring the Phase 6E-5 pattern."
+  },
+  "remaining_limitations": [
+    "This planner reads ONLY plain-JSON manifest sidecars. It does NOT load any ``<TICKER>_precomputed_results.pkl`` content -- that's Phase 6I-54b's job via the repo's verified pickle/provenance loader.",
+    "Date-range metadata is NOT extracted in this phase. The manifest sidecar does not carry it; only the PKL does. Phase 6I-54b will surface per-ticker date ranges as part of its write evidence.",
+    "``cache/results/`` (the signal-engine cache) and ``price_cache/daily/`` (the StackBuilder secondary price cache) are DISTINCT roots. This planner keeps them strictly separate; it never conflates them.",
+    "Tickers classified as ``needs_source_refresh`` require the Phase 6E-5 source-cache refresher to run first. That refresher uses yfinance internally; it is its own explicitly-authorized phase, NOT implicitly authorized by Phase 6I-54a.",
+    "Tickers classified as ``manual_review`` carry blocker codes explaining why; common cases are (a) the StackBuilder price cache already has a file for the ticker (operator must decide overwrite vs keep), (b) the signal-cache manifest sidecar is missing or unreadable, or (c) the manifest's price_source is not 'Close'."
+  ]
+}
