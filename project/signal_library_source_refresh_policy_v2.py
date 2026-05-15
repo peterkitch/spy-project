@@ -244,9 +244,22 @@ class SourceRefreshPolicyV2Report:
     warning_members: tuple[dict[str, Any], ...]
     refresh_candidate_ready: bool
     blocker_reasons: tuple[str, ...]
+    # Phase 6I-43 amendment-2 (Phase 6I-44 discovery): the
+    # singular fields are DEPRECATED but kept for backward
+    # compatibility -- they now carry the FIRST per-ticker
+    # command only (or None when the candidate set is
+    # empty). The authoritative surface is the plural
+    # ``refresh_candidate_commands`` /
+    # ``refresh_candidate_command_argvs``: one command per
+    # non-invalid candidate ticker, using the refresher's
+    # actual ``--ticker <TICKER>`` (singular) CLI.
     refresh_candidate_command: Optional[str]
     refresh_candidate_command_argv: Optional[
         tuple[str, ...]
+    ]
+    refresh_candidate_commands: tuple[str, ...]
+    refresh_candidate_command_argvs: tuple[
+        tuple[str, ...], ...
     ]
     refresh_candidate_tickers: tuple[str, ...]
     remaining_limitations: tuple[str, ...] = field(
@@ -324,6 +337,15 @@ class SourceRefreshPolicyV2Report:
                 if self.refresh_candidate_command_argv
                 is not None else None
             ),
+            "refresh_candidate_commands": list(
+                self.refresh_candidate_commands,
+            ),
+            "refresh_candidate_command_argvs": [
+                list(argv)
+                for argv in (
+                    self.refresh_candidate_command_argvs
+                )
+            ],
             "refresh_candidate_tickers": list(
                 self.refresh_candidate_tickers,
             ),
@@ -539,14 +561,23 @@ def _classify_one_ticker(
 # ---------------------------------------------------------------------------
 
 
-def _build_refresh_candidate_command(
+def _build_one_refresh_command(
     *,
-    tickers: Sequence[str],
+    ticker: str,
     cache_dir: Optional[str],
     current_as_of_date: Optional[str],
-) -> tuple[Optional[str], Optional[tuple[str, ...]]]:
+) -> tuple[str, tuple[str, ...]]:
     """Build the exact candidate command for the Phase 6E-5
-    refresher CLI. Returns ``(command_string, argv_tuple)``.
+    refresher CLI for ONE ticker. Returns ``(command_string,
+    argv_tuple)``.
+
+    Phase 6I-43 amendment-2: the refresher CLI accepts
+    ``--ticker TICKER`` (singular), one ticker per
+    invocation. The earlier amendment-1 plural
+    ``--tickers <CSV>`` shape was wrong -- it rejected at
+    argparse time with rc=2 and is documented in the
+    Phase 6I-44 evidence doc. This helper now emits the
+    correct singular shape.
 
     Authorization correction: the refresher uses
     ``--write`` + its internal optimizer / provenance
@@ -555,18 +586,10 @@ def _build_refresh_candidate_command(
     here therefore carries ``--write`` only -- no env-var
     wording.
     """
-    if not tickers:
-        return None, None
-    ticker_csv = ",".join(tickers)
-    # Phase 6I-43 amendment-1: use the pinned interpreter
-    # path. Bare ``python`` can resolve to the wrong
-    # environment on this machine; operator-copy commands
-    # must name the spyproject2 audit interpreter
-    # explicitly.
     argv: list[str] = [
         PINNED_PYTHON_INTERPRETER,
         "signal_engine_cache_refresher.py",
-        "--tickers", ticker_csv,
+        "--ticker", str(ticker),
     ]
     if cache_dir:
         argv.extend(["--cache-dir", str(cache_dir)])
@@ -578,6 +601,30 @@ def _build_refresh_candidate_command(
     argv.append("--write")
     cmd = " ".join(argv)
     return cmd, tuple(argv)
+
+
+def _build_refresh_candidate_commands(
+    *,
+    tickers: Sequence[str],
+    cache_dir: Optional[str],
+    current_as_of_date: Optional[str],
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Build the candidate-command list (one per ticker)
+    for the Phase 6E-5 refresher CLI. Returns ``(commands,
+    argvs)`` where ``commands`` is a tuple of joined
+    command strings and ``argvs`` is a tuple of argv
+    tuples (one per ticker)."""
+    commands: list[str] = []
+    argvs: list[tuple[str, ...]] = []
+    for t in tickers:
+        cmd, argv = _build_one_refresh_command(
+            ticker=t,
+            cache_dir=cache_dir,
+            current_as_of_date=current_as_of_date,
+        )
+        commands.append(cmd)
+        argvs.append(argv)
+    return tuple(commands), tuple(argvs)
 
 
 # ---------------------------------------------------------------------------
@@ -826,12 +873,16 @@ def plan_source_refresh_policy_v2(
                     f"{s.ticker}:{s.classification}",
                 )
 
-    # Candidate command -- only when ready.
+    # Candidate command list -- only when ready.
     refresh_candidate_tickers: list[str] = []
     refresh_candidate_command: Optional[str] = None
     refresh_candidate_argv: Optional[tuple[str, ...]] = (
         None
     )
+    refresh_candidate_commands: tuple[str, ...] = ()
+    refresh_candidate_command_argvs: tuple[
+        tuple[str, ...], ...
+    ] = ()
     if refresh_candidate_ready:
         # Refresh only the non-invalid tickers that are
         # NOT already cache-ready (refreshing an
@@ -843,8 +894,8 @@ def plan_source_refresh_policy_v2(
             if s.classification != CLASS_CACHE_ALREADY_READY
         ]
         if refresh_candidate_tickers:
-            refresh_candidate_command, refresh_candidate_argv = (
-                _build_refresh_candidate_command(
+            refresh_candidate_commands, refresh_candidate_command_argvs = (
+                _build_refresh_candidate_commands(
                     tickers=refresh_candidate_tickers,
                     cache_dir=(
                         str(cache_dir)
@@ -852,6 +903,17 @@ def plan_source_refresh_policy_v2(
                     ),
                     current_as_of_date=current_as_of_date,
                 )
+            )
+            # Singular fields are DEPRECATED (Phase 6I-43
+            # amendment-2 / Phase 6I-44 discovery). Kept
+            # for backward compatibility -- they now carry
+            # the FIRST per-ticker command only. Callers
+            # MUST use the plural fields above.
+            refresh_candidate_command = (
+                refresh_candidate_commands[0]
+            )
+            refresh_candidate_argv = (
+                refresh_candidate_command_argvs[0]
             )
 
     return SourceRefreshPolicyV2Report(
@@ -880,6 +942,12 @@ def plan_source_refresh_policy_v2(
         ),
         refresh_candidate_command_argv=(
             refresh_candidate_argv
+        ),
+        refresh_candidate_commands=(
+            refresh_candidate_commands
+        ),
+        refresh_candidate_command_argvs=(
+            refresh_candidate_command_argvs
         ),
         refresh_candidate_tickers=tuple(
             refresh_candidate_tickers,
