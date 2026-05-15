@@ -213,6 +213,24 @@ RANKING_BLOCKED_REASON_PROJECTED_OR_BRIDGE_ONLY = (
 RANKING_BLOCKED_REASON_PARTIAL_MULTIWINDOW_ONLY = (
     "partial_multiwindow_only"
 )
+# Phase 6I-48 ranking-eligibility-basis taxonomy. A
+# strict complete row carries ``strict_full_60_cell``; a
+# partial-but-rankable row (Phase 6I-48 effective-member
+# ranking contract) carries ``partial_effective_members``.
+# Blocked rows carry ``None``. The field is intentionally
+# explicit so a website / audit consumer can see at a
+# glance whether a row was ranked under the strict
+# Phase 6I-20 contract or the partial / effective contract.
+RANKING_ELIGIBILITY_BASIS_STRICT_FULL_60_CELL = (
+    "strict_full_60_cell"
+)
+RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS = (
+    "partial_effective_members"
+)
+ALL_RANKING_ELIGIBILITY_BASES: tuple[str, ...] = (
+    RANKING_ELIGIBILITY_BASIS_STRICT_FULL_60_CELL,
+    RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS,
+)
 
 ALL_RANKING_BLOCKED_REASONS: tuple[str, ...] = (
     RANKING_BLOCKED_REASON_ARTIFACT_MISSING,
@@ -530,6 +548,17 @@ class PerTickerRankingRow:
         default_factory=dict,
     )
 
+    # Phase 6I-48 ranking-eligibility-basis. Strict-complete
+    # rows carry ``strict_full_60_cell``; partial /
+    # effective-member rows carry ``partial_effective_members``;
+    # blocked rows carry ``None``. A website / audit
+    # consumer can use this field to tell at a glance
+    # whether a ranked row was produced under the strict
+    # Phase 6I-20 contract or the Phase 6I-48 partial /
+    # effective contract -- WITHOUT having to re-parse the
+    # row's ``data_status`` or ``data_completeness`` block.
+    ranking_eligibility_basis: Optional[str] = None
+
 
 @dataclass
 class MultiTickerRankingExportReport:
@@ -623,6 +652,9 @@ class MultiTickerRankingExportReport:
                     r.current_signal_status_block,
                 ),
                 "flip_risk": dict(r.flip_risk),
+                "ranking_eligibility_basis": (
+                    r.ranking_eligibility_basis
+                ),
             }
         return {
             "generated_at": self.generated_at,
@@ -2909,6 +2941,268 @@ def _build_blocked_row(
     )
 
 
+def _try_build_partial_rankable_row(
+    *,
+    ticker: str,
+    artifact: Mapping[str, Any],
+    artifact_path: Path,
+    artifact_last_date: Optional[str],
+    confluence_last_date: Optional[str],
+    freshness: str,
+    chart: Mapping[str, Any],
+    member_completeness_provider: Optional[
+        Callable[..., Mapping[str, Any]]
+    ],
+    live_price_provider: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ],
+    flip_risk_provider: Optional[
+        Callable[..., Optional[Mapping[str, Any]]]
+    ],
+) -> Optional[PerTickerRankingRow]:
+    """Phase 6I-48: build a rank-eligible ranking row for a
+    partial-only Confluence artifact whose partial
+    namespaced block carries ``effective_per_window_k_metrics``
+    (the Phase 6I-21 core grid result for the effective /
+    non-excluded member subset).
+
+    Returns ``None`` when the partial block is unavailable,
+    the effective metrics are missing / empty, or
+    ``prepared_cell_count`` is zero -- in those cases the
+    caller falls back to the Phase 6I-47 blocked-row path
+    so the row remains a blocked / unrankable display
+    surface rather than a fabricated empty rank.
+
+    Strict Phase 6I-20 gates are NOT touched: this row
+    carries ``data_status='partial_multiwindow'``,
+    ``data_completeness_status='partial'``,
+    ``data_warning_symbol='!'``, and
+    ``ranking_eligibility_basis='partial_effective_members'``.
+    The row's ``rank_eligible`` is True so the website
+    leaderboard treats it like any other rankable row, but
+    every visible surface that distinguishes strict from
+    partial sees the partial marker.
+    """
+    partial_block = artifact.get(
+        "multiwindow_k_partial_payload_metadata",
+    )
+    if not isinstance(partial_block, Mapping):
+        return None
+    effective_metrics = partial_block.get(
+        "effective_per_window_k_metrics",
+    )
+    if not isinstance(effective_metrics, (list, tuple)):
+        return None
+    if not effective_metrics:
+        return None
+    prepared_cell_count = partial_block.get(
+        "prepared_cell_count",
+    )
+    if not isinstance(
+        prepared_cell_count, int,
+    ) or isinstance(
+        prepared_cell_count, bool,
+    ) or prepared_cell_count <= 0:
+        return None
+    # Defensive: refuse a partial block that smuggles
+    # strict Phase 6I-20 keys (the writer's
+    # _writer_partial_payload_is_consistent + planner's
+    # _planner_partial_payload_is_valid both enforce this
+    # already, but the ranking export is a separate trust
+    # boundary).
+    forbidden_strict_keys = (
+        "per_window_k_metrics",
+        "build_wide_window_alignment",
+        "multiwindow_k_engine_payload_metadata",
+    )
+    for forbidden in forbidden_strict_keys:
+        if forbidden in partial_block:
+            return None
+
+    pwk_agg = _aggregate_per_window_k_metrics(
+        effective_metrics,
+    )
+    # Effective alignment is per-window; treat as a
+    # best-effort all-members-firing surface. When absent
+    # or partial, return an empty tuple so the row does NOT
+    # claim full alignment.
+    effective_alignment = partial_block.get(
+        "effective_build_wide_window_alignment",
+    )
+    if isinstance(effective_alignment, Mapping):
+        all_members_firing_windows = tuple(
+            sorted(
+                w for w, entry in (
+                    effective_alignment.items()
+                )
+                if isinstance(entry, Mapping)
+                and bool(
+                    entry.get("all_members_firing", False),
+                )
+            )
+        )
+    else:
+        all_members_firing_windows = ()
+
+    latest_dir = _latest_overall_direction(
+        partial_block, pwk_agg,
+    )
+
+    # Member-completeness block: lean on the existing
+    # provider, which already auto-reads
+    # ``multiwindow_k_partial_payload_metadata`` and
+    # surfaces the structured TEF-style exclusions as
+    # ``incomplete_members``.
+    member_provider = (
+        member_completeness_provider
+        or _default_member_completeness_provider
+    )
+    try:
+        member_block = member_provider(
+            ticker, artifact,
+        )
+    except Exception:
+        member_block = (
+            _default_member_completeness_provider(
+                ticker, artifact,
+            )
+        )
+    if not isinstance(member_block, Mapping):
+        member_block = (
+            _default_member_completeness_provider(
+                ticker, artifact,
+            )
+        )
+    # ``_build_data_completeness`` uses the partial member
+    # block to drive its status -- with
+    # ``rank_eligible=True`` AND an incomplete member set
+    # it returns ``partial`` + ``data_warning_symbol='!'``,
+    # which is exactly the user-visible warning surface
+    # for a Phase 6I-48 partial-ranked row.
+    completeness_block = _build_data_completeness(
+        rank_eligible=True,
+        member_block=member_block,
+        blocked_reason=None,
+    )
+
+    live_price_payload: Optional[Mapping[str, Any]] = None
+    if live_price_provider is not None:
+        try:
+            live_price_payload = live_price_provider(
+                ticker, artifact,
+            )
+        except Exception:
+            live_price_payload = None
+        if (
+            live_price_payload is not None
+            and not isinstance(
+                live_price_payload, Mapping,
+            )
+        ):
+            live_price_payload = None
+    signal_status_block = (
+        _build_current_signal_status_block(
+            ticker=ticker,
+            rank_eligible=True,
+            confluence_last_date=confluence_last_date,
+            live_price_payload=live_price_payload,
+        )
+    )
+    flip_risk_payload: Optional[Mapping[str, Any]] = None
+    if flip_risk_provider is not None:
+        try:
+            flip_risk_payload = flip_risk_provider(
+                ticker, artifact,
+            )
+        except Exception:
+            flip_risk_payload = None
+        if (
+            flip_risk_payload is not None
+            and not isinstance(
+                flip_risk_payload, Mapping,
+            )
+        ):
+            flip_risk_payload = None
+    flip_risk_block = _build_flip_risk_block(
+        flip_risk_payload=flip_risk_payload,
+    )
+
+    sort_values_block = _build_row_sort_values(
+        ticker=ticker,
+        rank=None,
+        total_capture_pct_sum=pwk_agg[
+            "total_capture_pct_sum"
+        ],
+        avg_sharpe_ratio=pwk_agg["avg_sharpe_ratio"],
+        trigger_days_sum=pwk_agg["trigger_days_sum"],
+    )
+
+    # Phase 6I-48: ``k_cells_available`` reflects the
+    # PREPARED-cell subset, not the canonical 60, so the
+    # row never silently claims full coverage.
+    k_cells_available = int(prepared_cell_count)
+
+    return PerTickerRankingRow(
+        ticker=ticker,
+        artifact_path=str(artifact_path),
+        artifact_last_date=artifact_last_date,
+        confluence_last_date=confluence_last_date,
+        data_status=DATA_STATUS_PARTIAL_MULTIWINDOW,
+        freshness_status=freshness,
+        rank_eligible=True,
+        ranking_blocked_reason=None,
+        windows_available=tuple(
+            w for w in CANONICAL_WINDOWS
+            if _artifact_window_present(artifact, w)
+        ),
+        windows_firing=pwk_agg["windows_firing"],
+        # NOTE: ``all_windows_firing`` on a partial row
+        # tracks whether every CANONICAL window has at
+        # least one firing effective cell -- it does NOT
+        # imply strict 60/60 completeness. The strict
+        # surface is ``DATA_STATUS_FULL_60_CELL``, which
+        # is intentionally different from this row's
+        # ``partial_multiwindow`` status.
+        all_windows_firing=pwk_agg["all_windows_firing"],
+        k_cells_available=k_cells_available,
+        k_cells_firing=pwk_agg["k_cells_firing"],
+        k_cells_total=DEFAULT_K_CELL_COUNT,
+        all_members_firing_windows=all_members_firing_windows,
+        strongest_window=pwk_agg["strongest_window"],
+        strongest_K=pwk_agg["strongest_K"],
+        strongest_total_capture_pct=pwk_agg[
+            "strongest_total_capture_pct"
+        ],
+        strongest_sharpe_ratio=pwk_agg[
+            "strongest_sharpe_ratio"
+        ],
+        total_capture_pct_sum=pwk_agg[
+            "total_capture_pct_sum"
+        ],
+        avg_sharpe_ratio=pwk_agg["avg_sharpe_ratio"],
+        trigger_days_sum=pwk_agg["trigger_days_sum"],
+        latest_overall_direction=latest_dir,
+        buy_signal_count=pwk_agg["buy_signal_count"],
+        short_signal_count=pwk_agg["short_signal_count"],
+        none_signal_count=pwk_agg["none_signal_count"],
+        missing_signal_count=pwk_agg["missing_signal_count"],
+        chart_ready_available=bool(
+            chart["chart_ready_available"],
+        ),
+        chart_ready_source=chart["chart_ready_source"],
+        chart_row_count=chart.get("chart_row_count"),
+        chart_blocker=chart.get("chart_blocker"),
+        issue_codes=(),
+        row_sort_values=sort_values_block,
+        data_completeness=completeness_block,
+        current_signal_status_block=signal_status_block,
+        flip_risk=flip_risk_block,
+        ranking_eligibility_basis=(
+            RANKING_ELIGIBILITY_BASIS_PARTIAL_EFFECTIVE_MEMBERS
+        ),
+    )
+
+
 def _build_one_ticker_row(
     ticker: str,
     *,
@@ -2997,14 +3291,56 @@ def _build_one_ticker_row(
     )
 
     if data_status != DATA_STATUS_FULL_60_CELL:
+        # Phase 6I-48 partial-rankable branch. When the
+        # artifact carries the partial namespaced block
+        # AND that block carries effective per-window K
+        # metrics (i.e. the Phase 6I-48 payload-builder
+        # effective branch produced cells for the prepared
+        # subset), promote the ticker to a rank-eligible
+        # row with an explicit partial / effective-member
+        # basis + a visible warning. The strict Phase 6I-20
+        # complete-payload contract is preserved verbatim:
+        # ``rank_eligible=True`` here NEVER implies
+        # ``data_status='full_60_cell'`` nor
+        # ``can_evaluate_full_60_cell_grid=True``.
+        if data_status == DATA_STATUS_PARTIAL_MULTIWINDOW:
+            partial_row = (
+                _try_build_partial_rankable_row(
+                    ticker=ticker,
+                    artifact=artifact,
+                    artifact_path=artifact_path,
+                    artifact_last_date=artifact_last_date,
+                    confluence_last_date=(
+                        confluence_last_date
+                    ),
+                    freshness=freshness,
+                    chart=chart,
+                    member_completeness_provider=(
+                        member_completeness_provider
+                    ),
+                    live_price_provider=(
+                        live_price_provider
+                    ),
+                    flip_risk_provider=(
+                        flip_risk_provider
+                    ),
+                )
+            )
+            if partial_row is not None:
+                return partial_row
+
         blocked_reason: str
         if data_status == DATA_STATUS_DAILY_ONLY:
             blocked_reason = (
                 RANKING_BLOCKED_REASON_DAILY_ONLY
             )
         elif data_status == DATA_STATUS_PARTIAL_MULTIWINDOW:
-            # Phase 6I-47: explicit blocked reason for the
-            # partial-payload artifact contract.
+            # Phase 6I-47 + 6I-48: partial-only artifact
+            # WITHOUT effective metrics remains blocked
+            # (Phase 6I-47 behaviour preserved). A partial
+            # block with prepared_cell_count=0 / missing
+            # effective_per_window_k_metrics is honestly
+            # not rankable.
             blocked_reason = (
                 RANKING_BLOCKED_REASON_PARTIAL_MULTIWINDOW_ONLY
             )
@@ -3260,6 +3596,9 @@ def _build_one_ticker_row(
         data_completeness=completeness_block,
         current_signal_status_block=signal_status_block,
         flip_risk=flip_risk_block,
+        ranking_eligibility_basis=(
+            RANKING_ELIGIBILITY_BASIS_STRICT_FULL_60_CELL
+        ),
     )
 
 
