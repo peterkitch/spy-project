@@ -256,11 +256,30 @@ The single SPY StackBuilder seed run on disk is
 output/stackbuilder/SPY/seedTC__AWR-D_CP-I_EXPO-D_LLY-I_CLH-D_GBCI-D_HCSG-D_TEF-I_JNJ-I_MO-I_AROW-D_PRA-D
 ```
 
-This seed run encodes a **12-member set including TEF** (see `TEF-I` in
-the run_id). The Phase 6I-22 input adapter consumes this run as the
-authoritative member list for the SPY multi-window K grid. The
-12-member set drives a 12-K-value × 5-window canonical 60-cell grid,
-where K ∈ {1..12}.
+This seed run encodes a **12-member set including TEF**: **AWR, CP,
+EXPO, LLY, CLH, GBCI, HCSG, TEF, JNJ, MO, AROW, PRA** (see the
+`*-D` / `*-I` direction tags in the run_id). The non-TEF members of
+this seed run number **11**: **AWR, CP, EXPO, LLY, CLH, GBCI, HCSG,
+JNJ, MO, AROW, PRA**. The Phase 6I-22 input adapter consumes this
+run as the authoritative member list for the SPY multi-window K grid.
+The 12-member set drives a 12-K-value × 5-window canonical 60-cell
+grid, where K ∈ {1..12}.
+
+Membership reconciliation with Phase 6I-44 / 6I-45:
+
+  * The Phase 6I-44 supervised refresh round covered the 14 valid SPY
+    K-universe tickers (SPY, AROW, AWR, CLH, CP, EXPO, FCFS, GBCI,
+    HCSG, JNJ, LLY, MO, PRA, PRGO) — plus TEF flagged as
+    invalid_or_delisted and excluded.
+  * The Phase 6I-45 staged build wrote 14 × 5 = 70 PKLs for those 14
+    refreshed tickers under `_phase_6i_45_staged_libraries/`.
+  * SPY itself is the **target** of the multi-window K build, not a
+    seed-run member.
+  * **FCFS** and **PRGO** were refreshed and staged in Phase 6I-44 /
+    6I-45 but are **NOT** members of the current SPY seed run
+    (`seedTC__...`). The seed-run member set was chosen by an earlier
+    StackBuilder search and is not derived from the Phase 6I-44
+    refreshed universe.
 
 For K ∈ {7..12} the adapter's combine-threshold enumeration cannot
 satisfy member coverage without TEF: every K-cell in that range
@@ -272,8 +291,8 @@ contract), the adapter skips those cells with
 `members_missing=['TEF']`.
 
 For K ∈ {1..6} the adapter's enumeration can satisfy member coverage
-using subsets of the 11 non-TEF members, so those cells prepare
-cleanly.
+using subsets of the 11 non-TEF seed-run members, so those cells
+prepare cleanly.
 
 **The blocker is structural: the on-disk StackBuilder seed run was
 generated before TEF was flagged invalid_or_delisted, and permanently
@@ -281,6 +300,42 @@ encodes TEF as a member.** Re-running the staging harness or pointing
 the chain at a different staged dir would not change this verdict —
 the adapter would still read the same seed run and still require TEF
 for K ∈ {7..12}.
+
+### 5.1 TrafficFlow parity implication
+
+Legacy TrafficFlow already faces the same class of problem — member
+PKLs that are missing, stale, or otherwise unloadable. TrafficFlow's
+behavior is the relevant precedent here:
+
+  * It scans each member's PKL and surfaces a **warning indicator**
+    (warning symbol / message) when a member is missing or stale.
+  * It preserves the **original member list** in the audit surface
+    (the build's authored members are not silently rewritten).
+  * Where the row can be computed from the **valid / loadable**
+    subset, it computes; where it cannot, the row carries an
+    explicit incomplete-member warning rather than being silently
+    discarded.
+  * Computed rows that used only a subset of members are **labeled
+    as partial** — they are not mislabeled as strict complete
+    coverage.
+
+The Phase 6I-45 BLOCKED verdict is, in effect, the multi-window
+Confluence path NOT YET having TrafficFlow-style invalid-member
+handling. Today the adapter silently skips affected cells with
+`incomplete_member_coverage`. The right product direction is **not**
+to silently drop TEF from the seed run and **not** to backfill
+dead/invalid TEF PKLs purely to make a strict 60-cell grid pass;
+both of those are dishonest about data quality. The right direction
+is to give the multi-window path the same shape of behavior
+TrafficFlow already uses: preserve `original_members`, compute on
+`effective_members` (the loadable / valid subset), surface
+`excluded_members` with reasons (`TEF → invalid_or_delisted /
+provider_fetch_failed_zero_rows`), and explicitly label any
+effective-member-derived payload as **partial** so the ranking
+export, website package, reader/view, renderer, and overlays all
+show an incomplete-member warning to the user. The strict
+Phase 6I-20 complete-payload path remains for cases where all
+members are available and loadable.
 
 ---
 
@@ -300,12 +355,16 @@ production stable dir:
 | `libraries_unchanged` | 0 |
 | `issue_codes` | `[]` |
 
-The 26 to-be-replaced libraries are the existing
-`SPY_stable_v1_0_0.pkl` (× 5 intervals) plus the 13 other tickers'
-base `_stable_v1_0_0.pkl` artifacts already in production (one per
-ticker — production never had the four per-interval variants for
-those tickers). The 44 to-be-added libraries are the four
-per-interval variants for the 11 other tickers (11 × 4 = 44).
+Per the captured `_phase_6i_45_promotion_plan.json`, the verified
+counts are: `expected_file_count=70`, `staged_files_found=70`,
+`staged_files_missing=0`, `libraries_to_add=44`,
+`libraries_to_replace=26`, `libraries_unchanged=0`. A per-library
+breakdown (which existing production-stable artifact each replaced
+library maps to, and which add-only artifacts have no production
+counterpart) lives in `per_library_states` in that JSON. The earlier
+short-form arithmetic that summed to 18 was a draft miscount and
+has been removed; the authoritative tally is the planner output
+itself.
 
 The Phase 6I-31 promotion writer in dry-run mode (no `--write`, no
 `PRJCT9_AUTOMATION_WRITE_AUTH` env var set):
@@ -387,75 +446,137 @@ blocker is in `output/stackbuilder/SPY/`, not in
 
 ---
 
-## 9. Smallest fix → Phase 6I-46 candidate scopes
+## 9. Recommended Phase 6I-46 direction → TrafficFlow-compatible invalid-member handling
 
-Three candidate paths can unblock the 60-cell grid. None is authorized
-in Phase 6I-45. The Phase 6I-46 prompt should pick one (or
-deliberately defer):
+Three candidate paths exist for Phase 6I-46. None is authorized in
+Phase 6I-45 itself. The Phase 6I-46 prompt should pick a direction
+(or deliberately defer):
 
-### Option A (recommended) — rebuild SPY StackBuilder with the 11-member set
+### Option A (recommended) — design / implement TrafficFlow-compatible invalid-member handling on the multi-window Confluence path
 
-Re-run StackBuilder for SPY with member universe **AROW, AWR, CLH,
-CP, EXPO, FCFS, GBCI, HCSG, JNJ, LLY, MO, PRA, PRGO** (TEF
-dropped). The resulting seed run drives an 11-K-value × 5-window
-canonical 55-cell grid (or the existing 60-cell convention with K
-ceiling at 11; verify Phase 6I-21 engine treats the universe size as
-a parameter). The adapter then has no missing-member dependency
-because the seed run's member list matches the staged library set.
+The multi-window K engine + adapter should treat
+missing/invalid/unloadable members the way TrafficFlow already
+treats them: surface honest warnings, compute on the valid subset
+when honest, label partial output as partial. Concretely the
+Phase 6I-46 scope is:
 
-  * Pros: cleanest fix; the universe is coherent; all downstream cells
-    can prepare.
+  * **Preserve `original_members`** on every payload / patch / ranking
+    / view-model surface that already carries `members_attempted` or
+    a member list. The build's authored member list (e.g. SPY's
+    `[AWR, CP, EXPO, LLY, CLH, GBCI, HCSG, TEF, JNJ, MO, AROW, PRA]`)
+    must remain auditable.
+  * **Derive `effective_members`** by excluding invalid / delisted /
+    unloadable members at adapter time. For SPY today that excludes
+    TEF and leaves the 11 non-TEF seed-run members.
+  * **Carry `excluded_members`** with structured reasons. For TEF:
+    `{"ticker": "TEF", "reason": "invalid_or_delisted",
+       "telemetry_reason": "provider_fetch_failed_zero_rows",
+       "source_classification": "phase_6i_43_invalid_or_delisted"}`.
+  * **Compute readiness / metrics on `effective_members` where
+    possible.** K ∈ {1..N_effective} cells can prepare against the
+    effective set; K > N_effective cells must be either marked as
+    `unprepared_due_to_excluded_members` or rewritten to the
+    `effective_members` set with an explicit re-K-scaling note.
+  * **Label every effective-member-derived payload as partial.**
+    Surface a `data_completeness_status="partial"`,
+    `data_warning_symbol="!"`, and `incomplete_member_detail` field
+    that propagates from the adapter through the payload builder,
+    patch planner, ranking export, website export package,
+    reader/view layer, static renderer, and Phase 6I-42 overlays —
+    every user-visible surface.
+  * **Explicitly distinguish strict from partial.** A payload built
+    on the full original member set carries
+    `data_completeness_status="complete"`; a payload built on a
+    proper subset carries `"partial"`. The two must be visibly
+    distinguishable in JSON, in HTML rendering, and in any future
+    scoring contract.
+  * **Preserve the strict Phase 6I-20 complete-payload path.** For
+    builds where every original member is valid and loadable, the
+    existing strict 60-cell complete-coverage contract applies
+    verbatim. The new partial path only activates when invalid /
+    excluded members are present.
+
+  * Pros: closes the genuine product gap (TrafficFlow parity); honest
+    about data quality; works for the current SPY seed run without
+    rewriting StackBuilder; works for future builds where members
+    become invalid mid-life; preserves the strict 60-cell contract
+    where it still applies.
+  * Cons: requires coordinated code work across adapter / payload
+    builder / patch planner / patch writer / ranking export / view /
+    renderer / overlays; the scoring contract still needs to decide
+    how partial-payload rows rank against complete-payload rows.
+  * Net effect on SPY today: the K ∈ {1..6} cells (which already
+    prepare cleanly against 11 effective members) carry a
+    `data_completeness_status="partial"` payload with TEF surfaced
+    in `excluded_members`; K ∈ {7..12} cells carry an explicit
+    `unprepared_due_to_excluded_members` state. The board surfaces
+    an incomplete-member warning. The verdict is not automatically
+    green — it depends on the Phase 6I-46 design decision about
+    whether partial payloads are promotable.
+
+### Option B — rebuild SPY StackBuilder with a new member set
+
+Re-run StackBuilder for SPY with an explicit member-universe choice.
+There are two sub-options the operator must pick between, neither of
+which Phase 6I-45 has proven:
+
+  * **B.1**: drop TEF and accept an **11-member set**: AWR, CP, EXPO,
+    LLY, CLH, GBCI, HCSG, JNJ, MO, AROW, PRA (the existing non-TEF
+    seed-run members). This produces an 11-K-value × 5-window grid
+    (55 cells) or a 60-cell grid with K ceiling at 11 — the Phase
+    6I-21 engine's K-ceiling-vs-universe-size behavior must be
+    confirmed; Phase 6I-45 did not verify this.
+  * **B.2**: replace TEF with another valid member chosen by
+    StackBuilder's search to preserve a **12-member / K1-K12 /
+    60-cell shape**. The replacement candidate must come from a
+    fresh StackBuilder search, not from Phase 6I-45's refreshed-
+    ticker list — FCFS and PRGO are refreshed/staged but were not
+    selected as SPY members by the prior StackBuilder run, so
+    treating them as direct drop-in replacements is a separate
+    StackBuilder/search decision.
+
+  * Pros: clean per-row member list (no excluded_members); strict
+    Phase 6I-20 complete-payload contract applies unchanged.
   * Cons: requires authorizing StackBuilder batch execution for SPY
     in a separate supervised phase; explicit operator authorization
-    for `output/stackbuilder/SPY/` writes (the StackBuilder writer
-    surface is currently NOT a guarded `--write` API — needs
-    confirmation). May also change the 60-cell convention to a
-    55-cell convention if K ceiling tracks universe size.
-  * Net effect: SPY's per-window K cells become evaluable end-to-end
-    against the refreshed cache.
-
-### Option B — backfill TEF's 4 missing per-interval libraries from the frozen 2026-01-28 cache
-
-Production stable currently has only `TEF_stable_v1_0_0.pkl` (the
-1-day base). Build the 4 per-interval variants
-(`TEF_stable_v1_0_0_1wk.pkl`, `_1mo`, `_3mo`, `_1y`) from TEF's
-frozen 2026-01-28 cache, with explicit `pinned_at=2026-01-28` and
-`provider_status=invalid_or_delisted` annotations on each manifest.
-Include those 4 + the base TEF library in the staged dir under a
-distinct prefix or naming convention (e.g.
-`TEF_pinned_v1_0_0_*.pkl`) so the adapter recognizes them as
-pinned-invalid members.
-
-  * Pros: keeps the existing 12-member StackBuilder run usable;
-    smaller blast radius than Option A.
-  * Cons: TEF's pinned 2026-01-28 close values are stale by ~3.5
-    months relative to the 14 other tickers' 2026-05-14 close
-    values, so K-cells containing TEF carry a stale-member warning
-    and may be unsuitable for live ranking even after coverage is
-    "complete." The adapter may also need a small amendment to
-    recognize the pinned-invalid naming convention and pass a
-    `pinned_invalid_member` flag through to the payload builder.
-  * Net effect: 60 / 60 coverage is technically achievable but
-    members for K ∈ {7..12} carry a stale-member warning.
+    for `output/stackbuilder/SPY/` writes; B.2 additionally requires
+    a StackBuilder search rerun whose outcome is not yet known.
+    Does NOT solve the general invalid-member problem for future
+    builds — it only fixes the SPY symptom today.
+  * Net effect: SPY's downstream chain becomes evaluable end-to-end,
+    but the multi-window Confluence path still lacks
+    TrafficFlow-style invalid-member handling for any future
+    invalid-member event.
 
 ### Option C — defer the SPY board surface; pivot to a multi-ticker minus-SPY board
 
 Skip SPY for now. Build the Phase 6I-34..6I-42 multi-ticker board
 against tickers that ALREADY have refresh-and-rebuild paths free of
-invalid members. Wait until either Option A or Option B lands before
+invalid members. Wait until Option A or Option B lands before
 restoring SPY to the leader-eligible set.
 
   * Pros: zero StackBuilder work; immediate board iteration on the
-    13 other tickers.
+    other refreshed tickers.
   * Cons: SPY remains parked indefinitely; the SPY pilot path stops
     being the proof path; the leader-row hero card on the Daily Signal
-    Board may need a temporary alternate primary ticker.
+    Board may need a temporary alternate primary ticker; does NOT
+    solve the underlying TrafficFlow-parity gap.
 
 ### Recommendation
 
-**Option A is the cleanest fix** if StackBuilder batch execution for
-SPY is acceptable in Phase 6I-46. Option B is the smallest
-incremental fix if it isn't. Option C is the deferral path.
+**Option A is the right product direction.** It closes the actual
+gap (the multi-window Confluence path doesn't yet have honest
+invalid-member handling) rather than papering over the SPY symptom.
+Option B is a narrower remediation that unblocks SPY but leaves the
+underlying gap intact for any future invalid-member event. Option C
+is the deferral path.
+
+**None of A / B / C is automatically green at Phase 6I-46's end.**
+Each requires its own design / implementation / audit cycle.
+Phase 6I-45 specifically proves that the staged-rebuild → adapter →
+payload → patch → promotion chain runs without error and that
+production roots remain untouched; it does **not** prove that any
+particular Phase 6I-46 path will produce a leader-eligible SPY row.
 
 ---
 
@@ -539,22 +660,26 @@ authoritative record of the phase is this markdown.
 ## 13. Next step
 
 If the operator picks **Option A** (recommended): open a separate
-supervised Phase 6I-46 prompt to re-run StackBuilder for SPY with the
-11-member non-TEF universe, then re-run the Phase 6I-45 harness
-against the new seed run. Expected verdict on success:
-`prepared_cell_count == 55` (or 60 if the engine treats the K ceiling
-as a fixed parameter), `can_evaluate_full_grid == True`,
-`payload_ready == True`, `patch_ready == True`,
-`planner_patch_ready == True`. Only then is a separate Phase 6I-47
-supervised Confluence patch writer + stable promotion authorization
-appropriate.
+Phase 6I-46 prompt to design + implement TrafficFlow-compatible
+invalid-member handling on the multi-window Confluence path — the
+`original_members` / `effective_members` / `excluded_members`
+contract, the `data_completeness_status="complete"` vs `"partial"`
+split, and the warning-symbol propagation through ranking export,
+website package, reader/view, renderer, and overlays. Re-run the
+Phase 6I-45 harness with the amended adapter; expect the SPY chain
+to emit a partial payload with TEF surfaced in `excluded_members`
+and an incomplete-member warning on every visible surface. Whether
+the resulting partial payload is promotable is a Phase 6I-46 design
+decision, not a Phase 6I-45 prediction.
 
 If the operator picks **Option B**: open a separate supervised
-Phase 6I-46 prompt to backfill TEF's 4 missing per-interval libraries
-from the frozen 2026-01-28 cache, with explicit `pinned_invalid`
-annotation, and amend the adapter (Phase 6I-22) to recognize pinned-
-invalid members. Re-run the Phase 6I-45 harness with TEF included as a
-pinned member.
+Phase 6I-46 prompt to re-run StackBuilder for SPY with either the
+11-member non-TEF set (B.1) or a 12-member set where TEF is
+replaced by a search-selected valid member (B.2). Authorize the
+`output/stackbuilder/SPY/` write surface explicitly. Re-run the
+Phase 6I-45 harness against the new seed run. Outcome depends on
+the engine's K-ceiling-vs-universe-size behavior (B.1) or on
+StackBuilder's search result (B.2).
 
 If the operator picks **Option C**: continue the multi-ticker board
 work without SPY and document the SPY-paused state on the front of
@@ -562,4 +687,7 @@ the Daily Signal Board.
 
 **No write is authorized in this phase. The verdict is BLOCKED with
 exact, structural blocker reasons. PR #261 closed Phase 6I-44; the
-SPY pilot remains parked.**
+SPY pilot remains parked.** The Phase 6I-45 evidence here proves the
+chain is honest about the BLOCKED state; it does not predict that
+any Phase 6I-46 path will automatically produce a leader-eligible
+SPY row.
