@@ -567,6 +567,47 @@ def _build_partial_payload_block(
         "strict_payload_ready": False,
         "strict_patch_ready": False,
         "reason": PARTIAL_PAYLOAD_REASON,
+        # Phase 6I-48 effective-member ranking surface.
+        # ``effective_per_window_k_metrics`` is the metric
+        # list produced by running the Phase 6I-21 core
+        # grid against the adapter's prepared-cell subset
+        # (only when ``partial_payload_available=True`` and
+        # at least one cell prepared cleanly). The strict
+        # Phase 6I-20 keys ``per_window_k_metrics`` /
+        # ``build_wide_window_alignment`` /
+        # ``multiwindow_k_engine_payload_metadata`` are
+        # NEVER carried inside this partial block --
+        # planner-side and writer-side consistency
+        # validators enforce. The
+        # ``effective_*`` field NAMES are distinct so the
+        # strict-key forbidden-list guard cannot
+        # accidentally trip on the effective surface.
+        "effective_per_window_k_metrics": [
+            dict(d) for d in (
+                getattr(
+                    payload_report,
+                    "effective_per_window_k_metrics",
+                    [],
+                ) or []
+            )
+        ],
+        "effective_build_wide_window_alignment": {
+            str(w): dict(entry)
+            for w, entry in (
+                getattr(
+                    payload_report,
+                    "effective_build_wide_window_alignment",
+                    {},
+                ) or {}
+            ).items()
+        },
+        "effective_cell_count": int(
+            getattr(
+                payload_report,
+                "effective_cell_count",
+                0,
+            ) or 0
+        ),
     }
 
 

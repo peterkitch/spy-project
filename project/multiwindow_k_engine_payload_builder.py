@@ -352,6 +352,28 @@ class MultiWindowKEnginePayloadReport:
     # surfaced to downstream warning consumers via this
     # flag, never by silently flipping ``payload_ready``.
     partial_payload_available: bool = False
+    # Phase 6I-48 effective-member ranking surface.
+    # ``effective_per_window_k_metrics`` carries the metric
+    # cells produced by running the Phase 6I-21 core grid
+    # against the adapter's PREPARED-cell subset (the cells
+    # that survived TrafficFlow-style invalid-member
+    # exclusion). Same per-cell shape as strict
+    # ``per_window_k_metrics`` BUT a distinct field name so
+    # the strict Phase 6I-20 keys are NEVER overloaded.
+    # ``effective_build_wide_window_alignment`` is the
+    # parallel per-window alignment surface for the
+    # effective subset. Both fields are non-empty only when
+    # ``partial_payload_available=True`` AND the core grid
+    # ran cleanly on the prepared subset. The strict
+    # ``per_window_k_metrics`` / ``build_wide_window_alignment``
+    # fields STAY EMPTY on the partial path.
+    effective_per_window_k_metrics: list[dict[str, Any]] = (
+        field(default_factory=list)
+    )
+    effective_build_wide_window_alignment: dict[
+        str, dict[str, Any],
+    ] = field(default_factory=dict)
+    effective_cell_count: int = 0
 
     def to_json_dict(self) -> dict[str, Any]:
         return _report_to_json_dict(self)
@@ -449,6 +471,29 @@ def _report_to_json_dict(
             getattr(
                 r, "partial_payload_available", False,
             ),
+        ),
+        # Phase 6I-48 effective-member surface.
+        "effective_per_window_k_metrics": [
+            dict(d) for d in (
+                getattr(
+                    r,
+                    "effective_per_window_k_metrics",
+                    [],
+                ) or []
+            )
+        ],
+        "effective_build_wide_window_alignment": {
+            w: dict(entry)
+            for w, entry in (
+                getattr(
+                    r,
+                    "effective_build_wide_window_alignment",
+                    {},
+                ) or {}
+            ).items()
+        },
+        "effective_cell_count": int(
+            getattr(r, "effective_cell_count", 0) or 0,
         ),
     }
 
@@ -806,6 +851,56 @@ def build_multiwindow_k_engine_payload(
 
     if not adapter_summary.can_evaluate_full_60_cell_grid:
         _append_unique(issues, ISSUE_ADAPTER_NOT_READY)
+        # Phase 6I-48 effective-member ranking branch.
+        # When the adapter is NOT strictly ready BUT
+        # ``partial_payload_available=True`` (i.e. at least
+        # one cell prepared against the effective members),
+        # run the Phase 6I-21 core grid against the
+        # adapter's prepared-cell subset so a downstream
+        # ranking consumer can rank the partial ticker
+        # honestly. The strict ``per_window_k_metrics`` /
+        # ``build_wide_window_alignment`` fields STAY EMPTY
+        # -- the effective metrics live ONLY on the
+        # ``effective_*`` fields. The strict gates
+        # (``payload_ready`` / ``can_evaluate_full_60_cell_grid``)
+        # are NOT touched.
+        effective_per_window_k_metrics: list[
+            dict[str, Any]
+        ] = []
+        effective_build_wide_window_alignment: dict[
+            str, dict[str, Any],
+        ] = {}
+        effective_cell_count = 0
+        if completeness_kwargs.get(
+            "partial_payload_available",
+        ):
+            try:
+                eff_cells_raw = (
+                    core_grid_callable
+                    or _mw_core.evaluate_k_window_grid
+                )(
+                    target_ticker=target_clean,
+                    per_cell_inputs=getattr(
+                        adapter_report,
+                        "per_cell_inputs",
+                        {},
+                    ),
+                )
+                eff_cells_tuple = tuple(eff_cells_raw or ())
+            except Exception:
+                eff_cells_tuple = ()
+            if eff_cells_tuple:
+                effective_per_window_k_metrics = (
+                    _mw_core.cells_to_per_window_k_metrics_payload(
+                        eff_cells_tuple,
+                    )
+                )
+                effective_build_wide_window_alignment = (
+                    _build_window_alignment(
+                        eff_cells_tuple, K_list,
+                    )
+                )
+                effective_cell_count = len(eff_cells_tuple)
         return MultiWindowKEnginePayloadReport(
             generated_at=_iso_now(),
             target_ticker=target_clean,
@@ -820,6 +915,13 @@ def build_multiwindow_k_engine_payload(
             remaining_limitations=(
                 _DEFAULT_REMAINING_LIMITATIONS
             ),
+            effective_per_window_k_metrics=(
+                effective_per_window_k_metrics
+            ),
+            effective_build_wide_window_alignment=(
+                effective_build_wide_window_alignment
+            ),
+            effective_cell_count=effective_cell_count,
             **completeness_kwargs,
         )
 

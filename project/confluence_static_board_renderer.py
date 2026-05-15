@@ -845,6 +845,31 @@ def _ranking_row_html(
     sort_values = row.get("row_sort_values")
     if not isinstance(sort_values, Mapping):
         sort_values = {}
+    # Phase 6I-48 amendment-1: ranking-eligibility-basis
+    # badge. ``strict_full_60_cell`` -> empty label (no
+    # visual clutter for the common case);
+    # ``partial_effective_members`` -> a visible "Partial
+    # (effective members)" badge so a user reading the
+    # leaderboard never confuses a partial-ranked row
+    # with a strict-complete one. ``None`` -> empty.
+    basis = row.get("ranking_eligibility_basis")
+    if basis == "partial_effective_members":
+        basis_badge_html = (
+            '<span class="basis-badge basis-partial" '
+            'title="Ranked on effective (non-excluded) '
+            'members; not strict full 60-cell coverage.">'
+            'Partial (effective members)</span>'
+        )
+    elif basis == "strict_full_60_cell":
+        basis_badge_html = (
+            '<span class="basis-badge basis-strict" '
+            'title="Ranked on the strict Phase 6I-20 '
+            'full 60-cell complete payload.">'
+            'Strict 60-cell</span>'
+        )
+    else:
+        basis_badge_html = ""
+
     data_attrs = (
         f' data-ticker="{_esc(ticker)}"'
         f' data-signal-status="'
@@ -860,6 +885,8 @@ def _ranking_row_html(
         f'{_esc(sort_values.get("trigger_days_sort"))}"'
         f' data-sort-ticker="'
         f'{_esc(sort_values.get("ticker_sort") or ticker)}"'
+        f' data-ranking-eligibility-basis="'
+        f'{_esc(basis or "")}"'
     )
 
     return (
@@ -867,7 +894,7 @@ def _ranking_row_html(
         f'{_esc(ticker)}"{data_attrs}>\n'
         f'  <td class="col-rank">{_fmt_int(rank)}</td>\n'
         f'  <td class="col-ticker"><code>{_esc(ticker)}'
-        f'</code></td>\n'
+        f'</code>{basis_badge_html}</td>\n'
         f'  <td class="col-primary-build">'
         f'{_render_primary_build_cell(pb)}</td>\n'
         f'  <td class="col-direction">{direction}</td>\n'
@@ -1664,6 +1691,33 @@ _INLINE_JS = r"""
       });
       grid += "</tbody></table></div></div>";
       pieces.push(grid);
+    }
+
+    // Phase 6I-48 amendment-1: ranking-eligibility-basis
+    // panel. Surfaces strict_full_60_cell vs
+    // partial_effective_members so a user reading the
+    // ticker card can never confuse a partial-ranked
+    // ticker with a strict-complete one. Hidden when
+    // basis is null/undefined (blocked rows).
+    var basis = d.ranking_eligibility_basis;
+    if (basis) {
+      var basisLabel;
+      if (basis === "strict_full_60_cell") {
+        basisLabel = "Strict (full 60-cell)";
+      } else if (basis === "partial_effective_members") {
+        basisLabel = "Partial (effective members)";
+      } else {
+        basisLabel = String(basis);
+      }
+      pieces.push(
+        "<div class='detail-section ranking-eligibility-basis'>" +
+        "<h3>Ranking eligibility basis</h3><dl>" +
+        "<dt>Basis</dt><dd>" +
+          escapeHtml(basisLabel) + "</dd>" +
+        "<dt>Internal code</dt><dd><code>" +
+          escapeHtml(basis) + "</code></dd>" +
+        "</dl></div>"
+      );
     }
 
     // Data completeness block.
