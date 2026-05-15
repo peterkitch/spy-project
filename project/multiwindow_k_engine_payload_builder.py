@@ -266,6 +266,15 @@ class AdapterSummary:
     directly. This summary is the minimum shape that lets
     a payload-builder consumer see *why* the adapter said
     ready or not-ready.
+
+    Phase 6I-46: ``data_completeness_status`` /
+    ``data_warning_symbol`` / ``incomplete_member_detail``
+    carry the TrafficFlow-compatible invalid-member
+    handling fields straight through from the adapter so
+    consumers (patch planner, ranking export, view model,
+    renderer, overlays) can render an explicit partial /
+    blocked warning without re-reading the adapter
+    report.
     """
 
     selected_run_dir: Optional[str]
@@ -276,6 +285,11 @@ class AdapterSummary:
     can_evaluate_full_60_cell_grid: bool
     skipped_cells: tuple[tuple[int, str, str], ...]
     adapter_issue_codes: tuple[str, ...]
+    data_completeness_status: str = "complete"
+    data_warning_symbol: str = ""
+    incomplete_member_detail: tuple[
+        dict[str, Any], ...
+    ] = ()
 
 
 @dataclass
@@ -316,6 +330,28 @@ class MultiWindowKEnginePayloadReport:
     adapter_summary: Optional[AdapterSummary] = None
     issue_codes: tuple[str, ...] = ()
     remaining_limitations: tuple[str, ...] = ()
+    # Phase 6I-46 TrafficFlow-compatible invalid-member
+    # handling fields, mirrored onto the top-level
+    # payload report so a consumer can read them without
+    # peeking into ``adapter_summary``. Default values
+    # preserve the legacy "complete" / no-warning shape
+    # when the adapter did not surface any exclusions.
+    data_completeness_status: str = "complete"
+    data_warning_symbol: str = ""
+    incomplete_member_detail: tuple[
+        dict[str, Any], ...
+    ] = ()
+    # ``partial_payload_available`` is True when the
+    # adapter reported ``data_completeness_status='partial'``
+    # AND at least one cell prepared on the effective
+    # member set. It is intentionally separate from
+    # ``payload_ready`` so the strict Phase 6I-20
+    # complete-payload contract is preserved verbatim:
+    # ``payload_ready`` ONLY ever flips True for a strict
+    # complete 60-cell payload. A partial payload is
+    # surfaced to downstream warning consumers via this
+    # flag, never by silently flipping ``payload_ready``.
+    partial_payload_available: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
         return _report_to_json_dict(self)
@@ -349,6 +385,23 @@ def _adapter_summary_to_json_dict(
         "adapter_issue_codes": list(
             s.adapter_issue_codes,
         ),
+        # Phase 6I-46 fields. Default values preserve the
+        # pre-Phase 6I-46 JSON shape for strict-only runs.
+        "data_completeness_status": str(
+            getattr(
+                s, "data_completeness_status", "complete",
+            ) or "complete",
+        ),
+        "data_warning_symbol": str(
+            getattr(s, "data_warning_symbol", "") or "",
+        ),
+        "incomplete_member_detail": [
+            dict(d) for d in (
+                getattr(
+                    s, "incomplete_member_detail", ()
+                ) or ()
+            )
+        ],
     }
 
 
@@ -375,6 +428,27 @@ def _report_to_json_dict(
         "issue_codes": list(r.issue_codes),
         "remaining_limitations": list(
             r.remaining_limitations,
+        ),
+        # Phase 6I-46 TrafficFlow-compatible fields.
+        "data_completeness_status": str(
+            getattr(
+                r, "data_completeness_status", "complete",
+            ) or "complete",
+        ),
+        "data_warning_symbol": str(
+            getattr(r, "data_warning_symbol", "") or "",
+        ),
+        "incomplete_member_detail": [
+            dict(d) for d in (
+                getattr(
+                    r, "incomplete_member_detail", ()
+                ) or ()
+            )
+        ],
+        "partial_payload_available": bool(
+            getattr(
+                r, "partial_payload_available", False,
+            ),
         ),
     }
 
@@ -446,6 +520,33 @@ def _summarize_adapter(
             str(c) for c in (
                 getattr(adapter_report, "issue_codes", ())
                 or ()
+            )
+        ),
+        # Phase 6I-46 fields. Default values preserve the
+        # legacy "complete" shape when the adapter report
+        # does not carry them (older / duck-typed reports
+        # injected by existing tests).
+        data_completeness_status=str(
+            getattr(
+                adapter_report,
+                "data_completeness_status",
+                "complete",
+            ) or "complete",
+        ),
+        data_warning_symbol=str(
+            getattr(
+                adapter_report,
+                "data_warning_symbol",
+                "",
+            ) or "",
+        ),
+        incomplete_member_detail=tuple(
+            dict(d) for d in (
+                getattr(
+                    adapter_report,
+                    "incomplete_member_detail",
+                    (),
+                ) or ()
             )
         ),
     )
@@ -601,6 +702,9 @@ def build_multiwindow_k_engine_payload(
     core_grid_callable: Optional[
         Callable[..., Any]
     ] = None,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> MultiWindowKEnginePayloadReport:
     """Assemble the Phase 6I-20-shaped future Confluence
     payload in memory for one target ticker.
@@ -628,18 +732,77 @@ def build_multiwindow_k_engine_payload(
     # its own ``close_loader`` -- the adapter's central
     # provenance-verified default loader is the only production
     # path. Tests inject fakes by passing an ``adapter_callable``.
+    # Phase 6I-46: ``invalid_members`` is forwarded only when
+    # non-empty so existing adapters / fakes that don't accept
+    # the new kwarg still work.
+    adapter_kwargs: dict[str, Any] = {
+        "stackbuilder_root": stackbuilder_root,
+        "signal_library_dir": signal_library_dir,
+        "K_values": K_list,
+        "windows": W_list,
+        "run_dir": run_dir,
+        "close_source_root": close_source_root,
+    }
+    if invalid_members:
+        adapter_kwargs["invalid_members"] = invalid_members
     adapter_report = adapter_fn(
-        target_clean,
-        stackbuilder_root=stackbuilder_root,
-        signal_library_dir=signal_library_dir,
-        K_values=K_list,
-        windows=W_list,
-        run_dir=run_dir,
-        close_source_root=close_source_root,
+        target_clean, **adapter_kwargs,
     )
 
     adapter_summary = _summarize_adapter(adapter_report)
     issues: list[str] = []
+
+    # Phase 6I-46 TrafficFlow-compatible completeness
+    # fields pulled directly from the adapter report (or
+    # the legacy "complete" / no-warning defaults when the
+    # adapter is an older duck-typed fake). These are
+    # threaded onto every constructed payload report so
+    # the partial / blocked state is preserved across
+    # every short-circuit return path below; the strict
+    # ``payload_ready`` gate is computed separately.
+    completeness_kwargs: dict[str, Any] = {
+        "data_completeness_status": str(
+            getattr(
+                adapter_report,
+                "data_completeness_status",
+                "complete",
+            ) or "complete",
+        ),
+        "data_warning_symbol": str(
+            getattr(
+                adapter_report,
+                "data_warning_symbol",
+                "",
+            ) or "",
+        ),
+        "incomplete_member_detail": tuple(
+            dict(d) for d in (
+                getattr(
+                    adapter_report,
+                    "incomplete_member_detail",
+                    (),
+                ) or ()
+            )
+        ),
+        # ``partial_payload_available`` is True when the
+        # adapter status is "partial" AND at least one
+        # cell prepared. Adapter "blocked" never produces
+        # a partial payload because no cells prepared.
+        "partial_payload_available": bool(
+            getattr(
+                adapter_report,
+                "data_completeness_status",
+                "complete",
+            ) == "partial"
+            and int(
+                getattr(
+                    adapter_report,
+                    "prepared_cell_count",
+                    0,
+                ) or 0,
+            ) > 0
+        ),
+    }
 
     if not adapter_summary.can_evaluate_full_60_cell_grid:
         _append_unique(issues, ISSUE_ADAPTER_NOT_READY)
@@ -657,6 +820,7 @@ def build_multiwindow_k_engine_payload(
             remaining_limitations=(
                 _DEFAULT_REMAINING_LIMITATIONS
             ),
+            **completeness_kwargs,
         )
 
     # Adapter says ready -- run the core grid.
@@ -689,6 +853,7 @@ def build_multiwindow_k_engine_payload(
             remaining_limitations=(
                 _DEFAULT_REMAINING_LIMITATIONS
             ),
+            **completeness_kwargs,
         )
 
     cells_tuple = tuple(cells or ())
@@ -708,6 +873,7 @@ def build_multiwindow_k_engine_payload(
             remaining_limitations=(
                 _DEFAULT_REMAINING_LIMITATIONS
             ),
+            **completeness_kwargs,
         )
 
     # Phase 6I-23 Codex amendment: a non-empty but
@@ -735,6 +901,7 @@ def build_multiwindow_k_engine_payload(
             remaining_limitations=(
                 _DEFAULT_REMAINING_LIMITATIONS
             ),
+            **completeness_kwargs,
         )
 
     per_window_k_metrics = (
@@ -767,6 +934,7 @@ def build_multiwindow_k_engine_payload(
         remaining_limitations=(
             _DEFAULT_REMAINING_LIMITATIONS
         ),
+        **completeness_kwargs,
     )
 
 

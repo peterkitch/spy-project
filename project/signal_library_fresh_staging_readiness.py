@@ -496,6 +496,9 @@ def _default_adapter_diagnostic(
     stackbuilder_root: Path,
     signal_library_dir: Path,
     cache_dir: Path,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> dict[str, Any]:
     import multiwindow_k_input_adapter_diagnostic as _diag
     return _diag.run_adapter_diagnostic(
@@ -503,6 +506,7 @@ def _default_adapter_diagnostic(
         stackbuilder_root=stackbuilder_root,
         signal_library_dir=signal_library_dir,
         cache_dir=cache_dir,
+        invalid_members=invalid_members,
     )
 
 
@@ -512,13 +516,20 @@ def _default_payload_builder(
     stackbuilder_root: Path,
     signal_library_dir: Path,
     cache_dir: Path,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> dict[str, Any]:
     import multiwindow_k_engine_payload_builder as _pb
+    pb_kwargs: dict[str, Any] = {
+        "stackbuilder_root": stackbuilder_root,
+        "signal_library_dir": signal_library_dir,
+        "close_source_root": cache_dir,
+    }
+    if invalid_members:
+        pb_kwargs["invalid_members"] = invalid_members
     report = _pb.build_multiwindow_k_engine_payload(
-        ticker,
-        stackbuilder_root=stackbuilder_root,
-        signal_library_dir=signal_library_dir,
-        close_source_root=cache_dir,
+        ticker, **pb_kwargs,
     )
     return report.to_json_dict()
 
@@ -531,15 +542,22 @@ def _default_patch_planner(
     signal_library_dir: Path,
     cache_dir: Path,
     current_as_of_date: Optional[str],
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> dict[str, Any]:
     import multiwindow_k_confluence_patch_planner as _pp
+    pp_kwargs: dict[str, Any] = {
+        "artifact_root": artifact_root,
+        "stackbuilder_root": stackbuilder_root,
+        "signal_library_dir": signal_library_dir,
+        "close_source_root": cache_dir,
+        "current_as_of_date": current_as_of_date,
+    }
+    if invalid_members:
+        pp_kwargs["invalid_members"] = invalid_members
     plan = _pp.plan_multiwindow_k_confluence_patch(
-        ticker,
-        artifact_root=artifact_root,
-        stackbuilder_root=stackbuilder_root,
-        signal_library_dir=signal_library_dir,
-        close_source_root=cache_dir,
-        current_as_of_date=current_as_of_date,
+        ticker, **pp_kwargs,
     )
     return plan.to_json_dict()
 
@@ -625,6 +643,9 @@ def evaluate_fresh_staging_readiness(
     run_source_availability: bool = True,
     run_downstream_chain: bool = True,
     run_snapshot_diff: bool = True,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> FreshStagingReadinessReport:
     """Run the Phase 6I-32 supervised fresh-staging readiness
     harness. Read-only. Default callables delegate to the
@@ -852,12 +873,22 @@ def evaluate_fresh_staging_readiness(
             adapter_diagnostic_callable
             or _default_adapter_diagnostic
         )
+        # Phase 6I-46: forward ``invalid_members`` to the
+        # downstream chain only when it is non-empty so
+        # existing test fakes that don't accept the new
+        # kwarg still work.
+        adapter_kwargs: dict[str, Any] = {
+            "stackbuilder_root": stack_path,
+            "signal_library_dir": staged_path,
+            "cache_dir": cache_path,
+        }
+        if invalid_members:
+            adapter_kwargs["invalid_members"] = (
+                invalid_members
+            )
         try:
             adapter_summary = adapter_fn(
-                primary,
-                stackbuilder_root=stack_path,
-                signal_library_dir=staged_path,
-                cache_dir=cache_path,
+                primary, **adapter_kwargs,
             )
         except Exception as exc:
             adapter_summary = {
@@ -875,12 +906,18 @@ def evaluate_fresh_staging_readiness(
             payload_builder_callable
             or _default_payload_builder
         )
+        payload_kwargs: dict[str, Any] = {
+            "stackbuilder_root": stack_path,
+            "signal_library_dir": staged_path,
+            "cache_dir": cache_path,
+        }
+        if invalid_members:
+            payload_kwargs["invalid_members"] = (
+                invalid_members
+            )
         try:
             payload_summary = payload_fn(
-                primary,
-                stackbuilder_root=stack_path,
-                signal_library_dir=staged_path,
-                cache_dir=cache_path,
+                primary, **payload_kwargs,
             )
         except Exception as exc:
             payload_summary = {
@@ -896,14 +933,20 @@ def evaluate_fresh_staging_readiness(
             patch_planner_callable
             or _default_patch_planner
         )
+        planner_kwargs: dict[str, Any] = {
+            "artifact_root": artifact_path,
+            "stackbuilder_root": stack_path,
+            "signal_library_dir": staged_path,
+            "cache_dir": cache_path,
+            "current_as_of_date": current_as_of_date,
+        }
+        if invalid_members:
+            planner_kwargs["invalid_members"] = (
+                invalid_members
+            )
         try:
             patch_planner_summary = patch_planner_fn(
-                primary,
-                artifact_root=artifact_path,
-                stackbuilder_root=stack_path,
-                signal_library_dir=staged_path,
-                cache_dir=cache_path,
-                current_as_of_date=current_as_of_date,
+                primary, **planner_kwargs,
             )
         except Exception as exc:
             patch_planner_summary = {
@@ -1220,6 +1263,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--patch-writer-execution-log",
         default=None,
     )
+    # Phase 6I-46: optional JSON of TrafficFlow-compatible
+    # invalid-member exclusions. Either an inline JSON
+    # string or ``@<path>`` to read from a file. Empty /
+    # absent means the strict full-member coverage path
+    # (default).
+    parser.add_argument(
+        "--invalid-members-json", default=None,
+        help=(
+            "Optional Phase 6I-46 JSON for invalid-member "
+            "exclusion (e.g. '{\"TEF\": {\"reason\": "
+            "\"invalid_or_delisted\"}}'). Use '@PATH' to "
+            "read from a file. Absent means strict "
+            "full-member coverage (default)."
+        ),
+    )
     return parser
 
 
@@ -1246,6 +1304,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    invalid_members_arg: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None
+    if args.invalid_members_json:
+        raw = args.invalid_members_json.strip()
+        if raw:
+            try:
+                if raw.startswith("@"):
+                    text = Path(raw[1:]).read_text(
+                        encoding="utf-8",
+                    )
+                else:
+                    text = raw
+                parsed = json.loads(text)
+            except Exception as exc:
+                print(
+                    json.dumps({
+                        "error": (
+                            "invalid_members_json_parse_error"
+                        ),
+                        "detail": str(exc),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            if not isinstance(parsed, dict):
+                print(
+                    json.dumps({
+                        "error": (
+                            "invalid_members_json_shape_error"
+                        ),
+                        "detail": (
+                            "expected JSON object mapping "
+                            "ticker -> exclusion record"
+                        ),
+                    }),
+                    file=sys.stderr,
+                )
+                return 2
+            invalid_members_arg = parsed
 
     try:
         report = evaluate_fresh_staging_readiness(
@@ -1276,6 +1375,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_snapshot_diff=(
                 not args.skip_snapshot_diff
             ),
+            invalid_members=invalid_members_arg,
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

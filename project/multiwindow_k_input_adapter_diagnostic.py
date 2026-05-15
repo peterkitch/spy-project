@@ -172,13 +172,40 @@ def _members_attempted_to_json(
     return out
 
 
+def _exclusion_record_to_json(
+    rec: Any,
+) -> dict[str, Any]:
+    """Serialize a Phase 6I-46 ``ExclusionRecord`` into a
+    JSON dict. Accepts either the real dataclass or a
+    duck-typed object that exposes the same attributes
+    (so tests can inject fakes)."""
+    return {
+        "ticker": str(
+            getattr(rec, "ticker", "") or "",
+        ),
+        "reason": str(
+            getattr(rec, "reason", "") or "",
+        ),
+        "telemetry_reason": getattr(
+            rec, "telemetry_reason", None,
+        ),
+        "source_classification": getattr(
+            rec, "source_classification", None,
+        ),
+    }
+
+
 def _state_to_dict(
     state: Any,
 ) -> dict[str, Any]:
     """Serialize a ``PerCellAdapterState`` into a JSON
     dict. ``members_prepared`` / ``members_missing`` are
     flat string tuples; ``members_attempted`` is a list
-    of ``[ticker, protocol]`` pairs."""
+    of ``[ticker, protocol]`` pairs.
+
+    Phase 6I-46: ``excluded_members`` carries the
+    per-cell exclusion records (empty for cells without
+    invalid-member exclusions)."""
     return {
         "K": int(state.K),
         "window": str(state.window),
@@ -200,6 +227,13 @@ def _state_to_dict(
         "skipped_reason": getattr(
             state, "skipped_reason", None,
         ),
+        "excluded_members": [
+            _exclusion_record_to_json(rec)
+            for rec in (
+                getattr(state, "excluded_members", ())
+                or ()
+            )
+        ],
     }
 
 
@@ -222,6 +256,7 @@ def _placeholder_cell_dict(
         "members_prepared": [],
         "members_missing": [],
         "skipped_reason": REASON_NO_STATE_RECORDED,
+        "excluded_members": [],
     }
 
 
@@ -257,6 +292,9 @@ def run_adapter_diagnostic(
     close_source_root: Optional[Any] = None,
     adapter_callable: Optional[
         Callable[..., Any]
+    ] = None,
+    invalid_members: Optional[
+        Mapping[str, Mapping[str, Any]]
     ] = None,
 ) -> dict[str, Any]:
     """Run the Phase 6I-22 adapter against the target
@@ -295,14 +333,26 @@ def run_adapter_diagnostic(
         close_source_root if close_source_root is not None
         else cache_dir
     )
+    # Phase 6I-46: ``invalid_members`` is only forwarded to
+    # the adapter when the caller supplied a non-empty
+    # mapping. The diagnostic still defaults to the strict
+    # full-member coverage contract; the new parameter is
+    # purely additive.
+    adapter_kwargs: dict[str, Any] = {
+        "stackbuilder_root": stackbuilder_root,
+        "signal_library_dir": signal_library_dir,
+        "K_values": K_list,
+        "windows": W_list,
+        "run_dir": run_dir,
+        "close_source_root": effective_close_source_root,
+    }
+    if invalid_members:
+        adapter_kwargs["invalid_members"] = (
+            invalid_members
+        )
     report = adapter_fn(
         target_clean,
-        stackbuilder_root=stackbuilder_root,
-        signal_library_dir=signal_library_dir,
-        K_values=K_list,
-        windows=W_list,
-        run_dir=run_dir,
-        close_source_root=effective_close_source_root,
+        **adapter_kwargs,
     )
 
     states_by_key: dict[tuple[int, str], Any] = {}
@@ -349,6 +399,58 @@ def run_adapter_diagnostic(
     )
     recommended = _derive_recommended_next_action(
         can_full, dominant,
+    )
+
+    # Phase 6I-46 TrafficFlow-compatible completeness
+    # fields (defaulted to the legacy "complete" /
+    # empty-warning shape when the adapter report does
+    # not carry them, so consumers reading the diagnostic
+    # JSON behave identically against a strict-only
+    # adapter report).
+    original_members_by_K_json = {
+        str(int(k)): _members_attempted_to_json(v)
+        for k, v in (
+            getattr(
+                report, "original_members_by_K", {}
+            ) or {}
+        ).items()
+    }
+    effective_members_by_K_json = {
+        str(int(k)): _members_attempted_to_json(v)
+        for k, v in (
+            getattr(
+                report, "effective_members_by_K", {}
+            ) or {}
+        ).items()
+    }
+    excluded_members_by_K_json = {
+        str(int(k)): [
+            _exclusion_record_to_json(rec) for rec in v
+        ]
+        for k, v in (
+            getattr(
+                report, "excluded_members_by_K", {}
+            ) or {}
+        ).items()
+    }
+    incomplete_member_detail_json = [
+        dict(d) for d in (
+            getattr(
+                report, "incomplete_member_detail", ()
+            ) or ()
+        )
+    ]
+    data_completeness_status = str(
+        getattr(
+            report,
+            "data_completeness_status",
+            "complete",
+        )
+        or "complete"
+    )
+    data_warning_symbol = str(
+        getattr(report, "data_warning_symbol", "")
+        or ""
     )
 
     return {
@@ -400,12 +502,61 @@ def run_adapter_diagnostic(
         "counts_by_skipped_reason": dict(counts),
         "dominant_skipped_reason": dominant,
         "recommended_next_action": recommended,
+        # Phase 6I-46 TrafficFlow-compatible fields.
+        "original_members_by_K": (
+            original_members_by_K_json
+        ),
+        "effective_members_by_K": (
+            effective_members_by_K_json
+        ),
+        "excluded_members_by_K": (
+            excluded_members_by_K_json
+        ),
+        "incomplete_member_detail": (
+            incomplete_member_detail_json
+        ),
+        "data_completeness_status": (
+            data_completeness_status
+        ),
+        "data_warning_symbol": data_warning_symbol,
     }
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _parse_invalid_members_json_arg(
+    raw: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Parse the ``--invalid-members-json`` CLI value.
+    Accepts either an inline JSON string or ``@PATH`` to
+    load from a file. Returns ``None`` for absent / empty
+    input; returns ``{"_parse_error": "..."}`` on parse
+    failure so ``main`` can emit a clean rc=2."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("@"):
+            from pathlib import Path as _P
+            text = _P(raw[1:]).read_text(encoding="utf-8")
+        else:
+            text = raw
+        parsed = json.loads(text)
+    except Exception as exc:
+        return {"_parse_error": str(exc)}
+    if not isinstance(parsed, dict):
+        return {
+            "_parse_error": (
+                "expected JSON object mapping "
+                "ticker -> exclusion record"
+            ),
+        }
+    return parsed
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -447,6 +598,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--close-source-root", default=None,
     )
+    # Phase 6I-46: optional JSON of TrafficFlow-compatible
+    # invalid-member exclusions. Either an inline JSON
+    # string or the literal ``@<path>`` to read from a
+    # file. Empty / absent means strict full-member
+    # coverage (default).
+    parser.add_argument(
+        "--invalid-members-json", default=None,
+        help=(
+            "Optional JSON for Phase 6I-46 invalid-member "
+            "exclusion (e.g. "
+            "'{\"TEF\": {\"reason\": "
+            "\"invalid_or_delisted\"}}'). Use '@PATH' to "
+            "read from a file. Empty / absent means strict "
+            "full-member coverage (default)."
+        ),
+    )
     return parser
 
 
@@ -473,6 +640,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    invalid_members_arg = _parse_invalid_members_json_arg(
+        args.invalid_members_json,
+    )
+    if isinstance(invalid_members_arg, dict) and (
+        "_parse_error" in invalid_members_arg
+    ):
+        print(
+            json.dumps({
+                "error": "invalid_members_json_parse_error",
+                "detail": invalid_members_arg[
+                    "_parse_error"
+                ],
+            }),
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         result = run_adapter_diagnostic(
             ticker,
@@ -482,6 +666,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             current_as_of_date=args.current_as_of_date,
             cache_dir=args.cache_dir,
             close_source_root=args.close_source_root,
+            invalid_members=invalid_members_arg or None,
         )
     except Exception as exc:  # pragma: no cover - defensive
         print(

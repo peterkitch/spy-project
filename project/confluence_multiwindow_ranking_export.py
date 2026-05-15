@@ -2150,12 +2150,22 @@ def _default_member_completeness_provider(
 ) -> dict[str, Any]:
     """Default member-completeness provider.
 
-    The current production Confluence artifact does NOT yet
-    carry member-level issue details. The default provider
-    therefore returns ``has_incomplete_build_members=False``
-    with empty member lists -- honest about the upstream gap.
-    Tests inject a fake provider that supplies member-level
-    issue data.
+    Phase 6I-46: if the on-disk Confluence artifact carries
+    the TrafficFlow-compatible invalid-member fields on its
+    ``multiwindow_k_engine_payload_metadata`` block (or at
+    the top level for back-compat with the in-memory
+    payload report shape), surface them honestly. The new
+    fields are ``data_completeness_status`` /
+    ``data_warning_symbol`` / ``incomplete_member_detail``
+    (a list of ``{ticker, reason, telemetry_reason,
+    source_classification, K}`` records).
+
+    When the artifact does NOT carry those fields (the
+    current production state for every ticker on disk),
+    the provider returns ``has_incomplete_build_members=
+    False`` with empty member lists -- honest about the
+    upstream gap. Tests can also inject a fake provider
+    that supplies the same shape directly.
 
     Returns a dict with stable keys:
 
@@ -2164,11 +2174,83 @@ def _default_member_completeness_provider(
       * incomplete_members: list[str]
       * incomplete_member_reasons: dict[str, str]
     """
-    return {
+    empty: dict[str, Any] = {
         "has_incomplete_build_members": False,
         "incomplete_member_count": 0,
         "incomplete_members": [],
         "incomplete_member_reasons": {},
+    }
+    if not isinstance(artifact, Mapping):
+        return empty
+    # The Phase 6I-46 payload builder mirrors the new fields
+    # onto the payload report; the Phase 6I-25 patch writer
+    # (when later authorized to land partial-payload metadata)
+    # would merge them into ``multiwindow_k_engine_payload_metadata``.
+    # Read from both locations so a future on-disk shape is
+    # already supported.
+    meta = artifact.get(
+        "multiwindow_k_engine_payload_metadata",
+    )
+    sources: list[Mapping[str, Any]] = []
+    if isinstance(meta, Mapping):
+        sources.append(meta)
+    sources.append(artifact)
+    status_raw: Optional[str] = None
+    incomplete_detail_raw: Any = None
+    for src in sources:
+        if status_raw is None and (
+            "data_completeness_status" in src
+        ):
+            cand = src.get("data_completeness_status")
+            if isinstance(cand, str) and cand:
+                status_raw = cand
+        if incomplete_detail_raw is None and (
+            "incomplete_member_detail" in src
+        ):
+            incomplete_detail_raw = src.get(
+                "incomplete_member_detail",
+            )
+    if status_raw not in (
+        "partial", "blocked",
+    ) or not isinstance(
+        incomplete_detail_raw, (list, tuple),
+    ):
+        return empty
+    incomplete_members: list[str] = []
+    incomplete_member_reasons: dict[str, str] = {}
+    for record in incomplete_detail_raw:
+        if not isinstance(record, Mapping):
+            continue
+        tk = str(record.get("ticker") or "").strip().upper()
+        if not tk:
+            continue
+        if tk not in incomplete_members:
+            incomplete_members.append(tk)
+        if tk not in incomplete_member_reasons:
+            reason = record.get("reason")
+            telemetry_reason = record.get(
+                "telemetry_reason",
+            )
+            if telemetry_reason:
+                incomplete_member_reasons[tk] = (
+                    f"{reason}:{telemetry_reason}"
+                    if reason else str(telemetry_reason)
+                )
+            elif reason:
+                incomplete_member_reasons[tk] = str(reason)
+            else:
+                incomplete_member_reasons[tk] = (
+                    "invalid_member"
+                )
+    if not incomplete_members:
+        return empty
+    return {
+        "has_incomplete_build_members": True,
+        "incomplete_member_count": len(incomplete_members),
+        "incomplete_members": incomplete_members,
+        "incomplete_member_reasons": (
+            incomplete_member_reasons
+        ),
     }
 
 
