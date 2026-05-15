@@ -157,5 +157,111 @@
     "stackbuilder_wrote_any_file": false,
     "subprocess_wrappers_added": false
   },
-  "next_step_recommendation": "Phase 6I-55 cannot proceed until the --primaries gap in the Phase 6I-52 locked policy is resolved. Recommended next phase: a Phase 6I-55a (or Phase 6I-52 amendment-3) that explicitly decides the --primaries axis -- preferably option (A) or (C) above. After that lands, Phase 6I-55b retries the supervised batch for the 6 ready tickers using the updated locked command shape. This is the same stop-and-resolve pattern Phase 6I-53 established for the cache-rebuild gap."
+  "next_step_recommendation": "Phase 6I-55 cannot proceed until the --primaries gap in the Phase 6I-52 locked policy is resolved. Recommended next phase: a Phase 6I-55a (or Phase 6I-52 amendment-3) that explicitly decides the --primaries axis -- preferably option (A) or (C) above. After that lands, Phase 6I-55b retries the supervised batch for the 6 ready tickers using the updated locked command shape. This is the same stop-and-resolve pattern Phase 6I-53 established for the cache-rebuild gap.",
+  "amendment_1_verified_upstream_chain": {
+    "chain_summary": "OnePass / signal_library -> ImpactSearch -> StackBuilder -> Confluence",
+    "code_path_citations": [
+      {
+        "stage": "OnePass writes signal libraries",
+        "file_line": "onepass.py:1154 save_signal_library",
+        "output_root": "signal_library/data/stable"
+      },
+      {
+        "stage": "ImpactSearch reads signal libraries (per primary)",
+        "file_line": "impactsearch.py:1525 load_signal_library",
+        "output_root": "(in-memory)"
+      },
+      {
+        "stage": "ImpactSearch writes per-secondary ranking workbooks",
+        "file_line": "impactsearch.py:2491 export_results_to_excel (output_dir 1355 = output/impactsearch)",
+        "output_root": "output/impactsearch/<TICKER>_analysis.xlsx"
+      },
+      {
+        "stage": "StackBuilder consumes ImpactSearch workbook",
+        "file_line": "stackbuilder.py:583 try_load_rank_from_impact_xlsx (used at :1105 when --prefer-impact-xlsx)",
+        "output_root": "(in-memory rank_direct / rank_inverse)"
+      },
+      {
+        "stage": "StackBuilder authorization gate",
+        "file_line": "stackbuilder.py:889 phase1_preflight FATAL when no primaries and no --prefer-impact-xlsx (comment at :869: CRITICAL: Strictly require user primaries; no 72k fallback)",
+        "output_root": "(blocks before write)"
+      },
+      {
+        "stage": "StackBuilder K-build iteration",
+        "file_line": "stackbuilder.py:1487 phase3_build_stacks (called from :2431 and :2866)",
+        "output_root": "output/stackbuilder/<TICKER>/seedTC__..."
+      },
+      {
+        "stage": "StackBuilder --prefer-impact-xlsx flag declaration",
+        "file_line": "stackbuilder.py:3361 add_argument",
+        "output_root": "(CLI surface)"
+      }
+    ],
+    "intended_bridge_flag": "--prefer-impact-xlsx",
+    "manual_override_flag": "--primaries <CSV>"
+  },
+  "amendment_1_concrete_upstream_state": {
+    "per_ticker_impactsearch_workbook": {
+      "SPY": {
+        "present": true,
+        "size_bytes": 5430811,
+        "mtime": "2026-01-09 23:38:35",
+        "freshness": "likely_stale_4_months_old"
+      },
+      "AAPL": {
+        "present": true,
+        "size_bytes": 5439393,
+        "mtime": "2026-01-09 23:38:31",
+        "freshness": "likely_stale_4_months_old"
+      },
+      "JNJ": {
+        "present": false,
+        "note": "workbook missing entirely; cannot use --prefer-impact-xlsx for this ticker"
+      },
+      "WMT": {
+        "present": false,
+        "note": "workbook missing entirely"
+      },
+      "HD": {
+        "present": false,
+        "note": "workbook missing entirely"
+      },
+      "MCD": {
+        "present": false,
+        "note": "workbook missing entirely"
+      }
+    },
+    "summary": "2 of 6 ready tickers have ImpactSearch workbooks (both ~4 months old); 4 of 6 have no workbook at all. Even option B (--prefer-impact-xlsx) cannot serve JNJ/WMT/HD/MCD today."
+  },
+  "amendment_1_revised_options_summary": {
+    "preferred_path": "Phase 6I-55a read-only ImpactSearch / primary-universe readiness planner",
+    "phase_6i_55a_taxonomy": [
+      "ready_for_stackbuilder_with_impact_xlsx",
+      "needs_impactsearch_run",
+      "manual_review"
+    ],
+    "option_table_revised": {
+      "A_explicit_primaries_csv": "manual override only; skips the curated upstream ranking and audit trail",
+      "B_add_prefer_impact_xlsx_to_locked_command": "cannot serve JNJ/WMT/HD/MCD today; operator-decision blocker on SPY/AAPL freshness",
+      "C_run_impactsearch_first": "natural path 6I-55a directs to for needs_impactsearch_run tickers",
+      "D_uniform_spy_k_universe": "NOT RECOMMENDED -- no economic basis for AAPL/JNJ/WMT/HD/MCD using SPY K-universe; includes TEF"
+    },
+    "concrete_next_steps": [
+      "Phase 6I-55a -- read-only ImpactSearch readiness planner (mirroring Phase 6I-53 / 6I-54a)",
+      "Operator review of 6I-55a output per ticker",
+      "Phase 6I-52 amendment-3 locks --prefer-impact-xlsx + freshness criteria",
+      "Phase 6I-55c retries the supervised StackBuilder batch for the ready_for_stackbuilder_with_impact_xlsx subset"
+    ]
+  },
+  "amendment_1_no_production_activity": {
+    "documentation_only": true,
+    "no_yfinance": true,
+    "no_stackbuilder_invocation": true,
+    "no_onepass_invocation": true,
+    "no_impactsearch_invocation": true,
+    "no_source_refresh": true,
+    "no_promotion": true,
+    "no_confluence_patch_writer": true,
+    "no_pipeline_runner": true
+  }
 }
