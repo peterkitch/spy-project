@@ -353,11 +353,31 @@ def test_invalid_ticker_excluded_from_candidate_command():
         source_readiness_callable=source_probe,
     )
     assert report.refresh_candidate_ready is True
-    cmd = report.refresh_candidate_command
-    assert cmd is not None
-    assert "TEF" not in cmd
-    assert "AAA" in cmd
-    assert "BBB" in cmd
+    # Phase 6I-44: candidate commands are now per-ticker
+    # singular. The plural list is authoritative; singular
+    # carries only the FIRST command.
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert len(commands) == 2
+    assert len(argvs) == 2
+    joined = " || ".join(commands)
+    assert "TEF" not in joined
+    # Each command refers to exactly one ticker via the
+    # singular --ticker flag.
+    for cmd_str, argv in zip(commands, argvs):
+        assert "--tickers" not in cmd_str
+        assert "--ticker" in cmd_str
+        assert "--tickers" not in argv
+    # The set of tickers across commands matches the
+    # non-invalid set.
+    tickers_in_argvs = []
+    for argv in argvs:
+        idx = list(argv).index("--ticker")
+        tickers_in_argvs.append(argv[idx + 1])
+    assert sorted(tickers_in_argvs) == ["AAA", "BBB"]
+    # Singular field is the first command (deprecated
+    # backward-compat).
+    assert report.refresh_candidate_command == commands[0]
     # Refresh candidate ticker list excludes TEF.
     assert "TEF" not in report.refresh_candidate_tickers
     assert sorted(
@@ -490,13 +510,22 @@ def test_ready_true_with_policy_and_invalid_excluded():
         ]
         == 1
     )
-    # Candidate command includes all 14 non-TEF tickers,
-    # excludes TEF.
-    cmd = report.refresh_candidate_command
-    assert cmd is not None
-    for t in non_tef:
-        assert t in cmd
-    assert "TEF" not in cmd
+    # Phase 6I-44: per-ticker commands. One command per
+    # non-invalid candidate ticker; TEF excluded entirely.
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert len(commands) == 14
+    assert len(argvs) == 14
+    joined = " || ".join(commands)
+    assert "TEF" not in joined
+    tickers_in_argvs = []
+    for cmd_str, argv in zip(commands, argvs):
+        assert "--tickers" not in cmd_str
+        assert "--ticker" in cmd_str
+        idx = list(argv).index("--ticker")
+        tickers_in_argvs.append(argv[idx + 1])
+    assert sorted(tickers_in_argvs) == sorted(non_tef)
+    assert report.refresh_candidate_command == commands[0]
 
 
 # ---------------------------------------------------------------------------
@@ -680,19 +709,37 @@ def test_amendment1_pinned_interpreter_with_invalid_excluded():
         source_readiness_callable=source_probe,
     )
     assert report.refresh_candidate_ready is True
-    cmd = report.refresh_candidate_command
-    assert cmd is not None
-    # Pinned interpreter first.
-    assert cmd.startswith(_PINNED + " ")
-    # TEF excluded.
-    assert "TEF" not in cmd
-    for t in non_tef:
-        assert t in cmd
-    # No env-var wording.
-    assert "PRJCT9_AUTOMATION_WRITE_AUTH" not in cmd
-    assert "phase_6h5_explicit" not in cmd
-    # --write present.
-    assert " --write" in cmd or cmd.endswith("--write")
+    # Phase 6I-44: combined check across the plural list.
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert len(commands) == 14
+    assert len(argvs) == 14
+    tickers_in_argvs = []
+    for cmd_str, argv in zip(commands, argvs):
+        # Pinned interpreter first.
+        assert cmd_str.startswith(_PINNED + " ")
+        assert argv[0] == _PINNED
+        # Refresher script.
+        assert argv[1] == "signal_engine_cache_refresher.py"
+        # --ticker (singular) present; --tickers (plural)
+        # never present.
+        assert "--ticker" in cmd_str
+        assert "--tickers" not in cmd_str
+        assert "--tickers" not in argv
+        # No env-var wording.
+        assert "PRJCT9_AUTOMATION_WRITE_AUTH" not in cmd_str
+        assert "phase_6h5_explicit" not in cmd_str
+        # --write present.
+        assert " --write" in cmd_str or (
+            cmd_str.endswith("--write")
+        )
+        # No bare ``python`` prefix.
+        assert not cmd_str.startswith("python ")
+        idx = list(argv).index("--ticker")
+        tickers_in_argvs.append(argv[idx + 1])
+    # TEF excluded; full non-TEF set covered.
+    assert "TEF" not in tickers_in_argvs
+    assert sorted(tickers_in_argvs) == sorted(non_tef)
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +1013,224 @@ def test_module_no_yfinance_import_anywhere():
                     "yfinance"
                     not in node.module.lower()
                 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-44: per-ticker command contract
+# ---------------------------------------------------------------------------
+
+
+def _spy_k_universe_publishable_fixture():
+    """Reusable 14-non-TEF + TEF fixture for the Phase 6I-44
+    per-ticker contract tests."""
+    non_tef = [
+        "SPY", "AROW", "AWR", "CLH", "CP", "EXPO", "FCFS",
+        "GBCI", "HCSG", "JNJ", "LLY", "MO", "PRA", "PRGO",
+    ]
+    universe = non_tef + ["TEF"]
+    cache_states = [
+        _cache_state(ticker=t) for t in universe
+    ]
+    source_states = [
+        _source_state(
+            ticker=t,
+            source_equal_to_cutoff=True,
+            new_cache_date_range_end="2026-05-14",
+            provider_fetch_telemetry=_telemetry_ok(),
+        )
+        for t in non_tef
+    ] + [
+        _source_state(
+            ticker="TEF",
+            new_cache_date_range_end=None,
+            provider_fetch_telemetry=_telemetry_delisted(),
+        ),
+    ]
+    cache_probe, source_probe = _fake_probes(
+        cache_states=cache_states,
+        source_states=source_states,
+    )
+    return non_tef, universe, cache_probe, source_probe
+
+
+def test_phase_6i44_commands_use_singular_ticker_not_plural():
+    """The Phase 6I-44 contract: each emitted command uses
+    ``--ticker <T>`` (singular), NEVER ``--tickers <CSV>``.
+    The plural shape was the Phase 6I-43 emitter bug that
+    failed live with argparse rc=2 at the refresher CLI."""
+    non_tef, universe, cache_probe, source_probe = (
+        _spy_k_universe_publishable_fixture()
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    assert report.refresh_candidate_ready is True
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert len(commands) == len(non_tef)
+    assert len(argvs) == len(non_tef)
+    for cmd_str, argv in zip(commands, argvs):
+        assert "--tickers" not in cmd_str
+        assert "--ticker" in cmd_str
+        assert "--tickers" not in argv
+        assert "--ticker" in argv
+        # Exactly one ticker per argv.
+        idx = list(argv).index("--ticker")
+        # Next token is the literal ticker, not a CSV.
+        assert "," not in argv[idx + 1]
+
+
+def test_phase_6i44_one_command_per_non_invalid_candidate():
+    """One command per non-invalid candidate ticker;
+    invalid tickers (TEF) excluded from the command list
+    AND from the candidate ticker list."""
+    non_tef, universe, cache_probe, source_probe = (
+        _spy_k_universe_publishable_fixture()
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert len(commands) == 14
+    assert len(argvs) == 14
+    # TEF appears nowhere.
+    joined = " || ".join(commands)
+    assert "TEF" not in joined
+    assert "TEF" not in report.refresh_candidate_tickers
+    # The exact 14 non-TEF tickers each appear once.
+    tickers_seen: list[str] = []
+    for argv in argvs:
+        idx = list(argv).index("--ticker")
+        tickers_seen.append(argv[idx + 1])
+    assert sorted(tickers_seen) == sorted(non_tef)
+    assert len(set(tickers_seen)) == 14
+
+
+def test_phase_6i44_each_command_starts_with_pinned_interpreter():
+    """Each command must begin with the pinned interpreter
+    path; the corresponding argv[0] must equal the pinned
+    interpreter constant. Bare ``python`` is forbidden."""
+    non_tef, universe, cache_probe, source_probe = (
+        _spy_k_universe_publishable_fixture()
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert len(commands) == 14
+    assert len(argvs) == 14
+    for cmd_str, argv in zip(commands, argvs):
+        assert cmd_str.startswith(_PINNED + " ")
+        assert argv[0] == _PINNED
+        assert not cmd_str.startswith("python ")
+        assert argv[0] != "python"
+
+
+def test_phase_6i44_each_argv_includes_refresher_script_and_ticker():
+    """argv must include ``signal_engine_cache_refresher.py``
+    and ``--ticker <T>``."""
+    non_tef, universe, cache_probe, source_probe = (
+        _spy_k_universe_publishable_fixture()
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    argvs = report.refresh_candidate_command_argvs
+    assert len(argvs) == 14
+    for argv in argvs:
+        assert (
+            "signal_engine_cache_refresher.py" in argv
+        )
+        assert "--ticker" in argv
+        idx = list(argv).index("--ticker")
+        assert argv[idx + 1] in non_tef
+
+
+def test_phase_6i44_no_env_var_or_phase_6h5_wording_in_any_command():
+    """No emitted command may carry
+    ``PRJCT9_AUTOMATION_WRITE_AUTH`` or
+    ``phase_6h5_explicit``. The Phase 6E-5 refresher CLI
+    does not use that env-var gate."""
+    non_tef, universe, cache_probe, source_probe = (
+        _spy_k_universe_publishable_fixture()
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    for cmd_str in report.refresh_candidate_commands:
+        assert "PRJCT9_AUTOMATION_WRITE_AUTH" not in cmd_str
+        assert "phase_6h5_explicit" not in cmd_str
+    for argv in report.refresh_candidate_command_argvs:
+        for token in argv:
+            assert (
+                "PRJCT9_AUTOMATION_WRITE_AUTH" not in token
+            )
+            assert "phase_6h5_explicit" not in token
+    # The to_json_dict() emission carries the plural lists
+    # too -- they must be present and carry no env-var
+    # wording either.
+    j = report.to_json_dict()
+    assert "refresh_candidate_commands" in j
+    assert "refresh_candidate_command_argvs" in j
+    assert len(j["refresh_candidate_commands"]) == 14
+    assert len(j["refresh_candidate_command_argvs"]) == 14
+    for cmd_str in j["refresh_candidate_commands"]:
+        assert "PRJCT9_AUTOMATION_WRITE_AUTH" not in cmd_str
+    for argv in j["refresh_candidate_command_argvs"]:
+        for token in argv:
+            assert (
+                "PRJCT9_AUTOMATION_WRITE_AUTH" not in token
+            )
+
+
+def test_phase_6i44_singular_field_is_first_plural_command():
+    """The deprecated singular ``refresh_candidate_command``
+    must equal the first element of the plural list (for
+    backward compatibility)."""
+    non_tef, universe, cache_probe, source_probe = (
+        _spy_k_universe_publishable_fixture()
+    )
+    report = pv2.plan_source_refresh_policy_v2(
+        universe,
+        cache_dir="cache/results",
+        current_as_of_date="2026-05-14",
+        allow_equal_cutoff_after_close=True,
+        cache_cutoff_callable=cache_probe,
+        source_readiness_callable=source_probe,
+    )
+    commands = report.refresh_candidate_commands
+    argvs = report.refresh_candidate_command_argvs
+    assert report.refresh_candidate_command == commands[0]
+    assert (
+        report.refresh_candidate_command_argv == argvs[0]
+    )
 
 
 def test_module_no_prjct9_automation_write_auth_in_emitted_command():
