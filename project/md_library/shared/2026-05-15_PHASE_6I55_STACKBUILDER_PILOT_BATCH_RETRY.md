@@ -1,6 +1,6 @@
 # Phase 6I-55: Supervised StackBuilder pilot batch retry — stopped on locked-policy gap
 
-**Date:** 2026-05-15 (amendment-1 same day, docs-only precision pass)
+**Date:** 2026-05-15 (amendment-1 + amendment-2 same day, docs-only precision passes)
 **Base commit (main):** `63b06c9` (Phase 6I-54b squash-merge)
 **Branch:** `phase-6i-55-stackbuilder-pilot-batch-retry`
 **Status:** **STOPPED on first ticker** per the prompt's `If any of the 6 no longer pass, STOP and report.` discipline. **Zero StackBuilder writes.** Production roots unchanged. Evidence-only PR. **Do not merge** until operator resolves the upstream ImpactSearch / primary-universe policy gap surfaced here (see Section 8 below; reframed in amendment-1).
@@ -19,6 +19,18 @@ Amendment-1 is a **docs-only** precision pass:
 - Production-roots evidence + execution-log + per-ticker results are unchanged — Phase 6I-55 still wrote nothing.
 
 No code changes. One small doc-guard test added to pin that future doc edits don't lose the upstream-chain citations. No production activity (no StackBuilder, no OnePass, no ImpactSearch, no yfinance, no source refresh, no promotion, no Confluence patch writer, no pipeline runner).
+
+## Amendment-2: evidence consistency (docs-only)
+
+Codex re-audit confirmed amendment-1's strategic reframing was correct but found two consistency issues:
+
+1. **`policy_gap.options_for_resolution` + `policy_gap.recommended_resolution` in the JSON still had the pre-amendment framing** (presenting explicit `--primaries` + uniform SPY K-universe in the older style, contradicting amendment-1's revised options). Amendment-2 rewrites those two fields so the JSON's policy-gap block matches the amendment-1 framing: preferred path = Phase 6I-55a planner; option A = manual override only; option D = NOT RECOMMENDED with TEF mention. No contradictory dual recommendations.
+
+2. **The doc + JSON referenced raw `*_RUN_SPY_STDOUT.txt` and `..._STDERR.txt` paths that are not committed** (git-ignored by `.gitignore *.txt`). Those files don't exist in the checkout, but the 10-line stdout/stderr tails are already embedded in the JSON's `execution_log.per_ticker_results[0].stdout_tail` / `stderr_tail`. Amendment-2 removes the file-path references and adds an explicit `stdout_stderr_capture = "embedded_only"` marker on each per-ticker row. The "Files added" section now correctly reports 6 committed files (5 evidence + 1 doc-guard test) and a separately-listed 2 embedded-only files.
+
+Amendment-2 also **extends the doc-guard** (`test_phase_6i_55_evidence_doc_guard.py`) with a path-existence walker that asserts every path-shaped reference in the doc + JSON actually exists, unless explicitly marked `embedded_only`. Future doc edits that introduce a stale path reference fail loudly.
+
+No code changes outside the doc-guard test. No production activity.
 
 ---
 
@@ -157,9 +169,9 @@ This is the concrete on-disk evidence behind the amendment-1 revised Section 8 b
 | 5 | HD | — | — | — | NOT ATTEMPTED. |
 | 6 | MCD | — | — | — | NOT ATTEMPTED. |
 
-**Raw run output** for SPY:
-- stdout: `md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDOUT.txt` (1 line: `[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE=False)`)
-- stderr: `md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDERR.txt` (1 line: `[FATAL] Primary tickers field is empty. Please supply one or more primaries.`)
+**Raw run output** for SPY (embedded-only; the raw `.txt` files are git-ignored per `.gitignore` `*.txt` — the authoritative on-disk record is the embedded `stdout_tail` + `stderr_tail` in the consolidated evidence JSON):
+- stdout (1 line): `[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE=False)`
+- stderr (1 line): `[FATAL] Primary tickers field is empty. Please supply one or more primaries.`
 
 ## 5. No yfinance fetched
 
@@ -245,19 +257,31 @@ No Phase 6I-55 batch retry should proceed under the current Phase 6I-52 lock —
 - Does NOT invoke yfinance, the source-cache refresher, the signal-library promotion writer, the Confluence patch writer, the pipeline runner, OnePass, ImpactSearch, TrafficFlow, or Spymaster batch.
 - Does NOT modify the Phase 6I-50 / 6I-51 / 6I-52 / 6I-53 / 6I-54a / 6I-54b modules.
 
-## 10. Files added (5)
+## 10. Files added (6 committed, after amendment-1 doc-guard test)
+
+**Committed files (6):**
 
 - `project/md_library/shared/2026-05-15_PHASE_6I55_STACKBUILDER_PILOT_BATCH_RETRY.md` (this doc).
-- `project/md_library/shared/2026-05-15_PHASE_6I55_STACKBUILDER_PILOT_BATCH_RETRY_EVIDENCE.json` — consolidated evidence (preflight + execution log + policy-gap analysis + production-root diff + reclassification).
+- `project/md_library/shared/2026-05-15_PHASE_6I55_STACKBUILDER_PILOT_BATCH_RETRY_EVIDENCE.json` — consolidated evidence (preflight + execution log + policy-gap analysis + production-root diff + reclassification + amendment-1 verified upstream chain + amendment-2 reframed options).
 - `project/md_library/shared/2026-05-15_PHASE_6I55_PRE_RUN_PREFLIGHT.json` — raw preflight table.
-- `project/md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDOUT.txt` — SPY run stdout (one `[SUCCESS]` line).
-- `project/md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDERR.txt` — SPY run stderr (the FATAL).
 - `project/md_library/shared/2026-05-15_PHASE_6I55_POST_RUN_6I50_LAUNCH_PLAN.json` — Phase 6I-50 verdict post-attempt.
 - `project/md_library/shared/2026-05-15_PHASE_6I55_POST_RUN_6I51_ROLLOUT_PLAN.json` — Phase 6I-51 verdict post-attempt.
+- `project/test_scripts/test_phase_6i_55_evidence_doc_guard.py` — amendment-1 + amendment-2 doc-guard test (verified-upstream-chain citations + amendment-1 JSON blocks + amendment-2 zero-production-activity flags + amendment-2 path-existence walker).
+
+**Not committed (embedded-only, captured as `stdout_tail` / `stderr_tail` in the consolidated evidence JSON):**
+
+- `2026-05-15_PHASE_6I55_RUN_SPY_STDOUT.txt` — 1 line `[SUCCESS] parity_config loaded successfully (STRICT_PARITY_MODE=False)`. Git-ignored by `.gitignore` rule `*.txt`.
+- `2026-05-15_PHASE_6I55_RUN_SPY_STDERR.txt` — 1 line `[FATAL] Primary tickers field is empty. Please supply one or more primaries.`. Git-ignored by the same rule.
+
+The two embedded-only files are not paths a reviewer should look for; the consolidated evidence JSON's `execution_log.per_ticker_results[0]` carries `stdout_tail` + `stderr_tail` + a `stdout_stderr_capture = "embedded_only"` marker.
 
 ## 11. Tests
 
-Per the prompt: *"Add or update tests only if needed for reusable execution evidence/parsing helpers."* No reusable helpers were added (the runs were direct one-shot Bash invocations with stdout/stderr capture). No new tests therefore. Focused regression confirmed unchanged:
+Per the original Phase 6I-55 prompt: *"Add or update tests only if needed for reusable execution evidence/parsing helpers."* No reusable execution-evidence helpers were added (the runs were direct one-shot Bash invocations with stdout/stderr capture).
+
+Amendment-1 added one **doc-guard test** (`test_phase_6i_55_evidence_doc_guard.py`) to pin the upstream-chain citations against future doc rewrites. Amendment-2 extended that file with a **path-existence guard** that walks every path-shaped reference in the doc + JSON (`evidence_file`, `stdout_path`, `manifest_path`, etc.) and asserts each exists, unless explicitly marked `embedded_only`.
+
+Focused regression confirmed unchanged:
 
 ```
 "<PINNED_PYTHON>" -m pytest \

@@ -53,8 +53,8 @@
         "wrote_files": false,
         "issue": "primaries_not_specified",
         "yfinance_fetched": false,
-        "stdout_path": "md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDOUT.txt",
-        "stderr_path": "md_library/shared/2026-05-15_PHASE_6I55_RUN_SPY_STDERR.txt"
+        "stdout_stderr_capture": "embedded_only",
+        "stdout_stderr_capture_note": "Raw stdout/stderr files are not committed (.gitignore *.txt). The 10-line tails in stdout_tail / stderr_tail above are the authoritative on-disk record of the SPY FATAL run."
       }
     ]
   },
@@ -66,12 +66,13 @@
       "AAPL": "seedTC__EXC-D_HD-D_JFJ.L-D_MWY.L-D_JCH.L-D_ATR.L-D_ETE.AT-I_HGT.L-D_CSL.AX-D_MGR.AX-I_TTE-I_AAPL-D (12 primaries; a different international set chosen by an earlier ImpactSearch / curated workflow)"
     },
     "options_for_resolution": [
-      "Option A: Amend Phase 6I-52 locked policy to include an explicit --primaries decision per ticker, drawn from the operator's curated ImpactSearch / GTL output. This is the most explicit + auditable path.",
-      "Option B: Add --prefer-impact-xlsx to the Phase 6I-52 locked policy if each pilot ticker has an ImpactSearch XLSX on disk. The Phase 6I-52 amendment-1 evidence did NOT verify whether such XLSXs exist for AAPL/JNJ/WMT/HD/MCD.",
-      "Option C: Run ImpactSearch first (its own explicitly-authorized phase) to produce per-ticker XLSXs, then run Phase 6I-55 with --prefer-impact-xlsx.",
-      "Option D: Adopt a single curated primaries list for the first rollout (e.g. the SPY K-universe AWR, CP, EXPO, LLY, CLH, GBCI, HCSG, TEF, JNJ, MO, AROW, PRA) used uniformly for all 6 tickers. Cheapest, but ties every secondary to the SPY-shaped K-universe, which may not be representative."
+      "PREFERRED: Phase 6I-55a -- read-only ImpactSearch / primary-universe readiness planner. Mirrors the Phase 6I-53 / 6I-54a pattern. Inspects output/impactsearch/<TICKER>_analysis.xlsx per ready secondary, verifies manifest sidecar + freshness, extracts the primary universe StackBuilder would consume via try_load_rank_from_impact_xlsx, and classifies each ticker as one of {ready_for_stackbuilder_with_impact_xlsx, needs_impactsearch_run, manual_review}. Read-only: no ImpactSearch / OnePass / StackBuilder / yfinance / subprocess / raw pickle.load.",
+      "Option A -- explicit --primaries <CSV> per ticker: MANUAL OVERRIDE ONLY. Skips the curated upstream ranking and the audit trail the OnePass -> ImpactSearch -> StackBuilder chain provides. Not equivalent to the intended app chain.",
+      "Option B -- add --prefer-impact-xlsx to the Phase 6I-52 locked command: gated on Phase 6I-55a output. Today the workbook is MISSING entirely for 4 of the 6 ready tickers (JNJ, WMT, HD, MCD) and the SPY + AAPL workbooks are dated 2026-01-09 (~4 months old). Operator must decide a freshness rule before this option becomes usable.",
+      "Option C -- run ImpactSearch first as its own authorized phase, then retry Phase 6I-55 with option B. This is the natural path Phase 6I-55a directs to for needs_impactsearch_run tickers.",
+      "Option D -- uniform SPY K-universe fallback (AWR, CP, EXPO, LLY, CLH, GBCI, HCSG, TEF, JNJ, MO, AROW, PRA): NOT RECOMMENDED / emergency-manual only. No economic basis for AAPL / JNJ / WMT / HD / MCD using the SPY K-universe. Includes TEF (the Phase 6I-43-flagged known-invalid ticker), which would propagate through the partial-payload path."
     ],
-    "recommended_resolution": "Operator decision required. The Phase 6I-55 implementation cannot responsibly pick from A/B/C/D on its own -- each option is a real policy choice. The next-step is a Phase 6I-52 amendment-3 (or a new Phase 6I-55a) that locks the --primaries decision before Phase 6I-55b retries the supervised batch."
+    "recommended_resolution": "Write a read-only Phase 6I-55a ImpactSearch / primary-universe readiness planner that mirrors the Phase 6I-53 / 6I-54a pattern. Operator reviews its per-ticker classification. For needs_impactsearch_run tickers, the operator either authorizes a separate ImpactSearch batch or defers those tickers. Once Phase 6I-55a confirms the upstream chain, a Phase 6I-52 amendment-3 locks --prefer-impact-xlsx (plus any freshness criteria) into the StackBuilder command shape, and Phase 6I-55c retries the supervised batch against the ready_for_stackbuilder_with_impact_xlsx subset. Explicit --primaries remains documented as the manual override path. The uniform SPY K-universe fallback (option D) is NOT recommended (no economic basis for the other 5 tickers; includes TEF). See amendment_1_revised_options_summary for the canonical option table."
   },
   "production_root_inventory_pre_run": {
     "cache/results": 3239,
