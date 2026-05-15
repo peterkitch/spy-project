@@ -320,36 +320,70 @@ def _candidate_board_render_now_commands(
 ) -> list[dict[str, Any]]:
     """Two read-only documentation commands per ticker:
     re-render the static board, and rebuild the website
-    export package. Both are read-only."""
-    common_argv: list[str] = []
+    export package. Both are read-only.
+
+    Phase 6I-51 amendment-1 corrections (Codex audit):
+      * ``confluence_static_board_renderer.py`` uses
+        ``--from-tickers`` (NOT ``--tickers``). The
+        ``--signal-library-dir`` / ``--stackbuilder-root``
+        flags do NOT exist on that script directly --
+        threading them through requires
+        ``--with-local-overlays`` plus the four
+        ``--overlay-*`` flags.
+      * ``confluence_website_export_package.py`` accepts
+        ``--tickers`` / ``--all-artifacts`` /
+        ``--from-stackbuilder-universe`` + ``--top-n`` +
+        ``--artifact-root`` + ``--cache-dir`` only.
+        ``--signal-library-dir`` and ``--stackbuilder-root``
+        do NOT exist there.
+    """
+    cmds: list[dict[str, Any]] = []
+
+    # 1) Static board renderer. Uses --from-tickers + the
+    # overlay flags so all root inputs are honestly threaded
+    # through. Without --with-local-overlays the renderer
+    # only consumes --artifact-root + --cache-dir.
+    argv_a: list[str] = [
+        PINNED_INTERPRETER,
+        "confluence_static_board_renderer.py",
+        "--from-tickers", ticker,
+    ]
     if artifact_root is not None:
-        common_argv += ["--artifact-root", str(artifact_root)]
+        argv_a += ["--artifact-root", str(artifact_root)]
     if cache_dir is not None:
-        common_argv += ["--cache-dir", str(cache_dir)]
-    if signal_library_dir is not None:
-        common_argv += [
-            "--signal-library-dir",
-            str(signal_library_dir),
-        ]
-    if stackbuilder_root is not None:
-        common_argv += [
-            "--stackbuilder-root",
-            str(stackbuilder_root),
-        ]
+        argv_a += ["--cache-dir", str(cache_dir)]
     if current_as_of_date is not None:
-        common_argv += [
+        argv_a += [
             "--current-as-of-date",
             str(current_as_of_date),
         ]
-
-    cmds: list[dict[str, Any]] = []
-
-    # 1) Static board renderer.
-    argv_a = [
-        PINNED_INTERPRETER,
-        "confluence_static_board_renderer.py",
-        "--tickers", ticker,
-    ] + common_argv
+    # Phase 6I-42 overlay path: only thread the
+    # signal-library / stackbuilder roots through when the
+    # operator wants the local overlay enrichment. Doing
+    # this by default matches the original Phase 6I-51
+    # intent ("emit board re-render commands that thread
+    # every supplied root through") while using the real
+    # CLI flag names.
+    argv_a += ["--with-local-overlays"]
+    if cache_dir is not None:
+        argv_a += [
+            "--overlay-cache-dir", str(cache_dir),
+        ]
+    if artifact_root is not None:
+        argv_a += [
+            "--overlay-artifact-root",
+            str(artifact_root),
+        ]
+    if stackbuilder_root is not None:
+        argv_a += [
+            "--overlay-stackbuilder-root",
+            str(stackbuilder_root),
+        ]
+    if signal_library_dir is not None:
+        argv_a += [
+            "--overlay-signal-library-dir",
+            str(signal_library_dir),
+        ]
     cmds.append({
         "ticker": ticker,
         "command_label": "static_board_render",
@@ -360,17 +394,24 @@ def _candidate_board_render_now_commands(
         "blocked_by_policy_decision": False,
         "notes": (
             "Read-only static-board re-render for the "
-            "ticker. Documentation only; no flag here "
-            "writes."
+            "ticker. Uses --from-tickers + Phase 6I-42 "
+            "--with-local-overlays so every supplied root "
+            "is honestly threaded through."
         ),
     })
 
-    # 2) Website export package.
-    argv_b = [
+    # 2) Website export package. Only the four supported
+    # flags. The export CLI does NOT accept
+    # --signal-library-dir or --stackbuilder-root.
+    argv_b: list[str] = [
         PINNED_INTERPRETER,
         "confluence_website_export_package.py",
         "--tickers", ticker,
-    ] + common_argv
+    ]
+    if artifact_root is not None:
+        argv_b += ["--artifact-root", str(artifact_root)]
+    if cache_dir is not None:
+        argv_b += ["--cache-dir", str(cache_dir)]
     cmds.append({
         "ticker": ticker,
         "command_label": "website_export_package",
@@ -380,8 +421,12 @@ def _candidate_board_render_now_commands(
         "requires_separate_operator_authorization": False,
         "blocked_by_policy_decision": False,
         "notes": (
-            "Read-only website export-package rebuild. "
-            "Outputs land outside production roots."
+            "Read-only website export-package rebuild "
+            "(JSON envelope on stdout). The CLI accepts "
+            "only --tickers/--all-artifacts/--from-"
+            "stackbuilder-universe + --top-n + "
+            "--artifact-root + --cache-dir; other flags "
+            "are intentionally omitted."
         ),
     })
     return cmds
@@ -524,25 +569,93 @@ def _candidate_signal_library_rebuild_or_promotion_commands(
     signal_library_status: Optional[str],
     cache_dir: Optional[str],
     signal_library_dir: Optional[str],
+    staged_dir_for_promotion: Optional[str],
+    intervals_for_promotion: Optional[str],
 ) -> list[dict[str, Any]]:
     """Two-mode candidate commands. ``stable_missing`` ->
-    staged rebuild (read-only staging at the planner
-    layer; the actual rebuild script is documented but
-    not generated here in detail). ``staged_possible`` ->
-    guarded stable-promotion write."""
+    staged rebuild (documentation-only; the Phase 6I-30 /
+    6I-32 rebuild path is a multi-step operator-staged
+    exercise, not a single CLI invocation).
+    ``staged_possible`` -> guarded stable-promotion write.
+
+    Phase 6I-51 amendment-1 corrections (Codex audit):
+    ``signal_library_stable_promotion_writer.py`` requires
+    ``--tickers <CSV>`` (NOT ``--ticker``), ``--staged-dir
+    <DIR>`` (required, no default), ``--production-stable-
+    dir <DIR>`` (defaults to project root), and
+    ``--intervals`` (default ``1d,1wk,1mo,3mo,1y``). It
+    does NOT accept ``--signal-library-dir``.
+
+    Because ``--staged-dir`` is required at the writer's
+    argparse level (no default), the planner cannot emit
+    a runnable argv unless the operator tells it which
+    staged-dir to use. The behavior is:
+      * ``staged_dir_for_promotion=None`` -> documentation-
+        only comment with a ``<STAGED_DIR>`` placeholder
+        and ``argv=None`` so the candidate is honest about
+        the missing input.
+      * ``staged_dir_for_promotion=<DIR>`` -> executable
+        argv tagged ``confluence_artifact_write`` -- err,
+        ``signal_library_promotion_write`` -- with
+        ``requires_separate_operator_authorization=True``.
+    """
     if signal_library_status == "staged_possible":
-        # Guarded promotion write (Phase 6I-31).
-        argv = [
+        intervals_csv = (
+            intervals_for_promotion or "1d,1wk,1mo,3mo,1y"
+        )
+        if staged_dir_for_promotion is None:
+            # Phase 6I-51 amendment-1: emit a
+            # documentation-only candidate with a
+            # <STAGED_DIR> placeholder rather than an
+            # argv that would fail the writer's
+            # ``required=True`` argparse.
+            template = (
+                f"# Phase 6I-31 stable-promotion candidate "
+                f"for {ticker}. Requires --staged-dir which "
+                f"the rollout planner does NOT know. Pass "
+                f"--staged-dir-for-promotion <DIR> to this "
+                f"planner to materialize a runnable argv. "
+                f"Template:\n"
+                f"# {_quote(PINNED_INTERPRETER)} "
+                f"signal_library_stable_promotion_writer.py "
+                f"--tickers {ticker} --staged-dir "
+                f"<STAGED_DIR> --production-stable-dir "
+                f"{_quote(signal_library_dir or '')} "
+                f"--intervals {intervals_csv} --write"
+            )
+            return [{
+                "ticker": ticker,
+                "command_label": (
+                    "signal_library_promotion_template"
+                ),
+                "argv": None,
+                "command": template,
+                "authorization_class": (
+                    AUTH_SIGNAL_LIBRARY_PROMOTION_WRITE
+                ),
+                "requires_separate_operator_authorization": True,
+                "blocked_by_policy_decision": False,
+                "notes": (
+                    "Documentation only -- the writer's "
+                    "--staged-dir argument has no default. "
+                    "Pass --staged-dir-for-promotion <DIR> "
+                    "to the rollout planner to emit a "
+                    "runnable argv."
+                ),
+            }]
+        # Executable argv with --staged-dir supplied.
+        argv: list[str] = [
             PINNED_INTERPRETER,
             "signal_library_stable_promotion_writer.py",
-            "--ticker", ticker,
+            "--tickers", ticker,
+            "--staged-dir", str(staged_dir_for_promotion),
         ]
         if signal_library_dir is not None:
             argv += [
-                "--signal-library-dir",
+                "--production-stable-dir",
                 str(signal_library_dir),
             ]
-        argv += ["--write"]
+        argv += ["--intervals", intervals_csv, "--write"]
         return [{
             "ticker": ticker,
             "command_label": "signal_library_promotion",
@@ -557,7 +670,10 @@ def _candidate_signal_library_rebuild_or_promotion_commands(
                 "Phase 6I-31 guarded stable promotion. "
                 "Still requires --write + PRJCT9_AUTOMATION"
                 "_WRITE_AUTH=phase_6h5_explicit (NOT "
-                "pre-set by this planner)."
+                "pre-set by this planner) + planner-side "
+                "plan_ready=True + writer-side "
+                "revalidation + production-stable path "
+                "guard."
             ),
         }]
     # Default: stable_missing -> staged rebuild
@@ -749,6 +865,8 @@ def build_rollout_batch_plan(
     signal_library_dir: Optional[Any] = None,
     stackbuilder_root: Optional[Any] = None,
     current_as_of_date: Optional[str] = None,
+    staged_dir_for_promotion: Optional[str] = None,
+    intervals_for_promotion: Optional[str] = None,
 ) -> dict[str, Any]:
     """Translate a Phase 6I-50 launch-plan dict into a
     Phase 6I-51 rollout-batch-plan dict.
@@ -883,6 +1001,12 @@ def build_rollout_batch_plan(
                     cache_dir=cache_dir_s,
                     signal_library_dir=(
                         signal_library_dir_s
+                    ),
+                    staged_dir_for_promotion=(
+                        staged_dir_for_promotion
+                    ),
+                    intervals_for_promotion=(
+                        intervals_for_promotion
                     ),
                 )
             )
@@ -1169,6 +1293,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--staged-dir-for-promotion", default=None,
+        help=(
+            "Optional staged signal-library directory "
+            "for the Phase 6I-31 stable-promotion "
+            "writer's --staged-dir argument. When absent, "
+            "promotion candidates emit a documentation-"
+            "only comment template (the writer's "
+            "--staged-dir has no default, so the rollout "
+            "planner cannot otherwise emit a runnable "
+            "argv). When present, promotion candidates "
+            "emit an executable argv."
+        ),
+    )
+    parser.add_argument(
+        "--intervals-for-promotion", default=None,
+        help=(
+            "Optional comma-separated intervals for the "
+            "Phase 6I-31 stable-promotion writer's "
+            "--intervals argument. Default: "
+            "1d,1wk,1mo,3mo,1y (matches the writer's "
+            "own default)."
+        ),
+    )
+    parser.add_argument(
         "--output", default=None,
         help=(
             "Optional JSON output path. The path is "
@@ -1381,6 +1529,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         signal_library_dir=args.signal_library_dir,
         stackbuilder_root=args.stackbuilder_root,
         current_as_of_date=args.current_as_of_date,
+        staged_dir_for_promotion=(
+            args.staged_dir_for_promotion
+        ),
+        intervals_for_promotion=(
+            args.intervals_for_promotion
+        ),
     )
 
     text = json.dumps(rollout, indent=2)

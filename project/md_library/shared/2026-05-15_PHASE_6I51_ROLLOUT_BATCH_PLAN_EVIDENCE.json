@@ -1,6 +1,6 @@
 {
   "schema_version": "confluence_large_universe_rollout_batch_planner_v1",
-  "generated_at": "2026-05-15T08:05:57+00:00",
+  "generated_at": "2026-05-15T08:23:53+00:00",
   "input_universe_summary": {
     "universe_mode": "all_artifacts",
     "target_tickers": [
@@ -63,22 +63,27 @@
       "argv": [
         "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe",
         "confluence_static_board_renderer.py",
-        "--tickers",
+        "--from-tickers",
         "SPY",
         "--artifact-root",
         "output/research_artifacts",
         "--cache-dir",
         "cache/results",
-        "--signal-library-dir",
-        "signal_library/data/stable",
-        "--stackbuilder-root",
-        "output/stackbuilder"
+        "--with-local-overlays",
+        "--overlay-cache-dir",
+        "cache/results",
+        "--overlay-artifact-root",
+        "output/research_artifacts",
+        "--overlay-stackbuilder-root",
+        "output/stackbuilder",
+        "--overlay-signal-library-dir",
+        "signal_library/data/stable"
       ],
-      "command": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe confluence_static_board_renderer.py --tickers SPY --artifact-root output/research_artifacts --cache-dir cache/results --signal-library-dir signal_library/data/stable --stackbuilder-root output/stackbuilder",
+      "command": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe confluence_static_board_renderer.py --from-tickers SPY --artifact-root output/research_artifacts --cache-dir cache/results --with-local-overlays --overlay-cache-dir cache/results --overlay-artifact-root output/research_artifacts --overlay-stackbuilder-root output/stackbuilder --overlay-signal-library-dir signal_library/data/stable",
       "authorization_class": "read_only",
       "requires_separate_operator_authorization": false,
       "blocked_by_policy_decision": false,
-      "notes": "Read-only static-board re-render for the ticker. Documentation only; no flag here writes.",
+      "notes": "Read-only static-board re-render for the ticker. Uses --from-tickers + Phase 6I-42 --with-local-overlays so every supplied root is honestly threaded through.",
       "batch": "board_render_now"
     },
     {
@@ -92,17 +97,13 @@
         "--artifact-root",
         "output/research_artifacts",
         "--cache-dir",
-        "cache/results",
-        "--signal-library-dir",
-        "signal_library/data/stable",
-        "--stackbuilder-root",
-        "output/stackbuilder"
+        "cache/results"
       ],
-      "command": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe confluence_website_export_package.py --tickers SPY --artifact-root output/research_artifacts --cache-dir cache/results --signal-library-dir signal_library/data/stable --stackbuilder-root output/stackbuilder",
+      "command": "C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe confluence_website_export_package.py --tickers SPY --artifact-root output/research_artifacts --cache-dir cache/results",
       "authorization_class": "read_only",
       "requires_separate_operator_authorization": false,
       "blocked_by_policy_decision": false,
-      "notes": "Read-only website export-package rebuild. Outputs land outside production roots.",
+      "notes": "Read-only website export-package rebuild (JSON envelope on stdout). The CLI accepts only --tickers/--all-artifacts/--from-stackbuilder-universe + --top-n + --artifact-root + --cache-dir; other flags are intentionally omitted.",
       "batch": "board_render_now"
     },
     {

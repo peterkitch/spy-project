@@ -1,9 +1,46 @@
 # Phase 6I-51: Large-universe rollout batch planner + board preview command manifest
 
-**Date:** 2026-05-15
+**Date:** 2026-05-15 (amendment-1 same day)
 **Base commit (main):** `c668922` (Phase 6I-50 squash-merge)
 **Branch:** `phase-6i-51-large-universe-rollout-batch-planner`
 **Status:** Read-only planner. No production writes. **Do not merge** until operator approval.
+
+For consistency, this document uses the placeholder `<PINNED_PYTHON>` to refer to the full pinned interpreter path:
+
+```
+<PINNED_PYTHON> = C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe
+```
+
+The generated JSON manifest always carries the full path; the placeholder is documentation-only.
+
+---
+
+## Amendment-1: corrected generated command-manifest CLI shapes
+
+Codex audit of the original Phase 6I-51 commit (`d76d8e9`) flagged four material shape errors in the generated command manifest. Phase 6I-51 is a command-manifest planner, so every generated command must match the real target CLI. Amendment-1 corrects all four at module + test + evidence levels.
+
+| Target script | Original (wrong) | Corrected |
+|---|---|---|
+| `confluence_static_board_renderer.py` | `--tickers SPY` (no such flag); passing `--signal-library-dir` / `--stackbuilder-root` directly (those flags do not exist on the renderer) | `--from-tickers SPY` + `--with-local-overlays` + `--overlay-cache-dir` / `--overlay-artifact-root` / `--overlay-stackbuilder-root` / `--overlay-signal-library-dir` so the roots thread through the Phase 6I-42 overlay path |
+| `confluence_website_export_package.py` | Including `--signal-library-dir` / `--stackbuilder-root` (those flags do not exist on the export CLI) | Only `--tickers` + `--artifact-root` + `--cache-dir` (the four flags actually accepted: `--tickers` / `--all-artifacts` / `--from-stackbuilder-universe` + `--top-n` + `--artifact-root` + `--cache-dir`) |
+| `signal_library_stable_promotion_writer.py` | `--ticker <T>` + `--signal-library-dir <r>` + `--write` (none of those are correct flags) | `--tickers <CSV>` + `--staged-dir <DIR>` + `--production-stable-dir <DIR>` + `--intervals <CSV>` + `--write`. Because `--staged-dir` has no default at the writer's argparse level, the planner now emits a documentation-only template (with `<STAGED_DIR>` placeholder) unless the operator passes the new `--staged-dir-for-promotion <DIR>` flag to the rollout planner |
+| `signal_library_stable_promotion_writer.py` invariant | Could emit an argv that would fail `argparse(required=True)` | Documentation-only template when `--staged-dir-for-promotion` is absent; executable argv only when supplied |
+
+### New CLI inputs (amendment-1)
+
+- `--staged-dir-for-promotion <DIR>`: when supplied, signal-library-promotion candidates emit an executable argv. When absent, they emit a documentation-only template with a `<STAGED_DIR>` placeholder.
+- `--intervals-for-promotion <CSV>`: overrides the writer's `1d,1wk,1mo,3mo,1y` default if needed.
+
+### Files changed in amendment-1
+
+- `project/confluence_large_universe_rollout_batch_planner.py` — `_candidate_board_render_now_commands`, `_candidate_signal_library_rebuild_or_promotion_commands`, public entry signature, CLI argparse, `main()` plumbing.
+- `project/test_scripts/test_confluence_large_universe_rollout_batch_planner.py` — 8 new tests including three that compare generated argv against the **real argparse surfaces** of `confluence_static_board_renderer._build_arg_parser()`, `confluence_website_export_package._build_arg_parser()`, and `signal_library_stable_promotion_writer._build_arg_parser()`.
+- `project/md_library/shared/2026-05-15_PHASE_6I51_ROLLOUT_BATCH_PLAN_EVIDENCE.json` — regenerated.
+- `project/md_library/shared/2026-05-15_PHASE_6I51_LARGE_UNIVERSE_ROLLOUT_BATCH_PLANNER.md` (this doc) — amendment-1 section + Section 5 + synthetic-examples table updates.
+
+### Re-running `--all-artifacts` against production for amendment-1 evidence
+
+Pre/post production-root counts identical: `cache/results=3239`, `cache/status=1634`, `output/research_artifacts=35`, `output/stackbuilder=5229`, `signal_library/data/stable=72899`. (Note: `output/stackbuilder=5229` is +1 from the original Phase 6I-51 capture's 5228 — that file change happened outside this PR's chain and was already present in the pre-run snapshot for amendment-1; the read-only contract for THIS PR is pre = post.) **No production activity** — no `--write`, no `PRJCT9_AUTOMATION_WRITE_AUTH`, no yfinance, no source refresh, no pipeline runner, no batch engine.
 
 ---
 
@@ -119,29 +156,34 @@ unresolved_policy_questions = 6 (carried through from Phase 6I-50)
 
 The evidence JSON lands at `md_library/shared/2026-05-15_PHASE_6I51_ROLLOUT_BATCH_PLAN_EVIDENCE.json` — outside every production root.
 
-## 5. Generated candidate command examples (per non-empty batch in production)
+## 5. Generated candidate command examples (per non-empty batch in production, post amendment-1)
 
 ### batch_1: `board_render_now` — SPY
 
-```
-C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe \
-    confluence_static_board_renderer.py \
-    --tickers SPY --artifact-root output/research_artifacts \
-    --cache-dir cache/results \
-    --signal-library-dir signal_library/data/stable \
-    --stackbuilder-root output/stackbuilder
-```
+Static board renderer (corrected: `--from-tickers` + Phase 6I-42 `--with-local-overlays`):
 
 ```
-C:/Users/sport/AppData/Local/NVIDIA/MiniConda/envs/spyproject2/python.exe \
-    confluence_website_export_package.py \
-    --tickers SPY --artifact-root output/research_artifacts \
+<PINNED_PYTHON> confluence_static_board_renderer.py \
+    --from-tickers SPY \
+    --artifact-root output/research_artifacts \
     --cache-dir cache/results \
-    --signal-library-dir signal_library/data/stable \
-    --stackbuilder-root output/stackbuilder
+    --with-local-overlays \
+    --overlay-cache-dir cache/results \
+    --overlay-artifact-root output/research_artifacts \
+    --overlay-stackbuilder-root output/stackbuilder \
+    --overlay-signal-library-dir signal_library/data/stable
 ```
 
-Both: `authorization_class="read_only"`, `requires_separate_operator_authorization=False`, `blocked_by_policy_decision=False`.
+Website export package (corrected: only the four supported flags):
+
+```
+<PINNED_PYTHON> confluence_website_export_package.py \
+    --tickers SPY \
+    --artifact-root output/research_artifacts \
+    --cache-dir cache/results
+```
+
+Both: `authorization_class="read_only"`, `requires_separate_operator_authorization=False`, `blocked_by_policy_decision=False`. Both argv strings parse cleanly against the real renderer / export-package argparse surfaces (pinned by amendment-1 tests `test_static_board_render_argv_parses_against_real_cli` and `test_website_export_package_argv_parses_against_real_cli`).
 
 ### batch_7: `blocked_or_manual_review` — _GSPC
 
@@ -156,15 +198,17 @@ Comment-only (`argv=None`); `authorization_class="manual_review"`, `requires_sep
 
 ### Synthetic examples (other batches — empty in production today)
 
-The tests cover candidate command shapes for the other five batches in isolation. Reference shapes:
+The tests cover candidate command shapes for the other five batches in isolation. All examples below use the pinned interpreter `<PINNED_PYTHON>` (see top of doc). Reference shapes (post amendment-1):
 
 | Batch | Command shape (representative) |
 |---|---|
-| `partial_artifact_write_candidates` | `python multiwindow_k_confluence_patch_writer.py --ticker <T> --artifact-root <r> ... --write --allow-partial-payload-plan --invalid-members-json @<path>` |
+| `partial_artifact_write_candidates` | `<PINNED_PYTHON> multiwindow_k_confluence_patch_writer.py --ticker <T> --artifact-root <r> --cache-dir <r> --stackbuilder-root <r> --signal-library-dir <r> --write --allow-partial-payload-plan --invalid-members-json @<path>` |
 | `strict_artifact_write_candidates` | Same as above WITHOUT `--allow-partial-payload-plan`. |
-| `source_refresh_candidates` | `python signal_engine_cache_refresher.py --ticker <T> --cache-dir <r> --status-dir <r> --write` (one command per ticker; never CSV). |
-| `signal_library_rebuild_or_promotion_candidates` | If `signal_library_status=staged_possible`: `python signal_library_stable_promotion_writer.py --ticker <T> --signal-library-dir <r> --write`. If `stable_missing`: documentation-only comment referencing the Phase 6I-30 / 6I-32 staged-rebuild runbook (no single-command rebuild). |
-| `stackbuilder_rerun_candidates` | `python stackbuilder.py --secondary <T> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --min-trigger-days 30 --combine-mode intersection`. Default: `blocked_by_policy_decision=true`. With `--accept-proposed-stackbuilder-defaults`: `blocked_by_policy_decision=false` + `policy_basis="proposed_defaults"`. |
+| `source_refresh_candidates` | `<PINNED_PYTHON> signal_engine_cache_refresher.py --ticker <T> --cache-dir <r> --status-dir <r> --write` (one command per ticker; never CSV). |
+| `signal_library_rebuild_or_promotion_candidates` (`staged_possible` + `--staged-dir-for-promotion <DIR>` supplied) | `<PINNED_PYTHON> signal_library_stable_promotion_writer.py --tickers <T> --staged-dir <DIR> --production-stable-dir <r> --intervals 1d,1wk,1mo,3mo,1y --write` |
+| `signal_library_rebuild_or_promotion_candidates` (`staged_possible`, no `--staged-dir-for-promotion`) | Documentation-only template (`argv=None`) with a `<STAGED_DIR>` placeholder. Amendment-1 pins this so the planner never emits an argv that would fail the writer's `argparse(required=True)`. |
+| `signal_library_rebuild_or_promotion_candidates` (`stable_missing`) | Documentation-only comment referencing the Phase 6I-30 / 6I-32 staged-rebuild runbook (no single-command rebuild). |
+| `stackbuilder_rerun_candidates` | `<PINNED_PYTHON> stackbuilder.py --secondary <T> --top-n 20 --bottom-n 20 --max-k 6 --search beam --beam-width 12 --seed-by total_capture --min-trigger-days 30 --combine-mode intersection`. Default: `blocked_by_policy_decision=true`. With `--accept-proposed-stackbuilder-defaults`: `blocked_by_policy_decision=false` + `policy_basis="proposed_defaults"`. |
 
 ## 6. StackBuilder policy handling
 

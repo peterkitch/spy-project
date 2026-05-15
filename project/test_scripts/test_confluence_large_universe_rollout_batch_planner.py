@@ -797,3 +797,309 @@ def test_emit_shell_script_writes_commented_out_lines(
             f"shell-script line not commented out: "
             f"{ln!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-51 amendment-1 tests: corrected CLI shapes against
+# the real argparse surfaces.
+#
+#   * confluence_static_board_renderer.py uses
+#     --from-tickers (NOT --tickers) and does not expose
+#     --signal-library-dir / --stackbuilder-root directly
+#     (overlay-* flags carry those).
+#   * confluence_website_export_package.py accepts
+#     --tickers + --top-n + --artifact-root + --cache-dir
+#     only; --signal-library-dir / --stackbuilder-root do
+#     not exist there.
+#   * signal_library_stable_promotion_writer.py requires
+#     --tickers (CSV) + --staged-dir + --production-stable-
+#     dir + --intervals + --write. Does NOT accept --ticker
+#     or --signal-library-dir.
+# ---------------------------------------------------------------------------
+
+
+def test_static_board_render_uses_from_tickers_not_tickers():
+    """The static-board-render candidate must use
+    --from-tickers (the real CLI flag), NOT --tickers
+    (which the original Phase 6I-51 commit used)."""
+    plan = _launch_plan([
+        _row(ticker="SPY", action="already_board_ranked"),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        artifact_root="output/research_artifacts",
+        cache_dir="cache/results",
+        signal_library_dir="signal_library/data/stable",
+        stackbuilder_root="output/stackbuilder",
+    )
+    cmds = [
+        c for c in rollout["command_manifest"]
+        if c["command_label"] == "static_board_render"
+    ]
+    assert len(cmds) == 1
+    argv = cmds[0]["argv"]
+    assert (
+        "confluence_static_board_renderer.py" in argv
+    )
+    assert "--from-tickers" in argv
+    # Hard regression guard: --tickers must NOT appear.
+    assert "--tickers" not in argv
+    # Overlay flags carry the signal-library / stackbuilder
+    # roots (the renderer does NOT accept them directly).
+    assert "--with-local-overlays" in argv
+    assert "--overlay-signal-library-dir" in argv
+    assert "--overlay-stackbuilder-root" in argv
+    # --signal-library-dir / --stackbuilder-root must NOT
+    # appear as direct flags (the renderer doesn't expose
+    # them).
+    assert "--signal-library-dir" not in argv
+    assert "--stackbuilder-root" not in argv
+
+
+def test_static_board_render_argv_parses_against_real_cli():
+    """Sanity-check that the generated static-board-render
+    argv is accepted by the real renderer's argparse
+    surface. We deferred-import the renderer here (the
+    rollout planner itself never imports it)."""
+    import confluence_static_board_renderer as csbr
+
+    plan = _launch_plan([
+        _row(ticker="SPY", action="already_board_ranked"),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        artifact_root="output/research_artifacts",
+        cache_dir="cache/results",
+        signal_library_dir="signal_library/data/stable",
+        stackbuilder_root="output/stackbuilder",
+    )
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["command_label"] == "static_board_render"
+    )
+    # Drop the leading interpreter + script name; argparse
+    # consumes only the flags that follow.
+    parser = csbr._build_arg_parser()
+    # SystemExit signals argparse rc != 0 (e.g. unknown
+    # flag); a clean parse returns a Namespace.
+    parsed = parser.parse_args(cmd["argv"][2:])
+    assert parsed.from_tickers == "SPY"
+    assert parsed.with_local_overlays is True
+
+
+def test_website_export_package_only_supported_flags():
+    """The website-export-package candidate must NOT
+    include --signal-library-dir or --stackbuilder-root
+    (those flags don't exist on that CLI)."""
+    plan = _launch_plan([
+        _row(ticker="SPY", action="already_board_ranked"),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        artifact_root="output/research_artifacts",
+        cache_dir="cache/results",
+        signal_library_dir="signal_library/data/stable",
+        stackbuilder_root="output/stackbuilder",
+    )
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["command_label"] == "website_export_package"
+    )
+    argv = cmd["argv"]
+    assert "--tickers" in argv
+    assert "--artifact-root" in argv
+    assert "--cache-dir" in argv
+    # Unsupported flags MUST be absent.
+    assert "--signal-library-dir" not in argv
+    assert "--stackbuilder-root" not in argv
+
+
+def test_website_export_package_argv_parses_against_real_cli():
+    """Sanity-check that the website-export-package argv
+    parses against the real CLI."""
+    import confluence_website_export_package as cwep
+
+    plan = _launch_plan([
+        _row(ticker="SPY", action="already_board_ranked"),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        artifact_root="output/research_artifacts",
+        cache_dir="cache/results",
+        signal_library_dir="signal_library/data/stable",
+        stackbuilder_root="output/stackbuilder",
+    )
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["command_label"] == "website_export_package"
+    )
+    parser = cwep._build_arg_parser()
+    parsed = parser.parse_args(cmd["argv"][2:])
+    assert parsed.tickers == "SPY"
+
+
+def test_promotion_template_without_staged_dir_is_doc_only():
+    """A ticker with signal_library_status=staged_possible
+    BUT no --staged-dir-for-promotion supplied should
+    emit a documentation-only template (argv=None) rather
+    than an argv that would fail the writer's
+    required=True argparse."""
+    plan = _launch_plan([
+        _row(
+            ticker="AAA",
+            action="promote_signal_libraries",
+            signal_library_status="staged_possible",
+        ),
+    ])
+    rollout = rbp.build_rollout_batch_plan(plan)
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["batch"] == (
+            rbp.BATCH_SIGNAL_LIBRARY_REBUILD_OR_PROMOTION_CANDIDATES
+        )
+    )
+    assert cmd["argv"] is None
+    assert (
+        cmd["command_label"]
+        == "signal_library_promotion_template"
+    )
+    assert "<STAGED_DIR>" in cmd["command"]
+    # The template references the real writer flags.
+    assert "--tickers AAA" in cmd["command"]
+    assert "--staged-dir" in cmd["command"]
+    assert "--production-stable-dir" in cmd["command"]
+    assert "--intervals" in cmd["command"]
+    # And does NOT reference the wrong --ticker /
+    # --signal-library-dir flags.
+    assert "--ticker " not in cmd["command"]
+    # ``--signal-library-dir`` must not appear in the
+    # template (the writer doesn't expose it; the
+    # equivalent flag is ``--production-stable-dir``).
+    assert "--signal-library-dir " not in cmd["command"]
+
+
+def test_promotion_with_staged_dir_produces_executable_argv():
+    """When --staged-dir-for-promotion is supplied, the
+    candidate emits an executable argv with the correct
+    flags."""
+    plan = _launch_plan([
+        _row(
+            ticker="BBB",
+            action="promote_signal_libraries",
+            signal_library_status="staged_possible",
+        ),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        signal_library_dir=(
+            "signal_library/data/stable"
+        ),
+        staged_dir_for_promotion=(
+            "signal_library/data/staged_2026_05_15"
+        ),
+    )
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["batch"] == (
+            rbp.BATCH_SIGNAL_LIBRARY_REBUILD_OR_PROMOTION_CANDIDATES
+        )
+    )
+    assert cmd["command_label"] == "signal_library_promotion"
+    argv = cmd["argv"]
+    assert argv is not None
+    # --tickers (CSV form), --staged-dir, --production-stable-dir,
+    # --intervals, --write.
+    assert "--tickers" in argv
+    tickers_idx = argv.index("--tickers")
+    assert argv[tickers_idx + 1] == "BBB"
+    assert "--staged-dir" in argv
+    sd_idx = argv.index("--staged-dir")
+    assert (
+        argv[sd_idx + 1]
+        == "signal_library/data/staged_2026_05_15"
+    )
+    assert "--production-stable-dir" in argv
+    psd_idx = argv.index("--production-stable-dir")
+    assert (
+        argv[psd_idx + 1] == "signal_library/data/stable"
+    )
+    assert "--intervals" in argv
+    iv_idx = argv.index("--intervals")
+    assert argv[iv_idx + 1] == "1d,1wk,1mo,3mo,1y"
+    assert "--write" in argv
+    # And NO --ticker / --signal-library-dir.
+    assert "--ticker" not in argv
+    assert "--signal-library-dir" not in argv
+    # Authorization tagging.
+    assert (
+        cmd["authorization_class"]
+        == rbp.AUTH_SIGNAL_LIBRARY_PROMOTION_WRITE
+    )
+    assert (
+        cmd["requires_separate_operator_authorization"]
+        is True
+    )
+
+
+def test_promotion_argv_parses_against_real_cli():
+    """Sanity-check that the executable promotion argv
+    parses against the real writer's argparse surface."""
+    import signal_library_stable_promotion_writer as slspw
+
+    plan = _launch_plan([
+        _row(
+            ticker="CCC",
+            action="promote_signal_libraries",
+            signal_library_status="staged_possible",
+        ),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        signal_library_dir=(
+            "signal_library/data/stable"
+        ),
+        staged_dir_for_promotion=(
+            "signal_library/data/staged_2026_05_15"
+        ),
+    )
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["command_label"] == "signal_library_promotion"
+    )
+    parser = slspw._build_arg_parser()
+    parsed = parser.parse_args(cmd["argv"][2:])
+    assert parsed.tickers == "CCC"
+    assert (
+        parsed.staged_dir
+        == "signal_library/data/staged_2026_05_15"
+    )
+    assert (
+        parsed.production_stable_dir
+        == "signal_library/data/stable"
+    )
+    assert parsed.intervals == "1d,1wk,1mo,3mo,1y"
+    assert parsed.write is True
+
+
+def test_intervals_for_promotion_override():
+    """--intervals-for-promotion should override the
+    1d,1wk,1mo,3mo,1y default."""
+    plan = _launch_plan([
+        _row(
+            ticker="DDD",
+            action="promote_signal_libraries",
+            signal_library_status="staged_possible",
+        ),
+    ])
+    rollout = rbp.build_rollout_batch_plan(
+        plan,
+        staged_dir_for_promotion="staged_dir",
+        intervals_for_promotion="1d,1wk",
+    )
+    cmd = next(
+        c for c in rollout["command_manifest"]
+        if c["command_label"] == "signal_library_promotion"
+    )
+    argv = cmd["argv"]
+    iv_idx = argv.index("--intervals")
+    assert argv[iv_idx + 1] == "1d,1wk"
