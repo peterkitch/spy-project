@@ -1,0 +1,124 @@
+{
+  "schema_version": "confluence_stackbuilder_pilot_batch_execution_evidence_v1",
+  "phase": "phase_6i_53",
+  "phase_label": "first_supervised_stackbuilder_pilot_batch_execution",
+  "generated_at": "2026-05-15T09:17:46+00:00",
+  "base_main_commit": "3bb222e",
+  "authorization_framing": "Phase 6I-52 amendment-1 + amendment-2 documented that stackbuilder.py has NO --write flag and does NOT use PRJCT9_AUTOMATION_WRITE_AUTH. The only authorization gate is the operator's separate decision to actually run the command. Phase 6I-53 WAS authorized by the operator to run the supervised pilot batch IF preflight passed. Preflight did not pass for any ticker (see below); no StackBuilder command was executed.",
+  "preflight_summary": {
+    "price_cache_dir_used": "price_cache\\daily",
+    "price_cache_dir_exists": false,
+    "ticker_count": 25,
+    "pass_count": 0,
+    "skip_count": 25,
+    "tickers_passing_preflight": [],
+    "tickers_skipped_missing_cache": [
+      "AAPL",
+      "ADBE",
+      "AMD",
+      "AMZN",
+      "AVGO",
+      "BRK-B",
+      "CRM",
+      "CSCO",
+      "GOOGL",
+      "HD",
+      "JNJ",
+      "JPM",
+      "KO",
+      "MA",
+      "MCD",
+      "META",
+      "MSFT",
+      "NVDA",
+      "ORCL",
+      "PG",
+      "QCOM",
+      "SPY",
+      "TSLA",
+      "V",
+      "WMT"
+    ],
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I53_PREFLIGHT.json"
+  },
+  "stackbuilder_execution_log": {
+    "tickers_attempted": [],
+    "tickers_succeeded": [],
+    "tickers_failed": [],
+    "commands_executed": 0,
+    "reason_no_commands_executed": "Zero tickers passed preflight. Every ticker in the Phase 6I-52 pilot universe would have triggered the stackbuilder _fetch_secondary_from_yf yfinance fallback because price_cache/daily/ does not exist on disk. Per the Phase 6I-53 operator instructions (\"If zero tickers pass preflight, stop with evidence-only PR. Do not run StackBuilder.\"), no StackBuilder command was invoked."
+  },
+  "production_root_inventory_pre_run": {
+    "cache/results": 3239,
+    "cache/status": 1634,
+    "output/research_artifacts": 35,
+    "output/stackbuilder": 5229,
+    "signal_library/data/stable": 72899,
+    "combined": 83036
+  },
+  "production_root_inventory_post_run": {
+    "cache/results": 3239,
+    "cache/status": 1634,
+    "output/research_artifacts": 35,
+    "output/stackbuilder": 5229,
+    "signal_library/data/stable": 72899,
+    "combined": 83036
+  },
+  "production_root_diff": {
+    "cache/results": 0,
+    "cache/status": 0,
+    "output/research_artifacts": 0,
+    "output/stackbuilder": 0,
+    "signal_library/data/stable": 0,
+    "combined": 0
+  },
+  "phase_6i_50_post_run_reclassification": {
+    "inspected_count": 2,
+    "rows": [
+      {
+        "ticker": "SPY",
+        "recommended_next_action": "already_board_ranked"
+      },
+      {
+        "ticker": "_GSPC",
+        "recommended_next_action": "blocked_missing_inputs"
+      }
+    ],
+    "verdict_unchanged_vs_pre_phase_6i_53": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I53_POST_RUN_6I50_LAUNCH_PLAN.json"
+  },
+  "phase_6i_51_post_run_reclassification": {
+    "batches": {
+      "board_render_now": [
+        "SPY"
+      ],
+      "partial_artifact_write_candidates": [],
+      "strict_artifact_write_candidates": [],
+      "source_refresh_candidates": [],
+      "signal_library_rebuild_or_promotion_candidates": [],
+      "stackbuilder_rerun_candidates": [],
+      "blocked_or_manual_review": [
+        "_GSPC"
+      ]
+    },
+    "verdict_unchanged_vs_pre_phase_6i_53": true,
+    "evidence_file": "md_library/shared/2026-05-15_PHASE_6I53_POST_RUN_6I51_ROLLOUT_PLAN.json"
+  },
+  "no_production_activity_confirmation": {
+    "wrote_via_stackbuilder": false,
+    "wrote_via_confluence_patch_writer": false,
+    "wrote_via_signal_library_promotion_writer": false,
+    "wrote_via_source_cache_refresher": false,
+    "invoked_yfinance": false,
+    "invoked_confluence_pipeline_runner": false,
+    "invoked_onepass_impactsearch_trafficflow_spymaster_batch": false,
+    "set_PRJCT9_AUTOMATION_WRITE_AUTH": false,
+    "used_dash_write_flag": false
+  },
+  "next_step_recommendation": "Rebuild local secondary price cache at price_cache/daily/ before a future Phase 6I-54 supervised batch can run. Without it, every StackBuilder candidate command in the Phase 6I-52 manifest will trigger a live yfinance fetch -- which this phase deliberately prevented. The cache-rebuild path is OUT OF SCOPE for Phase 6I-53; it should be its own explicitly-authorized phase, probably parallel to or downstream of the existing Phase 6E-5 signal_engine_cache_refresher writer.",
+  "remaining_limitations": [
+    "Phase 6I-53 produced no StackBuilder runs because the local secondary-price cache (price_cache/daily/) is missing. This is the safest possible outcome of the preflight gate: it stopped what would have been 25 silent yfinance fetches.",
+    "The preflight module reads ONLY Path.exists()/Path.is_file() on the five candidate paths per ticker; it does NOT load any parquet/csv content. A future enhancement could also probe cache_date_range_end / row-count freshness, but Phase 6I-53 deliberately keeps the preflight surface narrow.",
+    "The Phase 6I-50 + Phase 6I-51 reclassification verdicts are unchanged from the pre-Phase-6I-53 state -- SPY is still board_render_now, _GSPC is still blocked_or_manual_review. This is expected: no production output was written, so the classification surfaces have nothing new to classify."
+  ]
+}
