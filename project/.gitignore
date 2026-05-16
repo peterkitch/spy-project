@@ -81,6 +81,8 @@ misc.xml
 global_ticker_library/data/*.db
 global_ticker_library/data/*.db-*
 global_ticker_library/data/*.txt
+# Narrow exception: operator-curated V8 ticker list is tracked for review.
+!global_ticker_library/data/V8_Ticker.txt
 global_ticker_library/data/*.json
 
 # Windows NUL device file
