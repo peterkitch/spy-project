@@ -84,6 +84,11 @@ global_ticker_library/data/*.txt
 # Narrow exception: operator-curated V8 ticker list is tracked for review.
 !global_ticker_library/data/V8_Ticker.txt
 global_ticker_library/data/*.json
+# Narrow exception: operator-curation artifacts (ban-lists, decision
+# records). Tracked because they are review inputs for future
+# ticker-builder runs, not generated data. The root *.json rule still
+# catches everything else.
+!global_ticker_library/curation/v8_removed_from_master_banlist.json
 
 # Windows NUL device file
 NUL
