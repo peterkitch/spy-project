@@ -13,8 +13,65 @@ import random
 from global_ticker_library.gl_config import (
     DB_PATH, MASTER_FILE, REMOVAL_CONFIRMATIONS, STALE_DAYS,
     CACHE_TTL_HOURS, REMOVALS_LOG_FILE, PROGRESS_FILE,
-    UNKNOWN_RETRY_MINUTES, STALE_RECHECK_DAYS, INVALID_RECHECK_DAYS
+    UNKNOWN_RETRY_MINUTES, STALE_RECHECK_DAYS, INVALID_RECHECK_DAYS,
+    BANLIST_FILE,
 )
+
+
+_BANLIST_SCHEMA_PREFIX = "v8_removed_from_master_banlist"
+
+
+def _load_master_export_banlist(banlist_path: Optional[Path]) -> Set[str]:
+    """Load the master_tickers.txt export ban-list.
+
+    The ban-list captures symbols the operator-curated V8 universe
+    removed from the prior master (``master_tickers - V8_Ticker``) and
+    prevents future ``export_active()`` calls from silently
+    reintroducing them. The ban-list affects ONLY the
+    ``master_tickers.txt`` write; it does NOT mutate registry rows /
+    statuses / SQLite contents.
+
+    Behavior:
+
+      * ``banlist_path`` missing / ``None`` / not a file -> empty set
+        (backwards-compatible: no exclusions).
+      * Valid JSON with ``schema_version`` starting with
+        ``"v8_removed_from_master_banlist"`` and a list-typed
+        ``banned_removed_tickers`` -> uppercase ``set`` of those
+        symbols.
+      * Anything else -> ``ValueError`` (loud failure so operators do
+        not silently re-export banned symbols on a malformed file).
+    """
+    if banlist_path is None:
+        return set()
+    p = Path(banlist_path)
+    if not p.is_file():
+        return set()
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"ban-list at {p!s} is not a JSON object"
+        )
+    schema = raw.get("schema_version", "")
+    if not (
+        isinstance(schema, str)
+        and schema.startswith(_BANLIST_SCHEMA_PREFIX)
+    ):
+        raise ValueError(
+            f"unrecognized ban-list schema_version at {p!s}: "
+            f"{schema!r}"
+        )
+    banned_list = raw.get("banned_removed_tickers")
+    if not isinstance(banned_list, list):
+        raise ValueError(
+            f"ban-list at {p!s} missing list-typed "
+            "banned_removed_tickers"
+        )
+    return {
+        str(s).strip().upper()
+        for s in banned_list
+        if str(s).strip()
+    }
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tickers (
@@ -450,15 +507,35 @@ def cleanup_stale(db_path: Path = DB_PATH, dry_run: bool = False) -> Tuple[int, 
 
     return affected, invalidated
 
-def export_active(master_path: Path = MASTER_FILE, db_path: Path = DB_PATH) -> int:
-    """Export active symbols to master_tickers.txt"""
+def export_active(
+    master_path: Path = MASTER_FILE,
+    db_path: Path = DB_PATH,
+    banlist_path: Optional[Path] = BANLIST_FILE,
+) -> int:
+    """Export active symbols to master_tickers.txt.
+
+    V8 ban-list guardrail (2026-05-15): when ``banlist_path`` exists,
+    any symbol it lists is filtered out of the
+    ``master_tickers.txt`` write. The guardrail affects ONLY the
+    exported file -- it does NOT mutate registry status (symbols stay
+    ``active`` in the DB). Missing ban-list = no exclusions
+    (backwards-compatible). Malformed ban-list = ``ValueError`` (loud
+    failure, see ``_load_master_export_banlist``). The ban-list
+    prevents operator-removed tickers (``master - V8``) from being
+    silently reintroduced into the operational master list by future
+    scraper / batch / dashboard runs.
+    """
     with sqlite3.connect(db_path) as con, closing(con.cursor()) as cur:
         cur.execute(
             "SELECT symbol FROM tickers WHERE status='active' "
             "ORDER BY symbol COLLATE NOCASE"
         )
         symbols = [r[0] for r in cur.fetchall()]
-    
+
+    banned = _load_master_export_banlist(banlist_path)
+    if banned:
+        symbols = [s for s in symbols if s.upper() not in banned]
+
     master_path.write_text(",".join(symbols), encoding="utf-8")
     return len(symbols)
 

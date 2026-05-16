@@ -14,6 +14,18 @@ DB_PATH = DATA_DIR / "registry.db"
 MASTER_FILE = DATA_DIR / "master_tickers.txt"
 REMOVALS_LOG_FILE = DATA_DIR / "removals_log.txt"
 
+# V8 ban-list guardrail (2026-05-15 V8 operational master handoff).
+# When this tracked file is present, `registry.export_active()` filters
+# any symbol it lists out of the master_tickers.txt write. This
+# prevents tickers the operator-curated V8 universe intentionally
+# removed (master - V8) from being silently reintroduced by future
+# scraper / batch / dashboard runs. Missing file = no exclusions
+# (backwards-compatible). Path is relative to the package so the
+# tracked artifact at `global_ticker_library/curation/v8_removed_
+# from_master_banlist.json` is discoverable without configuration.
+CURATION_DIR = BASE_DIR / "curation"
+BANLIST_FILE = CURATION_DIR / "v8_removed_from_master_banlist.json"
+
 # Optional user input file (created by user when needed)
 MANUAL_FILE = DATA_DIR / "manual_input.txt"
 
