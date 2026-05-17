@@ -87,10 +87,19 @@ def _load_signal_library_quick(ticker: str):
         if not os.path.exists(p):
             continue
         try:
+            # Phase 6I-57 fix: engine_version lives at the manifest top
+            # level (alongside content_hash / build_timestamp), NOT inside
+            # `manifest.params`. The earlier `requested_params` block listed
+            # engine_version, which made the verifier look for it at
+            # `manifest.params.engine_version` and report a spurious
+            # mismatch on every fresh OnePass library. Top-level
+            # engine_version is still checked in `_is_compatible` below
+            # against `lib["engine_version"]`, so the integrity guard is
+            # preserved. MAX_SMA_DAY and price_source DO live inside
+            # `manifest.params` per the OnePass writer, so those stay.
             data, _vresult = _load_verified_signal_library(
                 p,
                 requested_params={
-                    'engine_version': ENGINE_VERSION,
                     'MAX_SMA_DAY': MAX_SMA_DAY,
                     'price_source': 'Close',
                 },

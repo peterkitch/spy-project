@@ -173,6 +173,7 @@ def test_schema_and_constants_are_stable():
         runner.PRIMARY_SOURCE_EXPLICIT_CSV,
         runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE,
         runner.PRIMARY_SOURCE_SIGNAL_LIBRARY_DIR,
+        runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE,
     ):
         assert s in runner.ALL_PRIMARY_SOURCES
     for s in (
@@ -202,8 +203,11 @@ def test_schema_and_constants_are_stable():
         runner.AUTH_CLASS_MANUAL_REVIEW,
     ):
         assert s in runner.ALL_AUTH_CLASSES
-    # 14 stable issue codes.
-    assert len(runner.ALL_ISSUE_CODES) == 14
+    # 17 stable issue codes (Phase 6I-57 added 3:
+    # primary_tickers_file_missing,
+    # primary_tickers_file_unreadable,
+    # primary_tickers_file_contains_unsafe_ticker).
+    assert len(runner.ALL_ISSUE_CODES) == 17
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +385,336 @@ def test_resolve_primary_universe_unknown_source():
         runner.resolve_primary_universe(
             primary_source="not_a_real_source",
         )
+
+
+# ---------------------------------------------------------------------------
+# 4b. master_tickers_file primary source (Phase 6I-57)
+# ---------------------------------------------------------------------------
+
+
+def test_master_tickers_file_in_all_primary_sources():
+    assert (
+        runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        in runner.ALL_PRIMARY_SOURCES
+    )
+    assert (
+        runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        == "master_tickers_file"
+    )
+
+
+def test_master_tickers_file_default_path_is_documented():
+    assert runner.DEFAULT_MASTER_TICKERS_FILE_RELATIVE == (
+        "global_ticker_library/data/master_tickers.txt"
+    )
+
+
+def test_master_tickers_file_issue_codes_in_all_issue_codes():
+    for code in (
+        runner.ISSUE_PRIMARY_TICKERS_FILE_MISSING,
+        runner.ISSUE_PRIMARY_TICKERS_FILE_UNREADABLE,
+        (
+            runner
+            .ISSUE_PRIMARY_TICKERS_FILE_CONTAINS_UNSAFE_TICKER
+        ),
+    ):
+        assert code in runner.ALL_ISSUE_CODES
+
+
+def test_master_tickers_file_resolves_comma_separated_input():
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="fake/path.txt",
+        master_tickers_file_loader=(
+            lambda p: "SPY,AAPL,WMT,HD,MCD"
+        ),
+    )
+    assert res["primary_source"] == (
+        runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+    )
+    assert res["universe"] == ["SPY", "AAPL", "WMT", "HD", "MCD"]
+    assert res["issue_codes"] == []
+    assert res["parsed_count"] == 5
+    assert res["accepted_count"] == 5
+    assert res["dropped_count"] == 0
+    assert res["primary_tickers_file"] == "fake/path.txt"
+
+
+def test_master_tickers_file_resolves_newline_and_comma_mixed():
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="fake/path.txt",
+        master_tickers_file_loader=(
+            lambda p: (
+                "SPY,AAPL\nMSFT, GOOGL ,AMZN\n\nNVDA\n"
+            )
+        ),
+    )
+    assert res["universe"] == [
+        "SPY", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+    ]
+    assert res["parsed_count"] == 6
+    assert res["accepted_count"] == 6
+    assert res["dropped_count"] == 0
+
+
+def test_master_tickers_file_preserves_NA_and_NAN_literal_tickers():
+    """The master ticker list contains literal members
+    "NA" and "NAN". The runner's raw-string parse must
+    NOT coerce them to NaN. This is the regression guard
+    for the Phase 6I-57 first-attempt finding."""
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="fake/path.txt",
+        master_tickers_file_loader=(
+            lambda p: "SPY,NA,AAPL,NAN,WMT"
+        ),
+    )
+    assert "NA" in res["universe"]
+    assert "NAN" in res["universe"]
+    assert res["universe"] == [
+        "SPY", "NA", "AAPL", "NAN", "WMT",
+    ]
+    assert res["issue_codes"] == []
+    assert res["parsed_count"] == 5
+    assert res["accepted_count"] == 5
+    assert res["dropped_count"] == 0
+
+
+def test_master_tickers_file_filters_unsafe_tickers():
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="fake/path.txt",
+        master_tickers_file_loader=(
+            lambda p: (
+                "SPY,../etc/passwd,AAPL,..\\windows,JNJ"
+            )
+        ),
+    )
+    assert res["universe"] == ["SPY", "AAPL", "JNJ"]
+    assert (
+        runner
+        .ISSUE_PRIMARY_TICKERS_FILE_CONTAINS_UNSAFE_TICKER
+        in res["issue_codes"]
+    )
+    assert res["parsed_count"] == 5
+    assert res["accepted_count"] == 3
+    assert res["dropped_count"] == 2
+
+
+def test_master_tickers_file_dedupes_preserving_first_occurrence():
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="fake/path.txt",
+        master_tickers_file_loader=(
+            lambda p: "SPY,aapl,SPY,AAPL,Spy"
+        ),
+    )
+    assert res["universe"] == ["SPY", "AAPL"]
+    assert res["parsed_count"] == 5
+    assert res["accepted_count"] == 2
+    # dedupe via _dedupe_normalize_tickers does NOT count
+    # duplicates as dropped_unsafe.
+    assert res["dropped_count"] == 0
+
+
+def test_master_tickers_file_missing_path_classifies_correctly(
+    tmp_path,
+):
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file=str(
+            tmp_path / "does_not_exist.txt"
+        ),
+    )
+    assert res["universe"] == []
+    assert (
+        runner.ISSUE_PRIMARY_TICKERS_FILE_MISSING
+        in res["issue_codes"]
+    )
+    assert (
+        runner.ISSUE_PRIMARY_UNIVERSE_EMPTY
+        in res["issue_codes"]
+    )
+    assert res["parsed_count"] == 0
+
+
+def test_master_tickers_file_unreadable_classifies_correctly():
+    def _raise_oserror(p):
+        raise OSError("disk gremlin")
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="fake/path.txt",
+        master_tickers_file_loader=_raise_oserror,
+    )
+    assert res["universe"] == []
+    assert (
+        runner.ISSUE_PRIMARY_TICKERS_FILE_UNREADABLE
+        in res["issue_codes"]
+    )
+    assert (
+        runner.ISSUE_PRIMARY_UNIVERSE_EMPTY
+        in res["issue_codes"]
+    )
+
+
+def test_master_tickers_file_default_path_used_when_none_supplied(
+    tmp_path,
+):
+    captured: list[str] = []
+
+    def _loader(p: str) -> str:
+        captured.append(p)
+        return "SPY,AAPL"
+
+    res = runner.resolve_primary_universe(
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        master_tickers_file_loader=_loader,
+    )
+    assert captured == [
+        runner.DEFAULT_MASTER_TICKERS_FILE_RELATIVE,
+    ]
+    assert res["primary_tickers_file"] == (
+        runner.DEFAULT_MASTER_TICKERS_FILE_RELATIVE
+    )
+    assert res["universe"] == ["SPY", "AAPL"]
+
+
+def test_cli_argv_parses_primary_tickers_file_flag():
+    args = runner._parse_argv([
+        "--secondaries", "SPY",
+        "--primary-source", "master_tickers_file",
+        "--primary-tickers-file",
+        "global_ticker_library/data/master_tickers.txt",
+        "--use-multiprocessing",
+    ])
+    assert args.secondaries == "SPY"
+    assert args.primary_source == "master_tickers_file"
+    assert args.primary_tickers_file == (
+        "global_ticker_library/data/master_tickers.txt"
+    )
+    assert args.use_multiprocessing is True
+    assert args.write is False
+    assert args.allow_network_fetch is False
+
+
+def test_cli_argv_primary_tickers_file_defaults_to_none():
+    args = runner._parse_argv([
+        "--secondaries", "SPY",
+    ])
+    assert args.primary_tickers_file is None
+
+
+def test_plan_carries_primary_tickers_file_in_policy(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file="some/custom/file.txt",
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        master_tickers_file_loader=(
+            lambda p: "SPY,AAPL,JNJ"
+        ),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+    )
+    assert plan["policy"]["primary_source"] == (
+        runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+    )
+    assert plan["policy"]["primary_tickers_file"] == (
+        "some/custom/file.txt"
+    )
+    pres = plan["primary_universe_resolution"]
+    assert pres["primary_tickers_file"] == (
+        "some/custom/file.txt"
+    )
+    assert pres["parsed_count"] == 3
+    assert pres["accepted_count"] == 3
+    assert pres["universe"] == ["SPY", "AAPL", "JNJ"]
+
+
+def test_command_manifest_includes_primary_tickers_file_flag(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        ),
+        primary_tickers_file=(
+            "global_ticker_library/data/master_tickers.txt"
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        master_tickers_file_loader=(
+            lambda p: "SPY,AAPL,NA,NAN,WMT"
+        ),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+    )
+    manifest = runner.build_command_manifest(plan)
+    assert len(manifest["entries"]) == 1
+    entry = manifest["entries"][0]
+    assert entry["argv"] is not None
+    argv = entry["argv"]
+    assert "--primary-source" in argv
+    ps_idx = argv.index("--primary-source")
+    assert argv[ps_idx + 1] == "master_tickers_file"
+    assert "--primary-tickers-file" in argv
+    ptf_idx = argv.index("--primary-tickers-file")
+    assert argv[ptf_idx + 1] == (
+        "global_ticker_library/data/master_tickers.txt"
+    )
+
+
+def test_command_manifest_omits_primary_tickers_file_flag_for_pilot_source(
+    tmp_path,
+):
+    """When the primary source is the 25-pilot universe
+    the manifest should NOT include --primary-tickers-file
+    (the flag is master_tickers_file-only)."""
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+    )
+    manifest = runner.build_command_manifest(plan)
+    entry = manifest["entries"][0]
+    assert "--primary-tickers-file" not in (
+        entry["argv"] or []
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1168,6 +1502,580 @@ def test_execute_workbook_run_fake_callable_failure_cleans_up_partials(
         if "runner_partial" in p.name
     ]
     assert runner_partial_left == []
+
+
+# ---------------------------------------------------------------------------
+# 10b. Per-secondary timing instrumentation (Phase 6I-57 baseline)
+# ---------------------------------------------------------------------------
+
+
+def _make_minimal_ok_callable(*, sleep_seconds: float = 0.0):
+    """Returns an impactsearch_callable_override that
+    writes a small workbook + sidecar through the
+    ``export_atomic`` seam, optionally sleeping to make
+    elapsed_seconds non-trivial."""
+    def _callable(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"XLSX-BYTES")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "ok",
+            },
+            per_strategy_validation={},
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": str(
+                atomic["canonical_sidecar"]
+            ),
+            "validation_status": "ok",
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+    return _callable
+
+
+import time as _time  # noqa: E402  (test-only import)
+
+
+def test_execute_workbook_run_records_per_secondary_timing(
+    tmp_path,
+):
+    plan, _ixd = _authorized_plan(tmp_path)
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=(
+            _make_minimal_ok_callable(sleep_seconds=0.05)
+        ),
+    )
+    assert res["status"] == "ok"
+    # Top-level run timing fields present.
+    for k in (
+        "run_started_at_utc",
+        "run_ended_at_utc",
+        "run_elapsed_seconds",
+        "run_elapsed_minutes",
+    ):
+        assert k in res, f"missing top-level field: {k}"
+    assert isinstance(res["run_elapsed_seconds"], float)
+    assert res["run_elapsed_seconds"] >= 0.0
+    # Per-secondary timing fields present.
+    pt = res["per_ticker_results"][0]
+    for k in (
+        "secondary",
+        "start_timestamp",
+        "end_timestamp",
+        "elapsed_seconds",
+        "elapsed_minutes",
+        "status",
+        "metrics_count",
+        "canonical_path",
+        "canonical_sidecar",
+        "workbook_size_bytes",
+        "manifest_size_bytes",
+        "validation_status",
+    ):
+        assert k in pt, (
+            f"missing per-secondary field: {k}"
+        )
+    assert pt["status"] == "ok"
+    assert pt["secondary"] == "SPY"
+    assert pt["elapsed_seconds"] >= 0.0
+    assert pt["elapsed_minutes"] == pytest.approx(
+        pt["elapsed_seconds"] / 60.0, abs=0.001,
+    )
+    # workbook + manifest sizes captured from disk.
+    assert pt["workbook_size_bytes"] == len(b"XLSX-BYTES")
+    assert pt["manifest_size_bytes"] is not None
+    assert pt["manifest_size_bytes"] >= 0
+
+
+def test_execute_workbook_run_passthrough_fast_path_and_yfinance_count(
+    tmp_path,
+):
+    plan, _ixd = _authorized_plan(tmp_path)
+
+    def _callable_with_extras(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"X")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "ok",
+            },
+            per_strategy_validation={},
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": str(
+                atomic["canonical_sidecar"]
+            ),
+            "validation_status": "ok",
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+            "fast_path_summary": {
+                "found": 42, "missing": 0,
+            },
+            "yfinance_call_count": 7,
+        }
+
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=(
+            _callable_with_extras
+        ),
+    )
+    pt = res["per_ticker_results"][0]
+    assert pt["fast_path_summary"] == {
+        "found": 42, "missing": 0,
+    }
+    assert pt["yfinance_call_count"] == 7
+
+
+def test_execute_workbook_run_failure_path_still_records_timing(
+    tmp_path,
+):
+    plan, _ixd = _authorized_plan(tmp_path)
+
+    def _raising_callable(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        raise RuntimeError("synthetic failure")
+
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=_raising_callable,
+    )
+    assert res["status"] in {"no_op", "partial"}
+    pt = res["per_ticker_results"][0]
+    assert pt["status"] == "failed"
+    assert "synthetic failure" in pt["reason"]
+    for k in (
+        "start_timestamp",
+        "end_timestamp",
+        "elapsed_seconds",
+        "elapsed_minutes",
+        "workbook_size_bytes",
+        "manifest_size_bytes",
+        "fast_path_summary",
+        "yfinance_call_count",
+    ):
+        assert k in pt, (
+            f"failure path missing timing field: {k}"
+        )
+    assert pt["workbook_size_bytes"] is None
+    assert pt["manifest_size_bytes"] is None
+    assert pt["elapsed_seconds"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# 10c. Phase 6I-57 quarantine helper + manifest verification tests
+# ---------------------------------------------------------------------------
+
+
+def test_quarantine_helper_moves_existing_outputs(tmp_path):
+    ixd = tmp_path / "ixd"
+    ixd.mkdir()
+    # Create existing artifacts that should be quarantined.
+    (ixd / "SPY_analysis.xlsx").write_bytes(b"OLD-XLSX")
+    (ixd / "SPY_analysis.xlsx.manifest.json").write_bytes(
+        b"{\"old\": true}",
+    )
+    (ixd / "SPY_analysis.runner_partial.xlsx").write_bytes(
+        b"PARTIAL",
+    )
+    # Unrelated ticker workbook must remain untouched.
+    (ixd / "AAPL_analysis.xlsx").write_bytes(b"AAPL-OLD")
+    rep = runner.quarantine_existing_outputs_for_secondary(
+        "SPY", output_dir=str(ixd),
+        now_iso="20260517T120000Z",
+    )
+    assert rep["reason"] == "moved"
+    assert rep["quarantine_dir"] == str(
+        ixd / "_quarantine_20260517T120000Z",
+    )
+    moved_basenames = {
+        os.path.basename(m["src"])
+        for m in rep["moved_files"]
+    }
+    assert moved_basenames == {
+        "SPY_analysis.xlsx",
+        "SPY_analysis.xlsx.manifest.json",
+        "SPY_analysis.runner_partial.xlsx",
+    }
+    # Canonical SPY paths are gone from ixd.
+    for name in moved_basenames:
+        assert not (ixd / name).exists()
+    # AAPL is untouched.
+    assert (ixd / "AAPL_analysis.xlsx").exists()
+    # All moved files exist in quarantine dir.
+    q_dir = Path(rep["quarantine_dir"])
+    for name in moved_basenames:
+        assert (q_dir / name).exists()
+
+
+def test_quarantine_helper_noop_when_no_existing_outputs(tmp_path):
+    ixd = tmp_path / "ixd"
+    ixd.mkdir()
+    rep = runner.quarantine_existing_outputs_for_secondary(
+        "SPY", output_dir=str(ixd),
+    )
+    assert rep["reason"] == "no_matching_files_present"
+    assert rep["moved_files"] == []
+    assert rep["quarantine_dir"] is None
+
+
+def test_quarantine_helper_rejects_unsafe_secondary(tmp_path):
+    ixd = tmp_path / "ixd"
+    ixd.mkdir()
+    rep = runner.quarantine_existing_outputs_for_secondary(
+        "../etc", output_dir=str(ixd),
+    )
+    assert rep["reason"] == "unsafe_or_empty_secondary"
+    assert rep["moved_files"] == []
+
+
+def test_execute_workbook_run_quarantines_existing_outputs(
+    tmp_path,
+):
+    plan, ixd = _authorized_plan(tmp_path)
+    # Plant pre-existing SPY artifacts BEFORE the run.
+    # _authorized_plan returns ixd without creating it
+    # (dry-run discipline); the runner creates it before
+    # the write. We create it here so we can plant the
+    # pre-existing artifacts.
+    ixd.mkdir(parents=True, exist_ok=True)
+    pre_xlsx = ixd / "SPY_analysis.xlsx"
+    pre_sidecar = (
+        ixd / "SPY_analysis.xlsx.manifest.json"
+    )
+    pre_xlsx.write_bytes(b"OLD-XLSX")
+    pre_sidecar.write_bytes(b"{\"old\": true}")
+
+    def _callable(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"NEW-XLSX")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{\"new\": true}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "ok",
+            },
+            per_strategy_validation={},
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": str(
+                atomic["canonical_sidecar"]
+            ),
+            "validation_status": "ok",
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=_callable,
+    )
+    pt = res["per_ticker_results"][0]
+    qr = pt["quarantine_report"]
+    assert qr["reason"] == "moved"
+    moved_basenames = {
+        os.path.basename(m["src"])
+        for m in qr["moved_files"]
+    }
+    assert "SPY_analysis.xlsx" in moved_basenames
+    assert (
+        "SPY_analysis.xlsx.manifest.json"
+        in moved_basenames
+    )
+    # New workbook is the fresh content, not the old.
+    assert pre_xlsx.read_bytes() == b"NEW-XLSX"
+
+
+def test_runner_passes_through_zero_primary_yfinance_when_records_empty(
+    tmp_path,
+):
+    plan, _ixd = _authorized_plan(tmp_path)
+
+    def _callable(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"X")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "ok",
+            },
+            per_strategy_validation={},
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": str(
+                atomic["canonical_sidecar"]
+            ),
+            "validation_status": "ok",
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=_callable,
+    )
+    pt = res["per_ticker_results"][0]
+    assert pt["primary_yfinance_fetch_count"] == 0
+    assert pt["secondary_yfinance_fetch_count"] == 0
+    assert pt["primary_yfinance_fetches"] == []
+
+
+def test_runner_records_primary_and_secondary_fetches_via_impactsearch_seam(
+    tmp_path, monkeypatch,
+):
+    """Inject a fake impactsearch module that returns one
+    primary + one secondary record; runner must partition
+    them correctly into the per-ticker result fields."""
+    plan, _ixd = _authorized_plan(tmp_path)
+
+    import types as _types
+    fake_records = []
+
+    def _reset():
+        fake_records.clear()
+
+    def _get():
+        return list(fake_records)
+
+    fake_mod = _types.ModuleType("impactsearch")
+    fake_mod.reset_yf_records = _reset
+    fake_mod.get_yf_records = _get
+    monkeypatch.setitem(sys.modules, "impactsearch", fake_mod)
+
+    def _callable(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        # Simulate impactsearch recording 1 secondary + 2 primary fetches.
+        fake_records.append({
+            "role": "secondary", "ticker": "SPY",
+            "stage": "process_primary_tickers",
+            "timestamp": "t0", "worker": "Main",
+        })
+        fake_records.append({
+            "role": "primary", "ticker": "AAPL",
+            "stage": "process_single_ticker",
+            "timestamp": "t1", "worker": "W1",
+        })
+        fake_records.append({
+            "role": "primary", "ticker": "MSFT",
+            "stage": "process_single_ticker",
+            "timestamp": "t2", "worker": "W2",
+        })
+
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"X")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "ok",
+            },
+            per_strategy_validation={},
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": str(
+                atomic["canonical_sidecar"]
+            ),
+            "validation_status": "ok",
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=_callable,
+    )
+    pt = res["per_ticker_results"][0]
+    assert pt["primary_yfinance_fetch_count"] == 2
+    assert pt["secondary_yfinance_fetch_count"] == 1
+    fetched_primary_tickers = {
+        r["ticker"] for r in pt["primary_yfinance_fetches"]
+    }
+    assert fetched_primary_tickers == {"AAPL", "MSFT"}
+
+
+def test_runner_zero_yf_gate_marks_failure_when_primary_fetch_observed(
+    tmp_path, monkeypatch,
+):
+    plan, _ixd = _authorized_plan(tmp_path)
+    monkeypatch.setenv("IMPACT_REQUIRE_ZERO_PRIMARY_YF", "1")
+
+    import types as _types
+    fake_records = [
+        {
+            "role": "primary", "ticker": "AAPL",
+            "stage": "process_single_ticker",
+            "timestamp": "t1", "worker": "W1",
+        },
+    ]
+    fake_mod = _types.ModuleType("impactsearch")
+    fake_mod.reset_yf_records = lambda: None
+    fake_mod.get_yf_records = lambda: list(fake_records)
+    monkeypatch.setitem(sys.modules, "impactsearch", fake_mod)
+
+    def _callable(
+        *,
+        secondary,
+        primary_tickers,
+        output_path,
+        use_multiprocessing,
+        export_atomic,
+    ):
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"X")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "ok",
+            },
+            per_strategy_validation={},
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": str(
+                atomic["canonical_sidecar"]
+            ),
+            "validation_status": "ok",
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan,
+        impactsearch_callable_override=_callable,
+    )
+    pt = res["per_ticker_results"][0]
+    assert pt["status"] == "failed"
+    assert "IMPACT_REQUIRE_ZERO_PRIMARY_YF" in pt["reason"]
+    assert "AAPL" in pt["reason"]
+    assert pt["primary_yfinance_fetch_count"] == 1
 
 
 # ---------------------------------------------------------------------------

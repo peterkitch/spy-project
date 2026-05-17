@@ -615,18 +615,125 @@ if FASTPATH_AVAILABLE and _fp_mod is not None:
 # Lightweight in-memory fast-path usage stats (for run summary)
 FASTPATH_STATS = {'total_primaries': 0, 'fastpath_used': 0, 'fallback_used': 0, 'fallback_reasons': {}}
 
+# ----------------------------------------------------------------------------
+# Phase 6I-57: thread-safe yfinance role attribution + zero-primary-fetch gate.
+#
+# `_YF_ROLE_LOCAL` is a threading.local that callers set BEFORE a yf.download
+# call so the wrapper can record role=primary vs role=secondary per call.
+# `_YF_CALL_RECORDS` is the lock-protected aggregate; the runner reads it
+# back via `get_yf_records()` to produce per-secondary attribution.
+# When `IMPACT_REQUIRE_ZERO_PRIMARY_YF=1` is set, any primary-role fetch
+# raises RuntimeError so the failure surfaces immediately rather than after
+# silently writing a contaminated workbook.
+# ----------------------------------------------------------------------------
+import threading as _threading
+
+_YF_ROLE_LOCAL = _threading.local()
+_YF_CALL_RECORDS: list[dict] = []
+_YF_LOCK = _threading.Lock()
+_YF_REQUIRE_ZERO_PRIMARY = os.environ.get(
+    "IMPACT_REQUIRE_ZERO_PRIMARY_YF", "0",
+).lower() in ("1", "true", "on", "yes")
+
+
+class _YfRoleContext:
+    """Set role/ticker/stage on the calling thread for the duration of the
+    `with` block. Nested contexts restore the prior values on exit."""
+
+    __slots__ = (
+        "role", "ticker", "stage",
+        "_prev_role", "_prev_ticker", "_prev_stage",
+    )
+
+    def __init__(self, role, ticker=None, stage=None):
+        self.role = role
+        self.ticker = ticker
+        self.stage = stage
+        self._prev_role = None
+        self._prev_ticker = None
+        self._prev_stage = None
+
+    def __enter__(self):
+        self._prev_role = getattr(_YF_ROLE_LOCAL, "role", None)
+        self._prev_ticker = getattr(_YF_ROLE_LOCAL, "ticker", None)
+        self._prev_stage = getattr(_YF_ROLE_LOCAL, "stage", None)
+        _YF_ROLE_LOCAL.role = self.role
+        _YF_ROLE_LOCAL.ticker = self.ticker
+        _YF_ROLE_LOCAL.stage = self.stage
+        return self
+
+    def __exit__(self, *_exc):
+        _YF_ROLE_LOCAL.role = self._prev_role
+        _YF_ROLE_LOCAL.ticker = self._prev_ticker
+        _YF_ROLE_LOCAL.stage = self._prev_stage
+
+
+def reset_yf_records():
+    """Drop all accumulated yfinance call records. Runner calls this
+    once per secondary, just before invoking process_primary_tickers,
+    so the per-secondary count is accurate even across reuse."""
+    with _YF_LOCK:
+        _YF_CALL_RECORDS.clear()
+
+
+def get_yf_records():
+    """Return a snapshot copy of all yfinance call records since the
+    last `reset_yf_records()`."""
+    with _YF_LOCK:
+        return list(_YF_CALL_RECORDS)
+
+
+def _record_yf_call(ticker_arg):
+    role = getattr(_YF_ROLE_LOCAL, "role", None) or "unknown"
+    role_ticker = getattr(_YF_ROLE_LOCAL, "ticker", None)
+    stage = getattr(_YF_ROLE_LOCAL, "stage", None)
+    rec = {
+        "role": role,
+        "ticker": (
+            str(role_ticker)
+            if role_ticker is not None
+            else (str(ticker_arg) if ticker_arg is not None else None)
+        ),
+        "stage": stage,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "worker": _threading.current_thread().name,
+    }
+    with _YF_LOCK:
+        _YF_CALL_RECORDS.append(rec)
+    if role == "primary" and _YF_REQUIRE_ZERO_PRIMARY:
+        raise RuntimeError(
+            "IMPACT_REQUIRE_ZERO_PRIMARY_YF=1: primary yfinance "
+            f"fetch attempted for {rec['ticker']!r} "
+            f"(stage={stage!r}); aborting per zero-primary-yf gate"
+        )
+
 # --- Optional instrumentation to count yfinance calls (verify speedup)
 YF_CALLS = 0
-if os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower() in ("1", "true", "on", "yes"):
+_yf_wrap_enabled = (
+    os.environ.get("IMPACT_INSTRUMENT_YF_CALLS", "0").lower()
+    in ("1", "true", "on", "yes")
+    or _YF_REQUIRE_ZERO_PRIMARY
+)
+if _yf_wrap_enabled:
     import yfinance as _yf
     _ORIG_YF_DOWNLOAD = _yf.download
     def _wrapped_download(*args, **kwargs):
         global YF_CALLS
         YF_CALLS += 1
+        # Phase 6I-57 thread-safe role attribution: read the calling
+        # thread's role context (set by `with _YfRoleContext(...)` at
+        # primary / secondary fetch sites) and record it, plus enforce
+        # the zero-primary-yf gate when armed.
+        _record_yf_call(args[0] if args else kwargs.get("tickers"))
         return _ORIG_YF_DOWNLOAD(*args, **kwargs)
     _yf.download = _wrapped_download
     yf.download = _wrapped_download  # Also wrap the imported reference
     print("[INSTRUMENTATION] Yahoo Finance call counting enabled")
+    if _YF_REQUIRE_ZERO_PRIMARY:
+        print(
+            "[INSTRUMENTATION] IMPACT_REQUIRE_ZERO_PRIMARY_YF=1: "
+            "any primary-role yfinance fetch will raise RuntimeError"
+        )
 
 # Boot-time visibility for user - comprehensive fastpath configuration
 print(f"[BOOT] Fast-path available={FASTPATH_AVAILABLE}  "
@@ -1545,10 +1652,18 @@ def load_signal_library(ticker, *, rejection_out=None):
 
             if os.path.exists(filepath):
                 # Phase 3B-1: route through the central verified loader.
+                # Phase 6I-57 fix: engine_version lives at the manifest
+                # top level (alongside content_hash / build_timestamp),
+                # NOT inside `manifest.params`. Listing it in
+                # `requested_params` made the verifier look for
+                # `manifest.params.engine_version` and report a spurious
+                # mismatch on every fresh OnePass library. Top-level
+                # engine_version is still checked downstream via
+                # `signal_data["engine_version"]`. MAX_SMA_DAY and
+                # price_source DO live inside `manifest.params`.
                 signal_data, _vresult = _load_verified_signal_library(
                     filepath,
                     requested_params={
-                        'engine_version': ENGINE_VERSION,
                         'MAX_SMA_DAY': MAX_SMA_DAY,
                         'price_source': 'Close',
                     },
@@ -2890,10 +3005,17 @@ def _impactsearch_primary_signal_series_for_secondary(
     
     # Single download: get raw frame & resolved symbol once
     fetch_rejection = {}
-    df_raw, fetched_symbol = fetch_data_raw(
-        prim_ticker, reference_now=analysis_clock,
-        rejection_out=fetch_rejection,
-    )
+    # Phase 6I-57: tag any yfinance fetch inside this scope as role=primary
+    # so the runner's per-secondary attribution and the
+    # IMPACT_REQUIRE_ZERO_PRIMARY_YF gate can see it. Thread-local; safe
+    # under ThreadPoolExecutor parallel workers.
+    with _YfRoleContext(
+        "primary", ticker=prim_ticker, stage="process_single_ticker",
+    ):
+        df_raw, fetched_symbol = fetch_data_raw(
+            prim_ticker, reference_now=analysis_clock,
+            rejection_out=fetch_rejection,
+        )
     # FIX: Add None check before accessing df_raw attributes
     if df_raw is None or df_raw.empty:
         logger.warning(f"No data for primary ticker {prim_ticker}, skipping.")
@@ -3431,10 +3553,16 @@ def process_primary_tickers(secondary_ticker, primary_tickers, use_multiprocessi
     # whole secondary returned [] rather than only seeing per-primary
     # failures.
     sec_fetch_rejection = {}
-    sec_raw, sec_resolved = fetch_data_raw(
-        secondary_ticker, reference_now=analysis_clock,
-        rejection_out=sec_fetch_rejection,
-    )
+    # Phase 6I-57 role attribution: secondary fetch in
+    # process_primary_tickers main path.
+    with _YfRoleContext(
+        "secondary", ticker=secondary_ticker,
+        stage="process_primary_tickers",
+    ):
+        sec_raw, sec_resolved = fetch_data_raw(
+            secondary_ticker, reference_now=analysis_clock,
+            rejection_out=sec_fetch_rejection,
+        )
     if sec_raw.empty:
         logger.error(f"No data for secondary ticker {secondary_ticker}, cannot proceed.")
         if sec_fetch_rejection:
@@ -3871,10 +3999,15 @@ def process_primary_tickers_aggregate_mode(
     secondary_ticker_resolved = vendor_symbol_sec
 
     sec_fetch_rejection = {}
-    sec_raw, sec_resolved = fetch_data_raw(
-        secondary_ticker_resolved, reference_now=analysis_clock,
-        rejection_out=sec_fetch_rejection,
-    )
+    # Phase 6I-57 role attribution: aggregate-mode secondary fetch.
+    with _YfRoleContext(
+        "secondary", ticker=secondary_ticker_resolved,
+        stage="process_primary_tickers_aggregate_mode",
+    ):
+        sec_raw, sec_resolved = fetch_data_raw(
+            secondary_ticker_resolved, reference_now=analysis_clock,
+            rejection_out=sec_fetch_rejection,
+        )
     if sec_raw is None or (hasattr(sec_raw, 'empty') and sec_raw.empty):
         rec = sec_fetch_rejection or _build_rejection(
             "fetch", FETCH_NO_DATA, ticker=secondary_ticker_resolved,
@@ -5646,10 +5779,15 @@ def _load_secondary_frame_for_validation(
     """
     rejection: dict = {}
     try:
-        df_raw, fetched_symbol = fetch_data_raw(
-            secondary_ticker, reference_now=analysis_clock,
-            rejection_out=rejection,
-        )
+        # Phase 6I-57 role attribution: secondary fetch helper.
+        with _YfRoleContext(
+            "secondary", ticker=secondary_ticker,
+            stage="fetch_data_with_close",
+        ):
+            df_raw, fetched_symbol = fetch_data_raw(
+                secondary_ticker, reference_now=analysis_clock,
+                rejection_out=rejection,
+            )
     except Exception:
         return None
     if df_raw is None or df_raw.empty:
