@@ -12,6 +12,28 @@ Pinned interpreter:
 
 ### Code changes
 
+  0. **Fastpath-fallback skip when zero-yf gate is armed**
+     in `impactsearch.py:_impactsearch_primary_signal_series_for_secondary`.
+     When the zero-primary-yfinance gate
+     (`IMPACT_REQUIRE_ZERO_PRIMARY_YF=1`) is armed and
+     `get_primary_signals_fast` returns
+     `(None, fp_reason)` (e.g. `incomplete_calendar:...`
+     on a delisted/stale-calendar ticker that has a
+     signal-library `.pkl` but whose library_end is too
+     far before the secondary effective end-date), the
+     helper now **skips** the primary BEFORE the slow
+     path would call `fetch_data_raw` and populates
+     `rejection_out` with the new structured reason
+     `PROCESS_FASTPATH_FALLBACK_SKIPPED_ZERO_YF_GATE`.
+     The primary produces no row for this secondary;
+     the threaded worker propagates the rejection
+     dict to `_record_recent_error(_format_rejection(...))`.
+     Existing slow-path behavior is preserved
+     byte-identical when the gate is **not** armed.
+     This is what unblocks the SPY checkpoint: ASHTF /
+     U1P.F / ZYN-style stale tickers no longer try to
+     fall back to a yfinance fetch the gate would then
+     kill mid-run.
   1. **Manifest verification fix** in
      `signal_library/impact_fastpath.py` and `impactsearch.py`.
      The fastpath previously passed
@@ -100,7 +122,8 @@ file; 125 tests pass) gains:
   - `test_runner_zero_yf_gate_marks_failure_when_primary_fetch_observed`
 
 `test_scripts/test_phase_6i57_fastpath_and_yf_gate.py` (new
-file; 8 tests pass):
+file; 11 tests pass — 8 original + 3 for the
+fastpath-fallback skip amendment):
 
   - `test_fastpath_loads_fresh_spy_library`
   - `test_is_compatible_rejects_wrong_top_level_engine_version`
@@ -110,8 +133,11 @@ file; 8 tests pass):
   - `test_require_zero_primary_yf_raises_on_primary_call`
   - `test_require_zero_primary_yf_raises_under_threaded_workers`
   - `test_reset_yf_records_clears_aggregate`
+  - `test_fastpath_fallback_skipped_when_zero_yf_gate_armed`
+  - `test_fastpath_fallback_not_skipped_when_zero_yf_gate_disarmed`
+  - `test_threaded_fastpath_fallback_skip_no_primary_yf_records`
 
-Total focused tests: **133 passed.**
+Total focused tests: **136 passed.**
 
 ## Gate 1 — direct fastpath sampler
 
@@ -150,15 +176,85 @@ Evidence JSONL:
 
 **Gate 1 PASS.**
 
-## Gate 2 — isolated threaded smoke write
+## Gate 2 — isolated threaded smoke write (amended)
 
-Real ImpactSearch run, threaded (`--use-multiprocessing` +
-8 primaries > 3 triggers the `ThreadPoolExecutor` branch).
-Secondary: SPY. Primaries: `SPY,AAPL,JNJ,WMT,HD,MCD,NA,NAN`.
-Output: **isolated** `logs/phase_6i57_baseline/smoke_20260517T225825Z/`
+Real ImpactSearch run, threaded (`--use-multiprocessing` plus
+8+ primaries triggers impactsearch's `len(primary_tickers) > 3`
+`ThreadPoolExecutor` branch at `impactsearch.py:3711`).
+Secondary: SPY. Output: **isolated** `logs/phase_6i57_baseline/smoke_<ts>/`
 (NOT `output/impactsearch/`). Env: `IMPACT_REQUIRE_ZERO_PRIMARY_YF=1`,
 `IMPACT_INSTRUMENT_YF_CALLS=1`, `IMPACT_TRUST_LIBRARY=1`,
 `IMPACT_TRUST_MAX_AGE_HOURS=720`, `IMPACT_CALENDAR_GRACE_DAYS=30`.
+
+### Secondary YF fetch count is `2` by design (this phase)
+
+The pass condition `secondary_yfinance_fetch_count == 2` for this
+phase is **expected and documented**:
+
+  - **one role=secondary fetch** in
+    `process_primary_tickers` (`impactsearch.py:3442`) — provides
+    `sec_df` for the primary loop.
+  - **one role=secondary fetch** in
+    `_prepare_impactsearch_durable_validation_for_export` via
+    `fetch_data_with_close` (`impactsearch.py:5657`) — provides the
+    secondary returns frame for the validation-prep stage that
+    writes the sidecar manifest.
+
+Both are role=secondary. The safety-critical invariant is
+`primary_yfinance_fetch_count == 0` **exactly**. Sharing the
+secondary fetch across the two stages would be a separate
+optimization phase (out of scope here).
+
+### Round 1 — pilot-only (smoke_20260517T225825Z)
+
+Primaries: `SPY,AAPL,JNJ,WMT,HD,MCD,NA,NAN`.
+
+| Metric | Value | Pass |
+|---|---|---|
+| `primary_yfinance_fetch_count` | **0** | ✓ |
+| `primary_yfinance_fetches` | `[]` | ✓ |
+| `secondary_yfinance_fetch_count` | 2 | ✓ (expected, see above) |
+| `workbook_row_count` | 8 | ✓ |
+| `workbook_unique_primary_count` | 8 | ✓ |
+| `NA` / `NAN` survive strict readback as distinct rows | yes / yes | ✓ |
+| `output/impactsearch/` untouched | yes | ✓ |
+| Elapsed seconds | 29.19 | — |
+
+### Round 2 — pilot + 3 fastpath-fallback stale-calendar tickers (smoke_20260517T232033Z)
+
+Primaries:
+`SPY,AAPL,JNJ,WMT,HD,MCD,NA,NAN,ASHTF,U1P.F,ZYN`.
+
+The 3 stale tickers (`ASHTF`, `U1P.F`, `ZYN`) trigger
+`get_primary_signals_fast` to return
+`(None, "incomplete_calendar:insufficient (lib_end=YYYY-MM-DD + 30d
+< sec_eff_end=YYYY-MM-DD)")`. With
+`IMPACT_REQUIRE_ZERO_PRIMARY_YF=1` armed, the helper at
+`_impactsearch_primary_signal_series_for_secondary`
+(`impactsearch.py:2906`) now skips the primary **before** the slow
+path would call `fetch_data_raw`, populates `rejection_out` with
+the structured reason
+`PROCESS_FASTPATH_FALLBACK_SKIPPED_ZERO_YF_GATE`, and returns
+`(None, rejection)`. The threaded worker propagates the rejection
+to `_record_recent_error(_format_rejection(...))` in
+`process_primary_tickers`. The primary produces no row in the
+output workbook.
+
+| Metric | Value | Pass |
+|---|---|---|
+| `primary_yfinance_fetch_count` | **0** | ✓ |
+| `primary_yfinance_fetches` | `[]` | ✓ |
+| `secondary_yfinance_fetch_count` | 2 | ✓ (expected) |
+| `workbook_row_count` | 8 | ✓ |
+| `workbook_unique_primary_count` | 8 | ✓ |
+| Healthy primaries (8) produce rows | yes | ✓ |
+| `ASHTF` absent from workbook (skipped) | yes | ✓ |
+| `U1P.F` absent from workbook (skipped) | yes | ✓ |
+| `ZYN` absent from workbook (skipped) | yes | ✓ |
+| Skip reasons recorded in `rejection_out` -> `recent_errors` | yes | ✓ |
+| `NA` / `NAN` survive strict readback as distinct rows | yes / yes | ✓ |
+| `output/impactsearch/` untouched | yes | ✓ |
+| Elapsed seconds | 29.02 | — |
 
 Reproducer (from `project/`):
 
@@ -169,45 +265,25 @@ Reproducer (from `project/`):
       impactsearch_workbook_runner.py \
         --secondaries SPY \
         --primary-source explicit_csv \
-        --primaries "SPY,AAPL,JNJ,WMT,HD,MCD,NA,NAN" \
+        --primaries "SPY,AAPL,JNJ,WMT,HD,MCD,NA,NAN,ASHTF,U1P.F,ZYN" \
         --output-dir logs/phase_6i57_baseline/smoke_<ts> \
         --write --allow-network-fetch --use-multiprocessing
 
-Results:
+**Gate 2 amended PASS.** Primary zero-yf invariant verified under
+threaded execution with both healthy and fastpath-fallback
+primaries in the same run.
 
-| Metric | Value | Spec | Pass |
-|---|---|---|---|
-| `run.status` | `ok` | `ok` | ✓ |
-| `per_ticker[0].status` | `ok` | `ok` | ✓ |
-| `primary_yfinance_fetch_count` | **0** | **== 0 exactly** | ✓ |
-| `primary_yfinance_fetches` | `[]` | `[]` | ✓ |
-| `secondary_yfinance_fetch_count` | 2 | `<= 1` | ⚠ see note |
-| `workbook_row_count` | 8 | 8 | ✓ |
-| `workbook_unique_primary_count` | 8 | 8 | ✓ |
-| `NA` survives readback (strict) | yes | yes | ✓ |
-| `NAN` survives readback (strict) | yes | yes | ✓ |
-| Workbook in temp dir | yes | yes | ✓ |
-| `output/impactsearch/` untouched | yes | yes | ✓ |
-| Threaded path exercised | yes (`> 3` primaries with `use_multiprocessing`) | yes | ✓ |
-| `validation_status` | `valid` | n/a | — |
-| Elapsed seconds | 29.188 | n/a | — |
+### Threaded test coverage of the skip path
 
-Secondary-count note: the impactsearch flow fetches the
-secondary twice per supervised run — once in
-`process_primary_tickers` for primary-loop input, once in
-`_prepare_impactsearch_durable_validation_for_export` for
-validation prep. Both fetches are role=secondary and the
-zero-primary-yf invariant is fully satisfied. Tightening
-to `<= 1` would require sharing the secondary fetch across
-the two stages, which is out of scope here.
-
-Stderr (`logs/phase_6i57_baseline/smoke_20260517T225825Z/runerr.log`)
-is 0 bytes — no manifest-mismatch warnings, no
-`dictionary changed size during iteration` cache errors, no
-yfinance retry traces.
-
-**Gate 2 PASS** (primary zero-yf invariant verified under
-threaded execution).
+  - `test_threaded_fastpath_fallback_skip_no_primary_yf_records`
+    spawns 8 worker threads calling
+    `_impactsearch_primary_signal_series_for_secondary`
+    concurrently with the gate armed and the fastpath stubbed
+    to return `(None, "incomplete_calendar:...")`. Every call
+    produces a structured rejection, no
+    `fetch_data_raw` call is attempted, and no role=primary
+    record appears in `get_yf_records()`. Synthetic stand-in
+    for the threaded production path; no real network.
 
 ## SPY checkpoint command (NOT YET LAUNCHED)
 

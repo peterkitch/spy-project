@@ -139,6 +139,15 @@ COERCE_MISSING_CLOSE_COLUMN = "missing_close_column"
 PROCESS_INSUFFICIENT_DATA = "insufficient_data"
 PROCESS_NO_METRICS = "no_metrics"
 PROCESS_WORKER_EXCEPTION = "worker_exception"
+# Phase 6I-57: fastpath fallback while the zero-primary-yfinance gate is
+# armed. The primary's signal library exists but the fastpath could not
+# accept it (e.g. incomplete_calendar on a delisted/stale ticker). Rather
+# than fall through to a primary yfinance fetch that the gate would then
+# kill mid-run, we skip the primary here and record a structured
+# rejection so the operator can review the shortfall.
+PROCESS_FASTPATH_FALLBACK_SKIPPED_ZERO_YF_GATE = (
+    "fastpath_fallback_skipped_zero_yf_gate"
+)
 
 # Reason codes -- EXPORT stage
 EXPORT_XLSX_MANIFEST_FAILED = "xlsx_manifest_failed"
@@ -2987,6 +2996,50 @@ def _impactsearch_primary_signal_series_for_secondary(
             logger.info(f"[FASTPATH:FALLBACK] {prim_ticker}: {fp_reason}")
             FASTPATH_STATS['fallback_used'] += 1
             FASTPATH_STATS['fallback_reasons'][fp_reason] = FASTPATH_STATS['fallback_reasons'].get(fp_reason, 0) + 1
+
+            # Phase 6I-57: when the zero-primary-yfinance gate is armed
+            # and the fastpath could not accept this library, skip the
+            # primary BEFORE the slow path would call fetch_data_raw.
+            # The slow path otherwise treats the secondary universe as
+            # large and would either trigger the gate's RuntimeError
+            # mid-run or contaminate the workbook. Record a structured
+            # rejection so the operator can review which primaries
+            # were skipped and why. This preserves existing behavior
+            # unchanged when the gate is NOT armed.
+            if _YF_REQUIRE_ZERO_PRIMARY:
+                logger.info(
+                    f"[FASTPATH:SKIP_ZERO_YF_GATE] {prim_ticker}: "
+                    f"{fp_reason} (slow-path yfinance fetch suppressed "
+                    "because IMPACT_REQUIRE_ZERO_PRIMARY_YF=1)"
+                )
+                if isinstance(rejection_out, dict):
+                    _populate_rejection(
+                        rejection_out, "process",
+                        PROCESS_FASTPATH_FALLBACK_SKIPPED_ZERO_YF_GATE,
+                        ticker=prim_ticker,
+                        message=(
+                            f"Fastpath fallback for {prim_ticker} "
+                            f"(reason={fp_reason!r}); slow-path "
+                            "yfinance fetch suppressed because "
+                            "IMPACT_REQUIRE_ZERO_PRIMARY_YF=1 is "
+                            "armed. The primary produces no row "
+                            "for this secondary."
+                        ),
+                        action=(
+                            "Review the fastpath fallback reason. If "
+                            "the underlying signal library should be "
+                            "refreshed or the calendar grace widened, "
+                            "do that and re-run. To allow yfinance "
+                            "fallback, unset "
+                            "IMPACT_REQUIRE_ZERO_PRIMARY_YF."
+                        ),
+                        retryable=False,
+                    )
+                return None, (
+                    dict(rejection_out)
+                    if isinstance(rejection_out, dict)
+                    else {}
+                )
 
     # SLOW PATH: Original processing with Yahoo Finance fetch
     logger.info(f"Processing {prim_ticker}...")

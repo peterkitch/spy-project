@@ -311,3 +311,190 @@ def test_reset_yf_records_clears_aggregate():
     assert len(get_yf_records()) >= 1
     reset_yf_records()
     assert get_yf_records() == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-57: skip primary on fastpath fallback when zero-yf gate is armed
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_sec_df():
+    import pandas as _pd
+    idx = _pd.date_range(
+        start="2024-01-02", end="2026-05-14", freq="B",
+    )
+    return _pd.DataFrame({"Close": [100.0] * len(idx)}, index=idx)
+
+
+def test_fastpath_fallback_skipped_when_zero_yf_gate_armed(
+    monkeypatch,
+):
+    """When `get_primary_signals_fast` returns None with a
+    reason like ``incomplete_calendar:...`` and the
+    zero-primary-yfinance gate is armed, the helper must
+    return ``(None, rejection)`` BEFORE calling
+    fetch_data_raw -- no primary yfinance attempted, no
+    contaminated row produced."""
+    import impactsearch as _is
+    reset = _is.reset_yf_records
+    reset()
+
+    monkeypatch.setattr(_is, "FASTPATH_AVAILABLE", True)
+    monkeypatch.setattr(_is, "IMPACT_TRUST_LIBRARY", True)
+    monkeypatch.setattr(
+        _is, "_YF_REQUIRE_ZERO_PRIMARY", True,
+    )
+    fp_reason = (
+        "incomplete_calendar:insufficient "
+        "(lib_end=2026-02-20 + 30d < sec_eff_end=2026-05-13)"
+    )
+    monkeypatch.setattr(
+        _is, "get_primary_signals_fast",
+        lambda t, idx: (None, fp_reason),
+    )
+    # Fail loudly if anything below the skip ever calls
+    # fetch_data_raw -- the whole point of the gate is to
+    # prevent that.
+    calls: list[str] = []
+
+    def _trap_fetch(*args, **kwargs):
+        calls.append(args[0] if args else "?")
+        raise AssertionError(
+            "fetch_data_raw must not be called when the "
+            "zero-primary-yf gate suppresses fallback"
+        )
+
+    monkeypatch.setattr(_is, "fetch_data_raw", _trap_fetch)
+    sec_df = _build_minimal_sec_df()
+    aligned, rejection = (
+        _is._impactsearch_primary_signal_series_for_secondary(
+            "U1P.F", sec_df, rejection_out={},
+        )
+    )
+    assert aligned is None
+    assert isinstance(rejection, dict)
+    # The rejection must use the new structured reason code.
+    reason = (
+        rejection.get("reason")
+        or (rejection.get("payload") or {}).get("reason")
+    )
+    # The helper passes structured rejection via _populate_rejection
+    # which sets standardized keys; allow either flat or nested.
+    full = repr(rejection)
+    assert (
+        _is.PROCESS_FASTPATH_FALLBACK_SKIPPED_ZERO_YF_GATE
+        in full
+    ), full
+    assert "U1P.F" in full
+    assert calls == []
+    # No primary yfinance records appeared either.
+    recs = _is.get_yf_records()
+    primary_recs = [
+        r for r in recs if r.get("role") == "primary"
+    ]
+    assert primary_recs == []
+
+
+def test_fastpath_fallback_not_skipped_when_zero_yf_gate_disarmed(
+    monkeypatch,
+):
+    """Control: when the gate is NOT armed, fastpath fallback
+    proceeds to the slow path (fetch_data_raw IS called).
+    Verifies the existing slow-path behavior is preserved."""
+    import impactsearch as _is
+    _is.reset_yf_records()
+
+    monkeypatch.setattr(_is, "FASTPATH_AVAILABLE", True)
+    monkeypatch.setattr(_is, "IMPACT_TRUST_LIBRARY", True)
+    monkeypatch.setattr(
+        _is, "_YF_REQUIRE_ZERO_PRIMARY", False,
+    )
+    monkeypatch.setattr(
+        _is, "get_primary_signals_fast",
+        lambda t, idx: (None, "incomplete_calendar:t1"),
+    )
+    seen: list[str] = []
+
+    def _stub_fetch(prim, **kwargs):
+        seen.append(prim)
+        return (None, prim)  # Empty -> downstream early-returns.
+
+    monkeypatch.setattr(_is, "fetch_data_raw", _stub_fetch)
+    sec_df = _build_minimal_sec_df()
+    aligned, _rej = (
+        _is._impactsearch_primary_signal_series_for_secondary(
+            "DELISTED", sec_df, rejection_out={},
+        )
+    )
+    # Slow path WAS reached; aligned is None (no data) and
+    # the test passes if fetch_data_raw was attempted.
+    assert seen == ["DELISTED"]
+    assert aligned is None
+
+
+def test_threaded_fastpath_fallback_skip_no_primary_yf_records(
+    monkeypatch,
+):
+    """Spin up 8 worker threads calling the helper
+    concurrently with the gate armed and a faked fastpath
+    fallback. Every call must skip; no role=primary
+    record may appear; fetch_data_raw must not be called."""
+    import impactsearch as _is
+    _is.reset_yf_records()
+
+    monkeypatch.setattr(_is, "FASTPATH_AVAILABLE", True)
+    monkeypatch.setattr(_is, "IMPACT_TRUST_LIBRARY", True)
+    monkeypatch.setattr(
+        _is, "_YF_REQUIRE_ZERO_PRIMARY", True,
+    )
+    monkeypatch.setattr(
+        _is, "get_primary_signals_fast",
+        lambda t, idx: (None, f"incomplete_calendar:t-{t}"),
+    )
+
+    def _trap_fetch(*args, **kwargs):
+        raise AssertionError(
+            "fetch_data_raw must not be called under "
+            "threaded skip"
+        )
+
+    monkeypatch.setattr(_is, "fetch_data_raw", _trap_fetch)
+
+    sec_df = _build_minimal_sec_df()
+    results: list[tuple] = []
+    lock = threading.Lock()
+
+    def _worker(t: str):
+        rej = {}
+        aligned, rejection = (
+            _is._impactsearch_primary_signal_series_for_secondary(
+                t, sec_df, rejection_out=rej,
+            )
+        )
+        with lock:
+            results.append((t, aligned, rejection))
+
+    tickers = [f"TKR{i}" for i in range(8)]
+    threads = [
+        threading.Thread(target=_worker, args=(t,))
+        for t in tickers
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert len(results) == 8
+    for t, aligned, rejection in results:
+        assert aligned is None
+        assert (
+            _is.PROCESS_FASTPATH_FALLBACK_SKIPPED_ZERO_YF_GATE
+            in repr(rejection)
+        ), repr(rejection)
+        assert t in repr(rejection)
+    # No primary yfinance records appeared from any worker.
+    recs = _is.get_yf_records()
+    primary_recs = [
+        r for r in recs if r.get("role") == "primary"
+    ]
+    assert primary_recs == [], primary_recs
