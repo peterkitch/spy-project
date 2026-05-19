@@ -1,8 +1,10 @@
 # Phase 6I-57 — Full-master ImpactSearch baseline preparation
 
-**Verdict:** Implementation + tests + Gate 1 + Gate 2 **PASS**. The SPY
-checkpoint and the remaining-five-secondaries run are **NOT YET
-LAUNCHED**, awaiting separate operator authorization.
+**Verdict:** Implementation + tests + Gate 1 + Gate 2 **PASS**. The
+full-master SPY checkpoint is **COMPLETE and audited PASS** (see
+*SPY checkpoint — audited baseline* below). The remaining-five-
+secondaries run is **NOT YET LAUNCHED** and is intentionally
+deferred pending separate operator authorization.
 
 ## What shipped on this branch
 
@@ -311,6 +313,103 @@ Notes:
   - The hard zero-primary-yf gate is armed in this command;
     any primary fetch will fail the run loudly rather than
     silently writing a contaminated workbook.
+
+## SPY checkpoint — audited baseline
+
+Launched 2026-05-19T02:19:01Z, completed 2026-05-19T03:39:47Z.
+Threaded `--use-multiprocessing` execution at 8 workers.
+
+### Artifact
+| field | value |
+|---|---|
+| artifact path | `output/impactsearch/SPY_analysis.xlsx` |
+| artifact size | 5,569,554 bytes (5.31 MiB) |
+| artifact sha256 | `d3c538452f9345902ba546e5f370e3857a5d155a8e14d3e80af353567c450b56` |
+| manifest path | `output/impactsearch/SPY_analysis.xlsx.manifest.json` |
+| manifest size | 2,478 bytes |
+| HEAD used | `4663561` |
+
+### Row + skip accounting
+| field | value |
+|---|---|
+| rows produced | 35,576 |
+| skipped (inferred) | 414 |
+| stable-library universe | 35,990 |
+| accounting | **35,576 + 414 = 35,990** ✓ |
+| skip rate | 1.15 % (matches the 600-primary engine-vs-wrapper diagnostic) |
+| skip reason class | `incomplete_calendar:insufficient` fastpath fallbacks, correctly suppressed by the zero-primary-yfinance gate |
+
+### Workbook shape
+| field | value |
+|---|---|
+| column count | 19 |
+| column schema | standard ImpactSearch columns (`Primary Ticker, Resolved/Fetched, Library Source, Trigger Days, Wins, Losses, Win Ratio (%), Std Dev (%), Sharpe Ratio, t-Statistic, p-Value, Significant 90%, Significant 95%, Significant 99%, Avg Daily Capture (%), Total Capture (%), Requested Ticker, Data Source, Secondary Ticker`) |
+| Data Source distribution | **FASTPATH only** (`{FASTPATH: 35,576}`) |
+| Secondary Ticker distribution | `{SPY: 35,576}` |
+| duplicate Primary Tickers | 0 |
+| literal `NA` / `NAN` rows | both present and distinct under strict (`keep_default_na=False`) readback |
+
+### Safety + validation surface
+| field | value |
+|---|---|
+| `primary_yfinance_fetch_count` | **0** (`primary_yfinance_fetches=[]`) |
+| `secondary_yfinance_fetch_count` | 1 (the single SPY secondary fetch) |
+| runner stderr | 0 bytes |
+| provenance mismatch warning count | 0 |
+| cache-race / error count | 0 |
+| `validation_mode` | `legacy_fast` |
+| `durable_validation_ran` | **false** |
+| `validation_status` | `not_run_manual_spymaster_audit` |
+| `validation_sidecar_path` | `null` (no sidecar written) |
+| runtime | **80.80 min** wall (`per-secondary elapsed_seconds = 4,839.70`); effective cores held ~0.98 throughout (ThreadPoolExecutor path saturates near one core, consistent with the scaling-ladder diagnostic) |
+
+### Explicit validation note
+
+**Durable validation was intentionally bypassed for this baseline.**
+The stage-isolation diagnostic localized the prior terminal SPY
+checkpoint's 20-hour pathology to durable validation fold/candidate
+evaluation (Category B). Skipping that surface restores the fast
+workbook-generation path. **Manual Spymaster review is the
+validation surface for this baseline**; no
+`validation_contract_v1` sidecar is written and the workbook
+metadata records this state explicitly
+(`validation_status = not_run_manual_spymaster_audit`).
+
+### Diagnostic chain summary
+
+  1. **Single-row SPY-vs-SPY check** — passed (1 row, primary YF 0).
+  2. **50-primary canonical-output check** — passed
+     (50 rows, primary YF 0, ~12 s wall).
+  3. **Scaling ladder** — passed; threaded path delivers no
+     parallel CPU speedup (eff cores ≤ 1.0) but per-primary cost
+     at scale is ~0.14 s/primary, projecting full-universe to
+     ~82 min via either runner or direct engine. Worker count
+     (4 / 8 / 16) and snapshot env vars are not meaningful
+     throttles.
+  4. **Engine-vs-wrapper diagnostic** (600-primary representative
+     random sample, seed=42) — passed; wrapper/export overhead
+     measured at **~3.5 %** (82.42 s wrapper vs 79.64 s engine
+     alone), classified **negligible**. Run 3 quarantine-overwrite
+     test PASS (Run-2 workbook quarantined byte-identical; final
+     canonical workbook fresh).
+  5. **Full SPY production run** — passed with `primary_yfinance_fetch_count = 0` exactly, FASTPATH-only Data Source, and full row+skip accounting.
+
+### Closeout note
+
+The three superseded test-run quarantine folders
+(`_quarantine_20260519T013811Z/`, `_quarantine_20260519T014052Z/`,
+`_quarantine_20260519T021901Z/`) under `output/impactsearch/` were
+removed during closeout after each quarantined `.xlsx` was
+verified by SHA256 to be a non-match to the canonical full-baseline
+`d3c538452...`. The canonical workbook and its manifest sidecar
+were not touched.
+
+The Phase 6I-57 benchmark scripts (`benchmark_impactsearch_fastpath.py`,
+`benchmark_impactsearch_stage_isolation.py`,
+`benchmark_impactsearch_scaling_ladder.py`) are now organized
+under `test_scripts/benchmarks/` with a `README.md` describing
+each script's question, command, output shape, and concurrency
+safety.
 
 ## What stayed out of scope
 
