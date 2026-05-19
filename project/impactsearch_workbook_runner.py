@@ -251,6 +251,17 @@ DEFAULT_PRICE_CACHE_DIR_RELATIVE: str = "price_cache/daily"
 DEFAULT_SIGNAL_LIB_DIR_RELATIVE: str = (
     "signal_library/data/stable"
 )
+# Operator-curated master ticker file shipped under
+# global_ticker_library/data/. Phase 6I-57 routes
+# ImpactSearch generation through this file by feeding it
+# into the runner's primary universe. Parsing is raw-string
+# (str.split on newlines + commas) so the master-list
+# literal members "NA" and "NAN" survive intact -- no
+# pandas / numpy NA coercion is applied to ticker tokens
+# on this read path.
+DEFAULT_MASTER_TICKERS_FILE_RELATIVE: str = (
+    "global_ticker_library/data/master_tickers.txt"
+)
 
 
 # Matches stackbuilder.py:3363 default + Phase 6I-52
@@ -278,12 +289,42 @@ PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE: str = (
     "phase_6i_52_pilot_universe"
 )
 PRIMARY_SOURCE_SIGNAL_LIBRARY_DIR: str = "signal_library_dir"
+PRIMARY_SOURCE_MASTER_TICKERS_FILE: str = (
+    "master_tickers_file"
+)
 
 
 ALL_PRIMARY_SOURCES: tuple[str, ...] = (
     PRIMARY_SOURCE_EXPLICIT_CSV,
     PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE,
     PRIMARY_SOURCE_SIGNAL_LIBRARY_DIR,
+    PRIMARY_SOURCE_MASTER_TICKERS_FILE,
+)
+
+
+# Validation modes for the workbook write path. ``durable`` is the
+# current default and routes through
+# ``_prepare_impactsearch_durable_validation_for_export`` to compute
+# durable validation summary + per-strategy validation, which are then
+# written into the workbook + sidecar by ``export_results_to_excel``.
+# ``legacy_fast`` is the explicit opt-in that mirrors the known-working
+# fast workbook generation path: it calls ``process_primary_tickers``
+# and ``export_results_to_excel(validation_summary=None,
+# per_strategy_validation=None)`` directly, with NO durable-validation
+# call and NO durable validation sidecar. Manual Spymaster review is
+# the validation surface in this mode.
+VALIDATION_MODE_DURABLE: str = "durable"
+VALIDATION_MODE_LEGACY_FAST: str = "legacy_fast"
+ALL_VALIDATION_MODES: tuple[str, ...] = (
+    VALIDATION_MODE_DURABLE,
+    VALIDATION_MODE_LEGACY_FAST,
+)
+# Validation-status string returned by legacy_fast runs. Makes
+# downstream consumers see "this workbook was NOT validated by the
+# durable engine; a human must Spymaster-audit it before relying on
+# the rows."
+LEGACY_FAST_VALIDATION_STATUS: str = (
+    "not_run_manual_spymaster_audit"
 )
 
 
@@ -403,6 +444,15 @@ ISSUE_PRIMARY_CSV_REQUIRED_BUT_MISSING: str = (
 ISSUE_PRIMARY_CSV_CONTAINS_UNSAFE_TICKER: str = (
     "primary_csv_contains_unsafe_ticker"
 )
+ISSUE_PRIMARY_TICKERS_FILE_MISSING: str = (
+    "primary_tickers_file_missing"
+)
+ISSUE_PRIMARY_TICKERS_FILE_UNREADABLE: str = (
+    "primary_tickers_file_unreadable"
+)
+ISSUE_PRIMARY_TICKERS_FILE_CONTAINS_UNSAFE_TICKER: str = (
+    "primary_tickers_file_contains_unsafe_ticker"
+)
 ISSUE_UNKNOWN_ERROR: str = "unknown_error"
 
 
@@ -420,6 +470,9 @@ ALL_ISSUE_CODES: tuple[str, ...] = (
     ISSUE_OUTPUT_DIR_UNSAFE,
     ISSUE_PRIMARY_CSV_REQUIRED_BUT_MISSING,
     ISSUE_PRIMARY_CSV_CONTAINS_UNSAFE_TICKER,
+    ISSUE_PRIMARY_TICKERS_FILE_MISSING,
+    ISSUE_PRIMARY_TICKERS_FILE_UNREADABLE,
+    ISSUE_PRIMARY_TICKERS_FILE_CONTAINS_UNSAFE_TICKER,
     ISSUE_UNKNOWN_ERROR,
 )
 
@@ -557,9 +610,13 @@ def resolve_primary_universe(
     primary_source: str,
     primary_csv: Optional[str] = None,
     signal_lib_dir: Optional[str] = None,
+    primary_tickers_file: Optional[str] = None,
     pilot_universe_loader: Optional[Callable[[], Sequence[str]]] = None,
     signal_library_lister: Optional[
         Callable[[str], Sequence[str]]
+    ] = None,
+    master_tickers_file_loader: Optional[
+        Callable[[str], str]
     ] = None,
 ) -> dict[str, Any]:
     """Resolve the requested primary universe.
@@ -574,7 +631,12 @@ def resolve_primary_universe(
           "issue_codes": list[str],
         }
 
-    Three sources are supported (selected by
+    For the ``master_tickers_file`` branch the dict also
+    carries ``primary_tickers_file``, ``parsed_count``,
+    ``accepted_count`` and ``dropped_count`` so the
+    operator can audit the parse outcome.
+
+    Four sources are supported (selected by
     ``primary_source``):
 
       * ``explicit_csv``: ``primary_csv`` is a
@@ -585,12 +647,23 @@ def resolve_primary_universe(
       * ``signal_library_dir``: scan
         ``signal_lib_dir`` for ``<TICKER>_stable_v*.pkl``
         files and use the discovered ticker set.
+      * ``master_tickers_file``: read
+        ``primary_tickers_file`` (default
+        ``global_ticker_library/data/master_tickers.txt``)
+        and parse it via raw-string ``str.split`` on
+        newlines and commas. Preserves the master-list
+        literal members ``"NA"`` and ``"NAN"`` as
+        Python strings (no pandas / numpy NA coercion).
 
     The function never reads .pkl bytes. The
     ``signal_library_lister`` callable is the seam used
     by tests to avoid touching ``signal_library/data/
     stable``; default lists ``Path(signal_lib_dir).glob
-    ("*_stable_v*.pkl")``.
+    ("*_stable_v*.pkl")``. The
+    ``master_tickers_file_loader`` callable is the seam
+    used by tests to avoid touching the operational
+    master file; default opens the path with UTF-8 and
+    returns the file text.
     """
     issues: list[str] = []
     warnings: list[str] = []
@@ -720,6 +793,94 @@ def resolve_primary_universe(
             "dropped_unsafe": dropped_unsafe,
             "warnings": warnings,
             "issue_codes": issues,
+        }
+
+    if primary_source == PRIMARY_SOURCE_MASTER_TICKERS_FILE:
+        path = (
+            primary_tickers_file
+            if primary_tickers_file
+            else DEFAULT_MASTER_TICKERS_FILE_RELATIVE
+        )
+        if master_tickers_file_loader is None:
+            def _default_master_loader(p: str) -> str:
+                with open(p, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            master_tickers_file_loader = (
+                _default_master_loader
+            )
+        try:
+            text = master_tickers_file_loader(path)
+        except FileNotFoundError as exc:
+            warnings.append(
+                f"master_tickers_file_loader: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            issues.append(
+                ISSUE_PRIMARY_TICKERS_FILE_MISSING
+            )
+            issues.append(ISSUE_PRIMARY_UNIVERSE_EMPTY)
+            return {
+                "primary_source": primary_source,
+                "universe": [],
+                "dropped_unsafe": [],
+                "warnings": warnings,
+                "issue_codes": issues,
+                "primary_tickers_file": path,
+                "parsed_count": 0,
+                "accepted_count": 0,
+                "dropped_count": 0,
+            }
+        except Exception as exc:
+            warnings.append(
+                f"master_tickers_file_loader raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+            issues.append(
+                ISSUE_PRIMARY_TICKERS_FILE_UNREADABLE
+            )
+            issues.append(ISSUE_PRIMARY_UNIVERSE_EMPTY)
+            return {
+                "primary_source": primary_source,
+                "universe": [],
+                "dropped_unsafe": [],
+                "warnings": warnings,
+                "issue_codes": issues,
+                "primary_tickers_file": path,
+                "parsed_count": 0,
+                "accepted_count": 0,
+                "dropped_count": 0,
+            }
+
+        # Raw-string parse: split on newlines, then commas.
+        # Preserves the master-list literal members "NA"
+        # and "NAN" intact (no pandas / numpy NA coercion
+        # on this path).
+        raw_tokens: list[str] = []
+        for line in text.splitlines():
+            for tok in line.split(","):
+                stripped = tok.strip()
+                if stripped:
+                    raw_tokens.append(stripped)
+        parsed_count = len(raw_tokens)
+        universe, dropped_unsafe = (
+            _dedupe_normalize_tickers(raw_tokens)
+        )
+        if dropped_unsafe:
+            issues.append(
+                ISSUE_PRIMARY_TICKERS_FILE_CONTAINS_UNSAFE_TICKER
+            )
+        if not universe:
+            issues.append(ISSUE_PRIMARY_UNIVERSE_EMPTY)
+        return {
+            "primary_source": primary_source,
+            "universe": universe,
+            "dropped_unsafe": dropped_unsafe,
+            "warnings": warnings,
+            "issue_codes": issues,
+            "primary_tickers_file": path,
+            "parsed_count": parsed_count,
+            "accepted_count": len(universe),
+            "dropped_count": len(dropped_unsafe),
         }
 
     raise ValueError(
@@ -1325,6 +1486,7 @@ def build_impactsearch_workbook_run_plan(
         PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
     ),
     primary_csv: Optional[str] = None,
+    primary_tickers_file: Optional[str] = None,
     output_dir: Optional[str] = None,
     signal_lib_dir: Optional[str] = None,
     price_cache_dir: Optional[str] = None,
@@ -1334,12 +1496,16 @@ def build_impactsearch_workbook_run_plan(
     write: bool = False,
     allow_network_fetch: bool = False,
     strict_manifests: bool = False,
+    validation_mode: str = VALIDATION_MODE_DURABLE,
     now_seconds: Optional[float] = None,
     pilot_universe_loader: Optional[
         Callable[[], Sequence[str]]
     ] = None,
     signal_library_lister: Optional[
         Callable[[str], Sequence[str]]
+    ] = None,
+    master_tickers_file_loader: Optional[
+        Callable[[str], str]
     ] = None,
     verified_loader: Optional[
         Callable[..., tuple[Any, Any]]
@@ -1381,13 +1547,29 @@ def build_impactsearch_workbook_run_plan(
         if impact_xlsx_max_age_days is not None
         else DEFAULT_IMPACT_XLSX_MAX_AGE_DAYS
     )
+    primary_tickers_file_resolved = (
+        primary_tickers_file
+        if primary_tickers_file is not None
+        else DEFAULT_MASTER_TICKERS_FILE_RELATIVE
+    )
+    if validation_mode not in ALL_VALIDATION_MODES:
+        raise ValueError(
+            f"unknown validation_mode: {validation_mode!r}; "
+            f"expected one of {ALL_VALIDATION_MODES}"
+        )
 
     primary_resolution = resolve_primary_universe(
         primary_source=primary_source,
         primary_csv=primary_csv,
         signal_lib_dir=signal_lib_dir_resolved,
+        primary_tickers_file=(
+            primary_tickers_file_resolved
+        ),
         pilot_universe_loader=pilot_universe_loader,
         signal_library_lister=signal_library_lister,
+        master_tickers_file_loader=(
+            master_tickers_file_loader
+        ),
     )
     universe = list(primary_resolution["universe"])
 
@@ -1600,6 +1782,10 @@ def build_impactsearch_workbook_run_plan(
             "output_dir": output_dir_resolved,
             "signal_lib_dir": signal_lib_dir_resolved,
             "price_cache_dir": price_cache_dir_resolved,
+            "primary_tickers_file": (
+                primary_tickers_file_resolved
+            ),
+            "validation_mode": validation_mode,
         },
         "primary_universe_resolution": primary_resolution,
         "per_ticker": per_ticker,
@@ -1632,6 +1818,8 @@ def _runner_argv_for_ticker(
     write: bool,
     allow_network_fetch: bool,
     strict_manifests: bool,
+    primary_tickers_file: Optional[str] = None,
+    validation_mode: str = VALIDATION_MODE_DURABLE,
 ) -> list[str]:
     argv = [
         PINNED_INTERPRETER,
@@ -1651,6 +1839,15 @@ def _runner_argv_for_ticker(
     ]
     if primary_csv:
         argv += ["--primaries", primary_csv]
+    if (
+        primary_source
+        == PRIMARY_SOURCE_MASTER_TICKERS_FILE
+        and primary_tickers_file
+    ):
+        argv += [
+            "--primary-tickers-file",
+            primary_tickers_file,
+        ]
     if current_as_of_date:
         argv += [
             "--current-as-of-date",
@@ -1664,6 +1861,11 @@ def _runner_argv_for_ticker(
         argv += ["--write"]
     if allow_network_fetch:
         argv += ["--allow-network-fetch"]
+    # Always emit the validation-mode flag so the operator-facing
+    # reproducible command in the manifest is unambiguous about
+    # whether durable validation runs.
+    if validation_mode in ALL_VALIDATION_MODES:
+        argv += ["--validation-mode", validation_mode]
     return argv
 
 
@@ -1717,11 +1919,22 @@ def build_command_manifest(
             PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE,
         )
     )
+    primary_tickers_file = str(
+        policy.get(
+            "primary_tickers_file",
+            DEFAULT_MASTER_TICKERS_FILE_RELATIVE,
+        )
+    )
     use_multiprocessing = bool(
         policy.get("use_multiprocessing", False)
     )
     strict_manifests = bool(
         policy.get("strict_manifests", False)
+    )
+    validation_mode = str(
+        policy.get(
+            "validation_mode", VALIDATION_MODE_DURABLE,
+        )
     )
 
     entries: list[dict[str, Any]] = []
@@ -1784,6 +1997,7 @@ def build_command_manifest(
                 sec,
                 primary_source=primary_source,
                 primary_csv=None,
+                primary_tickers_file=primary_tickers_file,
                 output_dir=output_dir,
                 signal_lib_dir=signal_lib_dir,
                 price_cache_dir=price_cache_dir,
@@ -1795,6 +2009,7 @@ def build_command_manifest(
                 write=True,
                 allow_network_fetch=True,
                 strict_manifests=strict_manifests,
+                validation_mode=validation_mode,
             )
             auth_class = (
                 AUTH_CLASS_IMPACTSEARCH_NETWORK_WRITE
@@ -1827,6 +2042,7 @@ def build_command_manifest(
             sec,
             primary_source=primary_source,
             primary_csv=None,
+            primary_tickers_file=primary_tickers_file,
             output_dir=output_dir,
             signal_lib_dir=signal_lib_dir,
             price_cache_dir=price_cache_dir,
@@ -1835,6 +2051,7 @@ def build_command_manifest(
             ),
             current_as_of_date=current_as_of_date,
             use_multiprocessing=use_multiprocessing,
+            validation_mode=validation_mode,
             write=True,
             allow_network_fetch=False,
             strict_manifests=strict_manifests,
@@ -1885,6 +2102,87 @@ def build_command_manifest(
 # ---------------------------------------------------------------------------
 # Authorized execution path (the lazy-import boundary)
 # ---------------------------------------------------------------------------
+
+
+def quarantine_existing_outputs_for_secondary(
+    secondary: str,
+    *,
+    output_dir: str,
+    quarantine_root: Optional[str] = None,
+    now_iso: Optional[str] = None,
+) -> dict[str, Any]:
+    """Move any existing ``<SECONDARY>_analysis*`` files (workbook,
+    sidecar manifest, runner partials) into a timestamped quarantine
+    folder under ``output_dir/_quarantine_<YYYYmmddTHHMMSSZ>/`` so the
+    impending real write produces a clean workbook with no
+    stale-row carry-forward.
+
+    Phase 6I-57 clean-write protection: this is the operator-facing
+    helper called immediately before any authorized SPY checkpoint /
+    Gate-4 secondary write. Returns a small report dict describing
+    what (if anything) was moved.
+    """
+    secondary_upper = (
+        str(secondary).strip().upper() if secondary else ""
+    )
+    if not secondary_upper or not is_safe_ticker(secondary_upper):
+        return {
+            "secondary": secondary,
+            "quarantine_dir": None,
+            "moved_files": [],
+            "reason": "unsafe_or_empty_secondary",
+        }
+    out_dir = os.path.abspath(output_dir or ".")
+    if not os.path.isdir(out_dir):
+        return {
+            "secondary": secondary_upper,
+            "quarantine_dir": None,
+            "moved_files": [],
+            "reason": "output_dir_does_not_exist",
+        }
+    # Match canonical, sidecar, and runner-partial variants. Keep the
+    # pattern conservative: must start with the exact ticker token
+    # followed by "_analysis" so we don't sweep neighboring tickers.
+    prefix = f"{secondary_upper}_analysis"
+    candidates: list[str] = []
+    for name in os.listdir(out_dir):
+        if not name.startswith(prefix):
+            continue
+        # Refuse to touch our own quarantine folders if someone
+        # places one with a colliding prefix; quarantine dirs are
+        # prefixed with `_quarantine_` so this should never match.
+        candidates.append(name)
+    if not candidates:
+        return {
+            "secondary": secondary_upper,
+            "quarantine_dir": None,
+            "moved_files": [],
+            "reason": "no_matching_files_present",
+        }
+    if now_iso is None:
+        now_iso = datetime.now(
+            tz=timezone.utc,
+        ).strftime("%Y%m%dT%H%M%SZ")
+    q_root = (
+        quarantine_root
+        if quarantine_root is not None
+        else os.path.join(
+            out_dir, f"_quarantine_{now_iso}",
+        )
+    )
+    os.makedirs(q_root, exist_ok=True)
+    moved: list[dict[str, str]] = []
+    for name in candidates:
+        src = os.path.join(out_dir, name)
+        dst = os.path.join(q_root, name)
+        os.replace(src, dst)
+        moved.append({"src": src, "dst": dst})
+    return {
+        "secondary": secondary_upper,
+        "quarantine_dir": q_root,
+        "moved_files": moved,
+        "reason": "moved",
+    }
 
 
 def _atomic_export_workbook(
@@ -2066,6 +2364,21 @@ def execute_workbook_run(
     use_multiprocessing = bool(
         policy.get("use_multiprocessing", False)
     )
+    validation_mode = str(
+        policy.get(
+            "validation_mode", VALIDATION_MODE_DURABLE,
+        )
+    )
+    if validation_mode not in ALL_VALIDATION_MODES:
+        return {
+            "status": "refused",
+            "reason": (
+                "unknown validation_mode in plan policy: "
+                f"{validation_mode!r}; expected one of "
+                f"{ALL_VALIDATION_MODES}"
+            ),
+            "per_ticker_results": [],
+        }
 
     if impactsearch_callable_override is None:
         def _default_impactsearch_callable(
@@ -2075,10 +2388,73 @@ def execute_workbook_run(
             output_path: str,
             use_multiprocessing: bool,
             export_atomic: Callable[..., Any],
+            validation_mode: str = VALIDATION_MODE_DURABLE,
+            **_kwargs: Any,
         ) -> dict[str, Any]:
-            # Lazy import: pulls Dash + yfinance into
-            # ``sys.modules``. Acceptable only on the
-            # authorized execution path.
+            # Lazy import. The legacy_fast branch deliberately
+            # does NOT import
+            # ``_prepare_impactsearch_durable_validation_for_export``;
+            # the durable branch imports it.
+            if validation_mode == VALIDATION_MODE_LEGACY_FAST:
+                from impactsearch import (  # noqa: E501
+                    process_primary_tickers,
+                    export_results_to_excel,
+                )
+                metrics = process_primary_tickers(
+                    secondary,
+                    list(primary_tickers),
+                    use_multiprocessing,
+                    mark_complete=False,
+                )
+                if not metrics:
+                    return {
+                        "status": "failed",
+                        "reason": (
+                            "process_primary_tickers returned "
+                            "no metrics for "
+                            f"{secondary}"
+                        ),
+                        "metrics_count": 0,
+                        "validation_mode": (
+                            VALIDATION_MODE_LEGACY_FAST
+                        ),
+                        "durable_validation_ran": False,
+                        "validation_status": (
+                            LEGACY_FAST_VALIDATION_STATUS
+                        ),
+                    }
+                # legacy_fast: skip durable validation entirely.
+                # Pass validation_summary=None and
+                # per_strategy_validation=None into the atomic
+                # export so ImpactSearch's own export path takes
+                # its no-durable-validation branch.
+                atomic_result = export_atomic(
+                    output_path,
+                    metrics,
+                    validation_summary=None,
+                    per_strategy_validation=None,
+                    export_callable=export_results_to_excel,
+                )
+                return {
+                    "status": "ok",
+                    "metrics_count": len(metrics),
+                    "validation_sidecar_path": None,
+                    "validation_status": (
+                        LEGACY_FAST_VALIDATION_STATUS
+                    ),
+                    "validation_mode": (
+                        VALIDATION_MODE_LEGACY_FAST
+                    ),
+                    "durable_validation_ran": False,
+                    "canonical_path": atomic_result[
+                        "canonical_path"
+                    ],
+                    "canonical_sidecar": atomic_result[
+                        "canonical_sidecar"
+                    ],
+                }
+            # validation_mode == durable -- existing behavior,
+            # byte-identical to the prior runner contract.
             from impactsearch import (  # noqa: E501
                 process_primary_tickers,
                 _prepare_impactsearch_durable_validation_for_export,  # noqa: E501
@@ -2099,6 +2475,8 @@ def execute_workbook_run(
                         f"{secondary}"
                     ),
                     "metrics_count": 0,
+                    "validation_mode": VALIDATION_MODE_DURABLE,
+                    "durable_validation_ran": False,
                 }
             (
                 _contract,
@@ -2128,6 +2506,8 @@ def execute_workbook_run(
                 "validation_status": (
                     validation_summary or {}
                 ).get("validation_status"),
+                "validation_mode": VALIDATION_MODE_DURABLE,
+                "durable_validation_ran": True,
                 "canonical_path": atomic_result[
                     "canonical_path"
                 ],
@@ -2142,6 +2522,10 @@ def execute_workbook_run(
         )
 
     per_ticker_results: list[dict[str, Any]] = []
+    _run_t_start_mono = time.monotonic()
+    _run_t_start_iso = datetime.now(
+        tz=timezone.utc,
+    ).isoformat()
     for row in plan.get("per_ticker", []) or []:
         elig = row.get("eligibility")
         if elig != ELIGIBILITY_READY_TO_RUN_WITH_EXPLICIT_NETWORK:
@@ -2169,6 +2553,48 @@ def execute_workbook_run(
         # the filesystem.
         out_dir = os.path.dirname(out_path) or "."
         os.makedirs(out_dir, exist_ok=True)
+        # Phase 6I-57 clean-write protection: quarantine any
+        # pre-existing <SECONDARY>_analysis* artifacts so the
+        # impending real write produces a clean workbook with
+        # no stale-row carry-forward from a prior run.
+        _quarantine_report = (
+            quarantine_existing_outputs_for_secondary(
+                sec, output_dir=out_dir,
+            )
+        )
+        # Phase 6I-57 per-secondary timing + on-disk size
+        # instrumentation. Records start/end wall time
+        # (UTC ISO-8601), monotonic elapsed seconds, and
+        # post-write workbook / manifest sizes so the
+        # supervised baseline doc can report apples-to-
+        # apples timing per secondary.
+        # Phase 6I-57 also snapshots impactsearch's
+        # thread-safe yfinance role attribution so the
+        # runner can report per-secondary
+        # primary_yfinance_fetch_count /
+        # secondary_yfinance_fetch_count without
+        # depending on unsynchronized module-level
+        # globals. Lazy import keeps the runner's no-
+        # top-level-impactsearch-import contract intact.
+        _impactsearch_mod = None
+        try:
+            import impactsearch as _impactsearch_mod  # noqa: E501
+        except Exception:
+            _impactsearch_mod = None
+        if (
+            _impactsearch_mod is not None
+            and hasattr(
+                _impactsearch_mod, "reset_yf_records",
+            )
+        ):
+            try:
+                _impactsearch_mod.reset_yf_records()
+            except Exception:
+                pass
+        _t_start_mono = time.monotonic()
+        _t_start_iso = datetime.now(
+            tz=timezone.utc,
+        ).isoformat()
         try:
             result = impactsearch_callable(
                 secondary=sec,
@@ -2178,10 +2604,233 @@ def execute_workbook_run(
                 output_path=out_path,
                 use_multiprocessing=use_multiprocessing,
                 export_atomic=_atomic_export_workbook,
+                validation_mode=validation_mode,
             )
             result.setdefault("secondary", sec)
+            # Guarantee validation-mode metadata is present on
+            # every per-secondary result, even if a test override
+            # callable forgot to set it. Defaults match the
+            # plan's validation_mode and "did this run write a
+            # durable sidecar?" semantics.
+            result.setdefault(
+                "validation_mode", validation_mode,
+            )
+            result.setdefault(
+                "durable_validation_ran",
+                validation_mode == VALIDATION_MODE_DURABLE,
+            )
+            if (
+                validation_mode == VALIDATION_MODE_LEGACY_FAST
+                and not result.get("validation_status")
+            ):
+                result["validation_status"] = (
+                    LEGACY_FAST_VALIDATION_STATUS
+                )
+            _t_end_mono = time.monotonic()
+            _t_end_iso = datetime.now(
+                tz=timezone.utc,
+            ).isoformat()
+            elapsed_seconds = round(
+                _t_end_mono - _t_start_mono, 3,
+            )
+            result["start_timestamp"] = _t_start_iso
+            result["end_timestamp"] = _t_end_iso
+            result["elapsed_seconds"] = elapsed_seconds
+            result["elapsed_minutes"] = round(
+                elapsed_seconds / 60.0, 3,
+            )
+            # On-disk size at workbook + manifest paths
+            # (where available). Best-effort; missing /
+            # unreadable -> None.
+            wb_path = result.get("canonical_path")
+            mf_path = result.get("canonical_sidecar")
+            if wb_path:
+                try:
+                    result["workbook_size_bytes"] = (
+                        os.path.getsize(wb_path)
+                    )
+                except OSError:
+                    result["workbook_size_bytes"] = None
+            else:
+                result["workbook_size_bytes"] = None
+            if mf_path:
+                try:
+                    result["manifest_size_bytes"] = (
+                        os.path.getsize(mf_path)
+                    )
+                except OSError:
+                    result["manifest_size_bytes"] = None
+            else:
+                result["manifest_size_bytes"] = None
+            # Fast-path / yfinance-call passthrough: if
+            # the impactsearch callable reported either,
+            # surface them; otherwise leave None so the
+            # evidence-doc table can call out "not
+            # captured."
+            result.setdefault(
+                "fast_path_summary",
+                result.get("fast_path_summary"),
+            )
+            result.setdefault(
+                "yfinance_call_count",
+                result.get("yfinance_call_count"),
+            )
+            result["quarantine_report"] = (
+                _quarantine_report
+            )
+            # Phase 6I-57: snapshot impactsearch's thread-
+            # safe yfinance role records and partition by
+            # role for this secondary. Empty list when
+            # the override seam was used (impactsearch
+            # never imported) -> counts default to 0,
+            # which is correct for tests.
+            _yf_recs = []
+            if (
+                _impactsearch_mod is not None
+                and hasattr(
+                    _impactsearch_mod, "get_yf_records",
+                )
+            ):
+                try:
+                    _yf_recs = (
+                        _impactsearch_mod.get_yf_records()
+                    )
+                except Exception:
+                    _yf_recs = []
+            primary_recs = [
+                r for r in _yf_recs
+                if r.get("role") == "primary"
+            ]
+            secondary_recs = [
+                r for r in _yf_recs
+                if r.get("role") == "secondary"
+            ]
+            result["primary_yfinance_fetch_count"] = len(
+                primary_recs,
+            )
+            result["secondary_yfinance_fetch_count"] = len(
+                secondary_recs,
+            )
+            result["primary_yfinance_fetches"] = (
+                primary_recs
+            )
+            # Best-effort post-write workbook integrity
+            # snapshot. Row count + unique Primary Ticker
+            # count under STRICT NaN handling so the
+            # operator-curated NA/NAN tickers survive
+            # readback as distinct rows.
+            wb_path = result.get("canonical_path")
+            if wb_path and os.path.exists(wb_path):
+                try:
+                    import pandas as _pd
+                    _wbdf = _pd.read_excel(
+                        wb_path,
+                        keep_default_na=False,
+                        na_values=[],
+                    )
+                    result["workbook_row_count"] = (
+                        int(len(_wbdf))
+                    )
+                    pcol = (
+                        "Primary Ticker"
+                        if "Primary Ticker"
+                        in _wbdf.columns
+                        else None
+                    )
+                    if pcol is not None:
+                        result[
+                            "workbook_unique_primary_count"
+                        ] = int(
+                            _wbdf[pcol]
+                            .astype(str)
+                            .str.strip()
+                            .nunique(),
+                        )
+                    else:
+                        result[
+                            "workbook_unique_primary_count"
+                        ] = None
+                except Exception as _exc:
+                    result["workbook_row_count"] = None
+                    result[
+                        "workbook_unique_primary_count"
+                    ] = None
+                    result[
+                        "workbook_read_error"
+                    ] = (
+                        f"{type(_exc).__name__}: {_exc}"
+                    )
+            else:
+                result["workbook_row_count"] = None
+                result[
+                    "workbook_unique_primary_count"
+                ] = None
+            # Phase 6I-57 zero-primary-yf hard gate: if
+            # the operator set IMPACT_REQUIRE_ZERO_PRIMARY_YF
+            # and the runner observed any primary fetch,
+            # downgrade the result status to failed with
+            # an actionable reason. (The impactsearch
+            # wrapper also raises RuntimeError at the
+            # call site; this is the belt-and-suspenders
+            # path for runs where the gate was armed but
+            # the wrapper was not installed.)
+            _require_zero = os.environ.get(
+                "IMPACT_REQUIRE_ZERO_PRIMARY_YF", "0",
+            ).lower() in ("1", "true", "on", "yes")
+            if (
+                _require_zero
+                and result.get(
+                    "primary_yfinance_fetch_count", 0,
+                )
+                > 0
+            ):
+                offenders = ", ".join(
+                    sorted({
+                        str(r.get("ticker"))
+                        for r in primary_recs[:5]
+                    })
+                )
+                result["status"] = "failed"
+                result["reason"] = (
+                    "IMPACT_REQUIRE_ZERO_PRIMARY_YF=1 "
+                    f"but observed "
+                    f"{result['primary_yfinance_fetch_count']}"
+                    f" primary yfinance fetch(es); "
+                    f"first offenders: {offenders}"
+                )
             per_ticker_results.append(result)
         except Exception as exc:
+            _t_end_mono = time.monotonic()
+            _t_end_iso = datetime.now(
+                tz=timezone.utc,
+            ).isoformat()
+            elapsed_seconds = round(
+                _t_end_mono - _t_start_mono, 3,
+            )
+            # Snapshot whatever yfinance records the
+            # impactsearch wrapper accumulated before
+            # the failure surfaced.
+            _yf_recs_fail = []
+            if (
+                _impactsearch_mod is not None
+                and hasattr(
+                    _impactsearch_mod, "get_yf_records",
+                )
+            ):
+                try:
+                    _yf_recs_fail = (
+                        _impactsearch_mod.get_yf_records()
+                    )
+                except Exception:
+                    _yf_recs_fail = []
+            primary_recs_fail = [
+                r for r in _yf_recs_fail
+                if r.get("role") == "primary"
+            ]
+            secondary_recs_fail = [
+                r for r in _yf_recs_fail
+                if r.get("role") == "secondary"
+            ]
             per_ticker_results.append(
                 {
                     "secondary": sec,
@@ -2189,9 +2838,40 @@ def execute_workbook_run(
                     "reason": (
                         f"{type(exc).__name__}: {exc}"
                     ),
+                    "start_timestamp": _t_start_iso,
+                    "end_timestamp": _t_end_iso,
+                    "elapsed_seconds": elapsed_seconds,
+                    "elapsed_minutes": round(
+                        elapsed_seconds / 60.0, 3,
+                    ),
+                    "workbook_size_bytes": None,
+                    "manifest_size_bytes": None,
+                    "workbook_row_count": None,
+                    "workbook_unique_primary_count": None,
+                    "fast_path_summary": None,
+                    "yfinance_call_count": None,
+                    "quarantine_report": (
+                        _quarantine_report
+                    ),
+                    "primary_yfinance_fetch_count": len(
+                        primary_recs_fail,
+                    ),
+                    "secondary_yfinance_fetch_count": len(
+                        secondary_recs_fail,
+                    ),
+                    "primary_yfinance_fetches": (
+                        primary_recs_fail
+                    ),
                 }
             )
     statuses = [r.get("status") for r in per_ticker_results]
+    _run_t_end_mono = time.monotonic()
+    _run_t_end_iso = datetime.now(
+        tz=timezone.utc,
+    ).isoformat()
+    _run_elapsed_seconds = round(
+        _run_t_end_mono - _run_t_start_mono, 3,
+    )
     return {
         "status": (
             "ok"
@@ -2199,6 +2879,12 @@ def execute_workbook_run(
             else "partial"
             if any(s == "ok" for s in statuses)
             else "no_op"
+        ),
+        "run_started_at_utc": _run_t_start_iso,
+        "run_ended_at_utc": _run_t_end_iso,
+        "run_elapsed_seconds": _run_elapsed_seconds,
+        "run_elapsed_minutes": round(
+            _run_elapsed_seconds / 60.0, 3,
         ),
         "per_ticker_results": per_ticker_results,
     }
@@ -2283,6 +2969,40 @@ def _parse_argv(
         help=(
             "comma-separated primary universe; required "
             "iff --primary-source explicit_csv"
+        ),
+    )
+    parser.add_argument(
+        "--primary-tickers-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a tickers file used as the primary "
+            "universe when --primary-source="
+            "master_tickers_file. Default: "
+            "global_ticker_library/data/master_tickers.txt. "
+            "Parsed by raw-string split on newlines and "
+            "commas; preserves literal NA and NAN as valid "
+            "ticker strings (no pandas / numpy NA coercion)."
+        ),
+    )
+    parser.add_argument(
+        "--validation-mode",
+        type=str,
+        choices=ALL_VALIDATION_MODES,
+        default=VALIDATION_MODE_DURABLE,
+        help=(
+            "durable (default) routes the write path through "
+            "_prepare_impactsearch_durable_validation_for_export "
+            "and writes a durable validation sidecar. "
+            "legacy_fast skips durable validation entirely and "
+            "calls export_results_to_excel with "
+            "validation_summary=None / per_strategy_validation="
+            "None, mirroring the known-working fast workbook "
+            "generation path. legacy_fast results are NOT "
+            "presented as validated; "
+            "validation_status='not_run_manual_spymaster_audit' "
+            "and a human Spymaster review is the validation "
+            "surface."
         ),
     )
     parser.add_argument(
@@ -2383,6 +3103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         secondaries=secondaries,
         primary_source=args.primary_source,
         primary_csv=args.primaries,
+        primary_tickers_file=args.primary_tickers_file,
         output_dir=args.output_dir,
         signal_lib_dir=args.signal_library_dir,
         price_cache_dir=args.price_cache_dir,
@@ -2394,6 +3115,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write=args.write,
         allow_network_fetch=args.allow_network_fetch,
         strict_manifests=args.strict_manifests,
+        validation_mode=args.validation_mode,
     )
     manifest = build_command_manifest(plan)
     if args.print_json:
