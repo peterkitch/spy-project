@@ -712,7 +712,7 @@ Per-app surfaces:
 - **stackbuilder.py**: Multi-primary stack construction with full-refit walk-forward validation; durable-only tier per locked 5C-1 methodology
 - **confluence.py**: Multi-primary confluence engine; interactive-tier validation per locked 5C-1 methodology
 - **trafficflow.py**: Cross-asset traffic flow analysis (contains the disabled matrix.py code path)
-- **tickerdash.py**: Per-ticker dashboard with single-job model
+- **global_ticker_library/tickerdash.py**: Global Ticker Library per-ticker dashboard with single-job model
 - **run.py**: Ticker universe construction
 
 Validation infrastructure (Phase 5C track):

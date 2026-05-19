@@ -403,7 +403,7 @@ class OnepassRunReport:
 # ``stackbuilder.try_load_rank_from_impact_xlsx``: callers may pass an
 # opt-in dict; on failure, the function populates it with a structured
 # rejection record. Return types are unchanged so existing callers
-# (ImpactSearch, Spymaster, Confluence, Phase 4A, batch_updater) keep
+# (ImpactSearch, Spymaster, Confluence, Phase 4A) keep
 # working without modification.
 #
 # The rejection record schema:
