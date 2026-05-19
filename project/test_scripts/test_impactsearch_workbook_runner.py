@@ -1360,6 +1360,7 @@ def test_execute_workbook_run_with_fake_callable_writes_to_tmp(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         calls.append(
             {
@@ -1449,6 +1450,7 @@ def test_execute_workbook_run_fake_callable_failure_cleans_up_partials(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         def _fake_export(
             partial_path, metrics, *,
@@ -1521,6 +1523,7 @@ def _make_minimal_ok_callable(*, sleep_seconds: float = 0.0):
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
@@ -1626,6 +1629,7 @@ def test_execute_workbook_run_passthrough_fast_path_and_yfinance_count(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         def _fake_export(
             partial, metrics, *,
@@ -1688,6 +1692,7 @@ def test_execute_workbook_run_failure_path_still_records_timing(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         raise RuntimeError("synthetic failure")
 
@@ -1808,6 +1813,7 @@ def test_execute_workbook_run_quarantines_existing_outputs(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         def _fake_export(
             partial, metrics, *,
@@ -1873,6 +1879,7 @@ def test_runner_passes_through_zero_primary_yfinance_when_records_empty(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         def _fake_export(
             partial, metrics, *,
@@ -1945,6 +1952,7 @@ def test_runner_records_primary_and_secondary_fetches_via_impactsearch_seam(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         # Simulate impactsearch recording 1 secondary + 2 primary fetches.
         fake_records.append({
@@ -2034,6 +2042,7 @@ def test_runner_zero_yf_gate_marks_failure_when_primary_fetch_observed(
         output_path,
         use_multiprocessing,
         export_atomic,
+        **_kwargs,
     ):
         def _fake_export(
             partial, metrics, *,
@@ -2076,6 +2085,446 @@ def test_runner_zero_yf_gate_marks_failure_when_primary_fetch_observed(
     assert "IMPACT_REQUIRE_ZERO_PRIMARY_YF" in pt["reason"]
     assert "AAPL" in pt["reason"]
     assert pt["primary_yfinance_fetch_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 10d. --validation-mode legacy_fast | durable (Phase 6I-57 amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_validation_mode_constants_are_exposed():
+    assert runner.VALIDATION_MODE_DURABLE == "durable"
+    assert runner.VALIDATION_MODE_LEGACY_FAST == "legacy_fast"
+    assert set(runner.ALL_VALIDATION_MODES) == {
+        "durable", "legacy_fast",
+    }
+    assert runner.LEGACY_FAST_VALIDATION_STATUS == (
+        "not_run_manual_spymaster_audit"
+    )
+
+
+def test_cli_parses_validation_mode_durable():
+    args = runner._parse_argv([
+        "--secondaries", "SPY",
+        "--validation-mode", "durable",
+    ])
+    assert args.validation_mode == "durable"
+
+
+def test_cli_parses_validation_mode_legacy_fast():
+    args = runner._parse_argv([
+        "--secondaries", "SPY",
+        "--validation-mode", "legacy_fast",
+    ])
+    assert args.validation_mode == "legacy_fast"
+
+
+def test_cli_default_validation_mode_is_durable():
+    args = runner._parse_argv([
+        "--secondaries", "SPY",
+    ])
+    assert args.validation_mode == "durable"
+
+
+def test_cli_rejects_invalid_validation_mode():
+    with pytest.raises(SystemExit):
+        runner._parse_argv([
+            "--secondaries", "SPY",
+            "--validation-mode", "bogus_mode",
+        ])
+
+
+def test_plan_records_validation_mode_durable_default(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+    )
+    assert plan["policy"]["validation_mode"] == "durable"
+
+
+def test_plan_records_validation_mode_legacy_fast(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+        validation_mode="legacy_fast",
+    )
+    assert plan["policy"]["validation_mode"] == "legacy_fast"
+
+
+def test_plan_rejects_unknown_validation_mode(tmp_path):
+    with pytest.raises(ValueError):
+        runner.build_impactsearch_workbook_run_plan(
+            secondaries=["SPY"],
+            primary_source=(
+                runner
+                .PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+            ),
+            output_dir=str(tmp_path / "ixd"),
+            signal_lib_dir=str(tmp_path / "sld"),
+            price_cache_dir=str(tmp_path / "pcd"),
+            pilot_universe_loader=lambda: ("SPY",),
+            validation_mode="bogus",
+        )
+
+
+def test_command_manifest_emits_validation_mode_flag_durable(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+    )
+    manifest = runner.build_command_manifest(plan)
+    entry = manifest["entries"][0]
+    assert "--validation-mode" in entry["argv"]
+    idx = entry["argv"].index("--validation-mode")
+    assert entry["argv"][idx + 1] == "durable"
+
+
+def test_command_manifest_emits_validation_mode_flag_legacy_fast(
+    tmp_path,
+):
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(tmp_path / "ixd"),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+        validation_mode="legacy_fast",
+    )
+    manifest = runner.build_command_manifest(plan)
+    entry = manifest["entries"][0]
+    assert "--validation-mode" in entry["argv"]
+    idx = entry["argv"].index("--validation-mode")
+    assert entry["argv"][idx + 1] == "legacy_fast"
+
+
+def _legacy_fast_authorized_plan(tmp_path):
+    """Mirror of _authorized_plan but with validation_mode=legacy_fast."""
+    ixd = tmp_path / "ixd"
+    plan = runner.build_impactsearch_workbook_run_plan(
+        secondaries=["SPY"],
+        primary_source=(
+            runner
+            .PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        output_dir=str(ixd),
+        signal_lib_dir=str(tmp_path / "sld"),
+        price_cache_dir=str(tmp_path / "pcd"),
+        write=True,
+        allow_network_fetch=True,
+        pilot_universe_loader=lambda: ("SPY", "AAPL"),
+        primary_library_existence_checker=(
+            lambda t, d: True
+        ),
+        validation_mode="legacy_fast",
+    )
+    return plan, ixd
+
+
+def test_execute_workbook_run_legacy_fast_passes_validation_none_through_override(
+    tmp_path,
+):
+    """When the plan policy carries validation_mode=legacy_fast,
+    the runner must call the override callable with
+    ``validation_mode="legacy_fast"``. The override then writes the
+    workbook via the existing atomic export seam with
+    ``validation_summary=None`` and
+    ``per_strategy_validation=None``. The per-secondary result
+    must surface ``validation_mode='legacy_fast'``,
+    ``durable_validation_ran=False``, and
+    ``validation_status='not_run_manual_spymaster_audit'``."""
+    plan, ixd = _legacy_fast_authorized_plan(tmp_path)
+    received: dict = {}
+
+    def _override(
+        *,
+        secondary, primary_tickers, output_path,
+        use_multiprocessing, export_atomic,
+        validation_mode="durable", **_kwargs,
+    ):
+        received["validation_mode"] = validation_mode
+        received["primary_tickers"] = list(primary_tickers)
+
+        # Capture the kwargs the override passes into the
+        # atomic export so we can prove validation_summary=None
+        # and per_strategy_validation=None.
+        atomic_kwargs_seen: dict = {}
+
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            atomic_kwargs_seen["validation_summary"] = (
+                validation_summary
+            )
+            atomic_kwargs_seen[
+                "per_strategy_validation"
+            ] = per_strategy_validation
+            Path(partial).write_bytes(b"LEGACY-FAST-XLSX")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary=None,
+            per_strategy_validation=None,
+            export_callable=_fake_export,
+        )
+        received["atomic_kwargs_seen"] = atomic_kwargs_seen
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": None,
+            "validation_status": (
+                runner.LEGACY_FAST_VALIDATION_STATUS
+            ),
+            "validation_mode": "legacy_fast",
+            "durable_validation_ran": False,
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan, impactsearch_callable_override=_override,
+    )
+    assert res["status"] == "ok"
+    pt = res["per_ticker_results"][0]
+    assert received["validation_mode"] == "legacy_fast"
+    assert (
+        received["atomic_kwargs_seen"][
+            "validation_summary"
+        ]
+        is None
+    )
+    assert (
+        received["atomic_kwargs_seen"][
+            "per_strategy_validation"
+        ]
+        is None
+    )
+    assert pt["validation_mode"] == "legacy_fast"
+    assert pt["durable_validation_ran"] is False
+    assert pt["validation_status"] == (
+        "not_run_manual_spymaster_audit"
+    )
+    # No durable sidecar path returned by legacy_fast.
+    assert pt.get("validation_sidecar_path") in (None, "None")
+
+
+def test_execute_workbook_run_durable_default_preserves_validation_summary_path(
+    tmp_path,
+):
+    """Durable mode (current default) must still pass a real
+    validation_summary + per_strategy_validation into the
+    atomic export and surface durable_validation_ran=True."""
+    plan, ixd = _authorized_plan(tmp_path)
+    # _authorized_plan does not pass validation_mode; default is durable.
+    assert plan["policy"]["validation_mode"] == "durable"
+
+    atomic_kwargs_seen: dict = {}
+
+    def _override(
+        *,
+        secondary, primary_tickers, output_path,
+        use_multiprocessing, export_atomic,
+        validation_mode="durable", **_kwargs,
+    ):
+        assert validation_mode == "durable"
+
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            atomic_kwargs_seen["validation_summary"] = (
+                validation_summary
+            )
+            atomic_kwargs_seen[
+                "per_strategy_validation"
+            ] = per_strategy_validation
+            Path(partial).write_bytes(b"DURABLE-XLSX")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary={
+                "validation_status": "valid",
+            },
+            per_strategy_validation={
+                "AAPL": {"ok": True},
+            },
+            export_callable=_fake_export,
+        )
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "validation_sidecar_path": "fake/sidecar.json",
+            "validation_status": "valid",
+            "validation_mode": "durable",
+            "durable_validation_ran": True,
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan, impactsearch_callable_override=_override,
+    )
+    assert res["status"] == "ok"
+    pt = res["per_ticker_results"][0]
+    assert atomic_kwargs_seen["validation_summary"] == {
+        "validation_status": "valid",
+    }
+    assert atomic_kwargs_seen[
+        "per_strategy_validation"
+    ] == {"AAPL": {"ok": True}}
+    assert pt["validation_mode"] == "durable"
+    assert pt["durable_validation_ran"] is True
+    assert pt["validation_status"] == "valid"
+
+
+def test_execute_workbook_run_fills_missing_legacy_fast_metadata(
+    tmp_path,
+):
+    """If a (sloppy) override callable forgets to set the
+    validation-mode metadata fields, the runner must guarantee
+    they appear on the per-secondary result so downstream
+    consumers can never mistake a legacy_fast workbook for a
+    validated one."""
+    plan, ixd = _legacy_fast_authorized_plan(tmp_path)
+
+    def _sloppy_override(
+        *,
+        secondary, primary_tickers, output_path,
+        use_multiprocessing, export_atomic,
+        validation_mode="durable", **_kwargs,
+    ):
+        def _fake_export(
+            partial, metrics, *,
+            validation_summary,
+            per_strategy_validation,
+        ):
+            Path(partial).write_bytes(b"X")
+            Path(
+                partial + ".manifest.json"
+            ).write_bytes(b"{}")
+        atomic = export_atomic(
+            output_path,
+            [{"Primary Ticker": "AAPL"}],
+            validation_summary=None,
+            per_strategy_validation=None,
+            export_callable=_fake_export,
+        )
+        # Deliberately omit validation_mode /
+        # durable_validation_ran / validation_status from
+        # the result.
+        return {
+            "status": "ok",
+            "metrics_count": 1,
+            "canonical_path": atomic["canonical_path"],
+            "canonical_sidecar": atomic[
+                "canonical_sidecar"
+            ],
+        }
+
+    res = runner.execute_workbook_run(
+        plan, impactsearch_callable_override=_sloppy_override,
+    )
+    pt = res["per_ticker_results"][0]
+    assert pt["validation_mode"] == "legacy_fast"
+    assert pt["durable_validation_ran"] is False
+    assert pt["validation_status"] == (
+        "not_run_manual_spymaster_audit"
+    )
+
+
+def test_execute_workbook_run_refuses_unknown_validation_mode(
+    tmp_path,
+):
+    """If a plan somehow carries an unknown validation_mode in
+    its policy (e.g. forged), the executor must refuse before
+    invoking ImpactSearch."""
+    plan, _ixd = _authorized_plan(tmp_path)
+    # Mutate the policy to a bogus value.
+    plan["policy"]["validation_mode"] = "totally_bogus"
+    res = runner.execute_workbook_run(plan)
+    assert res["status"] == "refused"
+    assert "unknown validation_mode" in res["reason"]
+    assert res["per_ticker_results"] == []
+
+
+def test_runner_argv_for_ticker_includes_validation_mode():
+    """_runner_argv_for_ticker should always emit
+    ``--validation-mode <mode>`` so the operator-facing
+    reproducible command is unambiguous about the validation
+    contract."""
+    argv = runner._runner_argv_for_ticker(
+        "SPY",
+        primary_source=(
+            runner.PRIMARY_SOURCE_PHASE_6I_52_PILOT_UNIVERSE
+        ),
+        primary_csv=None,
+        output_dir="output/impactsearch",
+        signal_lib_dir="signal_library/data/stable",
+        price_cache_dir="price_cache/daily",
+        impact_xlsx_max_age_days=45,
+        current_as_of_date=None,
+        use_multiprocessing=True,
+        write=True,
+        allow_network_fetch=True,
+        strict_manifests=False,
+        validation_mode="legacy_fast",
+    )
+    assert "--validation-mode" in argv
+    idx = argv.index("--validation-mode")
+    assert argv[idx + 1] == "legacy_fast"
 
 
 # ---------------------------------------------------------------------------

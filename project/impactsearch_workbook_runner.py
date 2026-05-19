@@ -302,6 +302,32 @@ ALL_PRIMARY_SOURCES: tuple[str, ...] = (
 )
 
 
+# Validation modes for the workbook write path. ``durable`` is the
+# current default and routes through
+# ``_prepare_impactsearch_durable_validation_for_export`` to compute
+# durable validation summary + per-strategy validation, which are then
+# written into the workbook + sidecar by ``export_results_to_excel``.
+# ``legacy_fast`` is the explicit opt-in that mirrors the known-working
+# fast workbook generation path: it calls ``process_primary_tickers``
+# and ``export_results_to_excel(validation_summary=None,
+# per_strategy_validation=None)`` directly, with NO durable-validation
+# call and NO durable validation sidecar. Manual Spymaster review is
+# the validation surface in this mode.
+VALIDATION_MODE_DURABLE: str = "durable"
+VALIDATION_MODE_LEGACY_FAST: str = "legacy_fast"
+ALL_VALIDATION_MODES: tuple[str, ...] = (
+    VALIDATION_MODE_DURABLE,
+    VALIDATION_MODE_LEGACY_FAST,
+)
+# Validation-status string returned by legacy_fast runs. Makes
+# downstream consumers see "this workbook was NOT validated by the
+# durable engine; a human must Spymaster-audit it before relying on
+# the rows."
+LEGACY_FAST_VALIDATION_STATUS: str = (
+    "not_run_manual_spymaster_audit"
+)
+
+
 # Workbook action taxonomy. Matches the 6I-55a freshness
 # verdict shape but is named at the action level.
 WORKBOOK_ACTION_ALREADY_FRESH: str = "already_fresh"
@@ -1470,6 +1496,7 @@ def build_impactsearch_workbook_run_plan(
     write: bool = False,
     allow_network_fetch: bool = False,
     strict_manifests: bool = False,
+    validation_mode: str = VALIDATION_MODE_DURABLE,
     now_seconds: Optional[float] = None,
     pilot_universe_loader: Optional[
         Callable[[], Sequence[str]]
@@ -1525,6 +1552,11 @@ def build_impactsearch_workbook_run_plan(
         if primary_tickers_file is not None
         else DEFAULT_MASTER_TICKERS_FILE_RELATIVE
     )
+    if validation_mode not in ALL_VALIDATION_MODES:
+        raise ValueError(
+            f"unknown validation_mode: {validation_mode!r}; "
+            f"expected one of {ALL_VALIDATION_MODES}"
+        )
 
     primary_resolution = resolve_primary_universe(
         primary_source=primary_source,
@@ -1753,6 +1785,7 @@ def build_impactsearch_workbook_run_plan(
             "primary_tickers_file": (
                 primary_tickers_file_resolved
             ),
+            "validation_mode": validation_mode,
         },
         "primary_universe_resolution": primary_resolution,
         "per_ticker": per_ticker,
@@ -1786,6 +1819,7 @@ def _runner_argv_for_ticker(
     allow_network_fetch: bool,
     strict_manifests: bool,
     primary_tickers_file: Optional[str] = None,
+    validation_mode: str = VALIDATION_MODE_DURABLE,
 ) -> list[str]:
     argv = [
         PINNED_INTERPRETER,
@@ -1827,6 +1861,11 @@ def _runner_argv_for_ticker(
         argv += ["--write"]
     if allow_network_fetch:
         argv += ["--allow-network-fetch"]
+    # Always emit the validation-mode flag so the operator-facing
+    # reproducible command in the manifest is unambiguous about
+    # whether durable validation runs.
+    if validation_mode in ALL_VALIDATION_MODES:
+        argv += ["--validation-mode", validation_mode]
     return argv
 
 
@@ -1891,6 +1930,11 @@ def build_command_manifest(
     )
     strict_manifests = bool(
         policy.get("strict_manifests", False)
+    )
+    validation_mode = str(
+        policy.get(
+            "validation_mode", VALIDATION_MODE_DURABLE,
+        )
     )
 
     entries: list[dict[str, Any]] = []
@@ -1965,6 +2009,7 @@ def build_command_manifest(
                 write=True,
                 allow_network_fetch=True,
                 strict_manifests=strict_manifests,
+                validation_mode=validation_mode,
             )
             auth_class = (
                 AUTH_CLASS_IMPACTSEARCH_NETWORK_WRITE
@@ -2006,6 +2051,7 @@ def build_command_manifest(
             ),
             current_as_of_date=current_as_of_date,
             use_multiprocessing=use_multiprocessing,
+            validation_mode=validation_mode,
             write=True,
             allow_network_fetch=False,
             strict_manifests=strict_manifests,
@@ -2318,6 +2364,21 @@ def execute_workbook_run(
     use_multiprocessing = bool(
         policy.get("use_multiprocessing", False)
     )
+    validation_mode = str(
+        policy.get(
+            "validation_mode", VALIDATION_MODE_DURABLE,
+        )
+    )
+    if validation_mode not in ALL_VALIDATION_MODES:
+        return {
+            "status": "refused",
+            "reason": (
+                "unknown validation_mode in plan policy: "
+                f"{validation_mode!r}; expected one of "
+                f"{ALL_VALIDATION_MODES}"
+            ),
+            "per_ticker_results": [],
+        }
 
     if impactsearch_callable_override is None:
         def _default_impactsearch_callable(
@@ -2327,10 +2388,73 @@ def execute_workbook_run(
             output_path: str,
             use_multiprocessing: bool,
             export_atomic: Callable[..., Any],
+            validation_mode: str = VALIDATION_MODE_DURABLE,
+            **_kwargs: Any,
         ) -> dict[str, Any]:
-            # Lazy import: pulls Dash + yfinance into
-            # ``sys.modules``. Acceptable only on the
-            # authorized execution path.
+            # Lazy import. The legacy_fast branch deliberately
+            # does NOT import
+            # ``_prepare_impactsearch_durable_validation_for_export``;
+            # the durable branch imports it.
+            if validation_mode == VALIDATION_MODE_LEGACY_FAST:
+                from impactsearch import (  # noqa: E501
+                    process_primary_tickers,
+                    export_results_to_excel,
+                )
+                metrics = process_primary_tickers(
+                    secondary,
+                    list(primary_tickers),
+                    use_multiprocessing,
+                    mark_complete=False,
+                )
+                if not metrics:
+                    return {
+                        "status": "failed",
+                        "reason": (
+                            "process_primary_tickers returned "
+                            "no metrics for "
+                            f"{secondary}"
+                        ),
+                        "metrics_count": 0,
+                        "validation_mode": (
+                            VALIDATION_MODE_LEGACY_FAST
+                        ),
+                        "durable_validation_ran": False,
+                        "validation_status": (
+                            LEGACY_FAST_VALIDATION_STATUS
+                        ),
+                    }
+                # legacy_fast: skip durable validation entirely.
+                # Pass validation_summary=None and
+                # per_strategy_validation=None into the atomic
+                # export so ImpactSearch's own export path takes
+                # its no-durable-validation branch.
+                atomic_result = export_atomic(
+                    output_path,
+                    metrics,
+                    validation_summary=None,
+                    per_strategy_validation=None,
+                    export_callable=export_results_to_excel,
+                )
+                return {
+                    "status": "ok",
+                    "metrics_count": len(metrics),
+                    "validation_sidecar_path": None,
+                    "validation_status": (
+                        LEGACY_FAST_VALIDATION_STATUS
+                    ),
+                    "validation_mode": (
+                        VALIDATION_MODE_LEGACY_FAST
+                    ),
+                    "durable_validation_ran": False,
+                    "canonical_path": atomic_result[
+                        "canonical_path"
+                    ],
+                    "canonical_sidecar": atomic_result[
+                        "canonical_sidecar"
+                    ],
+                }
+            # validation_mode == durable -- existing behavior,
+            # byte-identical to the prior runner contract.
             from impactsearch import (  # noqa: E501
                 process_primary_tickers,
                 _prepare_impactsearch_durable_validation_for_export,  # noqa: E501
@@ -2351,6 +2475,8 @@ def execute_workbook_run(
                         f"{secondary}"
                     ),
                     "metrics_count": 0,
+                    "validation_mode": VALIDATION_MODE_DURABLE,
+                    "durable_validation_ran": False,
                 }
             (
                 _contract,
@@ -2380,6 +2506,8 @@ def execute_workbook_run(
                 "validation_status": (
                     validation_summary or {}
                 ).get("validation_status"),
+                "validation_mode": VALIDATION_MODE_DURABLE,
+                "durable_validation_ran": True,
                 "canonical_path": atomic_result[
                     "canonical_path"
                 ],
@@ -2476,8 +2604,28 @@ def execute_workbook_run(
                 output_path=out_path,
                 use_multiprocessing=use_multiprocessing,
                 export_atomic=_atomic_export_workbook,
+                validation_mode=validation_mode,
             )
             result.setdefault("secondary", sec)
+            # Guarantee validation-mode metadata is present on
+            # every per-secondary result, even if a test override
+            # callable forgot to set it. Defaults match the
+            # plan's validation_mode and "did this run write a
+            # durable sidecar?" semantics.
+            result.setdefault(
+                "validation_mode", validation_mode,
+            )
+            result.setdefault(
+                "durable_validation_ran",
+                validation_mode == VALIDATION_MODE_DURABLE,
+            )
+            if (
+                validation_mode == VALIDATION_MODE_LEGACY_FAST
+                and not result.get("validation_status")
+            ):
+                result["validation_status"] = (
+                    LEGACY_FAST_VALIDATION_STATUS
+                )
             _t_end_mono = time.monotonic()
             _t_end_iso = datetime.now(
                 tz=timezone.utc,
@@ -2838,6 +2986,26 @@ def _parse_argv(
         ),
     )
     parser.add_argument(
+        "--validation-mode",
+        type=str,
+        choices=ALL_VALIDATION_MODES,
+        default=VALIDATION_MODE_DURABLE,
+        help=(
+            "durable (default) routes the write path through "
+            "_prepare_impactsearch_durable_validation_for_export "
+            "and writes a durable validation sidecar. "
+            "legacy_fast skips durable validation entirely and "
+            "calls export_results_to_excel with "
+            "validation_summary=None / per_strategy_validation="
+            "None, mirroring the known-working fast workbook "
+            "generation path. legacy_fast results are NOT "
+            "presented as validated; "
+            "validation_status='not_run_manual_spymaster_audit' "
+            "and a human Spymaster review is the validation "
+            "surface."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=DEFAULT_IMPACT_XLSX_DIR_RELATIVE,
@@ -2947,6 +3115,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write=args.write,
         allow_network_fetch=args.allow_network_fetch,
         strict_manifests=args.strict_manifests,
+        validation_mode=args.validation_mode,
     )
     manifest = build_command_manifest(plan)
     if args.print_json:
