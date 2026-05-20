@@ -6,10 +6,12 @@ This module enables a 99.99% reduction in Yahoo API calls by trusting recently-b
 signal libraries from onepass.py instead of re-fetching every primary ticker.
 """
 
+import functools
 import os
 import sys
 import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
@@ -292,6 +294,51 @@ def get_primary_signals_fast(primary_ticker: str, secondary_index: pd.DatetimeIn
     elif why and "basis_mismatch_overridden" in why:
         status += "|basis_override"
     return s, f"{status} (lib_days={len(s)})"
+
+def _auto_lru_size() -> int:
+    """Size the loader LRU cache to fit the whole stable universe + slack.
+
+    The PKLs live under ``<SIGNAL_LIBRARY_DIR>/stable/`` per
+    ``_lib_path_for`` above. With one entry per primary, secondary 2+ of
+    a multi-secondary runner invocation become pure cache-hit loads.
+    Falls back to a 50,000 floor when the directory cannot be inspected
+    so the fix degrades to "always cache" rather than "no cache".
+    """
+    try:
+        stable = Path(SIGNAL_LIBRARY_DIR) / "stable"
+        universe = sum(1 for _ in stable.glob("*_stable_v*.pkl"))
+        return max(universe * 2, 50_000)
+    except Exception:
+        return 50_000
+
+
+_LRU_CACHE_SIZE = _auto_lru_size()
+try:
+    _UNIVERSE_SIZE_AT_IMPORT = sum(
+        1 for _ in (Path(SIGNAL_LIBRARY_DIR) / "stable").glob(
+            "*_stable_v*.pkl"
+        )
+    )
+except Exception:
+    _UNIVERSE_SIZE_AT_IMPORT = -1
+
+# Phase 6I-59: wrap the loader with an LRU keyed by ticker. The library
+# files are immutable in steady state between OnePass writes (the existing
+# manifest hash cache in provenance_manifest already keys on
+# (path, mtime_ns, size) for content-hash invalidation); within a single
+# runner process across multiple secondaries the same primary is loaded
+# once and reused. This eliminates ~90% of per-primary manifest-verify
+# cost on secondaries 2+.
+_load_signal_library_quick = functools.lru_cache(
+    maxsize=_LRU_CACHE_SIZE
+)(_load_signal_library_quick)
+
+LOGGER.info(
+    f"[FASTPATH] lru_cache_size={_LRU_CACHE_SIZE} "
+    f"universe_size={_UNIVERSE_SIZE_AT_IMPORT} "
+    f"signal_library_dir={SIGNAL_LIBRARY_DIR}"
+)
+
 
 def log_fastpath_stats(stats: dict):
     """Log fast-path usage statistics."""

@@ -97,7 +97,44 @@ ARTIFACT_KIND_OUTPUT = "output"
 # mutation contract intact for the legacy direct-call shape.
 
 _MANIFEST_HASH_CACHE: "OrderedDict[Tuple[str, int, int], str]" = OrderedDict()
-_MANIFEST_HASH_CACHE_MAX = 256
+
+
+def _auto_manifest_cache_max() -> int:
+    """Size the manifest-hash LRU cache to fit the whole stable universe.
+
+    Reads ``SIGNAL_LIBRARY_DIR`` from the env (same key used by
+    ``signal_library/impact_fastpath.py``); counts the stable PKLs under
+    ``<dir>/stable/``; returns ``max(universe * 2, 50_000)``. Falls back
+    to the 50,000 floor when the directory cannot be inspected.
+
+    Replaces the prior hard-coded 256 cap, which evicted continuously at
+    universe scale (35,990 primaries) and produced a ~0% hit rate.
+    """
+    try:
+        sl_dir = os.environ.get("SIGNAL_LIBRARY_DIR", "signal_library/data")
+        stable = Path(sl_dir) / "stable"
+        universe = sum(1 for _ in stable.glob("*_stable_v*.pkl"))
+        return max(universe * 2, 50_000)
+    except Exception:
+        return 50_000
+
+
+_MANIFEST_HASH_CACHE_MAX = _auto_manifest_cache_max()
+try:
+    _MANIFEST_UNIVERSE_AT_IMPORT = sum(
+        1 for _ in (
+            Path(os.environ.get("SIGNAL_LIBRARY_DIR", "signal_library/data"))
+            / "stable"
+        ).glob("*_stable_v*.pkl")
+    )
+except Exception:
+    _MANIFEST_UNIVERSE_AT_IMPORT = -1
+
+LOGGER.info(
+    f"[MANIFEST_HASH_CACHE] max_size={_MANIFEST_HASH_CACHE_MAX} "
+    f"universe_size={_MANIFEST_UNIVERSE_AT_IMPORT}"
+)
+
 _MANIFEST_HASH_CACHE_LOCK = threading.RLock()
 _MANIFEST_HASH_CACHE_STATS = {
     "hits": 0,
