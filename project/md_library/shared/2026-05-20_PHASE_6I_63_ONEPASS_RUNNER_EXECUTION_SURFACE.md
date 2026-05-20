@@ -281,3 +281,71 @@ Add gitignored launcher only after runner behavior is proven. Do not bundle laun
 Build `onepass_workbook_runner.py` fresh. Do not revive `signal_library/batch_updater.py`.
 
 The runner should mirror the Dash worker one ticker at a time, default to `use_existing_signals=True`, read `master_tickers.txt`, require explicit network authorization, write atomically through a partial workbook, and produce JSON-only stdout. Before any full-universe overnight run, Phase B/C must measure the May 1-6 changes, especially verified-loader manifest hashing, against a small pilot.
+
+---
+
+## 10. Phase 6I-66 - Phase C supervised smoke (closeout)
+
+Supervised small-N integration verification for the merged Phase B runner. No code or test changes. Recorded here so the Phase A scoping doc carries the Phase C outcome without needing to consult untracked session logs.
+
+**Session evidence path (untracked, gitignored):**
+`logs/phase_6i66_smoke_run/20260520T101353Z/`
+
+**Runner commit:** `6c29c54a62438d921149057ce3199d1860ced687` (Phase 6I-64 squash, PR #282).
+
+**Tickers (6):** `AAPL, MSFT, SPY, NVDA, GOOGL, AMZN`.
+
+**Command behavior:**
+
+- `onepass_workbook_runner.py` invoked with `--write` and `--allow-network-fetch`.
+- `--force-rebuild` not passed; `use_existing_signals=True` (default).
+- Output isolation: workbook written to the session `output_dir/`. Canonical `output/onepass/onepass.xlsx` not written to.
+
+**Runtime:**
+
+- Exit code: `0`.
+- Elapsed: `23.993` s.
+- 6/6 per-ticker results `status="ok"`.
+- `metrics_count = 6`.
+
+**Stdout / stderr discipline:**
+
+- Stdout was exactly one parseable JSON object.
+- `onepass.py` import-time and per-ticker prints did not contaminate stdout (captured by the runner's `contextlib.redirect_stdout` around the lazy import and the engine call).
+- `tqdm` progress appeared on stderr (outer runner bar + inner OnePass-engine per-ticker bar).
+- No unhandled traceback.
+
+**Workbook (`onepass_smoke.xlsx`):**
+
+- Sidecar `onepass_smoke.xlsx.manifest.json` written alongside.
+- 6 rows, 15 canonical OnePass columns (`Primary Ticker`, `Trigger Days`, `Wins`, `Losses`, `Win Ratio (%)`, `Std Dev (%)`, `Sharpe Ratio`, `t-Statistic`, `p-Value`, `Significant 90%`, `Significant 95%`, `Significant 99%`, `Avg Daily Capture (%)`, `Total Capture (%)`, `Last Updated`).
+- `Primary Ticker` set exactly `{AAPL, MSFT, SPY, NVDA, GOOGL, AMZN}`; no duplicate rows.
+
+**Manifest:**
+
+- `producer_engine = "onepass"`.
+- `engine_version = "1.0.0"`.
+- `current_run_row_count = 6`.
+- `git_commit` matched the runner commit (`6c29c54a62438d921149057ce3199d1860ced687`).
+- `git_dirty = false`.
+
+**Canonical artifacts unchanged:**
+
+- `output/onepass/onepass.xlsx` SHA-256 unchanged: `7bf83e85fb119e95ef0f4aa8a669268f32679dea4abb6c3a88f5bbf3d1a6f067`.
+- `output/impactsearch/SPY_analysis.xlsx` SHA-256 unchanged: `d3c538452f9345902ba546e5f370e3857a5d155a8e14d3e80af353567c450b56`.
+
+**Stable library mutation profile:**
+
+- `signal_library/data/stable/` file count unchanged.
+- 12 changed files total: the six smoke ticker `_stable_v1_0_0.pkl` files plus six matching `.manifest.json` sidecars.
+- Changed tickers were only `AAPL, MSFT, SPY, NVDA, GOOGL, AMZN`.
+- Zero non-smoke stable PKLs changed.
+- **Rebuild cause:** the pre-existing smoke PKLs lacked the newer `params.engine_version` provenance field, so OnePass performed a one-time per-ticker rebuild despite `use_existing_signals=True`. The rebuild populated the field; T-1 persistence dropped the last bar before save, matching documented engine behavior.
+
+**Verdict:** PASS.
+
+### Phase D note
+
+- The Phase D full-universe run should expect some one-time stable-library provenance rebuilds for tickers whose existing PKLs lack `params.engine_version`. This is normal under `use_existing_signals=True` and does not indicate a runner defect.
+- Phase D must snapshot `signal_library/data/stable/` before and after the run and verify that the mutation scope is bounded to the universe actually processed.
+- Phase D remains a separate authorized task. This closeout does not authorize a full-universe run.
