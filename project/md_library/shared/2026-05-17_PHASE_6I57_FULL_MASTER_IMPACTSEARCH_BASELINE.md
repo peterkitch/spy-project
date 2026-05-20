@@ -411,6 +411,105 @@ under `test_scripts/benchmarks/` with a `README.md` describing
 each script's question, command, output shape, and concurrency
 safety.
 
+## Phase 6I-59 — fastpath-loader LRU verification (PR #278)
+
+The forensic audit (`2026-05-19_IMPACTSEARCH_DASH_VS_RUNNER_FORENSIC_AUDIT.md`)
+identified the per-primary `_load_signal_library_quick` call as the
+dominant unnecessary cost on multi-secondary full-universe runs:
+every secondary re-deserialized + re-verified all 35,990 PKLs
+because the loader had no caching and the manifest hash cache was
+capped at 256 entries (~0 % hit rate at universe scale).
+
+**PR #278** addressed this with an auto-scaled `functools.lru_cache`
+on `signal_library/impact_fastpath.py:_load_signal_library_quick`
+plus an auto-scaling `_MANIFEST_HASH_CACHE_MAX` in
+`provenance_manifest.py`. Both compute `max(universe * 2, 50_000)`
+from `<SIGNAL_LIBRARY_DIR>/stable/*_stable_v*.pkl` at module
+import. Merged to `main` at commit
+**`10c07aa9012ec294b62b08069ff1c498de82376f`**.
+
+### End-to-end verification — META + TSLA
+
+Two-secondary headless legacy_fast run in a single process,
+launched 2026-05-20T01:01:50Z, completed 2026-05-20T03:03:33Z.
+Total wall **123.68 min**. Returncode 0. Not terminated by the
+5-h hard ceiling.
+
+| field | META (cold cache) | TSLA (warm LRU) |
+|---|---:|---:|
+| elapsed | **4,915.41 s = 81.92 min** | **2,383.97 s = 39.73 min** |
+| rows produced | 35,555 | 35,558 |
+| skipped | 435 | 432 |
+| row + skip accounting | **35,555 + 435 = 35,990 ✓** | **35,558 + 432 = 35,990 ✓** |
+| `validation_mode` | `legacy_fast` | `legacy_fast` |
+| `durable_validation_ran` | `false` | `false` |
+| `validation_status` | `not_run_manual_spymaster_audit` | `not_run_manual_spymaster_audit` |
+| `validation_sidecar_path` | `null` | `null` |
+| `primary_yfinance_fetch_count` | **0** | **0** |
+| Data Source | `{FASTPATH: 35,555}` | `{FASTPATH: 35,558}` |
+| Secondary Ticker | `{META: 35,555}` | `{TSLA: 35,558}` |
+
+**TSLA / META elapsed ratio: 0.486** — warm-cache speedup
+**2.06×** (well below the 0.70 PASS threshold). META and TSLA
+row/skip profiles are materially identical (within 0.01 %),
+so the timing comparison is not biased by `sec_df.index` length
+differences.
+
+**RSS peak ~99 GB** during META's cold-cache fill, plateaued for
+the rest of the run — confirming the memory-for-speed tradeoff
+PR #278 was designed around. The machine has 200 GB RAM; the
+working set sat at ~50 % of physical RAM, safely inside the
+envelope.
+
+The pre-existing non-target workbooks (`SPY_analysis.xlsx`,
+`AAPL_analysis.xlsx`, `MSFT_analysis.xlsx`, `AMZN_analysis.xlsx`,
+`GOOGL_analysis.xlsx`, `NVDA_analysis.xlsx`) were verified
+**SHA256 + size byte-identical** to their pre-run state.
+
+`stderr` was 0 bytes. Zero provenance-mismatch warnings, zero
+cache-race errors, zero zero-primary-yf gate fires.
+
+The `[FASTPATH] lru_cache_size=…` and `[MANIFEST_HASH_CACHE] max_size=…`
+startup log lines emitted via `LOGGER.info(…)` did **not** surface
+in `stdout` / `stderr` for the runner subprocess (Python's
+`logging` module is not configured to print INFO-level records
+in the runner's default boot path). Static active-module
+inspection confirmed PR #278 code is on
+`signal_library/impact_fastpath.py:332-337` and
+`provenance_manifest.py:122-135`, and the timing delta is the
+definitive evidence that the LRU is delivering the predicted
+warm-secondary acceleration.
+
+**Correctness verdict: PASS.**
+**Performance verdict: PASS** (TSLA/META = 0.486 ≤ 0.70).
+
+### Operational rule for the new ImpactSearch LRU behavior
+
+- Run **one headless ImpactSearch runner process at a time** on
+  the full universe. The fastpath LRU cache is per-process and
+  saturates at roughly **99 GB RSS** at the current 35,990-primary
+  universe; concurrent runners would multiply this and risk
+  driving the machine into memory pressure.
+- Prefer **one multi-secondary runner invocation** (passing all
+  secondaries via a single `--secondaries A,B,C,…` CSV) over
+  multiple back-to-back single-secondary invocations. Each new
+  runner process pays the full ~80-min cold-cache fill on its
+  first secondary; subsequent secondaries within the same process
+  amortize to roughly half (~40 min) via the LRU.
+- **Do not rebuild or promote signal libraries while an
+  ImpactSearch runner process is alive.** The LRU is keyed by
+  ticker string and caches the deserialized library dict in
+  memory; if a stable-promotion writer replaces a PKL on disk,
+  the running process keeps serving the pre-promotion library.
+  Restart the Dash app / runner process after OnePass or
+  stable-promotion changes `signal_library/data/stable`.
+- Cache-warm secondaries within one process are expected to be
+  materially faster than the first cold-cache secondary. This
+  is normal and is the entire point of PR #278.
+- `legacy_fast` workbooks remain **manually validated through
+  Spymaster review**; durable validation is bypassed by design
+  (`validation_status = not_run_manual_spymaster_audit`).
+
 ## What stayed out of scope
 
 Per the operator's narrowed-scope instruction:
