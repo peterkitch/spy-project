@@ -6,12 +6,14 @@
 
 ## Pre-check
 
-- cwd: `C:\Users\sport\Documents\PythonProjects\spy-project\project`
-- repo root: `C:\Users\sport\Documents\PythonProjects\spy-project`
+> Actual local paths live in project/CLAUDE.md and are not committed to tracked docs.
+
+- cwd: `<PROJECT_ROOT>`
+- repo root: `<REPO_ROOT>`
 - branch: `main`
 - HEAD: `6719fad245dcf37f6a1b60fb8ce60a81ec5c4606`
 - git status: `## main...origin/main` clean
-- pinned interpreter from `CLAUDE.md`: `C:\Users\sport\AppData\Local\NVIDIA\MiniConda\envs\spyproject2\python.exe`
+- pinned interpreter from `CLAUDE.md`: `<PINNED_INTERPRETER>`
 
 ---
 
