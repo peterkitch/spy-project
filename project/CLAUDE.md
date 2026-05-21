@@ -120,6 +120,21 @@ main`, and respond with the standard 7-point template
 (squash confirmation, merge commit hash, title, local HEAD,
 status, branch preserved on origin, surprises).
 
+### 4a. Audit-vs-Implementation Authority
+
+Codex audits may push fixes ONLY when ALL apply:
+
+1. The original prompt explicitly says "you may patch in-audit".
+2. The gap is small, unambiguous, and matches a locked spec verbatim.
+3. Commit message starts with "Codex audit fix:".
+4. No new public surfaces, new defaults, or new test patterns added.
+5. Patches limited to the files already in the PR diff.
+
+Otherwise: report-only. Operator decides whether to send fix to Claude
+Code or accept Codex patch via separate authorization.
+
+Every Codex patch requires Claude Code audit-of-patch before merge.
+
 ### 5. Authoritative documents
 
 When implementing, debugging, or auditing, these are the
