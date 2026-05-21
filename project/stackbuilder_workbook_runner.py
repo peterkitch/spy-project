@@ -1183,8 +1183,10 @@ def execute_run(
     )
     for sec in iterator:
         ns = build_stackbuilder_args_namespace(args, sec, primaries_resolution)
+        engine_stdout = io.StringIO()
         try:
-            engine_result = engine_callable(ns, sec, primaries or None)
+            with contextlib.redirect_stdout(engine_stdout):
+                engine_result = engine_callable(ns, sec, primaries or None)
         except SystemExit as exc:
             engine_result = {
                 "status": "error",
@@ -1205,6 +1207,15 @@ def execute_run(
                 "captured_stdout_tail": "",
                 "error": f"{type(exc).__name__}: {exc}",
             }
+
+        captured_engine_stdout = engine_stdout.getvalue()
+        if captured_engine_stdout:
+            sys.stderr.write(captured_engine_stdout)
+            existing_tail = str(engine_result.get("captured_stdout_tail") or "")
+            combined_tail = existing_tail + captured_engine_stdout
+            if len(combined_tail) > 4000:
+                combined_tail = combined_tail[-4000:]
+            engine_result["captured_stdout_tail"] = combined_tail
 
         run_dir = engine_result.get("run_dir")
         run_summary = summarize_stackbuilder_run_dir(run_dir) if run_dir else {

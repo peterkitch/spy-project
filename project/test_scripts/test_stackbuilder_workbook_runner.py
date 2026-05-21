@@ -10,7 +10,7 @@ import io
 import json
 import os
 import sys
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -422,7 +422,7 @@ def test_engine_stdout_is_captured_with_fake_callable(tmp_path: Path):
     )
 
     def noisy_engine(args_ns, secondary, primaries=None):
-        # Simulate what _default_stackbuilder_callable captures.
+        print("RAW_ENGINE_NOISE")
         return {
             "status": "ok",
             "secondary": secondary,
@@ -433,26 +433,30 @@ def test_engine_stdout_is_captured_with_fake_callable(tmp_path: Path):
         }
 
     err_buf = io.StringIO()
+    out_buf = io.StringIO()
     with redirect_stderr(err_buf):
-        result = runner.execute_run(
-            args, ["SPY"],
-            primaries_resolution={
-                "status": "ok", "primary_source": "impact_xlsx",
-                "primaries": [], "primary_count": 0,
-                "source_path": str(tmp_path), "issues": [],
-            },
-            engine_callable=noisy_engine,
-            selection_updater=lambda *a, **k: {
-                "status": "skipped",
-                "selected_build_path": None,
-                "pinned_path": None,
-                "payload": None,
-                "issues": [],
-            },
-        )
+        with redirect_stdout(out_buf):
+            result = runner.execute_run(
+                args, ["SPY"],
+                primaries_resolution={
+                    "status": "ok", "primary_source": "impact_xlsx",
+                    "primaries": [], "primary_count": 0,
+                    "source_path": str(tmp_path), "issues": [],
+                },
+                engine_callable=noisy_engine,
+                selection_updater=lambda *a, **k: {
+                    "status": "skipped",
+                    "selected_build_path": None,
+                    "pinned_path": None,
+                    "payload": None,
+                    "issues": [],
+                },
+            )
     assert result["status"] == "ok"
+    assert out_buf.getvalue() == ""
+    assert "RAW_ENGINE_NOISE" in err_buf.getvalue()
     assert result["per_secondary_results"][0]["captured_stdout_tail"] == (
-        "ENGINE_NOISE_LINE\n[PHASE2] noise\n"
+        "ENGINE_NOISE_LINE\n[PHASE2] noise\nRAW_ENGINE_NOISE\n"
     )
 
 
