@@ -96,6 +96,19 @@ DEFAULT_TOTAL_CAPTURE_TOLERANCE = 1e-9
 _RAW_TICKER_SPLIT_RE = re.compile(r"[,\s]+")
 _PKL_TICKER_RE = re.compile(r"^(?P<ticker>.+)_stable_v[0-9_]+\.pkl$")
 
+# Phase 6I-71: characters legal in a runner-owned progress filename.
+# Mirrors the engine's ``vendor_secondary_clean = vendor_secondary
+# .replace('.', '_')`` sanitization (stackbuilder.py:2337) and extends
+# it to strip any other path / shell metacharacters; the caret in
+# tickers like ``^GSPC`` is safe on NTFS per the engine's own comment,
+# so it's preserved.
+_SAFE_SECONDARY_TRANSLATE = str.maketrans({
+    ".": "_",
+    "/": "_",
+    "\\": "_",
+    " ": "_",
+})
+
 
 # ---------------------------------------------------------------------------
 # Argparse
@@ -181,6 +194,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--operator-budget-label", default=None)
 
     p.add_argument("--no-progress", action="store_true", default=False)
+    # Phase 6I-71: runner-owned progress directory. Default ``None``
+    # resolves to ``<outdir>/_progress`` so an isolated --outdir (e.g.
+    # Phase C smoke under logs/) does NOT default progress writes back
+    # to canonical ``output/stackbuilder/_progress``.
+    p.add_argument("--progress-dir", default=None)
     return p.parse_args(argv)
 
 
@@ -632,6 +650,59 @@ def _git_head() -> tuple[Optional[str], Optional[bool]]:
     return commit, dirty
 
 
+def _safe_secondary_filename(secondary: str) -> str:
+    """Return a filesystem-safe stem for ``secondary``.
+
+    Mirrors the engine's ``replace('.', '_')`` sanitization
+    (stackbuilder.py:2337) and additionally strips path / whitespace
+    metacharacters. Preserves caret (``^GSPC``) per the engine's
+    NTFS-safe comment.
+    """
+    return str(secondary or "").translate(_SAFE_SECONDARY_TRANSLATE)
+
+
+def _effective_progress_dir(args: argparse.Namespace) -> str:
+    """Resolve the runner's progress-write directory.
+
+    - When ``--progress-dir`` is supplied (truthy), use it verbatim.
+    - Otherwise default to ``<outdir>/_progress``. **This is the
+      Phase 6I-71 invariant**: an isolated ``--outdir`` (e.g. Phase C
+      under ``logs/...``) must NOT default progress writes back to
+      canonical ``output/stackbuilder/_progress``.
+    """
+    explicit = getattr(args, "progress_dir", None)
+    if explicit:
+        return str(explicit)
+    outdir = getattr(args, "outdir", DEFAULT_OUTDIR)
+    return os.path.join(str(outdir), "_progress")
+
+
+_PROGRESS_PATH_COUNTER = 0
+
+
+def build_progress_path(args: argparse.Namespace, secondary: str) -> str:
+    """Compute a per-secondary progress-file path under the effective
+    progress directory.
+
+    Filename layout::
+
+        <effective_progress_dir>/<SAFE_SECONDARY>_<pid>_<ts_ns>_<seq>.json
+
+    ``ts_ns`` is nanosecond-precision so repeated same-secondary calls
+    inside a single process tick still produce distinct filenames;
+    ``seq`` is a monotonic in-process counter that defends against the
+    rare clock collision under tools that quantize ``time_ns`` to
+    microseconds on some platforms.
+    """
+    global _PROGRESS_PATH_COUNTER
+    _PROGRESS_PATH_COUNTER += 1
+    safe = _safe_secondary_filename(secondary)
+    fname = (
+        f"{safe}_{os.getpid()}_{time.time_ns()}_{_PROGRESS_PATH_COUNTER}.json"
+    )
+    return os.path.join(_effective_progress_dir(args), fname)
+
+
 def _effective_config(args: argparse.Namespace) -> dict:
     return {
         "k_max": int(getattr(args, "k_max", DEFAULT_K_MAX)),
@@ -650,6 +721,8 @@ def _effective_config(args: argparse.Namespace) -> dict:
         "grace_days": getattr(args, "grace_days", None),
         "output_format": getattr(args, "output_format", DEFAULT_OUTPUT_FORMAT),
         "outdir": getattr(args, "outdir", DEFAULT_OUTDIR),
+        "progress_dir": getattr(args, "progress_dir", None),
+        "effective_progress_dir": _effective_progress_dir(args),
         "jobs": int(getattr(args, "jobs", DEFAULT_JOBS)),
         "primary_source": getattr(args, "primary_source", "impact_xlsx"),
         "impact_xlsx_dir": getattr(
@@ -741,14 +814,18 @@ def build_run_plan(
     )
 
     secs = secondaries_resolution.get("secondaries") or []
+    effective_progress_dir = _effective_progress_dir(args)
     per_secondary_plan = [
         {
             "secondary": s,
             "primary_source": primaries_resolution.get("primary_source"),
             "primary_count": primaries_resolution.get("primary_count"),
             "outdir": os.path.join(
-                getattr(args, "outdir", DEFAULT_OUTDIR), s.replace(".", "_"),
+                getattr(args, "outdir", DEFAULT_OUTDIR),
+                _safe_secondary_filename(s),
             ),
+            "planned_progress_path": build_progress_path(args, s),
+            "effective_progress_dir": effective_progress_dir,
         }
         for s in secs
     ]
@@ -1194,7 +1271,10 @@ def execute_run(
         no_progress=bool(getattr(args, "no_progress", False)),
     )
     for sec in iterator:
-        ns = build_stackbuilder_args_namespace(args, sec, primaries_resolution)
+        progress_path = build_progress_path(args, sec)
+        ns = build_stackbuilder_args_namespace(
+            args, sec, primaries_resolution, progress_path=progress_path,
+        )
         engine_stdout = io.StringIO()
         try:
             with contextlib.redirect_stdout(engine_stdout):
@@ -1273,6 +1353,7 @@ def execute_run(
             "secondary": sec,
             "status": engine_result.get("status"),
             "run_dir": run_dir,
+            "progress_path": progress_path,
             "elapsed_seconds": engine_result.get("elapsed_seconds"),
             "row_counts": run_summary.get("row_counts"),
             "k_level_counts": run_summary.get("k_level_counts"),

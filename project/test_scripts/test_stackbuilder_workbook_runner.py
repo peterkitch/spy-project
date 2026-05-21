@@ -134,6 +134,9 @@ def test_parse_args_defaults_match_locked_v1():
     assert args.allow_network_fetch is False
     assert args.update_selected is False
     assert args.pin_build is None
+    # Phase 6I-71: progress_dir defaults to None and resolves at use-
+    # site to ``<outdir>/_progress``.
+    assert args.progress_dir is None
 
 
 # ---------------------------------------------------------------------------
@@ -791,3 +794,310 @@ def test_summarize_stackbuilder_run_dir_parses_manifest(tmp_path: Path):
     assert res["best_sharpe"] == 1.0
     assert res["best_total_capture"] == 2.0
     assert res["k_level_counts"] == {"1": 1, "2": 1}
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-71: progress-path isolation
+# ---------------------------------------------------------------------------
+
+
+def _isolated_run_plan(tmp_path: Path, **arg_overrides) -> dict:
+    """Build a runner plan with all preconditions for ``status="ready"``
+    so the per-secondary progress path is observable in the plan
+    output. Tests must still NOT call any engine.
+    """
+    argv = [
+        "--secondaries", arg_overrides.pop("secondaries", "SPY"),
+        "--primary-source", "impact_xlsx",
+        "--impact-xlsx-dir", str(tmp_path),
+        "--outdir", str(tmp_path / "out"),
+    ]
+    for k, v in arg_overrides.items():
+        if v is None or v is False:
+            continue
+        flag = "--" + k.replace("_", "-")
+        if v is True:
+            argv.append(flag)
+        else:
+            argv.extend([flag, str(v)])
+    args = runner.parse_args(argv)
+    secondaries_resolution = runner.resolve_secondaries(args)
+    primaries_resolution = runner.resolve_primaries(args)
+    conflict = {
+        "status": "ok", "conflicts": [], "queried_via": "fake",
+        "error": None,
+    }
+    return runner.build_run_plan(
+        args,
+        secondaries_resolution=secondaries_resolution,
+        primaries_resolution=primaries_resolution,
+        process_conflict_result=conflict,
+    )
+
+
+def test_plan_per_secondary_includes_progress_path_under_outdir_progress(
+    tmp_path: Path,
+):
+    plan = _isolated_run_plan(tmp_path, secondaries="SPY,QQQ")
+    assert plan["status"] == "dry_run"
+    per = plan["per_secondary_plan"]
+    assert [p["secondary"] for p in per] == ["SPY", "QQQ"]
+    expected_progress_dir = str(tmp_path / "out" / "_progress")
+    for entry in per:
+        assert entry["effective_progress_dir"] == expected_progress_dir
+        # Planned per-secondary progress path lives under the
+        # effective progress dir.
+        assert entry["planned_progress_path"].startswith(
+            expected_progress_dir + os.sep
+        ) or entry["planned_progress_path"].startswith(
+            expected_progress_dir + "/"
+        )
+    # Dry-run must NOT have created the progress directory.
+    assert not (tmp_path / "out" / "_progress").exists()
+    # Effective config carries the resolved dir explicitly.
+    assert plan["effective_config"]["effective_progress_dir"] == (
+        expected_progress_dir
+    )
+    assert plan["effective_config"]["progress_dir"] is None
+
+
+def test_phase_c_safety_default_progress_not_in_canonical_root(tmp_path: Path):
+    """Explicit negative assertion: when --outdir is set to a non-
+    canonical isolated dir, the default planned progress_path must
+    NOT default into ``output/stackbuilder/_progress``.
+    """
+    plan = _isolated_run_plan(tmp_path, secondaries="SPY")
+    per = plan["per_secondary_plan"]
+    assert per, "plan must include at least one secondary entry"
+    # Hard guard against the historical engine default leaking through.
+    canonical_default = os.path.join("output", "stackbuilder", "_progress")
+    for entry in per:
+        assert canonical_default not in entry["planned_progress_path"], (
+            f"isolated --outdir leaked progress to canonical: "
+            f"{entry['planned_progress_path']!r}"
+        )
+        assert canonical_default not in entry["effective_progress_dir"], (
+            f"effective_progress_dir leaked to canonical: "
+            f"{entry['effective_progress_dir']!r}"
+        )
+
+
+def test_execute_run_passes_isolated_progress_path_to_namespace(
+    tmp_path: Path,
+):
+    captured: list[SimpleNamespace] = []
+
+    def recording_engine(args_ns, secondary, primaries=None):
+        captured.append(args_ns)
+        return {
+            "status": "ok",
+            "secondary": secondary,
+            "run_dir": None,
+            "elapsed_seconds": 0.01,
+            "captured_stdout_tail": "",
+            "error": None,
+        }
+
+    args = _args_with(
+        secondaries="SPY",
+        primary_source="impact_xlsx",
+        impact_xlsx_dir=str(tmp_path),
+        outdir=str(tmp_path / "out"),
+        write=True,
+        allow_network_fetch=True,
+        duration_budget_minutes=10,
+        operator_budget_label="phase-c-fake",
+        no_progress=True,
+    )
+
+    err_buf = io.StringIO()
+    with redirect_stderr(err_buf):
+        result = runner.execute_run(
+            args, ["SPY"],
+            primaries_resolution={
+                "status": "ok", "primary_source": "impact_xlsx",
+                "primaries": [], "primary_count": 0,
+                "source_path": str(tmp_path), "issues": [],
+            },
+            engine_callable=recording_engine,
+            selection_updater=lambda *a, **k: {
+                "status": "skipped",
+                "selected_build_path": None,
+                "pinned_path": None,
+                "payload": None,
+                "issues": [],
+            },
+        )
+    assert result["status"] == "ok"
+    assert len(captured) == 1
+    ns = captured[0]
+    expected_progress_root = str(tmp_path / "out" / "_progress")
+    assert ns.progress_path
+    assert ns.progress_path.startswith(expected_progress_root + os.sep) or \
+        ns.progress_path.startswith(expected_progress_root + "/")
+    # Canonical-root negative assertion.
+    assert "output" + os.sep + "stackbuilder" + os.sep + "_progress" not in (
+        ns.progress_path
+    )
+    # Per-secondary result records the same path.
+    rec = result["per_secondary_results"][0]
+    assert rec["progress_path"] == ns.progress_path
+
+
+def test_explicit_progress_dir_overrides_default(tmp_path: Path):
+    captured: list[SimpleNamespace] = []
+
+    def recording_engine(args_ns, secondary, primaries=None):
+        captured.append(args_ns)
+        return {
+            "status": "ok",
+            "secondary": secondary,
+            "run_dir": None,
+            "elapsed_seconds": 0.01,
+            "captured_stdout_tail": "",
+            "error": None,
+        }
+
+    explicit_dir = tmp_path / "custom" / "progress"
+    args = _args_with(
+        secondaries="SPY",
+        primary_source="impact_xlsx",
+        impact_xlsx_dir=str(tmp_path),
+        outdir=str(tmp_path / "out"),
+        progress_dir=str(explicit_dir),
+        write=True,
+        allow_network_fetch=True,
+        duration_budget_minutes=10,
+        operator_budget_label="fake",
+        no_progress=True,
+    )
+
+    err_buf = io.StringIO()
+    with redirect_stderr(err_buf):
+        runner.execute_run(
+            args, ["SPY"],
+            primaries_resolution={
+                "status": "ok", "primary_source": "impact_xlsx",
+                "primaries": [], "primary_count": 0,
+                "source_path": str(tmp_path), "issues": [],
+            },
+            engine_callable=recording_engine,
+        )
+    assert len(captured) == 1
+    pp = captured[0].progress_path
+    assert pp.startswith(str(explicit_dir) + os.sep) or \
+        pp.startswith(str(explicit_dir) + "/")
+    # Not under <outdir>/_progress when --progress-dir overrides.
+    assert (str(tmp_path / "out" / "_progress")) not in pp
+
+
+def test_repeated_same_secondary_execute_run_yields_distinct_progress_paths(
+    tmp_path: Path,
+):
+    seen: list[str] = []
+
+    def recording_engine(args_ns, secondary, primaries=None):
+        seen.append(args_ns.progress_path)
+        return {
+            "status": "ok", "secondary": secondary, "run_dir": None,
+            "elapsed_seconds": 0.0, "captured_stdout_tail": "", "error": None,
+        }
+
+    args = _args_with(
+        secondaries="SPY",
+        primary_source="impact_xlsx",
+        impact_xlsx_dir=str(tmp_path),
+        outdir=str(tmp_path / "out"),
+        write=True,
+        allow_network_fetch=True,
+        duration_budget_minutes=10,
+        operator_budget_label="fake",
+        no_progress=True,
+    )
+    primaries_res = {
+        "status": "ok", "primary_source": "impact_xlsx",
+        "primaries": [], "primary_count": 0,
+        "source_path": str(tmp_path), "issues": [],
+    }
+    err_buf = io.StringIO()
+    with redirect_stderr(err_buf):
+        runner.execute_run(
+            args, ["SPY", "SPY", "SPY"],
+            primaries_resolution=primaries_res,
+            engine_callable=recording_engine,
+        )
+    assert len(seen) == 3
+    assert len(set(seen)) == 3, f"expected distinct paths, got {seen!r}"
+
+
+def test_main_write_path_emits_single_json_with_noisy_engine(
+    tmp_path: Path, capsys,
+):
+    """Phase 6I-71 regression for the stdout contract: even when the
+    engine_callable prints raw bytes to its (now-redirected) stdout,
+    the runner's own stdout must still be exactly one JSON object —
+    no engine noise before, inside, or after the JSON.
+    """
+    def noisy_engine(args_ns, secondary, primaries=None):
+        # The execute_run wrapper redirects stdout into a StringIO;
+        # this print goes there, then is mirrored to stderr.
+        print("RAW_ENGINE_NOISE_PRE_JSON")
+        return {
+            "status": "ok",
+            "secondary": secondary,
+            "run_dir": None,
+            "elapsed_seconds": 0.01,
+            "captured_stdout_tail": "",
+            "error": None,
+        }
+
+    rc = runner.main(
+        argv=[
+            "--secondaries", "SPY",
+            "--primary-source", "impact_xlsx",
+            "--impact-xlsx-dir", str(tmp_path),
+            "--outdir", str(tmp_path / "out"),
+            "--write",
+            "--allow-network-fetch",
+            "--duration-budget-minutes", "10",
+            "--operator-budget-label", "fake",
+            "--no-progress",
+        ],
+        engine_callable=noisy_engine,
+        process_conflict_checker=_no_conflict,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Stdout must parse as exactly one JSON object with no bare-text
+    # contamination before / between / after.
+    out = captured.out
+    assert out.rstrip("\n").startswith("{")
+    assert out.endswith("\n")
+    payload = json.loads(out)
+    assert isinstance(payload, dict)
+    rec = payload["per_secondary_results"][0]
+    # The engine's print MUST land in the JSON-quoted
+    # captured_stdout_tail field (the documented capture surface),
+    # NOT as bare text outside the JSON.
+    assert "RAW_ENGINE_NOISE_PRE_JSON" in (rec["captured_stdout_tail"] or "")
+    # And the bare-text guard: scrubbing the captured tail value from
+    # raw stdout leaves a parseable JSON shell only — no stray noise.
+    tail_value = rec["captured_stdout_tail"] or ""
+    bare_stdout_without_tail = out.replace(
+        json.dumps(tail_value)[1:-1], ""  # tail's JSON-escaped body
+    )
+    assert "RAW_ENGINE_NOISE_PRE_JSON" not in bare_stdout_without_tail
+    # Engine noise mirrored to stderr for live observability.
+    assert "RAW_ENGINE_NOISE_PRE_JSON" in captured.err
+    # And the per-secondary progress_path must be under the isolated
+    # outdir, not canonical output/stackbuilder/_progress.
+    assert "output" + os.sep + "stackbuilder" + os.sep + "_progress" not in (
+        rec["progress_path"]
+    )
+
+
+def test_safe_secondary_filename_preserves_caret_and_normalizes_dot():
+    assert runner._safe_secondary_filename("BRK.B") == "BRK_B"
+    assert runner._safe_secondary_filename("^GSPC") == "^GSPC"
+    assert runner._safe_secondary_filename("a/b") == "a_b"
+    assert runner._safe_secondary_filename("a b") == "a_b"
