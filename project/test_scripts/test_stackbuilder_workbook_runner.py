@@ -649,6 +649,17 @@ def test_pin_build_writes_pinned_manifest(tmp_path: Path):
 
 
 def test_selected_build_policy_total_capture_then_sharpe_then_latest():
+    same_k_old = {
+        "selected_k": 3, "total_capture": 99.0, "sharpe_ratio": 9.0,
+        "created_at": "2026-05-19T00:00:00Z",
+    }
+    same_k_new = {
+        "selected_k": 3, "total_capture": 4.0, "sharpe_ratio": 1.0,
+        "created_at": "2026-05-20T00:00:00Z",
+    }
+    # Same K across dates: latest run wins before cross-K comparison.
+    assert runner.select_build_per_policy([same_k_old, same_k_new]) is same_k_new
+
     a = {
         "selected_k": 3, "total_capture": 4.0, "sharpe_ratio": 1.0,
         "created_at": "2026-05-19T00:00:00Z",

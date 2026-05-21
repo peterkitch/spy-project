@@ -1098,9 +1098,11 @@ def select_build_per_policy(
 
     Each candidate must expose ``total_capture``, ``sharpe_ratio``,
     ``selected_k``, ``created_at`` (ISO-8601 string). Operator pins
-    (``operator_pinned=True``) win unconditionally; otherwise the
-    policy compares ``total_capture`` first (with tolerance),
-    ``sharpe_ratio`` second, ``created_at`` (latest) third.
+    (``operator_pinned=True``) win unconditionally. Otherwise the
+    Phase A policy first collapses same-K candidates to the latest
+    successful run, then compares the remaining K choices by
+    ``total_capture`` (with tolerance), ``sharpe_ratio``, and
+    ``created_at`` (latest).
     """
     cands = list(candidates or [])
     if not cands:
@@ -1109,6 +1111,16 @@ def select_build_per_policy(
     if pinned:
         # Latest pinned wins if multiple.
         return max(pinned, key=lambda c: c.get("created_at") or "")
+
+    latest_by_k: dict[str, dict] = {}
+    for c in cands:
+        k = str(c.get("selected_k"))
+        prev = latest_by_k.get(k)
+        if prev is None or (c.get("created_at") or "") > (
+            prev.get("created_at") or ""
+        ):
+            latest_by_k[k] = c
+    cands = list(latest_by_k.values())
 
     def _f(c: dict, key: str) -> float:
         v = c.get(key)
