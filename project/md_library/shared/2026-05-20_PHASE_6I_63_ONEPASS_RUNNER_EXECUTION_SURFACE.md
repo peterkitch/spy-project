@@ -349,3 +349,129 @@ Supervised small-N integration verification for the merged Phase B runner. No co
 - The Phase D full-universe run should expect some one-time stable-library provenance rebuilds for tickers whose existing PKLs lack `params.engine_version`. This is normal under `use_existing_signals=True` and does not indicate a runner defect.
 - Phase D must snapshot `signal_library/data/stable/` before and after the run and verify that the mutation scope is bounded to the universe actually processed.
 - Phase D remains a separate authorized task. This closeout does not authorize a full-universe run.
+
+---
+
+## Phase 6I-67 Closeout: Full-Universe OnePass Headless Run
+
+Authorized Phase D execution of the headless OnePass runner against the full master ticker universe. No code or test changes; the closeout is recorded here so future readers do not need to consult the untracked session evidence.
+
+**Session evidence path (untracked, gitignored):**
+`logs/phase_6i67_full_universe_run/20260520T103601Z/`
+
+**Run timing:**
+
+- Start: `2026-05-20T10:36:01Z`
+- End: `2026-05-21T04:27:05Z`
+- Internal `elapsed_seconds`: `64,176.645` (17 h 49 m 36 s)
+- Wall-clock from `Start-Process` to FINAL: approximately 18 h 0 m
+
+**Command behavior:**
+
+- `onepass_workbook_runner.py` invoked with `--write` and `--allow-network-fetch`.
+- `--force-rebuild` not passed; `use_existing_signals=True`.
+- Defaults applied:
+  - `--tickers-file global_ticker_library/data/master_tickers.txt`
+  - `--output-dir output/onepass`
+  - `--output-file onepass.xlsx`
+
+**Universe:**
+
+- 37,270 input tickers.
+- Source: `global_ticker_library/data/master_tickers.txt`.
+- Literal `NA` and `NAN` tickers preserved through `_parse_ticker_blob`.
+
+**Runtime profile:**
+
+- Exit code 0.
+- RSS bounded **171–263 MB** throughout the 18-hour run.
+- Effective cores ≈ **0.61**, stable from t+15 min onward.
+- 22 monitoring samples taken (startup, t+131 s, t+15 min, t+30 min, t+60 min, then hourly through t+17 hr, plus FINAL).
+- No memory pressure; no hang; 26-hour ceiling not approached.
+- Continuous stderr growth throughout (no stall-window signature).
+
+**Results:**
+
+- 37,270/37,270 per-ticker `status="ok"`.
+- 0 runner errors.
+- 35,977 workbook rows produced.
+- 1,293 tickers reported `status="ok"` with `metrics_count=0`. `metrics_count=0` means provider no-data or insufficient history for that ticker (e.g., the engine completed but the canonical-scoring path did not yield a metrics row), not a runner exception.
+
+**Workbook readback (`output/onepass/onepass.xlsx`):**
+
+- 35,977 rows.
+- 15 canonical OnePass columns.
+- 0 duplicate `Primary Ticker` values.
+- Literal `NA` / `NAN` preserved in `Primary Ticker`.
+- `p-Value` column present; 49 rows carry non-numeric placeholders (≈ 0.14% — pre-existing engine output for rows where statistics could not be computed).
+- `Last Updated` column present.
+
+**Manifest sidecar (`output/onepass/onepass.xlsx.manifest.json`):**
+
+- `producer_engine = "onepass"`.
+- `engine_version = "1.0.0"`.
+- `current_run_row_count = 35,977`.
+- `output_schema.final_row_count = 35,977`.
+- `git_commit = b212d793dccd2978eb3fe2f0586f2de117b28b8c` (matches main HEAD at run start).
+- `artifact_file_sha256` matches the recomputed SHA-256 of the written workbook.
+- `git_dirty = true`. **Benign for this run.** Current `git status` is clean (only `?? logs/`); `output/onepass/onepass.xlsx` is not git-tracked. The engine's transient view at manifest-write time captured `git_dirty=true` because the untracked `logs/phase_6i67_full_universe_run/...` session directory existed during manifest creation. No tracked file was modified.
+
+**Canonical artifacts:**
+
+- `output/onepass/onepass.xlsx` replaced via the runner's atomic write (`onepass.runner_partial.xlsx` → `os.replace` → `onepass.xlsx`). No partial files remain; no `_quarantine_*` directory created.
+- `output/impactsearch/SPY_analysis.xlsx` SHA-256 unchanged at `d3c538452f9345902ba546e5f370e3857a5d155a8e14d3e80af353567c450b56`.
+
+**Stable library mutation profile (`signal_library/data/stable/`):**
+
+| Metric | Pre | Post |
+|---|---:|---:|
+| Total files | 71,980 | 71,980 |
+| PKL count | 35,990 | 35,990 |
+| PKL manifest sidecar count | 35,990 | 35,990 |
+| Other files | 0 | 0 |
+
+- PKLs modified: **35,977**.
+- PKL manifest sidecars modified: **35,977**.
+- Files added: **0**.
+- Files removed: **0**.
+- Out-of-input-universe writes: **0**.
+- Unexpected naming (outside `*_stable_v*.pkl` / `*_stable_v*.pkl.manifest.json`): **0**.
+- Orphan / partial files left behind: **0**.
+
+**Thirteen old-stable baseline-gap tickers:**
+
+```
+BHAT, CBLUY, CFLT, ECDA, FGPRB, HLSCF, LITM, OPAP.AT, QIPT, RHO5.F, SGN, ULY, VVPR
+```
+
+These tickers had pre-existing stable PKLs, remained in the input universe for this run, produced no current workbook row (so `metrics_count=0`), and were not modified during the run. They account for the gap between the prior baseline workbook row count (35,990) and the current row count (35,977).
+
+**Stderr summary (`run.stderr.log`):**
+
+- File size ≈ 58.7 MB.
+- Outer runner `tqdm` bar closed cleanly: `OnePass: 100%|##########| 37270/37270 [17:49:25<00:00, 1.40s/ticker]`.
+- 35,991 `[ONEPASS:manifest_failed]` rebuild notices — the one-time `params.engine_version` provenance refresh predicted in the Phase 6I-66 closeout.
+- 0 `Traceback (most recent call last)` lines.
+- 0 `*Error:` lines.
+- 3,798 yfinance `Failed download` lines, all tied to provider no-data / no-output cases rather than runner defects.
+- 1 cosmetic pandas `FutureWarning` from `onepass.py` about `replace` downcasting deprecation.
+
+**Outage investigation:**
+
+- Operator flagged a possible roughly 30-minute internet outage during the run.
+- Monitoring data showed no stall signature: RSS, CPU, stderr growth, and tqdm cadence remained continuous across all 22 samples.
+- Zero-output tickers (1,293 total) were scattered across input order; 1,117 distinct contiguous zero-output runs.
+- Largest contiguous zero-output run was **8 tickers**; next four largest runs were 4 tickers each.
+- No concentrated outage window was found in the per-ticker output sequence.
+- Conclusion: the outage either did not occur during the observed process window or was inconsequential to the run result.
+
+**Audit verdict — PASS WITH NOTES:**
+
+- The 35,977-row workbook is trustworthy.
+- No full rerun needed.
+- No partial rerun needed.
+- Proceed to StackBuilder runner work.
+
+**Deferred observation (non-blocking):**
+
+- Future provenance work may distinguish `tracked_dirty` from `untracked_dirty`, or have the engine ignore runner session-evidence directories under `logs/` when computing `git_dirty`. The current behavior over-reports dirty during long runs that legitimately produce untracked evidence; the Phase 6I-67 manifest's `git_dirty=true` is the documented example.
