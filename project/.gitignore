@@ -28,6 +28,9 @@ QC/data/
 # Ignore log files
 *.log
 
+# Ignore run/session evidence written from project/
+logs/
+
 # Ignore batch files
 *.bat
 
