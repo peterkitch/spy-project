@@ -37,7 +37,9 @@
 
 Read-only static inspection only — no module was imported:
 
-- `stackbuilder.py` (full file, 3,426 lines)
+- `stackbuilder.py` (full file, 3,427 lines)
+- `provenance_manifest.py` (central verified-loader / manifest-cache surface)
+- `trafficflow.py` (downstream Spymaster PKL consumer check only)
 - `onepass_workbook_runner.py` (existence + CLI surface for lineage parity)
 - `impactsearch_workbook_runner.py` (existence for lineage parity)
 - `md_library/shared/2026-05-20_PHASE_6I_63_ONEPASS_RUNNER_EXECUTION_SURFACE.md` (Phase A pattern)
@@ -137,7 +139,42 @@ Every line reference below is repo-relative in the form `stackbuilder.py:<line>`
 | `StackBuilderValidationAdapter` | `stackbuilder.py:2768+` | Phase 5C-2c walk-forward fold adapter that re-runs `phase2_rank_all` + `phase3_build_stacks` with `data_available_through=context.selection_cutoff` and `args2.prefer_impact_xlsx=False` (full-history XLSX is forbidden inside fold selection, locked contract). |
 | `_prepare_stackbuilder_durable_validation` | `stackbuilder.py:3090+` | Run inside `run_for_secondary` before the final manifest write. Failure of the fallback-write propagates so a complete StackBuilder run directory is never produced without locked validation summary keys. |
 
-### 3.9 Progress and concurrency
+### 3.9 Upstream dependency audit
+
+| Dependency | Evidence | Current behavior / runner implication |
+|---|---|---|
+| ImpactSearch XLSX fast path | `stackbuilder.py:232-235`, `stackbuilder.py:583-700`, `stackbuilder.py:1099-1128` | Default root is `output/impactsearch` unless `PRJCT9_IMPACT_XLSX_DIR` / `--impact-xlsx-dir` overrides it. `try_load_rank_from_impact_xlsx` scans for the freshest `{SECONDARY}_*.xlsx`, rejects stale or manifest-mismatched workbooks, standardizes rank columns, and returns the ranking frame used by `phase2_rank_all`. This is the MVP primary path for the runner. |
+| Central verified signal-library load | `stackbuilder.py:32-40`, `stackbuilder.py:708-754`, `provenance_manifest.py:1036-1119` | StackBuilder's fallback library path uses `load_verified_signal_library(..., requested_params={'price_source': 'Close'})`, which routes load/type/manifest verification through the central loader. The loader uses the manifest content-hash cache when `cache=True`, so the PR #278 / Phase 6I-57 LRU sizing lesson is inherited for this fallback path. |
+| OnePass loader preference | `stackbuilder.py:210-215`, `stackbuilder.py:743-754` | If `onepass.load_signal_library` imports successfully, `load_lib_or_none` tries that first, then falls back to StackBuilder's central verified loader. The future runner should not assume the fallback path is always used; it should report effective signal-library source / warnings in the run JSON. |
+| Secondary price data | `stackbuilder.py:225`, `stackbuilder.py:506-556` | StackBuilder reads `price_cache/daily` first and falls through to `yf.download` on cache miss. The future runner must preserve the explicit `--allow-network-fetch` gate and should surface price-cache misses before execution where practical. |
+| Spymaster PKLs | `stackbuilder.py` static search; downstream evidence `trafficflow.py:86-87`, `trafficflow.py:1442-1458` | StackBuilder does **not** read `cache/results/*_precomputed_results.pkl` today. The Spymaster PKL default lives in TrafficFlow, which loads those PKLs downstream. StackBuilder output is therefore upstream of the Spymaster-PKL-consuming TrafficFlow stage, not a direct Spymaster PKL reader. |
+
+### 3.10 Recent change-history audit
+
+Read-only `git log --since=2026-05-01 --numstat -- stackbuilder.py` found 11 commits touching `stackbuilder.py`. Aggregate numstat: **+1,884 / -232**, net **+1,652**. Current file length is 3,427 lines versus 1,775 lines at the most recent pre-May-1 baseline (`7a27947`), matching the net growth.
+
+| Commit | Date | Lines | Summary | Risk classification |
+|---|---:|---:|---|---|
+| `7406886` | 2026-05-01 | +62 / -85 | Adj Close removal in stale_check + signal library, `ddof` fix. | Correctness: yes (price basis / statistics); runner-safety: low. |
+| `0768355` | 2026-05-01 | +43 / -15 | Backlog cleanup covering logs, dedupe, cache keys, grace, sentinels, closure, outdir. | Correctness: maybe; runner-safety: maybe (output/logging surfaces). |
+| `1629645` | 2026-05-02 | +30 / -7 | Parity suites + `_score_primary` fix + hardening. | Correctness: yes; artifact risk: low. |
+| `df8a456` | 2026-05-02 | +302 / -60 | Grace plumbing + `rank_inverse` structural fix. | Correctness: yes; runner defaults must preserve grace semantics. |
+| `667ce6d` | 2026-05-03 | +32 / -1 | Signal-library provenance manifests. | Artifact/contract: yes. |
+| `838009f` | 2026-05-03 | +27 / -29 | Manifest performance cache + central loader + B12 tightening. | Performance: yes; runner must preserve verified-loader path. |
+| `e31a0c7` | 2026-05-03 | +280 / -3 | Output manifest helper + StackBuilder run manifests + Spymaster PKLs. | Artifact/contract: yes; manifest readback is required. |
+| `8081f73` | 2026-05-03 | +126 / -13 | XLSX upsert manifests + strict-mode CLI + Phase 3 close. | Artifact/contract: yes; strict manifest behavior affects ImpactSearch fast path. |
+| `271312f` | 2026-05-04 | +34 / -1 | Post-Phase-3 UI / regression cleanup. | Correctness: maybe; runner-safety: low. |
+| `522bf70` | 2026-05-05 | +51 / -1 | Deprecated vestigial StackBuilder CLI flags. | Runner-safety: yes; future runner should not surface deprecated knobs as meaningful. |
+| `fe46aa5` | 2026-05-07 | +897 / -17 | Phase 5C-2c validation integration: full-refit walk-forward, candidate collector hook, run-manifest summary. | Correctness / artifact contract: high; Phase B must not bypass validation summary generation. |
+
+Specific risk classes requested for this audit:
+
+- Manifest verification: added / tightened across `667ce6d`, `838009f`, `e31a0c7`, and `8081f73`; future runner must validate `run_manifest.json` and output artifact presence after execution.
+- Canonical scoring delegation: current scoring path delegates to `canonical_scoring` (`stackbuilder.py:27-31`, `stackbuilder.py:827-859`); no new scoring algorithm should be introduced in the runner.
+- Rejection / diagnostic plumbing: ImpactSearch XLSX rejection detail lives in `try_load_rank_from_impact_xlsx` (`stackbuilder.py:583-700`) and is surfaced by `phase2_rank_all` (`stackbuilder.py:1099-1252`); runner JSON should preserve these reasons.
+- Refactor indirection: the largest current indirection is Phase 5C validation (`fe46aa5`, `StackBuilderValidationAdapter` at `stackbuilder.py:2768+`); runner scaffold tests should prove dry-run classification does not accidentally import or execute this heavy path.
+
+### 3.11 Progress and concurrency
 
 | Surface | File:line | Behavior |
 |---|---|---|
@@ -145,7 +182,7 @@ Every line reference below is repo-relative in the form `stackbuilder.py:<line>`
 | `_start_input_manifest_collection` / `_finalize_input_manifest_collection` | `stackbuilder.py:87-177` | Token-based set / reset of the ContextVar; finalize returns `{input_manifest_hashes, input_legacy_count, input_missing_manifest_count}`. |
 | `_submit_with_context` | `stackbuilder.py:180-190` | Wraps `executor.submit(ctx.run, fn, *args, **kwargs)` so worker threads see the submitter's ContextVar. Used inside `phase2_rank_all`. |
 
-### 3.10 `__main__` and Dash launch
+### 3.12 `__main__` and Dash launch
 
 `stackbuilder.py:3426` is `if __name__ == '__main__':` which simply calls `main()`. `main` parses args, mutates the four module globals (`OUTPUT_FORMAT`, `SIGNAL_LIB_DIR_RUNTIME`, `VERBOSE`, `COMBINE_INTERSECTION`), creates `args.outdir`, and:
 
@@ -741,7 +778,9 @@ Phase B (runner scaffold + tests) is accepted only if:
 | `_fetch_secondary_from_yf` | `stackbuilder.py` | 506–528 | `period='max'`, `auto_adjust=False`. |
 | Secondary price loader | `stackbuilder.py` | 530–556 | Cache-first; yfinance fallback. |
 | ImpactSearch XLSX rejection contract | `stackbuilder.py` | 583–700 | strict/non-strict matrix; staleness gate; populates `rejection_out`. |
+| Central verified signal-library loader | `provenance_manifest.py` | 1036–1119 | `load_verified_signal_library` uses manifest verification and cache-enabled content hash path. |
 | `load_lib_or_none` provenance pin | `stackbuilder.py` | 743–754 | Records every successful load. |
+| Spymaster PKL non-dependency | `stackbuilder.py`, `trafficflow.py` | `stackbuilder.py` static search; `trafficflow.py:86–87`, `trafficflow.py:1442–1458` | StackBuilder does not read `cache/results` Spymaster PKLs; TrafficFlow does downstream. |
 | Apply-signals grace plumbing | `stackbuilder.py` | 757–825 | `_effective_grace_days(grace_days)`; `IMPACT_DEBUG_ALIGN` env. |
 | `metrics_from_captures` canonical delegation | `stackbuilder.py` | 827–859 | `risk_free=5.0`, `periods=252`, `ddof=1`. |
 | `phase1_preflight` | `stackbuilder.py` | 862–892 | Fatal SystemExit on empty primaries unless `prefer_impact_xlsx`. |
@@ -758,6 +797,7 @@ Phase B (runner scaffold + tests) is accepted only if:
 | Locked validation summary keys | `stackbuilder.py` | 2606–2617 | 10 keys gated before manifest write. |
 | Validation adapter | `stackbuilder.py` | 2768+ | XLSX fast-path forced off; cutoff threaded through. |
 | `_prepare_stackbuilder_durable_validation` | `stackbuilder.py` | 3090+ | Runs before manifest publish; fallback-write failures propagate. |
+| Recent change-history audit | `git log` | since 2026-05-01 | 11 commits, aggregate +1,884 / -232, net +1,652 lines. |
 | Deprecated CLI flags | `stackbuilder.py` | 3267–3288 | `--alpha`, `--min-marginal-capture`, `--fail-on-missing-cache`. |
 | `parse_args` | `stackbuilder.py` | 3311–3379 | Full CLI surface. |
 | `main` global mutations | `stackbuilder.py` | 3383–3387 | Sets `OUTPUT_FORMAT`, `SIGNAL_LIB_DIR_RUNTIME`, `VERBOSE`, `COMBINE_INTERSECTION`. |
