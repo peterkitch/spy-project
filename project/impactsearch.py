@@ -2779,10 +2779,13 @@ def export_results_to_excel(
         combined_df = combined_df.drop_duplicates('__dedupe_key', keep='last')
         combined_df = combined_df.drop(columns='__dedupe_key')
 
-        # Coerce Sharpe to numeric before sorting to avoid float<->str errors
-        if 'Sharpe Ratio' in combined_df.columns:
-            combined_df['Sharpe Ratio'] = pd.to_numeric(combined_df['Sharpe Ratio'], errors='coerce')
-            combined_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
+        # Phase 6I-73: workbook export sorts by Total Capture (%)
+        # descending. Sharpe is no longer a supported selection /
+        # ranking / tiebreaker criterion across the StackBuilder
+        # pipeline; StackBuilder also defensively re-sorts on load.
+        if 'Total Capture (%)' in combined_df.columns:
+            combined_df['Total Capture (%)'] = pd.to_numeric(combined_df['Total Capture (%)'], errors='coerce')
+            combined_df.sort_values(by='Total Capture (%)', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
         combined_df = combined_df.reindex(columns=desired_order +
@@ -2794,10 +2797,10 @@ def export_results_to_excel(
     else:
         df = pd.DataFrame(normalized_rows)
 
-        # Coerce Sharpe to numeric before sorting
-        if 'Sharpe Ratio' in df.columns:
-            df['Sharpe Ratio'] = pd.to_numeric(df['Sharpe Ratio'], errors='coerce')
-            df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True, na_position='last')
+        # Phase 6I-73: sort by Total Capture (%) descending.
+        if 'Total Capture (%)' in df.columns:
+            df['Total Capture (%)'] = pd.to_numeric(df['Total Capture (%)'], errors='coerce')
+            df.sort_values(by='Total Capture (%)', ascending=False, inplace=True, na_position='last')
 
         # Ensure column order
         df = df.reindex(columns=desired_order +

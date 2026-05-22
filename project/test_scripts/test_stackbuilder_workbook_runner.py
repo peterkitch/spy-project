@@ -647,11 +647,12 @@ def test_pin_build_writes_pinned_manifest(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 18. Selection policy comparator (total_capture → sharpe → latest)
+# 18. Selection policy comparator (Phase 6I-73: total_capture → latest)
+# Sharpe is no longer a tiebreaker.
 # ---------------------------------------------------------------------------
 
 
-def test_selected_build_policy_total_capture_then_sharpe_then_latest():
+def test_selected_build_policy_total_capture_then_latest_no_sharpe_tiebreaker():
     same_k_old = {
         "selected_k": 3, "total_capture": 99.0, "sharpe_ratio": 9.0,
         "created_at": "2026-05-19T00:00:00Z",
@@ -674,19 +675,22 @@ def test_selected_build_policy_total_capture_then_sharpe_then_latest():
     # Different K, highest total_capture wins.
     assert runner.select_build_per_policy([a, b]) is b
 
+    # Phase 6I-73: with total_capture tied between b (2026-05-20) and
+    # c (2026-05-18), the LATEST candidate wins. Sharpe is NOT used
+    # as a tiebreaker; c has a much higher Sharpe but loses because
+    # b is more recent.
     c = {
         "selected_k": 4, "total_capture": 5.0, "sharpe_ratio": 1.5,
         "created_at": "2026-05-18T00:00:00Z",
     }
-    # total_capture tie with b → higher sharpe wins (c).
-    assert runner.select_build_per_policy([b, c]) is c
+    assert runner.select_build_per_policy([b, c]) is b
 
+    # Within tolerance + latest beats earlier: d (latest) wins over b.
     d = {
         "selected_k": 5, "total_capture": 5.0, "sharpe_ratio": 1.5,
         "created_at": "2026-05-21T00:00:00Z",
     }
-    # Remaining tie on total_capture + sharpe → latest wins (d).
-    assert runner.select_build_per_policy([c, d]) is d
+    assert runner.select_build_per_policy([b, d]) is d
 
     # Operator pin wins unconditionally even with worse metrics.
     pinned = {
@@ -695,6 +699,28 @@ def test_selected_build_policy_total_capture_then_sharpe_then_latest():
         "operator_pinned": True,
     }
     assert runner.select_build_per_policy([a, b, c, d, pinned]) is pinned
+
+
+def test_selected_build_policy_does_not_use_sharpe_tiebreaker():
+    """Phase 6I-73 regression: when two candidates tie on
+    total_capture and only Sharpe differs, the candidate with the
+    higher Sharpe must NOT be preferred; latest-wins applies.
+    """
+    earlier_high_sharpe = {
+        "selected_k": 4, "total_capture": 5.0, "sharpe_ratio": 9.99,
+        "created_at": "2026-05-15T00:00:00Z",
+    }
+    later_low_sharpe = {
+        "selected_k": 4, "total_capture": 5.0, "sharpe_ratio": 0.01,
+        "created_at": "2026-05-20T00:00:00Z",
+    }
+    # Same K so the K-collapse picks the latest one anyway. Use
+    # different K to exercise the cross-K branch.
+    earlier_high_sharpe["selected_k"] = 3
+    later_low_sharpe["selected_k"] = 5
+    assert runner.select_build_per_policy(
+        [earlier_high_sharpe, later_low_sharpe]
+    ) is later_low_sharpe
 
 
 # ---------------------------------------------------------------------------
@@ -731,10 +757,15 @@ def test_build_stackbuilder_args_namespace_matches_dash_defaults():
 
 
 def test_stackbuilder_is_lazy_imported(capsys):
-    # On module import, stackbuilder must NOT be loaded.
-    assert "stackbuilder" not in sys.modules
+    # The runner module's AST guard (test_no_toplevel_dangerous_imports)
+    # already proves stackbuilder is not a top-level import. This
+    # behavioral test additionally confirms that the runner's dry-run
+    # main does not TRANSITIVELY pull stackbuilder into sys.modules.
+    # We test the delta rather than the absolute presence because
+    # other test files in the session (e.g. cli_deprecations) may
+    # legitimately import stackbuilder for their own coverage.
+    before = "stackbuilder" in sys.modules
 
-    # On dry-run main, stackbuilder must still NOT be loaded.
     rc = runner.main(
         argv=["--secondaries", "SPY", "--primary-source", "impact_xlsx"],
         engine_callable=lambda *a, **k: {"status": "ok"},
@@ -742,7 +773,12 @@ def test_stackbuilder_is_lazy_imported(capsys):
     )
     capsys.readouterr()
     assert rc == 0
-    assert "stackbuilder" not in sys.modules
+    after = "stackbuilder" in sys.modules
+    # Dry-run main MUST NOT introduce stackbuilder into sys.modules
+    # if it wasn't already there.
+    assert (after and before) or (not after and not before), (
+        "runner dry-run main triggered a transitive stackbuilder import"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1101,3 +1137,49 @@ def test_safe_secondary_filename_preserves_caret_and_normalizes_dot():
     assert runner._safe_secondary_filename("^GSPC") == "^GSPC"
     assert runner._safe_secondary_filename("a/b") == "a_b"
     assert runner._safe_secondary_filename("a b") == "a_b"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-73: Sharpe is no longer a supported selection metric
+# ---------------------------------------------------------------------------
+
+
+def test_runner_cli_refuses_seed_by_sharpe():
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--secondaries", "SPY", "--seed-by", "sharpe"])
+
+
+def test_runner_cli_refuses_optimize_by_sharpe():
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--secondaries", "SPY", "--optimize-by", "sharpe"])
+
+
+def test_runner_cli_accepts_only_total_capture_for_seed_and_optimize():
+    args = runner.parse_args([
+        "--secondaries", "SPY",
+        "--seed-by", "total_capture",
+        "--optimize-by", "total_capture",
+    ])
+    assert args.seed_by == "total_capture"
+    assert args.optimize_by == "total_capture"
+
+
+def test_build_stackbuilder_args_namespace_resolves_optimize_to_total_capture():
+    args = runner.parse_args(["--secondaries", "SPY"])
+    # default optimize_by is "auto" → must resolve to total_capture
+    ns = runner.build_stackbuilder_args_namespace(
+        args, "SPY",
+        primaries_resolution={
+            "status": "ok", "primary_source": "impact_xlsx",
+            "primaries": [], "primary_count": 0,
+            "source_path": None, "issues": [],
+        },
+    )
+    assert ns.seed_by == "total_capture"
+    assert ns.optimize_by == "total_capture"
+
+
+def test_runner_selection_policy_label_is_total_capture_then_latest():
+    """Selection policy label must not advertise Sharpe."""
+    assert "sharpe" not in runner.SELECTION_POLICY.lower()
+    assert "total_capture" in runner.SELECTION_POLICY.lower()

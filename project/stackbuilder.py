@@ -380,8 +380,12 @@ def _output_artifact_entry(
 def _build_output_artifacts(outdir: str) -> list:
     """Scan a finalized StackBuilder run directory for output artifacts."""
     artifacts: list = []
+    # Phase 6I-73: rank_inverse is no longer a persisted output artifact.
+    # Bottom_n inverse candidates are derived internally from the
+    # most-negative Total Capture rows of rank_direct and live only as
+    # an in-memory bounded cohort frame.
     table_names = (
-        "rank_all", "rank_direct", "rank_inverse", "cohort", "combo_leaderboard",
+        "rank_all", "rank_direct", "cohort", "combo_leaderboard",
     )
     for name in table_names:
         entry = _output_artifact_entry(outdir, name)
@@ -1078,6 +1082,114 @@ def _score_primary_both_modes(
     )
     return direct, inverse
 
+def _stack_candidate_identity(path) -> str:
+    """Phase 6I-73 amendment: deterministic, NON-METRIC identity for a
+    stack-candidate path used as a tiebreaker in K=1 / K>=2 selection.
+
+    Members are normalized to uppercase ``"<ticker>[<mode>]"`` strings
+    and sorted alphabetically. The result is a single deterministic
+    string so the comparison surface is unambiguous and contains no
+    Sharpe / p-Value influence.
+    """
+    if not path:
+        return ""
+    members: list[str] = []
+    for entry in path:
+        # Each entry is (ticker, mode, sig_pair) per phase3 conventions.
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            t = str(entry[0]).upper()
+            m = str(entry[1]).upper()
+            members.append(f"{t}[{m}]")
+        else:
+            members.append(str(entry).upper())
+    return ",".join(sorted(members))
+
+
+def _is_better_total_capture_candidate(
+    candidate_total: Optional[float],
+    candidate_identity: Optional[str],
+    best_total: Optional[float],
+    best_identity: Optional[str],
+) -> bool:
+    """Phase 6I-73 amendment: explicit selection rule for candidate
+    comparison. Returns ``True`` if ``candidate`` should replace
+    ``best``:
+
+      * higher ``candidate_total`` wins, or
+      * equal total + lexicographically smaller ``candidate_identity``
+        wins.
+
+    Sharpe / p-Value MUST NOT be passed to this helper. Numeric ties
+    on ``candidate_total`` resolve by ``candidate_identity`` ASC.
+    ``best_total=None`` / ``best_identity=None`` means "no current
+    best yet" so the candidate wins by default.
+    """
+    if best_total is None or best_identity is None:
+        return candidate_total is not None
+    if candidate_total is None:
+        return False
+    if float(candidate_total) > float(best_total):
+        return True
+    if float(candidate_total) == float(best_total):
+        return str(candidate_identity) < str(best_identity)
+    return False
+
+
+def _build_bounded_inverse_cohort(
+    rank_direct: pd.DataFrame,
+    bottom_n: int,
+) -> pd.DataFrame:
+    """Phase 6I-73: derive a bounded inverse candidate cohort frame
+    from the most-negative Total Capture rows of ``rank_direct``.
+
+    Bottom_n inverse cohort display rows carry:
+      * ``Mode`` = ``'I'`` (added later by phase3 cohort assembly)
+      * ``Total Capture (%)`` = absolute value of the row's
+        original (negative) direct Total Capture, since under
+        inverse-mode that magnitude becomes a positive candidate.
+      * ``Avg Daily Capture (%)`` = sign-flipped where present.
+      * ``Trigger Days`` = copied from XLSX / direct row if present.
+      * ``Sharpe Ratio`` = ``NaN`` (intentionally not computed here;
+        K>=2 stack rows compute combined Sharpe from combined signal
+        series in phase3, and the K=1 leaderboard row picks up
+        accurate Sharpe via ``_combined_metrics_signals``).
+      * ``p-Value`` = ``NaN`` for the same reason.
+
+    This is the documented Phase 6I-73 bound: at most one
+    ``_score_primary_from_signals(..., mode='I')`` call per build,
+    only when an inverse candidate becomes the K=1 winner and an
+    accurate inverse rescore is needed for that one primary.
+    ``rank_inverse`` is NOT persisted as an output artifact under
+    this bound.
+    """
+    if rank_direct is None or rank_direct.empty or bottom_n <= 0:
+        return pd.DataFrame(columns=rank_direct.columns if rank_direct is not None else [])
+    if 'Total Capture (%)' not in rank_direct.columns:
+        return pd.DataFrame(columns=rank_direct.columns)
+    # Most-negative Total Capture rows = best inverse-mode candidates.
+    inv = rank_direct.sort_values(
+        by='Total Capture (%)', ascending=True
+    ).head(bottom_n).copy()
+    if inv.empty:
+        return pd.DataFrame(columns=rank_direct.columns)
+    # Sign-flip the capture magnitudes so they read as positive
+    # inverse-candidate Total Capture / Avg Daily Capture.
+    if 'Total Capture (%)' in inv.columns:
+        inv['Total Capture (%)'] = inv['Total Capture (%)'].astype(float) * -1.0
+    if 'Avg Daily Capture (%)' in inv.columns:
+        inv['Avg Daily Capture (%)'] = inv['Avg Daily Capture (%)'].astype(float) * -1.0
+    # Sharpe / p-Value are intentionally not computed here. Phase3
+    # picks up accurate metrics via _combined_metrics_signals.
+    if 'Sharpe Ratio' in inv.columns:
+        inv['Sharpe Ratio'] = float('nan')
+    if 'p-Value' in inv.columns:
+        inv['p-Value'] = float('nan')
+    inv = inv.sort_values(
+        by='Total Capture (%)', ascending=False
+    ).reset_index(drop=True)
+    return inv
+
+
 def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdir: str, secondary: Optional[str] = None, progress_path: Optional[str] = None, *, grace_days: Optional[int] = None, data_available_through: Optional[pd.Timestamp] = None):
     """Phase 2: Rank all primaries against secondary with progress tracking.
 
@@ -1136,70 +1248,26 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                     raise SystemExit(f"[FATAL] None of the entered primaries are present in the ImpactSearch Excel for {secondary}.")
 
             rank_direct = rank_all.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
-            # Phase 2B-2B: rank_inverse on the xlsx fast-path is now
-            # recomputed from signal libraries via real inverse-mode
-            # scoring (signals flipped Buy<->Short before alignment),
-            # not via negate-and-view of direct metrics. This pins
-            # rank_inverse to the same canonical Sharpe / p-value
-            # form that the normal path produces. Tickers whose
-            # signal library is missing or corrupt are skipped from
-            # rank_inverse with a warning; the run fails loudly only
-            # if the user requested a non-zero bottom_n and no
-            # usable inverse-mode rows survived.
-            inverse_rows: List[Dict] = []
-            inverse_missing: List[str] = []
-            for primary in rank_direct['Primary Ticker'].astype(str).tolist():
-                vendor, sigs, dates = _load_primary_signals(primary)
-                if sigs is None:
-                    inverse_missing.append(vendor)
-                    continue
-                inv = _score_primary_from_signals(
-                    vendor, sigs, dates, sec_rets,
-                    mode='I', grace_days=grace_days,
-                )
-                if inv is None:
-                    inverse_missing.append(vendor)
-                    continue
-                inverse_rows.append(inv)
-
-            if inverse_missing:
-                print(
-                    f"[PHASE2] xlsx fast-path: {len(inverse_missing)} ticker(s) "
-                    f"omitted from rank_inverse due to missing/corrupt signal "
-                    f"library or zero-trigger inverse: {inverse_missing[:10]}"
-                    f"{' ...' if len(inverse_missing) > 10 else ''}"
-                )
-
+            # Phase 6I-73: the prior xlsx fast-path full-universe inverse
+            # rescore loop is removed. The bottom_n inverse cohort is
+            # now derived directly from the most-negative Total Capture
+            # rows of rank_direct (no per-primary
+            # _score_primary_from_signals call in phase2). Bottom_n
+            # inverse candidate display rows carry the *positive*
+            # inverse-candidate Total Capture (sign-flipped from the
+            # original negative direct row), and Sharpe / p-Value are
+            # NaN at the cohort level — accurate K=1 metrics are
+            # computed in phase3 via _combined_metrics_signals on the
+            # aligned inverse signals, and K>=2 stack rows compute
+            # accurate combined Sharpe from combined signal series.
             requested_bottom_n = int(getattr(args, 'bottom_n', 0) or 0)
-            if not inverse_rows and requested_bottom_n > 0:
-                raise SystemExit(
-                    f"[FATAL] xlsx fast-path: requested bottom_n="
-                    f"{requested_bottom_n} but no inverse-mode rows could be "
-                    f"computed for any of the {len(rank_direct)} primaries in "
-                    f"the ImpactSearch Excel. Verify signal libraries exist "
-                    f"under {getattr(args, 'signal_lib_dir', SIGNAL_LIB_DIR_RUNTIME)} "
-                    f"or run without --prefer-impact-xlsx."
-                )
-
-            if inverse_rows:
-                rank_inverse = pd.DataFrame(inverse_rows)
-                # Reindex to rank_all column schema where possible so
-                # downstream consumers' column-access contracts hold.
-                shared_cols = [c for c in rank_all.columns if c in rank_inverse.columns]
-                rank_inverse = rank_inverse.reindex(columns=rank_all.columns)
-                # Sort by canonical key for consistency with the normal path.
-                if 'Total Capture (%)' in rank_inverse.columns:
-                    rank_inverse = rank_inverse.sort_values(
-                        by='Total Capture (%)', ascending=False
-                    ).reset_index(drop=True)
-                else:
-                    rank_inverse = rank_inverse.reset_index(drop=True)
-            else:
-                rank_inverse = pd.DataFrame(columns=rank_all.columns)
+            rank_inverse = _build_bounded_inverse_cohort(
+                rank_direct, requested_bottom_n,
+            )
 
             write_table(rank_all, os.path.join(outdir, 'rank_all'))
             write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
-            write_table(rank_inverse, os.path.join(outdir, 'rank_inverse'))
+            # Phase 6I-73: rank_inverse is NOT written to disk.
             # Emit progress counters even on XLSX fast-path so UI shows advancement
             if progress_path:
                 total = int(len(rank_all))
@@ -1252,7 +1320,8 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
                                    f"Uncheck 'Use ImpactSearch .xlsx' to compute from signal libraries.")
     max_workers = None if args.threads == 'auto' else int(args.threads)
     rows_direct: List[Dict] = []
-    rows_inverse: List[Dict] = []
+    # Phase 6I-73: rows_inverse retired — direct-only scoring; inverse
+    # cohort derived later via _build_bounded_inverse_cohort.
     missing: List[str] = []
     total = len(primaries_df['Primary Ticker'])
 
@@ -1266,15 +1335,26 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     # an incorrect Sharpe because the risk-free-rate term doesn't
     # change sign under metric negation; flipping signals first and
     # rescoring resolves that asymmetry.
+    # Phase 6I-73: score primaries in DIRECT mode only. The bottom_n
+    # inverse cohort is derived from the most-negative direct Total
+    # Capture rows via _build_bounded_inverse_cohort. This eliminates
+    # the prior full-universe inverse rescore loop. K=1 inverse-winner
+    # metrics still arrive accurately through phase3's
+    # _combined_metrics_signals on aligned inverse signals; K>=2 stack
+    # metrics still come from combined signal series.
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         # Phase 3B-2A amendment: wrap each submit with copy_context so the
         # per-run input-manifest collector ContextVar set by
         # run_for_secondary flows into the worker thread.
-        futures = {
-            _submit_with_context(
-                ex, _score_primary_both_modes, t, sec_rets,
+        def _direct_score(_t, _sec_rets):
+            return _score_primary(
+                _t, _sec_rets, mode='D',
                 grace_days=grace_days,
                 data_available_through=data_available_through,
+            )
+        futures = {
+            _submit_with_context(
+                ex, _direct_score, t, sec_rets,
             ): t
             for t in primaries_df['Primary Ticker']
         }
@@ -1291,14 +1371,11 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
         step = max(50, max(1, total // 200))
         for i, fut in enumerate(iterator, 1):
             ticker = futures[fut]
-            direct_m, inverse_m = fut.result()
-            if direct_m is None and inverse_m is None:
+            direct_m = fut.result()
+            if direct_m is None:
                 missing.append(ticker)
             else:
-                if direct_m is not None:
-                    rows_direct.append(direct_m)
-                if inverse_m is not None:
-                    rows_inverse.append(inverse_m)
+                rows_direct.append(direct_m)
 
             # Progress reporting with counters
             now = time.time()
@@ -1325,32 +1402,19 @@ def phase2_rank_all(args, primaries_df: pd.DataFrame, sec_rets: pd.Series, outdi
     if not rows_direct:
         raise SystemExit("[FATAL] No primaries produced valid metrics.")
 
-    # rank_all and rank_direct: direct-mode metrics. rank_inverse:
-    # real inverse-mode metrics (separate scoring path; column schema
-    # matches rank_all/rank_direct so downstream consumers — including
-    # phase3_build_stacks — keep their existing column-access
-    # contracts).
+    # rank_all and rank_direct: direct-mode metrics. Phase 6I-73:
+    # rank_inverse is a bounded in-memory cohort derived from the
+    # most-negative direct Total Capture rows; it is NOT persisted
+    # to disk. Sharpe / p-Value on the inverse cohort are NaN at the
+    # cohort layer (see _build_bounded_inverse_cohort docstring).
     rank_all = pd.DataFrame(rows_direct)
     rank_direct = rank_all.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
-
-    if rows_inverse:
-        rank_inverse = pd.DataFrame(rows_inverse)
-        # Reindex columns so rank_inverse has the same shape as
-        # rank_direct (defensive: every row was built by
-        # _score_primary_from_signals on the same metrics dict
-        # template, so columns should already match).
-        rank_inverse = rank_inverse.reindex(columns=rank_all.columns)
-        rank_inverse = rank_inverse.sort_values(by='Total Capture (%)', ascending=False).reset_index(drop=True)
-    else:
-        # No usable inverse-mode rows. Emit an empty DF with the same
-        # column schema so downstream consumers don't blow up on
-        # column access. phase3_build_stacks will simply find an
-        # empty bottom cohort if bottom_n > 0.
-        rank_inverse = pd.DataFrame(columns=rank_all.columns)
+    requested_bottom_n = int(getattr(args, 'bottom_n', 0) or 0)
+    rank_inverse = _build_bounded_inverse_cohort(rank_direct, requested_bottom_n)
 
     write_table(rank_all, os.path.join(outdir, 'rank_all'))
     write_table(rank_direct, os.path.join(outdir, 'rank_direct'))
-    write_table(rank_inverse, os.path.join(outdir, 'rank_inverse'))
+    # Phase 6I-73: rank_inverse is NOT written to disk.
     return rank_all, rank_direct, rank_inverse
 
 # ---------- Phase 3: Stack Builder ----------
@@ -1559,8 +1623,15 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     topN, botN = int(args.top_n), int(args.bottom_n)
     min_td = int(getattr(args, 'min_trigger_days', 30))
     eps = float(getattr(args, 'sharpe_eps', 1e-6))
-    seed_by = getattr(args, 'seed_by', 'sharpe')
-    optimize_by = getattr(args, 'optimize_by', seed_by)  # Default to seed_by if not specified
+    # Phase 6I-73: Total Capture is the only supported selection metric.
+    # Legacy 'sharpe' values from older configs are normalized to
+    # 'total_capture' here so old run_manifest replays still work.
+    seed_by = getattr(args, 'seed_by', 'total_capture')
+    if seed_by == 'sharpe':
+        seed_by = 'total_capture'
+    optimize_by = getattr(args, 'optimize_by', None) or seed_by
+    if optimize_by == 'sharpe':
+        optimize_by = 'total_capture'
     search = getattr(args, 'search', 'beam')
     beam_w = int(getattr(args, 'beam_width', 12))
     ex_k = int(getattr(args, 'exhaustive_k', 3))
@@ -1627,9 +1698,19 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     if not singles:
         raise SystemExit("[FATAL] No single candidate passed the min Trigger Days gate.")
 
-    key_sharpe = lambda it: (it[1]['Sharpe_raw'], it[1]['Total_raw'], -(it[1]['p_raw'] if it[1]['p_raw'] is not None else 1.0), it[0][0])
-    key_total  = lambda it: (it[1]['Total_raw'],  it[1]['Sharpe_raw'], -(it[1]['p_raw'] if it[1]['p_raw'] is not None else 1.0), it[0][0])
-    singles.sort(key=(key_sharpe if seed_by == 'sharpe' else key_total), reverse=True)
+    # Phase 6I-73 amendment: K=1 selection must use Total Capture
+    # only, with a NON-METRIC deterministic tiebreaker. Sharpe and
+    # p-Value are display-only and MUST NOT influence selection
+    # anywhere — including the tie path. Tiebreaker order:
+    #   (1) higher Total Capture wins
+    #   (2) lexicographically smaller (ticker_norm, mode_norm) wins
+    singles.sort(
+        key=lambda it: (
+            -float(it[1]['Total_raw']),
+            str(it[0][0]).upper(),
+            str(it[0][1]).upper(),
+        )
+    )
 
     # Helper to score any list of (t,mode,sig)
     def score_path(path):
@@ -1732,38 +1813,33 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                         print(f"  [REJECT] {[t for t in tickers]}: Trigger Days {mm['Trigger Days']} < {min_td}")
                     _emit_validation_record(path, K, "exhaustive", mm, "trigger_days")
                     continue
-                # Enforce monotone improvement based on optimize_by metric (unless allow_decreasing is enabled)
+                # Phase 6I-73 amendment: Total Capture is the only
+                # selection criterion. The legacy 'optimize_by ==
+                # sharpe' branch is removed entirely; the only
+                # monotone-improvement check is on Total Capture.
                 if not allow_decreasing:
-                    if optimize_by == 'total_capture':
-                        prev_metric = leaderboard[-1]['Total Capture (%)']
-                        cur_metric = mm['Total_raw']
-                        metric_name = 'Total Capture'
-                        if float(cur_metric) <= float(prev_metric) + eps:
-                            search_stats['combinations_rejected'] += 1
-                            search_stats['rejection_reasons']['sharpe_improvement'] += 1  # reuse counter
-                            if VERBOSE:
-                                print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f}% <= {prev_metric:.4f}% + {eps}")
-                            _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
-                            continue
-                    else:  # optimize_by == 'sharpe'
-                        prev_metric = leaderboard[-1]['Sharpe Ratio']
-                        cur_metric = mm['Sharpe_raw']
-                        metric_name = 'Sharpe'
-                        if float(cur_metric) <= float(prev_metric) + eps:
-                            search_stats['combinations_rejected'] += 1
-                            search_stats['rejection_reasons']['sharpe_improvement'] += 1
-                            if VERBOSE:
-                                print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f} <= {prev_metric:.4f} + {eps}")
-                            _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
-                            continue
+                    prev_metric = leaderboard[-1]['Total Capture (%)']
+                    cur_metric = mm['Total_raw']
+                    metric_name = 'Total Capture'
+                    if float(cur_metric) <= float(prev_metric) + eps:
+                        search_stats['combinations_rejected'] += 1
+                        search_stats['rejection_reasons']['sharpe_improvement'] += 1  # reuse counter for "no improvement"
+                        if VERBOSE:
+                            print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f}% <= {prev_metric:.4f}% + {eps}")
+                        _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
+                        continue
                 _emit_validation_record(path, K, "exhaustive", mm, None)
-                # Set key for comparison (always needed, regardless of allow_decreasing)
-                if optimize_by == 'total_capture':
-                    key = (mm['Total_raw'], mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0))
-                else:  # optimize_by == 'sharpe'
-                    key = (mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0), mm['Total_raw'])
-                if (best is None) or (key > best[0]):
-                    best = (key, path, comb, mm)
+                # Phase 6I-73 amendment: comparison uses Total Capture
+                # only, with a NON-METRIC deterministic tiebreaker.
+                # Sharpe / p-Value MUST NOT influence the choice.
+                cand_total = float(mm['Total_raw'])
+                cand_identity = _stack_candidate_identity(path)
+                if _is_better_total_capture_candidate(
+                    cand_total, cand_identity,
+                    None if best is None else best[0][0],
+                    None if best is None else best[0][1],
+                ):
+                    best = ((cand_total, cand_identity), path, comb, mm)
         # Final update for this K level
         combos_tested_acc += k_combos_tested
         if progress_cb:
@@ -1791,11 +1867,14 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
         if search == 'exhaustive' or K <= ex_k:
             found = exhaustive_k(K)
         else:
-            # Beam expand
+            # Beam expand. Phase 6I-73 amendment: Total Capture is
+            # the only selection metric; tiebreaker is the
+            # deterministic stack identity (sorted member list).
+            # Sharpe / p-Value MUST NOT influence ordering.
             cand_states = []
             seen = set()
             for path, _, prevm in beam:
-                prev_metric = float(prevm['Sharpe_raw'] if optimize_by=='sharpe' else prevm['Total_raw'])
+                prev_metric = float(prevm['Total_raw'])
                 used = {t for (t, _, _) in path}
                 for _, r in cohort.iterrows():
                     t, m = r['Primary Ticker'], r['Mode']
@@ -1814,40 +1893,47 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                         search_stats['rejection_reasons']['trigger_days'] += 1
                         _emit_validation_record(new_path, K, "beam", m2, "trigger_days")
                         continue
-                    # Enforce monotone improvement (unless allow_decreasing is enabled)
+                    # Enforce monotone improvement on Total Capture only.
                     if not allow_decreasing:
-                        cur_metric = float(m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'])
+                        cur_metric = float(m2['Total_raw'])
                         if cur_metric <= prev_metric + eps:
                             search_stats['combinations_rejected'] += 1
                             search_stats['rejection_reasons']['sharpe_improvement'] += 1
                             _emit_validation_record(new_path, K, "beam", m2, "sharpe_improvement")
                             continue
                     _emit_validation_record(new_path, K, "beam", m2, None)
-                    key = (m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'],
-                           - (m2['p_raw'] if m2['p_raw'] is not None else 1.0))
-                    sig = (tuple(sorted([x[0] for x in new_path])), tuple([x[1] for x in new_path]))
-                    if sig in seen: continue
+                    cand_total = float(m2['Total_raw'])
+                    cand_identity = _stack_candidate_identity(new_path)
+                    sig = (
+                        tuple(sorted([x[0] for x in new_path])),
+                        tuple([x[1] for x in new_path]),
+                    )
+                    if sig in seen:
+                        continue
                     seen.add(sig)
-                    cand_states.append((key, new_path, comb2, m2))
+                    # Sort key: negative total (descending order),
+                    # then ascending identity (lexical tiebreaker).
+                    cand_states.append((
+                        (-cand_total, cand_identity), new_path, comb2, m2,
+                    ))
             if cand_states:
-                cand_states.sort(key=lambda x: x[0], reverse=True)
+                cand_states.sort(key=lambda x: x[0])  # ascending
                 beam = [(p, c, m) for _, p, c, m in cand_states[:beam_w]]
-                # choose best of current K
+                # choose best of current K: smallest sort key.
                 _, best_path, best_comb, best_met = cand_states[0]
                 found = (None, best_path, best_comb, best_met)
 
         if not found:
             if k_patience > 0 and patience_used < k_patience:
                 patience_used += 1
-                metric_name = 'Total Capture' if optimize_by == 'total_capture' else 'Sharpe'
-                print(f"[PHASE3] K={K}: No {metric_name} improvement (>={eps:.6f}), using patience {patience_used}/{k_patience}")
+                # Phase 6I-73 amendment: Total Capture only.
+                print(f"[PHASE3] K={K}: No Total Capture improvement (>={eps:.6f}), using patience {patience_used}/{k_patience}")
                 continue  # Continue to next K instead of breaking
             else:
-                metric_name = 'Total Capture' if optimize_by == 'total_capture' else 'Sharpe'
                 if allow_decreasing:
                     print(f"[PHASE3] Stopping at K={K-1}: No valid candidates with >={min_td} trigger days")
                 else:
-                    print(f"[PHASE3] Stopping at K={K-1}: No candidate improves {metric_name} by >{eps:.6f} with >={min_td} trigger days")
+                    print(f"[PHASE3] Stopping at K={K-1}: No candidate improves Total Capture by >{eps:.6f} with >={min_td} trigger days")
                 break
 
         # Found improvement, reset patience
@@ -1922,11 +2008,14 @@ def run_dash(outdir: str, port: int = 8054):
             html.Label("Sharpe ε"),
             dcc.Input(id='sharpe-eps', type='number', value=1e-6, min=0, step=1e-6,
                       style={'width':'140px','marginRight':'12px'}),
+            # Phase 6I-73: Sharpe is removed as a selection criterion.
+            # Total Capture is the only supported seed/optimize metric;
+            # the radio is preserved as a single-option control so the
+            # Dash callback wiring keeps its existing State() shape.
             html.Label("Seed by"),
             dcc.RadioItems(
                 id='seed-by',
-                options=[{'label':'Sharpe','value':'sharpe'},
-                         {'label':'Total Capture','value':'total_capture'}],
+                options=[{'label':'Total Capture','value':'total_capture'}],
                 value='total_capture',
                 labelStyle={'display':'inline-block','marginRight':'12px'},
                 style={'display':'inline-block','marginRight':'12px'}
@@ -1934,10 +2023,8 @@ def run_dash(outdir: str, port: int = 8054):
             html.Label("Optimize by"),
             dcc.RadioItems(
                 id='optimize-by',
-                options=[{'label':'Sharpe','value':'sharpe'},
-                         {'label':'Total Capture','value':'total_capture'},
-                         {'label':'(Same as Seed)','value':'auto'}],
-                value='auto',
+                options=[{'label':'Total Capture','value':'total_capture'}],
+                value='total_capture',
                 labelStyle={'display':'inline-block','marginRight':'12px'},
                 style={'display':'inline-block','marginRight':'12px'}
             ),
@@ -2043,8 +2130,10 @@ def run_dash(outdir: str, port: int = 8054):
         # Validate and sanitize the new parameters
         min_trigger_days_val = int(min_trigger_days) if min_trigger_days else 30
         sharpe_eps_val = float(sharpe_eps) if sharpe_eps else 0.01
-        seed_by_val = seed_by if seed_by else 'total_capture'
-        optimize_by_val = optimize_by if optimize_by and optimize_by != 'auto' else seed_by_val
+        # Phase 6I-73: hard-pin to total_capture regardless of legacy
+        # incoming values from older Dash session state.
+        seed_by_val = 'total_capture'
+        optimize_by_val = 'total_capture'
         allow_decreasing_val = ('y' in (allow_decreasing or []))
         exk_val = int(exk or 4)
 
@@ -2484,14 +2573,18 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                 else:
                     member_names.append(m)
             # Include seed policy in folder name
-            seed_tag = "seedS" if getattr(args, 'seed_by', 'sharpe') == 'sharpe' else "seedTC"
+            # Phase 6I-73 amendment: Total Capture is the only seed
+            # policy; folder names never advertise a Sharpe seed.
+            seed_tag = "seedTC"
             final_name = f"{vendor_secondary_clean}__{seed_tag}__{('_'.join(member_names))}"
             # Truncate if too long for filesystem (Windows limit is 260 chars for full path)
             if len(final_name) > 200:
                 final_name = final_name[:197] + "..."
         else:
             # No stack was built - use special name
-            seed_tag = "seedS" if getattr(args, 'seed_by', 'sharpe') == 'sharpe' else "seedTC"
+            # Phase 6I-73 amendment: Total Capture is the only seed
+            # policy; folder names never advertise a Sharpe seed.
+            seed_tag = "seedTC"
             final_name = f"{vendor_secondary_clean}__{seed_tag}__no_stack"
 
         # Place in the secondary's parent directory
@@ -2547,10 +2640,10 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         manifest['elapsed_seconds'] = round(elapsed_time, 2)
         ext = 'xlsx' if OUTPUT_FORMAT=='xlsx' else ('parquet' if OUTPUT_FORMAT=='parquet' else 'csv')
         # Preserve the existing flat outputs mapping for backwards compat.
+        # Phase 6I-73: rank_inverse is no longer persisted; not listed.
         manifest['outputs'] = {
             'rank_all': f'rank_all.{ext}',
             'rank_direct': f'rank_direct.{ext}',
-            'rank_inverse': f'rank_inverse.{ext}',
             'cohort': f'cohort.{ext}',
             'leaderboard': f'combo_leaderboard.{ext}'
         }
@@ -3326,10 +3419,12 @@ def parse_args(argv=None):
                    help='Minimum Trigger Days required for any accepted stack')
     p.add_argument('--sharpe-eps', type=float, default=1e-6,
                    help='Strict Sharpe improvement per K must exceed this epsilon')
-    p.add_argument('--seed-by', choices=['sharpe','total_capture'], default='total_capture',
-                   help='Metric to choose the initial K=1 seed')
-    p.add_argument('--optimize-by', choices=['sharpe','total_capture'], default=None,
-                   help='Metric to optimize for K>=2 (defaults to seed-by if not specified)')
+    # Phase 6I-73: Sharpe is no longer a supported selection criterion.
+    # Total Capture is the only supported seed / optimize metric.
+    p.add_argument('--seed-by', choices=['total_capture'], default='total_capture',
+                   help='Metric to choose the initial K=1 seed (Total Capture only)')
+    p.add_argument('--optimize-by', choices=['total_capture'], default=None,
+                   help='Metric to optimize for K>=2 (Total Capture only; defaults to seed-by)')
     p.add_argument('--allow-decreasing', action='store_true',
                    help='Allow metric to decrease across K levels (find best at each K independently)')
     p.add_argument('--grace-days', type=int, default=None,

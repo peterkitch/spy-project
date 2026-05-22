@@ -804,3 +804,47 @@ Phase B (runner scaffold + tests) is accepted only if:
 | Bare invocation → Dash | `stackbuilder.py` | 3394–3400 | Default behavior when no `--secondary*` is supplied. |
 | `--jobs > 1` parallelism | `stackbuilder.py` | 3417–3422 | `ProcessPoolExecutor(max_workers=...)`. |
 | `__main__` guard | `stackbuilder.py` | 3426 | `if __name__ == '__main__': main()`. |
+
+---
+
+## Phase 6I-73 Policy Update: Sharpe Removal + Bounded Inverse Rescoring
+
+Operator-locked policy update applied as Phase B hardening before the Phase C smoke retry. Affects the engine, the runner, and the ImpactSearch export sort. No durable validation surface, no Phase 5C contract files, and no other engine were modified.
+
+### 1. Sharpe is no longer a selection criterion
+
+- **Total Capture is the only supported selection criterion** across StackBuilder's seed, optimize, rank, sort, K=1 winner, beam/exhaustive K>=2 ordering, monotone gate, and selected-build tiebreakers.
+- **Sharpe Ratio remains displayed** wherever the engine already computes it (workbook columns, `combo_leaderboard`, `summary.json`, manifest `output_schema`). Sharpe must not drive selection in any new code path.
+- Engine CLI: `--seed-by` and `--optimize-by` accept only `total_capture` (legacy `sharpe` values raise an argparse error at parse time). The Dash UI radio is collapsed to a single `Total Capture` option.
+- Runner CLI: `stackbuilder_workbook_runner.py --seed-by sharpe` and `--optimize-by sharpe` are refused at parse time; `--optimize-by auto` resolves deterministically to `total_capture`.
+- Selected-build policy (`SELECTION_POLICY` = `v2.total_capture_then_latest`): operator pin → highest Total Capture (with tolerance) → latest. **No Sharpe tiebreaker.** The prior `v1.total_capture_then_sharpe_then_latest` label is retired.
+
+### 2. Bounded inverse rescoring
+
+- The XLSX fast-path full-universe inverse rescore loop is **removed**. Phase 2 no longer calls `_score_primary_from_signals(..., mode="I")` per primary on the XLSX cohort.
+- The slow path's `_score_primary_both_modes` is replaced with direct-only scoring; the inverse cohort is derived afterward from `rank_direct`.
+- The bottom_n inverse candidate cohort is now derived directly from the **most-negative `Total Capture (%)` rows** of `rank_direct` via the new helper `_build_bounded_inverse_cohort`. Sign-flipped Total Capture / Avg Daily Capture present as positive inverse-candidate magnitudes; `Sharpe Ratio` and `p-Value` are **NaN** at the cohort layer.
+- K=1 winner selection consumes Total Capture only. **At most one** `_score_primary_from_signals(..., mode="I")` call may occur per build, only if a future caller explicitly requests an accurate inverse rescore for the K=1 winner; phase3's existing `_combined_metrics_signals` path already produces accurate K=1 metrics from aligned inverse signals without that call.
+- K>=2 stack rows continue to compute accurate combined Sharpe / p-Value from combined signal series (unchanged behavior in `phase3_build_stacks` → `_combined_metrics_signals`).
+
+### 3. `rank_inverse.*` is no longer a produced artifact
+
+- `_build_output_artifacts` enumerates only `rank_all`, `rank_direct`, `cohort`, `combo_leaderboard` (plus `summary.json`, `search_stats.json`).
+- `run_for_secondary` no longer writes a `rank_inverse` entry into the manifest `outputs` map.
+- `phase2_rank_all` writes only `rank_all` and `rank_direct` to disk. The bounded inverse cohort remains an in-memory frame passed to `phase3_build_stacks`.
+- The summarize-run-dir helper (`stackbuilder_workbook_runner.summarize_stackbuilder_run_dir`) no longer enumerates `rank_inverse` candidates.
+
+### 4. ImpactSearch export sort
+
+- `impactsearch.export_results_to_excel` (and the corresponding "no preexisting" branch) now sort the output workbook by `Total Capture (%)` descending. The prior `Sharpe Ratio` sort is removed.
+- StackBuilder retains a defensive `Total Capture (%)` re-sort on XLSX load, so existing workbooks remain consumable.
+
+### 5. Cohort display NaN policy
+
+Bottom_n inverse cohort display rows may carry `NaN` Sharpe / `NaN` p-Value because the cohort is composed of placeholder rows derived from negative direct rows, not from accurate inverse-mode metrics. The K=1 leaderboard row picks up accurate Sharpe / p-Value via `_combined_metrics_signals` regardless.
+
+### 6. Out-of-scope
+
+- Durable validation scope (Phase 5C contract files) is **not** touched in this PR. A future PR may revisit validation surfaces if needed.
+- Phase C smoke retry will land in a separate PR after Phase 6I-73 merges.
+- Phase D benchmark remains a separate authorized task.

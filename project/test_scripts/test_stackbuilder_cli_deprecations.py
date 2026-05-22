@@ -27,6 +27,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
@@ -105,7 +107,12 @@ def test_default_parse_emits_no_deprecation_warning(capsys):
 
 def test_active_ledger_example_flags_emit_no_deprecation_warning(capsys):
     """Codex preflight enumerated this active set; none of these
-    should trigger a deprecation warning today."""
+    should trigger a deprecation warning today.
+
+    Phase 6I-73: --seed-by / --optimize-by now only accept
+    ``total_capture``; the prior assertions on Sharpe are reframed
+    as parse-time refusals below.
+    """
     ns = stackbuilder.parse_args([
         "--secondary", "SPY",
         "--allow-decreasing",
@@ -115,8 +122,8 @@ def test_active_ledger_example_flags_emit_no_deprecation_warning(capsys):
         "--save-stats",
         "--serve",
         "--port", "8054",
-        "--optimize-by", "sharpe",
-        "--seed-by", "sharpe",
+        "--optimize-by", "total_capture",
+        "--seed-by", "total_capture",
     ])
     err = capsys.readouterr().err
     assert _DEPRECATED_PREFIX not in err, (
@@ -131,8 +138,23 @@ def test_active_ledger_example_flags_emit_no_deprecation_warning(capsys):
     assert ns.save_stats is True
     assert ns.serve is True
     assert ns.port == 8054
-    assert ns.optimize_by == "sharpe"
-    assert ns.seed_by == "sharpe"
+    assert ns.optimize_by == "total_capture"
+    assert ns.seed_by == "total_capture"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-73: Sharpe is refused at CLI parse time
+# ---------------------------------------------------------------------------
+
+
+def test_stackbuilder_cli_refuses_seed_by_sharpe():
+    with pytest.raises(SystemExit):
+        stackbuilder.parse_args(["--secondary", "SPY", "--seed-by", "sharpe"])
+
+
+def test_stackbuilder_cli_refuses_optimize_by_sharpe():
+    with pytest.raises(SystemExit):
+        stackbuilder.parse_args(["--secondary", "SPY", "--optimize-by", "sharpe"])
 
 
 # ---------------------------------------------------------------------------
