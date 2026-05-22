@@ -1082,6 +1082,59 @@ def _score_primary_both_modes(
     )
     return direct, inverse
 
+def _stack_candidate_identity(path) -> str:
+    """Phase 6I-73 amendment: deterministic, NON-METRIC identity for a
+    stack-candidate path used as a tiebreaker in K=1 / K>=2 selection.
+
+    Members are normalized to uppercase ``"<ticker>[<mode>]"`` strings
+    and sorted alphabetically. The result is a single deterministic
+    string so the comparison surface is unambiguous and contains no
+    Sharpe / p-Value influence.
+    """
+    if not path:
+        return ""
+    members: list[str] = []
+    for entry in path:
+        # Each entry is (ticker, mode, sig_pair) per phase3 conventions.
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            t = str(entry[0]).upper()
+            m = str(entry[1]).upper()
+            members.append(f"{t}[{m}]")
+        else:
+            members.append(str(entry).upper())
+    return ",".join(sorted(members))
+
+
+def _is_better_total_capture_candidate(
+    candidate_total: Optional[float],
+    candidate_identity: Optional[str],
+    best_total: Optional[float],
+    best_identity: Optional[str],
+) -> bool:
+    """Phase 6I-73 amendment: explicit selection rule for candidate
+    comparison. Returns ``True`` if ``candidate`` should replace
+    ``best``:
+
+      * higher ``candidate_total`` wins, or
+      * equal total + lexicographically smaller ``candidate_identity``
+        wins.
+
+    Sharpe / p-Value MUST NOT be passed to this helper. Numeric ties
+    on ``candidate_total`` resolve by ``candidate_identity`` ASC.
+    ``best_total=None`` / ``best_identity=None`` means "no current
+    best yet" so the candidate wins by default.
+    """
+    if best_total is None or best_identity is None:
+        return candidate_total is not None
+    if candidate_total is None:
+        return False
+    if float(candidate_total) > float(best_total):
+        return True
+    if float(candidate_total) == float(best_total):
+        return str(candidate_identity) < str(best_identity)
+    return False
+
+
 def _build_bounded_inverse_cohort(
     rank_direct: pd.DataFrame,
     bottom_n: int,
@@ -1645,9 +1698,19 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
     if not singles:
         raise SystemExit("[FATAL] No single candidate passed the min Trigger Days gate.")
 
-    key_sharpe = lambda it: (it[1]['Sharpe_raw'], it[1]['Total_raw'], -(it[1]['p_raw'] if it[1]['p_raw'] is not None else 1.0), it[0][0])
-    key_total  = lambda it: (it[1]['Total_raw'],  it[1]['Sharpe_raw'], -(it[1]['p_raw'] if it[1]['p_raw'] is not None else 1.0), it[0][0])
-    singles.sort(key=(key_sharpe if seed_by == 'sharpe' else key_total), reverse=True)
+    # Phase 6I-73 amendment: K=1 selection must use Total Capture
+    # only, with a NON-METRIC deterministic tiebreaker. Sharpe and
+    # p-Value are display-only and MUST NOT influence selection
+    # anywhere — including the tie path. Tiebreaker order:
+    #   (1) higher Total Capture wins
+    #   (2) lexicographically smaller (ticker_norm, mode_norm) wins
+    singles.sort(
+        key=lambda it: (
+            -float(it[1]['Total_raw']),
+            str(it[0][0]).upper(),
+            str(it[0][1]).upper(),
+        )
+    )
 
     # Helper to score any list of (t,mode,sig)
     def score_path(path):
@@ -1750,38 +1813,33 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                         print(f"  [REJECT] {[t for t in tickers]}: Trigger Days {mm['Trigger Days']} < {min_td}")
                     _emit_validation_record(path, K, "exhaustive", mm, "trigger_days")
                     continue
-                # Enforce monotone improvement based on optimize_by metric (unless allow_decreasing is enabled)
+                # Phase 6I-73 amendment: Total Capture is the only
+                # selection criterion. The legacy 'optimize_by ==
+                # sharpe' branch is removed entirely; the only
+                # monotone-improvement check is on Total Capture.
                 if not allow_decreasing:
-                    if optimize_by == 'total_capture':
-                        prev_metric = leaderboard[-1]['Total Capture (%)']
-                        cur_metric = mm['Total_raw']
-                        metric_name = 'Total Capture'
-                        if float(cur_metric) <= float(prev_metric) + eps:
-                            search_stats['combinations_rejected'] += 1
-                            search_stats['rejection_reasons']['sharpe_improvement'] += 1  # reuse counter
-                            if VERBOSE:
-                                print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f}% <= {prev_metric:.4f}% + {eps}")
-                            _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
-                            continue
-                    else:  # optimize_by == 'sharpe'
-                        prev_metric = leaderboard[-1]['Sharpe Ratio']
-                        cur_metric = mm['Sharpe_raw']
-                        metric_name = 'Sharpe'
-                        if float(cur_metric) <= float(prev_metric) + eps:
-                            search_stats['combinations_rejected'] += 1
-                            search_stats['rejection_reasons']['sharpe_improvement'] += 1
-                            if VERBOSE:
-                                print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f} <= {prev_metric:.4f} + {eps}")
-                            _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
-                            continue
+                    prev_metric = leaderboard[-1]['Total Capture (%)']
+                    cur_metric = mm['Total_raw']
+                    metric_name = 'Total Capture'
+                    if float(cur_metric) <= float(prev_metric) + eps:
+                        search_stats['combinations_rejected'] += 1
+                        search_stats['rejection_reasons']['sharpe_improvement'] += 1  # reuse counter for "no improvement"
+                        if VERBOSE:
+                            print(f"  [REJECT] {[t for t in tickers]}: {metric_name} {cur_metric:.4f}% <= {prev_metric:.4f}% + {eps}")
+                        _emit_validation_record(path, K, "exhaustive", mm, "sharpe_improvement")
+                        continue
                 _emit_validation_record(path, K, "exhaustive", mm, None)
-                # Set key for comparison (always needed, regardless of allow_decreasing)
-                if optimize_by == 'total_capture':
-                    key = (mm['Total_raw'], mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0))
-                else:  # optimize_by == 'sharpe'
-                    key = (mm['Sharpe_raw'], - (mm['p_raw'] if mm['p_raw'] is not None else 1.0), mm['Total_raw'])
-                if (best is None) or (key > best[0]):
-                    best = (key, path, comb, mm)
+                # Phase 6I-73 amendment: comparison uses Total Capture
+                # only, with a NON-METRIC deterministic tiebreaker.
+                # Sharpe / p-Value MUST NOT influence the choice.
+                cand_total = float(mm['Total_raw'])
+                cand_identity = _stack_candidate_identity(path)
+                if _is_better_total_capture_candidate(
+                    cand_total, cand_identity,
+                    None if best is None else best[0][0],
+                    None if best is None else best[0][1],
+                ):
+                    best = ((cand_total, cand_identity), path, comb, mm)
         # Final update for this K level
         combos_tested_acc += k_combos_tested
         if progress_cb:
@@ -1809,11 +1867,14 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
         if search == 'exhaustive' or K <= ex_k:
             found = exhaustive_k(K)
         else:
-            # Beam expand
+            # Beam expand. Phase 6I-73 amendment: Total Capture is
+            # the only selection metric; tiebreaker is the
+            # deterministic stack identity (sorted member list).
+            # Sharpe / p-Value MUST NOT influence ordering.
             cand_states = []
             seen = set()
             for path, _, prevm in beam:
-                prev_metric = float(prevm['Sharpe_raw'] if optimize_by=='sharpe' else prevm['Total_raw'])
+                prev_metric = float(prevm['Total_raw'])
                 used = {t for (t, _, _) in path}
                 for _, r in cohort.iterrows():
                     t, m = r['Primary Ticker'], r['Mode']
@@ -1832,40 +1893,47 @@ def phase3_build_stacks(args, rank_direct: pd.DataFrame, rank_inverse: pd.DataFr
                         search_stats['rejection_reasons']['trigger_days'] += 1
                         _emit_validation_record(new_path, K, "beam", m2, "trigger_days")
                         continue
-                    # Enforce monotone improvement (unless allow_decreasing is enabled)
+                    # Enforce monotone improvement on Total Capture only.
                     if not allow_decreasing:
-                        cur_metric = float(m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'])
+                        cur_metric = float(m2['Total_raw'])
                         if cur_metric <= prev_metric + eps:
                             search_stats['combinations_rejected'] += 1
                             search_stats['rejection_reasons']['sharpe_improvement'] += 1
                             _emit_validation_record(new_path, K, "beam", m2, "sharpe_improvement")
                             continue
                     _emit_validation_record(new_path, K, "beam", m2, None)
-                    key = (m2['Sharpe_raw'] if optimize_by=='sharpe' else m2['Total_raw'],
-                           - (m2['p_raw'] if m2['p_raw'] is not None else 1.0))
-                    sig = (tuple(sorted([x[0] for x in new_path])), tuple([x[1] for x in new_path]))
-                    if sig in seen: continue
+                    cand_total = float(m2['Total_raw'])
+                    cand_identity = _stack_candidate_identity(new_path)
+                    sig = (
+                        tuple(sorted([x[0] for x in new_path])),
+                        tuple([x[1] for x in new_path]),
+                    )
+                    if sig in seen:
+                        continue
                     seen.add(sig)
-                    cand_states.append((key, new_path, comb2, m2))
+                    # Sort key: negative total (descending order),
+                    # then ascending identity (lexical tiebreaker).
+                    cand_states.append((
+                        (-cand_total, cand_identity), new_path, comb2, m2,
+                    ))
             if cand_states:
-                cand_states.sort(key=lambda x: x[0], reverse=True)
+                cand_states.sort(key=lambda x: x[0])  # ascending
                 beam = [(p, c, m) for _, p, c, m in cand_states[:beam_w]]
-                # choose best of current K
+                # choose best of current K: smallest sort key.
                 _, best_path, best_comb, best_met = cand_states[0]
                 found = (None, best_path, best_comb, best_met)
 
         if not found:
             if k_patience > 0 and patience_used < k_patience:
                 patience_used += 1
-                metric_name = 'Total Capture' if optimize_by == 'total_capture' else 'Sharpe'
-                print(f"[PHASE3] K={K}: No {metric_name} improvement (>={eps:.6f}), using patience {patience_used}/{k_patience}")
+                # Phase 6I-73 amendment: Total Capture only.
+                print(f"[PHASE3] K={K}: No Total Capture improvement (>={eps:.6f}), using patience {patience_used}/{k_patience}")
                 continue  # Continue to next K instead of breaking
             else:
-                metric_name = 'Total Capture' if optimize_by == 'total_capture' else 'Sharpe'
                 if allow_decreasing:
                     print(f"[PHASE3] Stopping at K={K-1}: No valid candidates with >={min_td} trigger days")
                 else:
-                    print(f"[PHASE3] Stopping at K={K-1}: No candidate improves {metric_name} by >{eps:.6f} with >={min_td} trigger days")
+                    print(f"[PHASE3] Stopping at K={K-1}: No candidate improves Total Capture by >{eps:.6f} with >={min_td} trigger days")
                 break
 
         # Found improvement, reset patience
@@ -2505,14 +2573,18 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
                 else:
                     member_names.append(m)
             # Include seed policy in folder name
-            seed_tag = "seedS" if getattr(args, 'seed_by', 'sharpe') == 'sharpe' else "seedTC"
+            # Phase 6I-73 amendment: Total Capture is the only seed
+            # policy; folder names never advertise a Sharpe seed.
+            seed_tag = "seedTC"
             final_name = f"{vendor_secondary_clean}__{seed_tag}__{('_'.join(member_names))}"
             # Truncate if too long for filesystem (Windows limit is 260 chars for full path)
             if len(final_name) > 200:
                 final_name = final_name[:197] + "..."
         else:
             # No stack was built - use special name
-            seed_tag = "seedS" if getattr(args, 'seed_by', 'sharpe') == 'sharpe' else "seedTC"
+            # Phase 6I-73 amendment: Total Capture is the only seed
+            # policy; folder names never advertise a Sharpe seed.
+            seed_tag = "seedTC"
             final_name = f"{vendor_secondary_clean}__{seed_tag}__no_stack"
 
         # Place in the secondary's parent directory
