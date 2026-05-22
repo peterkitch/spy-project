@@ -90,7 +90,7 @@ PROCESS_CONFLICT_PATTERNS: tuple[str, ...] = (
     "signal_library_stable_promotion_writer.py",
 )
 
-SELECTION_POLICY = "v1.total_capture_then_sharpe_then_latest"
+SELECTION_POLICY = "v2.total_capture_then_latest"
 DEFAULT_TOTAL_CAPTURE_TOLERANCE = 1e-9
 
 _RAW_TICKER_SPLIT_RE = re.compile(r"[,\s]+")
@@ -169,14 +169,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--min-trigger-days", type=int, default=DEFAULT_MIN_TRIGGER_DAYS,
     )
     p.add_argument("--sharpe-eps", type=float, default=DEFAULT_SHARPE_EPS)
+    # Phase 6I-73: Sharpe is no longer a supported selection /
+    # seed / optimize / ranking criterion. Total Capture is the
+    # only supported metric. ``auto`` on --optimize-by is retained
+    # for backward compatibility and resolves deterministically to
+    # ``total_capture`` (i.e. to ``seed_by``).
     p.add_argument(
         "--seed-by",
-        choices=("sharpe", "total_capture"),
+        choices=("total_capture",),
         default=DEFAULT_SEED_BY,
     )
     p.add_argument(
         "--optimize-by",
-        choices=("sharpe", "total_capture", "auto"),
+        choices=("total_capture", "auto"),
         default=DEFAULT_OPTIMIZE_BY,
     )
     p.add_argument("--allow-decreasing", action="store_true", default=False)
@@ -423,9 +428,15 @@ def build_stackbuilder_args_namespace(
     sets ``prefer_impact_xlsx=True`` when the primary source is
     ``impact_xlsx``. Does NOT import ``stackbuilder``.
     """
-    seed_by = getattr(args, "seed_by", DEFAULT_SEED_BY)
+    # Phase 6I-73: hard-pin to Total Capture. ``sharpe`` is rejected
+    # by the CLI parser; if anything sneaks through programmatically
+    # we normalize here so downstream engine paths see only the
+    # supported value.
+    seed_by = getattr(args, "seed_by", DEFAULT_SEED_BY) or DEFAULT_SEED_BY
+    if seed_by == "sharpe":
+        seed_by = "total_capture"
     optimize_by = getattr(args, "optimize_by", DEFAULT_OPTIMIZE_BY)
-    if optimize_by == "auto":
+    if optimize_by in (None, "auto", "sharpe"):
         optimize_by = seed_by
     prefer_impact_xlsx = (
         (primaries_resolution or {}).get("primary_source", "impact_xlsx")
@@ -983,8 +994,9 @@ def summarize_stackbuilder_run_dir(run_dir: Optional[str]) -> dict:
         summary["best_total_capture"] = summary_json.get("best_capture")
 
     # Enumerate artifact paths by candidate extension.
+    # Phase 6I-73: rank_inverse is no longer produced.
     candidates = (
-        "rank_all", "rank_direct", "rank_inverse", "cohort", "combo_leaderboard",
+        "rank_all", "rank_direct", "cohort", "combo_leaderboard",
     )
     for name in candidates:
         for ext in ("xlsx", "parquet", "csv", "json"):
@@ -1171,15 +1183,17 @@ def select_build_per_policy(
     *,
     total_capture_tolerance: float = DEFAULT_TOTAL_CAPTURE_TOLERANCE,
 ) -> Optional[dict]:
-    """Apply Phase A locked v1 selection policy to ``candidates``.
+    """Apply Phase 6I-73 selection policy to ``candidates``.
 
-    Each candidate must expose ``total_capture``, ``sharpe_ratio``,
-    ``selected_k``, ``created_at`` (ISO-8601 string). Operator pins
+    Each candidate must expose ``total_capture``, ``selected_k``, and
+    ``created_at`` (ISO-8601 string). Operator pins
     (``operator_pinned=True``) win unconditionally. Otherwise the
-    Phase A policy first collapses same-K candidates to the latest
-    successful run, then compares the remaining K choices by
-    ``total_capture`` (with tolerance), ``sharpe_ratio``, and
-    ``created_at`` (latest).
+    policy first collapses same-K candidates to the latest successful
+    run, then compares the remaining K choices by ``total_capture``
+    (with tolerance), then falls back to ``created_at`` (latest)
+    within the tolerance band. Sharpe is intentionally NOT used as a
+    tiebreaker — Phase 6I-73 removed Sharpe from every selection /
+    ranking / seeding / optimize / tiebreaker surface.
     """
     cands = list(candidates or [])
     if not cands:
@@ -1214,15 +1228,10 @@ def select_build_per_policy(
             best = c
             continue
         if abs(tc_c - tc_b) <= total_capture_tolerance:
-            sh_c = _f(c, "sharpe_ratio")
-            sh_b = _f(best, "sharpe_ratio")
-            if sh_c > sh_b:
+            # Within tolerance: latest wins. No Sharpe tiebreaker.
+            if (c.get("created_at") or "") > (best.get("created_at") or ""):
                 best = c
                 continue
-            if sh_c == sh_b:
-                if (c.get("created_at") or "") > (best.get("created_at") or ""):
-                    best = c
-                    continue
     return best
 
 

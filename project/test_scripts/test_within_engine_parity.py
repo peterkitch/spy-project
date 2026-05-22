@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import pickle
 import shutil
 import sys
@@ -210,6 +211,19 @@ def test_b1_stackbuilder_direct_k1_parity(_populated_stackbuilder_lib):
         shutil.rmtree(out, ignore_errors=True)
 
 
+@pytest.mark.skip(
+    reason=(
+        "Phase 6I-73: phase2 no longer rescores inverse metrics. "
+        "rank_inverse is a bounded internal cohort frame derived "
+        "from the most-negative direct Total Capture rows with NaN "
+        "Sharpe / NaN p-Value. K=1 metrics in the leaderboard come "
+        "from phase3's _combined_metrics_signals path, so phase2 "
+        "cohort row and phase3 K=1 leaderboard row are no longer "
+        "expected to match field-for-field. Replacement coverage "
+        "lives in test_phase6i73_bounded_inverse_cohort_total_capture "
+        "and test_phase6i73_bounded_inverse_cohort_nan_sharpe below."
+    )
+)
 def test_b2_stackbuilder_inverse_k1_parity(_populated_stackbuilder_lib):
     """Phase 2 rank_inverse.iloc[0] must match the Phase 3 K=1
     leaderboard when bottom_n=1 forces inverse-mode-only K=1
@@ -295,6 +309,15 @@ def test_b2_stackbuilder_inverse_k1_parity(_populated_stackbuilder_lib):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(
+    reason=(
+        "Phase 6I-73: phase2 inverse rescore loop removed. Inverse "
+        "cohort Sharpe is NaN by design at the cohort layer. The "
+        "negate-symmetry regression this test guarded against can "
+        "no longer manifest because no inverse Sharpe is computed "
+        "in phase2."
+    )
+)
 def test_b2b_rank_inverse_not_negate_symmetry_when_rfr_nonzero(
     _populated_stackbuilder_lib,
 ):
@@ -377,6 +400,15 @@ def test_b2b_rank_inverse_not_negate_symmetry_when_rfr_nonzero(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(
+    reason=(
+        "Phase 6I-73: the xlsx fast-path no longer recomputes "
+        "inverse metrics per primary. The bounded inverse cohort "
+        "comes from rank_direct's most-negative Total Capture rows "
+        "with NaN Sharpe. Replacement coverage lives in "
+        "test_phase6i73_xlsx_fastpath_no_inverse_rescore below."
+    )
+)
 def test_b2c_xlsx_fastpath_inverse_recomputed_not_negated(
     monkeypatch, tmp_path,
 ):
@@ -504,6 +536,18 @@ def test_b2c_xlsx_fastpath_inverse_recomputed_not_negated(
         sb.SIGNAL_LIB_DIR_RUNTIME = pre_sb_runtime
 
 
+@pytest.mark.skip(
+    reason=(
+        "Phase 6I-73: the xlsx fast-path no longer loads inverse "
+        "libraries in phase2; the bounded inverse cohort is derived "
+        "from rank_direct rows with no library access. The loud-fail "
+        "this test guarded against can no longer manifest. Phase 3 "
+        "loads inverse signals once (for the K=1 winner if inverse), "
+        "via the existing _signals_aligned_and_mask path, where "
+        "missing-library failures surface as standard SystemExit "
+        "during _combined_metrics_signals or phase3 cohort assembly."
+    )
+)
 def test_b2d_xlsx_fastpath_inverse_missing_libraries_loud_fail(
     monkeypatch, tmp_path,
 ):
@@ -676,3 +720,193 @@ def test_b3_impactsearch_fastpath_metrics_parity(monkeypatch, tmp_path):
     finally:
         fp.SIGNAL_LIBRARY_DIR = pre_dir
         fp.IMPACT_TRUST_LIBRARY = pre_trust
+
+
+# ===========================================================================
+# Phase 6I-73 — bounded inverse cohort + xlsx fast-path replacement coverage
+# ===========================================================================
+
+
+def test_phase6i73_bounded_inverse_cohort_derives_from_most_negative_direct():
+    """Phase 6I-73: _build_bounded_inverse_cohort takes the most-
+    negative Total Capture rows from rank_direct, sign-flips the
+    capture magnitudes, and emits NaN Sharpe / NaN p-Value at the
+    cohort layer.
+    """
+    sb = _get_module("stackbuilder")
+    rank_direct = pd.DataFrame([
+        {"Primary Ticker": "POSHI", "Total Capture (%)":  5.0,
+         "Avg Daily Capture (%)":  0.5, "Sharpe Ratio": 1.0,
+         "p-Value": 0.01, "Trigger Days": 100},
+        {"Primary Ticker": "ZERO",  "Total Capture (%)":  0.0,
+         "Avg Daily Capture (%)":  0.0, "Sharpe Ratio": 0.0,
+         "p-Value": 0.50, "Trigger Days": 50},
+        {"Primary Ticker": "NEG1",  "Total Capture (%)": -3.0,
+         "Avg Daily Capture (%)": -0.2, "Sharpe Ratio": -0.5,
+         "p-Value": 0.30, "Trigger Days": 80},
+        {"Primary Ticker": "NEG2",  "Total Capture (%)": -7.0,
+         "Avg Daily Capture (%)": -0.4, "Sharpe Ratio": -1.0,
+         "p-Value": 0.20, "Trigger Days": 60},
+    ])
+    inv = sb._build_bounded_inverse_cohort(rank_direct, bottom_n=2)
+    # Two most-negative rows: NEG2 (-7.0) and NEG1 (-3.0).
+    tickers = inv["Primary Ticker"].tolist()
+    assert set(tickers) == {"NEG2", "NEG1"}
+    # Total Capture is sign-flipped to positive inverse-candidate
+    # magnitude, sorted descending.
+    captures = inv["Total Capture (%)"].tolist()
+    assert captures[0] == pytest.approx(7.0)
+    assert captures[1] == pytest.approx(3.0)
+    # Avg Daily Capture sign-flipped too.
+    avgs = inv["Avg Daily Capture (%)"].tolist()
+    assert avgs[0] == pytest.approx(0.4)
+    assert avgs[1] == pytest.approx(0.2)
+    # Sharpe / p-Value are NaN at the cohort layer (Phase 6I-73).
+    import math
+    for v in inv["Sharpe Ratio"].tolist():
+        assert math.isnan(float(v))
+    for v in inv["p-Value"].tolist():
+        assert math.isnan(float(v))
+
+
+def test_phase6i73_bounded_inverse_cohort_handles_no_negative_rows():
+    """If no direct row has negative Total Capture, the bounded
+    inverse cohort still returns up to bottom_n rows (sorted by
+    most-negative-first). The cohort layer never crashes; it just
+    yields the least-positive rows as the next-best candidates.
+    """
+    sb = _get_module("stackbuilder")
+    rank_direct = pd.DataFrame([
+        {"Primary Ticker": "A", "Total Capture (%)":  5.0,
+         "Avg Daily Capture (%)": 0.5, "Sharpe Ratio": 1.0,
+         "p-Value": 0.01, "Trigger Days": 100},
+        {"Primary Ticker": "B", "Total Capture (%)":  3.0,
+         "Avg Daily Capture (%)": 0.3, "Sharpe Ratio": 0.8,
+         "p-Value": 0.05, "Trigger Days": 100},
+    ])
+    inv = sb._build_bounded_inverse_cohort(rank_direct, bottom_n=1)
+    # bottom_n=1 → 1 row (least-positive Total Capture).
+    assert len(inv) == 1
+    # Sign-flipped → -3.0.
+    assert inv.iloc[0]["Total Capture (%)"] == pytest.approx(-3.0)
+    # Sharpe NaN by design.
+    import math
+    assert math.isnan(float(inv.iloc[0]["Sharpe Ratio"]))
+
+
+def test_phase6i73_xlsx_fastpath_no_inverse_rescore_call(monkeypatch, tmp_path):
+    """Phase 6I-73 regression: the XLSX fast-path must NOT call
+    ``_score_primary_from_signals(..., mode='I')`` during phase2.
+    The bounded inverse cohort comes from rank_direct rows only.
+    """
+    sb = _get_module("stackbuilder")
+
+    inv_call_count = {"n": 0}
+
+    def _spy_score_primary_from_signals(*a, **k):
+        if k.get("mode") == "I" or (len(a) >= 5 and a[4] == "I"):
+            inv_call_count["n"] += 1
+        return None
+
+    xlsx_df = pd.DataFrame([
+        {"Primary Ticker": "AAA", "Avg Daily Capture (%)":  0.10,
+         "Total Capture (%)":  1.0, "Sharpe Ratio": 7.5,
+         "Win Ratio (%)": 60.0, "Std Dev (%)": 0.5,
+         "Trigger Days": 8, "p-Value": 0.04},
+        {"Primary Ticker": "BBB", "Avg Daily Capture (%)": -0.20,
+         "Total Capture (%)": -2.0, "Sharpe Ratio": -1.5,
+         "Win Ratio (%)": 40.0, "Std Dev (%)": 0.6,
+         "Trigger Days": 10, "p-Value": 0.08},
+    ])
+    monkeypatch.setattr(sb, "try_load_rank_from_impact_xlsx",
+                        lambda *a, **k: xlsx_df.copy())
+    monkeypatch.setattr(sb, "_score_primary_from_signals",
+                        _spy_score_primary_from_signals)
+
+    primaries_df = pd.DataFrame({"Primary Ticker": ["AAA", "BBB"]})
+    args = SimpleNamespace(
+        secondary="ZZZ", prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>", impact_xlsx_max_age_days=45,
+        threads="auto", no_progress=True, bottom_n=1,
+        signal_lib_dir=str(tmp_path / "no_such_dir"),
+    )
+    out = tempfile.mkdtemp(prefix="phase6i73_")
+    try:
+        rank_all, rank_direct, rank_inverse = sb.phase2_rank_all(
+            args, primaries_df, pd.Series(dtype=float),
+            outdir=out, secondary="ZZZ", progress_path=None,
+        )
+        # ZERO inverse rescore calls in phase2 under Phase 6I-73.
+        assert inv_call_count["n"] == 0
+        # rank_inverse is a bounded internal frame (1 row for bottom_n=1).
+        assert len(rank_inverse) == 1
+        # Derived from the most-negative direct row (BBB at -2.0
+        # → sign-flipped to +2.0).
+        assert rank_inverse.iloc[0]["Primary Ticker"] == "BBB"
+        assert rank_inverse.iloc[0]["Total Capture (%)"] == pytest.approx(2.0)
+        import math
+        assert math.isnan(float(rank_inverse.iloc[0]["Sharpe Ratio"]))
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_phase6i73_rank_inverse_not_persisted_as_artifact(monkeypatch, tmp_path):
+    """Phase 6I-73: ``rank_inverse.*`` must NOT be written to disk
+    even on the XLSX fast-path with bottom_n > 0.
+    """
+    sb = _get_module("stackbuilder")
+    xlsx_df = pd.DataFrame([
+        {"Primary Ticker": "AAA", "Avg Daily Capture (%)":  0.10,
+         "Total Capture (%)":  1.0, "Sharpe Ratio": 7.5,
+         "Win Ratio (%)": 60.0, "Std Dev (%)": 0.5,
+         "Trigger Days": 8, "p-Value": 0.04},
+        {"Primary Ticker": "BBB", "Avg Daily Capture (%)": -0.20,
+         "Total Capture (%)": -2.0, "Sharpe Ratio": -1.5,
+         "Win Ratio (%)": 40.0, "Std Dev (%)": 0.6,
+         "Trigger Days": 10, "p-Value": 0.08},
+    ])
+    monkeypatch.setattr(sb, "try_load_rank_from_impact_xlsx",
+                        lambda *a, **k: xlsx_df.copy())
+    primaries_df = pd.DataFrame({"Primary Ticker": ["AAA", "BBB"]})
+    args = SimpleNamespace(
+        secondary="ZZZ", prefer_impact_xlsx=True,
+        impact_xlsx_dir="<unused>", impact_xlsx_max_age_days=45,
+        threads="auto", no_progress=True, bottom_n=1,
+        signal_lib_dir=str(tmp_path / "no_such_dir"),
+    )
+    out = tempfile.mkdtemp(prefix="phase6i73_artifact_")
+    try:
+        sb.phase2_rank_all(
+            args, primaries_df, pd.Series(dtype=float),
+            outdir=out, secondary="ZZZ", progress_path=None,
+        )
+        # rank_all and rank_direct should exist; rank_inverse must NOT.
+        existing = set(os.listdir(out))
+        assert any(name.startswith("rank_all.") for name in existing)
+        assert any(name.startswith("rank_direct.") for name in existing)
+        assert not any(name.startswith("rank_inverse.") for name in existing), (
+            f"rank_inverse artifact unexpectedly written: {sorted(existing)}"
+        )
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_phase6i73_build_output_artifacts_excludes_rank_inverse(tmp_path):
+    """``_build_output_artifacts`` must NOT enumerate ``rank_inverse``."""
+    sb = _get_module("stackbuilder")
+    # Drop a dummy rank_inverse.csv into the dir to confirm it is
+    # ignored by the artifact enumerator.
+    rd = tmp_path / "run_dir"
+    rd.mkdir()
+    (rd / "rank_all.csv").write_text("Primary Ticker\nA\n", encoding="utf-8")
+    (rd / "rank_direct.csv").write_text("Primary Ticker\nA\n", encoding="utf-8")
+    (rd / "rank_inverse.csv").write_text("Primary Ticker\nA\n", encoding="utf-8")
+    (rd / "cohort.csv").write_text("Primary Ticker\nA\n", encoding="utf-8")
+    artifacts = sb._build_output_artifacts(str(rd))
+    names = [a["name"] for a in artifacts]
+    assert "rank_inverse" not in names, (
+        f"_build_output_artifacts still enumerates rank_inverse: {names}"
+    )
+    assert "rank_all" in names
+    assert "rank_direct" in names
+    assert "cohort" in names
