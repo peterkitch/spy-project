@@ -791,13 +791,20 @@ def _consumer_load_pkl(path: str) -> Tuple[Optional[dict], Optional[str]]:
     """Direct ``pickle.load`` of a signal-library PKL. Returns
     ``(lib_or_None, reason_or_None)``. ``reason`` is the short
     diagnostic tag used by the warn-once channel.
+
+    Catches a broad ``Exception`` band because malformed pickle streams
+    can raise practically anything from ``pickle.UnpicklingError`` to
+    ``MemoryError`` / ``IndexError`` / ``OverflowError`` depending on
+    how the stream is broken. A consumer loader must never re-raise
+    on a single corrupt PKL; the safe contract is "return ``None`` and
+    let the run continue without this primary".
     """
     try:
         with open(path, 'rb') as fh:
             lib = pickle.load(fh)
     except FileNotFoundError:
         return None, "missing"
-    except (OSError, pickle.UnpicklingError, EOFError, ValueError) as exc:
+    except Exception as exc:
         return None, f"unreadable:{type(exc).__name__}"
     if not _consumer_validate_lib_payload(lib):
         return None, "invalid_payload"
@@ -837,13 +844,25 @@ def load_signal_library_for_stackbuilder(
     emits at most one ``[STACKBUILDER:library_*]`` diagnostic per
     (ticker, reason) pair via the warn-once channel.
     """
+    # Phase 6I-75 amendment: cache the no-candidates outcome BEFORE
+    # touching the filesystem. Repeated missing-library calls for the
+    # same ``(ticker, signal_lib_dir)`` skip the glob, the warn, and
+    # all candidate-loop work.
+    signal_lib_dir = SIGNAL_LIB_DIR_RUNTIME or DEFAULT_SIGNAL_LIB_DIR
+    no_candidate_key = f"{ticker}|{signal_lib_dir}|no-candidates"
+    with _CONSUMER_LOADER_LOCK:
+        if no_candidate_key in _CONSUMER_LOADER_CACHE:
+            return None
+
     candidates = list_signal_library_candidates(ticker)
     if not candidates:
+        with _CONSUMER_LOADER_LOCK:
+            _CONSUMER_LOADER_CACHE[no_candidate_key] = (None, "no_candidates")
         warn_key = f"missing:{ticker}"
         _consumer_warn_once(
             warn_key,
             f"[STACKBUILDER:library_missing] {ticker}: no signal library "
-            f"candidates under {SIGNAL_LIB_DIR_RUNTIME or DEFAULT_SIGNAL_LIB_DIR}",
+            f"candidates under {signal_lib_dir}",
         )
         return None
 

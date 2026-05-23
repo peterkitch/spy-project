@@ -906,7 +906,7 @@ semantic parity. The harness lives at
 component of `_combined_metrics_signals` independently against a
 30-year synthetic daily series with K=4 members.
 
-Result (median over 30 repetitions, pinned spyproject2 interpreter):
+Result (median over 30 repetitions, pinned interpreter):
 
 | Component | Median ms / combo | Share of full pipeline |
 |---|---|---|

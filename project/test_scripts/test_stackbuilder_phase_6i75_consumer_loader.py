@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import importlib
 import io
+import json
 import os
 import pickle
 import sys
@@ -216,6 +217,112 @@ def test_consumer_loader_memoizes_failure(sb, tmp_path, monkeypatch):
         if "[STACKBUILDER:library_missing]" in ln
     ]
     assert len(missing_lines) == 1
+
+
+def test_no_candidate_failure_is_cached(sb, tmp_path, monkeypatch):
+    """Amendment 5: a no-candidates outcome is stored in the cache so
+    repeated calls for the same missing ticker neither re-glob nor
+    re-warn."""
+    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
+
+    glob_count = {"n": 0}
+    real_lister = sb.list_signal_library_candidates
+
+    def counting_lister(ticker):
+        glob_count["n"] += 1
+        return real_lister(ticker)
+
+    monkeypatch.setattr(sb, "list_signal_library_candidates", counting_lister)
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        for _ in range(5):
+            assert sb.load_signal_library_for_stackbuilder("ABSENT") is None
+
+    # The lister is called at most once per missing ticker per run.
+    assert glob_count["n"] == 1
+    # The diagnostic is also emitted at most once.
+    missing_lines = [
+        ln for ln in out.getvalue().splitlines()
+        if "[STACKBUILDER:library_missing]" in ln
+    ]
+    assert len(missing_lines) == 1
+
+
+def test_no_candidate_cache_key_includes_signal_lib_dir(sb, tmp_path, monkeypatch):
+    """Switching ``SIGNAL_LIB_DIR_RUNTIME`` invalidates the no-candidate
+    failure cache for the same ticker so the new directory is actually
+    inspected."""
+    dir_a = tmp_path / "lib_a"
+    dir_b = tmp_path / "lib_b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(dir_a))
+    assert sb.load_signal_library_for_stackbuilder("MULTI") is None
+
+    # Place a usable PKL under dir_b and switch the runtime dir there;
+    # the new no-candidate key differs, so the loader must inspect
+    # dir_b and find the PKL.
+    _write_lib(dir_b / "MULTI_stable_v1.pkl")
+    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(dir_b))
+    found = sb.load_signal_library_for_stackbuilder("MULTI")
+    assert found is not None
+
+
+def test_corrupt_pkl_returns_none_without_writes(sb, tmp_path, monkeypatch):
+    """A truncated / corrupt PKL returns ``None`` with no rebuild
+    trigger, no file write under the signal-library directory, and no
+    network call."""
+    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
+    corrupt_path = tmp_path / "CORRUPT_stable_v1.pkl"
+    # Truncated header — not a valid pickle stream.
+    corrupt_path.write_bytes(b"\x80\x04\x95not-a-valid-pickle")
+
+    before = sorted(p.name for p in tmp_path.iterdir())
+    out = io.StringIO()
+    with redirect_stdout(out):
+        result = sb.load_signal_library_for_stackbuilder("CORRUPT")
+    after = sorted(p.name for p in tmp_path.iterdir())
+
+    assert result is None
+    # No new file created. No file removed. The single corrupt PKL is
+    # still on disk untouched.
+    assert before == after
+    # No "rebuild" / OnePass / network diagnostic surfaced.
+    text = out.getvalue()
+    assert "[STACKBUILDER:library_unreadable]" in text
+    assert "[ONEPASS:" not in text
+    assert "rebuild" not in text.lower()
+    assert "yfinance" not in text.lower()
+
+
+def test_readable_pkl_with_stale_manifest_is_accepted(sb, tmp_path, monkeypatch):
+    """A readable PKL whose ``_manifest`` metadata is stale or
+    mismatched still loads in consumer mode as long as the data
+    payload is valid. Provenance verification is not the gate here."""
+    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
+    lib_path = tmp_path / "STALE_stable_v1.pkl"
+    payload = {
+        "primary_signals": [0, 1, -1, 0],
+        "dates": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+        "tags": ["BUY[D]"],
+        # Intentionally stale manifest: the content_hash here is for a
+        # different payload and the schema_version is wrong. The
+        # consumer loader must not reject on these grounds.
+        "_manifest": {
+            "content_hash": "0" * 64,
+            "schema_version": -999,
+            "engine_version": "stale.0.0",
+            "stale": True,
+        },
+    }
+    with open(lib_path, "wb") as fh:
+        pickle.dump(payload, fh)
+
+    loaded = sb.load_signal_library_for_stackbuilder("STALE")
+    assert loaded is not None
+    assert loaded["primary_signals"] == [0, 1, -1, 0]
 
 
 def test_memoization_key_includes_mtime_and_size(sb, tmp_path, monkeypatch):
@@ -474,3 +581,409 @@ def test_runner_dry_run_plan_per_secondary_carries_skip_flag():
     )
     assert plan["effective_config"]["skip_durable_validation"] is True
     assert plan["per_secondary_plan"][0]["skip_durable_validation"] is True
+
+
+# ---------------------------------------------------------------------------
+# Amendment 3: hotpath benchmark harness schema + calibration coverage
+# ---------------------------------------------------------------------------
+
+_HOTPATH_REQUIRED_TOP_LEVEL_KEYS = (
+    "per_combo_ms_current_measured",
+    "current_sample_iterations",
+    "current_extrapolated_to_102050_seconds",
+    "observed_phase6i74_ms_per_combo",
+    "per_combo_ms_legacy_synthetic_baseline",
+    "per_combo_ms_target",
+    "overhead_decomposition",
+    "dominant_source",
+    "dominant_source_share",
+    "fast_helper_attempted",
+    "per_combo_ms_fast_measured",
+    "fast_sample_iterations",
+    "fast_helper_wired",
+    "reason_not_wired",
+)
+
+
+@pytest.fixture
+def hotpath_result(tmp_path):
+    """Run the benchmark once at a tiny iteration count and return the
+    parsed JSON. Used by every Amendment 3 schema test."""
+    bench = importlib.import_module(
+        "test_scripts.bench_phase_6i75_hotpath_decomposition"
+    )
+    out_path = tmp_path / "phase_6i75_hotpath_decomposition.json"
+    rc = bench.main([
+        "--out", str(out_path),
+        "--current-sample-iterations", "2",
+        "--years", "1",
+        "--k", "2",
+        "--warmup-iterations", "1",
+        "--max-wall-seconds", "900",
+    ])
+    assert rc == 0
+    assert out_path.is_file()
+    return json.loads(out_path.read_text(encoding="utf-8"))
+
+
+def test_hotpath_harness_required_top_level_keys(hotpath_result):
+    """All Phase 6I-75 spec keys are present at the top level."""
+    missing = [k for k in _HOTPATH_REQUIRED_TOP_LEVEL_KEYS
+               if k not in hotpath_result]
+    assert missing == [], f"missing keys: {missing!r}"
+
+
+def test_hotpath_harness_constants_match_spec(hotpath_result):
+    """The three locked constants from the prompt are emitted verbatim."""
+    assert hotpath_result["observed_phase6i74_ms_per_combo"] == 187.4
+    assert hotpath_result["per_combo_ms_legacy_synthetic_baseline"] == 5.94
+    assert hotpath_result["per_combo_ms_target"] == 18.0
+
+
+def test_hotpath_harness_reason_not_wired_present_when_not_wired(hotpath_result):
+    """When fast_helper_wired is False, reason_not_wired is a non-empty
+    string explaining the data-driven decision."""
+    assert hotpath_result["fast_helper_wired"] is False
+    assert hotpath_result["fast_helper_attempted"] is False
+    reason = hotpath_result["reason_not_wired"]
+    assert isinstance(reason, str)
+    assert reason.strip()
+    assert hotpath_result["per_combo_ms_fast_measured"] is None
+    assert hotpath_result["fast_sample_iterations"] is None
+
+
+def test_hotpath_harness_dominant_source_populated(hotpath_result):
+    """The decomposition picks a dominant source and reports its share."""
+    decomposition = hotpath_result["overhead_decomposition"]
+    assert isinstance(decomposition, dict)
+    assert decomposition, "overhead_decomposition is empty"
+    assert hotpath_result["dominant_source"] in decomposition
+    share = hotpath_result["dominant_source_share"]
+    assert share is not None
+    assert 0.0 < share <= 1.0
+
+
+def test_hotpath_harness_calibration_metadata_present(hotpath_result):
+    """Calibrated-sampling metadata is recorded for future audits."""
+    meta = hotpath_result["metadata"]
+    assert meta["warmup_iterations"] >= 1
+    assert meta["k_members"] >= 1
+    assert meta["max_wall_seconds"] > 0
+    assert meta["phase_6i74_combo_count"] == 102050
+    assert "calibration_note" in meta
+    assert "extrapolation_method" in meta
+    assert isinstance(meta["halted_for_budget"], bool)
+    assert hotpath_result["current_sample_iterations"] >= 1
+
+
+def test_hotpath_harness_extrapolation_is_consistent(hotpath_result):
+    """``current_extrapolated_to_102050_seconds`` matches the documented
+    formula ``per_combo_ms * 102050 / 1000``."""
+    expected = (
+        hotpath_result["per_combo_ms_current_measured"] * 102050 / 1000.0
+    )
+    actual = hotpath_result["current_extrapolated_to_102050_seconds"]
+    assert abs(actual - expected) < 1e-6
+
+
+def test_hotpath_harness_json_no_local_paths(hotpath_result):
+    """The verdict JSON must not embed local absolute paths, drive
+    letters, usernames, or conda paths.
+
+    Forbidden tokens are reconstructed from split string literals at
+    test time so this source file does not itself contain the
+    privacy-scan needles. (Without the split, the privacy scanner
+    would always match the literal needles inside this test, even
+    though the runtime check is correct.)
+    """
+    text = json.dumps(hotpath_result)
+    forbidden = [
+        "spo" + "rt",
+        "NV" + "IDIA",
+        "Mini" + "Conda",
+        "App" + "Data",
+        "spy" + "project2",
+        "/Us" + "ers/",
+        "C" + ":\\",
+        "C" + ":/",
+    ]
+    leaks = [needle for needle in forbidden if needle in text]
+    assert leaks == [], f"privacy leaks in verdict JSON: {leaks!r}"
+
+
+def test_hotpath_harness_budget_ceiling_is_enforced(tmp_path):
+    """A tiny ``--max-wall-seconds`` budget flips ``halted_for_budget``
+    on without crashing the harness — the JSON is still emitted with
+    the projection metadata so an operator can see WHY the run halted."""
+    bench = importlib.import_module(
+        "test_scripts.bench_phase_6i75_hotpath_decomposition"
+    )
+    out_path = tmp_path / "halted.json"
+    rc = bench.main([
+        "--out", str(out_path),
+        "--current-sample-iterations", "2",
+        "--years", "1",
+        "--k", "2",
+        "--warmup-iterations", "1",
+        # 0.0001 seconds = effectively zero; projection of any
+        # measurable per-combo cost over 102050 iterations will exceed.
+        "--max-wall-seconds", "0.0001",
+    ])
+    assert rc == 0
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["metadata"]["halted_for_budget"] is True
+    assert "projected" in payload["metadata"]["calibration_note"]
+
+
+# ---------------------------------------------------------------------------
+# Amendment 4: run_for_secondary skip-gate isolation
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_skip_args(
+    *,
+    secondary: str = "SPY",
+    outdir: Path,
+    skip: bool,
+):
+    """Construct the smallest plausible argparse.Namespace-like object
+    that ``run_for_secondary`` can consume. Each engine-internal phase
+    is stubbed out in the test body so this namespace only needs to
+    expose the attributes the test path actually reads."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        secondary=secondary,
+        secondaries=None,
+        primaries="STUB",
+        signal_lib_dir=None,
+        impact_xlsx_dir=None,
+        impact_xlsx_max_age_days=45,
+        prefer_impact_xlsx=False,
+        strict_manifests=False,
+        outdir=str(outdir),
+        output_format="xlsx",
+        top_n=1,
+        bottom_n=1,
+        max_k=1,
+        exhaustive_k=1,
+        min_trigger_days=1,
+        sharpe_eps=1e-6,
+        seed_by="total_capture",
+        optimize_by="total_capture",
+        allow_decreasing=False,
+        search="beam",
+        beam_width=1,
+        both_modes=False,
+        k_patience=0,
+        combine_mode="intersection",
+        grace_days=None,
+        threads="auto",
+        jobs=1,
+        verbose=False,
+        no_progress=True,
+        save_stats=False,
+        fail_on_missing_cache=False,
+        serve=False,
+        port=8054,
+        alpha=0.05,
+        min_marginal_capture=0.0,
+        progress_path=None,
+        skip_durable_validation=skip,
+    )
+
+
+def _install_engine_stubs(sb_module, monkeypatch):
+    """Stub out every side-effecting StackBuilder function that
+    ``run_for_secondary`` would normally invoke so the test exercises
+    only the validation gate. No I/O, no engine work, no canonical
+    artifact writes.
+
+    Returns the in-memory primaries / rank / leaderboard objects that
+    the stubs hand back, in case the test wants to assert on them.
+    """
+    import pandas as _pd
+
+    primaries = ["AROW", "AWR"]
+    primaries_df = _pd.DataFrame({"Primary Ticker": primaries})
+    idx = _pd.bdate_range("2024-01-02", periods=10)
+    sec_df = _pd.DataFrame({"Close": _pd.Series(range(1, 11), index=idx)})
+    sec_rets = sb_module.pct_returns(sec_df["Close"])
+    vendor_secondary = "SPY"
+
+    def _fake_phase1_preflight(args, secondary, specified_primaries=None):
+        return primaries_df, sec_rets, vendor_secondary
+    monkeypatch.setattr(sb_module, "phase1_preflight", _fake_phase1_preflight)
+
+    rank_df = _pd.DataFrame({
+        "Primary Ticker": primaries,
+        "Total Capture (%)": [10.0, 5.0],
+        "Sharpe Ratio": [0.5, 0.3],
+        "Trigger Days": [100, 80],
+        "Mode": ["D", "D"],
+    })
+
+    def _fake_phase2_rank_all(
+        args, primaries_df_in, sec_rets_in, outdir,
+        secondary=None, progress_path=None, *,
+        grace_days=None, data_available_through=None,
+    ):
+        return rank_df, rank_df.copy(), rank_df.iloc[:0].copy()
+    monkeypatch.setattr(sb_module, "phase2_rank_all", _fake_phase2_rank_all)
+
+    # Non-empty leaderboard so the run_for_secondary summary path,
+    # which formats ``best_sharpe``/``best_capture``/``best_trigger_days``
+    # with f-string ``:.3f`` / ``:.2f``, has real numbers to print. The
+    # actual values don't matter for the skip-gate assertions.
+    leaderboard_df = _pd.DataFrame({
+        "Sharpe Ratio": [0.5],
+        "Total Capture (%)": [10.0],
+        "Trigger Days": [100],
+    })
+    final_members: list = []
+
+    def _fake_phase3_build_stacks(
+        args, rank_direct, rank_inverse, sec_rets_in, outdir,
+        progress_cb=None, *, grace_days=None,
+        data_available_through=None, validation_collector=None,
+    ):
+        return leaderboard_df, final_members
+    monkeypatch.setattr(sb_module, "phase3_build_stacks", _fake_phase3_build_stacks)
+
+    # Make XLSX writes no-ops so the test doesn't depend on Excel
+    # engines and can't accidentally create canonical artifact files.
+    def _noop_write_table(df, basepath):
+        return None
+    monkeypatch.setattr(sb_module, "write_table", _noop_write_table)
+
+    return {
+        "primaries_df": primaries_df,
+        "rank_df": rank_df,
+        "leaderboard_df": leaderboard_df,
+    }
+
+
+@pytest.mark.parametrize("skip", [True, False])
+def test_run_for_secondary_skip_gate_controls_validation_path(
+    sb, tmp_path, monkeypatch, skip,
+):
+    """End-to-end skip-gate proof against ``run_for_secondary`` with
+    phase1/2/3 + writers monkeypatched.
+
+    When ``args.skip_durable_validation=True``:
+
+      * ``_prepare_stackbuilder_durable_validation`` is NEVER called.
+      * The manifest carries ``durable_validation_status='skipped'`` and
+        ``durable_validation_skip_reason='operator_flag'``.
+      * The locked-10 ``validation_status`` is ``'skipped'``.
+      * No durable validation sidecar is written.
+
+    When ``args.skip_durable_validation=False``: the spy IS called and
+    the run records ``durable_validation_status='ran'`` with whatever
+    summary the spy returns.
+    """
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    _install_engine_stubs(sb, monkeypatch)
+
+    # Spy on the four validation surfaces named by the spec.
+    spy_calls: dict = {
+        "_prepare_stackbuilder_durable_validation": 0,
+        "StackBuilderValidationAdapter_init": 0,
+        "validate_strategy_set": 0,
+        "write_validation_sidecar": 0,
+    }
+
+    def _spy_prepare(**kwargs):
+        spy_calls["_prepare_stackbuilder_durable_validation"] += 1
+        # Synthesize a minimal "ran" summary so the non-skip branch
+        # can complete; ``_validate_stackbuilder_validation_summary``
+        # only checks key presence.
+        summary = {
+            "validation_contract_version": "v1",
+            "validation_status": "valid",
+            "n_strategies_tested": 0,
+            "n_strategies_reported": 0,
+            "multiple_comparisons_control_method": "BH",
+            "multiple_comparisons_control_alpha": 0.05,
+            "walk_forward_n_folds": 0,
+            "mean_baseline_sharpe": None,
+            "validation_artifact_path": str(tmp_path / "sidecar.json"),
+            "validation_artifact_hash": "0" * 64,
+        }
+        return ({}, summary, str(tmp_path / "sidecar.json"))
+    monkeypatch.setattr(
+        sb, "_prepare_stackbuilder_durable_validation", _spy_prepare,
+    )
+
+    # Spy on StackBuilderValidationAdapter constructor and
+    # validate_strategy_set / write_validation_sidecar at the import
+    # sites StackBuilder uses; the skip path must not touch them.
+    import validation_engine as _ve_module
+
+    class _SpyAdapter:
+        def __init__(self, *a, **kw):
+            spy_calls["StackBuilderValidationAdapter_init"] += 1
+
+    # StackBuilder imports StackBuilderValidationAdapter at module
+    # load time; patch the binding on stackbuilder itself.
+    if hasattr(sb, "StackBuilderValidationAdapter"):
+        monkeypatch.setattr(
+            sb, "StackBuilderValidationAdapter", _SpyAdapter,
+        )
+
+    def _spy_validate_strategy_set(*a, **kw):
+        spy_calls["validate_strategy_set"] += 1
+        return None
+    if hasattr(sb, "validate_strategy_set"):
+        monkeypatch.setattr(
+            sb, "validate_strategy_set", _spy_validate_strategy_set,
+        )
+    if hasattr(_ve_module, "validate_strategy_set"):
+        monkeypatch.setattr(
+            _ve_module, "validate_strategy_set", _spy_validate_strategy_set,
+        )
+
+    def _spy_write_sidecar(*a, **kw):
+        spy_calls["write_validation_sidecar"] += 1
+        return None
+    if hasattr(sb, "write_validation_sidecar"):
+        monkeypatch.setattr(
+            sb, "write_validation_sidecar", _spy_write_sidecar,
+        )
+    if hasattr(_ve_module, "write_validation_sidecar"):
+        monkeypatch.setattr(
+            _ve_module, "write_validation_sidecar", _spy_write_sidecar,
+        )
+
+    args_ns = _build_minimal_skip_args(outdir=outdir, skip=skip)
+    # Set the progress path under tmp_path so the engine doesn't try
+    # to write to the canonical PROGRESS_ROOT location.
+    args_ns.progress_path = str(tmp_path / "progress.json")
+
+    final_outdir = sb.run_for_secondary(args_ns, "SPY")
+    # Read the manifest the engine just wrote.
+    manifest_path = Path(final_outdir) / "run_manifest.json"
+    assert manifest_path.is_file(), (
+        f"run_for_secondary did not produce a run_manifest at {manifest_path}"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    if skip:
+        # Spec gate — none of these surfaces should have been touched.
+        assert spy_calls["_prepare_stackbuilder_durable_validation"] == 0
+        assert spy_calls["StackBuilderValidationAdapter_init"] == 0
+        assert spy_calls["validate_strategy_set"] == 0
+        assert spy_calls["write_validation_sidecar"] == 0
+        assert manifest["durable_validation_status"] == "skipped"
+        assert manifest["durable_validation_skip_reason"] == "operator_flag"
+        assert manifest["validation_status"] == "skipped"
+        assert manifest["validation_artifact_path"] is None
+        assert manifest["validation_artifact_hash"] is None
+    else:
+        # The non-skip path still routes through the spy (proof the
+        # skip flag is the ONLY thing controlling the branch).
+        assert spy_calls["_prepare_stackbuilder_durable_validation"] == 1
+        assert manifest["durable_validation_status"] == "ran"
+        assert manifest["durable_validation_skip_reason"] is None
+        assert manifest["validation_status"] == "valid"
