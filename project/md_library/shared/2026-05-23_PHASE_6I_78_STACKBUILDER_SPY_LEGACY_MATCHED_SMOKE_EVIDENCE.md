@@ -1,5 +1,19 @@
 # Phase 6I-78 StackBuilder SPY LEGACY-Matched Smoke Evidence
 
+> **Framing correction (added by amendment).** The branch name and
+> PR title preserve the phrase "LEGACY-matched" as a historical
+> artifact of the operator's stated intent at the time the smoke
+> was launched. Later inspection of the engine source clarified
+> that the LEGACY Dash UI used `exhaustive_k=4` by default (not
+> `exhaustive_k=6`), so the actual LEGACY-default traversal was
+> K=1..K=4 exhaustive plus K=5..K=12 beam. This smoke was launched
+> with `--exhaustive-k 6` and is therefore a **deeper-than-LEGACY
+> exhaustive stress smoke**, not an apples-to-apples LEGACY-default
+> traversal. The K-depth and runner/safety verdicts below are
+> unaffected; the runtime-vs-LEGACY framing has been corrected. The
+> recommended apples-to-apples follow-up smoke (using
+> `--exhaustive-k 4`) is documented in §22 / §24.
+
 ## 1. Scope and Non-Goals
 
 SPY-only controlled StackBuilder smoke against the post-Phase-6I-76
@@ -7,9 +21,12 @@ current engine. Replaces the K-depth-incomplete Phase 6I-77 evidence
 (all 8 secondaries there stopped at K=3 because `--allow-decreasing`
 was not passed and the runner did not expose `--k-patience`).
 
-This evidence proves K=12 traversal end-to-end and measures
-current-engine wall-clock against the operator's LEGACY ~20-minute
-baseline.
+This evidence proves end-to-end K=12 traversal under the
+**K=1..K=6 exhaustive stress configuration** the smoke was launched
+with. It is not an apples-to-apples runtime comparison against the
+operator's ~20-minute LEGACY SPY baseline, because the LEGACY Dash
+defaults use `exhaustive_k=4` rather than `exhaustive_k=6` (see the
+framing correction above and the per-combo reconciliation in §22).
 
 Non-goals: Phase D benchmark, Phase E canonical write, Phase 5C
 validation-scope changes. No engine code modified.
@@ -52,7 +69,15 @@ and threaded.
   dry-run plan effective_config exposes k_patience + allow_decreasing,
   allow_decreasing default unchanged. All 51 runner tests pass.
 
-## 4. Operator LEGACY-Matched Configuration Used
+## 4. Operator Configuration Used (K=1..K=6 Exhaustive Stress Configuration)
+
+> The configuration recorded below was launched under the
+> operator's stated "LEGACY-matched" intent at the time of the
+> smoke. Later source inspection clarified the LEGACY Dash default
+> is `exhaustive_k=4`, so this configuration is actually
+> **deeper-than-LEGACY**. See the framing correction at the top
+> of this document and §22 for the corrected runtime
+> interpretation.
 
 | Flag | Value | Role |
 |---|---|---|
@@ -284,9 +309,14 @@ K levels definitely entered: K=1..K=12 (all 12 produced
 
 The K=6 exhaustive scan over 3,838,380 combinations accounts for
 **~85.5%** of the entire wall-clock. The Phase 6I-76 fast combine
-path keeps the per-combo cost low, but at 3.8M combos × ~11.7 ms
-amortized = ~12.5h — this is the dominant cost driver and the gap
-versus the operator's LEGACY ~20-min single-secondary baseline.
+path keeps the per-combo cost low (per-combo amortization at K=6
+is ~11.7 ms/combo — see the per-combo reconciliation in §22), but
+the **combinatorial workload itself** is the dominant cost driver
+in this smoke. The K=6 workload is not part of the LEGACY Dash
+default traversal (LEGACY default is `exhaustive_k=4`), so this
+~12.5 h is workload-attributable to the Phase 6I-78 stress
+configuration, not to a per-combo engine regression. See §22 for
+the corrected runtime-vs-LEGACY interpretation.
 
 ## 14. K=1 Fast-Path Assertion Result
 
@@ -424,11 +454,11 @@ test wiring changes from Part 0 and this evidence doc only.
 | `K=12` | 2 (engine `[PHASE3] K=12` + `[RESULT] Best stack K=12`) |
 | `[PHASE3] K=N` lines | 12 (one per K from 1..12) |
 
-## 22. Total Smoke Wall-Clock vs. Operator LEGACY ~20-Minute Baseline
+## 22. Total Smoke Wall-Clock and Per-Combo Reconciliation
+
+### 22.1 Measured wall-clock totals
 
 - Total wall-clock: **52,450.5 s = 14 h 34 m 10 s ≈ 874 minutes**.
-- LEGACY operator baseline: ~20 min for SPY full K=1..K=12.
-- Slowdown factor: **~43.7× LEGACY** for this single secondary.
 - Dominant cost: K=6 exhaustive over 3,838,380 combinations
   consumed ~44,850 s (~12 h 28 m, ~85.5% of wall).
 - Phase 1 + Phase 2 (workbook load + cohort assembly): ~11.9 s
@@ -437,7 +467,92 @@ test wiring changes from Part 0 and this evidence doc only.
 - K=7..K=12 beam total: ~52 s (~0.1% of wall) — the Phase 6I-76 fast
   combine path keeps beam steps sub-second per K=accept.
 
-Per the spec runtime classification (> 60 min): **MATERIAL-SLOWDOWN**.
+### 22.2 Configuration mismatch versus LEGACY Dash defaults
+
+The LEGACY Dash UI used `exhaustive_k=4` by default, so LEGACY's
+actual exhaustive workload for SPY on the 40-row cohort is the
+K=1..K=4 sum, with K=5..K=12 handled by beam:
+
+- LEGACY Dash default exhaustive units (K=1..K=4):
+
+  | K | Count |
+  |---:|---:|
+  | 1 | 40 |
+  | 2 | 780 |
+  | 3 | 9,880 |
+  | 4 | 91,390 |
+  | **Sum K=1..K=4** | **102,090** |
+
+- Phase 6I-78 stress smoke exhaustive units (K=1..K=6):
+
+  | K | Count |
+  |---:|---:|
+  | K=1..K=4 sum | 102,090 |
+  | 5 | 658,008 |
+  | 6 | 3,838,380 |
+  | **Sum K=1..K=6** | **4,598,478** |
+
+Phase 6I-78 therefore ran roughly **45× more exhaustive
+candidate work** than the actual LEGACY Dash-default K=1..K=4
+exhaustive configuration. The ~14h 34m wall-clock is explained by
+that workload mismatch, not by a per-combo engine regression.
+
+### 22.3 Per-combo reconciliation against the Phase 6I-76 fast-combine target
+
+Per-K amortized timings, derived from the measured per-K durations
+already recorded in §13:
+
+| K | Combos | Duration (s) | Amortized ms/combo |
+|---:|---:|---:|---:|
+| 2 | 780 | 5.3 | ~6.8 |
+| 3 | 9,880 | 78.9 | ~8.0 |
+| 4 | 91,390 | 806.5 | ~8.8 |
+| 5 | 658,008 | 6,639.8 | ~10.1 |
+| 6 | 3,838,380 | 44,849.9 | ~11.7 |
+
+These per-combo numbers are broadly consistent with the
+Phase 6I-76 synthetic fast-combine target (≤ 18 ms/combo at K=4
+synthetic), and they sit well under that target across every
+measured K level. The mild monotone growth from ~6.8 ms/combo at
+K=2 up to ~11.7 ms/combo at K=6 is expected overhead at larger K
+(member-array sizes grow, cohort-cache pressure grows). Nothing
+in this range indicates a per-combo engine regression versus the
+Phase 6I-76 baseline.
+
+### 22.4 Back-of-envelope LEGACY-default runtime estimate
+
+Treating the per-combo amortizations above as a representative
+estimate (not a guarantee), the LEGACY Dash-default exhaustive
+workload of **102,090 units** at roughly **8-9 ms/combo** would
+correspond to:
+
+- 102,090 × 8 ms ≈ 817 s ≈ **13.6 minutes** of exhaustive scoring.
+- 102,090 × 9 ms ≈ 919 s ≈ **15.3 minutes** of exhaustive scoring.
+
+Adding the small Phase 1 + Phase 2 setup (~11.9 s here) and the
+K=5..K=12 beam tail (per §13, K=7..K=12 beam totaled ~52 s; under
+LEGACY-default `exhaustive_k=4`, K=5 and K=6 would also run as
+beam steps, which on this engine should remain in the
+beam_width × remaining-cohort × per-combo regime), the estimated
+LEGACY-default total lands in the **~14-16 minute** range.
+
+That estimate is consistent with the operator's stated ~20-minute
+LEGACY SPY baseline. The correct test of this estimate is a
+follow-up smoke using `--exhaustive-k 4`, not reinterpretation of
+this Phase 6I-78 K=1..K=6 stress run. See §24 for the recommended
+follow-up command shape.
+
+### 22.5 Corrected runtime verdict
+
+Per the spec runtime classification (> 60 min): **MATERIAL-SLOWDOWN
+under the Phase 6I-78 stress configuration**. This is **not** an
+apples-to-apples LEGACY runtime comparison: this smoke ran ~45×
+more exhaustive candidate work than the LEGACY Dash default, the
+per-combo amortizations are consistent with the Phase 6I-76 fast
+combine target across every K level, and a back-of-envelope LEGACY-
+default estimate lands in the same range as the operator's
+~20-minute baseline. The 14h 34m wall-clock is workload-explained,
+not per-combo-explained.
 
 ## 23. Verdicts
 
@@ -445,18 +560,23 @@ Per the spec runtime classification (> 60 min): **MATERIAL-SLOWDOWN**.
 |---|---|---|
 | Runner / safety | **PASS** | `status=ok`, all required artifacts present, canonical safety zero-diff, forbidden expected-zero counts all zero, durable validation cleanly skipped, `rank_inverse` absent, cohort = 40 |
 | K-depth traversal | **PASS** | K=12 reached and cleanly finalized; all 12 `combo_k=N.json` published; no early-stop diagnostic in stderr |
-| Runtime-vs-LEGACY | **MATERIAL-SLOWDOWN** | 14 h 34 m for SPY vs LEGACY ~20 min (~43.7× baseline); dominated by K=6 exhaustive over 3.8 M combinations |
-| **Aggregate** | **SUSPECT** | runner/safety PASS + K-depth PASS, but runtime classification is MATERIAL-SLOWDOWN per spec aggregate rule |
+| Runtime-vs-LEGACY | **MATERIAL-SLOWDOWN under the Phase 6I-78 stress configuration; NOT an apples-to-apples LEGACY runtime comparison** | 14 h 34 m for SPY at `--exhaustive-k 6` is workload-explained, not per-combo-explained: ~45× more exhaustive candidate work than the LEGACY Dash default (`exhaustive_k=4`), per-combo amortization ranges ~6.8-11.7 ms/combo and stays under the Phase 6I-76 ≤18 ms/combo target across all K. The correct LEGACY runtime comparison requires a follow-up smoke at `--exhaustive-k 4` (see §22.4 / §24). |
+| **Aggregate** | **SUSPECT / EVIDENCE-NEEDS-FOLLOW-UP** | runner/safety PASS + K-depth PASS; runtime axis is classified MATERIAL-SLOWDOWN by the spec rule (> 60 min) but cannot be compared directly to LEGACY defaults from this stress configuration. Apples-to-apples LEGACY comparison is deferred to a `--exhaustive-k 4` follow-up smoke. |
 
 The smoke validates the K-depth traversal end-to-end and confirms
-that Phase 6I-78's runner-only `--k-patience` wiring + the operator's
-`--allow-decreasing` flag together produce the intended K=12
-behavior. The runtime cost is the K=6 exhaustive scan — the same
-3,838,380-combo workload the operator's LEGACY environment ran in
-~20 min. The per-combo work is fast (Phase 6I-76 verified ≤18 ms/
-combo synthetic), but in this current environment K=6 amortizes to
-~11.7 ms/combo × 3.8 M combos ≈ 12.5 h. That gap is the principal
-finding of this smoke.
+that Phase 6I-78's runner-only `--k-patience` wiring + the
+operator's `--allow-decreasing` flag together produce the intended
+K=12 behavior. The 14h 34m wall-clock is dominated by the K=6
+exhaustive scan over 3,838,380 combinations — work that is **not
+part of the LEGACY Dash-default traversal** (LEGACY default is
+`exhaustive_k=4`). Per-combo amortizations measured in this smoke
+(~6.8-11.7 ms/combo across K=2..K=6) are consistent with the
+Phase 6I-76 synthetic fast-combine target, so the runtime result is
+workload-explained, not a per-combo engine regression. A back-of-
+envelope LEGACY-default estimate (102,090 exhaustive units × ~8-9
+ms/combo ≈ 14-16 minutes; see §22.4) is consistent with the
+operator's ~20-minute LEGACY SPY baseline, and the correct
+apples-to-apples test is a follow-up smoke at `--exhaustive-k 4`.
 
 ## 24. Follow-Ups
 
@@ -468,14 +588,35 @@ finding of this smoke.
 - **Phase 5C validation-scope** work remains separate. Durable
   validation default is unchanged on `main`; the skip used here is
   Phase 6I-75's operator-explicit opt-in.
-- **K=6 exhaustive runtime gap.** The 43.7× factor against the
-  operator's LEGACY ~20-min baseline is the principal residual
-  performance question after Phases 6I-75 / 6I-76 and warrants a
-  dedicated phase. Candidate directions (out of scope for this PR):
-  hardware/environment delta investigation against the LEGACY
-  baseline, per-combo profiling under the K=6 cohort shape,
-  evaluation of partial K=6 enumeration strategies vs. exhaustive,
-  and a parallel-`--jobs` evaluation on a known-good box.
+- **Apples-to-apples LEGACY-default follow-up smoke.** The correct
+  test of the runtime hypothesis (LEGACY ~20 min for SPY is broadly
+  achievable on this engine under LEGACY-default traversal) is a
+  follow-up SPY smoke that uses the actual LEGACY Dash default
+  exhaustive depth. Suggested command shape:
+
+  ```
+  --exhaustive-k 4
+  --k-max 12
+  --search beam
+  --beam-width 12
+  --allow-decreasing
+  --k-patience 1
+  --top-n 20
+  --bottom-n 20
+  ```
+
+  Combined with `--secondaries SPY`, the same isolated `--outdir`
+  pattern, `--skip-durable-validation`, and the standard write
+  + budget flags. That smoke is the right place to settle the
+  apples-to-apples runtime question and validate the §22.4
+  back-of-envelope estimate against measured engine wall-clock.
+
+- **Deeper-than-LEGACY exhaustive stress validation (this PR).**
+  Phase 6I-78 demonstrates that the current engine can produce
+  correct artifacts and reach K=12 under the deeper K=1..K=6
+  exhaustive configuration. That result stands independent of the
+  LEGACY runtime question and is useful evidence for any future
+  deeper-stress validation.
 - StackBuilder-direct call paths (`stackbuilder.py` as an entry
   point) remain out of scope. This smoke used
   `stackbuilder_workbook_runner.py` exclusively.
