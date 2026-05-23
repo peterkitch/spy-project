@@ -3,7 +3,7 @@
 # Lean fastpath: uses existing Signal Library only; no network; optional minimal Dash UI.
 # Phases: 1) Preflight  2) Rank All  3) Stack Builder
 
-import os, re, sys, json, math, glob, argparse, time, shutil, threading
+import os, re, sys, json, math, glob, argparse, time, shutil, threading, pickle
 import contextvars
 import copy
 import logging
@@ -31,7 +31,6 @@ from canonical_scoring import (
 )
 from provenance_manifest import (
     verify_manifest as _verify_manifest,
-    load_verified_signal_library as _load_verified_signal_library,
     build_output_manifest as _build_output_manifest,
     file_sha256 as _file_sha256,
     load_verified_xlsx_artifact as _load_verified_xlsx_artifact,
@@ -207,10 +206,13 @@ def _try_import():
                 return t2, t2
             def detect_ticker_type(t: str) -> str:
                 return 'crypto' if (t or '').upper().endswith('-USD') else 'equity'
-    try:
-        from onepass import load_signal_library
-    except Exception:
-        load_signal_library = None
+    # Phase 6I-75: StackBuilder is a consumer-only engine. It must NOT
+    # call onepass.load_signal_library — that path can trigger OnePass
+    # rebuild side effects (yfinance fetch, PKL rewrite, manifest
+    # rewrite). The third return slot is kept as ``None`` for backward
+    # compatibility with any test that unpacks three values; no
+    # ``from onepass import load_signal_library`` happens here.
+    load_signal_library = None
     return resolve_symbol, detect_ticker_type, load_signal_library
 resolve_symbol, detect_ticker_type, load_signal_library = _try_import()
 
@@ -309,7 +311,7 @@ def _stable_cli_args_subset(args) -> dict:
     fields = (
         "alpha", "max_k", "top_n", "bottom_n", "min_trigger_days",
         "sharpe_eps", "seed_by", "search", "combine_mode",
-        "grace_days",
+        "grace_days", "skip_durable_validation",
     )
     out: dict = {}
     for fname in fields:
@@ -709,51 +711,225 @@ def list_signal_library_candidates(ticker: str) -> List[str]:
     pat2 = os.path.join(root, ticker[:2].upper() if len(ticker) >= 2 else ticker.upper(), f"{ticker}_signal_library.pkl")
     return glob.glob(pat1) + glob.glob(pat2)
 
-def fallback_load_signal_library(ticker: str) -> Optional[dict]:
+# Phase 6I-75: consumer-only signal-library loader. StackBuilder is a
+# CONSUMER engine — it must never call OnePass loader/rebuild paths,
+# never refresh yfinance, never write PKLs, and never modify signal-
+# library manifests. The previous Phase 3B-1 implementation routed
+# through ``_load_verified_signal_library`` which rejected libraries
+# on metadata-level manifest mismatch and (transitively, via the
+# pre-Phase-6I-75 ``load_lib_or_none`` first-trying OnePass) triggered
+# the "Forcing rebuild" loop seen in the Phase 6I-74 smoke. This
+# implementation reads the PKL directly with ``pickle.load`` and
+# accepts any readable library whose payload exposes the fields
+# StackBuilder needs.
+
+_CONSUMER_LOADER_CACHE: Dict[str, Tuple[Optional[dict], Optional[str]]] = {}
+_CONSUMER_LOADER_WARNED: set = set()
+_CONSUMER_LOADER_LOCK = threading.RLock()
+
+
+def _reset_consumer_loader_cache() -> None:
+    """Test helper: clear the in-memory consumer-loader memoization.
+
+    Used by focused tests to start each test from a known state.
+    Production code should never need to call this.
     """
-    Phase 3B-1: glob-based fallback loader for signal libraries when
-    onepass.load_signal_library is unavailable. Routes through the
-    central verified loader so the raw pickle.load, type check, and
-    manifest verification all live in provenance_manifest. Manifest
-    mismatches skip the candidate; legacy libraries warn and load.
+    with _CONSUMER_LOADER_LOCK:
+        _CONSUMER_LOADER_CACHE.clear()
+        _CONSUMER_LOADER_WARNED.clear()
+
+
+def _consumer_cache_key(ticker: str, path: str) -> str:
+    """Compose the memoization key from ticker + path + file identity.
+
+    File identity is ``(mtime_ns, size)`` when the file exists; missing
+    files key on the path alone so a later appearance of that path
+    forces a re-read.
     """
-    for p in list_signal_library_candidates(ticker):
-        try:
-            lib, _vresult = _load_verified_signal_library(
-                p,
-                requested_params={
-                    'price_source': 'Close',
-                },
-            )
-        except Exception:
-            continue
-        if lib is None:
-            continue
-        if _vresult.legacy:
-            # Legacy libraries (pre-Phase-3A) load with a warning.
-            # Print to stderr-equivalent via the existing print
-            # infrastructure rather than logger to match the rest
-            # of stackbuilder's IO pattern.
-            print(f"[WARN] {ticker}: legacy signal library at {p} "
-                  f"(no provenance manifest)")
+    try:
+        st = os.stat(path)
+        return f"{ticker}|{path}|{st.st_mtime_ns}|{st.st_size}"
+    except OSError:
+        return f"{ticker}|{path}|missing"
+
+
+def _consumer_warn_once(key: str, message: str) -> None:
+    """Print a StackBuilder-owned diagnostic at most once per key.
+
+    All diagnostics use the ``[STACKBUILDER:*]`` prefix family —
+    never ``[ONEPASS:*]`` and never the word "rebuild" — to make it
+    unambiguous that StackBuilder is the source and that no rebuild
+    has been requested.
+    """
+    with _CONSUMER_LOADER_LOCK:
+        if key in _CONSUMER_LOADER_WARNED:
+            return
+        _CONSUMER_LOADER_WARNED.add(key)
+    print(message)
+
+
+def _consumer_validate_lib_payload(lib: Any) -> bool:
+    """Return True if ``lib`` exposes the minimal payload StackBuilder
+    needs from a signal-library PKL: a non-empty signals list and a
+    non-empty dates list of matching length.
+    """
+    if not isinstance(lib, dict):
+        return False
+    sigs = lib.get('primary_signals') or lib.get('primary_signals_int8')
+    dates = lib.get('dates') or lib.get('date_index')
+    if not sigs or not dates:
+        return False
+    try:
+        if len(sigs) != len(dates):
+            return False
+    except TypeError:
+        return False
+    return True
+
+
+def _consumer_load_pkl(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Direct ``pickle.load`` of a signal-library PKL. Returns
+    ``(lib_or_None, reason_or_None)``. ``reason`` is the short
+    diagnostic tag used by the warn-once channel.
+
+    Catches a broad ``Exception`` band because malformed pickle streams
+    can raise practically anything from ``pickle.UnpicklingError`` to
+    ``MemoryError`` / ``IndexError`` / ``OverflowError`` depending on
+    how the stream is broken. A consumer loader must never re-raise
+    on a single corrupt PKL; the safe contract is "return ``None`` and
+    let the run continue without this primary".
+    """
+    try:
+        with open(path, 'rb') as fh:
+            lib = pickle.load(fh)
+    except FileNotFoundError:
+        return None, "missing"
+    except Exception as exc:
+        return None, f"unreadable:{type(exc).__name__}"
+    if not _consumer_validate_lib_payload(lib):
+        return None, "invalid_payload"
+    return lib, None
+
+
+def load_signal_library_for_stackbuilder(
+    ticker: str,
+) -> Optional[dict]:
+    """Phase 6I-75 consumer-only signal-library loader.
+
+    Glob-finds stable signal-library PKL candidates for ``ticker`` under
+    the runtime-configured stable directory, opens the first usable
+    one read-only via ``pickle.load``, validates the minimal payload
+    StackBuilder needs (signals + dates of matching length), and
+    returns the dict. Returns ``None`` on missing / unreadable /
+    invalid PKLs.
+
+    **Memoization.** Both success and failure are memoized in
+    ``_CONSUMER_LOADER_CACHE`` keyed by ``(ticker, candidate_path,
+    mtime_ns, size)``. Repeated calls for the same ticker do not
+    re-read the PKL or re-run validation.
+
+    **Loud-fail discipline.** StackBuilder is a consumer. This loader:
+
+      * never calls ``onepass.load_signal_library`` or any other
+        OnePass function;
+      * never writes to ``signal_library/`` or any subdirectory;
+      * never fetches from yfinance or any network;
+      * never rewrites the library manifest;
+      * never asks any other engine to rebuild anything;
+      * accepts readable libraries even when the only problem is
+        metadata-level manifest mismatch (the payload is what matters
+        for consumer mode).
+
+    **Diagnostics.** A library that's missing / unreadable / invalid
+    emits at most one ``[STACKBUILDER:library_*]`` diagnostic per
+    (ticker, reason) pair via the warn-once channel.
+    """
+    # Phase 6I-75 amendment: cache the no-candidates outcome BEFORE
+    # touching the filesystem. Repeated missing-library calls for the
+    # same ``(ticker, signal_lib_dir)`` skip the glob, the warn, and
+    # all candidate-loop work.
+    signal_lib_dir = SIGNAL_LIB_DIR_RUNTIME or DEFAULT_SIGNAL_LIB_DIR
+    no_candidate_key = f"{ticker}|{signal_lib_dir}|no-candidates"
+    with _CONSUMER_LOADER_LOCK:
+        if no_candidate_key in _CONSUMER_LOADER_CACHE:
+            return None
+
+    candidates = list_signal_library_candidates(ticker)
+    if not candidates:
+        with _CONSUMER_LOADER_LOCK:
+            _CONSUMER_LOADER_CACHE[no_candidate_key] = (None, "no_candidates")
+        warn_key = f"missing:{ticker}"
+        _consumer_warn_once(
+            warn_key,
+            f"[STACKBUILDER:library_missing] {ticker}: no signal library "
+            f"candidates under {signal_lib_dir}",
+        )
+        return None
+
+    last_reason: Optional[str] = None
+    for path in candidates:
+        cache_key = _consumer_cache_key(ticker, path)
+        with _CONSUMER_LOADER_LOCK:
+            if cache_key in _CONSUMER_LOADER_CACHE:
+                lib, cached_reason = _CONSUMER_LOADER_CACHE[cache_key]
+                if lib is not None:
+                    return lib
+                last_reason = cached_reason
+                continue
+        lib, reason = _consumer_load_pkl(path)
+        with _CONSUMER_LOADER_LOCK:
+            _CONSUMER_LOADER_CACHE[cache_key] = (lib, reason)
+        if lib is not None:
             return lib
-        if not _vresult.ok:
-            print(f"[WARN] {ticker}: provenance manifest mismatch at "
-                  f"{p}: {_vresult.mismatches}. Skipping.")
+        last_reason = reason
+        if reason == "missing":
             continue
-        return lib
+        warn_key = f"{reason}:{ticker}:{path}"
+        if reason and reason.startswith("unreadable"):
+            _consumer_warn_once(
+                warn_key,
+                f"[STACKBUILDER:library_unreadable] {ticker} at {path}: {reason}",
+            )
+        elif reason == "invalid_payload":
+            _consumer_warn_once(
+                warn_key,
+                f"[STACKBUILDER:library_invalid] {ticker} at {path}: "
+                f"signals/dates missing or length-mismatched",
+            )
+    # All candidates exhausted without success.
+    if last_reason == "missing" or last_reason is None:
+        warn_key = f"missing-all:{ticker}"
+        _consumer_warn_once(
+            warn_key,
+            f"[STACKBUILDER:library_missing] {ticker}: no readable PKL "
+            f"among {len(candidates)} candidate(s)",
+        )
     return None
 
+
+def fallback_load_signal_library(ticker: str) -> Optional[dict]:
+    """Phase 6I-75: thin alias preserved for backward compatibility.
+
+    Old call sites that referenced ``fallback_load_signal_library``
+    explicitly continue to work; new code should call
+    ``load_signal_library_for_stackbuilder`` directly. Both paths route
+    through the same consumer-only loader.
+    """
+    return load_signal_library_for_stackbuilder(ticker)
+
+
 def load_lib_or_none(t: str) -> Optional[dict]:
-    if load_signal_library:
-        try:
-            lib = load_signal_library(t)
-            if lib:
-                _record_input_lib(lib)
-                return lib
-        except Exception:
-            pass
-    lib = fallback_load_signal_library(t)
+    """Phase 6I-75: consumer-only library load with input-collector
+    bookkeeping.
+
+    Previously this tried ``onepass.load_signal_library`` first and
+    fell back to ``fallback_load_signal_library`` on failure. That
+    OnePass first-try is the path that emitted "Forcing rebuild"
+    notices and (transitively) drove rebuild side effects. It is now
+    removed. The function always uses the StackBuilder-local consumer
+    loader.
+    """
+    lib = load_signal_library_for_stackbuilder(t)
     _record_input_lib(lib)
     return lib
 
@@ -2543,21 +2719,40 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
             validation_universe = []
 
         validation_run_id = generate_run_id("stackbuilder", "run_directory")
-        # Intentionally NO try/except around this call. Normal
-        # validation failures are absorbed inside the helper (it
-        # writes a status='failed' artifact and returns a complete
-        # manifest summary); only a fallback-write failure can
-        # propagate, and that MUST abort the run so no manifest
-        # without locked validation keys is ever published.
-        _vcontract, validation_summary, _vsidecar = (
-            _prepare_stackbuilder_durable_validation(
-                args=args,
-                secondary_ticker=vendor_secondary,
-                primary_universe=validation_universe,
-                run_id=validation_run_id,
-                grace_days=effective_grace,
-            )
+        skip_durable_validation = bool(
+            getattr(args, "skip_durable_validation", False)
         )
+        if skip_durable_validation:
+            # Phase 6I-75: operator-explicit skip. No
+            # ``_prepare_stackbuilder_durable_validation`` call, no
+            # validation sidecar write, no walk-forward folds. The
+            # 10 locked manifest keys are still present (filled with
+            # None / 'skipped') so downstream readers can detect the
+            # skip and the locked-keys gate continues to pass. Two
+            # extra top-level manifest keys
+            # (``durable_validation_status`` /
+            # ``durable_validation_skip_reason``) are written below
+            # to make the skip explicit.
+            validation_summary = _build_skipped_validation_summary(
+                skip_reason="operator_flag",
+            )
+            _vsidecar = None
+        else:
+            # Intentionally NO try/except around this call. Normal
+            # validation failures are absorbed inside the helper (it
+            # writes a status='failed' artifact and returns a complete
+            # manifest summary); only a fallback-write failure can
+            # propagate, and that MUST abort the run so no manifest
+            # without locked validation keys is ever published.
+            _vcontract, validation_summary, _vsidecar = (
+                _prepare_stackbuilder_durable_validation(
+                    args=args,
+                    secondary_ticker=vendor_secondary,
+                    primary_universe=validation_universe,
+                    run_id=validation_run_id,
+                    grace_days=effective_grace,
+                )
+            )
         _validate_stackbuilder_validation_summary(validation_summary)
 
         # Construct final directory name based on stack members
@@ -2668,6 +2863,20 @@ def run_for_secondary(args, secondary: str, specified_primaries: Optional[List[s
         _validate_stackbuilder_validation_summary(validation_summary)
         for _vk in _LOCKED_VALIDATION_SUMMARY_KEYS:
             manifest[_vk] = validation_summary[_vk]
+        # Phase 6I-75: explicit operator skip marker. Always present
+        # so the manifest unambiguously distinguishes a skipped run
+        # ("skipped" / "operator_flag") from a normal run ("ran" /
+        # None). Fabricating validation_artifact_path or _hash on the
+        # skip branch is forbidden; the locked-keys block above
+        # already wrote those as ``None`` via the skipped summary.
+        if skip_durable_validation:
+            manifest['durable_validation_status'] = 'skipped'
+            manifest['durable_validation_skip_reason'] = (
+                validation_summary.get('skip_reason') or 'operator_flag'
+            )
+        else:
+            manifest['durable_validation_status'] = 'ran'
+            manifest['durable_validation_skip_reason'] = None
 
         manifest['status'] = 'complete'
         write_json(os.path.join(final_outdir, 'run_manifest.json'), manifest)
@@ -2723,6 +2932,42 @@ def _validate_stackbuilder_validation_summary(
             raise ValueError(
                 f"validation_summary missing required key: {key!r}"
             )
+
+
+def _build_skipped_validation_summary(
+    *,
+    skip_reason: str = "operator_flag",
+) -> dict:
+    """Phase 6I-75: construct a validation_summary for an explicitly
+    skipped durable validation run.
+
+    All 10 locked keys are present so
+    ``_validate_stackbuilder_validation_summary`` continues to pass;
+    every numeric/path value is ``None`` so downstream readers can
+    distinguish a skipped contract from a complete or failed one.
+    The skip is also reflected on the top-level manifest via the
+    additional ``durable_validation_status`` and
+    ``durable_validation_skip_reason`` keys written alongside the
+    locked 10 (see ``run_for_secondary``).
+
+    StackBuilder runs that hit this path do NOT emit a durable
+    validation sidecar; ``validation_artifact_path`` and
+    ``validation_artifact_hash`` are deliberately ``None`` (the spec
+    forbids fabricating either).
+    """
+    return {
+        "validation_contract_version": VALIDATION_CONTRACT_VERSION,
+        "validation_status": "skipped",
+        "n_strategies_tested": None,
+        "n_strategies_reported": None,
+        "multiple_comparisons_control_method": None,
+        "multiple_comparisons_control_alpha": None,
+        "walk_forward_n_folds": None,
+        "mean_baseline_sharpe": None,
+        "validation_artifact_path": None,
+        "validation_artifact_hash": None,
+        "skip_reason": skip_reason,
+    }
 
 
 def _stackbuilder_load_secondary_with_cutoff(
@@ -3329,6 +3574,19 @@ def _stackbuilder_validation_completion_lines(
             f"Sidecar: {artifact_path}"
         )
         return out
+    if status == "skipped":
+        # Phase 6I-75: explicit operator skip. No sidecar was
+        # written; the manifest carries the skip reason at the top
+        # level (``durable_validation_skip_reason``) alongside the
+        # locked-10 keys (all ``None`` here by construction).
+        skip_reason = (
+            validation_summary.get("skip_reason") or "operator_flag"
+        )
+        out.append(
+            f"Validation: SKIPPED ({skip_reason}). "
+            f"No durable validation sidecar was written."
+        )
+        return out
     n_tested = validation_summary.get("n_strategies_tested")
     n_reported = validation_summary.get("n_strategies_reported")
     alpha = validation_summary.get("multiple_comparisons_control_alpha")
@@ -3444,6 +3702,14 @@ def parse_args(argv=None):
                    help='Number of K levels to continue searching even without Sharpe improvement')
     p.add_argument('--combine-mode', choices=['intersection','union'], default='intersection',
                    help='How to combine trigger days: intersection (all members) or union (any member)')
+    p.add_argument('--skip-durable-validation', action='store_true',
+                   help=('Phase 6I-75: skip _prepare_stackbuilder_durable_validation entirely. '
+                         'Default off preserves the Phase 5C fail-closed contract. '
+                         'When set, the run still publishes a complete manifest with '
+                         'all 10 locked validation keys (status="skipped", artifact '
+                         'path/hash=None) plus the explicit top-level fields '
+                         'durable_validation_status="skipped" and '
+                         'durable_validation_skip_reason="operator_flag".'))
     p.add_argument('--verbose', action='store_true', help='Enable verbose diagnostic output')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
     p.add_argument('--save-stats', action='store_true', help='Save search statistics to JSON')
