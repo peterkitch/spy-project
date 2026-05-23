@@ -1692,6 +1692,117 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
 _COMBINE_SIGNALS_FAST_WIRED = True
 
 
+def _normalize_member_to_int8(s: pd.Series, n: int) -> np.ndarray:
+    """Phase 6I-76: vectorized int8 normalization of one signal-library
+    member series. Matches
+    ``canonical_scoring.normalize_signal_series`` exactly for every
+    dtype it accepts (verified by the parity tests in
+    ``test_scripts/test_stackbuilder_phase_6i76_combine_parity.py``).
+
+    Output convention: +1 = Buy, -1 = Short, 0 = None (or any value
+    that canonical normalizes to None: missing, NaN, unknown label,
+    numeric float, np.bool_, string "1"/"1.0"/etc.).
+
+    The dispatch mirrors the canonical per-element rules:
+
+      * **Pure bool dtype** (``np.bool_``): canonical takes the
+        ``str(raw).strip()`` route because ``np.bool_`` is not an
+        instance of ``int`` / ``np.integer``. ``"True"`` / ``"False"``
+        are not in the valid-label set -> the whole series collapses
+        to None.
+      * **Pure integer dtype** (Python int / numpy int*): values are
+        treated as codes; ``+1`` -> Buy, ``-1`` -> Short, everything
+        else -> None.
+      * **Pure float dtype**: canonical's ``str(raw).strip()`` gives
+        ``"1.0"`` / ``"-1.0"`` / ``"nan"`` / etc., none of which match
+        the valid labels -> all None.
+      * **Object dtype**: dispatched by
+        ``pd.api.types.infer_dtype(skipna=True)``:
+          - ``"string"`` / ``"empty"`` -> fast vectorized string
+            equality (the StackBuilder phase3 hot-path case);
+          - ``"integer"`` / ``"boolean"`` / mixed shapes ->
+            element-wise loop replicating canonical's ``isinstance``
+            cascade, including the Python-``bool``-is-``int``-subclass
+            quirk (``True`` -> Buy, ``False`` -> None);
+          - anything else (datetimes, categoricals embedded in
+            object, ...) -> defensive stringify + label-match.
+    """
+    code = np.zeros(n, dtype=np.int8)
+    if n == 0:
+        return code
+
+    # ``np.bool_`` series: canonical goes through ``str()`` which never
+    # matches valid labels.
+    if pd.api.types.is_bool_dtype(s):
+        return code
+
+    if pd.api.types.is_integer_dtype(s):
+        arr = s.to_numpy()
+        code[arr == 1] = 1
+        code[arr == -1] = -1
+        return code
+
+    if pd.api.types.is_float_dtype(s):
+        # Canonical sends every float through ``str(raw)`` (or NaN ->
+        # None). ``"1.0"`` is not a valid label. All -> None.
+        return code
+
+    if s.dtype == object:
+        inferred = pd.api.types.infer_dtype(s, skipna=True)
+        if inferred in ("string", "empty"):
+            v = s.fillna("None").astype(str).str.strip().to_numpy()
+            code[v == "Buy"] = 1
+            code[v == "Short"] = -1
+            return code
+        # Fall through to the per-element canonical replica for any
+        # object-dtype content that isn't pure-string. Common cases:
+        # ``"integer"`` (object container of ints), ``"boolean"``
+        # (object container of Python bools), ``"mixed-integer"``,
+        # ``"mixed-integer-float"``, ``"mixed"``, ``"floating"``.
+        arr = s.to_numpy()
+        for i in range(n):
+            raw = arr[i]
+            if raw is None:
+                continue
+            if isinstance(raw, bool):
+                # Python ``bool`` is a subclass of ``int``; canonical's
+                # ``isinstance(raw, (int, np.integer))`` matches it
+                # first. True -> 1 -> Buy, False -> 0 -> None.
+                if raw is True:
+                    code[i] = 1
+                continue
+            if isinstance(raw, (int, np.integer)):
+                v = int(raw)
+                if v == 1:
+                    code[i] = 1
+                elif v == -1:
+                    code[i] = -1
+                continue
+            if isinstance(raw, float):
+                # Canonical: NaN -> None; otherwise ``str(raw)`` ->
+                # invalid label -> None. Either way -> code stays 0.
+                continue
+            try:
+                lit = str(raw).strip()
+            except Exception:
+                continue
+            if lit == "Buy":
+                code[i] = 1
+            elif lit == "Short":
+                code[i] = -1
+            # Any other string (including "1", "-1", "0", "None",
+            # "abc") -> None.
+        return code
+
+    # Categorical / datetime / Period / etc.: canonical's behavior is
+    # ``str(raw).strip()`` against the valid label set. Defensive
+    # stringify covers them all.
+    v = s.astype(str).str.strip().to_numpy()
+    code[v == "Buy"] = 1
+    code[v == "Short"] = -1
+    return code
+
+
 def _combine_signals_fast(members: List[pd.Series]) -> pd.Series:
     """Vectorized local implementation of canonical consensus.
 
@@ -1705,10 +1816,9 @@ def _combine_signals_fast(members: List[pd.Series]) -> pd.Series:
 
     Inputs may share or differ in index. When indexes differ the
     fast path takes the union (matching the existing ``pd.concat
-    axis=1`` behavior). Missing values, ``NaN``, integer codes
-    (+1/-1/0), and stray labels are normalized the same way the
-    canonical helper does. Strings are stripped before comparison to
-    match ``normalize_signal_series``.
+    axis=1`` behavior). Member normalization is delegated to
+    ``_normalize_member_to_int8`` which matches
+    ``canonical_scoring.normalize_signal_series`` byte-for-byte.
     """
     if not members:
         return pd.Series(dtype=object)
@@ -1736,16 +1846,7 @@ def _combine_signals_fast(members: List[pd.Series]) -> pd.Series:
             s.index is common_idx or s.index.equals(common_idx)
         ):
             s = s.reindex(common_idx)
-        code = np.zeros(n, dtype=np.int8)
-        if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
-            arr = s.to_numpy()
-            code[arr == 1] = 1
-            code[arr == -1] = -1
-        else:
-            v = s.fillna("None").astype(str).str.strip().to_numpy()
-            code[v == "Buy"] = 1
-            code[v == "Short"] = -1
-        cols.append(code)
+        cols.append(_normalize_member_to_int8(s, n))
 
     if len(cols) > 1:
         arr = np.column_stack(cols)

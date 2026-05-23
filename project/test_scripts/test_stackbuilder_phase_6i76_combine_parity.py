@@ -324,3 +324,153 @@ def test_combined_metrics_signals_matches_canonical_path(sb, cs):
             assert abs(a - b) < 1e-9, f"metric {key!r}: {a!r} != {b!r}"
         else:
             assert a == b, f"metric {key!r}: {a!r} != {b!r}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-76 amendment: numeric / object-dtype edge cases
+#
+# Codex audit flagged the original fast path for numeric-dtype parity
+# bugs. The amendment fix routes the per-member normalization through
+# ``_normalize_member_to_int8`` which mirrors canonical_scoring
+# .normalize_signal_series exactly. These tests pin the closed gaps so
+# they cannot regress.
+# ---------------------------------------------------------------------------
+
+def test_float_dtype_numeric_values_resolve_to_none(sb, cs):
+    """Float dtype ``[1.0, -1.0, 0.0]`` must map to None / None / None.
+
+    Canonical: floats are stringified to ``"1.0"`` / ``"-1.0"`` /
+    ``"0.0"`` which are not valid labels, so the entire series becomes
+    None. The pre-amendment fast path treated ``1.0`` as the int code
+    ``+1`` (Buy) -> Codex audit gap 1.
+    """
+    idx = _idx(3)
+    members = [pd.Series([1.0, -1.0, 0.0], index=idx, dtype=float)]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == ["None"] * 3
+
+
+def test_object_dtype_python_int_resolves_to_codes(sb, cs):
+    """Object dtype ``[1, -1, 0]`` (Python ints) -> Buy / Short / None.
+
+    Canonical: ``isinstance(raw, (int, np.integer))`` matches Python
+    int values inside an object container. The pre-amendment fast
+    path missed this and stringified them, returning all None ->
+    Codex audit gap 2.
+    """
+    idx = _idx(3)
+    members = [pd.Series([1, -1, 0], index=idx, dtype=object)]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == [
+        "Buy", "Short", "None",
+    ]
+
+
+def test_object_dtype_numpy_int64_resolves_to_codes(sb, cs):
+    """Object dtype ``[np.int64(1), np.int64(-1), np.int64(0)]`` ->
+    Buy / Short / None. Same canonical contract as Python ints
+    because numpy integers satisfy ``isinstance(raw, np.integer)``.
+    """
+    idx = _idx(3)
+    members = [pd.Series(
+        [np.int64(1), np.int64(-1), np.int64(0)],
+        index=idx,
+        dtype=object,
+    )]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == [
+        "Buy", "Short", "None",
+    ]
+
+
+def test_string_numeric_labels_resolve_to_none(sb, cs):
+    """Object dtype ``["1", "-1", "0"]`` -> None / None / None.
+
+    These are strings, not integer codes. Canonical's ``str(raw)
+    .strip()`` route checks them against the valid-label set; ``"1"``
+    is not ``"Buy"`` / ``"Short"`` / ``"None"`` so they all collapse.
+    """
+    idx = _idx(3)
+    members = [pd.Series(["1", "-1", "0"], index=idx, dtype=object)]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == ["None"] * 3
+
+
+def test_bool_dtype_resolves_to_none(sb, cs):
+    """Pure ``bool`` dtype Series ``[True, False]`` -> None / None.
+
+    ``np.bool_`` is not a subclass of ``int`` / ``np.integer``;
+    canonical falls through to ``str(raw).strip()`` which yields
+    ``"True"`` / ``"False"`` -> neither is a valid label -> None.
+    """
+    idx = _idx(2)
+    members = [pd.Series([True, False], index=idx, dtype=bool)]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == ["None", "None"]
+
+
+def test_object_dtype_python_bool_resolves_per_canonical(sb, cs):
+    """Object dtype ``[True, False]`` (Python bools) -> Buy / None.
+
+    Python ``bool`` is a subclass of ``int``; canonical's
+    ``isinstance(raw, (int, np.integer))`` matches it first.
+    ``True -> int(1) -> Buy``; ``False -> int(0) -> None``. This is a
+    canonical idiosyncrasy and the fast path must mirror it byte for
+    byte.
+    """
+    idx = _idx(2)
+    members = [pd.Series([True, False], index=idx, dtype=object)]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == ["Buy", "None"]
+
+
+def test_mixed_int_string_object_dtype_parity(sb, cs):
+    """Object dtype with mixed ints / strings / ``None`` /  ``NaN``
+    elements normalizes per-element exactly as canonical does. The
+    fast path's per-element fallback covers this case."""
+    idx = _idx(4)
+    members = [pd.Series(
+        [1, "Buy", None, float("nan")],
+        index=idx,
+        dtype=object,
+    )]
+    _assert_parity(sb, cs, members)
+    assert sb._combine_signals_fast(members).tolist() == [
+        "Buy", "Buy", "None", "None",
+    ]
+
+
+def test_numeric_other_than_codes_resolves_to_none(sb, cs):
+    """Integer values that are NOT ``+1`` / ``-1`` (e.g. 2, -3, 99) ->
+    None for both pure int dtype and object dtype. Canonical's
+    int branch ``v == 1`` / ``v == -1`` rejects them; the ``else``
+    in the canonical ``isinstance(raw, (int, np.integer))`` arm
+    sets them explicitly to ``None``."""
+    idx = _idx(4)
+    members_int = [pd.Series([2, -3, 99, 0], index=idx, dtype=int)]
+    _assert_parity(sb, cs, members_int)
+    assert sb._combine_signals_fast(members_int).tolist() == ["None"] * 4
+    members_obj = [pd.Series([2, -3, 99, 0], index=idx, dtype=object)]
+    _assert_parity(sb, cs, members_obj)
+    assert sb._combine_signals_fast(members_obj).tolist() == ["None"] * 4
+
+
+def test_consensus_with_mixed_dtypes_across_members(sb, cs):
+    """K=3 with each member in a different shape: string labels, int
+    codes in object container, and float dtype. Canonical handles
+    each member independently and the fast path must match."""
+    idx = _idx(3)
+    members = [
+        pd.Series(["Buy", "Short", "None"], index=idx, dtype=object),
+        pd.Series([1, -1, 0], index=idx, dtype=object),
+        pd.Series([1.0, -1.0, 0.0], index=idx, dtype=float),
+    ]
+    _assert_parity(sb, cs, members)
+    # Day 0: m0=Buy, m1=Buy(code), m2=None(float) -> all non-None are
+    #   Buy -> Buy.
+    # Day 1: m0=Short, m1=Short(code), m2=None(float) -> all non-None
+    #   are Short -> Short.
+    # Day 2: m0=None, m1=None, m2=None(float) -> None.
+    assert sb._combine_signals_fast(members).tolist() == [
+        "Buy", "Short", "None",
+    ]
