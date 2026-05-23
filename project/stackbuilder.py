@@ -1682,14 +1682,97 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
         s = s.replace({'Buy':'Short','Short':'Buy'})
     return s, present
 
-def _combine_signals(members: List[pd.Series]) -> pd.Series:
-    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix.
-    Delegates to canonical_scoring.combine_consensus_signals (spec §18).
+# Phase 6I-76: StackBuilder phase3 hot-path implementation of the
+# canonical consensus contract from canonical_scoring.combine_consensus
+# _signals (spec §18). Semantic parity is guaranteed by the focused
+# parity tests in test_scripts/. ``canonical_scoring.py`` itself is
+# NOT modified; this is purely a local fast path for the K-search hot
+# loop in phase3, which is the per-combo bottleneck Phase 6I-75 surfaced
+# (~98% of per-combo time spent in the canonical Python normalize loop).
+_COMBINE_SIGNALS_FAST_WIRED = True
+
+
+def _combine_signals_fast(members: List[pd.Series]) -> pd.Series:
+    """Vectorized local implementation of canonical consensus.
+
+    Per-day semantics, preserved verbatim from
+    ``canonical_scoring.combine_consensus_signals``:
+
+      * all members ``None`` (or missing) -> output ``None``;
+      * all non-``None`` members agree on ``Buy``  -> output ``Buy``;
+      * all non-``None`` members agree on ``Short`` -> output ``Short``;
+      * any mix of ``Buy`` and ``Short`` -> output ``None``.
+
+    Inputs may share or differ in index. When indexes differ the
+    fast path takes the union (matching the existing ``pd.concat
+    axis=1`` behavior). Missing values, ``NaN``, integer codes
+    (+1/-1/0), and stray labels are normalized the same way the
+    canonical helper does. Strings are stripped before comparison to
+    match ``normalize_signal_series``.
     """
     if not members:
         return pd.Series(dtype=object)
-    df = pd.concat(members, axis=1).fillna('None').astype(str)
-    return _canonical_consensus([df[c] for c in df.columns])
+
+    first_idx = members[0].index
+    if len(members) == 1 or all(
+        (m.index is first_idx or m.index.equals(first_idx))
+        for m in members[1:]
+    ):
+        common_idx = first_idx
+        reindex_each = False
+    else:
+        common_idx = first_idx
+        for m in members[1:]:
+            common_idx = common_idx.union(m.index)
+        reindex_each = True
+
+    n = len(common_idx)
+    if n == 0:
+        return pd.Series([], index=common_idx, dtype=object)
+
+    cols: List[np.ndarray] = []
+    for s in members:
+        if reindex_each and not (
+            s.index is common_idx or s.index.equals(common_idx)
+        ):
+            s = s.reindex(common_idx)
+        code = np.zeros(n, dtype=np.int8)
+        if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+            arr = s.to_numpy()
+            code[arr == 1] = 1
+            code[arr == -1] = -1
+        else:
+            v = s.fillna("None").astype(str).str.strip().to_numpy()
+            code[v == "Buy"] = 1
+            code[v == "Short"] = -1
+        cols.append(code)
+
+    if len(cols) > 1:
+        arr = np.column_stack(cols)
+    else:
+        arr = cols[0].reshape(-1, 1)
+    cnt = (arr != 0).sum(axis=1)
+    ssum = arr.sum(axis=1)
+    out = np.where(
+        cnt == 0, "None",
+        np.where(
+            ssum == cnt, "Buy",
+            np.where(ssum == -cnt, "Short", "None"),
+        ),
+    )
+    return pd.Series(out, index=common_idx, dtype=object)
+
+
+def _combine_signals(members: List[pd.Series]) -> pd.Series:
+    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix.
+
+    Phase 6I-76: routes through the StackBuilder-local vectorized
+    ``_combine_signals_fast`` helper, which preserves the canonical
+    consensus contract from ``canonical_scoring.combine_consensus
+    _signals`` exactly. Semantic parity is guarded by focused tests
+    in ``test_scripts/`` against the canonical reference.
+    """
+    return _combine_signals_fast(members)
 
 def _captures_from_signals(signals: pd.Series, sec_rets: pd.Series) -> pd.Series:
     sig = signals.reindex(sec_rets.index).fillna('None').astype(str)
