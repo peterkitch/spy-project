@@ -60,11 +60,32 @@ and `--k-max 6`.
 `--search beam` does not beam-prune K ≤ `exhaustive_k`. The engine
 exhaustively searches K ≤ 6, then uses beam for K > 6.
 
-Engine k-patience behavior: the runner's
-`build_stackbuilder_args_namespace` sets `k_patience = 1`. When K=N+1
-fails to improve Total Capture by `sharpe_eps` (0.01), the engine
-stops at K=N+1 with `patience 1/1` used up. This is a known engine
-behavior, not a regression introduced by Phase 6I-77.
+Engine traversal-stop behavior in this smoke is driven by **two
+parameters acting together**, with one of them being the primary
+mismatch versus LEGACY Dash:
+
+- **Primary mismatch**: the smoke command did not pass
+  `--allow-decreasing`, so the runner CLI default kept
+  `allow_decreasing=False`. With that default, the
+  `phase3_build_stacks` monotone Total Capture gate refuses to
+  accept any K=N+1 candidate whose Total Capture does not strictly
+  improve on K=N's best. The LEGACY Dash UI checkbox for
+  allow-decreasing was enabled by default, so the LEGACY user
+  experience effectively ran with `allow_decreasing=True`.
+- **Secondary factor**: the runner's
+  `build_stackbuilder_args_namespace` pins `k_patience = 1`, which
+  controls how many non-improving / no-valid K levels the
+  `phase3_build_stacks` patience stop logic tolerates before
+  stopping. The runner CLI on `main` at smoke time did not expose
+  `--k-patience`, so the smoke could not override this.
+
+Either parameter alone could have produced a different traversal
+depth; together they produced the K-2-accepted, stop-at-K=3
+behavior observed in §11 / §14. The primary configuration mismatch
+versus the LEGACY Dash traversal is the missing
+`--allow-decreasing`, not the secondary `k_patience=1` setting. The
+engine behaved correctly for the parameters that were actually
+passed.
 
 ## 5. Pre-Checks
 
@@ -207,62 +228,103 @@ bytes, 80 lines (engine progress + completion lines).
 
 ## 11. Per-Secondary Smoke Run Results
 
-| Secondary | status | elapsed (s) | wall-clock | K reached | K=1 winner | K=2 members | Best Total Capture (%) |
-|---|---|---:|---:|---:|---|---|---:|
-| AAPL | ok | 1140.9 | 19m01s | K=2 (stopped at K=3) | WEN[D] | HD[D], WEN[D] | 1148.7443 |
-| AMZN | ok | 810.4 | 13m30s | K=2 (stopped at K=3) | AIRT[D] | CLDN.L[D], CML.L[I] | 1325.1187 |
-| GOOGL | ok | 676.3 | 11m16s | K=2 (stopped at K=3) | ACO-X.TO[D] | MDD.F[I], TFF.PA[D] | 664.6505 |
-| META | ok | 532.4 | 8m52s | K=2 (stopped at K=3) | SMMU[I] | KA8.DE[D], MALJF[D] | 665.2521 |
-| MSFT | ok | 1052.2 | 17m32s | K=2 (stopped at K=3) | IMO[I] | IMO[I], UDR[D] | 950.0831 |
-| NVDA | ok | 788.9 | 13m09s | K=2 (stopped at K=3) | ALK-B.CO[D] | APR.F[I], CGLO[D] | 1317.7099 |
-| SPY | ok | 909.8 | 15m10s | K=2 (stopped at K=3) | SBSI[D] | AWR[D], PRGO[D] | 450.3807 |
-| TSLA | ok | 572.4 | 9m32s | K=2 (stopped at K=3) | EGY.AX[D] | PGH.L[D], TCU.F[D] | 1066.7417 |
+Column meanings:
+
+- **Last accepted K**: the highest K level whose winner was
+  published to the leaderboard, evidenced by the highest
+  `combo_k=<K>.json` artifact in the run directory. For every
+  secondary in this smoke the only `combo_k` artifacts present are
+  `combo_k=1.json` and `combo_k=2.json`, so the last accepted K is
+  **K=2** for all 8.
+- **Last attempted K**: source-implied by the `[PHASE3] Stopping at
+  K=3` stderr line. The `phase3_build_stacks` patience stop logic
+  emits "Stopping at K=N" after the next-K (K=N+1) attempt fails
+  with patience already exhausted by K=N. With `k_patience=1`,
+  K=3's failed attempt consumed patience and K=4's failed attempt
+  then triggered the stop. So the last attempted K is **K=4** for
+  all 8.
+
+The "K accepted / K attempted" columns below reflect this. The
+"stopped at K=3" notation in the K-attempted column quotes the
+engine's stderr message verbatim.
+
+| Secondary | status | elapsed (s) | wall-clock | last accepted K | last attempted K (stderr: "Stopping at K=3") | K=1 winner | K=2 members | Best Total Capture (%) |
+|---|---|---:|---:|---:|---:|---|---|---:|
+| AAPL | ok | 1140.9 | 19m01s | K=2 | K=4 | WEN[D] | HD[D], WEN[D] | 1148.7443 |
+| AMZN | ok | 810.4 | 13m30s | K=2 | K=4 | AIRT[D] | CLDN.L[D], CML.L[I] | 1325.1187 |
+| GOOGL | ok | 676.3 | 11m16s | K=2 | K=4 | ACO-X.TO[D] | MDD.F[I], TFF.PA[D] | 664.6505 |
+| META | ok | 532.4 | 8m52s | K=2 | K=4 | SMMU[I] | KA8.DE[D], MALJF[D] | 665.2521 |
+| MSFT | ok | 1052.2 | 17m32s | K=2 | K=4 | IMO[I] | IMO[I], UDR[D] | 950.0831 |
+| NVDA | ok | 788.9 | 13m09s | K=2 | K=4 | ALK-B.CO[D] | APR.F[I], CGLO[D] | 1317.7099 |
+| SPY | ok | 909.8 | 15m10s | K=2 | K=4 | SBSI[D] | AWR[D], PRGO[D] | 450.3807 |
+| TSLA | ok | 572.4 | 9m32s | K=2 | K=4 | EGY.AX[D] | PGH.L[D], TCU.F[D] | 1066.7417 |
 
 ## 12. Per-Secondary Timing Decomposition Through K=12
 
-**Critical caveat on timing source.** StackBuilder writes its
-`rank_all.xlsx`, `cohort.xlsx`, `combo_k=N.json`, and
-`combo_leaderboard.xlsx` artifacts together during the finalize
-phase, not as the K-search progresses. Per-K artifact mtime deltas
-therefore reflect serialization order in finalize, **not** the
-underlying K=N search wall-clock. The engine's stderr does not
-timestamp K-level transitions. Per-K wall-clock cannot be recovered
-from these artifacts alone; we report aggregate K-range timing
-honestly using the runner-emitted per-secondary `elapsed_seconds`
-plus the artifact-derived finalize span.
+**Critical caveat on timing source.** The Phase 6I-77 artifacts
+alone do not establish per-K runtime cleanly: `combo_k=N.json` is
+written only when K=N is accepted into the leaderboard, and several
+other artifacts (`rank_all.xlsx`, `rank_direct.xlsx`,
+`cohort.xlsx`, `combo_leaderboard.xlsx`) are written during the
+finalize phase, not at K-accept time. The engine's stderr does not
+timestamp K-level transitions either. Per-K wall-clock therefore
+cannot be fully recovered from this smoke's evidence alone; the
+table below reports artifact-mtime deltas for the K levels that
+were accepted (K=1, K=2) and the aggregate per-secondary
+`elapsed_seconds` reported by the runner.
 
-K=12 was **not reached** for any secondary. All 8 secondaries
-stopped at K=3 with `[PHASE3] Stopping at K=3: No candidate improves
-Total Capture by >0.010000 with >=30 trigger days`, after exhausting
-the k_patience=1 budget. This is the runner's `--k-patience 1`
-default — the runner CLI does not expose a flag to lengthen patience.
+| Secondary | Phase1+rank_all artifact (s) | cohort artifact (s) | combo_k=1.json (s) | combo_k=2.json (s) | combo_leaderboard+finalize (s) | Total elapsed (s) | Last accepted K | Last attempted K |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AAPL | 9.5 | +2.4 | +6.2 | +6.5 | +0.05 | 1140.9 | K=2 | K=4 |
+| AMZN | 8.5 | +2.3 | +5.7 | +4.4 | +0.05 | 810.4 | K=2 | K=4 |
+| GOOGL | 8.6 | +2.3 | +5.4 | +3.7 | +0.05 | 676.3 | K=2 | K=4 |
+| META | 8.6 | +2.3 | +5.4 | +2.9 | +0.05 | 532.4 | K=2 | K=4 |
+| MSFT | 8.5 | +2.3 | +5.9 | +5.7 | +0.05 | 1052.2 | K=2 | K=4 |
+| NVDA | 8.6 | +2.4 | +5.5 | +4.3 | +0.05 | 788.9 | K=2 | K=4 |
+| SPY | 8.6 | +2.1 | +5.8 | +4.9 | +0.05 | 909.8 | K=2 | K=4 |
+| TSLA | 8.6 | +2.1 | +5.7 | +3.1 | +0.05 | 572.4 | K=2 | K=4 |
 
-| Secondary | Phase1+rank_all artifact (s, finalize-write) | cohort artifact (s) | combo_k=1.json (s) | combo_k=2.json (s) | combo_leaderboard+finalize (s) | Total elapsed (s) | K reached |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| AAPL | 9.5 | +2.4 | +6.2 | +6.5 | +0.05 | 1140.9 | K=2 |
-| AMZN | 8.5 | +2.3 | +5.7 | +4.4 | +0.05 | 810.4 | K=2 |
-| GOOGL | 8.6 | +2.3 | +5.4 | +3.7 | +0.05 | 676.3 | K=2 |
-| META | 8.6 | +2.3 | +5.4 | +2.9 | +0.05 | 532.4 | K=2 |
-| MSFT | 8.5 | +2.3 | +5.9 | +5.7 | +0.05 | 1052.2 | K=2 |
-| NVDA | 8.6 | +2.4 | +5.5 | +4.3 | +0.05 | 788.9 | K=2 |
-| SPY | 8.6 | +2.1 | +5.8 | +4.9 | +0.05 | 909.8 | K=2 |
-| TSLA | 8.6 | +2.1 | +5.7 | +3.1 | +0.05 | 572.4 | K=2 |
+**Runtime-driver interpretation.** The Phase 6I-78 SPY follow-up
+smoke (run on the same engine `main` HEAD, with explicit
+`--allow-decreasing` and `--k-patience 1` overrides) measured
+current-engine per-K timings directly via per-K-accept artifact
+mtimes:
 
-Interpretation: total elapsed is dominated by **Phase 2** ImpactSearch
-ranking (scoring ~35,500 cohort-universe rows per secondary against
-the synthetic K=1 baseline). Phase 3 K-search through K=3 over the
-40-row cohort runs in seconds (the Phase 6I-76 fast combine target
-held; K-search itself is not the bottleneck). The K-stopping at K=3
-is patience-driven, not performance-driven.
+| Phase | Duration (Phase 6I-78 SPY) |
+|---|---:|
+| Phase 1 + Phase 2 rank_all | 9.5 s |
+| Phase 2 cohort assembly | 2.4 s |
+| K=1 exhaustive (40) | 5.7 s |
+| K=2 exhaustive (780) | 5.3 s |
+| K=3 exhaustive (9,880) | 78.9 s |
+| K=4 exhaustive (91,390) | 806.5 s |
+
+In other words, on Phase 6I-78's measurement of the post-Phase-6I-76
+engine, just Phase 1 + Phase 2 + K=1 + K=2 + K=3 + the K=4 exhaustive
+attempt sums to ~908 s — within seconds of Phase 6I-77's measured
+SPY total of 909.8 s. That alignment makes the **K-search work
+through the failed K=4 attempt** the most plausible runtime driver
+for this smoke, not Phase 2 ImpactSearch ranking. (Earlier wording
+attributing the runtime primarily to Phase 2 has been corrected.)
+
+The same per-K shape — small Phase 1 + Phase 2 setup, fast K=1 and
+K=2, K=3 exhaustive sub-2 minutes, K=4 exhaustive ~13 minutes — fits
+the spread of Phase 6I-77 per-secondary totals (532 s to 1,141 s)
+without invoking any other phase dominating the wall-clock. The
+spread itself is consistent with per-secondary variation in K=3 /
+K=4 candidate-iteration cost, not a Phase 2 anomaly.
 
 Comparison vs LEGACY baseline (~20 min/secondary for full
 K=1..K=12):
 
 - AAPL 19.0 min, MSFT 17.5 min, SPY 15.2 min, AMZN 13.5 min,
   NVDA 13.1 min, GOOGL 11.3 min, TSLA 9.5 min, META 8.9 min.
-- All 8 secondaries finished under the LEGACY baseline despite not
-  reaching K=12 (the Phase 2 work dominates the wall-clock and
-  Phase 2 has not regressed).
+- All 8 secondaries finished under the LEGACY ~20-min single-
+  secondary baseline. They did so without exploring K=5..K=12,
+  which means the comparison is not a like-for-like proof against
+  the LEGACY traversal depth; it does establish that K=1..K=2
+  accepted + K=3 / K=4 attempted fits inside the legacy time
+  budget on this engine for these secondaries.
 
 ## 13. K=1 Fast-Path Assertion Results
 
@@ -290,25 +352,54 @@ Inverse K=1 winners (mode suffix `[I]`): META (SMMU[I]) and MSFT
 
 ## 14. K=1..K=6 Exhaustive Verification
 
-The engine stopped at K=3 for all 8 secondaries. K=1 (40 singleton
-scores) and K=2 (780 combinations) ran to completion and were
-written to `combo_k=1.json` / `combo_k=2.json`. K=3 was searched
-exhaustively (9,880 combinations) without leaderboard improvement
-above 0.01 Total Capture (the patience threshold), so no
-`combo_k=3.json` artifact was written and the engine stopped per
-spec ("`combo_k` files may only appear when the leaderboard
-improves"). K=4..K=6 were not entered.
+K-by-K status for every secondary:
+
+- **K=1 accepted**: `combo_k=1.json` present for every secondary,
+  one member, Total Capture recorded. 40 singleton scores ran to
+  completion.
+- **K=2 accepted**: `combo_k=2.json` present for every secondary,
+  two members, Total Capture recorded. 780 exhaustive combinations
+  ran to completion.
+- **K=3 attempted, not accepted**: 9,880 exhaustive combinations
+  were enumerated for each secondary, but the
+  `phase3_build_stacks` monotone Total Capture gate (active because
+  the smoke did not pass `--allow-decreasing`) rejected every
+  candidate that did not strictly improve on K=2's best Total
+  Capture. No K=3 candidate cleared the gate, so no
+  `combo_k=3.json` was written. The patience-stop logic then
+  consumed `k_patience=1`.
+- **K=4 attempted, not accepted**: source-implied by the
+  `[PHASE3] Stopping at K=3` stderr line — that message is emitted
+  while the K=4 candidate evaluation fails after patience was
+  already exhausted at K=3. No `combo_k=4.json` written.
+- **K=5..K=6 not entered**: the stop fired before K=5.
+
+The root cause of stopping at K=4 attempted (K=2 last accepted) is
+the runner CLI default `allow_decreasing=False`, which enforces the
+monotone Total Capture improvement gate inside
+`phase3_build_stacks`. The LEGACY Dash UI ran with the allow-
+decreasing checkbox enabled by default, so the LEGACY user
+experience effectively ran with `allow_decreasing=True` and would
+not have hit this gate. `k_patience=1` was a secondary contributing
+factor: it bounded how many non-improving K levels the patience-
+stop logic tolerates before stopping, but it did not by itself
+force the monotone gate.
 
 The Phase 6I-76 fast combine path is the reason K=3's 9,880-combo
-exhaustive scan stays fast enough to complete within the
-per-secondary budget (combined with the Phase 2 cost, the per-
-secondary total still fits the 45-min budget for all 8 secondaries).
+and K=4's 91,390-combo exhaustive scans complete inside the
+per-secondary budget — see §12 for the Phase 6I-78 SPY measurement
+that aligns K=4 exhaustive at ~806.5 s with Phase 6I-77's SPY total
+of 909.8 s.
 
 ## 15. K=7..K=12 Beam Verification
 
 K=7..K=12 were not entered for any secondary because the engine
-stopped at K=3. No beam-stage timing evidence is available for this
-smoke. K=12 was not reached for any secondary.
+stopped after attempting K=3 (patience consumed) and then K=4
+(stop fired). No beam-stage timing evidence is available for this
+smoke. K=12 was not reached for any secondary. The K-depth
+shortfall is a configuration mismatch (missing
+`--allow-decreasing`, plus the `k_patience=1` runner default) and
+not a Phase 6I-73 / 6I-75 / 6I-76 engine regression.
 
 ## 16. `selected_build.json` Behavior per Secondary
 
@@ -425,7 +516,12 @@ Forbidden counts (`[ONEPASS:`, `Forcing rebuild`, `Traceback`) are
 all zero. Consumer-loader diagnostic family is all zero (every
 primary library loaded cleanly). The 8 × `Stopping at K` / `No
 candidate improves Total Capture` / 0 × `K=12` pattern is the
-patience-driven early-stop behavior documented in §4 and §12.
+configuration-driven early-stop documented in §4 / §11 / §14 —
+the smoke omitted `--allow-decreasing`, so the
+`phase3_build_stacks` monotone Total Capture gate refused every
+K=3 candidate, the `k_patience=1` budget was consumed, and the
+K=4 attempt triggered the stop. The engine produced these lines
+correctly for the parameters that were actually passed.
 
 ## 22. Total Smoke Wall-Clock
 
@@ -438,50 +534,81 @@ patience-driven early-stop behavior documented in §4 and §12.
 
 ## 23. Verdict per Secondary
 
-Per the spec's verdict rules, "PASS" requires *"reached K=12 or the
-engine cleanly completed `max_k=12` evidence."* No secondary reached
-K=12; all stopped at K=3 due to k_patience=1. The engine completion
-was clean and within budget, but the lack of K=12 evidence places
-every secondary at the **SUSPECT** verdict level per the explicit
-spec criterion *"did not reach `k_max=12`."*
+The per-secondary verdicts below separate the axes the smoke
+**did** validate (runner / safety / K=1 / consumer loader / durable-
+validation skip / canonical artifact safety) from the axis it did
+**not** validate (K-depth traversal to `k_max=12`). The K-depth
+axis is **INCOMPLETE** for every secondary because the smoke
+parameters did not match LEGACY Dash traversal behavior — the
+smoke omitted `--allow-decreasing`, which is the primary
+configuration mismatch (see §4 / §14). It is not an engine failure.
 
-| Secondary | Verdict | Reason |
-|---|---|---|
-| AAPL | SUSPECT | runner status ok, total well under budget, K=1 PASS, all artifacts present, but engine stopped at K=3 (k_patience=1; Total Capture did not improve by ≥0.01); K=12 not reached |
-| AMZN | SUSPECT | same |
-| GOOGL | SUSPECT | same |
-| META | SUSPECT | same |
-| MSFT | SUSPECT | same |
-| NVDA | SUSPECT | same |
-| SPY | SUSPECT | same |
-| TSLA | SUSPECT | same |
+| Secondary | Runner / safety | K=1 fast-path | Consumer loader / no rebuild storm | Durable validation skip | Canonical artifact safety | K-depth traversal |
+|---|---|---|---|---|---|---|
+| AAPL | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| AMZN | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| GOOGL | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| META | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| MSFT | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| NVDA | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| SPY | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+| TSLA | PASS | PASS | PASS | PASS | PASS | INCOMPLETE (config mismatch) |
+
+"INCOMPLETE (config mismatch)" reads as: the engine behaved
+correctly for the parameters that were passed, but those
+parameters did not exercise the K=12 traversal path the spec was
+trying to validate. A follow-up smoke that explicitly passes
+`--allow-decreasing` (and, in the same spirit, exposes
+`--k-patience` on the runner so the operator can pin it) is the
+right way to supply K=12 evidence.
 
 ## 24. Aggregate Verdict
 
-**SUSPECT — clean run, partial K-evidence.**
+**SUSPECT — configuration-incomplete smoke, not an engine failure.**
 
-The smoke validates the post-Phase-6I-76 engine end-to-end across
-all 8 ImpactSearch XLSX secondaries with no failures, no timeouts,
-no canonical artifact writes, no forbidden diagnostics, validation
-properly skipped, and the Phase 6I-73 / 6I-75 / 6I-76 invariants all
-preserved. Every per-secondary safety check passes. Total wall-clock
-is well below the LEGACY ~160 min budget and well below the 6-hour
-hard ceiling.
+The per-axis aggregate reads:
 
-The single reason the aggregate is **SUSPECT** rather than **PASS**
-is the engine's k_patience=1 early-stop: every secondary stopped at
-K=3 without reaching the configured `k_max=12`. The early-stop is
-behaviorally correct (no candidate improved Total Capture by the
-0.01 threshold for K=3 over the 40-row cohort with these primaries)
-and is not a regression introduced by Phase 6I-75 / 6I-76 — but the
-spec gates PASS on K=12 evidence, which this smoke cannot supply
-without a `k_patience` override on the runner CLI surface.
+- **Runner / safety invariants: PASS.** `status=ok`, all required
+  per-secondary artifacts present, runner exited normally inside
+  budget, no failures.
+- **K=1 fast-path: PASS.** 8/8 secondaries cleared the K=1
+  ≤30 s assertion.
+- **Consumer loader / no rebuild storm: PASS.** Zero
+  `[ONEPASS:`, zero `Forcing rebuild`, zero
+  `[STACKBUILDER:library_*]` diagnostics — Phase 6I-75's consumer-
+  loader contract held.
+- **Durable validation skip: PASS.** Every per-secondary
+  `run_manifest.json` carries `durable_validation_status=skipped`
+  + `skip_reason=operator_flag`; no sidecar written; Phase 5C
+  fail-closed default unchanged.
+- **Canonical artifact safety: PASS.** Pre/post snapshot diff
+  empty across `output/stackbuilder`,
+  `output/stackbuilder/_progress`, `output/impactsearch`,
+  `output/onepass.xlsx`, `output/validation`,
+  `signal_library/data/stable`, `price_cache/daily`.
+- **K-depth traversal validation: INCOMPLETE.** The smoke omitted
+  `--allow-decreasing`, so the `phase3_build_stacks` monotone
+  Total Capture gate refused every K=3 candidate and the patience
+  stop fired during the K=4 attempt. The smoke therefore cannot
+  serve as K=12 evidence; it can only serve as K=2-accepted /
+  K=4-attempted evidence under the parameters that were actually
+  passed.
 
-The Phase 6I-76 fast combine path itself is operating correctly:
-combine wall-clock is no longer the dominant per-combo cost, and
-the K-search work that did run (K=1 + K=2 exhaustive + K=3
-exhaustive-to-termination) all fits comfortably within the
-per-secondary budget.
+The aggregate is **SUSPECT** in the sense that the K-depth axis
+is incomplete. It is explicitly **not** an engine failure: every
+other axis passed cleanly, the engine behaved correctly for the
+parameters that were actually passed, and the K-stop is wholly
+explained by the `--allow-decreasing` omission (primary) and the
+`k_patience=1` runner default (secondary). Earlier wording that
+suggested the engine produced bad builds, or that Phase 2 ranking
+dominated the wall-clock, has been corrected.
+
+The Phase 6I-76 fast combine path is operating correctly: combine
+wall-clock is no longer the dominant per-combo cost (see Phase
+6I-78 SPY measurement quoted in §12), and the K-search work that
+the smoke actually ran (K=1 + K=2 accepted, K=3 + K=4 attempted)
+fits comfortably inside the per-secondary budget for all 8
+secondaries.
 
 ## 25. Follow-Ups
 
@@ -493,13 +620,12 @@ per-secondary budget.
 - **Phase 5C validation-scope** work remains separate. Durable
   validation default behavior is unchanged on `main` — the skip
   used here is the operator-explicit opt-in from Phase 6I-75.
-- **Recommended next**: a small follow-up phase exposing
-  `--k-patience` on the runner CLI surface (and/or lowering the
-  Total Capture improvement threshold) would let a future smoke
-  supply K=12 evidence. The current runner namespace pins
-  `k_patience = 1` in `build_stackbuilder_args_namespace`. Without
-  that exposure, no smoke can produce a PASS verdict under the
-  current spec rules.
+- **Recommended next**: a follow-up SPY smoke that explicitly
+  passes `--allow-decreasing` (the primary configuration mismatch
+  versus LEGACY Dash here), plus runner-side exposure of
+  `--k-patience` so the operator can pin patience from the CLI.
+  With those two parameters in place a future smoke can supply
+  K=12 evidence on the same engine `main` HEAD.
 - StackBuilder-direct call paths (`stackbuilder.py` as an entry
   point) are out of scope — the smoke used
   `stackbuilder_workbook_runner.py` exclusively.
@@ -523,8 +649,14 @@ per-secondary budget.
 - StackBuilder was run only through
   `stackbuilder_workbook_runner.py`.
 - Per-secondary timing was reported through the K-range the engine
-  actually entered (K=1, K=2 exhaustive, K=3 exhaustive-to-stop);
-  K=4..K=12 were not entered because of k_patience=1.
+  actually exercised: K=1 + K=2 accepted (artifacts published),
+  K=3 + K=4 attempted (no leaderboard improvement; stop fired
+  with `[PHASE3] Stopping at K=3`). K=5..K=12 were not entered.
+  The primary cause of stopping at K=4 attempted (K=2 last
+  accepted) is the missing `--allow-decreasing` flag, which left
+  the runner CLI default `allow_decreasing=False` in place and
+  enforced the `phase3_build_stacks` monotone Total Capture gate;
+  `k_patience=1` was a secondary contributing factor.
 - K=1 fast-path assertion passed for all 8 secondaries.
 - Progress-path isolation under `<outdir>/_progress` held for all 8.
 - Durable validation was explicitly skipped; manifest carries
