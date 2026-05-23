@@ -1183,3 +1183,112 @@ def test_runner_selection_policy_label_is_total_capture_then_latest():
     """Selection policy label must not advertise Sharpe."""
     assert "sharpe" not in runner.SELECTION_POLICY.lower()
     assert "total_capture" in runner.SELECTION_POLICY.lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6I-78: runner --k-patience pass-through
+#
+# The runner previously hardcoded ``k_patience=1`` in the engine
+# Namespace without exposing it on the CLI surface. Phase 6I-78 adds
+# the explicit ``--k-patience`` flag so the operator can pin the
+# traversal-stop behavior from the runner without modifying
+# stackbuilder.py.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_k_patience_default_is_one():
+    """Default ``args.k_patience`` is ``1``, preserving the runner's
+    prior hardcoded engine-namespace value when the flag is omitted."""
+    args = runner.parse_args(["--secondaries", "SPY"])
+    assert args.k_patience == 1
+
+
+def test_parse_args_k_patience_accepts_explicit_one():
+    """Explicit ``--k-patience 1`` round-trips through argparse."""
+    args = runner.parse_args(["--secondaries", "SPY", "--k-patience", "1"])
+    assert args.k_patience == 1
+
+
+def test_parse_args_k_patience_accepts_higher_value():
+    """An explicit larger value (3) round-trips."""
+    args = runner.parse_args(["--secondaries", "SPY", "--k-patience", "3"])
+    assert args.k_patience == 3
+
+
+def test_effective_config_includes_k_patience_default():
+    """``_effective_config`` reports the default k_patience value."""
+    args = runner.parse_args(["--secondaries", "SPY"])
+    cfg = runner._effective_config(args)
+    assert cfg["k_patience"] == 1
+
+
+def test_effective_config_includes_k_patience_explicit():
+    """``_effective_config`` reports the explicit k_patience value."""
+    args = runner.parse_args(["--secondaries", "SPY", "--k-patience", "3"])
+    cfg = runner._effective_config(args)
+    assert cfg["k_patience"] == 3
+
+
+def test_build_stackbuilder_args_namespace_passes_k_patience_default():
+    """The engine Namespace receives the default k_patience=1."""
+    args = runner.parse_args(["--secondaries", "SPY"])
+    ns = runner.build_stackbuilder_args_namespace(
+        args, "SPY",
+        primaries_resolution={
+            "status": "ok", "primary_source": "impact_xlsx",
+            "primaries": [], "primary_count": 0,
+            "source_path": None, "issues": [],
+        },
+    )
+    assert ns.k_patience == 1
+
+
+def test_build_stackbuilder_args_namespace_passes_k_patience_explicit():
+    """The engine Namespace receives the operator-passed k_patience."""
+    args = runner.parse_args(["--secondaries", "SPY", "--k-patience", "3"])
+    ns = runner.build_stackbuilder_args_namespace(
+        args, "SPY",
+        primaries_resolution={
+            "status": "ok", "primary_source": "impact_xlsx",
+            "primaries": [], "primary_count": 0,
+            "source_path": None, "issues": [],
+        },
+    )
+    assert ns.k_patience == 3
+
+
+def test_dry_run_plan_effective_config_includes_k_patience_and_allow_decreasing():
+    """``build_run_plan`` exposes both traversal controls in the
+    dry-run JSON's ``effective_config`` block."""
+    args = runner.parse_args([
+        "--secondaries", "SPY",
+        "--allow-decreasing",
+        "--k-patience", "1",
+        "--duration-budget-minutes", "1440",
+        "--operator-budget-label", "phase-6i-78-test",
+    ])
+    plan = runner.build_run_plan(
+        args,
+        secondaries_resolution={
+            "status": "ok",
+            "secondaries": ["SPY"],
+        },
+        primaries_resolution={
+            "status": "ok",
+            "primary_source": "impact_xlsx",
+            "primary_count": 1,
+            "primaries": ["AAPL"],
+        },
+    )
+    cfg = plan["effective_config"]
+    assert cfg["k_patience"] == 1
+    assert cfg["allow_decreasing"] is True
+
+
+def test_allow_decreasing_default_unchanged_by_k_patience_addition():
+    """Adding --k-patience must not change --allow-decreasing default
+    behavior."""
+    args_default = runner.parse_args(["--secondaries", "SPY"])
+    assert args_default.allow_decreasing is False
+    args_set = runner.parse_args(["--secondaries", "SPY", "--allow-decreasing"])
+    assert args_set.allow_decreasing is True

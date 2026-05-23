@@ -185,6 +185,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_OPTIMIZE_BY,
     )
     p.add_argument("--allow-decreasing", action="store_true", default=False)
+    p.add_argument(
+        "--k-patience",
+        type=int,
+        default=1,
+        help=(
+            "Phase 6I-78: how many non-improving / no-valid K levels "
+            "the engine will tolerate before stopping. Default 1 "
+            "preserves the runner's prior hardcoded behavior."
+        ),
+    )
     p.add_argument("--grace-days", type=int, default=None)
     p.add_argument("--threads", default=None)
     p.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
@@ -497,7 +507,7 @@ def build_stackbuilder_args_namespace(
         verbose=False,
         no_progress=bool(getattr(args, "no_progress", False)),
         both_modes=False,
-        k_patience=1,
+        k_patience=int(getattr(args, "k_patience", 1)),
         combine_mode="intersection",
         strict_manifests=False,
         signal_lib_dir=None,
@@ -742,6 +752,7 @@ def _effective_config(args: argparse.Namespace) -> dict:
         "seed_by": getattr(args, "seed_by", DEFAULT_SEED_BY),
         "optimize_by": getattr(args, "optimize_by", DEFAULT_OPTIMIZE_BY),
         "allow_decreasing": bool(getattr(args, "allow_decreasing", False)),
+        "k_patience": int(getattr(args, "k_patience", 1)),
         "grace_days": getattr(args, "grace_days", None),
         "output_format": getattr(args, "output_format", DEFAULT_OUTPUT_FORMAT),
         "outdir": getattr(args, "outdir", DEFAULT_OUTDIR),
