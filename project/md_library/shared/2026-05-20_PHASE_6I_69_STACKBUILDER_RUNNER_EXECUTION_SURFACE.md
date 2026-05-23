@@ -848,3 +848,156 @@ Bottom_n inverse cohort display rows may carry `NaN` Sharpe / `NaN` p-Value beca
 - Durable validation scope (Phase 5C contract files) is **not** touched in this PR. A future PR may revisit validation surfaces if needed.
 - Phase C smoke retry will land in a separate PR after Phase 6I-73 merges.
 - Phase D benchmark remains a separate authorized task.
+
+## Phase 6I-75 Runtime Recovery Update
+
+Recovery follow-up to the Phase 6I-74 supervised smoke timeout. Three
+runtime boundaries are restored or added; no Phase 6I-73 scoring policy
+is touched (Total Capture remains the sole selection criterion; Sharpe
+remains display-only; the Phase 5C fail-closed durable-validation
+contract remains the default).
+
+### A. Consumer-only signal-library loader
+
+StackBuilder is a consumer engine. The Phase 3B-1 path routed library
+loads through `onepass.load_signal_library`, which in turn called
+`load_verified_signal_library` with manifest verification; provenance
+mismatches emitted a "Forcing rebuild" notice that in the Phase 6I-74
+smoke ran ~229,201 times across the 4-secondary run.
+
+Phase 6I-75 removes the OnePass call path from StackBuilder entirely:
+
+- `from onepass import load_signal_library` is gone; the
+  `_try_import()` slot is permanently bound to `None`.
+- `load_signal_library_for_stackbuilder(ticker)` is the new consumer
+  loader. It globs the stable signal-library directory, opens the
+  first readable PKL with a direct `pickle.load`, validates the
+  minimal payload StackBuilder needs (1D `primary_signals` of the same
+  length as `dates`), and returns the dict.
+- Loads are memoized per-run on both success and failure in
+  `_CONSUMER_LOADER_CACHE`, keyed by
+  `(ticker, candidate_path, mtime_ns, size)`. Repeated calls for the
+  same ticker do not re-read the PKL.
+- Diagnostics use the `[STACKBUILDER:library_missing]`,
+  `[STACKBUILDER:library_unreadable]`, and
+  `[STACKBUILDER:library_invalid]` prefix family. No `[ONEPASS:*]`
+  tag, no "Forcing rebuild" string, no rebuild side effect.
+- Manifest-level mismatches no longer reject a readable library in
+  consumer mode (the payload is what matters; manifest provenance is
+  recorded by `_record_input_lib` but does not gate the load).
+- `fallback_load_signal_library` and `load_lib_or_none` are thin
+  aliases over `load_signal_library_for_stackbuilder`. Every existing
+  call site (the K-search hot path, `_load_primary_signals`,
+  `_signals_aligned_and_mask`, `_captures_for`) still works without
+  modification.
+
+The loader does not fetch from yfinance, write to `signal_library/`,
+modify any manifest, or call any other engine. A unit test
+(`test_consumer_loader_does_not_write_to_signal_lib_dir`) verifies the
+file-stat invariants on every load attempt, including missing-library
+and invalid-payload paths.
+
+### B. Phase3 hot-path decomposition (measurement-only)
+
+Spec Part 2 authorized implementing a `_metrics_from_captures_fast`
+helper only if a synthetic measurement showed ≤18 ms per combo with
+semantic parity. The harness lives at
+`test_scripts/bench_phase_6i75_hotpath_decomposition.py` and times each
+component of `_combined_metrics_signals` independently against a
+30-year synthetic daily series with K=4 members.
+
+Result (median over 30 repetitions, pinned spyproject2 interpreter):
+
+| Component | Median ms / combo | Share of full pipeline |
+|---|---|---|
+| `_combine_signals` (canonical consensus) | 180.83 | 97.76% |
+| `_captures_from_signals` | 1.28 | 0.69% |
+| `trigger_mask = comb_sig.isin(...)` | 0.16 | 0.08% |
+| `metrics_from_captures` (full) | 0.73 | 0.40% |
+| `_canonical_score_captures` only | 0.68 | 0.37% |
+| `metrics_to_legacy_dict` only | 0.002 | 0.001% |
+| `_combined_metrics_signals` total | 184.98 | 100% |
+
+`metrics_from_captures` already runs in well under 1 ms per call (≈24×
+faster than the 18 ms/combo target). Implementing
+`_metrics_from_captures_fast` would save < 0.5% of per-combo time and
+introduce semantic-parity risk for no operational benefit. The fast
+helper is therefore **not** implemented.
+
+The dominant cost (~98%) is the canonical consensus combine
+(`combine_consensus_signals`). That helper is out of scope for Part 2
+under the spec; a future authorized phase may revisit it. The
+measurement JSON (with per-sample timings + verdict block) is
+preserved at
+`logs/phase_6i75_stackbuilder_runtime_recovery/<SESSION_DIR>/phase_6i75_hotpath_decomposition.json`.
+
+### C. `--skip-durable-validation` flag
+
+A new operator-explicit CLI flag (default off) lets a supervised
+operator skip the Phase 5C durable validation surface on a per-run
+basis. Default behavior — and therefore the locked Phase 5C
+fail-closed contract — is unchanged when the flag is absent.
+
+Engine surface (`stackbuilder.py`):
+
+- `parse_args` exposes `--skip-durable-validation`
+  (`store_true`, default `False`).
+- `_stable_cli_args_subset` records the flag so the manifest
+  fingerprint distinguishes skip from no-skip re-runs.
+- In `run_for_secondary`, when the flag is set the call to
+  `_prepare_stackbuilder_durable_validation` is skipped entirely:
+  no walk-forward folds, no `evaluate_candidate` loop, no sidecar
+  write. The function `_build_skipped_validation_summary` returns
+  a complete locked-10 summary with
+  `validation_status="skipped"`, `validation_artifact_path=None`,
+  `validation_artifact_hash=None`, and the other numeric/path
+  fields `None`. The locked-keys gate
+  (`_validate_stackbuilder_validation_summary`) continues to pass.
+- The manifest carries two additional top-level keys to make the
+  skip unambiguous on the consumer side:
+  `durable_validation_status` is `"skipped"` (with the flag) or
+  `"ran"` (default), and `durable_validation_skip_reason` is
+  `"operator_flag"` on the skip path or `None` otherwise.
+  Fabricating `validation_artifact_path` or
+  `validation_artifact_hash` on the skip path is forbidden.
+- The completion line emits `Validation: SKIPPED (operator_flag).
+  No durable validation sidecar was written.` on the skip path.
+
+Runner surface (`stackbuilder_workbook_runner.py`):
+
+- `parse_args` exposes `--skip-durable-validation`
+  (`store_true`, default `False`).
+- `_effective_config` records the flag.
+- `per_secondary_plan` entries carry the flag for per-secondary
+  visibility in the dry-run JSON.
+- `build_stackbuilder_args_namespace` threads
+  `skip_durable_validation` into the `SimpleNamespace` handed to
+  `stackbuilder.run_for_secondary`.
+
+### D. What changed and what didn't
+
+Changed:
+
+- `stackbuilder.py` — consumer-only loader, skip-validation gate,
+  CLI flag.
+- `stackbuilder_workbook_runner.py` — runner CLI plumbing for the
+  skip flag.
+- `test_scripts/test_stackbuilder_phase_6i75_consumer_loader.py` —
+  24 new focused tests covering loader semantics, memoization,
+  diagnostics, skip-summary schema, and runner plumbing.
+- `test_scripts/bench_phase_6i75_hotpath_decomposition.py` —
+  synthetic measurement harness.
+
+Unchanged:
+
+- Phase 6I-73 selection policy: Total Capture only; Sharpe
+  display-only.
+- Phase 5C durable-validation default (fail-closed remains the
+  default; the skip is opt-in only).
+- Validation engine (`validation_engine.py`) and the Phase 5C
+  contract files.
+- StackBuilder phase3 hot-path code (no `_metrics_from_captures_fast`
+  was added; measurement did not support it).
+- ImpactSearch XLSX provenance verification path (still strict).
+- Output-manifest schema beyond the two new explicit skip-marker
+  keys.

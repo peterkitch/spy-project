@@ -198,6 +198,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--duration-budget-minutes", type=int, default=None)
     p.add_argument("--operator-budget-label", default=None)
 
+    p.add_argument(
+        "--skip-durable-validation",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase 6I-75: skip _prepare_stackbuilder_durable_validation "
+            "for every secondary in this run. Default off preserves the "
+            "Phase 5C fail-closed contract."
+        ),
+    )
     p.add_argument("--no-progress", action="store_true", default=False)
     # Phase 6I-71: runner-owned progress directory. Default ``None``
     # resolves to ``<outdir>/_progress`` so an isolated --outdir (e.g.
@@ -491,6 +501,9 @@ def build_stackbuilder_args_namespace(
         combine_mode="intersection",
         strict_manifests=False,
         signal_lib_dir=None,
+        skip_durable_validation=bool(
+            getattr(args, "skip_durable_validation", False)
+        ),
     )
 
 
@@ -746,6 +759,9 @@ def _effective_config(args: argparse.Namespace) -> dict:
                 DEFAULT_IMPACT_XLSX_MAX_AGE_DAYS,
             )
         ),
+        "skip_durable_validation": bool(
+            getattr(args, "skip_durable_validation", False)
+        ),
     }
 
 
@@ -826,6 +842,9 @@ def build_run_plan(
 
     secs = secondaries_resolution.get("secondaries") or []
     effective_progress_dir = _effective_progress_dir(args)
+    skip_durable_validation = bool(
+        getattr(args, "skip_durable_validation", False)
+    )
     per_secondary_plan = [
         {
             "secondary": s,
@@ -837,6 +856,7 @@ def build_run_plan(
             ),
             "planned_progress_path": build_progress_path(args, s),
             "effective_progress_dir": effective_progress_dir,
+            "skip_durable_validation": skip_durable_validation,
         }
         for s in secs
     ]
