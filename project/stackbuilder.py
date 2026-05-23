@@ -1682,14 +1682,198 @@ def _signals_aligned_and_mask(primary: str, mode: str, sec_index: pd.DatetimeInd
         s = s.replace({'Buy':'Short','Short':'Buy'})
     return s, present
 
-def _combine_signals(members: List[pd.Series]) -> pd.Series:
-    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix.
-    Delegates to canonical_scoring.combine_consensus_signals (spec §18).
+# Phase 6I-76: StackBuilder phase3 hot-path implementation of the
+# canonical consensus contract from canonical_scoring.combine_consensus
+# _signals (spec §18). Semantic parity is guaranteed by the focused
+# parity tests in test_scripts/. ``canonical_scoring.py`` itself is
+# NOT modified; this is purely a local fast path for the K-search hot
+# loop in phase3, which is the per-combo bottleneck Phase 6I-75 surfaced
+# (~98% of per-combo time spent in the canonical Python normalize loop).
+_COMBINE_SIGNALS_FAST_WIRED = True
+
+
+def _normalize_member_to_int8(s: pd.Series, n: int) -> np.ndarray:
+    """Phase 6I-76: vectorized int8 normalization of one signal-library
+    member series. Matches
+    ``canonical_scoring.normalize_signal_series`` exactly for every
+    dtype it accepts (verified by the parity tests in
+    ``test_scripts/test_stackbuilder_phase_6i76_combine_parity.py``).
+
+    Output convention: +1 = Buy, -1 = Short, 0 = None (or any value
+    that canonical normalizes to None: missing, NaN, unknown label,
+    numeric float, np.bool_, string "1"/"1.0"/etc.).
+
+    The dispatch mirrors the canonical per-element rules:
+
+      * **Pure bool dtype** (``np.bool_``): canonical takes the
+        ``str(raw).strip()`` route because ``np.bool_`` is not an
+        instance of ``int`` / ``np.integer``. ``"True"`` / ``"False"``
+        are not in the valid-label set -> the whole series collapses
+        to None.
+      * **Pure integer dtype** (Python int / numpy int*): values are
+        treated as codes; ``+1`` -> Buy, ``-1`` -> Short, everything
+        else -> None.
+      * **Pure float dtype**: canonical's ``str(raw).strip()`` gives
+        ``"1.0"`` / ``"-1.0"`` / ``"nan"`` / etc., none of which match
+        the valid labels -> all None.
+      * **Object dtype**: dispatched by
+        ``pd.api.types.infer_dtype(skipna=True)``:
+          - ``"string"`` / ``"empty"`` -> fast vectorized string
+            equality (the StackBuilder phase3 hot-path case);
+          - ``"integer"`` / ``"boolean"`` / mixed shapes ->
+            element-wise loop replicating canonical's ``isinstance``
+            cascade, including the Python-``bool``-is-``int``-subclass
+            quirk (``True`` -> Buy, ``False`` -> None);
+          - anything else (datetimes, categoricals embedded in
+            object, ...) -> defensive stringify + label-match.
+    """
+    code = np.zeros(n, dtype=np.int8)
+    if n == 0:
+        return code
+
+    # ``np.bool_`` series: canonical goes through ``str()`` which never
+    # matches valid labels.
+    if pd.api.types.is_bool_dtype(s):
+        return code
+
+    if pd.api.types.is_integer_dtype(s):
+        arr = s.to_numpy()
+        code[arr == 1] = 1
+        code[arr == -1] = -1
+        return code
+
+    if pd.api.types.is_float_dtype(s):
+        # Canonical sends every float through ``str(raw)`` (or NaN ->
+        # None). ``"1.0"`` is not a valid label. All -> None.
+        return code
+
+    if s.dtype == object:
+        inferred = pd.api.types.infer_dtype(s, skipna=True)
+        if inferred in ("string", "empty"):
+            v = s.fillna("None").astype(str).str.strip().to_numpy()
+            code[v == "Buy"] = 1
+            code[v == "Short"] = -1
+            return code
+        # Fall through to the per-element canonical replica for any
+        # object-dtype content that isn't pure-string. Common cases:
+        # ``"integer"`` (object container of ints), ``"boolean"``
+        # (object container of Python bools), ``"mixed-integer"``,
+        # ``"mixed-integer-float"``, ``"mixed"``, ``"floating"``.
+        arr = s.to_numpy()
+        for i in range(n):
+            raw = arr[i]
+            if raw is None:
+                continue
+            if isinstance(raw, bool):
+                # Python ``bool`` is a subclass of ``int``; canonical's
+                # ``isinstance(raw, (int, np.integer))`` matches it
+                # first. True -> 1 -> Buy, False -> 0 -> None.
+                if raw is True:
+                    code[i] = 1
+                continue
+            if isinstance(raw, (int, np.integer)):
+                v = int(raw)
+                if v == 1:
+                    code[i] = 1
+                elif v == -1:
+                    code[i] = -1
+                continue
+            if isinstance(raw, float):
+                # Canonical: NaN -> None; otherwise ``str(raw)`` ->
+                # invalid label -> None. Either way -> code stays 0.
+                continue
+            try:
+                lit = str(raw).strip()
+            except Exception:
+                continue
+            if lit == "Buy":
+                code[i] = 1
+            elif lit == "Short":
+                code[i] = -1
+            # Any other string (including "1", "-1", "0", "None",
+            # "abc") -> None.
+        return code
+
+    # Categorical / datetime / Period / etc.: canonical's behavior is
+    # ``str(raw).strip()`` against the valid label set. Defensive
+    # stringify covers them all.
+    v = s.astype(str).str.strip().to_numpy()
+    code[v == "Buy"] = 1
+    code[v == "Short"] = -1
+    return code
+
+
+def _combine_signals_fast(members: List[pd.Series]) -> pd.Series:
+    """Vectorized local implementation of canonical consensus.
+
+    Per-day semantics, preserved verbatim from
+    ``canonical_scoring.combine_consensus_signals``:
+
+      * all members ``None`` (or missing) -> output ``None``;
+      * all non-``None`` members agree on ``Buy``  -> output ``Buy``;
+      * all non-``None`` members agree on ``Short`` -> output ``Short``;
+      * any mix of ``Buy`` and ``Short`` -> output ``None``.
+
+    Inputs may share or differ in index. When indexes differ the
+    fast path takes the union (matching the existing ``pd.concat
+    axis=1`` behavior). Member normalization is delegated to
+    ``_normalize_member_to_int8`` which matches
+    ``canonical_scoring.normalize_signal_series`` byte-for-byte.
     """
     if not members:
         return pd.Series(dtype=object)
-    df = pd.concat(members, axis=1).fillna('None').astype(str)
-    return _canonical_consensus([df[c] for c in df.columns])
+
+    first_idx = members[0].index
+    if len(members) == 1 or all(
+        (m.index is first_idx or m.index.equals(first_idx))
+        for m in members[1:]
+    ):
+        common_idx = first_idx
+        reindex_each = False
+    else:
+        common_idx = first_idx
+        for m in members[1:]:
+            common_idx = common_idx.union(m.index)
+        reindex_each = True
+
+    n = len(common_idx)
+    if n == 0:
+        return pd.Series([], index=common_idx, dtype=object)
+
+    cols: List[np.ndarray] = []
+    for s in members:
+        if reindex_each and not (
+            s.index is common_idx or s.index.equals(common_idx)
+        ):
+            s = s.reindex(common_idx)
+        cols.append(_normalize_member_to_int8(s, n))
+
+    if len(cols) > 1:
+        arr = np.column_stack(cols)
+    else:
+        arr = cols[0].reshape(-1, 1)
+    cnt = (arr != 0).sum(axis=1)
+    ssum = arr.sum(axis=1)
+    out = np.where(
+        cnt == 0, "None",
+        np.where(
+            ssum == cnt, "Buy",
+            np.where(ssum == -cnt, "Short", "None"),
+        ),
+    )
+    return pd.Series(out, index=common_idx, dtype=object)
+
+
+def _combine_signals(members: List[pd.Series]) -> pd.Series:
+    """Allow Buy/NONE or Short/NONE; cancel to NONE on any Buy+Short mix.
+
+    Phase 6I-76: routes through the StackBuilder-local vectorized
+    ``_combine_signals_fast`` helper, which preserves the canonical
+    consensus contract from ``canonical_scoring.combine_consensus
+    _signals`` exactly. Semantic parity is guarded by focused tests
+    in ``test_scripts/`` against the canonical reference.
+    """
+    return _combine_signals_fast(members)
 
 def _captures_from_signals(signals: pd.Series, sec_rets: pd.Series) -> pd.Series:
     sig = signals.reindex(sec_rets.index).fillna('None').astype(str)

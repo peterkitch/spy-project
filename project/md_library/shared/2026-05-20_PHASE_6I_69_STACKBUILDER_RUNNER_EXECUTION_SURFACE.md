@@ -1001,3 +1001,52 @@ Unchanged:
 - ImpactSearch XLSX provenance verification path (still strict).
 - Output-manifest schema beyond the two new explicit skip-marker
   keys.
+
+## Phase 6I-76 Runtime Update: StackBuilder Combine Hot Path
+
+Phase 6I-75 measurement identified `_combine_signals` /
+`canonical_scoring.combine_consensus_signals` as the remaining
+K-search bottleneck — ~98% of per-combo time on synthetic K=4 / 30y
+data, ~5h04m extrapolated over the Phase 6I-74-sized 102,050 combos.
+
+Phase 6I-76 adds a StackBuilder-local vectorized fast combine path
+that supersedes the canonical Python normalize loop for the K-search
+hot path. The implementation lives entirely inside `stackbuilder.py`
+(`_combine_signals_fast`); `canonical_scoring.py` is unchanged.
+Semantic parity is guaranteed by focused tests in
+`test_scripts/test_stackbuilder_phase_6i76_combine_parity.py` that
+compare the fast helper against `canonical_scoring.combine_consensus_
+signals` for all per-day rules (all-None, single-Buy / single-Short,
+Buy+Short conflict resolving to None, multi-member agreement, mixed
+cross-date sequences, NaN / integer-code / whitespace / unknown-label
+normalization, K=1 passthrough, partial-overlap union, and randomized
+K=4 deterministic cases). End-to-end equivalence is also tested
+through `_combined_metrics_signals`.
+
+Synthetic K=4 / 30y measurement, same shape as Phase 6I-75:
+
+| Metric | Baseline | After fast combine |
+|---|---|---|
+| `_combined_metrics_signals` median ms/combo | 182.95 | **8.40** |
+| dominant component | `combine_signals` | `combine_signals` |
+| dominant share | ~98% | ~64% |
+| extrapolated 102,050 combos | ~5h04m | **~14.3 min** |
+| target ≤ 18 ms/combo | failed | **met** |
+| speedup | — | **21.78×** |
+
+The dominant component is still `combine_signals` (the
+captures / metrics paths were already sub-millisecond), but it no
+longer paces the run: the fast helper drops absolute per-combo cost
+well below the 18 ms target, so Phase C smoke is no longer blocked by
+phase3 throughput. Phase C smoke retry remains a separate PR.
+
+Baseline / after / summary measurement JSON were written under
+`logs/phase_6i76_stackbuilder_combine_hotpath/<SESSION_DIR>/` and are
+not staged. The same harness
+(`test_scripts/bench_phase_6i76_combine_hotpath.py`) is used for both
+runs so the JSON files compare head-to-head.
+
+Unchanged in Phase 6I-76: `canonical_scoring.py`, OnePass,
+ImpactSearch, TrafficFlow, Spymaster, Confluence, MTF, the durable-
+validation default, the Sharpe / Total Capture policy, and the
+rank_inverse-not-persisted policy.
