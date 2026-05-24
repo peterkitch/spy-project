@@ -170,20 +170,21 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State as of 2026-05-14 (post Phase 6I-33)
+### 6. Current Sprint State (post Phase 6I-79)
 
-**main / origin/main HEAD:** `6ae247b` — `Phase 6I-32: supervised fresh-source readiness + staged signal-library rebuild evidence harness (#249)`.
+**Phase 6I sprint closed.** The following PRs are merged on `main`:
 
-**Phase 6I-33 status:** PR #250 is OPEN at head `369a112` — `Phase 6I-33: SPY K-universe source-cache refresh readiness + exact supervised refresh candidate`. **Not merged.** Read-only source-refresh readiness coordinator. Verdict against the 15-ticker SPY K-universe (SPY + AROW / AWR / CLH / CP / EXPO / FCFS / GBCI / HCSG / JNJ / LLY / MO / PRA / PRGO / TEF): **`refresh_candidate_ready=false`**. Every ticker classifies as `source_behind_or_error`:
+- **Phase 6I-77** (#292): multi-secondary StackBuilder smoke evidence (corrected framing -- K=2 accepted, K=4 attempted under the missing `--allow-decreasing` configuration; the engine behaved correctly for the parameters passed).
+- **Phase 6I-78** (#293): SPY K=12 stress-smoke evidence plus runner `--k-patience` wiring (CLI flag, `_effective_config` entry, namespace pass-through, default `1` preserves prior hardcoded behavior).
+- **Phase 6I-79** (#295): production StackBuilder run for all 8 ImpactSearch secondaries under LEGACY-default traversal controls (`--exhaustive-k 4 --k-max 12 --search beam --beam-width 12 --top-n 20 --bottom-n 20 --allow-decreasing --k-patience 1`). All 8 reached K=12 cleanly. Total wall-clock ~117.6 min for 8 secondaries (mean 14.7 min/secondary).
 
-- 14 equities — yfinance `new_cache_date_range_end=2026-05-13` < resolved cutoff `2026-05-14` (one trading day behind; supervised refresh would NOT be productive yet).
-- TEF — yfinance `new_cache_date_range_end=null` (no parseable end-date returned); flagged for separate triage if it persists.
+**Production StackBuilder outputs are now on disk under canonical `output/stackbuilder/`** for AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA. `selected_build.json` was updated per secondary and points to the fresh Phase 6I-79 run directory. These outputs are runtime artifacts and are intentionally NOT staged in git.
 
-**No future supervised refresh command was prepared** because the predicate failed. Production roots remained 0/0/0 across all 5 roots (83,027 files). The Phase 6I-32 fresh-staging harness re-run inside the same evidence pass confirmed the downstream staged chain is still all-green (sandbox 75/0, promotion planner `plan_ready=true`, adapter `prepared=60` / `can_evaluate_full_60_cell_grid=true`, payload_ready, patch_ready, patch writer dry-run `planner_patch_ready=true`).
+**Phase 5C / Phase 5D / Phase 6 status:** Phase 5C validation framework remains CLOSED. Phase 5D-1 onboarding remains merged. Phase 5D-2 / 5D-3 distributed-and-cloud compute remain NOT STARTED -- they are now folded into the Phase 7+ "cloud compute architecture for ticker expansion" parking-lot item rather than tracked as imminent. Phase 6 public-facing UX / Wikipedia-of-pattern-finding work is gated on Phase 7+ research items and is not active.
 
-**Authorization wording correction (Phase 6I-33 amendment-1).** The Phase 6E-5 source refresher `signal_engine_cache_refresher.py` uses the explicit `--write` flag plus its internal optimizer / provenance write guards. It does **NOT** use the `PRJCT9_AUTOMATION_WRITE_AUTH=phase_6h5_explicit` two-key gate. The `PRJCT9_AUTOMATION_WRITE_AUTH` env-var gate applies to the LATER guarded writer surfaces — the Phase 6I-25 Confluence patch writer (`multiwindow_k_confluence_patch_writer.py`), the Phase 6I-31 signal-library promotion writer (`signal_library_stable_promotion_writer.py`), and the Phase 6H-5 daily-board automation writer (`daily_board_automation_writer.py`). Earlier sprint narrative incorrectly described the refresher as two-key-gated; that was wrong. Note that `daily_board_automation_writer` in supervised mode wraps the refresher behind its own two-key gate, but the refresher's own CLI surface is single-key.
+**Next named sprint: TrafficFlow headless development.** Before any TrafficFlow code change, the first step should be a retrospective audit of the prior headless conversions -- OnePass, ImpactSearch, and StackBuilder -- capturing lessons learned about LEGACY behavior, UI/CLI default drift (the class of bug surfaced by Phase 6I-77/6I-78), runner surfaces, artifact safety, and performance regressions caught late. The defaults-diff audit item in the sprint carry-forward tracking doc covers part of this scope.
 
-**No production write is currently authorized.** The next operational event is a clock-time wait until yfinance publishes the 2026-05-14 trading-day data. Once that lands, an operator may re-run the Phase 6I-33 readiness module; if it then reports `refresh_candidate_ready=true`, a supervised refresh of the 15-ticker K-universe can be requested in a SEPARATE prompt.
+**Authoritative source-of-truth.** For up-to-the-minute state, run `git log -10 --oneline main` and `git log --oneline main --grep="Phase 6I-7"`. The cross-session work tracking is in the dedicated tracking docs referenced in the "Tracking Documents" section below.
 
 ---
 
@@ -218,23 +219,9 @@ Stay aligned with the existing script family — **OnePass** / **ImpactSearch** 
 
 ---
 
-#### Recent merged phase trail (Phase 6I-20 → Phase 6I-32)
+#### Recent merged phase trail (post Phase 6I-79)
 
-| Phase | PR | Hash | Subject |
-|---|---|---|---|
-| 6I-32 | #249 | `6ae247b` | Supervised fresh-source readiness + staged rebuild evidence harness (incl. amendment-1 robust staged-dir safety boundary) |
-| 6I-31 | #248 | `c73e20e` | Guarded signal-library stable promotion path + SPY staged rebuild evidence (incl. transactional rollback amendment) |
-| 6I-30 | #247 | `9421bfe` | Interval-native close in signal-library builder + sandbox 60-cell SPY proof |
-| 6I-29 | #246 | `1e07fae` | Daily member exact-date alignment — 12/12 daily cells prepare |
-| 6I-28 | #245 | `7407415` | Adapter close-source join + SPY patch-readiness dry-run |
-| 6I-27 | #244 | `1cee319` | SPY adapter diagnostic — `missing_target_close` directly proven |
-| 6I-26 | #243 | `e0c42e9` | Supervised SPY Confluence patch writer DRY-RUN evidence |
-| 6I-25 | #242 | `10b535b` | Guarded Confluence artifact patch writer (`_writer_plan_payload_is_consistent` lives here) |
-| 6I-24 | #241 | `e62cb5a` | Read-only Confluence artifact patch planner |
-| 6I-23 | #240 | `948c961` | In-memory multi-window K engine payload builder |
-| 6I-22 | #239 | `66599c7` | Read-only adapter from StackBuilder + OnePass libraries into engine inputs |
-| 6I-21 | #238 | `3bce8aa` | Multi-window K engine core |
-| 6I-20 | #237 | `38a1bcb` | Gap audit |
+For the recent phase trail, run `git log --oneline main --grep="Phase 6I"`. Phase 6I-77 through Phase 6I-79 are described in the current-sprint-state block above; earlier Phase 6I phases are preserved in the historical sub-sections (sub-section 6.0, sub-section 6.1, and the 2026-05-10 / 2026-05-08 blocks) further down.
 
 ---
 
@@ -507,26 +494,46 @@ this section may lag reality if PRs land without an update.
 
 ### 7. Deferred work items
 
-These items have been intentionally deferred. When working
-on the named gate phase, surface them so they can be
-scheduled or explicitly re-deferred.
+Sprint-relevant carry-forward items (CLAUDE.md sprint-state
+drift, TrafficFlow refresh callback scope, defaults-diff
+audit, monthly StackBuilder rebuild cadence) and Phase 7+
+research items (B11 `compute_signals` cleanup,
+`environment.yml` / `requirements.txt` hygiene, OnePass error
+UX, ImpactSearch error taxonomy, StackBuilder progress JSON,
+TickerDash global single-job model, pre-computed closing-price
+threshold caching, daily TrafficFlow / MTF / Confluence
+scheduling, real-time data feed selection, cloud compute
+architecture for ticker expansion, Spymaster build history UI,
+universe-wide beam K-search research) are tracked in the
+durable cross-session tracking docs referenced in sub-section 8 below.
 
-  - **B11 `compute_signals` delete-or-shift-correct
-    (deferred through Phase 3 / Phase 4; classified for
-    Phase 5B in
-    `2026-05-05_PHASE_5A_CLEANUP_LEDGER.md` Item 6):** the
-    function in spymaster has a dead-code static guard
-    (`test_b11_spymaster_compute_signals_uncalled` in
-    `project/test_scripts/test_lookahead_guards.py`) but
-    the function body has a shift-correctness question.
-    Either delete the function or fix the shift and change
-    the guard from "uncalled" to "shift-correct." Phase 5B
-    preflight picks one before code change begins.
+The following entry is preserved here as a residual
+code-reference note that is not currently captured in either
+tracking doc:
+
   - **QC clone Adj Close sites:** at
     `project/QC/Clone of Project 9/main.py:103, 918, 1509`.
     QC clone is a frozen historical snapshot, intentionally
     excluded from the Entry 1 (Adj Close removal) sweep.
     Revisit only on explicit scope expansion.
+
+### 8. Tracking Documents
+
+Sprint-relevant carry-forward items are tracked in:
+
+    md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md
+
+Phase 7+ research and parking-lot items are tracked in:
+
+    md_library/shared/2026-05-23_PHASE_7_PLUS_UNIVERSE_WIDE_BEAM_SCOPING.md
+
+These docs are the durable source-of-truth for work that spans
+sessions. New items discovered between sessions should be
+appended to the appropriate tracking doc rather than left in
+conversation memory. Each tracking-doc entry carries Status
+(OPEN / IN PROGRESS / RESOLVED) and is updated in place when
+work begins or completes; resolved entries remain in the doc
+as historical record.
 
 ## AUTOMATIC BEHAVIORS - DO NOT DEVIATE
 
