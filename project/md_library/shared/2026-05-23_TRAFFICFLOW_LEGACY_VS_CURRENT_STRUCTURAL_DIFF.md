@@ -26,6 +26,7 @@ Coverage:
 - Full top-level AST inventory compared (82 LEGACY defs vs 83 current defs).
 - Full callback inventory compared (2 LEGACY vs 2 current).
 - Default-value surfaces reviewed (46 LEGACY module-level assigns vs 53 current; 3 removed, 10 new, 1 changed).
+- **Dash component-default sweep over `make_app` completed via AST walk** of every `html.* / dcc.* / dbc.* / dash_table.* / Dash(...)` constructor call inside the `make_app` body: 12 constructors in LEGACY, 12 in current, all matched by `(ctor, id)` or positional-within-ctor; every keyword argument byte-identical across versions (see section 9.4).
 - Imports compared (28 LEGACY vs 31 current; 3 new, 0 removed).
 - Data-flow surfaces reviewed (StackBuilder consumption keywords, price_cache references, refresh-callback issue-code references, canonical-scoring delegation, provenance-manifest verification, TF_MATRIX removal).
 - `trafficflow.py` was not imported or executed.
@@ -102,22 +103,22 @@ Net delta: **+1** (3 new minus 2 removed).
 
 ### 7.3 MODIFIED (common name, body change; signatures unchanged for all 14)
 
-| Function | LEGACY lines | CURRENT lines | Delta | Likely cause (mapped to commit trail) |
-|---|---:|---:|---:|---|
-| `_combine_signals` | 39 | 15 | -24 | Body collapsed onto delegation to `canonical_scoring.combine_consensus_signals` (Phase 1B-2A / 1B-2B). |
-| `load_spymaster_pkl` | 18 | 31 | +13 | Added `load_verified_pickle_artifact` verification (Phase 3B-2A). |
-| `_load_secondary_prices` | 38 | 38 | 0 | Body churn without size change (Phase 1B-2B). |
-| `_metrics_like_spymaster` | 91 | 78 | -13 | Reduction; consistent with shared scoring delegation. |
-| `_session_sanity` | 70 | 70 | 0 | Body churn without size change. |
-| `_signal_snapshot_for_members` | 87 | 87 | 0 | Body churn without size change. |
-| `_stream_primary_positions_and_captures` | 81 | 81 | 0 | Body churn without size change. |
-| `_subset_metrics_spymaster` | 202 | 192 | -10 | Reduction along with the matrix-path cleanup and canonical delegation. |
-| `_subset_metrics_spymaster_bitmask` | 144 | 132 | -12 | Same. |
-| `_subset_metrics_spymaster_fast` | 126 | 116 | -10 | Same. |
-| `compute_build_metrics_spymaster_parity` | 195 | 181 | -14 | Same. |
-| `main` | 28 | 28 | 0 | Minor changes. |
-| `make_app` | 258 | 306 | +48 | Largest UI growth; consistent with Phase 5B Item 8 callback-issue plumbing surfacing through `make_app`. |
-| `refresh_secondary_caches` | 64 | 119 | +55 | Largest function-body growth in the diff; matches Phase 5B Item 8 surfacing of refresh-callback errors and the new structured reason codes. |
+| Function | LEGACY lines | CURRENT lines | Delta | Signature | Structural summary (inferred surfaces) |
+|---|---:|---:|---:|---|---|
+| `_combine_signals` | 39 | 15 | -24 | unchanged | Body collapsed onto delegation to `canonical_scoring.combine_consensus_signals` (Phase 1B-2A / 1B-2B). Affects: outputs (numerical results now come from the canonical helper); internal cleanup. |
+| `load_spymaster_pkl` | 18 | 31 | +13 | unchanged | Added `load_verified_pickle_artifact` verification (Phase 3B-2A). Affects: manifest/provenance behavior (PKL reads now gated on the strict-manifest contract); error handling (verification-failure paths added). |
+| `_load_secondary_prices` | 38 | 38 | 0 | unchanged | Single-line replacement of `sec = (secondary or "").upper()` with `sec = _price_cache_key(secondary)`. Affects: cache behavior (cache-key derivation centralized through the new `_price_cache_key` helper); internal cleanup. |
+| `_metrics_like_spymaster` | 91 | 78 | -13 | unchanged | Reduction; consistent with shared scoring delegation. Affects: outputs (metric values now flow through the canonical scoring delegate); internal cleanup. |
+| `_session_sanity` | 70 | 70 | 0 | unchanged | Single-line replacement of `_PRICE_CACHE.get(secondary)` with `_PRICE_CACHE.get(_price_cache_key(secondary))`. Affects: cache behavior (lookup key normalized through the new helper); internal cleanup. |
+| `_signal_snapshot_for_members` | 87 | 87 | 0 | unchanged | Two-line replacement: both the `_PRICE_CACHE.get(...)` lookup and the subsequent `_PRICE_CACHE[...] = sec_df` write now key on `_price_cache_key(secondary)`. Affects: cache behavior (read and write keys consistently normalized); internal cleanup. |
+| `_stream_primary_positions_and_captures` | 81 | 81 | 0 | unchanged | Two-line replacement of magic-number fallback tuples `((1, 2), 0.0)` with `(_BUY_SENTINEL, 0.0)` and `(_SHORT_SENTINEL, 0.0)` (the new module-level SMA sentinel constants pointing at `(MAX_SMA_DAY, MAX_SMA_DAY-1)` and `(MAX_SMA_DAY-1, MAX_SMA_DAY)` respectively). Affects: outputs (the SMA pair used when yesterday's top-pair lookup misses now follows the canonical Spymaster sentinel convention rather than literal `(1,2)`). Static diff shows the literal-to-named-constant swap; downstream pair-impact behavior under a miss may differ, but the behavioral impact is not fully inferable without execution. |
+| `_subset_metrics_spymaster` | 202 | 192 | -10 | unchanged | Reduction along with the matrix-path cleanup and canonical delegation. Affects: outputs (canonical scoring delegate); internal cleanup. |
+| `_subset_metrics_spymaster_bitmask` | 144 | 132 | -12 | unchanged | Same shape as `_subset_metrics_spymaster`. Affects: outputs (canonical scoring delegate); internal cleanup. |
+| `_subset_metrics_spymaster_fast` | 126 | 116 | -10 | unchanged | Same shape as `_subset_metrics_spymaster`. Affects: outputs (canonical scoring delegate); internal cleanup. |
+| `compute_build_metrics_spymaster_parity` | 195 | 181 | -14 | unchanged | Same shape as `_subset_metrics_spymaster`. Affects: outputs (canonical scoring delegate); internal cleanup. |
+| `main` | 28 | 28 | 0 | unchanged | Single `print()` change to the v1.9 startup banner: the `Matrix=REMOVED` suffix is removed (the matrix path is gone, so advertising its removal is no longer informative). Affects: UI behavior only (operator-visible startup banner cosmetic). |
+| `make_app` | 258 | 306 | +48 | unchanged | Largest UI growth; consistent with Phase 5B Item 8 callback-issue plumbing surfacing through `make_app`. **Component-default sweep** (section 9.4) shows zero Dash component default changes at the constructor surface, so the +48 lines live inside the nested callback bodies (`_refresh` and `update_tooltips` are nested defs inside `make_app`) and the layout-wiring imperative code, not in Dash component defaults. Affects: UI behavior (refresh-callback issue surfacing visible to the operator); error handling. |
+| `refresh_secondary_caches` | 64 | 119 | +55 | unchanged | Largest function-body growth in the diff; matches Phase 5B Item 8 surfacing of refresh-callback errors and the new structured reason codes. Affects: error handling (failures now classify into the 5 enumerated `REFRESH_*` / `PRICE_LOAD_FAILED` reason codes); UI behavior (those reason codes become visible to the operator through the `_refresh` callback). |
 
 UNCHANGED top-level definitions: **66** (out of 80 names common to both versions). No signature changed in any of the 14 modified functions.
 
@@ -171,7 +172,32 @@ This is the largest single behavior-affecting default change: a hardcoded local 
 
 ### 9.4 Dash UI component defaults
 
-The callback signatures (Output/Input/State counts and `prevent_initial_call`) are unchanged (section 8). Component-level UI defaults (`value=`, `checked=`, `min=`, `max=`, `step=`, `options=`, `multi=`) live inside the `make_app` body, which grew by +48 lines. A finer-grained sweep of those UI defaults was not performed line-by-line because they cannot be confidently extracted from text without AST-traversal into the function body. **Open question for headless scoping** (section 14): perform an AST-traversal sweep of `make_app` to enumerate every Dash component default at the LEGACY vs current call sites before the headless conversion begins.
+The callback signatures (Output/Input/State counts and `prevent_initial_call`) are unchanged (section 8). Component-level UI defaults (`value=`, `checked=`, `min=`, `max=`, `step=`, `options=`, `multi=`) live inside the `make_app` body, which grew by +48 lines.
+
+**Sweep method.** An AST walk was performed over the `make_app` body at both LEGACY (`5361445e1c16ddf26cbe7a381716919d0b9778a0`) and current `main` (`2cb3e538643b33710c40304254e0a7872ba502a4`). Every `ast.Call` whose callee resolves to `html.*`, `dcc.*`, `dbc.*`, `dash_table.*`, or bare `Dash(...)` was extracted. For each constructor, the `id=` keyword (when present) was used as the match key; for the rare unkeyed constructor, positional pairing within the same Python type was used. For every matched pair, every keyword argument was compared as `ast.unparse` byte-equality across versions.
+
+**Sweep result.**
+
+| Surface | LEGACY count | CURRENT count | Delta |
+|---|---:|---:|---:|
+| Dash component constructors inside `make_app` | 12 | 12 | 0 |
+| `Dash(...)` | 1 | 1 | 0 |
+| `dash_table.DataTable(...)` | 1 | 1 | 0 |
+| `dcc.Input(...)` | 1 | 1 | 0 |
+| `html.Button(...)` | 1 | 1 | 0 |
+| `html.Div(...)` | 5 | 5 | 0 |
+| `html.H3(...)` | 1 | 1 | 0 |
+| `html.Label(...)` | 1 | 1 | 0 |
+| `html.Span(...)` | 1 | 1 | 0 |
+| `id=`-keyed constructors matched | 6 | 6 | 0 |
+| Constructors NEW in CURRENT vs LEGACY | -- | 0 | -- |
+| Constructors REMOVED in LEGACY vs CURRENT | -- | 0 | -- |
+| Constructors with CHANGED kwargs | -- | 0 | -- |
+| Constructors UNCHANGED | -- | 12 | -- |
+
+The six `id=`-keyed constructors matched 1:1 across versions: `board` (`dash_table.DataTable`), `k` (`dcc.Input`), `refresh` (`html.Button`), `missing-pkls` (`html.Div`), `status` (`html.Div`), `last-update` (`html.Span`). All keyword arguments inside each of those constructors (`columns`, `data`, `page_size`, `sort_action`, `sort_by`, `style_cell`, `style_data_conditional`, `style_header`, `style_table`, `tooltip_data`, `value`, `min`, `step`, `type`, `style`, `n_clicks`, etc.) are byte-identical across LEGACY and current. The six unkeyed constructors (1 `Dash`, 3 `html.Div`, 1 `html.H3`, 1 `html.Label`) match by ctor + position within the same constructor type, and their per-call kwargs are also byte-identical across versions.
+
+**Implication.** The +48-line growth in `make_app` is NOT at the Dash-component-default surface. It lives inside the nested callback bodies (`_refresh` and `update_tooltips` are nested defs declared inside `make_app`) and the imperative layout-wiring code that constructs the page tree. **No Dash component default in `make_app` resembles the Phase 6I-77 / 6I-78 class of UI/CLI default-drift bug**: every constructor default in the LEGACY UI is preserved verbatim in the current UI. (The headless-scoping default-drift audit still matters once a runner CLI is added; this finding only certifies the Dash-side defaults are stable across LEGACY and current.)
 
 ### 9.5 argparse defaults
 
@@ -270,7 +296,7 @@ The largest performance-relevant function-body change is `refresh_secondary_cach
 
 ## 14. Open Questions for TrafficFlow Headless Scoping
 
-1. **Make_app default sweep.** Section 9.4 flagged that Dash UI component defaults (`value=`, `checked=`, `min=`, `max=`, `step=`, `options=`, `multi=`) inside `make_app` were not enumerated. Headless TrafficFlow scoping should perform an AST-traversal sweep of `make_app` at the current commit to capture every UI default; that list becomes the canonical reference the runner CLI must align to (defaults-diff audit prevention).
+1. **Make_app default sweep (LEGACY-vs-current portion CLOSED; runner-CLI portion remains open).** The LEGACY-vs-current Dash component-default sweep over `make_app` has been completed in section 9.4: 12 constructors in each version, all matched, every kwarg byte-identical. **No Dash component default has drifted between LEGACY and current.** The remaining open question is for the future headless TrafficFlow runner CLI: when that runner is built, its argparse defaults must be enumerated and compared against the (still-stable) `make_app` component-default set in section 9.4, exactly the Phase 6I-77 / 6I-78 defaults-diff audit pattern. The reference list of current `make_app` Dash component defaults lives in this diff doc and the source itself; no separate inventory pass is needed before the runner-CLI build begins.
 
 2. **StackBuilder artifact contract.** TrafficFlow currently consumes only `combo_leaderboard` XLSX files (section 11.1). Post-Phase-6I-79 StackBuilder writes a richer artifact surface: `selected_build.json` (per-secondary parent), `cohort.xlsx`, `rank_all.xlsx`, `rank_direct.xlsx`, per-K `combo_k=N.json`, `combo_leaderboard.xlsx`, `run_manifest.json`, `summary.json`. Should headless TrafficFlow consume `selected_build.json` instead of (or in addition to) `combo_leaderboard.xlsx`? `selected_build.json` carries `selected_run_dir`, `selected_k`, `total_capture`, `sharpe_ratio`, `selection_policy` and points to a fresh run directory with all the K artifacts. This is a contract decision.
 
@@ -288,7 +314,7 @@ The largest performance-relevant function-body change is `refresh_secondary_cach
 
 ## 15. Recommended Next Steps
 
-1. Capture the make_app Dash component defaults sweep as a separate read-only Codex inspection task before the TrafficFlow headless conversion begins.
+1. ~~Capture the make_app Dash component defaults sweep as a separate read-only Codex inspection task before the TrafficFlow headless conversion begins.~~ **Done** as part of this amendment (section 9.4). The LEGACY-vs-current portion is closed; the runner-CLI defaults-diff comparison will become actionable once a `trafficflow_workbook_runner.py` exists and exposes argparse defaults to compare against.
 2. Decide the StackBuilder-artifact consumption contract for headless TrafficFlow (`combo_leaderboard.xlsx` vs `selected_build.json` vs both).
 3. Design the headless TrafficFlow runner CLI surface with `--spymaster-pkl-dir`, `--strict-manifests`, refresh-control flags, and a structured logging gate.
 4. Extend `stackbuilder_workbook_runner.PROCESS_CONFLICT_PATTERNS` (and equivalent in the new runner) to include `trafficflow_workbook_runner.py` once it exists.
