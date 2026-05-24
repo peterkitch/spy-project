@@ -1720,3 +1720,306 @@ def test_phase_c_manifest_uses_actual_selected_build_path_not_default_root(
     raw_manifest = (out_dir / "run_manifest.json").read_text(
         encoding="utf-8")
     assert str(tmp_path) not in raw_manifest
+
+
+# ===========================================================================
+# Engine network/price-cache surface block (PR #307 follow-up amendment)
+#
+# These tests inject a fake ``trafficflow`` module into ``sys.modules`` so
+# the lazy ``_default_compute_loader`` resolves to the fake. The fake
+# captures call counts on the engine-internal network / price-cache
+# functions the runner is supposed to pin when ``--allow-network-fetch``
+# is not passed. No real trafficflow import.
+# ===========================================================================
+
+
+def _make_engine_surface_fake(tmp_path, *, decoy_path=None):
+    """Build a SimpleNamespace masquerading as the trafficflow module
+    with original implementations for the network / price-cache
+    surface and ``build_board_rows`` that exercises them through the
+    module's current attributes (so wrapper-applied pins are observed).
+    """
+    import pandas as pd
+    state = {
+        "needs_refresh_calls": 0,
+        "fetch_calls": 0,
+        "write_cache_calls": 0,
+        "persist_cache_calls": 0,
+        "finder_calls": [],
+        "compute_calls": [],
+        "compute_saw": {},
+    }
+    fake_cache_target = tmp_path / "fake_price_cache" / "FAKE.csv"
+    state["fake_cache_target"] = str(fake_cache_target)
+
+    def _orig_needs_refresh(sym, df, cache_path):
+        state["needs_refresh_calls"] += 1
+        return True  # original would say "yes, refresh"
+
+    def _orig_fetch_secondary_from_yf(secondary):
+        state["fetch_calls"] += 1
+        # Would fetch real data; for the test we return a deterministic
+        # non-empty DataFrame so the caller proceeds to write if not
+        # blocked.
+        return pd.DataFrame({"Close": [1.0, 2.0, 3.0]})
+
+    def _orig_write_cache_file(path, df):
+        state["write_cache_calls"] += 1
+        # If reached, actually write to the tracked tmp_path target
+        # so the test can prove the write did NOT happen when blocked.
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("WROTE", encoding="utf-8")
+
+    def _orig_persist_cache(path, df):
+        state["persist_cache_calls"] += 1
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("PERSISTED", encoding="utf-8")
+
+    fake = SimpleNamespace()
+    fake._needs_refresh = _orig_needs_refresh
+    fake._fetch_secondary_from_yf = _orig_fetch_secondary_from_yf
+    fake._write_cache_file = _orig_write_cache_file
+    fake._persist_cache = _orig_persist_cache
+
+    decoy = decoy_path or (tmp_path / "decoy_combo_leaderboard.xlsx")
+    if decoy_path is None:
+        decoy.parent.mkdir(parents=True, exist_ok=True)
+        decoy.write_text("decoy", encoding="utf-8")
+
+    def _orig_find_latest_combo_table(sec):
+        state["finder_calls"].append(("ORIGINAL", sec))
+        return Path(decoy)
+    fake._find_latest_combo_table = _orig_find_latest_combo_table
+
+    def _build_board_rows(sec, k, *, run_fence=None, missing_map=None):
+        # Snapshot the engine-internal surface as the runner wrapper
+        # has it at the moment build_board_rows is invoked.
+        state["compute_calls"].append((sec, k))
+        nr_seen = fake._needs_refresh(sec, None, Path(fake_cache_target))
+        state["compute_saw"]["needs_refresh_result"] = nr_seen
+        if nr_seen:
+            fetched = fake._fetch_secondary_from_yf(sec)
+            state["compute_saw"]["fetched_empty"] = bool(fetched.empty)
+            if not fetched.empty:
+                # If reached while pinned this raises
+                # ``engine_price_cache_write_blocked``; the engine
+                # would normally try/except around the write but our
+                # fake propagates so the test can observe.
+                fake._write_cache_file(Path(fake_cache_target), fetched)
+        try:
+            path_via_finder = fake._find_latest_combo_table(sec)
+            state["compute_saw"]["finder_returned"] = str(path_via_finder)
+        except Exception as exc:
+            state["compute_saw"]["finder_error"] = repr(exc)[:200]
+        return [{"K": k, "Members": "FAKE"}]
+    fake.build_board_rows = _build_board_rows
+
+    return fake, state
+
+
+def test_engine_network_surface_blocked_when_flag_not_passed(
+        tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+    fake, state = _make_engine_surface_fake(tmp_path)
+
+    # Save originals so we can assert restoration after main returns.
+    orig_finder = fake._find_latest_combo_table
+    orig_needs_refresh = fake._needs_refresh
+    orig_fetch = fake._fetch_secondary_from_yf
+    orig_write_cache = fake._write_cache_file
+    orig_persist = fake._persist_cache
+
+    sys.modules["trafficflow"] = fake
+    try:
+        argv = ["--secondaries", "SPY",
+                "--stackbuilder-root", str(sb_root),
+                "--k", "1",
+                "--write",
+                "--output-dir", str(out_dir)]
+        # NO compute_callable -> uses _default_compute_loader.
+        # NO --allow-network-fetch -> network/cache surfaces must
+        # be pinned.
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict)
+    finally:
+        del sys.modules["trafficflow"]
+
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "ok"
+
+    # Compute fired once for the eligible cell.
+    assert state["compute_calls"] == [("SPY", 1)]
+    # The ORIGINAL network/cache helpers must never have been called.
+    assert state["needs_refresh_calls"] == 0
+    assert state["fetch_calls"] == 0
+    assert state["write_cache_calls"] == 0
+    assert state["persist_cache_calls"] == 0
+    # During compute the pinned _needs_refresh returned False.
+    assert state["compute_saw"]["needs_refresh_result"] is False
+    # The tracked would-be cache file must not exist.
+    assert not Path(state["fake_cache_target"]).exists()
+    # All patched attributes restored.
+    assert fake._find_latest_combo_table is orig_finder
+    assert fake._needs_refresh is orig_needs_refresh
+    assert fake._fetch_secondary_from_yf is orig_fetch
+    assert fake._write_cache_file is orig_write_cache
+    assert fake._persist_cache is orig_persist
+
+
+def test_engine_network_surface_not_pinned_when_flag_passed(
+        tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+    fake, state = _make_engine_surface_fake(tmp_path)
+
+    orig_finder = fake._find_latest_combo_table
+    orig_needs_refresh = fake._needs_refresh
+    orig_fetch = fake._fetch_secondary_from_yf
+    orig_write_cache = fake._write_cache_file
+    orig_persist = fake._persist_cache
+
+    sys.modules["trafficflow"] = fake
+    try:
+        argv = ["--secondaries", "SPY",
+                "--stackbuilder-root", str(sb_root),
+                "--k", "1",
+                "--write",
+                "--output-dir", str(out_dir),
+                "--allow-network-fetch"]
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict)
+    finally:
+        del sys.modules["trafficflow"]
+
+    assert rc == runner.EXIT_OK
+    # Compute ran and observed the ORIGINAL (un-pinned) network surface.
+    assert state["needs_refresh_calls"] >= 1
+    assert state["fetch_calls"] >= 1
+    assert state["write_cache_calls"] >= 1
+    # The fake write target now exists under tmp_path only.
+    assert Path(state["fake_cache_target"]).exists()
+    assert str(tmp_path) in state["fake_cache_target"]
+    # All originals restored after wrapper exit (no leaked patches).
+    assert fake._find_latest_combo_table is orig_finder
+    assert fake._needs_refresh is orig_needs_refresh
+    assert fake._fetch_secondary_from_yf is orig_fetch
+    assert fake._write_cache_file is orig_write_cache
+    assert fake._persist_cache is orig_persist
+
+
+def test_engine_network_surface_restored_on_exception(tmp_path, monkeypatch):
+    """When build_board_rows raises, every patched attribute must be
+    restored to its original reference."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+    fake, state = _make_engine_surface_fake(tmp_path)
+
+    orig_finder = fake._find_latest_combo_table
+    orig_needs_refresh = fake._needs_refresh
+    orig_fetch = fake._fetch_secondary_from_yf
+    orig_write_cache = fake._write_cache_file
+    orig_persist = fake._persist_cache
+
+    def _raising_build_board_rows(sec, k, *, run_fence=None, missing_map=None):
+        # Confirm pin is active at the moment of raise.
+        state["compute_saw"]["needs_refresh_result"] = fake._needs_refresh(
+            sec, None, None)
+        raise RuntimeError("synthetic engine failure")
+    fake.build_board_rows = _raising_build_board_rows
+
+    sys.modules["trafficflow"] = fake
+    try:
+        argv = ["--secondaries", "SPY",
+                "--stackbuilder-root", str(sb_root),
+                "--k", "1",
+                "--write",
+                "--output-dir", str(out_dir)]
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict)
+    finally:
+        del sys.modules["trafficflow"]
+
+    # Runner's per-cell exception handling: cell records as error;
+    # status is "failed" since no cell wrote.
+    assert payload["status"] == "failed"
+    cells = payload.get("per_cell_summary") or []
+    assert any(c["status"] == "error"
+               and c.get("error_class") == "RuntimeError"
+               for c in cells)
+    assert state["compute_saw"].get("needs_refresh_result") is False
+    # All patched attributes restored.
+    assert fake._find_latest_combo_table is orig_finder
+    assert fake._needs_refresh is orig_needs_refresh
+    assert fake._fetch_secondary_from_yf is orig_fetch
+    assert fake._write_cache_file is orig_write_cache
+    assert fake._persist_cache is orig_persist
+
+
+def test_engine_network_surface_restored_on_keyboard_interrupt(
+        tmp_path, monkeypatch):
+    """The compute wrapper restores patched attributes even on
+    BaseException (including KeyboardInterrupt). Tested directly
+    against the wrapper rather than via ``main`` to avoid race-y
+    test aborts."""
+    fake, state = _make_engine_surface_fake(tmp_path)
+
+    orig_finder = fake._find_latest_combo_table
+    orig_needs_refresh = fake._needs_refresh
+    orig_fetch = fake._fetch_secondary_from_yf
+    orig_write_cache = fake._write_cache_file
+    orig_persist = fake._persist_cache
+
+    def _interrupting_build_board_rows(sec, k, *, run_fence=None,
+                                        missing_map=None):
+        state["compute_saw"]["needs_refresh_result"] = fake._needs_refresh(
+            sec, None, None)
+        raise KeyboardInterrupt("synthetic ^C")
+    fake.build_board_rows = _interrupting_build_board_rows
+
+    sys.modules["trafficflow"] = fake
+    try:
+        compute = runner._default_compute_loader(allow_network_fetch=False)
+        with pytest.raises(KeyboardInterrupt):
+            compute("SPY", 1, run_fence={"global": None, "by_sec": {}},
+                    missing_map=None,
+                    combo_leaderboard_path=str(tmp_path / "fake.xlsx"))
+    finally:
+        del sys.modules["trafficflow"]
+
+    assert state["compute_saw"].get("needs_refresh_result") is False
+    # All patched attributes restored even on BaseException.
+    assert fake._find_latest_combo_table is orig_finder
+    assert fake._needs_refresh is orig_needs_refresh
+    assert fake._fetch_secondary_from_yf is orig_fetch
+    assert fake._write_cache_file is orig_write_cache
+    assert fake._persist_cache is orig_persist
+
+
+def test_engine_network_surface_block_preserves_selected_build_pin(
+        tmp_path, monkeypatch):
+    """Selected-build pinning must still operate alongside the
+    network/cache block."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+    fake, state = _make_engine_surface_fake(tmp_path)
+
+    sys.modules["trafficflow"] = fake
+    try:
+        argv = ["--secondaries", "SPY",
+                "--stackbuilder-root", str(sb_root),
+                "--k", "1",
+                "--write",
+                "--output-dir", str(out_dir)]
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict)
+    finally:
+        del sys.modules["trafficflow"]
+
+    assert rc == runner.EXIT_OK
+    finder_returned = state["compute_saw"].get("finder_returned")
+    assert finder_returned is not None
+    assert "combo_leaderboard" in finder_returned
+    assert "decoy" not in finder_returned
+    assert state["needs_refresh_calls"] == 0
+    assert state["fetch_calls"] == 0
+    assert state["write_cache_calls"] == 0
+    assert state["persist_cache_calls"] == 0
