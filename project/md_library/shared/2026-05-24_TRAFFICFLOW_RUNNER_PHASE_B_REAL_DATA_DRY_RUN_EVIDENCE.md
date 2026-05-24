@@ -23,7 +23,10 @@ Scope:
 
 Non-goals:
 
-- This is NOT Phase C (operator-authorized canonical write).
+- This is NOT Phase C. Per the Phase A scoping doc, Phase C is the
+  supervised smoke that writes to an isolated noncanonical
+  `--output-dir`; operator-authorized canonical writes remain a
+  later phase, not Phase C.
 - This is NOT runner implementation.
 - This is NOT TrafficFlow compute execution.
 - No `--write`, no `--refresh-missing-pkls`, no `--refresh-stale-prices`,
@@ -351,15 +354,15 @@ What Phase C should focus on first:
    (a) Authorize a bounded
    `signal_engine_cache_refresher.py --max-sma-day 114` pass over
    the 48 STALE members BEFORE the supervised smoke. This restores
-   the PR #301-style "all ELIGIBLE" surface and keeps the smoke
-   focused purely on the compute path. (b) Run the supervised
-   smoke on the 2 currently-ELIGIBLE cells (GOOGL K=1 and META
-   K=1) under an isolated `--output-dir`. This validates the
-   runner end-to-end without paying the refresh cost yet, but at
-   the cost of very thin coverage. Option (a) is the closer match
-   to the Phase A plan's "supervised smoke on 1-2 secondaries
-   using isolated output dir" because it gives the runner real
-   compute work to do across multiple K levels.
+   the PR #301-style "all ELIGIBLE" surface and gives Phase C real
+   multi-K compute work across multiple secondaries. (b) Run the
+   supervised smoke on the 2 currently-ELIGIBLE cells (GOOGL K=1
+   and META K=1) under an isolated `--output-dir`. This validates
+   the runner end-to-end without paying the refresh cost yet, but
+   at the cost of very thin coverage. **Option (a) is the stronger
+   path before a meaningful isolated-output smoke** because it
+   matches the Phase A plan's "supervised smoke on 1-2 secondaries
+   using isolated output dir" with non-trivial K coverage.
 
 2. **Treat the freshness-gate behavior as a feature, not a bug.**
    Update the Phase A operator-locked v1 defaults note to make
@@ -367,11 +370,17 @@ What Phase C should focus on first:
    freshness gate; this avoids surprise when the supervised smoke
    surfaces STALE PKLs not flagged by PR #301's earlier rule.
 
-3. **Stay strictly within the Phase B/C contract during Phase C:**
-   no canonical writes under `output/trafficflow/`, no
-   `--write`, no network fetches absent explicit
-   `--allow-network-fetch`, no compute path beyond the supervised
-   smoke target cells.
+3. **Stay strictly within the Phase C contract.** Per the Phase A
+   plan, Phase C is the supervised isolated-output smoke. It may
+   pass `--write` ONLY after the Phase C runner implementation
+   explicitly supports isolated-output writes, and ONLY when
+   `--output-dir` points to an isolated noncanonical directory.
+   Phase C must NOT write canonical `output/trafficflow/`
+   artifacts (that is reserved for a later operator-authorized
+   phase). Phase C must NOT issue network fetches unless
+   `--allow-network-fetch` is explicitly authorized. Phase C
+   compute work must be limited to the supervised smoke target
+   cells/secondaries.
 
 ## Notes on this evidence task
 
