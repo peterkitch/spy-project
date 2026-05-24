@@ -1614,3 +1614,109 @@ def test_phase_c_on_disk_artifact_lists_are_complete(tmp_path, monkeypatch):
         if out_dir.exists():
             import shutil as _sh
             _sh.rmtree(out_dir, ignore_errors=True)
+
+
+def test_phase_c_manifest_uses_actual_selected_build_path_not_default_root(
+        tmp_path, monkeypatch):
+    """Provenance fix: ``run_manifest.json`` must cite the actual
+    ``selected_build.json`` that preflight consumed (under the
+    operator-supplied ``--stackbuilder-root``), not a recomputed path
+    rooted at ``DEFAULT_STACKBUILDER_ROOT``.
+
+    Layout:
+      * ``custom_stackbuilder/SPY/selected_build.json`` (the one the
+        runner is told to use via ``--stackbuilder-root``).
+      * ``output/stackbuilder/SPY/selected_build.json`` (DECOY at the
+        default root with different contents/SHA). If the bug were
+        present, the manifest would cite this decoy's SHA.
+
+    The test runs under ``monkeypatch.chdir(tmp_path)`` so the
+    sanitizer can map both paths to readable repo-relative POSIX
+    strings.
+    """
+    import hashlib
+
+    monkeypatch.chdir(tmp_path)
+
+    # Custom (real) StackBuilder root the operator points at.
+    custom_root = tmp_path / "custom_stackbuilder"
+    custom_chosen = custom_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(custom_chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(custom_root, "SPY", selected_run_dir=custom_chosen,
+                          payload_extras={"selected_run_id": "CUSTOM-1"})
+    custom_sb = custom_root / "SPY" / "selected_build.json"
+
+    # Decoy default root with DIFFERENT contents so the SHA differs.
+    decoy_root = tmp_path / "output" / "stackbuilder"
+    decoy_chosen = decoy_root / "SPY" / "RUN_DECOY"
+    _make_fake_leaderboard(decoy_chosen, k_to_members={1: ["DECOY[D]"]})
+    _write_selected_build(decoy_root, "SPY", selected_run_dir=decoy_chosen,
+                          payload_extras={"selected_run_id": "DECOY-1"})
+    decoy_sb = decoy_root / "SPY" / "selected_build.json"
+
+    def _sha(p):
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    custom_sha = _sha(custom_sb)
+    decoy_sha = _sha(decoy_sb)
+    assert custom_sha != decoy_sha, (
+        "Test fixture must produce distinct SHAs for the custom "
+        "vs decoy selected_build.json; otherwise the regression "
+        "guard cannot fire."
+    )
+
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+
+    out_dir = tmp_path / "smoke_out"
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", "custom_stackbuilder",
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_OK
+
+    manifest = json.loads(
+        (out_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    refs = manifest["canonical_artifacts_referenced"]
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["secondary"] == "SPY"
+    # The provenance entry must cite the CUSTOM selected_build.json
+    # SHA and a path that includes the custom_stackbuilder root, not
+    # the default output/stackbuilder root.
+    assert ref["selected_build_sha256"] == custom_sha
+    assert ref["selected_build_sha256"] != decoy_sha
+    sb_path_str = str(ref["selected_build_path"])
+    assert "custom_stackbuilder/SPY/selected_build.json" in sb_path_str, (
+        f"manifest cites unexpected selected_build path: "
+        f"{sb_path_str!r}"
+    )
+    assert "output/stackbuilder" not in sb_path_str, (
+        f"manifest leaked the default stackbuilder root: "
+        f"{sb_path_str!r}"
+    )
+    assert ref["explicit_build_override"] is False
+
+    # The manifest must not contain the raw absolute tmp_path string.
+    raw_manifest = (out_dir / "run_manifest.json").read_text(
+        encoding="utf-8")
+    assert str(tmp_path) not in raw_manifest

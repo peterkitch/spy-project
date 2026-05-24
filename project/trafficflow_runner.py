@@ -1893,33 +1893,67 @@ def _write_run_manifest(
 
 
 def _build_canonical_artifacts_ref(per_secondary: list[dict]) -> list[dict]:
-    """Per-secondary ``selected_build.json`` path + SHA-256 reference."""
+    """Per-secondary ``selected_build.json`` provenance reference.
+
+    Uses the actual ``selected_build_path`` captured by
+    ``preflight_secondary`` for each secondary. Honors any
+    ``--stackbuilder-root`` override the operator supplied; does NOT
+    recompute from ``DEFAULT_STACKBUILDER_ROOT``. SHA-256 is read from
+    the same file the preflight consumed.
+
+    Explicit-build override mode emits a null ``selected_build_path``
+    and ``selected_build_sha256`` plus ``explicit_build_override=True``
+    and the sanitized ``selected_run_dir``.
+    """
     out: list[dict] = []
     for sec_row in per_secondary:
         sec = sec_row.get("secondary")
-        sb_path = sec_row.get("selected_build_consumed") or {}
-        # selected_build_consumed in per_secondary_results is the
-        # parsed payload; the actual file path is the canonical
-        # location, computed here. Compute SHA-256 from the live
-        # canonical file (read-only).
-        canonical_path = (Path(DEFAULT_STACKBUILDER_ROOT) / str(sec)
-                           / "selected_build.json")
+        explicit_override = bool(sec_row.get("explicit_build_override"))
+        sb_path_raw = sec_row.get("selected_build_path")
+        run_dir_raw = sec_row.get("selected_run_dir")
+
+        if explicit_override or not sb_path_raw:
+            out.append({
+                "secondary": sec,
+                "selected_build_path": (
+                    path_for_output(sb_path_raw) if sb_path_raw else None
+                ),
+                "selected_build_sha256": None,
+                "explicit_build_override": explicit_override,
+                "selected_run_dir": (
+                    path_for_output(run_dir_raw) if run_dir_raw else None
+                ),
+            })
+            continue
+
+        sb_path = Path(sb_path_raw)
         sha = None
+        provenance_warning = None
         try:
-            if canonical_path.exists():
+            if sb_path.is_file():
                 import hashlib
                 h = hashlib.sha256()
-                with open(canonical_path, "rb") as fh:
+                with open(sb_path, "rb") as fh:
                     for chunk in iter(lambda: fh.read(1 << 16), b""):
                         h.update(chunk)
                 sha = h.hexdigest()
-        except Exception:
-            pass
-        out.append({
+            else:
+                provenance_warning = "selected_build_path_not_a_file"
+        except Exception as exc:
+            provenance_warning = f"selected_build_sha_error:{type(exc).__name__}"
+
+        entry = {
             "secondary": sec,
-            "selected_build_path": path_for_output(str(canonical_path)),
+            "selected_build_path": path_for_output(str(sb_path)),
             "selected_build_sha256": sha,
-        })
+            "explicit_build_override": False,
+            "selected_run_dir": (
+                path_for_output(run_dir_raw) if run_dir_raw else None
+            ),
+        }
+        if provenance_warning is not None:
+            entry["provenance_warning"] = provenance_warning
+        out.append(entry)
     return out
 
 
