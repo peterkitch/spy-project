@@ -119,6 +119,24 @@ class _FakeDF:
         self.columns = columns
 
 
+class _TailIdxStub:
+    """Picklable stub whose .max() returns a stored tail value."""
+    def __init__(self, tail):
+        self._tail = tail
+    def __len__(self):
+        return 1
+    def max(self):
+        return self._tail
+
+
+class _TailDFStub:
+    """Picklable stub for preprocessed_data with a .columns list and
+    a .index whose .max() returns the configured tail date string."""
+    def __init__(self, columns, tail):
+        self.columns = columns
+        self.index = _TailIdxStub(tail)
+
+
 def _write_pkl(cache_results_dir, member, *, declared_max_sma_day,
                has_sma_114=True, with_required_fields=True,
                with_manifest=True, manifest_schema="new"):
@@ -316,6 +334,12 @@ def test_no_latest_directory_fallback(tmp_path):
 
 
 def test_selected_build_exact_consumption(tmp_path):
+    """The chosen leaderboard's members appear in JSON; the decoy's do not.
+
+    Verification by content (members) rather than path because the
+    sanitizer redacts the absolute tmp_path. The decoy and chosen
+    leaderboards have disjoint member sets so leakage is detectable.
+    """
     sb_root = tmp_path / "output" / "stackbuilder"
     spy_dir = sb_root / "SPY"
     chosen = spy_dir / "RUN_CHOSEN"
@@ -332,9 +356,13 @@ def test_selected_build_exact_consumption(tmp_path):
     rc, payload, _, _ = _capture_main(argv,
                                        process_conflict_checker=_no_conflict)
     sec = payload["per_secondary_results"][0]
-    assert sec["selected_run_dir"] == str(chosen)
-    assert "RUN_CHOSEN" in sec["combo_leaderboard_path"]
-    assert "ZZZ" not in json.dumps(sec)
+    # The selected_run_dir field is sanitized (tmp_path is outside cwd),
+    # so the runner consumed the chosen build but exposes a placeholder.
+    assert sec["selected_run_dir"] in ("<ABSOLUTE_PATH_REDACTED>", None) or \
+           isinstance(sec["selected_run_dir"], str)
+    # The chosen build's members must appear; the decoy's must not.
+    assert "BBB" in json.dumps(sec)
+    assert "ZZZ" not in json.dumps(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +388,9 @@ def test_effective_config_defaults(tmp_path):
     assert ec["refresh_stale_prices"] is False
     assert ec["max_sma_day"] == 114
     assert ec["use_selected_build"] is True
-    assert ec["stackbuilder_root"] == str(sb_root)
+    # The stackbuilder_root in tests is an absolute tmp_path outside the
+    # project root, so the sanitizer redacts it.
+    assert ec["stackbuilder_root"] == "<ABSOLUTE_PATH_REDACTED>"
     assert ec["output_dir"] == "output/trafficflow"
     assert ec["parallel_subsets"] == 0
     assert ec["subset_workers"] == 4
@@ -634,3 +664,366 @@ def test_missing_secondaries_refused(tmp_path):
     assert rc == runner.EXIT_REFUSED
     assert payload["status"] == "refused"
     assert "secondaries_required" in payload["errors"]
+
+
+# ===========================================================================
+# Amendment Part 1 - JSON sanitization / path redaction
+# ===========================================================================
+
+
+def test_sanitizer_helpers_redact_drive_letter_paths():
+    """Drive-letter paths under known private tokens collapse to the
+    redaction placeholder; constructed in pieces to keep this test file
+    itself free of any real local path string."""
+    fake = chr(90) + ":" + chr(92) + "PRIVATE" + chr(92) + "trafficflow.py"
+    assert runner.is_absolute_path_like(fake)
+    assert runner.path_for_output(fake) == "<ABSOLUTE_PATH_REDACTED>"
+
+
+def test_sanitizer_keeps_relative_paths_normalized():
+    assert runner.path_for_output("output/trafficflow/_progress") == \
+        "output/trafficflow/_progress"
+    # Backslash-relative -> POSIX-style.
+    rel = "output" + chr(92) + "trafficflow"
+    assert runner.path_for_output(rel) == "output/trafficflow"
+
+
+def test_sanitizer_resolves_paths_under_project_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "subdir").mkdir()
+    out = runner.path_for_output(str(tmp_path / "subdir"))
+    assert out == "subdir"
+
+
+def test_dry_run_json_does_not_leak_absolute_tmp_path(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload, _, raw_stdout = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    blob = json.dumps(payload)
+    assert str(tmp_path) not in blob
+    assert str(sb_root) not in blob
+    assert str(chosen) not in blob
+
+
+def test_dry_run_json_does_not_leak_explicit_build_absolute_path(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--explicit-build", str(chosen),
+            "--k", "1"]
+    _, payload, _, _ = _capture_main(argv,
+                                      process_conflict_checker=_no_conflict)
+    blob = json.dumps(payload)
+    assert str(chosen) not in blob
+
+
+def test_process_conflict_json_redacts_raw_cmdline(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+
+    # Build a fake cmdline containing a synthetic private absolute path.
+    fake_cmdline = (
+        chr(90) + ":" + chr(92) + "PRIVATE" + chr(92) + "x" + chr(92)
+        + "trafficflow.py --secret"
+    )
+
+    def _conflict_with_path(write_requested=False):
+        return {
+            "status": "blocked",
+            "conflicts": [
+                {"pid": 12345, "cmdline": fake_cmdline,
+                 "matched_pattern": "trafficflow.py"},
+            ],
+            "queried_via": "fake",
+            "error": None,
+        }
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_conflict_with_path)
+    blob = json.dumps(payload)
+    assert fake_cmdline not in blob
+    assert "PRIVATE" not in blob
+    pc = payload["process_conflict_result"]
+    assert pc["conflicts"][0]["command_line_redacted"] is True
+    assert pc["conflicts"][0]["matched_pattern"] == "trafficflow.py"
+    assert "cmdline" not in pc["conflicts"][0]
+
+
+def test_would_refresh_pkls_command_shape_uses_pinned_interpreter_placeholder(tmp_path, monkeypatch):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--refresh-missing-pkls"]
+    _, payload, _, _ = _capture_main(argv,
+                                      process_conflict_checker=_no_conflict)
+    assert payload["would_refresh_pkls"], "expected at least one would_refresh entry"
+    for entry in payload["would_refresh_pkls"]:
+        assert "<PINNED_INTERPRETER>" in entry["command_shape"]
+        # No leaking of the real interpreter or absolute paths.
+        # Construct the forbidden substring from pieces so the test
+        # file itself stays free of any literal interpreter token.
+        forbidden_interpreter = "python" + chr(46) + "exe"
+        assert forbidden_interpreter not in entry["command_shape"]
+
+
+# ===========================================================================
+# Amendment Part 2 - PKL STALE classification
+# ===========================================================================
+
+
+def _write_pkl_with_tail(cache_results_dir, member, *, tail_date,
+                          declared_max_sma_day=114, has_sma_114=True):
+    """Write a fake PKL whose preprocessed_data.index.max() returns
+    ``tail_date``. Uses module-scope picklable stubs.
+    """
+    d = Path(cache_results_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    cols = ["Close", "SMA_30"] + (["SMA_114"] if has_sma_114 else [])
+    payload = {
+        "preprocessed_data": _TailDFStub(columns=cols, tail=tail_date),
+        "active_pairs": [],
+        "daily_top_buy_pairs": {},
+        "daily_top_short_pairs": {},
+    }
+    with open(d / f"{member}_precomputed_results.pkl", "wb") as fh:
+        pickle.dump(payload, fh)
+    man = {"params": {"max_sma_day": declared_max_sma_day, "ticker": member}}
+    (d / f"{member}_precomputed_results.pkl.manifest.json").write_text(
+        json.dumps(man), encoding="utf-8")
+
+
+def test_classify_pkl_stale_when_tail_before_benchmark(tmp_path):
+    cache_dir = tmp_path / "cache" / "results"
+    _write_pkl_with_tail(cache_dir, "STALE1", tail_date="2026-05-10")
+    r = runner.classify_pkl("STALE1", str(cache_dir),
+                            benchmark_as_of_date="2026-05-22")
+    assert r["classification"] == "STALE"
+    assert r["data_tail_date"] == "2026-05-10"
+    assert r["benchmark_as_of_date"] == "2026-05-22"
+    assert r["freshness_class"] == "STALE"
+
+
+def test_classify_pkl_ok_when_tail_equals_benchmark(tmp_path):
+    cache_dir = tmp_path / "cache" / "results"
+    _write_pkl_with_tail(cache_dir, "FRESH1", tail_date="2026-05-22")
+    r = runner.classify_pkl("FRESH1", str(cache_dir),
+                            benchmark_as_of_date="2026-05-22")
+    assert r["classification"] == "OK"
+    assert r["freshness_class"] == "OK"
+
+
+def test_classify_pkl_ok_when_tail_after_benchmark(tmp_path):
+    cache_dir = tmp_path / "cache" / "results"
+    _write_pkl_with_tail(cache_dir, "FRESH2", tail_date="2026-05-23")
+    r = runner.classify_pkl("FRESH2", str(cache_dir),
+                            benchmark_as_of_date="2026-05-22")
+    assert r["classification"] == "OK"
+
+
+def test_classify_pkl_no_tail_no_stale(tmp_path):
+    """When tail cannot be determined, STALE must NOT fire purely on
+    that basis. UNKNOWN_USABLE remains the inference path."""
+    cache_dir = tmp_path / "cache" / "results"
+    # No manifest, no tail-bearing dataframe -> declared_inferred path.
+    _write_pkl(cache_dir, "NOTAIL", declared_max_sma_day=None,
+               has_sma_114=True, with_manifest=False)
+    r = runner.classify_pkl("NOTAIL", str(cache_dir),
+                            benchmark_as_of_date="2026-05-22")
+    assert r["classification"] in ("UNKNOWN_USABLE", "OK")
+    assert r["classification"] != "STALE"
+
+
+def test_max_sma_mismatch_outranks_stale(tmp_path):
+    """A PKL with stale tail AND max_sma_day=30 must remain
+    MISMATCH_MAX_SMA, not STALE."""
+    cache_dir = tmp_path / "cache" / "results"
+    _write_pkl_with_tail(cache_dir, "MIXED",
+                         tail_date="2026-05-10",
+                         declared_max_sma_day=30,
+                         has_sma_114=False)
+    r = runner.classify_pkl("MIXED", str(cache_dir),
+                            benchmark_as_of_date="2026-05-22")
+    assert r["classification"] == "MISMATCH_MAX_SMA"
+
+
+def test_stale_pkl_gates_cell(tmp_path, monkeypatch):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["STALEM"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl_with_tail(tmp_path / "cache" / "results", "STALEM",
+                         tail_date="2026-05-10")
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload, _, _ = _capture_main(argv,
+                                      process_conflict_checker=_no_conflict)
+    sec = payload["per_secondary_results"][0]
+    assert sec["k_eligibility"]["K1"] == "STALE-GATED"
+
+
+def test_refresh_missing_pkls_includes_stale(tmp_path, monkeypatch):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["STALEM"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl_with_tail(tmp_path / "cache" / "results", "STALEM",
+                         tail_date="2026-05-10")
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--refresh-missing-pkls"]
+    _, payload, _, _ = _capture_main(argv,
+                                      process_conflict_checker=_no_conflict)
+    tickers = [e["ticker"] for e in payload["would_refresh_pkls"]]
+    classes = [e["classification"] for e in payload["would_refresh_pkls"]]
+    assert "STALEM" in tickers
+    assert "STALE" in classes
+
+
+# ===========================================================================
+# Amendment Part 3 - selected_build.json schema validation
+# ===========================================================================
+
+
+def test_selected_build_missing_schema_version_refuses(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    sb_dir = sb_root / "SPY"
+    sb_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        # schema_version intentionally omitted
+        "secondary": "SPY",
+        "selected_k": 1,
+        "selection_policy": "v2",
+        "operator_pinned": False,
+        "selected_run_dir": str(chosen),
+    }
+    (sb_dir / "selected_build.json").write_text(json.dumps(payload),
+                                                 encoding="utf-8")
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload_out, _, _ = _capture_main(argv,
+                                          process_conflict_checker=_no_conflict)
+    sec = payload_out["per_secondary_results"][0]
+    assert sec["verdict"] == "REFUSED"
+    assert sec["reason"] == "selected_build_missing_required_fields"
+
+
+def test_selected_build_missing_selected_k_refuses(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    sb_dir = sb_root / "SPY"
+    sb_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "secondary": "SPY",
+        # selected_k intentionally omitted
+        "selection_policy": "v2",
+        "operator_pinned": False,
+        "selected_run_dir": str(chosen),
+    }
+    (sb_dir / "selected_build.json").write_text(json.dumps(payload),
+                                                 encoding="utf-8")
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload_out, _, _ = _capture_main(argv,
+                                          process_conflict_checker=_no_conflict)
+    sec = payload_out["per_secondary_results"][0]
+    assert sec["verdict"] == "REFUSED"
+    assert sec["reason"] in (
+        "selected_build_missing_required_fields",
+        "selected_build_invalid_selected_k",
+    )
+
+
+def test_selected_build_secondary_mismatch_refuses(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    # The selected_build.json declares "AAPL" but the file is under SPY/.
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen,
+                          payload_extras={"secondary": "AAPL"})
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload_out, _, _ = _capture_main(argv,
+                                          process_conflict_checker=_no_conflict)
+    sec = payload_out["per_secondary_results"][0]
+    assert sec["verdict"] == "REFUSED"
+    assert sec["reason"] == "selected_build_secondary_mismatch"
+
+
+def test_selected_build_invalid_selected_k_refuses(tmp_path):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen,
+                          payload_extras={"selected_k": 0})
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload_out, _, _ = _capture_main(argv,
+                                          process_conflict_checker=_no_conflict)
+    sec = payload_out["per_secondary_results"][0]
+    assert sec["verdict"] == "REFUSED"
+    assert sec["reason"] == "selected_build_invalid_selected_k"
+
+
+def test_selected_build_valid_payload_passes(tmp_path, monkeypatch):
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    rc, payload_out, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    sec = payload_out["per_secondary_results"][0]
+    # Valid selected_build.json + missing PKL/price -> still passes
+    # schema gate; verdict surfaces a readiness gate, NOT REFUSED.
+    assert sec["verdict"] != "REFUSED"
+    assert sec["reason"] is None or "selected_build" not in sec["reason"]

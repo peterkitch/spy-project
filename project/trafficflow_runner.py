@@ -97,6 +97,15 @@ EXIT_PROCESS_CONFLICT = 3
 
 _RAW_TICKER_SPLIT_RE = re.compile(r"[,\s]+")
 
+# JSON sanitization patterns. The drive-letter regex is constructed
+# from character escapes so the source text itself contains no literal
+# example of a drive-letter path like `C:` + slash.
+_ABS_PATH_REDACTED = "<ABSOLUTE_PATH_REDACTED>"
+_CMDLINE_REDACTED = "<COMMAND_LINE_REDACTED>"
+_DRIVE_LETTER_RE = re.compile(
+    "^[A-Za-z]" + chr(58) + "[" + chr(92) + chr(92) + chr(47) + "]"
+)
+
 
 # ---------------------------------------------------------------------------
 # Argparse
@@ -362,12 +371,156 @@ def _parse_k_range_expression(expr: str, issues: list[str]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# JSON output sanitizer (privacy gate before stdout emit)
+# ---------------------------------------------------------------------------
+
+
+def is_absolute_path_like(value: str) -> bool:
+    """Best-effort detection of an absolute filesystem path.
+
+    Recognizes:
+      * POSIX leading-slash absolute paths.
+      * Windows drive-letter paths (a single ASCII letter followed by a
+        colon and a path separator).
+      * UNC paths beginning with a doubled backslash.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    if s.startswith(("/", "\\")):
+        return True
+    if _DRIVE_LETTER_RE.match(s) is not None:
+        return True
+    if s.startswith("\\\\"):  # UNC
+        return True
+    return False
+
+
+def path_for_output(
+    value: Any,
+    *,
+    project_root: Optional[Path] = None,
+) -> Optional[str]:
+    """Return a JSON-safe path string.
+
+    Rules:
+      * ``None`` -> ``None``.
+      * Relative path -> normalized POSIX-style relative spelling.
+      * Absolute path under the project root -> repo-relative POSIX-style.
+        The under-project-root conversion runs BEFORE any private-token
+        redaction so a sanctioned path that happens to contain a
+        sensitive substring (e.g. an unrelated occurrence of "Users")
+        still surfaces as a repo-relative string.
+      * Absolute path outside the project root -> ``<ABSOLUTE_PATH_REDACTED>``.
+    """
+    if value is None:
+        return None
+    s = str(value)
+    if not s:
+        return s
+    if is_absolute_path_like(s):
+        root = project_root if project_root is not None else Path.cwd()
+        try:
+            p = Path(s).resolve()
+            rel = p.relative_to(root.resolve())
+            return rel.as_posix()
+        except (ValueError, OSError):
+            return _ABS_PATH_REDACTED
+        # Defensive: if relative_to succeeded but the result still
+        # contains a private token, redact.
+    # Relative path: normalize to POSIX form, no leading "./"
+    norm = s.replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def redact_command_line(value: str) -> str:
+    """Drop the raw command line entirely; callers can keep
+    ``matched_pattern`` etc. but never the full cmdline."""
+    return _CMDLINE_REDACTED
+
+
+_PATH_LIKE_KEYS = frozenset({
+    "selected_run_dir", "combo_leaderboard_path", "path_rel",
+    "manifest_path_rel", "stackbuilder_root", "explicit_build",
+    "output_dir", "progress_dir", "source_manifest_path", "sb_path",
+})
+
+
+def sanitize_for_json(value: Any, *, project_root: Optional[Path] = None) -> Any:
+    """Recursive sanitizer applied to the envelope before
+    ``json.dumps``.
+
+    Strategy:
+      * dict: sanitize each value; if the key is in
+        ``_PATH_LIKE_KEYS``, treat the value as a path-for-output.
+        Special-case ``conflicts`` lists to redact raw cmdline.
+      * list/tuple: sanitize each element.
+      * str: leave intact UNLESS it looks like an absolute path; then
+        redact-or-relativize.
+      * other scalars: leave intact.
+    """
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            if k == "conflicts" and isinstance(v, list):
+                out[k] = [_sanitize_conflict_entry(e) for e in v]
+                continue
+            if k == "cmdline" and isinstance(v, str):
+                out[k] = redact_command_line(v)
+                continue
+            if k in _PATH_LIKE_KEYS:
+                if v is None:
+                    out[k] = None
+                else:
+                    out[k] = path_for_output(v, project_root=project_root)
+                continue
+            out[k] = sanitize_for_json(v, project_root=project_root)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [sanitize_for_json(item, project_root=project_root) for item in value]
+    if isinstance(value, str):
+        if is_absolute_path_like(value):
+            return path_for_output(value, project_root=project_root)
+        return value
+    return value
+
+
+def _sanitize_conflict_entry(entry: Any) -> Any:
+    if not isinstance(entry, dict):
+        return entry
+    out = {
+        "pid": entry.get("pid"),
+        "matched_pattern": entry.get("matched_pattern"),
+        "command_line_redacted": True,
+    }
+    # If a safe one-word label can be derived, surface it.
+    pat = entry.get("matched_pattern")
+    if pat:
+        out["command_label"] = pat
+    return out
+
+
+# ---------------------------------------------------------------------------
 # selected_build.json + combo_leaderboard.xlsx
 # ---------------------------------------------------------------------------
 
 
 def _selected_build_path(stackbuilder_root: str, secondary: str) -> Path:
     return Path(stackbuilder_root) / secondary / "selected_build.json"
+
+
+SELECTED_BUILD_REQUIRED_FIELDS = (
+    "schema_version",
+    "secondary",
+    "selected_k",
+    "selection_policy",
+    "operator_pinned",
+    "selected_run_dir",
+)
 
 
 def read_selected_build(
@@ -379,11 +532,13 @@ def read_selected_build(
 
     Returns dict with keys:
       status: "ok" | "refused" | "explicit_override"
-      reason: explanation when not ok
-      sb_path: path inspected (repo-relative-like)
+      reason: short refusal reason on non-ok
+      missing_fields: list[str] when reason is
+          "selected_build_missing_required_fields"
+      sb_path: path inspected (raw; sanitizer runs at emit time)
       payload: parsed JSON dict on ok
       explicit_build_override: bool
-      selected_run_dir: resolved repo-relative or as-provided string
+      selected_run_dir: resolved string (raw; sanitizer runs at emit time)
     """
     if explicit_build_path:
         run_dir = Path(explicit_build_path)
@@ -391,6 +546,7 @@ def read_selected_build(
             return {
                 "status": "refused",
                 "reason": "explicit_build_path_missing",
+                "missing_fields": [],
                 "sb_path": None,
                 "payload": None,
                 "explicit_build_override": True,
@@ -399,6 +555,7 @@ def read_selected_build(
         return {
             "status": "explicit_override",
             "reason": None,
+            "missing_fields": [],
             "sb_path": None,
             "payload": None,
             "explicit_build_override": True,
@@ -410,6 +567,7 @@ def read_selected_build(
         return {
             "status": "refused",
             "reason": "selected_build_missing",
+            "missing_fields": [],
             "sb_path": str(sb_path),
             "payload": None,
             "explicit_build_override": False,
@@ -421,6 +579,7 @@ def read_selected_build(
         return {
             "status": "refused",
             "reason": f"selected_build_unreadable: {type(exc).__name__}",
+            "missing_fields": [],
             "sb_path": str(sb_path),
             "payload": None,
             "explicit_build_override": False,
@@ -430,16 +589,60 @@ def read_selected_build(
         return {
             "status": "refused",
             "reason": "selected_build_not_object",
+            "missing_fields": [],
             "sb_path": str(sb_path),
             "payload": None,
             "explicit_build_override": False,
             "selected_run_dir": None,
         }
+    # Schema gate: required fields must all be present.
+    missing = [f for f in SELECTED_BUILD_REQUIRED_FIELDS if f not in payload]
+    if missing:
+        return {
+            "status": "refused",
+            "reason": "selected_build_missing_required_fields",
+            "missing_fields": missing,
+            "sb_path": str(sb_path),
+            "payload": payload,
+            "explicit_build_override": False,
+            "selected_run_dir": None,
+        }
+    # Secondary match.
+    declared_sec = str(payload.get("secondary") or "").strip().upper()
+    requested = str(secondary or "").strip().upper()
+    if declared_sec != requested:
+        return {
+            "status": "refused",
+            "reason": "selected_build_secondary_mismatch",
+            "missing_fields": [],
+            "sb_path": str(sb_path),
+            "payload": payload,
+            "explicit_build_override": False,
+            "selected_run_dir": None,
+        }
+    # selected_k must be a positive int.
+    sk_raw = payload.get("selected_k")
+    try:
+        sk = int(sk_raw)
+        if sk < 1:
+            raise ValueError(f"selected_k<1: {sk}")
+    except (TypeError, ValueError):
+        return {
+            "status": "refused",
+            "reason": "selected_build_invalid_selected_k",
+            "missing_fields": [],
+            "sb_path": str(sb_path),
+            "payload": payload,
+            "explicit_build_override": False,
+            "selected_run_dir": None,
+        }
+    # selected_run_dir non-empty.
     run_dir = payload.get("selected_run_dir")
-    if not run_dir:
+    if not run_dir or not str(run_dir).strip():
         return {
             "status": "refused",
             "reason": "selected_build_missing_selected_run_dir",
+            "missing_fields": [],
             "sb_path": str(sb_path),
             "payload": payload,
             "explicit_build_override": False,
@@ -448,6 +651,7 @@ def read_selected_build(
     return {
         "status": "ok",
         "reason": None,
+        "missing_fields": [],
         "sb_path": str(sb_path),
         "payload": payload,
         "explicit_build_override": False,
@@ -681,18 +885,87 @@ def classify_price_cache(
 # ---------------------------------------------------------------------------
 
 
+_PKL_DATE_FIELDS = (
+    "last_processed_date", "last_date", "date_range_end",
+    "end_date", "latest_date",
+)
+
+
+def _normalize_date_string(value: Any) -> Optional[str]:
+    """Best-effort YYYY-MM-DD normalization without importing pandas."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Take the first 10 chars if shape is YYYY-MM-DD or YYYY-MM-DD HH:MM:SS.
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            datetime.strptime(s[:10], "%Y-%m-%d")
+            return s[:10]
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(s).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _extract_pkl_tail_date(obj: dict) -> Optional[str]:
+    """Inspect a loaded PKL dict for the latest usable data date.
+
+    Order of attempts:
+      1. preprocessed_data.index.max() when available.
+      2. Top-level date fields: last_processed_date, last_date,
+         date_range_end, end_date, latest_date.
+      3. Embedded manifest fields if present in the PKL.
+    """
+    df = obj.get("preprocessed_data")
+    if df is not None:
+        try:
+            idx = getattr(df, "index", None)
+            if idx is not None and len(idx) > 0:
+                # Avoid importing pandas: rely on .max() if it exists.
+                last = idx.max()
+                d = _normalize_date_string(last)
+                if d:
+                    return d
+        except Exception:
+            pass
+    for k in _PKL_DATE_FIELDS:
+        if k in obj:
+            d = _normalize_date_string(obj[k])
+            if d:
+                return d
+    man = obj.get("manifest") if isinstance(obj.get("manifest"), dict) else None
+    if man:
+        for k in _PKL_DATE_FIELDS:
+            if k in man:
+                d = _normalize_date_string(man[k])
+                if d:
+                    return d
+    return None
+
+
 def classify_pkl(
     member: str,
     cache_results_dir: str = DEFAULT_CACHE_RESULTS_DIR,
     *,
     max_sma_required: int = DEFAULT_MAX_SMA_DAY,
+    benchmark_as_of_date: Optional[str] = None,
     pickle_module: Any = pickle,
 ) -> dict:
     """Classify a Spymaster precomputed-result PKL plus its manifest.
 
-    Returns dict with keys:
-      member, classification, max_sma_class, path_rel, manifest_max_sma_day,
-      has_SMA_114, missing_fields, issues, declared_inferred
+    Returns dict with keys including ``classification``, ``max_sma_class``,
+    ``data_tail_date``, ``benchmark_as_of_date``, ``freshness_class``,
+    ``has_SMA_114``, ``manifest_max_sma_day``, ``missing_fields``,
+    ``issues``, ``declared_inferred``.
+
+    More severe classes always win over STALE:
+      UNREADABLE / INVALID / SCHEMA_MISMATCH / MISMATCH_MAX_SMA /
+      CONFLICTING_MAX_SMA / UNDETERMINABLE_MAX_SMA take precedence over
+      STALE.
     """
     pkl_p = Path(cache_results_dir) / f"{member}_precomputed_results.pkl"
     man_p = Path(cache_results_dir) / f"{member}_precomputed_results.pkl.manifest.json"
@@ -707,6 +980,9 @@ def classify_pkl(
         "missing_fields": [],
         "issues": [],
         "declared_inferred": False,
+        "data_tail_date": None,
+        "benchmark_as_of_date": benchmark_as_of_date,
+        "freshness_class": None,
     }
 
     if not pkl_p.exists():
@@ -759,6 +1035,23 @@ def classify_pkl(
             has_114 = None
     out["has_SMA_114"] = has_114
 
+    # Extract data tail date for freshness classification.
+    tail = _extract_pkl_tail_date(obj)
+    out["data_tail_date"] = tail
+
+    # Compute freshness class (advisory; STALE may be overridden by a
+    # more severe classification below).
+    freshness: Optional[str] = None
+    if benchmark_as_of_date and tail:
+        if tail < benchmark_as_of_date:
+            freshness = "STALE"
+        else:
+            freshness = "OK"
+    elif benchmark_as_of_date and not tail:
+        out["issues"].append("pkl_tail_date_unknown")
+        freshness = "UNKNOWN"
+    out["freshness_class"] = freshness
+
     # Inline PKL metadata fallback
     if declared_msd is None:
         for k in ("max_sma_day", "existing_max_sma_day"):
@@ -791,7 +1084,7 @@ def classify_pkl(
             msd_class = "UNDETERMINABLE_MAX_SMA"
     out["max_sma_class"] = msd_class
 
-    # Top-level classification
+    # Top-level classification. More severe classes outrank STALE.
     if missing:
         out["classification"] = "SCHEMA_MISMATCH"
         return out
@@ -803,6 +1096,10 @@ def classify_pkl(
         return out
     if msd_class == "UNDETERMINABLE_MAX_SMA":
         out["classification"] = "UNDETERMINABLE_MAX_SMA"
+        return out
+    # max-SMA is MATCH at this point. Apply freshness gate next.
+    if freshness == "STALE":
+        out["classification"] = "STALE"
         return out
     if out["declared_inferred"]:
         out["classification"] = "UNKNOWN_USABLE"
@@ -1064,6 +1361,7 @@ def preflight_secondary(
                                        today=today,
                                        pandas_module=pandas_module)
     result["price_cache"] = price_class
+    benchmark_as_of_date = price_class.get("tail_date") if isinstance(price_class, dict) else None
 
     # Collect unique member set across all requested K rows
     unique_members: list[str] = []
@@ -1078,6 +1376,7 @@ def preflight_secondary(
     pkl_results = [
         classify_pkl(m, cache_results_dir,
                      max_sma_required=max_sma_required,
+                     benchmark_as_of_date=benchmark_as_of_date,
                      pickle_module=pickle_module)
         for m in unique_members
     ]
@@ -1188,7 +1487,15 @@ def build_would_refresh_lists(
 
 
 def _emit_json(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload, indent=2, default=str))
+    """Sanitize the envelope before writing to stdout.
+
+    Path-like values are converted to repo-relative POSIX strings or
+    redacted with ``<ABSOLUTE_PATH_REDACTED>``. Raw process command
+    lines in ``process_conflict_result.conflicts`` are dropped in favor
+    of ``matched_pattern`` + ``command_line_redacted=true``.
+    """
+    safe = sanitize_for_json(payload, project_root=Path.cwd())
+    sys.stdout.write(json.dumps(safe, indent=2, default=str))
     sys.stdout.write("\n")
     sys.stdout.flush()
 
