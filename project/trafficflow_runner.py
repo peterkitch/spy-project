@@ -409,10 +409,9 @@ def path_for_output(
       * ``None`` -> ``None``.
       * Relative path -> normalized POSIX-style relative spelling.
       * Absolute path under the project root -> repo-relative POSIX-style.
-        The under-project-root conversion runs BEFORE any private-token
-        redaction so a sanctioned path that happens to contain a
-        sensitive substring (e.g. an unrelated occurrence of "Users")
-        still surfaces as a repo-relative string.
+        The under-project-root conversion runs first so that a
+        sanctioned path which incidentally contains a sensitive-looking
+        substring is still surfaced as a repo-relative string.
       * Absolute path outside the project root -> ``<ABSOLUTE_PATH_REDACTED>``.
     """
     if value is None:
