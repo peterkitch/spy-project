@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pickle
+import re
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -398,15 +399,20 @@ def test_effective_config_defaults(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 7. --write rejection
+# 7. --write canonical refusal (Phase C guardrail)
 # ---------------------------------------------------------------------------
 
 
-def test_write_is_refused(tmp_path):
+def test_write_to_default_canonical_output_is_refused(tmp_path):
+    """Phase C canonical guardrail: --write without an explicit
+    isolated --output-dir defaults to ``output/trafficflow`` and must
+    be refused with ``canonical_write_forbidden_in_phase_c`` before any
+    compute or trafficflow import."""
     sb_root = tmp_path / "output" / "stackbuilder"
     chosen = sb_root / "SPY" / "RUN_A"
     _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
     _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
     argv = ["--secondaries", "SPY",
             "--stackbuilder-root", str(sb_root),
             "--k", "1",
@@ -415,10 +421,17 @@ def test_write_is_refused(tmp_path):
         argv, process_conflict_checker=_no_conflict)
     assert rc == runner.EXIT_REFUSED
     assert payload["status"] == "refused"
-    assert "phase_b_write_not_supported" in payload["warnings"]
-    assert "phase_b_write_not_supported" in payload["errors"]
+    assert "canonical_write_forbidden_in_phase_c" in payload["warnings"]
+    assert "canonical_write_forbidden_in_phase_c" in payload["errors"]
     assert payload["artifacts_written"] == []
     assert payload["verdict"] == "REFUSED"
+    ec = payload["effective_config"]
+    assert ec["canonical_write_blocked"] is True
+    assert ec["write_authorized"] is False
+    assert ec["output_dir_isolated"] is False
+    assert ec["write_mode"] == "refused"
+    # Canonical refusal path must not import real trafficflow.
+    assert "trafficflow" not in sys.modules
 
 
 # ---------------------------------------------------------------------------
@@ -1027,3 +1040,683 @@ def test_selected_build_valid_payload_passes(tmp_path, monkeypatch):
     # schema gate; verdict surfaces a readiness gate, NOT REFUSED.
     assert sec["verdict"] != "REFUSED"
     assert sec["reason"] is None or "selected_build" not in sec["reason"]
+
+
+# ===========================================================================
+# Phase C - isolated-output --write support
+# ===========================================================================
+
+
+def _eligible_fixture(tmp_path, monkeypatch, *, secondary="SPY",
+                      member="AAA", k=1):
+    """Build a fully-eligible single-cell fixture in tmp_path.
+
+    Returns (sb_root_path, output_dir_path).
+    """
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / secondary / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={k: [f"{member}[D]"]})
+    _write_selected_build(sb_root, secondary, selected_run_dir=chosen,
+                          selected_k=k)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", secondary,
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", member,
+               declared_max_sma_day=114, has_sma_114=True)
+    out_dir = tmp_path / "smoke_out"
+    return sb_root, out_dir
+
+
+def test_phase_c_is_isolated_output_dir_helper():
+    # Canonical and descendants are not isolated.
+    assert runner.is_isolated_output_dir("output/trafficflow") is False
+    assert runner.is_isolated_output_dir("output/trafficflow/foo") is False
+    # Relative paths outside the canonical root are isolated.
+    assert runner.is_isolated_output_dir("output/trafficflow_smoke") is True
+    assert runner.is_isolated_output_dir("output/something_else") is True
+    # Logs are isolated.
+    assert runner.is_isolated_output_dir("logs/trafficflow_phase_c_smoke") is True
+
+
+def test_phase_c_isolated_write_succeeds_with_mock_compute(tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        captured["calls"].append((sec, k))
+        return [
+            {"Ticker": sec, "K": k, "Members": "AAA",
+             "Trigs": 10, "Wins": 6, "Losses": 4, "Avg %": 1.25},
+        ]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "ok"
+    assert payload["effective_config"]["write_authorized"] is True
+    assert payload["effective_config"]["output_dir_isolated"] is True
+    assert payload["effective_config"]["write_mode"] == "isolated"
+    # Compute was called exactly once for the eligible cell.
+    assert captured["calls"] == [("SPY", 1)]
+    # Artifact files exist on disk under the isolated output dir.
+    assert (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert (out_dir / "SPY" / "board_rows_k=1.csv").exists()
+    assert (out_dir / "run_manifest.json").exists()
+    assert (out_dir / "run.stdout.json").exists()
+    # No canonical output/trafficflow writes occurred.
+    canonical = Path("output") / "trafficflow"
+    assert not (canonical.exists() and any(canonical.iterdir())) \
+        or all("smoke_out" not in str(p) for p in canonical.iterdir())
+
+
+def test_phase_c_isolated_write_skips_ineligible_cell(tmp_path, monkeypatch):
+    """Cells that are STALE-GATED / PKL-GATED / DATA-GATED must be
+    skipped without invoking compute."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    # Two K cells: K=1 eligible, K=2 PKL-GATED (member BBB has no PKL).
+    _make_fake_leaderboard(chosen, k_to_members={
+        1: ["AAA[D]"],
+        2: ["BBB[D]"],
+    })
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    # BBB intentionally NOT written -> K=2 cell is PKL-GATED.
+    out_dir = tmp_path / "smoke_out"
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        captured["calls"].append((sec, k))
+        return [{"K": k, "Members": "AAA"}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # Compute fired only for K=1, not K=2.
+    assert captured["calls"] == [("SPY", 1)]
+    cells = payload.get("per_cell_summary") or []
+    by_k = {c["k"]: c for c in cells}
+    assert by_k[1]["status"] == "ok"
+    assert by_k[2]["status"] == "skipped"
+    assert "non_eligible:" in by_k[2]["skip_reason"]
+    # K=1 wrote, K=2 did not.
+    assert (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert not (out_dir / "SPY" / "board_rows_k=2.json").exists()
+
+
+def test_phase_c_isolated_write_emits_sanitized_paths(tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        return [{"K": k, "Members": "AAA"}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # On-disk artifacts must not contain the raw tmp_path string.
+    raw_stdout = (out_dir / "run.stdout.json").read_text(encoding="utf-8")
+    raw_manifest = (out_dir / "run_manifest.json").read_text(encoding="utf-8")
+    assert str(tmp_path) not in raw_stdout
+    assert str(tmp_path) not in raw_manifest
+    # No drive-letter pattern in either.
+    drive_pat = re.compile(r"[A-Z]:[\\/]")
+    assert not drive_pat.search(raw_stdout)
+    assert not drive_pat.search(raw_manifest)
+    # Payload artifacts list is sanitized.
+    for art in payload["artifacts_written"]:
+        assert str(tmp_path) not in art
+        assert not drive_pat.search(art)
+
+
+def test_phase_c_refresh_flags_remain_report_only_with_write(tmp_path, monkeypatch):
+    """Even with --write authorized for isolated output, the refresh
+    flags must remain report-only: would_refresh_pkls populated,
+    signal_engine_cache_refresher.py never invoked, the PKL-gated cell
+    skipped (compute never called for it)."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["MISSINGM[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    # MISSINGM's PKL intentionally not written.
+    invoked = {"count": 0}
+    def _no_subproc(*a, **kw):
+        invoked["count"] += 1
+        raise AssertionError("subprocess.run must not be invoked in Phase C")
+    monkeypatch.setattr(runner.subprocess, "run", _no_subproc)
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        captured["calls"].append((sec, k))
+        return [{"K": k}]
+
+    out_dir = tmp_path / "smoke_out"
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir),
+            "--refresh-missing-pkls"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert any(e["ticker"] == "MISSINGM"
+               for e in payload["would_refresh_pkls"])
+    # Compute was NOT invoked (cell is PKL-GATED).
+    assert captured["calls"] == []
+    # No cache writes happened.
+    assert not (tmp_path / "cache" / "results" /
+                "MISSINGM_precomputed_results.pkl").exists()
+
+
+def test_phase_c_compute_exception_handled_gracefully(tmp_path, monkeypatch):
+    """Compute raises for one cell; another succeeds; run status is
+    partial; errored cell recorded with sanitized exception detail."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={
+        1: ["AAA[D]"],
+        2: ["AAA[D]", "BBB[D]"],
+    })
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen,
+                          selected_k=2)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    _write_pkl(tmp_path / "cache" / "results", "BBB",
+               declared_max_sma_day=114, has_sma_114=True)
+    out_dir = tmp_path / "smoke_out"
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        if k == 2:
+            raise RuntimeError("synthetic compute failure for K=2")
+        return [{"K": k, "Members": "AAA"}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # Partial outcome: 1 cell wrote, 1 cell errored.
+    assert payload["status"] == "partial"
+    by_k = {c["k"]: c for c in payload["per_cell_summary"]}
+    assert by_k[1]["status"] == "ok"
+    assert by_k[2]["status"] == "error"
+    assert by_k[2]["error_class"] == "RuntimeError"
+    assert "synthetic compute failure" in by_k[2]["error_message"]
+    # K=1 wrote artifacts; K=2 did not.
+    assert (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert not (out_dir / "SPY" / "board_rows_k=2.json").exists()
+    summary = payload["write_summary"]
+    assert summary["cells_written"] == 1
+    assert summary["cells_errored"] == 1
+
+
+def test_phase_c_no_tmp_files_remain_after_isolated_write(tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # Walk the output dir; no .tmp files may remain.
+    tmps = [p for p in out_dir.rglob("*.tmp")]
+    assert tmps == [], f"unexpected .tmp remnants: {tmps}"
+
+
+def test_phase_c_lazy_compute_loader_not_invoked_in_dry_run(tmp_path, monkeypatch):
+    """Dry-run path must not resolve the compute callable. With the
+    sys.meta_path sentinel blocking trafficflow import, a dry-run still
+    succeeds. The compute_callable kwarg is irrelevant in dry-run."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    sys.modules.pop("signal_engine_cache_refresher", None)
+
+    class _BlockTraffic:
+        def find_module(self, name, path=None):
+            if name in ("trafficflow", "signal_engine_cache_refresher"):
+                return self
+            return None
+        def load_module(self, name):
+            raise ImportError(
+                f"forbidden import in dry-run path: {name}")
+    monkeypatch.setattr(sys, "meta_path", [_BlockTraffic()] + sys.meta_path)
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "dry_run"
+    assert payload["effective_config"]["write_mode"] == "dry_run"
+    assert "trafficflow" not in sys.modules
+
+
+def test_phase_c_effective_config_dry_run_fields():
+    args = runner.parse_args(["--secondaries", "SPY"])
+    ec = runner.build_effective_config(args)
+    assert ec["write_authorized"] is False
+    assert ec["canonical_write_blocked"] is False
+    assert ec["write_mode"] == "dry_run"
+
+
+def test_phase_c_effective_config_canonical_refused_fields():
+    args = runner.parse_args(["--secondaries", "SPY", "--write"])
+    ec = runner.build_effective_config(args)
+    assert ec["write_authorized"] is False
+    assert ec["canonical_write_blocked"] is True
+    assert ec["output_dir_isolated"] is False
+    assert ec["write_mode"] == "refused"
+
+
+def test_phase_c_effective_config_isolated_authorized_fields(tmp_path):
+    args = runner.parse_args([
+        "--secondaries", "SPY",
+        "--write",
+        "--output-dir", str(tmp_path / "smoke_out"),
+    ])
+    ec = runner.build_effective_config(args)
+    assert ec["write_authorized"] is True
+    assert ec["canonical_write_blocked"] is False
+    assert ec["output_dir_isolated"] is True
+    assert ec["write_mode"] == "isolated"
+
+
+def test_phase_c_no_writes_when_all_cells_ineligible(tmp_path, monkeypatch):
+    """All requested cells are PKL-GATED (missing members). Compute
+    must not be called; no board_rows files; status must clearly
+    report zero cells_written."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["GONE[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    # No PKL for GONE -> K=1 cell is PKL-GATED.
+    out_dir = tmp_path / "smoke_out"
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
+        captured["calls"].append((sec, k))
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert captured["calls"] == []
+    summary = payload["write_summary"]
+    assert summary["cells_written"] == 0
+    assert payload["status"] == "failed"
+    assert not (out_dir / "SPY" / "board_rows_k=1.json").exists()
+
+
+# ===========================================================================
+# Phase C amendment - selected-build enforcement, process-conflict fail-
+# closed, complete artifact list, docstring/contract reaffirmations.
+# ===========================================================================
+
+
+def test_phase_c_compute_callable_receives_combo_leaderboard_path(
+        tmp_path, monkeypatch):
+    """The runner threads the preflight-resolved combo_leaderboard_path
+    into the compute callable."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+    seen: dict = {}
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        seen["combo_leaderboard_path"] = combo_leaderboard_path
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_OK
+    # The compute callable receives the RAW (unsanitized) leaderboard
+    # path so the engine can actually open the file. The sanitized
+    # equivalent in payload["per_secondary_results"] is redacted when
+    # the tmp_path is outside the project root, so we can only assert
+    # structural properties on what compute saw.
+    assert seen["combo_leaderboard_path"], "compute did not receive the path"
+    assert "combo_leaderboard" in str(seen["combo_leaderboard_path"])
+    # The resolved file must actually exist on disk where the runner
+    # said it did - that proves the path is the preflight-resolved
+    # path, not None or a decoy.
+    assert Path(seen["combo_leaderboard_path"]).exists()
+
+
+def test_phase_c_selected_build_enforced_during_default_compute(
+        tmp_path, monkeypatch):
+    """Inject a fake trafficflow into sys.modules and verify the
+    _default_compute_loader wrapper pins _find_latest_combo_table to
+    the selected combo_leaderboard path during build_board_rows and
+    restores the original finder after the call."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    decoy_path = tmp_path / "decoy" / "combo_leaderboard.xlsx"
+    decoy_path.parent.mkdir(parents=True, exist_ok=True)
+    decoy_path.write_text("decoy", encoding="utf-8")
+
+    seen: dict = {"finder_calls": []}
+
+    fake_tf = SimpleNamespace()
+    def _original_finder(sec):
+        seen["finder_calls"].append(("ORIGINAL", sec))
+        return Path(decoy_path)
+    fake_tf._find_latest_combo_table = _original_finder
+
+    def _fake_build_board_rows(sec, k, *, run_fence=None, missing_map=None):
+        # The engine would normally call _find_latest_combo_table here.
+        # The wrapper must have pinned this attribute to a function
+        # returning the SELECTED path BEFORE this call.
+        path_via_finder = fake_tf._find_latest_combo_table(sec)
+        seen["finder_used_by_build"] = path_via_finder
+        return [{"K": k, "Members": "AAA"}]
+    fake_tf.build_board_rows = _fake_build_board_rows
+
+    sys.modules["trafficflow"] = fake_tf
+    try:
+        argv = ["--secondaries", "SPY",
+                "--stackbuilder-root", str(sb_root),
+                "--k", "1",
+                "--write",
+                "--output-dir", str(out_dir)]
+        # NO compute_callable -> _default_compute_loader is used.
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict)
+    finally:
+        del sys.modules["trafficflow"]
+
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "ok"
+    pinned_used = seen.get("finder_used_by_build")
+    assert pinned_used is not None
+    assert "combo_leaderboard" in str(pinned_used)
+    assert "decoy" not in str(pinned_used)
+    # Original finder restored AFTER compute - verifiable by calling
+    # it now and observing the ORIGINAL decoy-returning behavior.
+    restored_result = fake_tf._find_latest_combo_table("SPY")
+    assert "decoy" in str(restored_result)
+    assert ("ORIGINAL", "SPY") in seen["finder_calls"]
+
+
+def test_phase_c_write_refuses_on_process_conflict_enumeration_error(
+        tmp_path, monkeypatch):
+    """Write mode fails closed when process-conflict enumeration
+    fails (status='error')."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    def _conflict_error(write_requested=False):
+        return {
+            "status": "error",
+            "conflicts": [],
+            "queried_via": "fake",
+            "error": "enumeration_unavailable",
+        }
+
+    captured = {"calls": 0}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        captured["calls"] += 1
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_conflict_error,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_PROCESS_CONFLICT
+    assert payload["status"] == "refused"
+    assert "process_conflict_enumeration_unavailable" in payload["errors"]
+    assert captured["calls"] == 0
+    assert not (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert not (out_dir / "run_manifest.json").exists()
+    assert not (out_dir / "run.stdout.json").exists()
+
+
+def test_phase_c_on_disk_artifact_lists_are_complete(tmp_path, monkeypatch):
+    """run_manifest.json and run.stdout.json on disk both enumerate
+    the complete artifact list including themselves and the per-cell
+    board-row JSON + CSV.
+
+    The output dir is placed UNDER the project root so the sanitizer
+    converts artifact paths to repo-relative POSIX strings rather than
+    redacting them to ``<ABSOLUTE_PATH_REDACTED>``. The repo-relative
+    rendering is what the test asserts on by substring.
+    """
+    # Build the stackbuilder fixture under tmp_path but emit artifacts
+    # to a project-root-relative directory so the sanitizer can map
+    # them back to readable repo-relative POSIX strings. The test
+    # cleans up after itself.
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    out_dir = PROJECT_ROOT / f"logs/_pytest_phase_c_artifact_list_{os.getpid()}"
+    # Defensive cleanup if a prior aborted run left this dir behind.
+    if out_dir.exists():
+        import shutil as _sh
+        _sh.rmtree(out_dir, ignore_errors=True)
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    try:
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict,
+            compute_callable=_fake_compute)
+        assert rc == runner.EXIT_OK
+
+        manifest = json.loads(
+            (out_dir / "run_manifest.json").read_text(encoding="utf-8"))
+        stdout_file = json.loads(
+            (out_dir / "run.stdout.json").read_text(encoding="utf-8"))
+
+        def _has(art_list, needle):
+            return any(needle in str(a) for a in art_list)
+
+        for art_list in (manifest["artifacts_written"],
+                         stdout_file["artifacts_written"]):
+            assert _has(art_list, "board_rows_k=1.json"), art_list
+            assert _has(art_list, "board_rows_k=1.csv"), art_list
+            assert _has(art_list, "run_manifest.json"), art_list
+            assert _has(art_list, "run.stdout.json"), art_list
+        # Both on-disk files reference the same final list.
+        assert sorted(manifest["artifacts_written"]) == \
+            sorted(stdout_file["artifacts_written"])
+        # write_summary.artifacts_written_count matches the final count.
+        assert (manifest["write_summary"]["artifacts_written_count"]
+                == len(manifest["artifacts_written"]))
+        assert (stdout_file["write_summary"]["artifacts_written_count"]
+                == len(stdout_file["artifacts_written"]))
+    finally:
+        if out_dir.exists():
+            import shutil as _sh
+            _sh.rmtree(out_dir, ignore_errors=True)
+
+
+def test_phase_c_manifest_uses_actual_selected_build_path_not_default_root(
+        tmp_path, monkeypatch):
+    """Provenance fix: ``run_manifest.json`` must cite the actual
+    ``selected_build.json`` that preflight consumed (under the
+    operator-supplied ``--stackbuilder-root``), not a recomputed path
+    rooted at ``DEFAULT_STACKBUILDER_ROOT``.
+
+    Layout:
+      * ``custom_stackbuilder/SPY/selected_build.json`` (the one the
+        runner is told to use via ``--stackbuilder-root``).
+      * ``output/stackbuilder/SPY/selected_build.json`` (DECOY at the
+        default root with different contents/SHA). If the bug were
+        present, the manifest would cite this decoy's SHA.
+
+    The test runs under ``monkeypatch.chdir(tmp_path)`` so the
+    sanitizer can map both paths to readable repo-relative POSIX
+    strings.
+    """
+    import hashlib
+
+    monkeypatch.chdir(tmp_path)
+
+    # Custom (real) StackBuilder root the operator points at.
+    custom_root = tmp_path / "custom_stackbuilder"
+    custom_chosen = custom_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(custom_chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(custom_root, "SPY", selected_run_dir=custom_chosen,
+                          payload_extras={"selected_run_id": "CUSTOM-1"})
+    custom_sb = custom_root / "SPY" / "selected_build.json"
+
+    # Decoy default root with DIFFERENT contents so the SHA differs.
+    decoy_root = tmp_path / "output" / "stackbuilder"
+    decoy_chosen = decoy_root / "SPY" / "RUN_DECOY"
+    _make_fake_leaderboard(decoy_chosen, k_to_members={1: ["DECOY[D]"]})
+    _write_selected_build(decoy_root, "SPY", selected_run_dir=decoy_chosen,
+                          payload_extras={"selected_run_id": "DECOY-1"})
+    decoy_sb = decoy_root / "SPY" / "selected_build.json"
+
+    def _sha(p):
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    custom_sha = _sha(custom_sb)
+    decoy_sha = _sha(decoy_sb)
+    assert custom_sha != decoy_sha, (
+        "Test fixture must produce distinct SHAs for the custom "
+        "vs decoy selected_build.json; otherwise the regression "
+        "guard cannot fire."
+    )
+
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+
+    out_dir = tmp_path / "smoke_out"
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", "custom_stackbuilder",
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_OK
+
+    manifest = json.loads(
+        (out_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    refs = manifest["canonical_artifacts_referenced"]
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["secondary"] == "SPY"
+    # The provenance entry must cite the CUSTOM selected_build.json
+    # SHA and a path that includes the custom_stackbuilder root, not
+    # the default output/stackbuilder root.
+    assert ref["selected_build_sha256"] == custom_sha
+    assert ref["selected_build_sha256"] != decoy_sha
+    sb_path_str = str(ref["selected_build_path"])
+    assert "custom_stackbuilder/SPY/selected_build.json" in sb_path_str, (
+        f"manifest cites unexpected selected_build path: "
+        f"{sb_path_str!r}"
+    )
+    assert "output/stackbuilder" not in sb_path_str, (
+        f"manifest leaked the default stackbuilder root: "
+        f"{sb_path_str!r}"
+    )
+    assert ref["explicit_build_override"] is False
+
+    # The manifest must not contain the raw absolute tmp_path string.
+    raw_manifest = (out_dir / "run_manifest.json").read_text(
+        encoding="utf-8")
+    assert str(tmp_path) not in raw_manifest
