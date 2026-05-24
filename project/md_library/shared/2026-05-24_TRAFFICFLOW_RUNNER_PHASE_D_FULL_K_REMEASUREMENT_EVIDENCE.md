@@ -14,14 +14,27 @@ invocation shape against the now-ready surface and characterizes
 end-to-end performance for the full K=1..12 surface across all 8
 Phase 6I-79 secondaries.
 
-**Headline result.** Canonical safety holds. All 96 cells executed.
-Total wall-clock 6,400.48 s (about 1 h 46.7 min). Max peak RSS 478.5
-MiB (MSFT) at about 0.234 percent of the 200 GiB operator-described
-context. **Per-cell elapsed scales sharply with K**: K=1..6 medians
-sit in the 0.3 - 3.0 s band (consistent with PR #311 baseline), while
-K=7..12 medians escalate from 6.87 s (K=7) to 297.55 s (K=12). The
-slowest single cell is MSFT K=12 at 863.30 s (about 14.4 min).
-Phase E canonical-write design must account for this K-tail cost.
+**Headline result.**
+
+- **Correctness and canonical safety: PASS.** All 96 cells executed,
+  all canonical artifacts byte-identical pre/post, zero
+  modifications outside the gitignored session evidence directory.
+- **Performance characterization: PASS WITH NOTES.** Total
+  wall-clock 6,400.48 s (about 1 h 46.7 min). Max peak RSS 478.5 MiB
+  (MSFT) at about 0.234 percent of the 200 GiB operator-described
+  context. Per-cell elapsed scales sharply with K: K=1..6 medians
+  sit in the 0.3 - 3.0 s band (consistent with PR #311 baseline);
+  K=7..12 medians escalate from 6.87 s (K=7) to 297.55 s (K=12);
+  slowest single cell is MSFT K=12 at 863.30 s (about 14.4 min).
+- **Phase E canonical-write design should remain deferred** until a
+  dedicated headless TrafficFlow speed-parity / optimization audit
+  resolves how the sequential, secondary-by-secondary runner
+  invocation shape this PR measured compares to the legacy
+  TrafficFlow secondary-parallel orchestration the engine was
+  optimized against. This PR characterizes the runner's full-K
+  sequential cost; it does not yet prove speed parity with legacy
+  TrafficFlow. See Section 9.5 below and Section 16 for the
+  proposed next-step audit.
 
 ---
 
@@ -279,6 +292,58 @@ CPU/wall ratio 0.961 - 0.977 across all 8 invocations. Consistent
 with `PARALLEL_SUBSETS=0` default - effectively single-threaded with
 minor BLAS / pandas library parallelism.
 
+### 9.5 Legacy TrafficFlow Speed-Parity Caveat
+
+The 1 h 46.7 min full-K wall-clock measured above is the cost of the
+headless runner's specific orchestration shape, not a like-for-like
+benchmark against the legacy Dash TrafficFlow surface. Four points
+are load-bearing for any subsequent Phase E design decision:
+
+- **The headless runner uses the real TrafficFlow compute path.**
+  `trafficflow_runner.py` invokes
+  `trafficflow.build_board_rows(...)` (see line 1740 in
+  `trafficflow_runner.py` and the
+  `_default_compute_loader` wrapper that pins the engine's
+  cache-write / network-fetch surface). There is no compute-shim
+  layer; the same engine function legacy callers used is the
+  function this measurement exercised.
+- **The bitmask fast path is active by default.** `trafficflow.py`
+  sets `TF_BITMASK_FASTPATH = os.environ.get("TF_BITMASK_FASTPATH",
+  "1").lower() in {"1","true","on","yes"}` at module load (see
+  `trafficflow.py` line 258). The default-enabled bitmask path was
+  documented as a 3x speedup (30 s -> 10 s) in
+  `md_library/trafficflow/2025-10-08_BITMASK_ENABLED_AS_PRODUCTION_DEFAULT.md`,
+  and `build_board_rows` selects
+  `_subset_metrics_spymaster_bitmask` when the flag is on. The
+  measurement above ran with that flag on by default; the observed
+  K-tail cost is therefore not explained by missing vectorization.
+- **K=10..12 consumed about 89 percent of total wall-clock.** That
+  share is a combinatorial fact about K-tail subset enumeration,
+  not a runner overhead. Legacy K=6-only measurements (the regime
+  the bitmask fast path was originally tuned against) are not
+  comparable to a K=1..12 sum without explicitly separating the
+  K=1..6 head from the K=7..12 tail.
+- **The runner invoked secondaries one at a time; legacy
+  TrafficFlow ran them in parallel.** Legacy / Dash TrafficFlow
+  used a secondary-level ThreadPoolExecutor (16 workers processing
+  100 secondaries in parallel; see
+  `md_library/trafficflow/2025-10-14_TRAFFICFLOW_PERFORMANCE_BOTTLENECK_ANALYSIS_AND_OPTIMIZATION_PROPOSALS.md`
+  for the outer-parallelization architecture, and
+  `md_library/trafficflow/2025-10-14_TRAFFICFLOW_SUBSET_PARALLELIZATION_TEST_RESULTS_AND_ANALYSIS.md`
+  for the subsequent finding that subset-level parallelism was
+  marginal or slightly slower and not adopted as default). PR #311
+  and this re-measurement intentionally measured sequential
+  per-secondary runner invocations; the K-tail cost in any
+  legacy-equivalent secondary-parallel orchestration will look
+  meaningfully different on wall-clock even if per-cell engine
+  cost is identical.
+
+Therefore: PR #313 characterizes full-K sequential runner cost, but
+does NOT yet prove speed parity with legacy TrafficFlow. A
+dedicated headless TrafficFlow speed-parity / optimization audit
+should answer that question before any Phase E canonical-write
+design proceeds. See Section 16 for the proposed audit scope.
+
 ---
 
 ## 10. Comparison to PR #311
@@ -480,37 +545,67 @@ four invocations exceeded the task spec's 15-minute LONG-RUNNING
 threshold but completed successfully without intervention - the
 LONG-RUNNING annotation is informational, not a failure mode.
 
+15.10 Headless speed parity with legacy TrafficFlow remains
+unproven (informational finding, not a correctness or canonical-
+safety issue). The 1 h 46.7 min full-K sequential wall-clock
+measured here is not directly comparable to legacy TrafficFlow
+performance because (a) legacy TrafficFlow parallelized across
+secondaries and PR #313 did not, and (b) K=10..12 dominates the
+total and was not historically a legacy benchmark target (legacy
+benchmarks were typically K=6-only). The bitmask fast path is
+active by default in `trafficflow.py` and the runner exercises the
+real `trafficflow.build_board_rows` path (see Section 9.5), so the
+observed cost is orchestration and K-tail combinatorics, not
+absence of vectorization. A required follow-up should compare
+K=6-only and K=1..6 runner performance against legacy-equivalent
+orchestration before any Phase E canonical-write design proceeds.
+
 ---
 
 ## 16. Recommendation
 
-**PASS.**
+**PASS WITH NOTES.**
 
-The runner's runtime, memory footprint, and CPU profile are now
-fully characterized across the 8-secondary, K=1..12 operational
-surface under isolated-output `--write` mode. Canonical safety is
-preserved end-to-end. PR #312's PKL readiness repair fully cleared
-the K=7..12 gate, allowing this task to measure the full surface
-without any cell skipping.
+Correctness and canonical safety: PASS. The runner's runtime, peak
+memory, and CPU profile are characterized across the 8-secondary
+K=1..12 operational surface under isolated-output `--write` mode.
+PR #312's PKL readiness repair fully cleared the K=7..12 gate, and
+this task measured the full surface without any cell skipping.
 
-Proposed next step: **Phase E canonical-write design**. Two
-specific Phase E considerations are surfaced by this data and should
-inform that design:
+Performance characterization: PASS WITH NOTES. The 1 h 46.7 min
+full-K sequential wall-clock measured here is not directly
+comparable to legacy TrafficFlow performance, because the headless
+runner invocations were sequential per secondary while legacy
+TrafficFlow used a secondary-level ThreadPoolExecutor, and because
+K=10..12 (about 89 percent of total wall-clock) is not a legacy
+benchmark regime. See Section 9.5 for the speed-parity caveat
+detail.
 
-- **K-tail wall-clock is dominant.** A full 8-secondary x K=1..12
-  canonical-write run on this measurement's exact shape would take
-  about 1 h 47 min sequentially. Phase E design should consider
-  whether canonical writes should default to a smaller K subset
-  (e.g. K=1..6 or K=1..8) with the high-K cells as an opt-in,
-  whether the K=10..12 cells warrant a separate stage with its own
-  invocation cadence, and whether output-side artifact contracts
-  (one combined Excel vs per-K files) should anticipate
-  long-running runs.
-- **Memory is not a binding constraint** at this scale; any
-  parallelism decision must be made on engine-internal
-  serialization grounds, not RAM headroom. This task makes no
-  parallelism recommendation; that is a Phase E sub-task on its
-  own.
+Required next step before Phase E canonical-write design:
+
+  **TrafficFlow runner headless speed-parity / optimization
+  audit.** Suggested scope:
+
+  - Review the legacy TrafficFlow optimization history
+    (`md_library/trafficflow/2025-10-08_BITMASK_ENABLED_AS_PRODUCTION_DEFAULT.md`,
+    `md_library/trafficflow/2025-10-14_TRAFFICFLOW_SUBSET_PARALLELIZATION_TEST_RESULTS_AND_ANALYSIS.md`,
+    `md_library/trafficflow/2025-10-14_TRAFFICFLOW_PERFORMANCE_BOTTLENECK_ANALYSIS_AND_OPTIMIZATION_PROPOSALS.md`).
+  - Compare the sequential per-secondary runner orchestration this
+    PR exercised against a legacy-style secondary-parallel
+    orchestration on equivalent hardware.
+  - Benchmark K=6-only and K=1..6 separately from K=7..12 so the
+    legacy-comparable head can be isolated from the new K-tail.
+  - Confirm `TF_BITMASK_FASTPATH` is active during every measured
+    run and document any environment override.
+  - Keep canonical writes forbidden throughout the audit; reuse the
+    isolated-output `<SESSION_DIR>` pattern.
+  - Do NOT adopt `PARALLEL_SUBSETS=1`, secondary-level concurrency,
+    or any other optimization as a default without separate
+    evidence and operator authorization.
+
+Phase E canonical-write design remains deferred until that audit
+resolves the operational policy for K=10..12 and the question of
+secondary-level parallelism.
 
 ---
 
@@ -518,7 +613,10 @@ This was the Phase D full-K re-measurement after PR #312's PKL
 readiness repair. No canonical artifacts were modified. No PKL or
 price-cache refresh occurred. No `PARALLEL_SUBSETS` override was
 tested. Measurement methodology matches PR #311 (`psutil`
-process-tree polling at 0.5 s interval). All session evidence under
-`<SESSION_DIR>` is gitignored. Phase E canonical-write design can
-responsibly begin, with the K-tail cost characterized above as a
-load-bearing input to that design.
+process-tree polling at 0.5 s interval). The runner exercised the
+real `trafficflow.build_board_rows` compute path with the default
+`TF_BITMASK_FASTPATH=1` setting; the observed K-tail cost reflects
+orchestration and combinatorics, not absence of vectorization. All
+session evidence under `<SESSION_DIR>` is gitignored. Phase E
+canonical-write design remains deferred pending a dedicated
+headless TrafficFlow speed-parity / optimization audit.
