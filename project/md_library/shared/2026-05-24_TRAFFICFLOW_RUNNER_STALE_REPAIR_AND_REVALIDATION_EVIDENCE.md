@@ -94,7 +94,7 @@ The discovered count is within the gate (`<= 50`); the task proceeds.
 
 ## 4. Refresh Gate Verification
 
-All four refresh gates pass:
+All eight refresh gates pass:
 
 | Gate | Result |
 |---|---|
@@ -360,22 +360,25 @@ files. `cwd` field in every payload is the literal placeholder
 
 **PASS.** Phase C can proceed.
 
-The input surface is now fully ELIGIBLE under the Phase B runner's
-strict freshness gate. Phase C's supervised isolated-output smoke
-can run with non-trivial multi-K coverage across all 8 secondaries
-without input gating.
+The input surface is now fully ELIGIBLE across all 8 Phase 6I-79
+secondaries under the Phase B runner's strict freshness gate. Phase C
+can therefore choose meaningful multi-K supervised-smoke targets from
+the now-eligible 8-secondary surface; the actual Phase C target count
+remains a deliberate operator/scope decision rather than a mandate to
+run all 8.
 
 Phase C scope reminders (carried forward from the PR #304 amendment):
 
+- Phase C remains the supervised isolated-output smoke; no canonical
+  `output/trafficflow/` writes (canonical writes are reserved for a
+  later operator-authorized phase).
 - Phase C may pass `--write` ONLY after the Phase C runner
   implementation explicitly supports isolated-output writes AND
   `--output-dir` points to an isolated noncanonical directory.
-- Phase C must NOT write canonical `output/trafficflow/` artifacts
-  (reserved for a later operator-authorized phase).
 - Phase C must NOT issue network fetches unless
   `--allow-network-fetch` is explicitly authorized.
-- Phase C compute work must be limited to the supervised smoke
-  target cells/secondaries.
+- Phase C compute work must be limited to the operator-selected
+  supervised smoke target cells/secondaries.
 
 ## Notes on this evidence task
 
