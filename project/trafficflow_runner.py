@@ -1,29 +1,50 @@
-"""TrafficFlow runner Phase B: dry-run preflight scaffold.
+"""TrafficFlow runner: dry-run preflight (Phase B) + isolated-output
+write support (Phase C).
 
-Phase B of the TrafficFlow headless runner work. Phase A scoping doc:
+Phase A scoping doc:
 ``md_library/shared/2026-05-24_TRAFFICFLOW_RUNNER_EXECUTION_SURFACE.md``.
 
 Behavior contract:
 
-  * Dry-run is the default. The runner never invokes the TrafficFlow
-    compute path in Phase B; it never imports ``trafficflow``.
-  * ``--write`` is unconditionally refused in Phase B (status
-    ``refused`` with reason ``phase_b_write_not_supported``).
+  * Dry-run is the default. Without ``--write``, the runner runs the
+    Phase B preflight (input readiness classification, max-SMA-day
+    verification, freshness gate, eligibility computation) and emits a
+    single JSON envelope on stdout. The dry-run path NEVER imports
+    ``trafficflow``.
+  * ``--write`` is the Phase C isolated-output smoke surface. It is
+    structurally refused when the resolved ``--output-dir`` is the
+    canonical ``output/trafficflow`` root or any descendant; the
+    refusal happens BEFORE any preflight or compute and never imports
+    ``trafficflow``. Canonical ``output/trafficflow`` writes remain
+    reserved for a later operator-authorized phase.
+  * When ``--write`` is authorized for an isolated output directory,
+    the runner runs preflight, invokes ``trafficflow.build_board_rows``
+    via a wrapper that pins the resolved ``selected_build.json``
+    ``combo_leaderboard`` path so the engine cannot fall back to the
+    latest-by-ctime directory scan, and atomically writes
+    ``board_rows_k=<K>.{json,csv}`` per-(secondary, K), plus
+    ``run_manifest.json`` and ``run.stdout.json`` mirrors, all under
+    the isolated directory.
   * Per-secondary ``selected_build.json`` is consumed explicitly. The
     runner refuses any secondary whose ``selected_build.json`` is
-    missing unless ``--explicit-build`` is supplied (and then only when
-    exactly one secondary was requested).
-  * The runner never falls back to a latest-by-ctime directory listing.
-    It does NOT call ``trafficflow._find_latest_combo_table``.
+    missing unless ``--explicit-build`` is supplied (and then only
+    when exactly one secondary was requested).
+  * The runner never falls back to a latest-by-ctime directory
+    listing. It does NOT call ``trafficflow._find_latest_combo_table``
+    directly, and during isolated-write compute it monkey-patches that
+    helper so the engine cannot fall back either.
   * Process-conflict check enumerates command lines and refuses when
-    another engine/runner is active.
+    another engine/runner is active. In write-authorized mode, the
+    runner ALSO fails closed when conflict enumeration itself fails
+    (``status == "error"``).
   * stdout is exactly one JSON object emitted by ``main``.
   * stderr carries human-readable progress, warnings, and tracebacks.
   * Repair flags (``--refresh-missing-pkls`` and
-    ``--refresh-stale-prices``) are report-only in Phase B; the runner
-    computes ``would_refresh_pkls`` / ``would_refresh_prices`` lists
-    but does not invoke ``signal_engine_cache_refresher.py`` and does
-    not call ``trafficflow.refresh_secondary_caches``.
+    ``--refresh-stale-prices``) are report-only across both dry-run
+    and isolated-write modes; the runner computes
+    ``would_refresh_pkls`` / ``would_refresh_prices`` lists but does
+    not invoke ``signal_engine_cache_refresher.py`` and does not call
+    ``trafficflow.refresh_secondary_caches``.
 
 No top-level import of ``trafficflow``, ``signal_engine_cache_refresher``,
 ``stackbuilder``, ``onepass``, ``impactsearch``, ``spymaster``,
@@ -32,6 +53,9 @@ No top-level import of ``trafficflow``, ``signal_engine_cache_refresher``,
 
 ``pandas`` is imported only inside the leaderboard-reading helper to
 keep the dry-run path importable in fixture-free contexts.
+``trafficflow`` is imported only inside the Phase C isolated-write
+compute path; tests inject a ``compute_callable`` to avoid that
+lazy import entirely.
 """
 from __future__ import annotations
 
@@ -1385,6 +1409,7 @@ def preflight_secondary(
         "verdict": None,
         "reason": None,
         "selected_build_consumed": None,
+        "selected_build_path": None,
         "explicit_build_override": False,
         "selected_run_dir": None,
         "combo_leaderboard_path": None,
@@ -1402,6 +1427,7 @@ def preflight_secondary(
     sb = read_selected_build(stackbuilder_root, secondary,
                              explicit_build_path=explicit_build)
     result["selected_build_consumed"] = sb.get("payload")
+    result["selected_build_path"] = sb.get("sb_path")
     result["explicit_build_override"] = sb.get("explicit_build_override", False)
     result["selected_run_dir"] = sb.get("selected_run_dir")
     if sb["status"] == "refused":
@@ -1570,14 +1596,67 @@ def build_would_refresh_lists(
 
 
 def _default_compute_loader() -> Callable[..., list]:
-    """Lazily resolve ``trafficflow.build_board_rows``.
+    """Lazily resolve a TrafficFlow compute wrapper.
+
+    Returns a callable with signature
+    ``(secondary, k, *, run_fence, missing_map, combo_leaderboard_path)``.
+    The wrapper:
+
+      1. Lazily imports ``trafficflow``.
+      2. Pins ``trafficflow._find_latest_combo_table`` to a function
+         that returns the supplied ``combo_leaderboard_path`` for the
+         requested secondary. This prevents the engine from falling
+         back to its latest-by-ctime directory scan when the runner
+         has already resolved the canonical path via
+         ``selected_build.json``.
+      3. Calls ``trafficflow.build_board_rows(secondary, k=k,
+         run_fence=run_fence, missing_map=missing_map)``.
+      4. Restores the original ``_find_latest_combo_table`` in a
+         ``finally`` block whether or not compute raised.
+
+    Raises ``ValueError`` if ``combo_leaderboard_path`` is missing,
+    so a misconfigured caller cannot silently fall through to the
+    engine default.
 
     Only invoked inside the authorized isolated-write execution path.
     Never called during dry-run or canonical-refused paths. Tests inject
-    a fake compute callable rather than triggering this loader.
+    a fake ``compute_callable`` rather than triggering this loader.
     """
     import trafficflow as tf  # local import; not a module-level dependency
-    return tf.build_board_rows
+
+    def _wrapped(secondary, k, *, run_fence, missing_map,
+                 combo_leaderboard_path):
+        if not combo_leaderboard_path:
+            raise ValueError(
+                "trafficflow_runner Phase C compute requires "
+                "combo_leaderboard_path resolved from selected_build.json"
+            )
+        pinned = Path(str(combo_leaderboard_path))
+        original = getattr(tf, "_find_latest_combo_table", None)
+
+        def _pinned_finder(sec, *args, **kwargs):
+            # Pin to the resolved path only when the requested
+            # secondary matches; otherwise raise so the engine's own
+            # cross-secondary lookups cannot silently use a stale path.
+            if str(sec).upper() == str(secondary).upper():
+                return pinned
+            raise RuntimeError(
+                "trafficflow_runner Phase C: unexpected "
+                "_find_latest_combo_table call for "
+                f"{sec!r} (expected {secondary!r})"
+            )
+
+        try:
+            if original is not None:
+                tf._find_latest_combo_table = _pinned_finder
+            return tf.build_board_rows(
+                secondary, k=k, run_fence=run_fence, missing_map=missing_map
+            )
+        finally:
+            if original is not None:
+                tf._find_latest_combo_table = original
+
+    return _wrapped
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -1655,6 +1734,7 @@ def _execute_isolated_write(
         secondary = sec_row.get("secondary")
         elig_map = sec_row.get("k_eligibility") or {}
         members_by_k = sec_row.get("members_by_k") or {}
+        combo_leaderboard_path = sec_row.get("combo_leaderboard_path")
         for k_key, eligibility in elig_map.items():
             cells_requested += 1
             try:
@@ -1691,8 +1771,11 @@ def _execute_isolated_write(
             missing_map: Optional[dict] = None
             t0 = time.perf_counter()
             try:
-                rows = compute(secondary, k_val,
-                               run_fence=run_fence, missing_map=missing_map)
+                rows = compute(
+                    secondary, k_val,
+                    run_fence=run_fence, missing_map=missing_map,
+                    combo_leaderboard_path=combo_leaderboard_path,
+                )
                 if rows is None:
                     rows = []
                 if not isinstance(rows, list):
@@ -1772,7 +1855,14 @@ def _write_run_manifest(
     envelope: dict,
     artifacts_written: list[str],
 ) -> Optional[str]:
-    """Write ``run_manifest.json`` to the isolated output directory."""
+    """Write ``run_manifest.json`` to the isolated output directory.
+
+    ``artifacts_written`` is the final list to record in the manifest,
+    including the manifest path and the ``run.stdout.json`` path; the
+    caller is responsible for assembling that complete list BEFORE
+    invoking this writer so both on-disk run files reference the same
+    set.
+    """
     manifest = {
         "schema_version": PHASE_C_RUN_MANIFEST_SCHEMA,
         "run_id": envelope.get("run_id"),
@@ -1791,7 +1881,7 @@ def _write_run_manifest(
         ),
         "output_dir": path_for_output(str(output_dir)),
         "write_mode": "isolated",
-        "artifacts_written": artifacts_written,
+        "artifacts_written": list(artifacts_written),
     }
     safe = sanitize_for_json(manifest, project_root=Path.cwd())
     path = output_dir / "run_manifest.json"
@@ -1956,6 +2046,23 @@ def main(
                 f"matched={[c.get('matched_pattern') for c in conflict_result.get('conflicts', [])]}")
         _emit_json(envelope)
         return EXIT_PROCESS_CONFLICT
+    # In write-authorized mode, also fail closed on conflict
+    # enumeration errors. Dry-run / non-write modes only treat the
+    # enumeration as advisory and continue.
+    if (write_requested
+            and conflict_result.get("status") == "error"):
+        envelope["status"] = "refused"
+        envelope["errors"].append("process_conflict_enumeration_unavailable")
+        envelope["warnings"].append("process_conflict_enumeration_unavailable")
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: process-conflict enumeration "
+            "unavailable in write mode; refusing write to fail closed."
+        )
+        _emit_json(envelope)
+        return EXIT_PROCESS_CONFLICT
 
     # Secondaries resolution
     sec_res = resolve_secondaries(args)
@@ -2070,30 +2177,44 @@ def main(
             _emit_json(envelope)
             return EXIT_REFUSED
         envelope["status"] = status
-        envelope["artifacts_written"] = artifacts_written
         envelope["write_mode"] = "isolated"
         envelope["next_stage_ready"] = False
         envelope["ended_at"] = _utc_iso()
         envelope["elapsed_seconds"] = round(
             time.perf_counter() - start_t, 4)
-        # Write run_manifest.json + run.stdout.json under the isolated
-        # output dir. The manifest mirrors the sanitized envelope but
-        # includes per_cell_summary, write_summary, and the canonical
-        # selected_build references.
+        # Compute the COMPLETE artifact list before writing either of
+        # the two run files, so both on-disk files (run_manifest.json
+        # and run.stdout.json) reference the same full list including
+        # themselves. Both run files are written under the isolated
+        # output dir.
         output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
-            manifest_rel = _write_run_manifest(
-                output_dir, envelope, artifacts_written)
-            if manifest_rel:
-                envelope["artifacts_written"].append(manifest_rel)
+            manifest_path = output_dir / "run_manifest.json"
             stdout_path = output_dir / "run.stdout.json"
+            manifest_rel = path_for_output(str(manifest_path))
+            stdout_rel = path_for_output(str(stdout_path))
+            final_artifacts = list(artifacts_written)
+            if manifest_rel:
+                final_artifacts.append(manifest_rel)
+            if stdout_rel:
+                final_artifacts.append(stdout_rel)
+            envelope["artifacts_written"] = final_artifacts
+            # Keep write_summary.artifacts_written_count consistent
+            # with the final list now that the two run files are
+            # accounted for.
+            if isinstance(envelope.get("write_summary"), dict):
+                envelope["write_summary"]["artifacts_written_count"] = (
+                    len(final_artifacts)
+                )
+            # Write manifest first; both run files end up referencing
+            # the same final artifact list because manifest_rel /
+            # stdout_rel were appended to the envelope above before
+            # either file was written.
+            _write_run_manifest(output_dir, envelope, final_artifacts)
             safe_envelope = sanitize_for_json(
                 envelope, project_root=Path.cwd())
             _atomic_write_json(stdout_path, safe_envelope)
-            rel_stdout = path_for_output(str(stdout_path))
-            if rel_stdout:
-                envelope["artifacts_written"].append(rel_stdout)
         except Exception as exc:  # pragma: no cover - defensive
             envelope["warnings"].append(
                 f"manifest_write_exception:{type(exc).__name__}"

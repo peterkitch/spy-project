@@ -1085,7 +1085,7 @@ def test_phase_c_isolated_write_succeeds_with_mock_compute(tmp_path, monkeypatch
     sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
 
     captured = {"calls": []}
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         captured["calls"].append((sec, k))
         return [
             {"Ticker": sec, "K": k, "Members": "AAA",
@@ -1141,7 +1141,7 @@ def test_phase_c_isolated_write_skips_ineligible_cell(tmp_path, monkeypatch):
     out_dir = tmp_path / "smoke_out"
 
     captured = {"calls": []}
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         captured["calls"].append((sec, k))
         return [{"K": k, "Members": "AAA"}]
 
@@ -1168,7 +1168,7 @@ def test_phase_c_isolated_write_skips_ineligible_cell(tmp_path, monkeypatch):
 def test_phase_c_isolated_write_emits_sanitized_paths(tmp_path, monkeypatch):
     sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
 
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         return [{"K": k, "Members": "AAA"}]
 
     argv = ["--secondaries", "SPY",
@@ -1217,7 +1217,7 @@ def test_phase_c_refresh_flags_remain_report_only_with_write(tmp_path, monkeypat
     monkeypatch.setattr(runner.subprocess, "run", _no_subproc)
 
     captured = {"calls": []}
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         captured["calls"].append((sec, k))
         return [{"K": k}]
 
@@ -1263,7 +1263,7 @@ def test_phase_c_compute_exception_handled_gracefully(tmp_path, monkeypatch):
                declared_max_sma_day=114, has_sma_114=True)
     out_dir = tmp_path / "smoke_out"
 
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         if k == 2:
             raise RuntimeError("synthetic compute failure for K=2")
         return [{"K": k, "Members": "AAA"}]
@@ -1294,7 +1294,7 @@ def test_phase_c_compute_exception_handled_gracefully(tmp_path, monkeypatch):
 def test_phase_c_no_tmp_files_remain_after_isolated_write(tmp_path, monkeypatch):
     sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
 
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         return [{"K": k}]
 
     argv = ["--secondaries", "SPY",
@@ -1390,7 +1390,7 @@ def test_phase_c_no_writes_when_all_cells_ineligible(tmp_path, monkeypatch):
     out_dir = tmp_path / "smoke_out"
 
     captured = {"calls": []}
-    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None, combo_leaderboard_path=None):
         captured["calls"].append((sec, k))
         return [{"K": k}]
 
@@ -1407,3 +1407,210 @@ def test_phase_c_no_writes_when_all_cells_ineligible(tmp_path, monkeypatch):
     assert summary["cells_written"] == 0
     assert payload["status"] == "failed"
     assert not (out_dir / "SPY" / "board_rows_k=1.json").exists()
+
+
+# ===========================================================================
+# Phase C amendment - selected-build enforcement, process-conflict fail-
+# closed, complete artifact list, docstring/contract reaffirmations.
+# ===========================================================================
+
+
+def test_phase_c_compute_callable_receives_combo_leaderboard_path(
+        tmp_path, monkeypatch):
+    """The runner threads the preflight-resolved combo_leaderboard_path
+    into the compute callable."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+    seen: dict = {}
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        seen["combo_leaderboard_path"] = combo_leaderboard_path
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_OK
+    # The compute callable receives the RAW (unsanitized) leaderboard
+    # path so the engine can actually open the file. The sanitized
+    # equivalent in payload["per_secondary_results"] is redacted when
+    # the tmp_path is outside the project root, so we can only assert
+    # structural properties on what compute saw.
+    assert seen["combo_leaderboard_path"], "compute did not receive the path"
+    assert "combo_leaderboard" in str(seen["combo_leaderboard_path"])
+    # The resolved file must actually exist on disk where the runner
+    # said it did - that proves the path is the preflight-resolved
+    # path, not None or a decoy.
+    assert Path(seen["combo_leaderboard_path"]).exists()
+
+
+def test_phase_c_selected_build_enforced_during_default_compute(
+        tmp_path, monkeypatch):
+    """Inject a fake trafficflow into sys.modules and verify the
+    _default_compute_loader wrapper pins _find_latest_combo_table to
+    the selected combo_leaderboard path during build_board_rows and
+    restores the original finder after the call."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    decoy_path = tmp_path / "decoy" / "combo_leaderboard.xlsx"
+    decoy_path.parent.mkdir(parents=True, exist_ok=True)
+    decoy_path.write_text("decoy", encoding="utf-8")
+
+    seen: dict = {"finder_calls": []}
+
+    fake_tf = SimpleNamespace()
+    def _original_finder(sec):
+        seen["finder_calls"].append(("ORIGINAL", sec))
+        return Path(decoy_path)
+    fake_tf._find_latest_combo_table = _original_finder
+
+    def _fake_build_board_rows(sec, k, *, run_fence=None, missing_map=None):
+        # The engine would normally call _find_latest_combo_table here.
+        # The wrapper must have pinned this attribute to a function
+        # returning the SELECTED path BEFORE this call.
+        path_via_finder = fake_tf._find_latest_combo_table(sec)
+        seen["finder_used_by_build"] = path_via_finder
+        return [{"K": k, "Members": "AAA"}]
+    fake_tf.build_board_rows = _fake_build_board_rows
+
+    sys.modules["trafficflow"] = fake_tf
+    try:
+        argv = ["--secondaries", "SPY",
+                "--stackbuilder-root", str(sb_root),
+                "--k", "1",
+                "--write",
+                "--output-dir", str(out_dir)]
+        # NO compute_callable -> _default_compute_loader is used.
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict)
+    finally:
+        del sys.modules["trafficflow"]
+
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "ok"
+    pinned_used = seen.get("finder_used_by_build")
+    assert pinned_used is not None
+    assert "combo_leaderboard" in str(pinned_used)
+    assert "decoy" not in str(pinned_used)
+    # Original finder restored AFTER compute - verifiable by calling
+    # it now and observing the ORIGINAL decoy-returning behavior.
+    restored_result = fake_tf._find_latest_combo_table("SPY")
+    assert "decoy" in str(restored_result)
+    assert ("ORIGINAL", "SPY") in seen["finder_calls"]
+
+
+def test_phase_c_write_refuses_on_process_conflict_enumeration_error(
+        tmp_path, monkeypatch):
+    """Write mode fails closed when process-conflict enumeration
+    fails (status='error')."""
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    def _conflict_error(write_requested=False):
+        return {
+            "status": "error",
+            "conflicts": [],
+            "queried_via": "fake",
+            "error": "enumeration_unavailable",
+        }
+
+    captured = {"calls": 0}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        captured["calls"] += 1
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_conflict_error,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_PROCESS_CONFLICT
+    assert payload["status"] == "refused"
+    assert "process_conflict_enumeration_unavailable" in payload["errors"]
+    assert captured["calls"] == 0
+    assert not (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert not (out_dir / "run_manifest.json").exists()
+    assert not (out_dir / "run.stdout.json").exists()
+
+
+def test_phase_c_on_disk_artifact_lists_are_complete(tmp_path, monkeypatch):
+    """run_manifest.json and run.stdout.json on disk both enumerate
+    the complete artifact list including themselves and the per-cell
+    board-row JSON + CSV.
+
+    The output dir is placed UNDER the project root so the sanitizer
+    converts artifact paths to repo-relative POSIX strings rather than
+    redacting them to ``<ABSOLUTE_PATH_REDACTED>``. The repo-relative
+    rendering is what the test asserts on by substring.
+    """
+    # Build the stackbuilder fixture under tmp_path but emit artifacts
+    # to a project-root-relative directory so the sanitizer can map
+    # them back to readable repo-relative POSIX strings. The test
+    # cleans up after itself.
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    out_dir = PROJECT_ROOT / f"logs/_pytest_phase_c_artifact_list_{os.getpid()}"
+    # Defensive cleanup if a prior aborted run left this dir behind.
+    if out_dir.exists():
+        import shutil as _sh
+        _sh.rmtree(out_dir, ignore_errors=True)
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None,
+                       combo_leaderboard_path=None):
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    try:
+        rc, payload, _, _ = _capture_main(
+            argv, process_conflict_checker=_no_conflict,
+            compute_callable=_fake_compute)
+        assert rc == runner.EXIT_OK
+
+        manifest = json.loads(
+            (out_dir / "run_manifest.json").read_text(encoding="utf-8"))
+        stdout_file = json.loads(
+            (out_dir / "run.stdout.json").read_text(encoding="utf-8"))
+
+        def _has(art_list, needle):
+            return any(needle in str(a) for a in art_list)
+
+        for art_list in (manifest["artifacts_written"],
+                         stdout_file["artifacts_written"]):
+            assert _has(art_list, "board_rows_k=1.json"), art_list
+            assert _has(art_list, "board_rows_k=1.csv"), art_list
+            assert _has(art_list, "run_manifest.json"), art_list
+            assert _has(art_list, "run.stdout.json"), art_list
+        # Both on-disk files reference the same final list.
+        assert sorted(manifest["artifacts_written"]) == \
+            sorted(stdout_file["artifacts_written"])
+        # write_summary.artifacts_written_count matches the final count.
+        assert (manifest["write_summary"]["artifacts_written_count"]
+                == len(manifest["artifacts_written"]))
+        assert (stdout_file["write_summary"]["artifacts_written_count"]
+                == len(stdout_file["artifacts_written"]))
+    finally:
+        if out_dir.exists():
+            import shutil as _sh
+            _sh.rmtree(out_dir, ignore_errors=True)
