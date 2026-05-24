@@ -1595,7 +1595,81 @@ def build_would_refresh_lists(
 # ---------------------------------------------------------------------------
 
 
-def _default_compute_loader() -> Callable[..., list]:
+ENGINE_NETWORK_SURFACE_NAMES: tuple[str, ...] = (
+    "_needs_refresh",
+    "_fetch_secondary_from_yf",
+    "_write_cache_file",
+    "_persist_cache",
+)
+
+
+def _patch_engine_network_surface(tf_module: Any) -> dict:
+    """Pin every engine-internal surface that can write to
+    ``price_cache/daily/`` or fetch from network during compute.
+
+    Returns a ``saved`` dict whose keys mirror
+    ``ENGINE_NETWORK_SURFACE_NAMES`` and whose values are the original
+    callables. ``_restore_engine_surface`` consumes this dict to undo
+    the patches.
+
+    Pin behavior:
+
+      * ``_needs_refresh``: returns ``False`` so the engine's
+        freshness gate concludes the existing on-disk cache is
+        usable; this short-circuits the fetch / write path without
+        raising.
+      * ``_fetch_secondary_from_yf``: returns an empty pandas
+        DataFrame with the ``Close`` column the caller expects on
+        empty-result paths. The engine's own ``if fresh.empty: return
+        fresh`` short-circuit then prevents any cache write.
+      * ``_write_cache_file``: fails closed with
+        ``RuntimeError("engine_price_cache_write_blocked")`` so any
+        path that bypasses the two short-circuits above cannot
+        silently mutate ``price_cache/daily/``.
+      * ``_persist_cache``: same fail-closed behavior. This catches
+        the alternate cache-writer path used by
+        ``_yf_fetch_incremental`` and ``refresh_secondary_caches``.
+
+    Caller is responsible for calling ``_restore_engine_surface`` in
+    a ``finally`` block.
+    """
+    import pandas as pd  # local import; matches the lazy contract
+    saved: dict[str, Any] = {
+        name: getattr(tf_module, name, None)
+        for name in ENGINE_NETWORK_SURFACE_NAMES
+    }
+
+    def _blocked_needs_refresh(*args, **kwargs):
+        return False
+
+    def _blocked_fetch_secondary_from_yf(*args, **kwargs):
+        return pd.DataFrame(columns=["Close"])
+
+    def _blocked_write_cache_file(*args, **kwargs):
+        raise RuntimeError("engine_price_cache_write_blocked")
+
+    def _blocked_persist_cache(*args, **kwargs):
+        raise RuntimeError("engine_price_cache_write_blocked")
+
+    tf_module._needs_refresh = _blocked_needs_refresh
+    tf_module._fetch_secondary_from_yf = _blocked_fetch_secondary_from_yf
+    tf_module._write_cache_file = _blocked_write_cache_file
+    tf_module._persist_cache = _blocked_persist_cache
+    return saved
+
+
+def _restore_engine_surface(tf_module: Any, saved: dict) -> None:
+    """Restore every engine-internal surface saved by
+    ``_patch_engine_network_surface``. Idempotent on missing keys."""
+    for name in ENGINE_NETWORK_SURFACE_NAMES:
+        original = saved.get(name)
+        if original is not None:
+            setattr(tf_module, name, original)
+
+
+def _default_compute_loader(
+    *, allow_network_fetch: bool = False,
+) -> Callable[..., list]:
     """Lazily resolve a TrafficFlow compute wrapper.
 
     Returns a callable with signature
@@ -1609,10 +1683,21 @@ def _default_compute_loader() -> Callable[..., list]:
          back to its latest-by-ctime directory scan when the runner
          has already resolved the canonical path via
          ``selected_build.json``.
-      3. Calls ``trafficflow.build_board_rows(secondary, k=k,
+      3. When ``allow_network_fetch`` is False, additionally pins
+         ``trafficflow._needs_refresh``,
+         ``trafficflow._fetch_secondary_from_yf``,
+         ``trafficflow._write_cache_file``, and
+         ``trafficflow._persist_cache`` per
+         ``_patch_engine_network_surface``. This closes the PR #307
+         finding: the engine's compute-time price-cache freshness
+         gate cannot write to ``price_cache/daily/`` while the runner
+         is in isolated-write mode without explicit network
+         authorization.
+      4. Calls ``trafficflow.build_board_rows(secondary, k=k,
          run_fence=run_fence, missing_map=missing_map)``.
-      4. Restores the original ``_find_latest_combo_table`` in a
-         ``finally`` block whether or not compute raised.
+      5. Restores every original in a single ``finally`` block - even
+         on ``Exception`` and ``BaseException`` (including
+         ``KeyboardInterrupt``).
 
     Raises ``ValueError`` if ``combo_leaderboard_path`` is missing,
     so a misconfigured caller cannot silently fall through to the
@@ -1632,7 +1717,8 @@ def _default_compute_loader() -> Callable[..., list]:
                 "combo_leaderboard_path resolved from selected_build.json"
             )
         pinned = Path(str(combo_leaderboard_path))
-        original = getattr(tf, "_find_latest_combo_table", None)
+        original_finder = getattr(tf, "_find_latest_combo_table", None)
+        engine_surface_saved: Optional[dict] = None
 
         def _pinned_finder(sec, *args, **kwargs):
             # Pin to the resolved path only when the requested
@@ -1647,14 +1733,21 @@ def _default_compute_loader() -> Callable[..., list]:
             )
 
         try:
-            if original is not None:
+            if original_finder is not None:
                 tf._find_latest_combo_table = _pinned_finder
+            if not allow_network_fetch:
+                engine_surface_saved = _patch_engine_network_surface(tf)
             return tf.build_board_rows(
                 secondary, k=k, run_fence=run_fence, missing_map=missing_map
             )
         finally:
-            if original is not None:
-                tf._find_latest_combo_table = original
+            # Restoration runs on normal return, on Exception, and on
+            # BaseException (including KeyboardInterrupt). The bare
+            # try/finally above already guarantees that.
+            if original_finder is not None:
+                tf._find_latest_combo_table = original_finder
+            if engine_surface_saved is not None:
+                _restore_engine_surface(tf, engine_surface_saved)
 
     return _wrapped
 
@@ -1728,7 +1821,18 @@ def _execute_isolated_write(
     consec_errors = 0
     short_circuit = False
 
-    compute = compute_callable if compute_callable is not None else _default_compute_loader()
+    # Resolve the compute callable. If the caller did not inject one,
+    # use the lazy loader and thread the operator's
+    # ``allow_network_fetch`` decision through so the wrapper can pin
+    # the engine's network / price-cache surface when network access
+    # is not authorized.
+    allow_network_fetch = bool(getattr(args, "allow_network_fetch", False))
+    if compute_callable is None:
+        compute = _default_compute_loader(
+            allow_network_fetch=allow_network_fetch
+        )
+    else:
+        compute = compute_callable
 
     for sec_row in per_secondary:
         secondary = sec_row.get("secondary")
