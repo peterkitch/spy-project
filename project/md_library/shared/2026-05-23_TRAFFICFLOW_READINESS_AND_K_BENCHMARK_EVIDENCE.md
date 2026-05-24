@@ -327,17 +327,29 @@ ticker list passed was strictly the 6 missing target secondaries.
 | NVDA  | yfinance fetch -> csv | 0.33 | 2026-05-22 | 6,876 | 212,621 | OK |
 | TSLA  | yfinance fetch -> csv | 0.26 | 2026-05-22 | 4,000 | 121,445 | OK |
 
-`AAPL.csv` and `SPY.csv` were left in place under
-TrafficFlow's `_needs_refresh -> False` monkey-patch for the
-benchmark; the benchmark therefore treats the existing AAPL/SPY tails
-(2026-05-04 / 2026-05-14) as "current enough" by the patched
-freshness contract. All six warmed secondaries reached tail
-`2026-05-22`, the most recent fully closed equity session on
-yfinance at session time.
+In the initial repair pass, `AAPL.csv` and `SPY.csv` were left in
+place under TrafficFlow's `_needs_refresh -> False` monkey-patch and
+the benchmark proceeded with their stale tails (AAPL 2026-05-04,
+SPY 2026-05-14). The six warmed secondaries all reached tail
+`2026-05-22` in that initial repair pass, the most recent fully
+closed equity session on yfinance at session time.
 
-No write occurred outside `price_cache/daily/`. The 4 pre-existing
-extras (`HD.csv`, `JNJ.csv`, `MCD.csv`, `WMT.csv`) carry session-
-unrelated mtimes from 2026-05-15 and were not touched.
+**Amendment (PR #301 re-audit): AAPL and SPY price caches were
+subsequently refreshed via the same
+`trafficflow.refresh_secondary_caches([sec], force=False)` path used
+for the other six secondaries.** Both reached tail `2026-05-22`
+uniformly. Per-secondary detail:
+
+| Secondary | Action | Elapsed (s) | Tail pre | Tail post | Size pre | Size post | Status |
+|---|---|---:|---|---|---:|---:|---|
+| AAPL | yfinance fetch -> csv (refresh) | 0.38 | 2026-05-04 | 2026-05-22 | 347,925 | 344,941 | OK |
+| SPY  | yfinance fetch -> csv (refresh) | 0.17 | 2026-05-14 | 2026-05-22 | 231,840 | 231,432 | OK |
+
+After the amendment, all 8 target secondaries carry tail
+`2026-05-22` uniformly. No write occurred outside `price_cache/daily/`
+during the amendment. The 4 pre-existing extras (`HD.csv`, `JNJ.csv`,
+`MCD.csv`, `WMT.csv`) carry session-unrelated mtimes from 2026-05-15
+and were not touched.
 
 ## 11. Bounded Repair: TrafficFlow PKL Generation via signal_engine_cache_refresher.py
 
@@ -462,8 +474,10 @@ landed outside `cache/results/` or `cache/status/`.
 
 By max-SMA class: 61 MATCH, 0 other.
 
-By secondary price-cache state: all 8 target secondaries on disk,
-all tails `2026-05-22` (six warmed this session; AAPL/SPY pre-existing).
+By secondary price-cache state, after the PR #301 amendment refresh:
+all 8 target secondaries on disk, all tails uniformly `2026-05-22`
+(six warmed in the initial repair pass; AAPL and SPY refreshed in
+the amendment via the same bounded path).
 
 ## 13. Benchmark Eligibility
 
@@ -482,56 +496,74 @@ rule in section 7. The matrix:
 | TSLA  | ELIGIBLE | ELIGIBLE | ELIGIBLE | ELIGIBLE | ELIGIBLE |
 
 40 of 40 cells are ELIGIBLE. No cell is DATA-GATED, PKL-GATED,
-MAX-SMA-GATED, STALE-GATED, or ERROR.
+MAX-SMA-GATED, STALE-GATED, or ERROR. After the PR #301 amendment
+refresh (section 10), AAPL and SPY are ELIGIBLE on the same
+uniform-tail basis as the other six secondaries; the original
+benchmark's stale-tail caveat for AAPL/SPY no longer applies.
 
 ## 14. PARALLEL_SUBSETS=0 Results
 
 Variant: subprocess invoked with `PARALLEL_SUBSETS=0`. Default
 TrafficFlow flags (bitmask fastpath ON, post-intersect fastpath OFF).
-3 reps per cell, median reported.
+3 reps per cell, median reported. AAPL and SPY values reflect the
+PR #301 amendment re-run against the refreshed `2026-05-22` price
+caches; the other six secondaries are unchanged from the initial
+benchmark.
 
-| Secondary | K1 | K2 | K3 | K4 | K6 | rows@K6 |
-|---|---:|---:|---:|---:|---:|---:|
-| AAPL  | 0.167 | 0.338 | 0.772 | 0.876 | 1.975 | 1 |
-| AMZN  | 0.138 | 0.228 | 0.300 | 0.436 | 0.584 | 1 |
-| GOOGL | 0.107 | 0.144 | 0.252 | 0.453 | 0.986 | 1 |
-| META  | 0.066 | 0.160 | 0.416 | 0.777 | 3.634 | 1 |
-| MSFT  | 0.159 | 0.338 | 0.423 | 0.829 | 3.688 | 1 |
-| NVDA  | 0.031 | 0.151 | 0.202 | 0.340 | 1.155 | 1 (K=1 row=0; see section 17) |
-| SPY   | 0.110 | 0.312 | 0.661 | 0.813 | 3.290 | 1 |
-| TSLA  | 0.115 | 0.176 | 0.481 | 0.824 | 1.791 | 1 |
+| Secondary | K1 | K2 | K3 | K4 | K6 | rows@K6 | Source |
+|---|---:|---:|---:|---:|---:|---:|---|
+| AAPL  | 0.165 | 0.367 | 0.783 | 0.865 | 1.938 | 1 | amendment refresh |
+| AMZN  | 0.138 | 0.228 | 0.300 | 0.436 | 0.584 | 1 | initial |
+| GOOGL | 0.107 | 0.144 | 0.252 | 0.453 | 0.986 | 1 | initial |
+| META  | 0.066 | 0.160 | 0.416 | 0.777 | 3.634 | 1 | initial |
+| MSFT  | 0.159 | 0.338 | 0.423 | 0.829 | 3.688 | 1 | initial |
+| NVDA  | 0.031 | 0.151 | 0.202 | 0.340 | 1.155 | 1 (K=1 row=0; see section 17) | initial |
+| SPY   | 0.112 | 0.321 | 0.663 | 0.825 | 3.390 | 1 | amendment refresh |
+| TSLA  | 0.115 | 0.176 | 0.481 | 0.824 | 1.791 | 1 | initial |
 
 Per-K row counts (across the full 8-secondary sweep, serial): K1=7,
 K2=8, K3=8, K4=8, K6=8 (NVDA K1 is the only 0-row cell; this is a
 real TrafficFlow active-member filter outcome, not a readiness gap;
-see section 17).
+see section 17). The amendment re-run reproduced the same row count
+pattern.
 
-Serial sum across 8 secondaries:
-K1: 0.893s, K2: 1.847s, K3: 3.507s, K4: 5.348s, K6: 17.103s.
+Serial sum across 8 secondaries (post-amendment):
+K1: 0.893 s, K2: 1.885 s, K3: 3.520 s, K4: 5.349 s, K6: 17.166 s.
+(Initial values were K6 17.103 s; the amendment shifted the K=6 sum
+by +0.063 s, within run-to-run noise.)
 
 ## 15. PARALLEL_SUBSETS=1 Results
 
 Variant: subprocess invoked with `PARALLEL_SUBSETS=1`. Same other
-defaults. 3 reps per cell, median reported.
+defaults. 3 reps per cell, median reported. AAPL and SPY values
+reflect the PR #301 amendment re-run against the refreshed
+`2026-05-22` price caches; the other six secondaries are unchanged
+from the initial benchmark.
 
-| Secondary | K1 | K2 | K3 | K4 | K6 |
-|---|---:|---:|---:|---:|---:|
-| AAPL  | 0.166 | 0.339 | 0.767 | 0.877 | 1.965 |
-| AMZN  | 0.142 | 0.234 | 0.310 | 0.451 | 0.598 |
-| GOOGL | 0.106 | 0.148 | 0.252 | 0.458 | 1.028 |
-| META  | 0.066 | 0.161 | 0.421 | 0.805 | 3.842 |
-| MSFT  | 0.162 | 0.354 | 0.440 | 0.850 | 3.761 |
-| NVDA  | 0.031 | 0.152 | 0.201 | 0.343 | 1.165 |
-| SPY   | 0.112 | 0.320 | 0.660 | 0.814 | 3.411 |
-| TSLA  | 0.115 | 0.178 | 0.495 | 0.838 | 1.907 |
+| Secondary | K1 | K2 | K3 | K4 | K6 | Source |
+|---|---:|---:|---:|---:|---:|---|
+| AAPL  | 0.170 | 0.345 | 0.793 | 0.876 | 1.946 | amendment refresh |
+| AMZN  | 0.142 | 0.234 | 0.310 | 0.451 | 0.598 | initial |
+| GOOGL | 0.106 | 0.148 | 0.252 | 0.458 | 1.028 | initial |
+| META  | 0.066 | 0.161 | 0.421 | 0.805 | 3.842 | initial |
+| MSFT  | 0.162 | 0.354 | 0.440 | 0.850 | 3.761 | initial |
+| NVDA  | 0.031 | 0.152 | 0.201 | 0.343 | 1.165 | initial |
+| SPY   | 0.110 | 0.316 | 0.654 | 0.819 | 3.330 | amendment refresh |
+| TSLA  | 0.115 | 0.178 | 0.495 | 0.838 | 1.907 | initial |
 
-Parallel sum across 8 secondaries:
-K1: 0.900s, K2: 1.886s, K3: 3.546s, K4: 5.436s, K6: 17.677s.
+Parallel sum across 8 secondaries (post-amendment):
+K1: 0.902 s, K2: 1.888 s, K3: 3.564 s, K4: 5.440 s, K6: 17.577 s.
+(Initial values were K6 17.677 s; the amendment shifted the K=6
+parallel sum by -0.100 s, again within run-to-run noise.)
 
 ## 16. Parallel Comparison Summary
 
 Speedup ratio (serial wall_med / parallel wall_med) across all 39
-non-empty cells: range 0.94 - 1.01, median 0.99.
+non-empty cells (post-amendment, where AAPL/SPY values come from the
+refreshed re-run): range 0.94 - 1.06, median 0.99. The AAPL/SPY
+ratios moved slightly under the amendment re-run but remain in the
+"no material speedup" band; the cross-variant conclusion is
+unchanged.
 
 PARALLEL_SUBSETS=1 does NOT materially regress, but it also does NOT
 materially speed up the benchmark workload. For K=4 and K=6
@@ -567,9 +599,21 @@ evidence task.
   deterministic across all 3 reps within each variant for every
   non-empty cell.
 - Cross-variant determinism: **all 39 non-empty cells produce the
-  same row hash under PARALLEL_SUBSETS=0 and PARALLEL_SUBSETS=1.**
+  same row hash under PARALLEL_SUBSETS=0 and PARALLEL_SUBSETS=1** in
+  both the initial benchmark and the PR #301 amendment re-run (10/10
+  matching hashes for the re-run AAPL+SPY cells, 29/29 unchanged
+  hashes carried from the initial benchmark for the other six).
   Threading did not introduce non-determinism, consistent with the
   per-subset averaging step using stable arithmetic.
+- Cross-pass observation: the amendment refresh shifted the
+  `preprocessed_data` tail of AAPL.csv and SPY.csv forward (to
+  2026-05-22). Most AAPL/SPY cell row hashes therefore changed
+  between the initial pass and the amendment pass because the
+  "Today" / "TMRW" snapshot fields in the board row depend on the
+  secondary's price index. The SPY K=1 row hash did NOT change (the
+  K=1 fast path's snapshot is anchored on the lone member's PKL
+  index, which was unchanged). This is the expected behavior of the
+  refresh, not a determinism issue.
 
 ## 18. Bottleneck Profiling Summary
 
@@ -662,11 +706,11 @@ Overall: **PASS WITH NOTES**.
 shows no speedup, leaving K-scaling acceleration as an open
 implementation question for headless TrafficFlow; (b) NVDA K=1
 produced 0 rows for a real runtime-data reason that downstream
-documentation should expect; (c) AAPL.csv and SPY.csv were used
-"as-is" with stale tails (2026-05-04 and 2026-05-14 respectively),
-under monkey-patched `_needs_refresh -> False`, rather than refreshed
-to the 2026-05-22 tail the other 6 secondaries reached - a future
-benchmark may want uniform tails across all 8 secondaries.
+documentation should expect. The earlier AAPL/SPY stale-tail caveat
+has been resolved by the PR #301 amendment (section 10); all 8
+target secondaries now carry the uniform `2026-05-22` tail and the
+amendment re-run reproduced the same ELIGIBLE / 1-row outcome at
+sub-4-second wall time per cell.
 
 ## 20. Canonical Artifact Safety Check
 
@@ -680,7 +724,7 @@ Post-run snapshot diff against pre-run state:
 | `signal_library/data/stable/` | 71,980 | 71,980 | yes |
 | `output/validation/` | 0 | 0 | yes |
 
-Authorized writes:
+Authorized writes (initial repair pass):
 
 - `price_cache/daily/`: 6 ADDED (AMZN, GOOGL, META, MSFT, NVDA,
   TSLA); 0 modified outside the 8-target set. The 4 pre-existing
@@ -690,6 +734,24 @@ Authorized writes:
 - `cache/status/`: 14 ADDED (matching the bounded generation set);
   0 unexpected content changes.
 
+Authorized writes (PR #301 amendment, in addition to the above):
+
+- `price_cache/daily/AAPL.csv`: CONTENT CHANGED (tail advanced from
+  2026-05-04 to 2026-05-22; size 347,925 -> 344,941 bytes).
+- `price_cache/daily/SPY.csv`: CONTENT CHANGED (tail advanced from
+  2026-05-14 to 2026-05-22; size 231,840 -> 231,432 bytes).
+- `cache/results/`: **UNCHANGED** in the amendment (file count and
+  latest mtime both unchanged; no PKL was generated or rewritten).
+- `cache/status/`: **UNCHANGED** in the amendment (file count and
+  latest mtime both unchanged).
+- `output/stackbuilder/`, `output/impactsearch/`, `output/onepass/`,
+  `signal_library/data/stable/`: all UNCHANGED in the amendment
+  (file counts and latest mtimes unchanged; `output/onepass/onepass.xlsx`
+  SHA-256 unchanged; `output/impactsearch/` xlsx SHA-256 set
+  unchanged).
+- No tracked code or test file was modified; only the evidence doc
+  (this file) was modified as a tracked artifact.
+
 ## 21. Remaining Gaps Before TrafficFlow Headless
 
 - **K-scaling parallelism is unresolved.** PARALLEL_SUBSETS=1 fires
@@ -698,13 +760,16 @@ Authorized writes:
   leaderboards: process-level parallelism, Cython / numba for
   `_subset_metrics_spymaster_bitmask`, or accepting the serial
   ceiling under the 1-row-per-K Phase 6I-79 density.
-- **Price-cache freshness contract.** This benchmark relied on a
-  monkey-patched `_needs_refresh -> False`. Headless TrafficFlow
-  needs an explicit refresh policy: refuse to compute on stale
-  secondary prices, or refresh in-process before computing. The
-  current `refresh_secondary_caches` helper proved bounded and
-  fast (sub-second per ticker), so an in-process refresh path is
-  feasible.
+- **Price-cache freshness contract.** The initial benchmark relied
+  on a monkey-patched `_needs_refresh -> False` for AAPL/SPY; the
+  PR #301 amendment then refreshed those two via the same
+  `trafficflow.refresh_secondary_caches([sec], force=False)` helper
+  used for the other six. Headless TrafficFlow still needs an
+  explicit refresh policy (refuse to compute on stale secondary
+  prices, or refresh in-process before computing). The helper proved
+  bounded and fast (sub-second per ticker for AAPL and SPY in the
+  amendment refresh: 0.38 s and 0.17 s respectively), so an
+  in-process refresh path is feasible.
 - **Manifest schema dual surface.** Existing TrafficFlow-consumed
   PKLs carry `max_sma_day` at the manifest top level; PKLs generated
   by current `signal_engine_cache_refresher.py` carry it at
