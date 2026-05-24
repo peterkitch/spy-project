@@ -193,3 +193,152 @@ The decision should be based on measured evidence, not assumption:
 - Can results be explained clearly to the operator and downstream UI users?
 
 For now: parked. Captured here so the idea survives without disrupting the current sprint.
+
+## Phase 7+ Carry-Forward Items
+
+These items were identified during a Codex classification audit of accumulated technical debt and architectural ideas. Each item is parked for Phase 7+ prioritization. None are implementation-ready. Capture here ensures the ideas survive outside of conversation memory.
+
+### 1. B11 compute_signals cleanup
+
+Description: Deferred technical debt in the Spymaster `compute_signals` path, carried forward from the Post-Phase-3 sprint. The exact cleanup scope was not fully specified and requires source inspection at Phase 7+ planning time.
+
+Why deferred: Not blocking current TrafficFlow headless work unless Spymaster cleanup is pulled forward by operator decision.
+
+Open questions:
+
+- What specifically needs cleanup in `compute_signals`?
+- Does it affect Spymaster headless conversion if one is ever pursued?
+- Is it a correctness issue, a clarity issue, or a performance issue?
+
+### 2. environment.yml / requirements.txt hygiene
+
+Description: Dependency manifest cleanup. CLAUDE.md notes that the existing manifests do not match the pinned audit environment. This item covers future hygiene work to bring dependency documentation and rebuild paths into alignment.
+
+Why deferred: Important for environment rebuild and deployment scenarios, but not sprint-critical until cloud compute or fresh-environment provisioning becomes active work.
+
+Open questions:
+
+- What is the canonical dependency set that should be reflected?
+- Should `environment.yml` and `requirements.txt` both be maintained, or should one be the source of truth?
+- Are there pinned versions that need to be relaxed for portability?
+
+### 3. OnePass error UX
+
+Description: Deferred UI/operational issue from the Post-Phase-3 Codex audit. OnePass error messaging and handling behavior needs review for clarity and actionability.
+
+Why deferred: Not needed for current StackBuilder outputs or imminent TrafficFlow headless consumption. Improves operational experience but is not a correctness blocker.
+
+Open questions:
+
+- Which OnePass error paths produce the most confusing or unhelpful messaging?
+- Is the issue surfaced in Dash UI, in the headless runner, or both?
+- What is the desired error contract for downstream consumers?
+
+### 4. ImpactSearch error taxonomy
+
+Description: Error categorization in the ImpactSearch pipeline. Future robustness work should give ImpactSearch a structured error taxonomy.
+
+Why deferred: ImpactSearch inputs are already available for the current pipeline path. Taxonomy cleanup is future work, not a current blocker.
+
+Open questions:
+
+- What error categories does ImpactSearch currently emit?
+- Which categories should be retryable, fatal, or operator-actionable?
+- Does the taxonomy need to align with OnePass or StackBuilder error conventions?
+
+### 5. StackBuilder progress JSON
+
+Description: Progress JSON schema or behavior refinements in StackBuilder. This is future observability work.
+
+Why deferred: StackBuilder production runs have completed successfully under current progress JSON behavior. Refinements are deferred unless a concrete downstream blocker appears.
+
+Open questions:
+
+- What specifically needs refinement in the progress JSON?
+- Is the issue schema, frequency, completeness, or something else?
+- Is this needed before headless TrafficFlow consumption of StackBuilder outputs?
+
+### 6. TickerDash global single-job model
+
+Description: TickerDash currently uses a global single-job model for processing. This is a broader UI/concurrency model issue.
+
+Why deferred: Not part of current StackBuilder or imminent TrafficFlow headless work. Concurrency refactor is a larger investment that should wait until the headless pipeline is stable.
+
+Open questions:
+
+- What specific limitations does the single-job model impose?
+- Would a multi-job model require schema or storage changes?
+- How does this interact with the broader headless architecture?
+
+### 7. Pre-computed closing-price threshold caching
+
+Description: Operator-proposed architecture for the daily trading pipeline. Instead of running TrafficFlow / MTF / Confluence during market hours, run them post-close on confirmed close data, then compute the closing-price ranges that would produce Buy / Short / None signals for the next trading day. Cache those ranges. During market hours, look up live price against cached ranges instead of recomputing the pipeline.
+
+Rationale: This sidesteps the gray-zone-close-data problem where intraday queries to a price feed can return a current daily bar that is not yet the actual close. By doing all heavy math on confirmed close data and reducing market-hours computation to range lookups, the pre-close trading decision becomes a fast comparison rather than a full pipeline run.
+
+The signal generation logic is primarily SMA crossovers, which are algebraically solvable for the threshold price that would flip a signal direction. The system already knows the last N-1 close prices for any ticker; computing the close value that would make the SMA cross a level is a direct calculation per condition.
+
+The approach may extend to MTF where a new window is forming on a specific close. For most MTF timeframes on most days, no new window is closing, so threshold computation may apply mainly to the daily timeframe and only occasionally to other timeframes.
+
+Why deferred: Blocked by headless TrafficFlow / MTF / Confluence. Threshold caching cannot be scoped fully until the underlying pipeline runs headless and produces structured output that the threshold computation layer can consume.
+
+Open questions:
+
+- Is the threshold a single value per ticker per timeframe, or a set of conditions with multiple boundaries?
+- How are real-time data feeds integrated to provide live-price lookup during market hours?
+- What cache format and storage location works best for range data?
+- How does the existing Spymaster dashboard surface live signal state during market hours?
+- How are MTF windows that are mid-formation on the daily close handled?
+
+### 8. Daily TrafficFlow / MTF / Confluence scheduling
+
+Description: Windows Task Scheduler, or equivalent scheduling, firing a local batch entrypoint at approximately the daily close window, running the three headless engines in sequence on confirmed close data.
+
+Why deferred: Blocked by headless TrafficFlow, MTF, and Confluence existing. The scheduling layer should not be implemented before those engines have stable headless contracts.
+
+Open questions:
+
+- Exact timing: before close, after confirmed close, or another window?
+- Failure handling: email, SMS, Slack, local notification, or another alert path?
+- Retry logic: re-run on transient failure, or treat as fatal?
+- Logging: where do scheduled-run logs live, and how long are they retained?
+- How does scheduling interact with the threshold caching layer described in item 7?
+
+### 9. Real-time data feed selection
+
+Description: yfinance is adequate for the public Wikipedia-of-pattern-finding layer but insufficient for pre-close personal trading decisions due to data freshness limitations. Candidate real-time data providers include Polygon.io, IEX Cloud, Alpaca, and Interactive Brokers API.
+
+Why deferred: Selection should wait until daily scheduling and threshold caching designs are closer to implementation, because the choice of provider depends on the latency and coverage requirements of those layers.
+
+Open questions:
+
+- What is the latency budget for live price lookups?
+- What ticker universe coverage is required: US equities only, ETFs, foreign listings, or broader coverage?
+- What is the cost model: per-query, monthly subscription, bundled with execution, or another model?
+- Should the public Wikipedia layer continue using yfinance while the personal trading layer uses a paid feed, or should both consolidate on one provider?
+
+### 10. Cloud compute architecture for ticker expansion
+
+Description: Path from the 500-ticker baseline to 3,000-5,000 tickers and eventually toward the full yfinance universe. StackBuilder monthly refresh is the workload that most clearly needs cloud compute capacity.
+
+Why deferred: Headless runner already exists for StackBuilder. What is missing is the orchestration layer: shipping signal library PKLs to cloud compute, distributing ticker work across workers, and collecting results back. This is significant infrastructure work that should wait until ticker expansion is operator-prioritized.
+
+Open questions:
+
+- Which cloud provider fits best: AWS, GCP, Azure, dedicated on-prem, or another option?
+- Is the existing dedicated machine sufficient for the 3,000-5,000 ticker tier, with cloud only needed for larger universes?
+- How is signal library data synchronized between local development and cloud workers?
+- What orchestration tool fits the current workflow: Apache Airflow, Prefect, custom scripts, or another option?
+- How does an eventual crowdsourced volunteer-compute model interact with paid cloud compute?
+
+### 11. Build history UI for Spymaster
+
+Description: UI feature to browse historical StackBuilder run directories per secondary, charting how the best stack composition changed over time.
+
+Why deferred: The underlying data already exists in timestamped run directories. Only UI work is needed. This is an enhancement, not a blocker.
+
+Open questions:
+
+- What is the desired interaction: timeline view, diff view, side-by-side comparison, or another model?
+- Should historical builds be loadable for TrafficFlow / MTF / Confluence replay, or read-only browsing?
+- How does this interact with the Phase 7+ Wikipedia-of-pattern-finding public-facing site?
