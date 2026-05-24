@@ -89,6 +89,15 @@ PROCESS_CONFLICT_PATTERNS: tuple[str, ...] = (
     "multi_timeframe_builder.py",
 )
 
+# Phase C canonical-output guardrail: --write is structurally refused
+# when the resolved output dir is the canonical TrafficFlow root or any
+# descendant. Phase C is supervised isolated-output smoke only.
+CANONICAL_OUTPUT_FORBIDDEN_FOR_PHASE_C: tuple[str, ...] = (
+    "output/trafficflow",
+)
+
+PHASE_C_RUN_MANIFEST_SCHEMA = "trafficflow_runner_phase_c_v1"
+
 # Exit codes
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -501,6 +510,54 @@ def _sanitize_conflict_entry(entry: Any) -> Any:
     if pat:
         out["command_label"] = pat
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase C canonical-output guardrail
+# ---------------------------------------------------------------------------
+
+
+def is_isolated_output_dir(
+    output_dir: Any,
+    *,
+    project_root: Optional[Path] = None,
+) -> bool:
+    """Return True when ``output_dir`` is NOT the canonical TrafficFlow
+    output root or any descendant.
+
+    Resolves relative paths under ``project_root`` (default: ``Path.cwd()``)
+    before comparison. Normalizes separators and case. Absolute paths
+    outside the project root resolve as isolated; the sanitizer redacts
+    them when they appear in emitted JSON.
+    """
+    if output_dir is None:
+        return False
+    root = project_root if project_root is not None else Path.cwd()
+    raw = str(output_dir)
+    # Resolve absolute or relative to project root.
+    p = Path(raw)
+    if not p.is_absolute():
+        try:
+            p = (root / p)
+        except Exception:
+            return False
+    try:
+        resolved = p.resolve(strict=False)
+    except Exception:
+        return False
+    try:
+        rel = resolved.relative_to(root.resolve())
+        rel_posix = rel.as_posix().rstrip("/").lower()
+    except (ValueError, OSError):
+        # Absolute path outside project root: treat as isolated.
+        return True
+    for forbidden in CANONICAL_OUTPUT_FORBIDDEN_FOR_PHASE_C:
+        f = forbidden.strip("/").lower()
+        if rel_posix == f:
+            return False
+        if rel_posix.startswith(f + "/"):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1227,14 +1284,36 @@ def check_process_conflicts(
 
 
 def build_effective_config(args: argparse.Namespace) -> dict:
-    """All resolved CLI flags + the locked v1 default snapshot."""
+    """All resolved CLI flags + the locked v1 default snapshot.
+
+    Includes the Phase C write-mode discriminators
+    (``write_authorized``, ``output_dir_isolated``,
+    ``canonical_write_blocked``, ``write_mode``). These are computed
+    here so every emit path - dry-run, refused, isolated-write -
+    surfaces the same canonical fields.
+    """
+    write_flag = bool(getattr(args, "write", False))
+    output_dir = getattr(args, "output_dir", DEFAULT_OUTPUT_DIR)
+    isolated = is_isolated_output_dir(output_dir)
+    if write_flag and not isolated:
+        write_mode = "refused"
+        canonical_write_blocked = True
+        write_authorized = False
+    elif write_flag and isolated:
+        write_mode = "isolated"
+        canonical_write_blocked = False
+        write_authorized = True
+    else:
+        write_mode = "dry_run"
+        canonical_write_blocked = False
+        write_authorized = False
     return {
         "secondaries": getattr(args, "secondaries", None),
         "secondaries_file": getattr(args, "secondaries_file", None),
         "stackbuilder_root": getattr(args, "stackbuilder_root", DEFAULT_STACKBUILDER_ROOT),
         "use_selected_build": bool(getattr(args, "use_selected_build", True)),
         "explicit_build": getattr(args, "explicit_build", None),
-        "output_dir": getattr(args, "output_dir", DEFAULT_OUTPUT_DIR),
+        "output_dir": output_dir,
         "k": getattr(args, "k", None),
         "k_range": getattr(args, "k_range", None),
         "all_selected_k": bool(getattr(args, "all_selected_k", True)),
@@ -1245,7 +1324,7 @@ def build_effective_config(args: argparse.Namespace) -> dict:
         "refresh_missing_pkls": bool(getattr(args, "refresh_missing_pkls", False)),
         "max_sma_day": int(getattr(args, "max_sma_day", DEFAULT_MAX_SMA_DAY)),
         "refresh_stale_prices": bool(getattr(args, "refresh_stale_prices", False)),
-        "write": bool(getattr(args, "write", False)),
+        "write": write_flag,
         "allow_network_fetch": bool(getattr(args, "allow_network_fetch", False)),
         "duration_budget_minutes": getattr(args, "duration_budget_minutes", None),
         "operator_budget_label": getattr(args, "operator_budget_label", None),
@@ -1253,6 +1332,11 @@ def build_effective_config(args: argparse.Namespace) -> dict:
         "progress_dir": getattr(args, "progress_dir", None) or DEFAULT_PROGRESS_DIR,
         "strict_inputs": bool(getattr(args, "strict_inputs", False)),
         "skip_secondary_on_input_gate": bool(getattr(args, "skip_secondary_on_input_gate", True)),
+        # Phase C write-mode discriminators
+        "write_authorized": write_authorized,
+        "output_dir_isolated": isolated,
+        "canonical_write_blocked": canonical_write_blocked,
+        "write_mode": write_mode,
     }
 
 
@@ -1481,6 +1565,275 @@ def build_would_refresh_lists(
 
 
 # ---------------------------------------------------------------------------
+# Phase C isolated-output write execution
+# ---------------------------------------------------------------------------
+
+
+def _default_compute_loader() -> Callable[..., list]:
+    """Lazily resolve ``trafficflow.build_board_rows``.
+
+    Only invoked inside the authorized isolated-write execution path.
+    Never called during dry-run or canonical-refused paths. Tests inject
+    a fake compute callable rather than triggering this loader.
+    """
+    import trafficflow as tf  # local import; not a module-level dependency
+    return tf.build_board_rows
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` via a ``.tmp`` sibling + ``replace``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    blob = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    _atomic_write_bytes(path, blob)
+
+
+def _board_rows_to_csv_bytes(rows: list[dict]) -> bytes:
+    """Serialize a list of board-row dicts to CSV bytes.
+
+    Column order is preserved from the first row that defines a column;
+    later rows that introduce new columns extend the header. Missing
+    values in a row are rendered as the empty string. An empty rows
+    list yields a single newline (no header).
+    """
+    import csv
+    import io as _io
+    if not rows:
+        return b""
+    cols: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        for k in r.keys():
+            ks = str(k)
+            if ks not in seen:
+                seen.add(ks)
+                cols.append(ks)
+    buf = _io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({c: r.get(c, "") for c in cols})
+    return buf.getvalue().encode("utf-8")
+
+
+def _execute_isolated_write(
+    envelope: dict,
+    per_secondary: list[dict],
+    args: argparse.Namespace,
+    *,
+    compute_callable: Optional[Callable[..., list]] = None,
+) -> tuple[str, dict, list[str]]:
+    """Run TrafficFlow compute for every ELIGIBLE cell and write
+    isolated-output artifacts under ``args.output_dir``.
+
+    Returns ``(status, write_summary, artifacts_written)`` where status
+    is one of ``"ok"``, ``"partial"``, ``"failed"`` and the artifact
+    list contains repo-relative or sanitized paths.
+    """
+    output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cells_requested = 0
+    cells_eligible = 0
+    cells_written = 0
+    cells_skipped = 0
+    cells_errored = 0
+    artifacts_written: list[str] = []
+    per_cell_summary: list[dict] = []
+    consec_errors = 0
+    short_circuit = False
+
+    compute = compute_callable if compute_callable is not None else _default_compute_loader()
+
+    for sec_row in per_secondary:
+        secondary = sec_row.get("secondary")
+        elig_map = sec_row.get("k_eligibility") or {}
+        members_by_k = sec_row.get("members_by_k") or {}
+        for k_key, eligibility in elig_map.items():
+            cells_requested += 1
+            try:
+                k_val = int(str(k_key).lstrip("K"))
+            except ValueError:
+                k_val = None
+            cell_record: dict[str, Any] = {
+                "secondary": secondary,
+                "k": k_val,
+                "eligibility": eligibility,
+                "status": None,
+                "row_count": 0,
+                "elapsed_seconds": 0.0,
+                "board_rows_json_path": None,
+                "board_rows_csv_path": None,
+                "error_class": None,
+                "error_message": None,
+                "skip_reason": None,
+            }
+            if eligibility != "ELIGIBLE":
+                cells_skipped += 1
+                cell_record["status"] = "skipped"
+                cell_record["skip_reason"] = f"non_eligible:{eligibility}"
+                per_cell_summary.append(cell_record)
+                continue
+            if short_circuit:
+                cells_skipped += 1
+                cell_record["status"] = "skipped"
+                cell_record["skip_reason"] = "short_circuited_after_consecutive_errors"
+                per_cell_summary.append(cell_record)
+                continue
+            cells_eligible += 1
+            run_fence = {"global": None, "by_sec": {}}
+            missing_map: Optional[dict] = None
+            t0 = time.perf_counter()
+            try:
+                rows = compute(secondary, k_val,
+                               run_fence=run_fence, missing_map=missing_map)
+                if rows is None:
+                    rows = []
+                if not isinstance(rows, list):
+                    rows = list(rows)
+            except Exception as exc:
+                cells_errored += 1
+                consec_errors += 1
+                cell_record["status"] = "error"
+                cell_record["elapsed_seconds"] = round(
+                    time.perf_counter() - t0, 4)
+                cell_record["error_class"] = type(exc).__name__
+                cell_record["error_message"] = repr(exc)[:240]
+                per_cell_summary.append(cell_record)
+                if consec_errors >= 3:
+                    short_circuit = True
+                continue
+
+            consec_errors = 0
+            cell_record["elapsed_seconds"] = round(
+                time.perf_counter() - t0, 4)
+            cell_record["row_count"] = len(rows)
+
+            sec_dir = output_dir / str(secondary)
+            sec_dir.mkdir(parents=True, exist_ok=True)
+            json_p = sec_dir / f"board_rows_k={k_val}.json"
+            csv_p = sec_dir / f"board_rows_k={k_val}.csv"
+            try:
+                _atomic_write_json(json_p, rows)
+                _atomic_write_bytes(csv_p, _board_rows_to_csv_bytes(rows))
+            except Exception as exc:
+                cells_errored += 1
+                consec_errors += 1
+                cell_record["status"] = "error"
+                cell_record["error_class"] = type(exc).__name__
+                cell_record["error_message"] = repr(exc)[:240]
+                per_cell_summary.append(cell_record)
+                if consec_errors >= 3:
+                    short_circuit = True
+                continue
+
+            cells_written += 1
+            cell_record["status"] = "ok"
+            json_rel = path_for_output(str(json_p))
+            csv_rel = path_for_output(str(csv_p))
+            cell_record["board_rows_json_path"] = json_rel
+            cell_record["board_rows_csv_path"] = csv_rel
+            if json_rel:
+                artifacts_written.append(json_rel)
+            if csv_rel:
+                artifacts_written.append(csv_rel)
+            per_cell_summary.append(cell_record)
+
+    write_summary = {
+        "cells_requested": cells_requested,
+        "cells_eligible": cells_eligible,
+        "cells_written": cells_written,
+        "cells_skipped": cells_skipped,
+        "cells_errored": cells_errored,
+        "artifacts_written_count": len(artifacts_written),
+        "short_circuited_after_consecutive_errors": short_circuit,
+    }
+
+    if cells_errored == 0 and cells_written > 0 and cells_skipped == 0:
+        status = "ok"
+    elif cells_written == 0:
+        status = "failed"
+    else:
+        status = "partial"
+
+    envelope["per_cell_summary"] = per_cell_summary
+    envelope["write_summary"] = write_summary
+    return status, write_summary, artifacts_written
+
+
+def _write_run_manifest(
+    output_dir: Path,
+    envelope: dict,
+    artifacts_written: list[str],
+) -> Optional[str]:
+    """Write ``run_manifest.json`` to the isolated output directory."""
+    manifest = {
+        "schema_version": PHASE_C_RUN_MANIFEST_SCHEMA,
+        "run_id": envelope.get("run_id"),
+        "stage": envelope.get("stage"),
+        "started_at": envelope.get("started_at"),
+        "ended_at": envelope.get("ended_at"),
+        "elapsed_seconds": envelope.get("elapsed_seconds"),
+        "git_head": envelope.get("git_head"),
+        "inputs": envelope.get("inputs"),
+        "effective_config": envelope.get("effective_config"),
+        "selected_build_consumed": envelope.get("selected_build_consumed"),
+        "per_cell_summary": envelope.get("per_cell_summary"),
+        "write_summary": envelope.get("write_summary"),
+        "canonical_artifacts_referenced": _build_canonical_artifacts_ref(
+            envelope.get("per_secondary_results") or []
+        ),
+        "output_dir": path_for_output(str(output_dir)),
+        "write_mode": "isolated",
+        "artifacts_written": artifacts_written,
+    }
+    safe = sanitize_for_json(manifest, project_root=Path.cwd())
+    path = output_dir / "run_manifest.json"
+    try:
+        _atomic_write_json(path, safe)
+    except Exception:
+        return None
+    return path_for_output(str(path))
+
+
+def _build_canonical_artifacts_ref(per_secondary: list[dict]) -> list[dict]:
+    """Per-secondary ``selected_build.json`` path + SHA-256 reference."""
+    out: list[dict] = []
+    for sec_row in per_secondary:
+        sec = sec_row.get("secondary")
+        sb_path = sec_row.get("selected_build_consumed") or {}
+        # selected_build_consumed in per_secondary_results is the
+        # parsed payload; the actual file path is the canonical
+        # location, computed here. Compute SHA-256 from the live
+        # canonical file (read-only).
+        canonical_path = (Path(DEFAULT_STACKBUILDER_ROOT) / str(sec)
+                           / "selected_build.json")
+        sha = None
+        try:
+            if canonical_path.exists():
+                import hashlib
+                h = hashlib.sha256()
+                with open(canonical_path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 16), b""):
+                        h.update(chunk)
+                sha = h.hexdigest()
+        except Exception:
+            pass
+        out.append({
+            "secondary": sec,
+            "selected_build_path": path_for_output(str(canonical_path)),
+            "selected_build_sha256": sha,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1511,13 +1864,20 @@ def main(
     pandas_module: Optional[Any] = None,
     pickle_module: Any = pickle,
     today: Optional[datetime] = None,
+    compute_callable: Optional[Callable[..., list]] = None,
 ) -> int:
-    """Phase B dry-run entrypoint.
+    """Phase B dry-run / Phase C isolated-write entrypoint.
 
     Always emits exactly one JSON object on stdout. Returns:
-      0 on dry_run success;
-      1 on refused/error per-invocation;
+      0 on dry_run success or isolated-write ok;
+      1 on refused, partial, failed, or per-invocation error;
       3 on process-conflict refusal.
+
+    ``compute_callable`` is the test seam for Phase C isolated-write
+    mode. When not supplied and ``--write`` is authorized for an
+    isolated output directory, the runner lazily imports
+    ``trafficflow.build_board_rows``. The dry-run path never resolves
+    the compute callable.
     """
     args = parse_args(argv)
     start_t = time.perf_counter()
@@ -1558,21 +1918,32 @@ def main(
         "verdict": None,
     }
 
-    # Phase B unconditionally refuses --write.
-    if bool(getattr(args, "write", False)):
+    write_flag = bool(getattr(args, "write", False))
+
+    # Phase C canonical-output guardrail: --write to canonical
+    # ``output/trafficflow`` (or any descendant) is structurally
+    # refused before any preflight or compute work. The refusal
+    # must NOT import trafficflow.
+    if write_flag and effective_config.get("canonical_write_blocked"):
         envelope["status"] = "refused"
-        envelope["warnings"].append("phase_b_write_not_supported")
-        envelope["errors"].append("phase_b_write_not_supported")
+        envelope["warnings"].append("canonical_write_forbidden_in_phase_c")
+        envelope["errors"].append("canonical_write_forbidden_in_phase_c")
         envelope["verdict"] = "REFUSED"
         envelope["ended_at"] = _utc_iso()
         envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
-        _stderr("trafficflow_runner: Phase B refuses --write. "
-                "Use Phase E for canonical writes.")
+        _stderr(
+            "trafficflow_runner: Phase C refuses --write to canonical "
+            "output/trafficflow. Use an isolated --output-dir for "
+            "supervised smoke; canonical writes are reserved for a "
+            "later operator-authorized phase."
+        )
         _emit_json(envelope)
         return EXIT_REFUSED
 
-    # Process-conflict check (advisory in Phase B; refuse on actual blockage)
-    write_requested = False
+    # Process-conflict check. When --write is authorized, the checker
+    # is asked to fail-closed (status="error" on enumeration failure);
+    # otherwise it returns status="unknown" advisorily.
+    write_requested = bool(effective_config.get("write_authorized"))
     conflict_result = process_conflict_checker(write_requested=write_requested)
     envelope["process_conflict_result"] = conflict_result
     if conflict_result.get("status") == "blocked":
@@ -1674,6 +2045,63 @@ def main(
     else:
         envelope["verdict"] = "PARTIAL"
 
+    # ------------------------------------------------------------------
+    # Phase C isolated-write execution
+    # ------------------------------------------------------------------
+    # Reached only when --write is authorized AND the output dir is
+    # isolated. Dry-run callers (the canonical Phase B contract) skip
+    # this block entirely because ``write_authorized`` is False.
+    if effective_config.get("write_authorized"):
+        try:
+            status, write_summary, artifacts_written = _execute_isolated_write(
+                envelope, per_secondary, args,
+                compute_callable=compute_callable,
+            )
+        except Exception as exc:
+            envelope["status"] = "failed"
+            envelope["errors"].append(
+                f"isolated_write_exception:{type(exc).__name__}"
+            )
+            envelope["verdict"] = "ERROR"
+            envelope["ended_at"] = _utc_iso()
+            envelope["elapsed_seconds"] = round(
+                time.perf_counter() - start_t, 4)
+            envelope["write_mode"] = "isolated"
+            _emit_json(envelope)
+            return EXIT_REFUSED
+        envelope["status"] = status
+        envelope["artifacts_written"] = artifacts_written
+        envelope["write_mode"] = "isolated"
+        envelope["next_stage_ready"] = False
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(
+            time.perf_counter() - start_t, 4)
+        # Write run_manifest.json + run.stdout.json under the isolated
+        # output dir. The manifest mirrors the sanitized envelope but
+        # includes per_cell_summary, write_summary, and the canonical
+        # selected_build references.
+        output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            manifest_rel = _write_run_manifest(
+                output_dir, envelope, artifacts_written)
+            if manifest_rel:
+                envelope["artifacts_written"].append(manifest_rel)
+            stdout_path = output_dir / "run.stdout.json"
+            safe_envelope = sanitize_for_json(
+                envelope, project_root=Path.cwd())
+            _atomic_write_json(stdout_path, safe_envelope)
+            rel_stdout = path_for_output(str(stdout_path))
+            if rel_stdout:
+                envelope["artifacts_written"].append(rel_stdout)
+        except Exception as exc:  # pragma: no cover - defensive
+            envelope["warnings"].append(
+                f"manifest_write_exception:{type(exc).__name__}"
+            )
+        _emit_json(envelope)
+        return EXIT_OK if status == "ok" else EXIT_REFUSED
+
+    # Dry-run path
     envelope["next_stage_ready"] = False  # Phase B never advances the stage
     envelope["ended_at"] = _utc_iso()
     envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)

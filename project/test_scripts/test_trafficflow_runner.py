@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pickle
+import re
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -398,15 +399,20 @@ def test_effective_config_defaults(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 7. --write rejection
+# 7. --write canonical refusal (Phase C guardrail)
 # ---------------------------------------------------------------------------
 
 
-def test_write_is_refused(tmp_path):
+def test_write_to_default_canonical_output_is_refused(tmp_path):
+    """Phase C canonical guardrail: --write without an explicit
+    isolated --output-dir defaults to ``output/trafficflow`` and must
+    be refused with ``canonical_write_forbidden_in_phase_c`` before any
+    compute or trafficflow import."""
     sb_root = tmp_path / "output" / "stackbuilder"
     chosen = sb_root / "SPY" / "RUN_A"
     _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
     _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
     argv = ["--secondaries", "SPY",
             "--stackbuilder-root", str(sb_root),
             "--k", "1",
@@ -415,10 +421,17 @@ def test_write_is_refused(tmp_path):
         argv, process_conflict_checker=_no_conflict)
     assert rc == runner.EXIT_REFUSED
     assert payload["status"] == "refused"
-    assert "phase_b_write_not_supported" in payload["warnings"]
-    assert "phase_b_write_not_supported" in payload["errors"]
+    assert "canonical_write_forbidden_in_phase_c" in payload["warnings"]
+    assert "canonical_write_forbidden_in_phase_c" in payload["errors"]
     assert payload["artifacts_written"] == []
     assert payload["verdict"] == "REFUSED"
+    ec = payload["effective_config"]
+    assert ec["canonical_write_blocked"] is True
+    assert ec["write_authorized"] is False
+    assert ec["output_dir_isolated"] is False
+    assert ec["write_mode"] == "refused"
+    # Canonical refusal path must not import real trafficflow.
+    assert "trafficflow" not in sys.modules
 
 
 # ---------------------------------------------------------------------------
@@ -1027,3 +1040,370 @@ def test_selected_build_valid_payload_passes(tmp_path, monkeypatch):
     # schema gate; verdict surfaces a readiness gate, NOT REFUSED.
     assert sec["verdict"] != "REFUSED"
     assert sec["reason"] is None or "selected_build" not in sec["reason"]
+
+
+# ===========================================================================
+# Phase C - isolated-output --write support
+# ===========================================================================
+
+
+def _eligible_fixture(tmp_path, monkeypatch, *, secondary="SPY",
+                      member="AAA", k=1):
+    """Build a fully-eligible single-cell fixture in tmp_path.
+
+    Returns (sb_root_path, output_dir_path).
+    """
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / secondary / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={k: [f"{member}[D]"]})
+    _write_selected_build(sb_root, secondary, selected_run_dir=chosen,
+                          selected_k=k)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", secondary,
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", member,
+               declared_max_sma_day=114, has_sma_114=True)
+    out_dir = tmp_path / "smoke_out"
+    return sb_root, out_dir
+
+
+def test_phase_c_is_isolated_output_dir_helper():
+    # Canonical and descendants are not isolated.
+    assert runner.is_isolated_output_dir("output/trafficflow") is False
+    assert runner.is_isolated_output_dir("output/trafficflow/foo") is False
+    # Relative paths outside the canonical root are isolated.
+    assert runner.is_isolated_output_dir("output/trafficflow_smoke") is True
+    assert runner.is_isolated_output_dir("output/something_else") is True
+    # Logs are isolated.
+    assert runner.is_isolated_output_dir("logs/trafficflow_phase_c_smoke") is True
+
+
+def test_phase_c_isolated_write_succeeds_with_mock_compute(tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        captured["calls"].append((sec, k))
+        return [
+            {"Ticker": sec, "K": k, "Members": "AAA",
+             "Trigs": 10, "Wins": 6, "Losses": 4, "Avg %": 1.25},
+        ]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "ok"
+    assert payload["effective_config"]["write_authorized"] is True
+    assert payload["effective_config"]["output_dir_isolated"] is True
+    assert payload["effective_config"]["write_mode"] == "isolated"
+    # Compute was called exactly once for the eligible cell.
+    assert captured["calls"] == [("SPY", 1)]
+    # Artifact files exist on disk under the isolated output dir.
+    assert (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert (out_dir / "SPY" / "board_rows_k=1.csv").exists()
+    assert (out_dir / "run_manifest.json").exists()
+    assert (out_dir / "run.stdout.json").exists()
+    # No canonical output/trafficflow writes occurred.
+    canonical = Path("output") / "trafficflow"
+    assert not (canonical.exists() and any(canonical.iterdir())) \
+        or all("smoke_out" not in str(p) for p in canonical.iterdir())
+
+
+def test_phase_c_isolated_write_skips_ineligible_cell(tmp_path, monkeypatch):
+    """Cells that are STALE-GATED / PKL-GATED / DATA-GATED must be
+    skipped without invoking compute."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    # Two K cells: K=1 eligible, K=2 PKL-GATED (member BBB has no PKL).
+    _make_fake_leaderboard(chosen, k_to_members={
+        1: ["AAA[D]"],
+        2: ["BBB[D]"],
+    })
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    # BBB intentionally NOT written -> K=2 cell is PKL-GATED.
+    out_dir = tmp_path / "smoke_out"
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        captured["calls"].append((sec, k))
+        return [{"K": k, "Members": "AAA"}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # Compute fired only for K=1, not K=2.
+    assert captured["calls"] == [("SPY", 1)]
+    cells = payload.get("per_cell_summary") or []
+    by_k = {c["k"]: c for c in cells}
+    assert by_k[1]["status"] == "ok"
+    assert by_k[2]["status"] == "skipped"
+    assert "non_eligible:" in by_k[2]["skip_reason"]
+    # K=1 wrote, K=2 did not.
+    assert (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert not (out_dir / "SPY" / "board_rows_k=2.json").exists()
+
+
+def test_phase_c_isolated_write_emits_sanitized_paths(tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        return [{"K": k, "Members": "AAA"}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # On-disk artifacts must not contain the raw tmp_path string.
+    raw_stdout = (out_dir / "run.stdout.json").read_text(encoding="utf-8")
+    raw_manifest = (out_dir / "run_manifest.json").read_text(encoding="utf-8")
+    assert str(tmp_path) not in raw_stdout
+    assert str(tmp_path) not in raw_manifest
+    # No drive-letter pattern in either.
+    drive_pat = re.compile(r"[A-Z]:[\\/]")
+    assert not drive_pat.search(raw_stdout)
+    assert not drive_pat.search(raw_manifest)
+    # Payload artifacts list is sanitized.
+    for art in payload["artifacts_written"]:
+        assert str(tmp_path) not in art
+        assert not drive_pat.search(art)
+
+
+def test_phase_c_refresh_flags_remain_report_only_with_write(tmp_path, monkeypatch):
+    """Even with --write authorized for isolated output, the refresh
+    flags must remain report-only: would_refresh_pkls populated,
+    signal_engine_cache_refresher.py never invoked, the PKL-gated cell
+    skipped (compute never called for it)."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["MISSINGM[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    # MISSINGM's PKL intentionally not written.
+    invoked = {"count": 0}
+    def _no_subproc(*a, **kw):
+        invoked["count"] += 1
+        raise AssertionError("subprocess.run must not be invoked in Phase C")
+    monkeypatch.setattr(runner.subprocess, "run", _no_subproc)
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        captured["calls"].append((sec, k))
+        return [{"K": k}]
+
+    out_dir = tmp_path / "smoke_out"
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir),
+            "--refresh-missing-pkls"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert any(e["ticker"] == "MISSINGM"
+               for e in payload["would_refresh_pkls"])
+    # Compute was NOT invoked (cell is PKL-GATED).
+    assert captured["calls"] == []
+    # No cache writes happened.
+    assert not (tmp_path / "cache" / "results" /
+                "MISSINGM_precomputed_results.pkl").exists()
+
+
+def test_phase_c_compute_exception_handled_gracefully(tmp_path, monkeypatch):
+    """Compute raises for one cell; another succeeds; run status is
+    partial; errored cell recorded with sanitized exception detail."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={
+        1: ["AAA[D]"],
+        2: ["AAA[D]", "BBB[D]"],
+    })
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen,
+                          selected_k=2)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    _write_pkl(tmp_path / "cache" / "results", "BBB",
+               declared_max_sma_day=114, has_sma_114=True)
+    out_dir = tmp_path / "smoke_out"
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        if k == 2:
+            raise RuntimeError("synthetic compute failure for K=2")
+        return [{"K": k, "Members": "AAA"}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # Partial outcome: 1 cell wrote, 1 cell errored.
+    assert payload["status"] == "partial"
+    by_k = {c["k"]: c for c in payload["per_cell_summary"]}
+    assert by_k[1]["status"] == "ok"
+    assert by_k[2]["status"] == "error"
+    assert by_k[2]["error_class"] == "RuntimeError"
+    assert "synthetic compute failure" in by_k[2]["error_message"]
+    # K=1 wrote artifacts; K=2 did not.
+    assert (out_dir / "SPY" / "board_rows_k=1.json").exists()
+    assert not (out_dir / "SPY" / "board_rows_k=2.json").exists()
+    summary = payload["write_summary"]
+    assert summary["cells_written"] == 1
+    assert summary["cells_errored"] == 1
+
+
+def test_phase_c_no_tmp_files_remain_after_isolated_write(tmp_path, monkeypatch):
+    sb_root, out_dir = _eligible_fixture(tmp_path, monkeypatch)
+
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    # Walk the output dir; no .tmp files may remain.
+    tmps = [p for p in out_dir.rglob("*.tmp")]
+    assert tmps == [], f"unexpected .tmp remnants: {tmps}"
+
+
+def test_phase_c_lazy_compute_loader_not_invoked_in_dry_run(tmp_path, monkeypatch):
+    """Dry-run path must not resolve the compute callable. With the
+    sys.meta_path sentinel blocking trafficflow import, a dry-run still
+    succeeds. The compute_callable kwarg is irrelevant in dry-run."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    sys.modules.pop("signal_engine_cache_refresher", None)
+
+    class _BlockTraffic:
+        def find_module(self, name, path=None):
+            if name in ("trafficflow", "signal_engine_cache_refresher"):
+                return self
+            return None
+        def load_module(self, name):
+            raise ImportError(
+                f"forbidden import in dry-run path: {name}")
+    monkeypatch.setattr(sys, "meta_path", [_BlockTraffic()] + sys.meta_path)
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_OK
+    assert payload["status"] == "dry_run"
+    assert payload["effective_config"]["write_mode"] == "dry_run"
+    assert "trafficflow" not in sys.modules
+
+
+def test_phase_c_effective_config_dry_run_fields():
+    args = runner.parse_args(["--secondaries", "SPY"])
+    ec = runner.build_effective_config(args)
+    assert ec["write_authorized"] is False
+    assert ec["canonical_write_blocked"] is False
+    assert ec["write_mode"] == "dry_run"
+
+
+def test_phase_c_effective_config_canonical_refused_fields():
+    args = runner.parse_args(["--secondaries", "SPY", "--write"])
+    ec = runner.build_effective_config(args)
+    assert ec["write_authorized"] is False
+    assert ec["canonical_write_blocked"] is True
+    assert ec["output_dir_isolated"] is False
+    assert ec["write_mode"] == "refused"
+
+
+def test_phase_c_effective_config_isolated_authorized_fields(tmp_path):
+    args = runner.parse_args([
+        "--secondaries", "SPY",
+        "--write",
+        "--output-dir", str(tmp_path / "smoke_out"),
+    ])
+    ec = runner.build_effective_config(args)
+    assert ec["write_authorized"] is True
+    assert ec["canonical_write_blocked"] is False
+    assert ec["output_dir_isolated"] is True
+    assert ec["write_mode"] == "isolated"
+
+
+def test_phase_c_no_writes_when_all_cells_ineligible(tmp_path, monkeypatch):
+    """All requested cells are PKL-GATED (missing members). Compute
+    must not be called; no board_rows files; status must clearly
+    report zero cells_written."""
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["GONE[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    # No PKL for GONE -> K=1 cell is PKL-GATED.
+    out_dir = tmp_path / "smoke_out"
+
+    captured = {"calls": []}
+    def _fake_compute(sec, k, *, run_fence=None, missing_map=None):
+        captured["calls"].append((sec, k))
+        return [{"K": k}]
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--write",
+            "--output-dir", str(out_dir)]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=_fake_compute)
+    assert captured["calls"] == []
+    summary = payload["write_summary"]
+    assert summary["cells_written"] == 0
+    assert payload["status"] == "failed"
+    assert not (out_dir / "SPY" / "board_rows_k=1.json").exists()
