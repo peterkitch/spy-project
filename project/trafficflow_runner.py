@@ -274,13 +274,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Phase E PR Alpha guardrail. Authorizes Phase E "
-            "canonical-write mode under output/trafficflow. Requires "
-            "--write. Canonical-write mechanics are not implemented "
-            "in PR Alpha; passing this flag against a valid "
-            "configuration still refuses with "
-            "canonical_write_not_implemented_in_phase_alpha (exit 3) "
-            "until PR Beta lands the per-secondary canonical writer."
+            "Phase E guardrail. Authorizes Phase E canonical-write "
+            "mode under output/trafficflow. Requires --write and an "
+            "explicit --k or --k-range; single-secondary only "
+            "(multi-secondary fan-out is the orchestrator's job, "
+            "PR Gamma). Writes per-K board_rows files plus a zero-"
+            "byte .done marker per secondary; on failure, writes a "
+            "quarantine record under .quarantine/<SEC>/failure.json "
+            "and leaves .done absent. Run-level files "
+            "(progress.json, run_status.json, run_manifest.json, "
+            "selected_output.json) are PR Gamma scope and are not "
+            "written by this flag."
         ),
     )
     p.add_argument(
@@ -1427,15 +1431,13 @@ def build_effective_config(args: argparse.Namespace) -> dict:
         write_mode = "dry_run"
         canonical_write_blocked = False
         write_authorized = False
-    # Phase E PR Alpha discriminator. The only canonical-write mode
-    # implemented in PR Alpha is the not-implemented refusal boundary;
-    # mechanics land in PR Beta. The value is set whenever
-    # --canonical-write is requested so the refusal envelope can
-    # surface it; it remains None for invocations that don't ask for
-    # canonical-write at all.
-    canonical_write_mode = (
-        "phase_alpha_not_implemented" if canonical_write_flag else None
-    )
+    # Phase E discriminator. The mode is set dynamically by the
+    # canonical writer (`complete` / `quarantined`) or left None for
+    # invocations that don't reach the writer (dry-run, isolated-write,
+    # early refusal paths). PR Beta retired the Phase Alpha
+    # not-implemented boundary; valid canonical-write requests now
+    # execute the per-secondary writer.
+    canonical_write_mode = None
     return {
         "secondaries": getattr(args, "secondaries", None),
         "secondaries_file": getattr(args, "secondaries_file", None),
@@ -2064,6 +2066,315 @@ def _execute_isolated_write(
     return status, write_summary, artifacts_written
 
 
+def _execute_canonical_write(
+    envelope: dict,
+    per_secondary: list[dict],
+    args: argparse.Namespace,
+    *,
+    compute_callable: Optional[Callable[..., list]] = None,
+) -> tuple[str, dict, list[str], str]:
+    """Phase E PR Beta single-secondary canonical writer.
+
+    Produces, for the single resolved secondary, per-K
+    ``board_rows_k=<K>.{json,csv}`` files under
+    ``<output_dir>/<SECONDARY>/`` via the existing atomic helpers,
+    a ``secondary_manifest.json`` (Option A per PR #317), and a
+    zero-byte ``<SECONDARY>/.done`` marker written last. The
+    ``.done`` marker is the downstream per-secondary completion
+    gate; it must be absent on any failure.
+
+    On compute, write, or validation failure, the function stops
+    processing further K values, ensures ``.done`` is absent, and
+    writes a quarantine record at
+    ``<output_dir>/.quarantine/<SECONDARY>/failure.json``. Run-level
+    files (``progress.json``, ``run_status.json``,
+    ``run_manifest.json``, ``run.stdout.json``,
+    ``selected_output.json``) are NOT written here; those are
+    PR Gamma orchestrator scope.
+
+    Returns ``(status, write_summary, artifacts_written,
+    canonical_write_mode)`` where ``canonical_write_mode`` is
+    ``"complete"`` on success or ``"quarantined"`` on failure.
+    """
+    output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(per_secondary) != 1:  # pragma: no cover - defensive
+        raise RuntimeError(
+            "_execute_canonical_write requires exactly one resolved "
+            "secondary; multi-secondary canonical-write is refused "
+            "upstream by canonical_write_multi_secondary_unsupported_"
+            "use_orchestrator."
+        )
+
+    sec_row = per_secondary[0]
+    secondary = sec_row.get("secondary")
+    elig_map = sec_row.get("k_eligibility") or {}
+    combo_leaderboard_path = sec_row.get("combo_leaderboard_path")
+
+    sb_path_raw = sec_row.get("selected_build_path")
+    run_dir_raw = sec_row.get("selected_run_dir")
+    explicit_build_override = bool(sec_row.get("explicit_build_override"))
+    # selected_build_sha256: read from the same file preflight consumed,
+    # matching the Phase C manifest provenance pattern in
+    # _build_canonical_artifacts_ref.
+    selected_build_sha256: Optional[str] = None
+    if sb_path_raw and not explicit_build_override:
+        try:
+            sb_p = Path(sb_path_raw)
+            if sb_p.is_file():
+                import hashlib
+                h = hashlib.sha256()
+                with open(sb_p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 16), b""):
+                        h.update(chunk)
+                selected_build_sha256 = h.hexdigest()
+        except Exception:
+            selected_build_sha256 = None
+
+    allow_network_fetch = bool(getattr(args, "allow_network_fetch", False))
+    if compute_callable is None:
+        compute = _default_compute_loader(
+            allow_network_fetch=allow_network_fetch
+        )
+    else:
+        compute = compute_callable
+
+    sec_dir = output_dir / str(secondary)
+    sec_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts_written: list[str] = []
+    per_cell_summary: list[dict] = []
+    cells_requested = 0
+    cells_written = 0
+    cells_errored = 0
+
+    failure_kind: Optional[str] = None
+    failure_error_class: Optional[str] = None
+    failure_error_message: Optional[str] = None
+    last_completed_k: Optional[int] = None
+    failed_at_k: Optional[int] = None
+
+    start_iso = _utc_iso()
+    writer_t0 = time.perf_counter()
+
+    # Iterate K in numeric-ascending order for deterministic .done
+    # timing and predictable last_completed_k semantics.
+    def _k_sort_key(item):
+        try:
+            return int(str(item[0]).lstrip("K"))
+        except (ValueError, TypeError):
+            return 0
+
+    for k_key, eligibility in sorted(elig_map.items(), key=_k_sort_key):
+        cells_requested += 1
+        try:
+            k_val = int(str(k_key).lstrip("K"))
+        except ValueError:
+            k_val = None
+        cell_record: dict[str, Any] = {
+            "secondary": secondary,
+            "k": k_val,
+            "eligibility": eligibility,
+            "status": None,
+            "row_count": 0,
+            "elapsed_seconds": 0.0,
+            "board_rows_json_path": None,
+            "board_rows_csv_path": None,
+            "error_class": None,
+            "error_message": None,
+        }
+
+        if eligibility != "ELIGIBLE":
+            cells_errored += 1
+            cell_record["status"] = "error"
+            cell_record["error_class"] = "ValidationError"
+            cell_record["error_message"] = f"non_eligible:{eligibility}"
+            per_cell_summary.append(cell_record)
+            failure_kind = "validation_error"
+            failure_error_class = "ValidationError"
+            failure_error_message = f"non_eligible:{eligibility}"
+            failed_at_k = k_val
+            break
+
+        run_fence = {"global": None, "by_sec": {}}
+        missing_map: Optional[dict] = None
+        cell_t0 = time.perf_counter()
+        try:
+            rows = compute(
+                secondary, k_val,
+                run_fence=run_fence, missing_map=missing_map,
+                combo_leaderboard_path=combo_leaderboard_path,
+            )
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
+                rows = list(rows)
+        except Exception as exc:
+            cells_errored += 1
+            cell_record["status"] = "error"
+            cell_record["elapsed_seconds"] = round(
+                time.perf_counter() - cell_t0, 4)
+            cell_record["error_class"] = type(exc).__name__
+            cell_record["error_message"] = repr(exc)[:240]
+            per_cell_summary.append(cell_record)
+            failure_kind = "compute_error"
+            failure_error_class = type(exc).__name__
+            failure_error_message = repr(exc)[:240]
+            failed_at_k = k_val
+            break
+
+        cell_record["elapsed_seconds"] = round(
+            time.perf_counter() - cell_t0, 4)
+        cell_record["row_count"] = len(rows)
+
+        json_p = sec_dir / f"board_rows_k={k_val}.json"
+        csv_p = sec_dir / f"board_rows_k={k_val}.csv"
+        try:
+            _atomic_write_json(json_p, rows)
+            _atomic_write_bytes(csv_p, _board_rows_to_csv_bytes(rows))
+        except Exception as exc:
+            cells_errored += 1
+            cell_record["status"] = "error"
+            cell_record["error_class"] = type(exc).__name__
+            cell_record["error_message"] = repr(exc)[:240]
+            per_cell_summary.append(cell_record)
+            failure_kind = "write_error"
+            failure_error_class = type(exc).__name__
+            failure_error_message = repr(exc)[:240]
+            failed_at_k = k_val
+            break
+
+        cells_written += 1
+        cell_record["status"] = "ok"
+        json_rel = path_for_output(str(json_p))
+        csv_rel = path_for_output(str(csv_p))
+        cell_record["board_rows_json_path"] = json_rel
+        cell_record["board_rows_csv_path"] = csv_rel
+        if json_rel:
+            artifacts_written.append(json_rel)
+        if csv_rel:
+            artifacts_written.append(csv_rel)
+        per_cell_summary.append(cell_record)
+        last_completed_k = k_val
+
+    end_iso = _utc_iso()
+    elapsed_seconds = round(time.perf_counter() - writer_t0, 4)
+
+    invocation_id = envelope.get("run_id")
+
+    write_summary = {
+        "cells_requested": cells_requested,
+        "cells_written": cells_written,
+        "cells_errored": cells_errored,
+        "artifacts_written_count": len(artifacts_written),
+        "secondary": secondary,
+    }
+    envelope["per_cell_summary"] = per_cell_summary
+    envelope["write_summary"] = write_summary
+
+    # ----------------- Success path: secondary_manifest + .done -----------------
+    if failure_kind is None:
+        # Write secondary_manifest.json first; promote to .done only if
+        # the manifest write itself succeeds. Manifest is implemented
+        # per PR #317 Option A for PR Beta because .done verification
+        # benefits from a self-contained per-secondary provenance file.
+        sec_manifest = {
+            "schema_version": PHASE_E_RUN_MANIFEST_SCHEMA,
+            "secondary": secondary,
+            "invocation_id": invocation_id,
+            "started_at": start_iso,
+            "ended_at": end_iso,
+            "elapsed_seconds": elapsed_seconds,
+            "selected_build_path": (
+                path_for_output(str(sb_path_raw)) if sb_path_raw else None
+            ),
+            "selected_build_sha256": selected_build_sha256,
+            "explicit_build_override": explicit_build_override,
+            "selected_run_dir": (
+                path_for_output(str(run_dir_raw)) if run_dir_raw else None
+            ),
+            "combo_leaderboard_path": (
+                path_for_output(str(combo_leaderboard_path))
+                if combo_leaderboard_path else None
+            ),
+            "k_requested": [
+                c["k"] for c in per_cell_summary if c.get("k") is not None
+            ],
+            "per_k_summary": [
+                {"k": c["k"], "row_count": c["row_count"],
+                 "elapsed_seconds": c["elapsed_seconds"],
+                 "json_path": c["board_rows_json_path"],
+                 "csv_path": c["board_rows_csv_path"]}
+                for c in per_cell_summary if c.get("status") == "ok"
+            ],
+            "artifacts_written": list(artifacts_written),
+            "canonical_write_mode": "complete",
+        }
+        try:
+            sec_manifest_path = sec_dir / "secondary_manifest.json"
+            _atomic_write_json(sec_manifest_path, sec_manifest)
+            sec_manifest_rel = path_for_output(str(sec_manifest_path))
+            if sec_manifest_rel:
+                artifacts_written.append(sec_manifest_rel)
+            # .done is the final, downstream-visible completion gate.
+            # It is written ONLY after all board-row files and the
+            # secondary_manifest have succeeded.
+            done_path = sec_dir / ".done"
+            _atomic_write_bytes(done_path, b"")
+            done_rel = path_for_output(str(done_path))
+            if done_rel:
+                artifacts_written.append(done_rel)
+        except Exception as exc:
+            failure_kind = "write_error"
+            failure_error_class = type(exc).__name__
+            failure_error_message = repr(exc)[:240]
+            # Fall through to failure path below.
+
+    # ----------------- Failure path: quarantine + ensure no .done ------------
+    if failure_kind is not None:
+        # Ensure .done is absent. If it somehow exists, remove it so
+        # downstream consumers don't see a stale completion marker.
+        try:
+            done_path = sec_dir / ".done"
+            if done_path.exists():
+                done_path.unlink()
+        except Exception:
+            pass
+        try:
+            quarantine_dir = output_dir / ".quarantine" / str(secondary)
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            failure_record = {
+                "schema_version": PHASE_E_RUN_MANIFEST_SCHEMA,
+                "secondary": secondary,
+                "failure_kind": failure_kind,
+                "failure_at_utc": end_iso,
+                "error_class": failure_error_class,
+                "error_message": failure_error_message,
+                "last_completed_k": last_completed_k,
+                "failed_at_k": failed_at_k,
+                "runner_invocation_id": invocation_id,
+            }
+            failure_path = quarantine_dir / "failure.json"
+            _atomic_write_json(failure_path, failure_record)
+            failure_rel = path_for_output(str(failure_path))
+            if failure_rel:
+                artifacts_written.append(failure_rel)
+        except Exception:
+            # Best-effort: if even quarantine write fails, the
+            # caller still sees the failed status. Do not raise.
+            pass
+        canonical_write_mode = "quarantined"
+        status = "failed"
+        write_summary["artifacts_written_count"] = len(artifacts_written)
+        return status, write_summary, artifacts_written, canonical_write_mode
+
+    canonical_write_mode = "complete"
+    status = "ok"
+    write_summary["artifacts_written_count"] = len(artifacts_written)
+    return status, write_summary, artifacts_written, canonical_write_mode
+
+
 def _write_run_manifest(
     output_dir: Path,
     envelope: dict,
@@ -2316,6 +2627,37 @@ def main(
         _emit_json(envelope)
         return EXIT_CANONICAL_WRITE_REFUSED
 
+    # 4. --canonical-write requires explicit --k or --k-range.
+    # PR #318 audit carry-forward: the PR Alpha heavy-stage gate
+    # only inspects an explicit K list, so an implicit
+    # ``--all-selected-k`` request (the default when neither --k nor
+    # --k-range is passed) could otherwise bypass the K > 6 refusal
+    # by resolving K at per-secondary preflight time, after the gate.
+    # PR Beta closes this by requiring an explicit K selection
+    # whenever --canonical-write is set. Refusal fires before any
+    # preflight, compute, or write; trafficflow is not imported.
+    if (canonical_write_flag
+            and getattr(args, "k", None) is None
+            and not getattr(args, "k_range", None)):
+        envelope["status"] = "refused"
+        envelope["warnings"].append(
+            "canonical_write_requires_explicit_k_selection"
+        )
+        envelope["errors"].append(
+            "canonical_write_requires_explicit_k_selection"
+        )
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: --canonical-write requires explicit "
+            "--k or --k-range. Default / all-selected K is refused so "
+            "K > 6 cannot bypass the --heavy-stage gate at per-"
+            "secondary K resolution time."
+        )
+        _emit_json(envelope)
+        return EXIT_CANONICAL_WRITE_REFUSED
+
     # Phase C canonical-output guardrail: --write to canonical
     # ``output/trafficflow`` (or any descendant) is structurally
     # refused before any preflight or compute work. The refusal
@@ -2447,32 +2789,15 @@ def main(
             _emit_json(envelope)
             return EXIT_CANONICAL_WRITE_REFUSED
 
-    # Phase E PR Alpha: the canonical-write mechanics are not
-    # implemented in PR Alpha. Once every preceding canonical-write
-    # validation has passed, refuse with a stable not-implemented
-    # reason and exit 3. PR Beta lands the per-secondary canonical
-    # writer; this refusal is the boundary between PR Alpha (CLI
-    # guardrails only) and PR Beta (writer mechanics).
-    if canonical_write_flag:
-        envelope["status"] = "refused"
-        envelope["warnings"].append(
-            "canonical_write_not_implemented_in_phase_alpha"
-        )
-        envelope["errors"].append(
-            "canonical_write_not_implemented_in_phase_alpha"
-        )
-        envelope["verdict"] = "REFUSED"
-        envelope["ended_at"] = _utc_iso()
-        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
-        _stderr(
-            "trafficflow_runner: Phase E PR Alpha refuses --canonical-write "
-            "execution. Canonical-write mechanics are not implemented in "
-            "PR Alpha and are deferred to PR Beta. The CLI surface, "
-            "validation, and refusal reasons have landed; no canonical "
-            "writes are performed by this invocation."
-        )
-        _emit_json(envelope)
-        return EXIT_CANONICAL_WRITE_NOT_IMPLEMENTED
+    # Phase E PR Beta: the canonical-write mechanics are now
+    # implemented (per-secondary writer with .done / quarantine).
+    # When every preceding canonical-write validation has passed,
+    # main() falls through to preflight + writer dispatch below.
+    # The Phase Alpha not-implemented refusal
+    # (canonical_write_not_implemented_in_phase_alpha,
+    # EXIT_CANONICAL_WRITE_NOT_IMPLEMENTED) was retired here in
+    # PR Beta; the constant and reason code remain defined for
+    # backward-compatibility but are no longer raised by main().
 
     # If --explicit-build was set, only one secondary may be requested.
     if getattr(args, "explicit_build", None) and len(secondaries) != 1:
@@ -2544,6 +2869,60 @@ def main(
             return EXIT_REFUSED
     else:
         envelope["verdict"] = "PARTIAL"
+
+    # ------------------------------------------------------------------
+    # Phase E PR Beta: canonical-write execution
+    # ------------------------------------------------------------------
+    # Reached only when --canonical-write is authorized AND all
+    # canonical-write validations have passed. Single-secondary by
+    # invariant; the multi-secondary check above already refused
+    # multi-secondary canonical-write requests.
+    #
+    # ``write_authorized`` is False here because the Phase C
+    # write-mode logic in ``build_effective_config`` treats
+    # ``output/trafficflow`` paths as canonical and therefore
+    # NOT-isolated, so ``write_authorized`` stays False. The Phase E
+    # canonical writer is the correct execution path for these
+    # requests; the Phase C isolated-write block below is the wrong
+    # destination and is gated by ``write_authorized``.
+    if canonical_write_flag and write_flag:
+        try:
+            (status,
+             write_summary,
+             artifacts_written,
+             cw_mode) = _execute_canonical_write(
+                envelope, per_secondary, args,
+                compute_callable=compute_callable,
+            )
+        except Exception as exc:
+            envelope["status"] = "failed"
+            envelope["errors"].append(
+                f"canonical_write_exception:{type(exc).__name__}"
+            )
+            envelope["verdict"] = "ERROR"
+            envelope["ended_at"] = _utc_iso()
+            envelope["elapsed_seconds"] = round(
+                time.perf_counter() - start_t, 4)
+            envelope["write_mode"] = "canonical"
+            envelope["effective_config"]["canonical_write_mode"] = (
+                "quarantined"
+            )
+            _emit_json(envelope)
+            return EXIT_REFUSED
+        envelope["status"] = status
+        envelope["write_mode"] = "canonical"
+        envelope["next_stage_ready"] = False
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(
+            time.perf_counter() - start_t, 4)
+        envelope["artifacts_written"] = list(artifacts_written)
+        envelope["effective_config"]["canonical_write_mode"] = cw_mode
+        # PR Beta does NOT write run-level files
+        # (progress.json, run_status.json, run_manifest.json,
+        # run.stdout.json, selected_output.json). Those are PR Gamma
+        # orchestrator scope.
+        _emit_json(envelope)
+        return EXIT_OK if status == "ok" else EXIT_REFUSED
 
     # ------------------------------------------------------------------
     # Phase C isolated-write execution
