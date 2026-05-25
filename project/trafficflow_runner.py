@@ -122,11 +122,27 @@ CANONICAL_OUTPUT_FORBIDDEN_FOR_PHASE_C: tuple[str, ...] = (
 
 PHASE_C_RUN_MANIFEST_SCHEMA = "trafficflow_runner_phase_c_v1"
 
+# Phase E PR Alpha: schema constant for the future canonical-write
+# manifest. The Phase E canonical writer is not implemented in PR
+# Alpha (only CLI guardrails and refusal logic land here); the
+# constant exists so PR Beta / Gamma can land the writer mechanics
+# against a stable, locked schema string.
+PHASE_E_RUN_MANIFEST_SCHEMA = "trafficflow_runner_phase_e_v1"
+
 # Exit codes
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_ARGPARSE = 2  # argparse exits 2 itself on usage error
 EXIT_PROCESS_CONFLICT = 3
+# Phase E PR Alpha canonical-write exit codes. The integer values
+# intentionally collide with EXIT_ARGPARSE / EXIT_PROCESS_CONFLICT
+# because the Phase E contract (PR #317) fixes exit 2 for canonical-
+# write validation refusals and exit 3 for the Phase Alpha
+# not-implemented boundary. Use these named constants for clarity at
+# the call sites in main(); the value collision is a fact of the
+# locked contract, not a design choice this PR can change.
+EXIT_CANONICAL_WRITE_REFUSED = 2
+EXIT_CANONICAL_WRITE_NOT_IMPLEMENTED = 3
 
 _RAW_TICKER_SPLIT_RE = re.compile(r"[,\s]+")
 
@@ -246,6 +262,39 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Phase B refuses --write. Reserved for Phase E.",
+    )
+    # Phase E PR Alpha guardrail flags. --canonical-write authorizes
+    # writes under output/trafficflow (subject to validation) and
+    # requires --write. --heavy-stage lifts the K > 6 refusal under
+    # --canonical-write. Neither flag is auto-set; both default False.
+    # PR Alpha implements the CLI surface and fail-closed refusal
+    # logic only - canonical-write mechanics are deferred to PR Beta.
+    p.add_argument(
+        "--canonical-write",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase E PR Alpha guardrail. Authorizes Phase E "
+            "canonical-write mode under output/trafficflow. Requires "
+            "--write. Canonical-write mechanics are not implemented "
+            "in PR Alpha; passing this flag against a valid "
+            "configuration still refuses with "
+            "canonical_write_not_implemented_in_phase_alpha (exit 3) "
+            "until PR Beta lands the per-secondary canonical writer."
+        ),
+    )
+    p.add_argument(
+        "--heavy-stage",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase E PR Alpha guardrail. Allows K > 6 under "
+            "--canonical-write. Without it, canonical-write requests "
+            "containing K > 6 refuse with "
+            "canonical_write_heavy_stage_requires_flag. Heavy-stage "
+            "canonical-write implementation is deferred to Phase F "
+            "or later."
+        ),
     )
     p.add_argument("--allow-network-fetch", action="store_true", default=False)
     p.add_argument("--duration-budget-minutes", type=int, default=None)
@@ -582,6 +631,51 @@ def is_isolated_output_dir(
         if rel_posix.startswith(f + "/"):
             return False
     return True
+
+
+def is_canonical_trafficflow_output_dir(
+    output_dir: Any,
+    *,
+    project_root: Optional[Path] = None,
+) -> bool:
+    """Return True iff ``output_dir`` is the canonical TrafficFlow
+    output root (``output/trafficflow``) or any descendant under the
+    project root.
+
+    Phase E PR Alpha uses this as a focused gate when ``--canonical-write``
+    is passed. The check is the inverse of ``is_isolated_output_dir``
+    for paths under the project root, but is written as its own helper
+    so that absolute paths outside the project root render as
+    "not canonical" rather than inheriting the "isolated" semantics.
+
+    Returns False for ``None``, paths that cannot be resolved, and
+    absolute paths outside the project root.
+    """
+    if output_dir is None:
+        return False
+    root = project_root if project_root is not None else Path.cwd()
+    raw = str(output_dir)
+    p = Path(raw)
+    if not p.is_absolute():
+        try:
+            p = (root / p)
+        except Exception:
+            return False
+    try:
+        resolved = p.resolve(strict=False)
+    except Exception:
+        return False
+    try:
+        rel = resolved.relative_to(root.resolve())
+        rel_posix = rel.as_posix().rstrip("/").lower()
+    except (ValueError, OSError):
+        return False
+    canonical = "output/trafficflow"
+    if rel_posix == canonical:
+        return True
+    if rel_posix.startswith(canonical + "/"):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1317,6 +1411,8 @@ def build_effective_config(args: argparse.Namespace) -> dict:
     surfaces the same canonical fields.
     """
     write_flag = bool(getattr(args, "write", False))
+    canonical_write_flag = bool(getattr(args, "canonical_write", False))
+    heavy_stage_flag = bool(getattr(args, "heavy_stage", False))
     output_dir = getattr(args, "output_dir", DEFAULT_OUTPUT_DIR)
     isolated = is_isolated_output_dir(output_dir)
     if write_flag and not isolated:
@@ -1331,6 +1427,15 @@ def build_effective_config(args: argparse.Namespace) -> dict:
         write_mode = "dry_run"
         canonical_write_blocked = False
         write_authorized = False
+    # Phase E PR Alpha discriminator. The only canonical-write mode
+    # implemented in PR Alpha is the not-implemented refusal boundary;
+    # mechanics land in PR Beta. The value is set whenever
+    # --canonical-write is requested so the refusal envelope can
+    # surface it; it remains None for invocations that don't ask for
+    # canonical-write at all.
+    canonical_write_mode = (
+        "phase_alpha_not_implemented" if canonical_write_flag else None
+    )
     return {
         "secondaries": getattr(args, "secondaries", None),
         "secondaries_file": getattr(args, "secondaries_file", None),
@@ -1361,6 +1466,11 @@ def build_effective_config(args: argparse.Namespace) -> dict:
         "output_dir_isolated": isolated,
         "canonical_write_blocked": canonical_write_blocked,
         "write_mode": write_mode,
+        # Phase E PR Alpha discriminators. Always present; the mode
+        # field is None unless --canonical-write was requested.
+        "canonical_write_requested": canonical_write_flag,
+        "heavy_stage_requested": heavy_stage_flag,
+        "canonical_write_mode": canonical_write_mode,
     }
 
 
@@ -2147,12 +2257,80 @@ def main(
     }
 
     write_flag = bool(getattr(args, "write", False))
+    canonical_write_flag = bool(getattr(args, "canonical_write", False))
+    heavy_stage_flag = bool(getattr(args, "heavy_stage", False))
+
+    # Phase E PR Alpha canonical-write flag-only validations. These
+    # fire before the existing Phase C canonical-output refusal,
+    # before process-conflict, before secondaries resolution, before
+    # K parsing, and before any preflight or compute work. Each
+    # refusal exits 2 (EXIT_CANONICAL_WRITE_REFUSED) with a stable
+    # reason code. These checks must NOT import trafficflow.
+
+    # 1. --heavy-stage requires --canonical-write.
+    if heavy_stage_flag and not canonical_write_flag:
+        envelope["status"] = "refused"
+        envelope["warnings"].append("heavy_stage_requires_canonical_write")
+        envelope["errors"].append("heavy_stage_requires_canonical_write")
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: --heavy-stage requires --canonical-write."
+        )
+        _emit_json(envelope)
+        return EXIT_CANONICAL_WRITE_REFUSED
+
+    # 2. --canonical-write requires --write.
+    if canonical_write_flag and not write_flag:
+        envelope["status"] = "refused"
+        envelope["warnings"].append("canonical_write_requires_write")
+        envelope["errors"].append("canonical_write_requires_write")
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: --canonical-write requires --write."
+        )
+        _emit_json(envelope)
+        return EXIT_CANONICAL_WRITE_REFUSED
+
+    # 3. --canonical-write requires output_dir under output/trafficflow.
+    if canonical_write_flag and not is_canonical_trafficflow_output_dir(
+        effective_config.get("output_dir")
+    ):
+        envelope["status"] = "refused"
+        envelope["warnings"].append(
+            "canonical_write_output_dir_must_be_output_trafficflow"
+        )
+        envelope["errors"].append(
+            "canonical_write_output_dir_must_be_output_trafficflow"
+        )
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: --canonical-write requires --output-dir "
+            "under output/trafficflow."
+        )
+        _emit_json(envelope)
+        return EXIT_CANONICAL_WRITE_REFUSED
 
     # Phase C canonical-output guardrail: --write to canonical
     # ``output/trafficflow`` (or any descendant) is structurally
     # refused before any preflight or compute work. The refusal
     # must NOT import trafficflow.
-    if write_flag and effective_config.get("canonical_write_blocked"):
+    #
+    # Phase E PR Alpha note: when ``--canonical-write`` is also
+    # passed, the canonical-write validations above have already
+    # handled the request (either refused with a canonical-write
+    # reason or fallen through to the Phase Alpha not-implemented
+    # boundary later in main). The Phase C refusal below only fires
+    # in the legacy path: ``--write`` without ``--canonical-write``
+    # against an output_dir under ``output/trafficflow``.
+    if (write_flag
+            and not canonical_write_flag
+            and effective_config.get("canonical_write_blocked")):
         envelope["status"] = "refused"
         envelope["warnings"].append("canonical_write_forbidden_in_phase_c")
         envelope["errors"].append("canonical_write_forbidden_in_phase_c")
@@ -2214,10 +2392,87 @@ def main(
         return EXIT_REFUSED
     secondaries = sec_res["secondaries"]
 
+    # Phase E PR Alpha: --canonical-write is single-secondary only.
+    # Multi-secondary canonical writes must go through the orchestrator
+    # (PR Gamma), which spawns single-secondary worker subprocesses.
+    # No preflight, no compute, no writes.
+    if canonical_write_flag and len(secondaries) > 1:
+        envelope["status"] = "refused"
+        envelope["warnings"].append(
+            "canonical_write_multi_secondary_unsupported_use_orchestrator"
+        )
+        envelope["errors"].append(
+            "canonical_write_multi_secondary_unsupported_use_orchestrator"
+        )
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: --canonical-write accepts only a single "
+            "secondary per invocation; multi-secondary canonical-write "
+            "must be driven by the Phase E orchestrator."
+        )
+        _emit_json(envelope)
+        return EXIT_CANONICAL_WRITE_REFUSED
+
     # K selection
     k_sel = parse_k_selection(args)
     if k_sel["issues"]:
         envelope["warnings"].extend(k_sel["issues"])
+
+    # Phase E PR Alpha: --canonical-write with any K > 6 requires
+    # --heavy-stage. Heavy-stage canonical-write mechanics are
+    # deferred to Phase F or later; the flag itself merely lifts the
+    # K > 6 refusal so future implementation can land against a
+    # locked gate. No preflight, no compute, no writes.
+    if canonical_write_flag and not heavy_stage_flag:
+        ks = k_sel.get("ks") or []
+        if any(int(k) > 6 for k in ks if isinstance(k, (int, float))
+                or (isinstance(k, str) and str(k).isdigit())):
+            envelope["status"] = "refused"
+            envelope["warnings"].append(
+                "canonical_write_heavy_stage_requires_flag"
+            )
+            envelope["errors"].append(
+                "canonical_write_heavy_stage_requires_flag"
+            )
+            envelope["verdict"] = "REFUSED"
+            envelope["ended_at"] = _utc_iso()
+            envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+            _stderr(
+                "trafficflow_runner: --canonical-write with any K > 6 "
+                "requires --heavy-stage. Heavy-stage canonical-write "
+                "mechanics are deferred to Phase F or later."
+            )
+            _emit_json(envelope)
+            return EXIT_CANONICAL_WRITE_REFUSED
+
+    # Phase E PR Alpha: the canonical-write mechanics are not
+    # implemented in PR Alpha. Once every preceding canonical-write
+    # validation has passed, refuse with a stable not-implemented
+    # reason and exit 3. PR Beta lands the per-secondary canonical
+    # writer; this refusal is the boundary between PR Alpha (CLI
+    # guardrails only) and PR Beta (writer mechanics).
+    if canonical_write_flag:
+        envelope["status"] = "refused"
+        envelope["warnings"].append(
+            "canonical_write_not_implemented_in_phase_alpha"
+        )
+        envelope["errors"].append(
+            "canonical_write_not_implemented_in_phase_alpha"
+        )
+        envelope["verdict"] = "REFUSED"
+        envelope["ended_at"] = _utc_iso()
+        envelope["elapsed_seconds"] = round(time.perf_counter() - start_t, 4)
+        _stderr(
+            "trafficflow_runner: Phase E PR Alpha refuses --canonical-write "
+            "execution. Canonical-write mechanics are not implemented in "
+            "PR Alpha and are deferred to PR Beta. The CLI surface, "
+            "validation, and refusal reasons have landed; no canonical "
+            "writes are performed by this invocation."
+        )
+        _emit_json(envelope)
+        return EXIT_CANONICAL_WRITE_NOT_IMPLEMENTED
 
     # If --explicit-build was set, only one secondary may be requested.
     if getattr(args, "explicit_build", None) and len(secondaries) != 1:
