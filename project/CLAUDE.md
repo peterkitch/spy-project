@@ -170,21 +170,30 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
-### 6. Current Sprint State (post Phase 6I-79)
+### 6. Current Sprint State (post Phase E PR Epsilon)
 
-**Phase 6I sprint closed.** The following PRs are merged on `main`:
+**Phase 6I sprint closed** (historical context). Production StackBuilder outputs for the 8 PRJCT9 secondaries (AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA) live under canonical `output/stackbuilder/` and each `selected_build.json` points to its production run directory. These are runtime artifacts, not staged in git.
 
-- **Phase 6I-77** (#292): multi-secondary StackBuilder smoke evidence (corrected framing -- K=2 accepted, K=4 attempted under the missing `--allow-decreasing` configuration; the engine behaved correctly for the parameters passed).
-- **Phase 6I-78** (#293): SPY K=12 stress-smoke evidence plus runner `--k-patience` wiring (CLI flag, `_effective_config` entry, namespace pass-through, default `1` preserves prior hardcoded behavior).
-- **Phase 6I-79** (#295): production StackBuilder run for all 8 ImpactSearch secondaries under LEGACY-default traversal controls (`--exhaustive-k 4 --k-max 12 --search beam --beam-width 12 --top-n 20 --bottom-n 20 --allow-decreasing --k-patience 1`). All 8 reached K=12 cleanly. Total wall-clock ~117.6 min for 8 secondaries (mean 14.7 min/secondary).
+**TrafficFlow headless development sprint substantially complete.** Phases delivered, in order:
 
-**Production StackBuilder outputs are now on disk under canonical `output/stackbuilder/`** for AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA. `selected_build.json` was updated per secondary and points to the fresh Phase 6I-79 run directory. These outputs are runtime artifacts and are intentionally NOT staged in git.
+- **Phase A** -- scoping doc and execution-surface contract for the headless runner.
+- **Phase B** -- dry-run preflight scaffold (`trafficflow_runner.py`); reads `selected_build.json` per secondary, classifies input readiness, emits a single sanitized JSON envelope on stdout, never imports `trafficflow`.
+- **Phase C** -- isolated-output write capability: `--write` to a non-canonical directory invokes the lazy compute path with a pinned engine surface and atomically writes `board_rows_k=<K>.{json,csv}` plus a Phase C run manifest. Canonical `output/trafficflow/` writes remain structurally refused at this phase.
+- **Phase D** -- full-K performance characterization across the 8 secondaries; established the K=1..6 vs K=7..12 cost separation that anchors the heavy-stage gate.
+- **Phase E** -- daily-cadence canonical-write contract:
+  - Alpha CLI guardrails (`--canonical-write`, `--heavy-stage`, `PHASE_E_RUN_MANIFEST_SCHEMA`, fail-closed refusal logic).
+  - Beta single-secondary canonical writer (per-secondary `board_rows_k=*.{json,csv}`, `secondary_manifest.json`, zero-byte `.done`; quarantine on failure; pre-loop eligibility validation; path-scrubbed `failure.json`).
+  - Gamma orchestrator / finalizer (`trafficflow_canonical_orchestrator.py`): fans out single-secondary canonical-write worker subprocesses, owns run-level `progress.json` / `run_status.json` / `run_manifest.json` and the global `selected_output.json` pointer, supports `--resume` and `--allow-partial-publish`.
+  - Delta first real canonical-write smoke (SPY + AAPL, K=1..6, `--workers 2`).
+  - Epsilon broader real smoke for all 8 secondaries at K=1..6 with `--workers 4`.
 
-**Phase 5C / Phase 5D / Phase 6 status:** Phase 5C validation framework remains CLOSED. Phase 5D-1 onboarding remains merged. Phase 5D-2 / 5D-3 distributed-and-cloud compute remain NOT STARTED -- they are now folded into the Phase 7+ "cloud compute architecture for ticker expansion" parking-lot item rather than tracked as imminent. Phase 6 public-facing UX / Wikipedia-of-pattern-finding work is gated on Phase 7+ research items and is not active.
+**Current operational baseline.** TrafficFlow K=1..6 canonical writes are proven at full 8-secondary scale via the orchestrator. The downstream discovery pointer is `output/trafficflow/selected_output.json`; it references the most recent canonical run root under `output/trafficflow/runs/<UTC_TIMESTAMP>/`, which is the single source of truth for that run's `progress.json`, `run_status.json`, `run_manifest.json`, and per-secondary `board_rows_k=*.{json,csv}` + `secondary_manifest.json` + `.done`.
 
-**Next named sprint: TrafficFlow headless development.** Before any TrafficFlow code change, the first step should be a retrospective audit of the prior headless conversions -- OnePass, ImpactSearch, and StackBuilder -- capturing lessons learned about LEGACY behavior, UI/CLI default drift (the class of bug surfaced by Phase 6I-77/6I-78), runner surfaces, artifact safety, and performance regressions caught late. The defaults-diff audit item in the sprint carry-forward tracking doc covers part of this scope.
+**Deferred to a future phase.** Heavy-stage K=7..12 is gated by `--heavy-stage` at both the runner and the orchestrator and is not yet exercised against real canonical writes. 250-500 secondary real runs remain inference-only.
 
-**Authoritative source-of-truth.** For up-to-the-minute state, run `git log -10 --oneline main` and `git log --oneline main --grep="Phase 6I-7"`. The cross-session work tracking is in the dedicated tracking docs referenced in the "Tracking Documents" section below.
+**Next named sprint direction: MTF and Confluence integration with canonical TrafficFlow output**, in service of the 250-500 secondary launch universe. Downstream consumers should read the canonical contract via `output/trafficflow/selected_output.json` -> run root -> per-secondary board_rows; they should not import `trafficflow` directly.
+
+**Authoritative source-of-truth.** Run `git log -10 --oneline main` for current head; sprint cursor lives in the auto-memory `sprint_state.md`. PR-level detail and per-PR amendment cycles are recorded in `md_library/shared/*PHASE_*` evidence docs and do not belong in this file.
 
 ---
 
