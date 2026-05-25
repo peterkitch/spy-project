@@ -322,6 +322,32 @@ def _read_quarantine_failure(quarantine_dir: Path) -> Optional[dict]:
         return None
 
 
+def _clear_stale_quarantine(run_root: Path, secondary: str) -> None:
+    """Best-effort removal of a stale per-secondary quarantine marker.
+
+    Used by Amendment 1 of PR #320 during ``--resume`` setup: a
+    secondary with a prior ``failure.json`` and no ``.done`` is a
+    failed attempt that resume will retry. The stale ``failure.json``
+    must be removed before dispatch so that a successful retry does
+    not later classify as ``inconsistent_worker_state``. Also removes
+    the per-secondary quarantine directory if it ends up empty; the
+    top-level ``.quarantine/`` directory is left intact so other
+    secondaries' records survive.
+    """
+    quarantine_dir = run_root / ".quarantine" / secondary
+    failure_path = quarantine_dir / "failure.json"
+    try:
+        if failure_path.is_file():
+            failure_path.unlink()
+    except Exception:
+        return
+    try:
+        if quarantine_dir.is_dir() and not any(quarantine_dir.iterdir()):
+            quarantine_dir.rmdir()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Worker invocation
 # ---------------------------------------------------------------------------
@@ -470,8 +496,16 @@ def _classify_worker_outcome(
             status = "failed"
             failure_kind = "worker_nonzero_exit_with_done"
     elif not done_present and quarantine_present:
+        # Amendment 3: do NOT pre-set failure_kind here. This is the
+        # expected PR Beta failure shape (.done absent, quarantine
+        # present); the worker has already classified the failure in
+        # failure.json. Leave failure_kind unset and let the
+        # quarantine-read block below propagate the worker's
+        # ``failure_kind`` verbatim. The post-read fallback at the
+        # bottom of this function maps any still-None case to
+        # ``worker_failed`` so the orchestrator never emits an empty
+        # failure_kind for a quarantined secondary.
         status = "failed"
-        failure_kind = "worker_failed"
     else:
         status = "failed"
         if parse_status in ("json_decode_error", "non_object"):
@@ -518,6 +552,16 @@ def _classify_worker_outcome(
             failure_message = "worker_left_no_disk_marker"
         elif done_present and quarantine_present:
             failure_message = "worker_left_done_and_quarantine"
+
+    # Amendment 3: post-read fallback. A quarantined secondary whose
+    # failure.json had no usable ``failure_kind`` field still classifies
+    # as ``worker_failed`` so the orchestrator never reports an empty
+    # kind on a failed row. Orchestrator-owned kinds (worker_timeout,
+    # worker_output_unparseable, worker_no_marker, inconsistent_worker
+    # _state, worker_nonzero_exit_with_done) were already set before
+    # the quarantine read and survive this fallback.
+    if status == "failed" and failure_kind is None:
+        failure_kind = "worker_failed"
 
     return {
         "status": status,
@@ -894,15 +938,34 @@ def main(
         "allow_partial_publish": bool(args.allow_partial_publish),
     }
 
+    # Amendment 2: separate progress_path existence from parse success.
+    # An existing-but-unparseable progress.json must fail closed under
+    # both --resume and non-resume invocations. The pre-amendment code
+    # silently treated a JSON-decode error as "no prior progress",
+    # which bypassed the run-root-already-used and resume-config-mismatch
+    # gates.
+    progress_exists = progress_path.is_file()
     existing_progress: Optional[dict] = None
-    if progress_path.is_file():
+    progress_unreadable = False
+    if progress_exists:
         try:
             existing_progress = json.loads(
                 progress_path.read_text(encoding="utf-8"))
+            if not isinstance(existing_progress, dict):
+                existing_progress = None
+                progress_unreadable = True
         except Exception:
             existing_progress = None
+            progress_unreadable = True
 
-    if existing_progress is not None and not args.resume:
+    if progress_unreadable:
+        return _emit_refusal(
+            "orchestrator_progress_unreadable",
+            detail={"progress_path": path_for_output(
+                str(progress_path), project_root=project_root)},
+        )
+
+    if progress_exists and not args.resume:
         return _emit_refusal(
             "orchestrator_run_root_already_used",
             detail={"run_root": path_for_output(
@@ -928,6 +991,14 @@ def main(
         secondaries=secondaries,
     )
 
+    # Amendment 1: track stale quarantine markers that must be cleared
+    # before dispatching a resume-retry. A secondary with quarantine
+    # present and no .done is a previously-failed attempt; resume must
+    # leave the row pending AND remove the stale failure.json so that a
+    # successful retry classifies as ``complete`` rather than tripping
+    # ``inconsistent_worker_state``. Both-markers-present remains
+    # inconsistent state and is NOT cleared here.
+    stale_quarantine_to_clear: list[str] = []
     if args.resume:
         for row in progress["secondaries"]:
             sec = row["secondary"]
@@ -949,6 +1020,17 @@ def main(
                             continue
                 row["status"] = "skipped_resume"
                 row["k_completed"] = ks
+            elif quarantine_present and not done_present:
+                # Resume retry: leave row pending, clear the stale
+                # quarantine before dispatch so the retry's success
+                # path is not blocked.
+                stale_quarantine_to_clear.append(sec)
+                row["quarantine_present"] = False
+
+    # Clear stale quarantine markers BEFORE writing initial progress.json
+    # so the on-disk state matches what the orchestrator advertises.
+    for sec in stale_quarantine_to_clear:
+        _clear_stale_quarantine(run_root, sec)
 
     progress_lock = Lock()
     _write_progress(progress_path, progress)
@@ -987,12 +1069,36 @@ def main(
         "worker_timeout_seconds": int(args.worker_timeout),
     }, project_root=project_root)
 
-    artifacts_written: list[str] = []
-    progress_rel = path_for_output(str(progress_path))
-    if progress_rel:
-        artifacts_written.append(progress_rel)
+    # Amendment 4: build the complete final artifacts_written inventory
+    # BEFORE writing run_manifest.json so the manifest's own field is
+    # self-referential and includes every run-level file the
+    # orchestrator emits, including itself and selected_output.json
+    # when the publish policy promotes the run. The pre-amendment
+    # build only contained progress.json + run_status.json by the time
+    # the manifest was written.
+    will_publish_selected = (
+        run_status == "complete"
+        or (run_status == "partial" and bool(args.allow_partial_publish))
+    )
 
-    status_rel = _write_run_status(
+    progress_rel = path_for_output(str(progress_path)) or str(progress_path)
+    status_rel = path_for_output(str(run_root / "run_status.json")) or str(
+        run_root / "run_status.json"
+    )
+    manifest_rel = path_for_output(str(run_root / "run_manifest.json")) or str(
+        run_root / "run_manifest.json"
+    )
+    selected_output_planned_rel: Optional[str] = None
+    if will_publish_selected:
+        selected_output_planned_rel = path_for_output(
+            str(_selected_output_path(project_root))
+        )
+
+    final_artifacts: list[str] = [progress_rel, status_rel, manifest_rel]
+    if selected_output_planned_rel:
+        final_artifacts.append(selected_output_planned_rel)
+
+    _write_run_status(
         run_root,
         invocation_id=invocation_id,
         started_at=started_at,
@@ -1001,9 +1107,8 @@ def main(
         run_status=run_status,
         progress=progress,
     )
-    artifacts_written.append(status_rel)
 
-    manifest_rel = _write_run_manifest(
+    _write_run_manifest(
         run_root,
         invocation_id=invocation_id,
         started_at=started_at,
@@ -1012,9 +1117,8 @@ def main(
         run_status=run_status,
         inputs=inputs,
         progress=progress,
-        artifacts_written=list(artifacts_written),
+        artifacts_written=list(final_artifacts),
     )
-    artifacts_written.append(manifest_rel)
 
     selected_output_rel = _maybe_update_selected_output(
         project_root=project_root,
@@ -1025,8 +1129,16 @@ def main(
         ended_at=ended_at,
         allow_partial_publish=bool(args.allow_partial_publish),
     )
-    if selected_output_rel:
-        artifacts_written.append(selected_output_rel)
+
+    # Sanity: the planned and actual selected_output emission must agree.
+    # If selected_output ended up not being written (e.g. policy declined),
+    # drop it from the final inventory so the stdout summary matches the
+    # real on-disk state.
+    artifacts_written = list(final_artifacts)
+    if selected_output_planned_rel and not selected_output_rel:
+        artifacts_written = [
+            a for a in artifacts_written if a != selected_output_planned_rel
+        ]
 
     # Final progress rewrite so totals/timestamps reflect terminal state.
     _write_progress(progress_path, progress)

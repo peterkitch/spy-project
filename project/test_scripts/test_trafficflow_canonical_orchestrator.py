@@ -824,3 +824,307 @@ def test_help_smoke_via_cli(tmp_path):
     )
     assert proc.returncode == 0
     assert "trafficflow_canonical_orchestrator" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Amendment 1: resume retry must recover quarantined secondaries
+# ---------------------------------------------------------------------------
+
+
+def _seed_prior_progress(run_root: Path, k_range: list[int]) -> None:
+    """Drop a valid prior progress.json so --resume can attach to it."""
+    (run_root / "progress.json").write_text(
+        json.dumps({
+            "schema_version": orch.ORCHESTRATOR_SCHEMA,
+            "config": {"k_range": list(k_range)},
+        }),
+        encoding="utf-8")
+
+
+def _seed_stale_quarantine(run_root: Path, secondary: str,
+                            *, failure_kind: str = "compute_error",
+                            failed_at_k: int = 2,
+                            error_message: str = "prior_attempt_boom") -> None:
+    quarantine_dir = run_root / ".quarantine" / secondary
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    (quarantine_dir / "failure.json").write_text(
+        json.dumps({
+            "schema_version": runner.PHASE_E_RUN_MANIFEST_SCHEMA,
+            "secondary": secondary,
+            "failure_kind": failure_kind,
+            "error_class": "RuntimeError",
+            "error_message": error_message,
+            "failed_at_k": failed_at_k,
+        }),
+        encoding="utf-8")
+
+
+def test_resume_retries_quarantined_secondary_success(tmp_path, monkeypatch):
+    """Amendment 1: --resume + prior quarantine + no .done -> retry; success
+    classifies as complete, not inconsistent_worker_state."""
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_RETRY_OK")
+    _seed_prior_progress(run_root, [1, 2])
+    _seed_stale_quarantine(run_root, "AMZN")
+
+    seen: list[str] = []
+
+    def _tracking_invoker(**kwargs):
+        seen.append(kwargs["secondary"])
+        return _make_success_invoker(k_list=[1, 2])(**kwargs)
+
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["AMZN"], k_range="1,2", workers=1,
+        extra=["--resume"])
+    rc, payload, _, _ = _capture_main(argv, worker_invoker=_tracking_invoker)
+    assert rc == orch.EXIT_OK
+    assert payload["run_status"] == "complete"
+    assert seen == ["AMZN"]
+    progress = json.loads(
+        (run_root / "progress.json").read_text(encoding="utf-8"))
+    row = next(r for r in progress["secondaries"] if r["secondary"] == "AMZN")
+    assert row["status"] == "complete"
+    assert row["done_marker_present"] is True
+    assert row["quarantine_present"] is False
+    assert row["failure_kind"] is None
+    # The stale quarantine file must be gone after a successful retry.
+    assert not (run_root / ".quarantine" / "AMZN" / "failure.json").exists()
+
+
+def test_resume_retries_quarantined_secondary_fail_again(tmp_path,
+                                                         monkeypatch):
+    """Amendment 1: --resume + prior quarantine + retry fails -> failed,
+    fresh quarantine reflected, no inconsistent_worker_state."""
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_RETRY_FAIL")
+    _seed_prior_progress(run_root, [1, 2])
+    _seed_stale_quarantine(run_root, "AMZN", failed_at_k=1,
+                           error_message="prior_boom")
+
+    base = _make_success_invoker(k_list=[1, 2])
+    invoker = _make_quarantine_invoker(
+        fail_secondaries={"AMZN"}, success_invoker=base,
+        failure_message="retry_boom", failed_at_k=2)
+
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["AMZN"], k_range="1,2", workers=1,
+        extra=["--resume"])
+    rc, payload, _, _ = _capture_main(argv, worker_invoker=invoker)
+    assert rc == orch.EXIT_FAILED
+    assert payload["run_status"] == "failed"
+    progress = json.loads(
+        (run_root / "progress.json").read_text(encoding="utf-8"))
+    row = next(r for r in progress["secondaries"] if r["secondary"] == "AMZN")
+    assert row["status"] == "failed"
+    assert row["failure_kind"] == "compute_error"  # Amendment 3 propagation
+    assert row["k_failed"] == 2
+    # Fresh failure.json is present (the retry's quarantine).
+    fresh = json.loads(
+        (run_root / ".quarantine" / "AMZN" / "failure.json").read_text(
+            encoding="utf-8"))
+    assert fresh["failed_at_k"] == 2
+    # Failure message must mention the retry, not the prior attempt.
+    assert "retry_boom" in (row["failure_message_sanitized"] or "")
+
+
+# ---------------------------------------------------------------------------
+# Amendment 2: unreadable progress.json must fail closed
+# ---------------------------------------------------------------------------
+
+
+def test_unreadable_progress_refuses_without_resume(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_BADJSON_A")
+    progress_path = run_root / "progress.json"
+    progress_path.write_text("{not json at all", encoding="utf-8")
+    original_bytes = progress_path.read_bytes()
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY"], k_range="1,2", workers=1)
+    rc, payload, _, _ = _capture_main(
+        argv, worker_invoker=_make_success_invoker(k_list=[1, 2]))
+    assert rc == orch.EXIT_REFUSED
+    assert payload["refusal_reason"] == "orchestrator_progress_unreadable"
+    # Original on-disk file must not have been rewritten by the orchestrator.
+    assert progress_path.read_bytes() == original_bytes
+
+
+def test_unreadable_progress_refuses_with_resume(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_BADJSON_B")
+    progress_path = run_root / "progress.json"
+    progress_path.write_text("{still not json", encoding="utf-8")
+    original_bytes = progress_path.read_bytes()
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY"], k_range="1,2", workers=1,
+        extra=["--resume"])
+    rc, payload, _, _ = _capture_main(
+        argv, worker_invoker=_make_success_invoker(k_list=[1, 2]))
+    assert rc == orch.EXIT_REFUSED
+    assert payload["refusal_reason"] == "orchestrator_progress_unreadable"
+    assert progress_path.read_bytes() == original_bytes
+
+
+# ---------------------------------------------------------------------------
+# Amendment 3: worker quarantine failure_kind is propagated
+# ---------------------------------------------------------------------------
+
+
+def test_quarantine_failure_kind_propagated(tmp_path, monkeypatch):
+    """Amendment 3: worker-written failure_kind survives orchestrator
+    classification. The orchestrator must not overwrite a quarantine
+    record's failure_kind with the generic 'worker_failed' sentinel."""
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_FAILKIND")
+    base = _make_success_invoker(k_list=[1, 2, 3, 4])
+    invoker = _make_quarantine_invoker(
+        fail_secondaries={"SPY"}, success_invoker=base,
+        failure_message="synthetic compute failure", failed_at_k=4)
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY"], k_range="1,2,3,4", workers=1)
+    rc, _, _, _ = _capture_main(argv, worker_invoker=invoker)
+    assert rc == orch.EXIT_FAILED
+    progress = json.loads(
+        (run_root / "progress.json").read_text(encoding="utf-8"))
+    row = next(r for r in progress["secondaries"] if r["secondary"] == "SPY")
+    assert row["failure_kind"] == "compute_error"
+    assert row["k_failed"] == 4
+    manifest = json.loads(
+        (run_root / "run_manifest.json").read_text(encoding="utf-8"))
+    sec_summary = next(
+        e for e in manifest["per_secondary_summary"] if e["secondary"] == "SPY"
+    )
+    assert sec_summary["failure_kind"] == "compute_error"
+    assert sec_summary["k_failed"] == 4
+
+
+def test_quarantine_without_failure_kind_falls_back_to_worker_failed(
+    tmp_path, monkeypatch
+):
+    """A quarantine record missing ``failure_kind`` must still classify
+    as ``worker_failed`` rather than leaving the row's failure_kind
+    null."""
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_FALLBACK")
+
+    def _kindless_quarantine_invoker(*, runner_path, python_path, secondary,
+                                      k_range, stackbuilder_root, output_dir,
+                                      heavy_stage, timeout_seconds):
+        quarantine_dir = Path(output_dir) / ".quarantine" / secondary
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        (quarantine_dir / "failure.json").write_text(
+            json.dumps({
+                "schema_version": runner.PHASE_E_RUN_MANIFEST_SCHEMA,
+                "secondary": secondary,
+                "error_message": "no_failure_kind_field",
+            }),
+            encoding="utf-8")
+        return {
+            "exit_code": 0,
+            "stdout_text": json.dumps({"secondary": secondary}),
+            "stderr_text": "",
+            "elapsed_seconds": 0.01,
+            "timed_out": False,
+            "pid": 77777,
+            "command": [python_path, runner_path],
+        }
+
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY"], k_range="1", workers=1)
+    rc, _, _, _ = _capture_main(
+        argv, worker_invoker=_kindless_quarantine_invoker)
+    assert rc == orch.EXIT_FAILED
+    progress = json.loads(
+        (run_root / "progress.json").read_text(encoding="utf-8"))
+    row = next(r for r in progress["secondaries"] if r["secondary"] == "SPY")
+    assert row["failure_kind"] == "worker_failed"
+
+
+# ---------------------------------------------------------------------------
+# Amendment 4: complete artifacts_written inventory
+# ---------------------------------------------------------------------------
+
+
+def test_artifacts_written_complete_run_includes_all_run_level_files(
+    tmp_path, monkeypatch
+):
+    """run_manifest.json artifacts_written must include progress.json,
+    run_status.json, run_manifest.json, and selected_output.json."""
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_ART_COMPLETE")
+    invoker = _make_success_invoker(k_list=[1, 2])
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY", "AAPL"], k_range="1,2", workers=2)
+    rc, payload, _, _ = _capture_main(argv, worker_invoker=invoker)
+    assert rc == orch.EXIT_OK
+    manifest = json.loads(
+        (run_root / "run_manifest.json").read_text(encoding="utf-8"))
+    arts = manifest["artifacts_written"]
+    assert any(a.endswith("progress.json") for a in arts)
+    assert any(a.endswith("run_status.json") for a in arts)
+    assert any(a.endswith("run_manifest.json") for a in arts)
+    assert any(a.endswith("selected_output.json") for a in arts)
+    # Stdout summary must agree.
+    summary_arts = payload["artifacts_written"]
+    assert set(summary_arts) == set(arts)
+
+
+def test_artifacts_written_partial_without_publish_excludes_selected_output(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_ART_PARTIAL_NP")
+    base = _make_success_invoker(k_list=[1])
+    invoker = _make_quarantine_invoker(
+        fail_secondaries={"AAPL"}, success_invoker=base)
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY", "AAPL"], k_range="1", workers=2)
+    rc, payload, _, _ = _capture_main(argv, worker_invoker=invoker)
+    assert rc == orch.EXIT_PARTIAL
+    manifest = json.loads(
+        (run_root / "run_manifest.json").read_text(encoding="utf-8"))
+    arts = manifest["artifacts_written"]
+    assert any(a.endswith("progress.json") for a in arts)
+    assert any(a.endswith("run_status.json") for a in arts)
+    assert any(a.endswith("run_manifest.json") for a in arts)
+    assert not any(a.endswith("selected_output.json") for a in arts)
+    summary_arts = payload["artifacts_written"]
+    assert set(summary_arts) == set(arts)
+
+
+def test_artifacts_written_partial_with_publish_includes_selected_output(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    runner_stub = _runner_stub_path(tmp_path)
+    run_root = _setup_canonical_root(tmp_path, sub="runs/RUN_ART_PARTIAL_P")
+    base = _make_success_invoker(k_list=[1])
+    invoker = _make_quarantine_invoker(
+        fail_secondaries={"AAPL"}, success_invoker=base)
+    argv = _argv_base(
+        run_root=run_root, runner_path=runner_stub,
+        secondaries=["SPY", "AAPL"], k_range="1", workers=2,
+        extra=["--allow-partial-publish"])
+    rc, payload, _, _ = _capture_main(argv, worker_invoker=invoker)
+    assert rc == orch.EXIT_PARTIAL
+    manifest = json.loads(
+        (run_root / "run_manifest.json").read_text(encoding="utf-8"))
+    arts = manifest["artifacts_written"]
+    assert any(a.endswith("selected_output.json") for a in arts)
+    summary_arts = payload["artifacts_written"]
+    assert set(summary_arts) == set(arts)
