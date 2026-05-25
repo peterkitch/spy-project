@@ -574,6 +574,38 @@ def sanitize_for_json(value: Any, *, project_root: Optional[Path] = None) -> Any
     return value
 
 
+_EMBEDDED_ABS_PATH_RE = re.compile(
+    # POSIX absolute paths: leading slash + at least two name segments
+    # (so a stray "/" or short token like "/var" by itself does not
+    # match). Each segment allows letters, digits, dot, dash, underscore.
+    # Windows drive-letter absolute paths: any single ASCII letter
+    # followed by a colon and a path separator, then at least one path
+    # segment.
+    r"(?:[A-Za-z]:[\\/][^\s\"'<>]+|/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+)"
+)
+
+
+def _scrub_embedded_absolute_paths(value: Any) -> Any:
+    """Replace embedded absolute-path substrings inside a free-form
+    string with ``<ABSOLUTE_PATH_REDACTED>``.
+
+    ``sanitize_for_json`` only redacts string LEAVES that look like a
+    path in their entirety. It deliberately does not scan free-form
+    strings (e.g. error messages, exception repr) for embedded paths,
+    because path-like substrings are normally caller-owned and the
+    sanitizer's contract is leaf-level only.
+
+    The canonical writer feeds OS-level error messages into
+    ``failure.json``, and those messages routinely embed absolute
+    filesystem paths (pytest ``tmp_path``, the system's temp dir,
+    etc.). This scrubber is the targeted privacy gate for that case.
+    Non-string values pass through unchanged.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    return _EMBEDDED_ABS_PATH_RE.sub(_ABS_PATH_REDACTED, value)
+
+
 def _sanitize_conflict_entry(entry: Any) -> Any:
     if not isinstance(entry, dict):
         return entry
@@ -2110,6 +2142,8 @@ def _execute_canonical_write(
     sec_row = per_secondary[0]
     secondary = sec_row.get("secondary")
     elig_map = sec_row.get("k_eligibility") or {}
+    k_requested_raw = sec_row.get("k_requested") or []
+    preflight_verdict = sec_row.get("verdict")
     combo_leaderboard_path = sec_row.get("combo_leaderboard_path")
 
     sb_path_raw = sec_row.get("selected_build_path")
@@ -2158,15 +2192,70 @@ def _execute_canonical_write(
     start_iso = _utc_iso()
     writer_t0 = time.perf_counter()
 
-    # Iterate K in numeric-ascending order for deterministic .done
-    # timing and predictable last_completed_k semantics.
-    def _k_sort_key(item):
+    # Amendment 1 (PR #319 audit): canonical-write must fail-closed
+    # when preflight is not eligible or no K cells are eligible.
+    # Validate BEFORE the K loop so that an empty k_eligibility map
+    # (e.g. preflight refused on missing selected_build) cannot
+    # silently skip the loop and still promote .done. Validation
+    # errors here are treated as a single validation_error and
+    # quarantined; .done is never written.
+    eligible_verdicts = {"ELIGIBLE", "ELIGIBLE_WITH_NOTES"}
+    requested_k_ints: list[int] = []
+    for k_raw in k_requested_raw:
         try:
-            return int(str(item[0]).lstrip("K"))
-        except (ValueError, TypeError):
-            return 0
+            requested_k_ints.append(int(k_raw))
+        except (TypeError, ValueError):
+            continue
 
-    for k_key, eligibility in sorted(elig_map.items(), key=_k_sort_key):
+    if preflight_verdict not in eligible_verdicts:
+        failure_kind = "validation_error"
+        failure_error_class = "ValidationError"
+        failure_error_message = (
+            f"preflight_verdict_not_eligible:{preflight_verdict!r}"
+        )
+    elif not requested_k_ints:
+        failure_kind = "validation_error"
+        failure_error_class = "ValidationError"
+        failure_error_message = "no_requested_k_cells"
+    else:
+        # Verify every explicitly requested K is present in the
+        # preflight eligibility map AND marked ELIGIBLE. Use the
+        # explicit ``k_requested`` list (anchored on --k / --k-range)
+        # rather than ``elig_map.items()`` so the writer cannot
+        # silently honor a partial eligibility set that omits a
+        # requested K.
+        for k_val in requested_k_ints:
+            key = f"K{k_val}"
+            cell_elig = elig_map.get(key)
+            if cell_elig is None:
+                failure_kind = "validation_error"
+                failure_error_class = "ValidationError"
+                failure_error_message = (
+                    f"requested_k_missing_from_eligibility:{k_val}"
+                )
+                failed_at_k = k_val
+                break
+            if cell_elig != "ELIGIBLE":
+                failure_kind = "validation_error"
+                failure_error_class = "ValidationError"
+                failure_error_message = (
+                    f"requested_k_not_eligible:{k_val}:{cell_elig}"
+                )
+                failed_at_k = k_val
+                break
+
+    # If pre-loop validation failed, skip the K loop entirely. The
+    # downstream quarantine + .done-absence logic below handles the
+    # rest. Compute is NOT invoked.
+    if failure_kind is not None:
+        # No K loop iterations; cells_requested stays 0 so the failure
+        # path below sees an empty per_cell_summary.
+        iter_k_keys = []
+    else:
+        iter_k_keys = [f"K{k}" for k in sorted(requested_k_ints)]
+
+    for k_key in iter_k_keys:
+        eligibility = elig_map.get(k_key, "ELIGIBLE")
         cells_requested += 1
         try:
             k_val = int(str(k_key).lstrip("K"))
@@ -2344,19 +2433,35 @@ def _execute_canonical_write(
         try:
             quarantine_dir = output_dir / ".quarantine" / str(secondary)
             quarantine_dir.mkdir(parents=True, exist_ok=True)
+            # Amendment 3 (PR #319 audit): sanitize the error_message
+            # field BEFORE assembling the failure_record. OSError
+            # messages routinely embed absolute filesystem paths
+            # (pytest tmp_path, the system temp dir, etc.). The
+            # default sanitize_for_json only redacts whole-string path
+            # LEAVES; it does not scan free-form strings for embedded
+            # paths. _scrub_embedded_absolute_paths is the targeted
+            # gate for that case. After scrubbing, the record still
+            # passes through sanitize_for_json as a defense-in-depth
+            # pass for any path-like leaves the writer may add later.
+            scrubbed_error_message = _scrub_embedded_absolute_paths(
+                failure_error_message
+            )
             failure_record = {
                 "schema_version": PHASE_E_RUN_MANIFEST_SCHEMA,
                 "secondary": secondary,
                 "failure_kind": failure_kind,
                 "failure_at_utc": end_iso,
                 "error_class": failure_error_class,
-                "error_message": failure_error_message,
+                "error_message": scrubbed_error_message,
                 "last_completed_k": last_completed_k,
                 "failed_at_k": failed_at_k,
                 "runner_invocation_id": invocation_id,
             }
+            safe_failure_record = sanitize_for_json(
+                failure_record, project_root=Path.cwd()
+            )
             failure_path = quarantine_dir / "failure.json"
-            _atomic_write_json(failure_path, failure_record)
+            _atomic_write_json(failure_path, safe_failure_record)
             failure_rel = path_for_output(str(failure_path))
             if failure_rel:
                 artifacts_written.append(failure_rel)
@@ -2691,7 +2796,17 @@ def main(
     # Process-conflict check. When --write is authorized, the checker
     # is asked to fail-closed (status="error" on enumeration failure);
     # otherwise it returns status="unknown" advisorily.
-    write_requested = bool(effective_config.get("write_authorized"))
+    #
+    # Amendment 2 (PR #319 audit): canonical writes must also
+    # fail-closed. ``write_authorized`` is False for canonical writes
+    # because the Phase C write-mode logic treats output/trafficflow
+    # paths as canonical (NOT isolated). Without this OR, canonical
+    # writes would pass ``write_requested=False`` and the conflict
+    # checker would be advisory rather than fail-closed.
+    write_requested = bool(
+        effective_config.get("write_authorized")
+        or (canonical_write_flag and write_flag)
+    )
     conflict_result = process_conflict_checker(write_requested=write_requested)
     envelope["process_conflict_result"] = conflict_result
     if conflict_result.get("status") == "blocked":

@@ -2792,3 +2792,322 @@ def test_phase_e_beta_secondary_manifest_provenance_fields(
     assert sm["selected_build_sha256"] is not None
     assert sm["selected_build_path"] is not None
     assert sm["explicit_build_override"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase E PR Beta amendments (PR #319 audit fixes)
+# ---------------------------------------------------------------------------
+#
+# Amendment 1: prevent false `.done` on preflight failure or empty K
+# eligibility. The canonical writer must validate the preflight
+# verdict + requested-K eligibility BEFORE the K loop; an empty
+# eligibility map must NOT be promoted to .done.
+#
+# Amendment 2: treat canonical-write requests as write_requested=True
+# for process-conflict checks. Canonical writes must fail closed when
+# enumeration errors occur, matching isolated-write semantics.
+#
+# Amendment 3: sanitize the quarantine failure.json before writing.
+# OSError messages can leak absolute filesystem paths through
+# error_message; the failure record must pass through the same
+# path/privacy layer as stdout.
+
+
+def test_phase_e_beta_amendment_missing_selected_build_quarantines(
+    tmp_path, monkeypatch
+):
+    """Audit blocker repro: canonical-write with a missing
+    selected_build.json must fail-closed, write .quarantine, and NOT
+    write .done."""
+    monkeypatch.chdir(tmp_path)
+    # Build a stackbuilder root that does NOT contain SPY/selected_build.json,
+    # so preflight will refuse.
+    sb_root = tmp_path / "output" / "stackbuilder"
+    sb_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    canonical_root = Path("output") / "trafficflow" / "runs" / "RUN_MISSING_SB"
+    compute = _make_canonical_compute_mock()
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2,3,4,5,6",
+            "--output-dir", str(canonical_root),
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=compute)
+    assert rc == runner.EXIT_REFUSED
+    assert payload["status"] == "failed"
+    # Compute mock was NOT called; the validation refusal fires before
+    # the K loop.
+    assert compute.calls == []
+    # .done must be absent.
+    sec_dir = canonical_root / "SPY"
+    assert not (sec_dir / ".done").exists()
+    # No board-row files should exist.
+    if sec_dir.exists():
+        assert list(sec_dir.glob("board_rows_*")) == []
+    # Quarantine failure.json must exist with validation_error kind.
+    failure_path = canonical_root / ".quarantine" / "SPY" / "failure.json"
+    assert failure_path.exists()
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert failure["secondary"] == "SPY"
+    assert failure["failure_kind"] == "validation_error"
+    ec = payload["effective_config"]
+    assert ec["canonical_write_mode"] == "quarantined"
+
+
+def test_phase_e_beta_amendment_empty_k_eligibility_quarantines(
+    tmp_path, monkeypatch
+):
+    """When preflight returns an empty k_eligibility map (e.g.
+    leaderboard rows missing for every requested K), canonical-write
+    must fail-closed and not write .done. The compute callable must
+    not be invoked."""
+    # Build a fixture where the leaderboard has K=1 but the canonical
+    # request asks for K=5, so preflight resolves no eligible K cells.
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen,
+                          selected_k=1)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    canonical_root = Path("output") / "trafficflow" / "runs" / "RUN_EMPTY_K"
+    compute = _make_canonical_compute_mock()
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "5",  # K=5 is NOT in the leaderboard
+            "--output-dir", str(canonical_root),
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=compute)
+    assert rc == runner.EXIT_REFUSED
+    assert payload["status"] == "failed"
+    # Compute must not have been called.
+    assert compute.calls == []
+    # .done absent; no board-row files.
+    sec_dir = canonical_root / "SPY"
+    assert not (sec_dir / ".done").exists()
+    if sec_dir.exists():
+        assert list(sec_dir.glob("board_rows_*")) == []
+    # Quarantine record present.
+    failure_path = canonical_root / ".quarantine" / "SPY" / "failure.json"
+    assert failure_path.exists()
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert failure["failure_kind"] == "validation_error"
+    ec = payload["effective_config"]
+    assert ec["canonical_write_mode"] == "quarantined"
+
+
+def test_phase_e_beta_amendment_requested_k_not_eligible_quarantines(
+    tmp_path, monkeypatch
+):
+    """When a requested K is present in the leaderboard but resolves
+    to a non-ELIGIBLE eligibility (e.g. STALE-GATED via missing PKL),
+    canonical-write must fail-closed before invoking compute for the
+    bad K. Earlier K values that completed successfully may remain on
+    disk, but .done must be absent and quarantine must be written."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    # Two K rows but only K=1's member has a PKL; K=2's member is
+    # missing, so its eligibility resolves to a non-ELIGIBLE gate.
+    _make_fake_leaderboard(chosen,
+                            k_to_members={1: ["AAA[D]"], 2: ["MISS[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen,
+                          selected_k=2)
+    monkeypatch.setattr(runner, "DEFAULT_PRICE_CACHE_DIR",
+                        str(tmp_path / "price_cache" / "daily"))
+    monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
+                        str(tmp_path / "cache" / "results"))
+    _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
+                       tail_date="2026-05-22")
+    _write_pkl(tmp_path / "cache" / "results", "AAA",
+               declared_max_sma_day=114, has_sma_114=True)
+    # MISS has no PKL written.
+    canonical_root = Path("output") / "trafficflow" / "runs" / "RUN_K2_BAD"
+    compute = _make_canonical_compute_mock()
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2",
+            "--output-dir", str(canonical_root),
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=compute)
+    assert rc == runner.EXIT_REFUSED
+    assert payload["status"] == "failed"
+    # The pre-loop validation fires before compute is invoked.
+    assert compute.calls == []
+    sec_dir = canonical_root / "SPY"
+    assert not (sec_dir / ".done").exists()
+    failure_path = canonical_root / ".quarantine" / "SPY" / "failure.json"
+    assert failure_path.exists()
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert failure["failure_kind"] == "validation_error"
+    ec = payload["effective_config"]
+    assert ec["canonical_write_mode"] == "quarantined"
+
+
+def test_phase_e_beta_amendment_canonical_write_treated_as_write_for_conflict(
+    tmp_path, monkeypatch
+):
+    """The process-conflict checker must be called with
+    write_requested=True for canonical-write requests, even though
+    Phase C write-mode logic leaves write_authorized=False for
+    canonical output paths."""
+    sb_root, canonical_root = _canonical_eligible_fixture(tmp_path, monkeypatch)
+    compute = _make_canonical_compute_mock()
+    seen = {"write_requested": None}
+
+    def _checker(write_requested=False):
+        seen["write_requested"] = write_requested
+        return {"status": "ok", "conflicts": [],
+                "queried_via": "fake", "error": None}
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2,3",
+            "--output-dir", str(canonical_root),
+            "--write",
+            "--canonical-write"]
+    rc, _, _, _ = _capture_main(
+        argv, process_conflict_checker=_checker,
+        compute_callable=compute)
+    assert rc == runner.EXIT_OK
+    # The conflict checker MUST have been called with write_requested=True.
+    assert seen["write_requested"] is True
+
+
+def test_phase_e_beta_amendment_canonical_write_enumeration_error_refuses(
+    tmp_path, monkeypatch
+):
+    """If the process-conflict checker returns status='error' under
+    canonical-write, the runner must fail closed (refuse) just as it
+    does for isolated-write. Compute must not be invoked and
+    trafficflow must not be imported."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+
+    def _enum_error(write_requested=False):
+        return {"status": "error", "conflicts": [],
+                "queried_via": "fake",
+                "error": "enumeration_failed"}
+
+    compute = _make_canonical_compute_mock()
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", "output/trafficflow",
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_enum_error,
+        compute_callable=compute)
+    assert rc == runner.EXIT_PROCESS_CONFLICT
+    assert payload["status"] == "refused"
+    assert "process_conflict_enumeration_unavailable" in payload["errors"]
+    assert compute.calls == []
+    assert "trafficflow" not in sys.modules
+
+
+def test_phase_e_beta_amendment_canonical_write_blocked_conflict_refuses(
+    tmp_path, monkeypatch
+):
+    """If the process-conflict checker returns status='blocked' under
+    canonical-write, the runner must refuse with process_conflict_blocked
+    and exit EXIT_PROCESS_CONFLICT."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    compute = _make_canonical_compute_mock()
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", "output/trafficflow",
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_blocked_conflict,
+        compute_callable=compute)
+    assert rc == runner.EXIT_PROCESS_CONFLICT
+    assert payload["status"] == "refused"
+    assert "process_conflict_blocked" in payload["errors"]
+    assert compute.calls == []
+    assert "trafficflow" not in sys.modules
+
+
+def test_phase_e_beta_amendment_quarantine_failure_json_sanitizes_paths(
+    tmp_path, monkeypatch
+):
+    """Force an OSError whose message contains an absolute tmp_path-
+    like path. The quarantine failure.json must NOT contain that raw
+    absolute path; sanitization must redact it via the same
+    path/privacy layer that processes stdout."""
+    sb_root, canonical_root = _canonical_eligible_fixture(tmp_path, monkeypatch)
+    compute = _make_canonical_compute_mock()
+    real_write_bytes = runner._atomic_write_bytes
+
+    # Craft an absolute-path-bearing OSError message. The path lives
+    # under tmp_path (which is outside the chdir'd project root in
+    # canonical-write fixtures because chdir(tmp_path) makes tmp_path
+    # the project root - so we point at an absolute path OUTSIDE the
+    # project root, which sanitize_for_json redacts to
+    # <ABSOLUTE_PATH_REDACTED>).
+    leaky_abs_path = "/var/some/leaky/abs/path/cache/results/SPY.pkl"
+
+    def _selective_write_bytes(path, data):
+        if str(path).endswith("board_rows_k=2.csv"):
+            raise OSError(
+                f"simulated_oserror referencing {leaky_abs_path}"
+            )
+        return real_write_bytes(path, data)
+
+    monkeypatch.setattr(runner, "_atomic_write_bytes", _selective_write_bytes)
+
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2,3",
+            "--output-dir", str(canonical_root),
+            "--write",
+            "--canonical-write"]
+    rc, _, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict,
+        compute_callable=compute)
+    assert rc == runner.EXIT_REFUSED
+    failure_path = canonical_root / ".quarantine" / "SPY" / "failure.json"
+    assert failure_path.exists()
+    raw_fail = failure_path.read_text(encoding="utf-8")
+    # The raw absolute path must NOT appear in failure.json.
+    assert leaky_abs_path not in raw_fail
+    # And the canonical privacy placeholder must appear instead
+    # (sanitize_for_json + path_for_output rewrites any absolute path
+    # outside the project root as <ABSOLUTE_PATH_REDACTED>).
+    failure = json.loads(raw_fail)
+    assert failure["failure_kind"] == "write_error"
+    # The error_message field still describes the error class /
+    # context but the absolute path has been redacted.
+    em = str(failure.get("error_message", ""))
+    assert leaky_abs_path not in em
+    assert "<ABSOLUTE_PATH_REDACTED>" in em
