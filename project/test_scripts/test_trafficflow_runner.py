@@ -2023,3 +2023,329 @@ def test_engine_network_surface_block_preserves_selected_build_pin(
     assert state["fetch_calls"] == 0
     assert state["write_cache_calls"] == 0
     assert state["persist_cache_calls"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase E PR Alpha: canonical-write CLI guardrails
+# ---------------------------------------------------------------------------
+#
+# These tests cover the new --canonical-write and --heavy-stage CLI
+# flags, the PHASE_E_RUN_MANIFEST_SCHEMA constant, the canonical
+# output-dir helper, the fail-closed validation refusal codes, and
+# the Phase Alpha not-implemented boundary. PR Alpha implements CLI
+# guards and refusals only - no canonical-write mechanics. All tests
+# refuse before any preflight or compute work; trafficflow.py is
+# never imported by these tests.
+
+
+def _alpha_argv_canonical(sb_root, *, secondaries="SPY", k_range="1,2,3,4,5,6",
+                            output_dir_under_cwd="output/trafficflow",
+                            write=True, canonical_write=True,
+                            heavy_stage=False):
+    """Build an argv for a Phase E PR Alpha canonical-write request.
+
+    The output dir is given as a repo-relative path so the runner's
+    canonical helper resolves it under the current working directory
+    (which tests typically swap to tmp_path via monkeypatch.chdir).
+    """
+    argv = ["--secondaries", secondaries,
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", k_range,
+            "--output-dir", output_dir_under_cwd]
+    if write:
+        argv.append("--write")
+    if canonical_write:
+        argv.append("--canonical-write")
+    if heavy_stage:
+        argv.append("--heavy-stage")
+    return argv
+
+
+def test_phase_e_alpha_schema_constant_locked():
+    """PHASE_E_RUN_MANIFEST_SCHEMA is locked to phase_e_v1."""
+    assert runner.PHASE_E_RUN_MANIFEST_SCHEMA == "trafficflow_runner_phase_e_v1"
+
+
+def test_phase_e_alpha_existing_phase_c_canonical_refusal_preserved(
+    tmp_path, monkeypatch
+):
+    """--write into output/trafficflow without --canonical-write must
+    still refuse with canonical_write_forbidden_in_phase_c. The Phase
+    Alpha guardrails must not weaken the existing Phase C refusal."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", "output/trafficflow",
+            "--write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_REFUSED
+    assert payload["status"] == "refused"
+    assert "canonical_write_forbidden_in_phase_c" in payload["errors"]
+    # No board-row files written under the fake output/trafficflow root.
+    fake_canonical = tmp_path / "output" / "trafficflow"
+    if fake_canonical.exists():
+        assert list(fake_canonical.rglob("board_rows_*")) == []
+        assert list(fake_canonical.rglob("run_manifest.json")) == []
+    assert "trafficflow" not in sys.modules
+
+
+def test_phase_e_alpha_canonical_write_without_write_refuses(
+    tmp_path, monkeypatch
+):
+    """--canonical-write without --write refuses with
+    canonical_write_requires_write, exit 2, before any compute."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", "output/trafficflow",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_REFUSED
+    assert rc == 2
+    assert payload["status"] == "refused"
+    assert "canonical_write_requires_write" in payload["errors"]
+    assert "trafficflow" not in sys.modules
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is True
+    assert ec["heavy_stage_requested"] is False
+
+
+def test_phase_e_alpha_heavy_stage_without_canonical_write_refuses(
+    tmp_path, monkeypatch
+):
+    """--heavy-stage without --canonical-write refuses with
+    heavy_stage_requires_canonical_write, exit 2, before any compute."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    iso_out = tmp_path / "iso"
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", str(iso_out),
+            "--write",
+            "--heavy-stage"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_REFUSED
+    assert rc == 2
+    assert payload["status"] == "refused"
+    assert "heavy_stage_requires_canonical_write" in payload["errors"]
+    assert "trafficflow" not in sys.modules
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is False
+    assert ec["heavy_stage_requested"] is True
+
+
+def test_phase_e_alpha_canonical_write_wrong_output_dir_refuses(
+    tmp_path, monkeypatch
+):
+    """--canonical-write with output_dir not under output/trafficflow
+    refuses with canonical_write_output_dir_must_be_output_trafficflow."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    iso_out = tmp_path / "iso"
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", str(iso_out),
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_REFUSED
+    assert rc == 2
+    assert payload["status"] == "refused"
+    assert (
+        "canonical_write_output_dir_must_be_output_trafficflow"
+        in payload["errors"]
+    )
+    assert "trafficflow" not in sys.modules
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is True
+
+
+def test_phase_e_alpha_canonical_write_multi_secondary_refuses(
+    tmp_path, monkeypatch
+):
+    """--canonical-write with multiple secondaries refuses with
+    canonical_write_multi_secondary_unsupported_use_orchestrator."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    for sec in ("SPY", "AAPL"):
+        chosen = sb_root / sec / "RUN_A"
+        _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+        _write_selected_build(sb_root, sec, selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    argv = ["--secondaries", "SPY,AAPL",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1",
+            "--output-dir", "output/trafficflow",
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_REFUSED
+    assert rc == 2
+    assert payload["status"] == "refused"
+    assert (
+        "canonical_write_multi_secondary_unsupported_use_orchestrator"
+        in payload["errors"]
+    )
+    assert "trafficflow" not in sys.modules
+    # No board-row files anywhere under the fake canonical root.
+    fake_canonical = tmp_path / "output" / "trafficflow"
+    if fake_canonical.exists():
+        assert list(fake_canonical.rglob("board_rows_*")) == []
+
+
+def test_phase_e_alpha_canonical_write_k_above_6_without_heavy_stage_refuses(
+    tmp_path, monkeypatch
+):
+    """--canonical-write with K > 6 and no --heavy-stage refuses with
+    canonical_write_heavy_stage_requires_flag."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"], 7: ["BBB[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,7",
+            "--output-dir", "output/trafficflow",
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_REFUSED
+    assert rc == 2
+    assert payload["status"] == "refused"
+    assert (
+        "canonical_write_heavy_stage_requires_flag"
+        in payload["errors"]
+    )
+    assert "trafficflow" not in sys.modules
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is True
+    assert ec["heavy_stage_requested"] is False
+
+
+def test_phase_e_alpha_canonical_write_k_above_6_with_heavy_stage_not_implemented(
+    tmp_path, monkeypatch
+):
+    """--canonical-write with K > 6 and --heavy-stage clears the K
+    refusal but lands on the Phase Alpha not-implemented boundary
+    (exit 3, canonical_write_not_implemented_in_phase_alpha)."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"], 7: ["BBB[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,7",
+            "--output-dir", "output/trafficflow",
+            "--write",
+            "--canonical-write",
+            "--heavy-stage"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_NOT_IMPLEMENTED
+    assert rc == 3
+    assert payload["status"] == "refused"
+    assert (
+        "canonical_write_not_implemented_in_phase_alpha"
+        in payload["errors"]
+    )
+    assert "trafficflow" not in sys.modules
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is True
+    assert ec["heavy_stage_requested"] is True
+    assert ec["canonical_write_mode"] == "phase_alpha_not_implemented"
+
+
+def test_phase_e_alpha_valid_canonical_write_request_lands_on_not_implemented(
+    tmp_path, monkeypatch
+):
+    """A valid-looking --canonical-write K=1..6 single-secondary
+    request still refuses with canonical_write_not_implemented_in_phase_alpha
+    (exit 3) and writes nothing under the fake canonical root."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    sys.modules.pop("trafficflow", None)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k-range", "1,2,3,4,5,6",
+            "--output-dir", "output/trafficflow",
+            "--write",
+            "--canonical-write"]
+    rc, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    assert rc == runner.EXIT_CANONICAL_WRITE_NOT_IMPLEMENTED
+    assert rc == 3
+    assert payload["status"] == "refused"
+    assert (
+        "canonical_write_not_implemented_in_phase_alpha"
+        in payload["errors"]
+    )
+    assert "trafficflow" not in sys.modules
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is True
+    assert ec["heavy_stage_requested"] is False
+    assert ec["canonical_write_mode"] == "phase_alpha_not_implemented"
+    # No board-row / manifest / sidecar artifacts under the fake
+    # canonical root.
+    fake_canonical = tmp_path / "output" / "trafficflow"
+    if fake_canonical.exists():
+        assert list(fake_canonical.rglob("board_rows_*")) == []
+        assert list(fake_canonical.rglob("run_manifest.json")) == []
+        assert list(fake_canonical.rglob("run.stdout.json")) == []
+        assert list(fake_canonical.rglob(".done")) == []
+
+
+def test_phase_e_alpha_default_invocation_effective_config_fields_present(
+    tmp_path, monkeypatch
+):
+    """Non-canonical default invocations surface the new Phase E
+    discriminators in effective_config. canonical_write_requested and
+    heavy_stage_requested are False; canonical_write_mode is None."""
+    monkeypatch.chdir(tmp_path)
+    sb_root = tmp_path / "output" / "stackbuilder"
+    chosen = sb_root / "SPY" / "RUN_A"
+    _make_fake_leaderboard(chosen, k_to_members={1: ["AAA[D]"]})
+    _write_selected_build(sb_root, "SPY", selected_run_dir=chosen)
+    argv = ["--secondaries", "SPY",
+            "--stackbuilder-root", str(sb_root),
+            "--k", "1"]
+    _, payload, _, _ = _capture_main(
+        argv, process_conflict_checker=_no_conflict)
+    ec = payload["effective_config"]
+    assert ec["canonical_write_requested"] is False
+    assert ec["heavy_stage_requested"] is False
+    assert ec["canonical_write_mode"] is None
