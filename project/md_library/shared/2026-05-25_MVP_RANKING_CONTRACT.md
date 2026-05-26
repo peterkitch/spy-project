@@ -290,49 +290,91 @@ These are explicitly not on the MVP spine. Path 3b remains the long-term archite
 
 ## Display Contract
 
-The MVP Dash front-end displays the following.
+The MVP Dash front-end displays the following. The same behavioral contract applies to the future React rebuild per the 2026-05-26 React Migration Declaration and Frontend Contract (PR #329).
 
-### Board View
+### Landing View
 
-The board view includes:
+- Header: "PRJCT9 Daily Signal Board" (text only, no images).
+- Subheader: "MVP v0" or a similar version indicator.
+- Ranking DataTable with exactly three visible columns:
+  - **Rank**: 1 through N where N is the count of successfully ranked secondaries.
+  - **Ticker**: the secondary ticker symbol.
+  - **Sharpe Score**: the engine-emitted Sharpe value formatted to two decimals. In v0 this is the Phase E K=6 Sharpe as emitted. In v1 this is the match-rule Sharpe with sign-applied captures from Step v1.6.
+- No visible content below the DataTable on the landing view.
 
-- header: "PRJCT9 Daily Signal Board" or similar branding;
-- eight rows;
-- rows sorted by Sharpe descending;
-- footer with data freshness timestamp and a short historical-performance disclaimer.
+The landing view does NOT show:
 
-Each row shows, left to right:
+- Phase E Status field.
+- Total capture %.
+- Triggers / sample size.
+- Low-sample warning indicator.
+- Source Phase E run id.
+- Ranking generated_at timestamp.
+- Historical-performance disclaimer.
 
-- rank, 1 through 8;
-- ticker symbol;
-- current signal / status field in v0, using Phase E's own field name if present;
-- trade direction in v1, BUY or SHORT from v1.1;
-- Sharpe ratio, numeric with two decimals;
-- total capture %, numeric with two decimals;
-- sample size, triggers in v0 and N in v1;
-- warning marker `!` if `low_sample_warning` is true.
-
-In v0, the signal / status column must not be labeled "Direction" or "Recommendation" unless Phase E's emitted field actually uses that meaning. If no such field exists, display the value as unavailable.
+This simplification reflects operator feedback that the landing surface is the ranking surface. Supporting detail and provenance belong in the detail modal so the at-a-glance ranking is not crowded.
 
 ### Detail Modal
 
-On row click, the v0 modal shows:
+- Opens on row click.
+- Renders as a true overlay: fixed-position container, semi-transparent backdrop, centered panel above the page content. The backdrop covers the viewport; the panel sits above it.
+- Opening the modal must not push the landing view downward in normal document flow.
 
-- ticker;
-- member list;
-- Phase E current signal / status field if present;
-- K=6 metrics;
-- Phase E provenance;
-- close button.
+In the Dash implementation, the modal container, the inner panel, the modal content container, and the close button are all present in the initial layout from page load. The container is hidden when closed and visible when open; only the inner content container is rebuilt on each callback fire. This is a Dash-specific callback-graph requirement (callback Inputs must exist at page load), not a binding React implementation detail. A React rebuild may use a route-based detail page or a different overlay primitive as long as the behavioral contract below is preserved.
 
-On row click, the v1 modal shows all v0 fields plus:
+v0 modal content, in order:
 
-- trade direction;
-- current alignment state tuple;
-- CCC time series chart as the hero element;
-- v1 metrics.
+1. **Ticker** as the modal title.
+2. **Member ticker list**, comma-separated.
+3. **K=6 metrics**:
+   - Sharpe, engine-emitted, two decimals.
+   - Total %, engine-emitted, two decimals.
+   - Triggers, engine-emitted, integer.
+   - Wins, engine-emitted, integer.
+   - Losses, engine-emitted, integer.
+   - Win %, engine-emitted, two decimals.
+   - Avg %, engine-emitted, two decimals.
+   - StdDev %, engine-emitted, two decimals.
+   - p-value, engine-emitted, four decimals.
+   - `low_sample_warning`, boolean displayed verbatim.
+4. **Phase E Status** section:
+   - Render each key/value pair from `phase_e_status`.
+   - If `phase_e_status` is empty, display "No Phase E status fields emitted for this secondary."
+5. **Provenance** section:
+   - "Source Phase E run: <trafficflow_run_id>".
+   - `trafficflow_run_root` (repo-relative path).
+   - "Ranking generated at: <generated_at_utc>".
+6. **Disclaimer** as the final modal body element:
+   - "Historical performance does not guarantee future returns."
+7. **Close button** in the modal panel.
 
-The CCC chart appears in v1 only. v0 ships without it.
+v1 modal content extends v0 with the following additions:
+
+- **Trade direction**, BUY or SHORT, derived per Step v1.1.
+- **Current alignment state tuple**, rendered from the engine-emitted state values for 1d, 1wk, 1mo, 3mo, 1y.
+- **CCC time series chart** as the hero element of the v1 modal, positioned prominently after the alignment tuple.
+- **v1 metrics** from Step v1.6: v1 Sharpe, v1 total capture %, v1 N, v1 win count, v1 loss count, v1 win %.
+
+The Sharpe Score column on the v1 landing view reflects the v1 match-rule Sharpe, not the v0 Phase E K=6 Sharpe. v0 and v1 may therefore produce different rankings; that is expected and not an error.
+
+### Modal Toggle Behavior
+
+- First click on a row opens the modal for that row.
+- Click on the same row closes the modal. In the Dash implementation, clicking a different cell in the same row is the reliable same-row close gesture because clicking the exact same cell may not re-fire the underlying DataTable signal.
+- Click on a different row while the modal is open switches the modal content to the new row.
+- The close button closes the modal regardless of click history.
+
+### Error and Edge States
+
+- If the ranking artifact path does not exist, render a clear error message ("Ranking artifact not found.") in place of the table. Do not crash. Do not attempt computation.
+- If the artifact JSON is unreadable or malformed, render an error message ("Ranking artifact unreadable. See console output.").
+- If the artifact `schema_version` is not the expected value, render a message naming both expected and actual schema strings.
+- If `per_secondary` is empty, render the header and subheader with an empty-state message ("No ranked secondaries available in this run.") in place of the table.
+- If a `per_secondary` record is missing an optional field, render "Unavailable" in that field's display position in the modal rather than crashing.
+
+### Amendment History
+
+This Display Contract section was amended on 2026-05-26 to reflect operator-accepted refinements from live testing of PR #327 and PR #328: true modal overlay behavior, landing-board column simplification to Rank / Ticker / Sharpe Score, removal of the landing-view footer, and relocation of provenance plus the historical-performance disclaimer into the modal. The ranking math sections and data input sections are unchanged from the original 2026-05-25 publication.
 
 ---
 
