@@ -673,3 +673,148 @@ def test_modal_state_store_present_in_layout(tmp_path):
     )
     assert store is not None
     assert store.data == {"row_index": None}
+
+
+# ---------------------------------------------------------------------------
+# Live-modal regression coverage (would have failed against merged PR #327)
+# ---------------------------------------------------------------------------
+
+
+def _collect_layout_ids(layout) -> set:
+    """Return the set of string ids assigned to components in the layout."""
+    ids: set = set()
+    for c in _walk_components(layout):
+        comp_id = getattr(c, "id", None)
+        if isinstance(comp_id, str):
+            ids.add(comp_id)
+    return ids
+
+
+def _callback_input_state_ids(app) -> set:
+    """Return the set of component ids referenced by callback Inputs and
+    States across the app's callback_map."""
+    referenced: set = set()
+    for cb in (app.callback_map or {}).values():
+        for spec in cb.get("inputs", []) or []:
+            cid = spec.get("id")
+            if isinstance(cid, str):
+                referenced.add(cid)
+        for spec in cb.get("state", []) or []:
+            cid = spec.get("id")
+            if isinstance(cid, str):
+                referenced.add(cid)
+    return referenced
+
+
+def test_initial_layout_includes_every_callback_input_and_state(tmp_path):
+    """Every component referenced by a callback Input or State must exist
+    in the initial layout. This is the regression test that would have
+    failed against merged PR #327, where ``mvp-modal-close`` was a
+    callback Input but only appeared inside content rendered by the
+    callback itself."""
+    payload = _make_artifact([_make_row("AAA"), _make_row("BBB")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+
+    layout_ids = _collect_layout_ids(app.layout)
+    referenced_ids = _callback_input_state_ids(app)
+
+    missing = referenced_ids - layout_ids
+    assert not missing, (
+        "callback Input/State references components missing from initial "
+        f"layout: {sorted(missing)}"
+    )
+
+
+def test_mvp_modal_close_present_in_initial_layout(tmp_path):
+    """The close button must exist in the initial layout (before any row
+    is clicked), otherwise the live Dash callback's close Input cannot
+    register at page load."""
+    payload = _make_artifact([_make_row("AAA")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+
+    close_buttons = [
+        c for c in _walk_components(app.layout)
+        if isinstance(c, html.Button)
+        and getattr(c, "id", None) == "mvp-modal-close"
+    ]
+    assert len(close_buttons) == 1, (
+        f"expected exactly 1 mvp-modal-close in initial layout, "
+        f"got {len(close_buttons)}"
+    )
+
+    content_containers = [
+        c for c in _walk_components(app.layout)
+        if getattr(c, "id", None) == "mvp-modal-content"
+    ]
+    assert len(content_containers) == 1
+
+
+def test_initial_layout_has_no_duplicate_component_ids(tmp_path):
+    payload = _make_artifact([_make_row("AAA"), _make_row("BBB")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+
+    seen: dict = {}
+    for c in _walk_components(app.layout):
+        cid = getattr(c, "id", None)
+        if isinstance(cid, str):
+            seen[cid] = seen.get(cid, 0) + 1
+
+    duplicates = {cid: count for cid, count in seen.items() if count > 1}
+    assert not duplicates, (
+        f"duplicate component ids in initial layout: {duplicates}"
+    )
+
+
+def test_render_detail_modal_content_does_not_own_close_button():
+    """The close button must NOT live inside the modal body content.
+    It lives in the modal container alongside the body. This prevents
+    the duplicate-ID risk that would otherwise occur every time the
+    callback rebuilds the body content."""
+    row = _make_row("AAA")
+    payload = _make_artifact([row])
+    content = board.render_detail_modal_content(row, payload)
+    matches = [
+        c for c in _walk_components(content)
+        if getattr(c, "id", None) == "mvp-modal-close"
+    ]
+    assert matches == [], (
+        "render_detail_modal_content must not include mvp-modal-close; "
+        "the close button is part of the stable modal container."
+    )
+
+
+def test_callback_writes_content_to_mvp_modal_content_not_mvp_modal(
+    tmp_path,
+):
+    """The callback writes modal body content to ``mvp-modal-content``
+    and never to ``mvp-modal.children``. Writing to ``mvp-modal.children``
+    would clobber the static close button at each callback fire and
+    re-introduce the duplicate-ID risk."""
+    payload = _make_artifact([_make_row("AAA")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+
+    output_targets: list = []
+    for cb in (app.callback_map or {}).values():
+        for output in cb.get("output", []) or []:
+            comp_id = getattr(output, "component_id", None)
+            comp_prop = getattr(output, "component_property", None)
+            if (comp_id is None or comp_prop is None) and isinstance(
+                output, str
+            ):
+                if "." in output:
+                    comp_id, comp_prop = output.split(".", 1)
+            output_targets.append((comp_id, comp_prop))
+
+    assert ("mvp-modal-content", "children") in output_targets, (
+        f"callback must write to mvp-modal-content.children; "
+        f"observed outputs: {output_targets}"
+    )
+    assert ("mvp-modal", "children") not in output_targets, (
+        f"callback must not write to mvp-modal.children "
+        f"(would clobber the static close button); "
+        f"observed outputs: {output_targets}"
+    )

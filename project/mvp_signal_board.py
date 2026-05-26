@@ -309,16 +309,36 @@ def render_detail_modal_content(row: dict, payload: dict) -> html.Div:
                     html.Li(f"generated_at_utc: {generated_at}"),
                 ]),
             ]),
-            html.Button("Close", id="mvp-modal-close", n_clicks=0),
         ],
     )
 
 
-def _render_modal_container(initial_children: Optional[Any] = None) -> html.Div:
+def _render_modal_container() -> html.Div:
+    """Render the modal container with its STABLE children in place.
+
+    The container itself is hidden by default. The modal body content
+    lives in a separate inner Div (``mvp-modal-content``) which the
+    callback updates; the close button (``mvp-modal-close``) is part
+    of the container and present at page load so the Dash callback's
+    Input on its ``n_clicks`` resolves correctly.
+
+    Live bug fix (post PR #327): previously the close button was
+    created only inside ``render_detail_modal_content`` and therefore
+    did not exist at page load. The callback referenced it as an
+    Input, which prevented the callback from dispatching in the live
+    browser and broke row-click open behavior end-to-end. Keeping
+    ``mvp-modal-close`` in the initial layout makes the callback
+    live-safe; keeping ``mvp-modal-content`` as a separate inner
+    container avoids duplicate-ID risk when the body content is
+    rebuilt on each click.
+    """
     return html.Div(
         id="mvp-modal",
         style={"display": "none"},
-        children=initial_children or [],
+        children=[
+            html.Div(id="mvp-modal-content", children=[]),
+            html.Button("Close", id="mvp-modal-close", n_clicks=0),
+        ],
     )
 
 
@@ -458,7 +478,7 @@ def build_mvp_signal_board_app(
 
     @app.callback(
         Output("mvp-modal", "style"),
-        Output("mvp-modal", "children"),
+        Output("mvp-modal-content", "children"),
         Output("mvp-modal-state", "data"),
         Input("mvp-board-table", "active_cell"),
         Input("mvp-modal-close", "n_clicks"),
