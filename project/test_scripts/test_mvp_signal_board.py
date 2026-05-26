@@ -327,7 +327,7 @@ def test_wrong_schema_error_layout(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 10. Empty per_secondary -> header/footer + empty-state message
+# 10. Empty per_secondary -> header + empty-state message; no visible footer
 # ---------------------------------------------------------------------------
 
 
@@ -339,7 +339,9 @@ def test_empty_per_secondary_renders_empty_state(tmp_path):
     assert board.BOARD_HEADER in text
     assert board.BOARD_SUBHEADER in text
     assert board.EMPTY_TABLE_MESSAGE in text
-    assert board.DISCLAIMER in text
+    # The disclaimer now lives only inside the modal. The empty landing
+    # page must NOT carry the disclaimer text.
+    assert board.DISCLAIMER not in text
     # No DataTable rendered for an empty board.
     table = _find_component(
         app.layout, lambda c: isinstance(c, dash_table.DataTable)
@@ -483,22 +485,34 @@ def test_no_writes_from_app_factory(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 16. Footer renders provenance + disclaimer
+# 16. Provenance + disclaimer now live inside the modal (not the landing)
 # ---------------------------------------------------------------------------
 
 
-def test_footer_renders_provenance(tmp_path):
+def test_modal_provenance_and_disclaimer_render(tmp_path):
     payload = _make_artifact(
         [_make_row("AAA")],
         run_id="RUN_FOOTER",
+        run_root="output/trafficflow/runs/RUN_FOOTER",
         generated_at="2026-05-26T10:00:00.000000Z",
     )
+    # Render the modal content for the row directly; the provenance and
+    # disclaimer must appear inside that subtree.
+    row = payload["per_secondary"][0]
+    modal = board.render_detail_modal_content(row, payload)
+    modal_text = _flatten_text(modal)
+    assert "RUN_FOOTER" in modal_text
+    assert "output/trafficflow/runs/RUN_FOOTER" in modal_text
+    assert "2026-05-26T10:00:00.000000Z" in modal_text
+    assert board.DISCLAIMER in modal_text
+
+    # And the visible landing layout must NOT carry any of those.
     path = _write_artifact(tmp_path, payload)
     app = board.build_mvp_signal_board_app(path)
-    text = _flatten_text(app.layout)
-    assert "RUN_FOOTER" in text
-    assert "2026-05-26T10:00:00.000000Z" in text
-    assert board.DISCLAIMER in text
+    visible_text = _visible_landing_text(app.layout)
+    assert "RUN_FOOTER" not in visible_text
+    assert "2026-05-26T10:00:00.000000Z" not in visible_text
+    assert board.DISCLAIMER not in visible_text
 
 
 # ---------------------------------------------------------------------------
@@ -945,3 +959,142 @@ def test_modal_detail_preserves_removed_board_fields():
     assert "Phase E Status" in text
     assert "Now = 1.5" in text
     assert "MIX = 1/1" in text
+
+
+# ---------------------------------------------------------------------------
+# Visible-landing helper + footer-relocation regression coverage
+# (third round of live operator testing on PR #328)
+# ---------------------------------------------------------------------------
+
+
+def _visible_landing_text(layout) -> str:
+    """Flatten visible text from the layout while EXCLUDING the modal
+    subtree (id='mvp-modal') and hidden dcc.Store data.
+
+    The modal container has display:none at page load, so its text is
+    not visible to the operator on the landing page. Tests that assert
+    the landing page has no footer use this helper to scope the
+    text-search away from the modal contents.
+    """
+    chunks: list[str] = []
+    for c in _walk_components(layout):
+        # Skip the modal subtree entirely by detecting the modal root.
+        # _walk_components does not give us a parent, so we instead
+        # exclude any component whose id matches the modal id and any
+        # of its descendants. To keep this simple and robust, we walk
+        # children manually and short-circuit at the modal root.
+        pass
+    # Manual recursive walk that skips the modal subtree and dcc.Store
+    # data fields.
+    def _walk(node):
+        if node is None:
+            return
+        if isinstance(node, str):
+            chunks.append(node)
+            return
+        if isinstance(node, (int, float)):
+            chunks.append(str(node))
+            return
+        # Skip the modal subtree (its content is not visible on the
+        # landing page because display:none).
+        if getattr(node, "id", None) == "mvp-modal":
+            return
+        # dcc.Store: its data is hidden; do not collect.
+        if isinstance(node, dcc.Store):
+            return
+        ch = getattr(node, "children", None)
+        if ch is None:
+            return
+        if isinstance(ch, (list, tuple)):
+            for sub in ch:
+                _walk(sub)
+        elif isinstance(ch, (str, int, float)):
+            chunks.append(str(ch))
+        else:
+            _walk(ch)
+
+    _walk(layout)
+    return " ".join(chunks)
+
+
+def test_landing_page_has_no_visible_footer_text(tmp_path):
+    """The visible landing page must contain only the header, subheader,
+    and ranking table. Source-run, generated-at, and disclaimer text now
+    live inside the modal and must not appear outside it."""
+    payload = _make_artifact(
+        [_make_row("AAA"), _make_row("BBB")],
+        run_id="RUN_LANDING",
+        run_root="output/trafficflow/runs/RUN_LANDING",
+        generated_at="2026-05-26T10:00:00.000000Z",
+    )
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+
+    visible = _visible_landing_text(app.layout)
+
+    # The header and subheader should remain visible.
+    assert board.BOARD_HEADER in visible
+    assert board.BOARD_SUBHEADER in visible
+
+    # The three previously-visible footer lines must NOT appear outside
+    # the modal subtree.
+    forbidden_outside_modal = [
+        "Source Phase E run",
+        "Ranking generated at",
+        "Historical performance does not guarantee future returns",
+    ]
+    for needle in forbidden_outside_modal:
+        assert needle not in visible, (
+            f"forbidden landing-page footer line present outside modal: "
+            f"{needle!r}"
+        )
+
+
+def test_modal_disclaimer_component_present(tmp_path):
+    """The disclaimer must exist inside the modal content as a
+    component with id 'mvp-modal-disclaimer'."""
+    row = _make_row("AAA")
+    payload = _make_artifact([row])
+    modal = board.render_detail_modal_content(row, payload)
+    disclaimer = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-disclaimer"
+    )
+    assert disclaimer is not None
+    # And its text content carries the disclaimer string.
+    disclaimer_text = _flatten_text(disclaimer)
+    assert board.DISCLAIMER in disclaimer_text
+
+
+def test_modal_disclaimer_is_final_body_element():
+    """The disclaimer line must appear AFTER the provenance section
+    in the modal body (it is the final body content element). Inspect
+    the direct children order of render_detail_modal_content(...)."""
+    row = _make_row("AAA")
+    payload = _make_artifact([row])
+    modal = board.render_detail_modal_content(row, payload)
+    children = modal.children
+    assert isinstance(children, (list, tuple))
+    # Locate the provenance section and the disclaimer in the direct
+    # children list and assert their relative order.
+    provenance_idx = None
+    disclaimer_idx = None
+    for idx, child in enumerate(children):
+        cid = getattr(child, "id", None)
+        if cid == "mvp-modal-provenance":
+            provenance_idx = idx
+        elif cid == "mvp-modal-disclaimer":
+            disclaimer_idx = idx
+    assert provenance_idx is not None, (
+        "modal must include the provenance section"
+    )
+    assert disclaimer_idx is not None, (
+        "modal must include the disclaimer component"
+    )
+    assert provenance_idx < disclaimer_idx, (
+        "disclaimer must appear AFTER the provenance section in the "
+        "modal body"
+    )
+    # And the disclaimer should be the final body element.
+    assert disclaimer_idx == len(children) - 1, (
+        "disclaimer must be the final body content element"
+    )

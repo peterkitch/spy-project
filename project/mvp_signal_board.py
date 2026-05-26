@@ -214,24 +214,6 @@ def _table_data_from_payload(payload: dict) -> list[dict]:
     return out
 
 
-def _render_footer(payload: Optional[dict]) -> html.Footer:
-    run_id = UNAVAILABLE
-    generated_at = UNAVAILABLE
-    if isinstance(payload, dict):
-        run_id = payload.get("trafficflow_run_id") or UNAVAILABLE
-        generated_at = payload.get("generated_at_utc") or UNAVAILABLE
-    return html.Footer(
-        id="mvp-footer",
-        children=[
-            html.Div(f"Source Phase E run: {run_id}",
-                     id="mvp-footer-run-id"),
-            html.Div(f"Ranking generated at: {generated_at}",
-                     id="mvp-footer-generated-at"),
-            html.Div(DISCLAIMER, id="mvp-footer-disclaimer"),
-        ],
-    )
-
-
 def render_error_layout(message: str) -> html.Div:
     return html.Div(
         id="mvp-root",
@@ -239,7 +221,6 @@ def render_error_layout(message: str) -> html.Div:
             html.H1(BOARD_HEADER, id="mvp-header"),
             html.H2(BOARD_SUBHEADER, id="mvp-subheader"),
             html.Div(message, id="mvp-error-message"),
-            _render_footer(None),
         ],
     )
 
@@ -309,11 +290,15 @@ def render_detail_modal_content(row: dict, payload: dict) -> html.Div:
             html.Section(id="mvp-modal-provenance", children=[
                 html.Strong("Provenance"),
                 html.Ul([
-                    html.Li(f"trafficflow_run_id: {run_id}"),
+                    html.Li(f"Source Phase E run: {run_id}"),
                     html.Li(f"trafficflow_run_root: {run_root}"),
-                    html.Li(f"generated_at_utc: {generated_at}"),
+                    html.Li(f"Ranking generated at: {generated_at}"),
                 ]),
             ]),
+            # Disclaimer must be the final body content line of the
+            # modal. The landing page no longer carries a footer; the
+            # historical-performance caveat lives here instead.
+            html.Div(DISCLAIMER, id="mvp-modal-disclaimer"),
         ],
     )
 
@@ -408,10 +393,14 @@ def render_board_layout(payload: dict) -> html.Div:
             html.H1(BOARD_HEADER, id="mvp-header"),
             html.H2(BOARD_SUBHEADER, id="mvp-subheader"),
             html.Section(id="mvp-board", children=[body]),
+            # Hidden modal/state plumbing only beyond this point.
+            # Per operator feedback, the visible landing page must
+            # have no footer text below the ranking table. The
+            # disclaimer and the source-run / generated-at metadata
+            # now live inside the modal body content.
             _render_modal_container(),
             dcc.Store(id="mvp-payload-store", data=payload),
             dcc.Store(id="mvp-modal-state", data={"row_index": None}),
-            _render_footer(payload),
         ],
     )
 
