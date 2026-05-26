@@ -174,19 +174,20 @@ def test_board_renders_rows_in_artifact_order(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_low_sample_warning_marker(tmp_path):
-    payload = _make_artifact([
-        _make_row("AAA", low_sample=True),
-        _make_row("BBB", low_sample=False),
-    ])
-    path = _write_artifact(tmp_path, payload)
-    app = board.build_mvp_signal_board_app(path)
-    table = _find_component(
-        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+def test_low_sample_warning_surfaces_in_modal_detail():
+    """Board columns no longer expose Warning. low_sample_warning must
+    still be visible from the modal detail content."""
+    row_warn = _make_row("AAA", low_sample=True)
+    row_ok = _make_row("BBB", low_sample=False)
+    payload = _make_artifact([row_warn, row_ok])
+    warn_text = _flatten_text(
+        board.render_detail_modal_content(row_warn, payload)
     )
-    warnings_by_ticker = {row["ticker"]: row["warning"] for row in table.data}
-    assert warnings_by_ticker["AAA"] == "!"
-    assert warnings_by_ticker["BBB"] == ""
+    ok_text = _flatten_text(
+        board.render_detail_modal_content(row_ok, payload)
+    )
+    assert "low_sample_warning: True" in warn_text
+    assert "low_sample_warning: False" in ok_text
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +195,9 @@ def test_low_sample_warning_marker(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_phase_e_status_present_renders_in_board(tmp_path):
+def test_phase_e_status_not_displayed_on_board(tmp_path):
+    """The simplified MVP v0 board does not expose Phase E Status as a
+    column. Phase E Status remains visible from the modal."""
     payload = _make_artifact([
         _make_row("AAA", phase_e_status={"Now": 1.5, "MIX": "1/1"}),
     ])
@@ -203,8 +206,7 @@ def test_phase_e_status_present_renders_in_board(tmp_path):
     table = _find_component(
         app.layout, lambda c: isinstance(c, dash_table.DataTable)
     )
-    status_text = table.data[0]["phase_e_status"]
-    assert "Now=1.5" in status_text
+    assert "phase_e_status" not in table.data[0]
 
 
 def test_phase_e_status_present_renders_in_modal():
@@ -221,16 +223,23 @@ def test_phase_e_status_present_renders_in_modal():
 # ---------------------------------------------------------------------------
 
 
-def test_phase_e_status_missing_in_board_shows_unavailable(tmp_path):
+def test_board_table_has_no_phase_e_status_or_warning_columns(tmp_path):
+    """Removed columns must not appear in the board table even when the
+    artifact carries Phase E status and warning values. They surface in
+    the modal instead."""
     payload = _make_artifact([
-        _make_row("AAA", phase_e_status={}),
+        _make_row("AAA", phase_e_status={}, low_sample=True),
     ])
     path = _write_artifact(tmp_path, payload)
     app = board.build_mvp_signal_board_app(path)
     table = _find_component(
         app.layout, lambda c: isinstance(c, dash_table.DataTable)
     )
-    assert table.data[0]["phase_e_status"] == board.UNAVAILABLE
+    for forbidden_key in ("phase_e_status", "total_pct",
+                          "triggers", "warning"):
+        assert forbidden_key not in table.data[0], (
+            f"forbidden board column key present: {forbidden_key}"
+        )
 
 
 def test_phase_e_status_missing_in_modal_shows_empty_message():
@@ -583,6 +592,17 @@ def _toggle_fixture():
     return rows, payload
 
 
+def _assert_open_overlay_style(style):
+    """The open style must be a true overlay: display block, position
+    fixed, covering the viewport with a high z-index. Asserts the
+    characteristic overlay properties without pinning the exact dict
+    contents so future minor style tweaks do not require test edits."""
+    assert isinstance(style, dict)
+    assert style.get("display") == "block"
+    assert style.get("position") == "fixed"
+    assert "zIndex" in style
+
+
 def test_row_click_opens_modal_for_that_row():
     rows, payload = _toggle_fixture()
     style, children, new_state = board.resolve_modal_state(
@@ -592,7 +612,7 @@ def test_row_click_opens_modal_for_that_row():
         rows=rows,
         payload=payload,
     )
-    assert style == {"display": "block"}
+    _assert_open_overlay_style(style)
     assert new_state == {"row_index": 2}
     assert "CCC" in _flatten_text(children)
 
@@ -611,7 +631,7 @@ def test_same_row_click_closes_modal():
         rows=rows,
         payload=payload,
     )
-    assert style_open == {"display": "block"}
+    _assert_open_overlay_style(style_open)
     assert state_after_open == {"row_index": 1}
     # Second click on the same row (any column).
     style_close, children_close, state_after_close = board.resolve_modal_state(
@@ -635,7 +655,7 @@ def test_different_row_click_switches_modal_content():
         rows=rows,
         payload=payload,
     )
-    assert style == {"display": "block"}
+    _assert_open_overlay_style(style)
     assert new_state == {"row_index": 0}
     text = _flatten_text(children)
     # New row's ticker present.
@@ -818,3 +838,110 @@ def test_callback_writes_content_to_mvp_modal_content_not_mvp_modal(
         f"(would clobber the static close button); "
         f"observed outputs: {output_targets}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Board column simplification + modal overlay regression coverage
+# (live-testing follow-up to PR #328)
+# ---------------------------------------------------------------------------
+
+
+def test_board_columns_are_exactly_rank_ticker_sharpe_score(tmp_path):
+    payload = _make_artifact([_make_row("AAA"), _make_row("BBB")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+    )
+    assert table is not None
+    column_names = [col["name"] for col in table.columns]
+    assert column_names == ["Rank", "Ticker", "Sharpe Score"], (
+        f"expected exactly Rank/Ticker/Sharpe Score; got {column_names}"
+    )
+    forbidden_names = {"Phase E Status", "Total %", "Triggers", "Warning"}
+    assert not (forbidden_names & set(column_names)), (
+        f"forbidden column(s) present: "
+        f"{sorted(forbidden_names & set(column_names))}"
+    )
+
+
+def test_board_table_data_keys_are_exactly_rank_ticker_sharpe_score(tmp_path):
+    payload = _make_artifact([_make_row("AAA", sharpe=2.5)])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+    )
+    assert set(table.data[0].keys()) == {"rank", "ticker", "sharpe_score"}
+    assert table.data[0]["sharpe_score"] == "2.50"
+    assert table.data[0]["ticker"] == "AAA"
+    assert table.data[0]["rank"] == 1
+
+
+def test_modal_open_style_is_overlay_not_inline(tmp_path):
+    """The open modal style must declare position: fixed (and other
+    overlay characteristics). This guards against a regression where the
+    modal would render inline under the table, which is what live
+    operator testing surfaced on PR #328 before this amendment."""
+    payload = _make_artifact([_make_row("AAA")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+
+    # Initial layout: modal hidden.
+    modal_div = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-modal"
+    )
+    assert modal_div is not None
+    assert modal_div.style == {"display": "none"}
+
+    # When the resolver returns the open state, the style must be a
+    # true overlay (position fixed, high zIndex).
+    open_style, _children, _state = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 0, "column_id": "ticker"},
+        current_state={"row_index": None},
+        rows=payload["per_secondary"],
+        payload=payload,
+    )
+    assert open_style.get("display") == "block"
+    assert open_style.get("position") == "fixed"
+    assert "zIndex" in open_style
+    # Covers viewport.
+    for edge in ("top", "left", "right", "bottom"):
+        assert edge in open_style, (
+            f"open overlay style missing '{edge}'; got keys {sorted(open_style.keys())}"
+        )
+
+
+def test_modal_container_has_panel_subcomponent(tmp_path):
+    """The modal container should include an inner panel (mvp-modal-panel)
+    so the overlay backdrop is visually distinct from the centered card."""
+    payload = _make_artifact([_make_row("AAA")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    panel = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-modal-panel"
+    )
+    assert panel is not None
+
+
+def test_modal_detail_preserves_removed_board_fields():
+    """Fields removed from the board (Phase E Status, Total %, Triggers,
+    low_sample_warning) must remain visible in the detail modal."""
+    row = _make_row(
+        "AAA",
+        total=33.33,
+        triggers=42,
+        low_sample=True,
+        phase_e_status={"Now": 1.5, "MIX": "1/1"},
+    )
+    payload = _make_artifact([row])
+    text = _flatten_text(board.render_detail_modal_content(row, payload))
+    # Total %, Triggers, and low_sample_warning all still appear.
+    assert "Total %: 33.33" in text
+    assert "Triggers: 42" in text
+    assert "low_sample_warning: True" in text
+    # Phase E status section header and key/value lines present.
+    assert "Phase E Status" in text
+    assert "Now = 1.5" in text
+    assert "MIX = 1/1" in text

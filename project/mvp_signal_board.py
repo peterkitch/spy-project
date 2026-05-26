@@ -188,15 +188,19 @@ def get_row_rank(row: dict, position_one_based: int) -> int:
 _BOARD_COLUMNS = [
     {"name": "Rank", "id": "rank"},
     {"name": "Ticker", "id": "ticker"},
-    {"name": "Phase E Status", "id": "phase_e_status"},
-    {"name": "Sharpe", "id": "sharpe"},
-    {"name": "Total %", "id": "total_pct"},
-    {"name": "Triggers", "id": "triggers"},
-    {"name": "Warning", "id": "warning"},
+    {"name": "Sharpe Score", "id": "sharpe_score"},
 ]
 
 
 def _table_data_from_payload(payload: dict) -> list[dict]:
+    """Build the board table row dicts for the simplified MVP v0 surface.
+
+    The board exposes only Rank / Ticker / Sharpe Score per operator
+    feedback (live testing on PR #328). All other per-secondary fields
+    (Phase E Status, Total %, Triggers, Wins, Losses, Win %, Avg %,
+    StdDev %, p-value, low_sample_warning, and phase_e_status keys)
+    remain available in the detail modal via render_detail_modal_content().
+    """
     out: list[dict] = []
     rows = payload.get("per_secondary") or []
     for idx, row in enumerate(rows):
@@ -205,11 +209,7 @@ def _table_data_from_payload(payload: dict) -> list[dict]:
         out.append({
             "rank": get_row_rank(row, idx + 1),
             "ticker": row.get("secondary") or UNAVAILABLE,
-            "phase_e_status": format_phase_e_status(row),
-            "sharpe": format_number(row.get("sharpe")),
-            "total_pct": format_number(row.get("total_capture_pct")),
-            "triggers": format_integer(row.get("triggers")),
-            "warning": get_warning_marker(row),
+            "sharpe_score": format_number(row.get("sharpe")),
         })
     return out
 
@@ -295,6 +295,11 @@ def render_detail_modal_content(row: dict, payload: dict) -> html.Div:
                         "p-value: "
                         f"{format_number(row.get('p_value'), decimals=4)}"
                     ),
+                    html.Li(
+                        "low_sample_warning: "
+                        f"{bool(row.get('low_sample_warning'))}",
+                        id="mvp-modal-low-sample-warning",
+                    ),
                 ]),
             ]),
             html.Section(id="mvp-modal-status", children=[
@@ -313,31 +318,69 @@ def render_detail_modal_content(row: dict, payload: dict) -> html.Div:
     )
 
 
+_MODAL_PANEL_STYLE = {
+    "backgroundColor": "white",
+    "maxWidth": "720px",
+    "margin": "0 auto",
+    "padding": "20px",
+    "border": "1px solid #ddd",
+    "borderRadius": "6px",
+    "boxShadow": "0 4px 20px rgba(0, 0, 0, 0.2)",
+    "position": "relative",
+}
+
+_MODAL_CLOSE_BUTTON_STYLE = {
+    "position": "absolute",
+    "top": "12px",
+    "right": "12px",
+    "padding": "4px 12px",
+    "cursor": "pointer",
+}
+
+
 def _render_modal_container() -> html.Div:
     """Render the modal container with its STABLE children in place.
 
-    The container itself is hidden by default. The modal body content
-    lives in a separate inner Div (``mvp-modal-content``) which the
-    callback updates; the close button (``mvp-modal-close``) is part
-    of the container and present at page load so the Dash callback's
-    Input on its ``n_clicks`` resolves correctly.
+    The container itself is hidden by default. When open, the container
+    becomes a true fixed-position overlay (see _MODAL_OPEN_STYLE below)
+    sitting above the board / footer rather than pushing them down in
+    normal document flow.
 
-    Live bug fix (post PR #327): previously the close button was
-    created only inside ``render_detail_modal_content`` and therefore
-    did not exist at page load. The callback referenced it as an
-    Input, which prevented the callback from dispatching in the live
-    browser and broke row-click open behavior end-to-end. Keeping
-    ``mvp-modal-close`` in the initial layout makes the callback
-    live-safe; keeping ``mvp-modal-content`` as a separate inner
-    container avoids duplicate-ID risk when the body content is
-    rebuilt on each click.
+    Stable inner structure:
+
+      - ``mvp-modal-content`` -- the inner Div the callback updates with
+        the per-row body (members, K=6 metrics, Phase E status,
+        provenance, low-sample warning). Always present at page load
+        with empty children.
+      - ``mvp-modal-close`` -- close button. Always present at page
+        load so the Dash callback's Input on its ``n_clicks`` resolves
+        correctly. Positioned in the panel corner via inline style.
+
+    Two ID stability guarantees the live Dash callback relies on:
+
+      1. ``mvp-modal-close`` exists at page load (live bug fix
+         post PR #327).
+      2. ``mvp-modal-content`` is the callback's children-Output
+         target, not ``mvp-modal.children``, so the static close
+         button is never clobbered between callback fires.
     """
     return html.Div(
         id="mvp-modal",
         style={"display": "none"},
         children=[
-            html.Div(id="mvp-modal-content", children=[]),
-            html.Button("Close", id="mvp-modal-close", n_clicks=0),
+            html.Div(
+                id="mvp-modal-panel",
+                style=_MODAL_PANEL_STYLE,
+                children=[
+                    html.Button(
+                        "Close",
+                        id="mvp-modal-close",
+                        n_clicks=0,
+                        style=_MODAL_CLOSE_BUTTON_STYLE,
+                    ),
+                    html.Div(id="mvp-modal-content", children=[]),
+                ],
+            ),
         ],
     )
 
@@ -380,7 +423,18 @@ def render_board_layout(payload: dict) -> html.Div:
 
 
 _MODAL_CLOSED_STYLE = {"display": "none"}
-_MODAL_OPEN_STYLE = {"display": "block"}
+_MODAL_OPEN_STYLE = {
+    "display": "block",
+    "position": "fixed",
+    "top": "0",
+    "left": "0",
+    "right": "0",
+    "bottom": "0",
+    "backgroundColor": "rgba(0, 0, 0, 0.5)",
+    "zIndex": "1000",
+    "overflow": "auto",
+    "padding": "40px 20px",
+}
 _MODAL_CLOSE_TRIGGER_ID = "mvp-modal-close"
 
 
