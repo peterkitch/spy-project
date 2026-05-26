@@ -566,3 +566,110 @@ def test_no_forbidden_recomputation_labels(tmp_path):
         assert forbidden not in modal_text, (
             f"forbidden v0 label present in modal content: {forbidden}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Modal toggle behavior (audit-amendment regression)
+# ---------------------------------------------------------------------------
+
+
+def _toggle_fixture():
+    rows = [
+        _make_row("AAA", sharpe=2.0),
+        _make_row("BBB", sharpe=1.0),
+        _make_row("CCC", sharpe=0.5),
+    ]
+    payload = _make_artifact(rows)
+    return rows, payload
+
+
+def test_row_click_opens_modal_for_that_row():
+    rows, payload = _toggle_fixture()
+    style, children, new_state = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 2, "column_id": "ticker"},
+        current_state={"row_index": None},
+        rows=rows,
+        payload=payload,
+    )
+    assert style == {"display": "block"}
+    assert new_state == {"row_index": 2}
+    assert "CCC" in _flatten_text(children)
+
+
+def test_same_row_click_closes_modal():
+    """Audit amendment: clicking the same row again toggles the modal closed.
+    A second click on the same row -- typically a different column -- fires
+    the callback, and the resolver sees current_state.row_index == new row,
+    so the modal closes and the state resets."""
+    rows, payload = _toggle_fixture()
+    # First open row 1.
+    style_open, _children_open, state_after_open = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 1, "column_id": "ticker"},
+        current_state={"row_index": None},
+        rows=rows,
+        payload=payload,
+    )
+    assert style_open == {"display": "block"}
+    assert state_after_open == {"row_index": 1}
+    # Second click on the same row (any column).
+    style_close, children_close, state_after_close = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 1, "column_id": "sharpe"},
+        current_state=state_after_open,
+        rows=rows,
+        payload=payload,
+    )
+    assert style_close == {"display": "none"}
+    assert children_close == []
+    assert state_after_close == {"row_index": None}
+
+
+def test_different_row_click_switches_modal_content():
+    rows, payload = _toggle_fixture()
+    style, children, new_state = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 0, "column_id": "ticker"},
+        current_state={"row_index": 2},
+        rows=rows,
+        payload=payload,
+    )
+    assert style == {"display": "block"}
+    assert new_state == {"row_index": 0}
+    text = _flatten_text(children)
+    # New row's ticker present.
+    assert "AAA" in text
+    # Previously open row's ticker not surfaced as the new modal title.
+    # (CCC may still appear elsewhere if rendered, but we assert the
+    # new state index is 0 and the new row's content was rendered.)
+
+
+def test_close_button_closes_modal():
+    rows, payload = _toggle_fixture()
+    style, children, new_state = board.resolve_modal_state(
+        triggered_id="mvp-modal-close",
+        active_cell={"row": 1, "column_id": "ticker"},
+        current_state={"row_index": 1},
+        rows=rows,
+        payload=payload,
+    )
+    assert style == {"display": "none"}
+    assert children == []
+    assert new_state == {"row_index": None}
+
+
+def test_modal_state_store_present_in_layout(tmp_path):
+    """The toggle relies on a dcc.Store(id='mvp-modal-state'). Asserting
+    the Store is present in the layout protects against accidental removal
+    in future refactors."""
+    payload = _make_artifact([_make_row("AAA")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    store = _find_component(
+        app.layout,
+        lambda c: isinstance(c, dcc.Store)
+        and getattr(c, "id", None) == "mvp-modal-state",
+    )
+    assert store is not None
+    assert store.data == {"row_index": None}

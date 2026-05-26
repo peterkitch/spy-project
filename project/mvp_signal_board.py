@@ -347,8 +347,67 @@ def render_board_layout(payload: dict) -> html.Div:
             html.Section(id="mvp-board", children=[body]),
             _render_modal_container(),
             dcc.Store(id="mvp-payload-store", data=payload),
+            dcc.Store(id="mvp-modal-state", data={"row_index": None}),
             _render_footer(payload),
         ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Modal toggle resolver (pure helper; called from the Dash callback and
+# directly from tests)
+# ---------------------------------------------------------------------------
+
+
+_MODAL_CLOSED_STYLE = {"display": "none"}
+_MODAL_OPEN_STYLE = {"display": "block"}
+_MODAL_CLOSE_TRIGGER_ID = "mvp-modal-close"
+
+
+def resolve_modal_state(
+    *,
+    triggered_id: Optional[str],
+    active_cell: Optional[dict],
+    current_state: Optional[dict],
+    rows: list,
+    payload: dict,
+) -> tuple:
+    """Pure resolver for the modal toggle behavior.
+
+    Returns ``(modal_style, modal_children, new_state_data)`` where
+    ``modal_style`` is a Dash style dict, ``modal_children`` is the
+    modal body (or an empty list when closed), and ``new_state_data``
+    is the next value for the ``mvp-modal-state`` Store.
+
+    Toggle rules:
+
+      - Close button trigger -> close, reset row_index to None.
+      - active_cell None or out of range -> close, reset row_index.
+      - active_cell row == current_state.row_index -> close (same-row
+        toggle), reset row_index.
+      - active_cell row != current_state.row_index -> open with the
+        new row, set row_index to the new row.
+    """
+    closed = (_MODAL_CLOSED_STYLE, [], {"row_index": None})
+    if triggered_id == _MODAL_CLOSE_TRIGGER_ID:
+        return closed
+    if not isinstance(active_cell, dict):
+        return closed
+    row_idx = active_cell.get("row")
+    if not isinstance(row_idx, int) or row_idx < 0 or row_idx >= len(rows):
+        return closed
+    current_idx = None
+    if isinstance(current_state, dict):
+        current_idx = current_state.get("row_index")
+    if current_idx == row_idx:
+        return closed
+    row = rows[row_idx]
+    if not isinstance(row, dict):
+        return closed
+    return (
+        _MODAL_OPEN_STYLE,
+        render_detail_modal_content(row, payload),
+        {"row_index": row_idx},
     )
 
 
@@ -400,29 +459,23 @@ def build_mvp_signal_board_app(
     @app.callback(
         Output("mvp-modal", "style"),
         Output("mvp-modal", "children"),
+        Output("mvp-modal-state", "data"),
         Input("mvp-board-table", "active_cell"),
         Input("mvp-modal-close", "n_clicks"),
-        State("mvp-modal", "style"),
+        State("mvp-modal-state", "data"),
         prevent_initial_call=True,
     )
-    def _update_modal(active_cell, close_clicks, current_style):
+    def _update_modal(active_cell, close_clicks, current_state):
         ctx = dash.callback_context
         if not ctx.triggered:
             raise dash.exceptions.PreventUpdate
         trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
-        if trigger_id == "mvp-modal-close":
-            return {"display": "none"}, []
-        if active_cell is None:
-            return {"display": "none"}, []
-        row_idx = active_cell.get("row")
-        if not isinstance(row_idx, int) or row_idx < 0 or row_idx >= len(rows):
-            return {"display": "none"}, []
-        row = rows[row_idx]
-        if not isinstance(row, dict):
-            return {"display": "none"}, []
-        return (
-            {"display": "block"},
-            render_detail_modal_content(row, payload),
+        return resolve_modal_state(
+            triggered_id=trigger_id,
+            active_cell=active_cell,
+            current_state=current_state,
+            rows=rows,
+            payload=payload,
         )
 
     return app
