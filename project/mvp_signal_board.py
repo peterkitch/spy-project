@@ -188,15 +188,19 @@ def get_row_rank(row: dict, position_one_based: int) -> int:
 _BOARD_COLUMNS = [
     {"name": "Rank", "id": "rank"},
     {"name": "Ticker", "id": "ticker"},
-    {"name": "Phase E Status", "id": "phase_e_status"},
-    {"name": "Sharpe", "id": "sharpe"},
-    {"name": "Total %", "id": "total_pct"},
-    {"name": "Triggers", "id": "triggers"},
-    {"name": "Warning", "id": "warning"},
+    {"name": "Sharpe Score", "id": "sharpe_score"},
 ]
 
 
 def _table_data_from_payload(payload: dict) -> list[dict]:
+    """Build the board table row dicts for the simplified MVP v0 surface.
+
+    The board exposes only Rank / Ticker / Sharpe Score per operator
+    feedback (live testing on PR #328). All other per-secondary fields
+    (Phase E Status, Total %, Triggers, Wins, Losses, Win %, Avg %,
+    StdDev %, p-value, low_sample_warning, and phase_e_status keys)
+    remain available in the detail modal via render_detail_modal_content().
+    """
     out: list[dict] = []
     rows = payload.get("per_secondary") or []
     for idx, row in enumerate(rows):
@@ -205,31 +209,9 @@ def _table_data_from_payload(payload: dict) -> list[dict]:
         out.append({
             "rank": get_row_rank(row, idx + 1),
             "ticker": row.get("secondary") or UNAVAILABLE,
-            "phase_e_status": format_phase_e_status(row),
-            "sharpe": format_number(row.get("sharpe")),
-            "total_pct": format_number(row.get("total_capture_pct")),
-            "triggers": format_integer(row.get("triggers")),
-            "warning": get_warning_marker(row),
+            "sharpe_score": format_number(row.get("sharpe")),
         })
     return out
-
-
-def _render_footer(payload: Optional[dict]) -> html.Footer:
-    run_id = UNAVAILABLE
-    generated_at = UNAVAILABLE
-    if isinstance(payload, dict):
-        run_id = payload.get("trafficflow_run_id") or UNAVAILABLE
-        generated_at = payload.get("generated_at_utc") or UNAVAILABLE
-    return html.Footer(
-        id="mvp-footer",
-        children=[
-            html.Div(f"Source Phase E run: {run_id}",
-                     id="mvp-footer-run-id"),
-            html.Div(f"Ranking generated at: {generated_at}",
-                     id="mvp-footer-generated-at"),
-            html.Div(DISCLAIMER, id="mvp-footer-disclaimer"),
-        ],
-    )
 
 
 def render_error_layout(message: str) -> html.Div:
@@ -239,7 +221,6 @@ def render_error_layout(message: str) -> html.Div:
             html.H1(BOARD_HEADER, id="mvp-header"),
             html.H2(BOARD_SUBHEADER, id="mvp-subheader"),
             html.Div(message, id="mvp-error-message"),
-            _render_footer(None),
         ],
     )
 
@@ -295,6 +276,11 @@ def render_detail_modal_content(row: dict, payload: dict) -> html.Div:
                         "p-value: "
                         f"{format_number(row.get('p_value'), decimals=4)}"
                     ),
+                    html.Li(
+                        "low_sample_warning: "
+                        f"{bool(row.get('low_sample_warning'))}",
+                        id="mvp-modal-low-sample-warning",
+                    ),
                 ]),
             ]),
             html.Section(id="mvp-modal-status", children=[
@@ -304,21 +290,83 @@ def render_detail_modal_content(row: dict, payload: dict) -> html.Div:
             html.Section(id="mvp-modal-provenance", children=[
                 html.Strong("Provenance"),
                 html.Ul([
-                    html.Li(f"trafficflow_run_id: {run_id}"),
+                    html.Li(f"Source Phase E run: {run_id}"),
                     html.Li(f"trafficflow_run_root: {run_root}"),
-                    html.Li(f"generated_at_utc: {generated_at}"),
+                    html.Li(f"Ranking generated at: {generated_at}"),
                 ]),
             ]),
-            html.Button("Close", id="mvp-modal-close", n_clicks=0),
+            # Disclaimer must be the final body content line of the
+            # modal. The landing page no longer carries a footer; the
+            # historical-performance caveat lives here instead.
+            html.Div(DISCLAIMER, id="mvp-modal-disclaimer"),
         ],
     )
 
 
-def _render_modal_container(initial_children: Optional[Any] = None) -> html.Div:
+_MODAL_PANEL_STYLE = {
+    "backgroundColor": "white",
+    "maxWidth": "720px",
+    "margin": "0 auto",
+    "padding": "20px",
+    "border": "1px solid #ddd",
+    "borderRadius": "6px",
+    "boxShadow": "0 4px 20px rgba(0, 0, 0, 0.2)",
+    "position": "relative",
+}
+
+_MODAL_CLOSE_BUTTON_STYLE = {
+    "position": "absolute",
+    "top": "12px",
+    "right": "12px",
+    "padding": "4px 12px",
+    "cursor": "pointer",
+}
+
+
+def _render_modal_container() -> html.Div:
+    """Render the modal container with its STABLE children in place.
+
+    The container itself is hidden by default. When open, the container
+    becomes a true fixed-position overlay (see _MODAL_OPEN_STYLE below)
+    sitting above the board / footer rather than pushing them down in
+    normal document flow.
+
+    Stable inner structure:
+
+      - ``mvp-modal-content`` -- the inner Div the callback updates with
+        the per-row body (members, K=6 metrics, Phase E status,
+        provenance, low-sample warning). Always present at page load
+        with empty children.
+      - ``mvp-modal-close`` -- close button. Always present at page
+        load so the Dash callback's Input on its ``n_clicks`` resolves
+        correctly. Positioned in the panel corner via inline style.
+
+    Two ID stability guarantees the live Dash callback relies on:
+
+      1. ``mvp-modal-close`` exists at page load (live bug fix
+         post PR #327).
+      2. ``mvp-modal-content`` is the callback's children-Output
+         target, not ``mvp-modal.children``, so the static close
+         button is never clobbered between callback fires.
+    """
     return html.Div(
         id="mvp-modal",
         style={"display": "none"},
-        children=initial_children or [],
+        children=[
+            html.Div(
+                id="mvp-modal-panel",
+                style=_MODAL_PANEL_STYLE,
+                children=[
+                    html.Button(
+                        "Close",
+                        id="mvp-modal-close",
+                        n_clicks=0,
+                        style=_MODAL_CLOSE_BUTTON_STYLE,
+                    ),
+                    html.Div(id="mvp-modal-content", children=[]),
+                ],
+            ),
+        ],
     )
 
 
@@ -345,10 +393,14 @@ def render_board_layout(payload: dict) -> html.Div:
             html.H1(BOARD_HEADER, id="mvp-header"),
             html.H2(BOARD_SUBHEADER, id="mvp-subheader"),
             html.Section(id="mvp-board", children=[body]),
+            # Hidden modal/state plumbing only beyond this point.
+            # Per operator feedback, the visible landing page must
+            # have no footer text below the ranking table. The
+            # disclaimer and the source-run / generated-at metadata
+            # now live inside the modal body content.
             _render_modal_container(),
             dcc.Store(id="mvp-payload-store", data=payload),
             dcc.Store(id="mvp-modal-state", data={"row_index": None}),
-            _render_footer(payload),
         ],
     )
 
@@ -360,7 +412,18 @@ def render_board_layout(payload: dict) -> html.Div:
 
 
 _MODAL_CLOSED_STYLE = {"display": "none"}
-_MODAL_OPEN_STYLE = {"display": "block"}
+_MODAL_OPEN_STYLE = {
+    "display": "block",
+    "position": "fixed",
+    "top": "0",
+    "left": "0",
+    "right": "0",
+    "bottom": "0",
+    "backgroundColor": "rgba(0, 0, 0, 0.5)",
+    "zIndex": "1000",
+    "overflow": "auto",
+    "padding": "40px 20px",
+}
 _MODAL_CLOSE_TRIGGER_ID = "mvp-modal-close"
 
 
@@ -458,7 +521,7 @@ def build_mvp_signal_board_app(
 
     @app.callback(
         Output("mvp-modal", "style"),
-        Output("mvp-modal", "children"),
+        Output("mvp-modal-content", "children"),
         Output("mvp-modal-state", "data"),
         Input("mvp-board-table", "active_cell"),
         Input("mvp-modal-close", "n_clicks"),
