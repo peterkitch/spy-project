@@ -2362,7 +2362,46 @@ def _execute_canonical_write(
     envelope["per_cell_summary"] = per_cell_summary
     envelope["write_summary"] = write_summary
 
-    # ----------------- Success path: secondary_manifest + .done -----------------
+    # ----------------- Success path: v1_history + secondary_manifest + .done ----
+    # Phase 3a (PR #331 contract): emit v1_history.json BEFORE writing
+    # the secondary_manifest and .done. Any v1_history failure flips
+    # failure_kind to v1_history_write_error and falls through to the
+    # existing quarantine path, so a successful secondary never lacks
+    # v1_history.json.
+    if failure_kind is None:
+        try:
+            from trafficflow_v1_history_writer import (
+                write_v1_history_artifact as _write_v1_history,
+            )
+            # Codex audit fix (Finding 1): trafficflow_run_id is the
+            # canonical Phase E run-root directory name, matching the
+            # selected_output.json selected_run_id convention. The
+            # worker envelope's run_id (invocation_id) is per-worker
+            # scoped and is recorded separately in secondary_manifest.
+            v1_result = _write_v1_history(
+                secondary=secondary,
+                sec_dir=sec_dir,
+                trafficflow_run_id=Path(output_dir).name,
+                trafficflow_run_root=str(output_dir),
+                price_cache_dir=DEFAULT_PRICE_CACHE_DIR,
+                project_root=Path.cwd(),
+            )
+        except Exception as exc:
+            failure_kind = "v1_history_write_error"
+            failure_error_class = type(exc).__name__
+            failure_error_message = repr(exc)[:240]
+        else:
+            if v1_result.get("status") == "ok":
+                v1_rel = v1_result.get("artifact_path")
+                if v1_rel:
+                    artifacts_written.append(v1_rel)
+            else:
+                failure_kind = "v1_history_write_error"
+                failure_error_class = "V1HistoryWriteError"
+                failure_error_message = (
+                    f"v1_history:{v1_result.get('error_code', 'unknown')}"
+                )
+
     if failure_kind is None:
         # Write secondary_manifest.json first; promote to .done only if
         # the manifest write itself succeeds. Manifest is implemented

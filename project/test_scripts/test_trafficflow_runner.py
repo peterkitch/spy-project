@@ -2347,6 +2347,31 @@ def _canonical_eligible_fixture(tmp_path, monkeypatch, *,
                 seen.add(base)
                 _write_pkl(tmp_path / "cache" / "results", base,
                            declared_max_sma_day=114, has_sma_114=True)
+    # Phase 3a (PR #332): canonical-write now also emits v1_history.json
+    # per secondary via trafficflow_v1_history_writer. A "fully-eligible
+    # canonical-write fixture" therefore needs per-interval signal
+    # libraries on disk so the v1 history writer can build a non-empty
+    # bars array. Write a minimal fake library for each canonical
+    # timeframe aligned with the price cache dates above.
+    sig_lib_dir = tmp_path / "signal_library" / "data" / "stable"
+    sig_lib_dir.mkdir(parents=True, exist_ok=True)
+    _sig_dates = ["2026-05-01", "2026-05-22"]
+    _sig_values = ["Buy", "Buy"]
+    for _tf in ("1d", "1wk", "1mo", "3mo", "1y"):
+        if _tf == "1d":
+            _fname = f"{secondary}_stable_v1_0_0.pkl"
+        else:
+            _fname = f"{secondary}_stable_v1_0_0_{_tf}.pkl"
+        _payload = {
+            "ticker": secondary,
+            "interval": _tf,
+            "engine_version": "1.0.0",
+            "dates": list(_sig_dates),
+            "signals": list(_sig_values),
+        }
+        with open(sig_lib_dir / _fname, "wb") as _fh:
+            import pickle as _pickle
+            _pickle.dump(_payload, _fh)
     monkeypatch.chdir(tmp_path)
     canonical_root = Path("output") / "trafficflow" / "runs" / "RUN_PHASE_E_TEST"
     return sb_root, canonical_root
