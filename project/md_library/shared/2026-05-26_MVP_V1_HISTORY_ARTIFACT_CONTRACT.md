@@ -15,6 +15,22 @@
 
 ---
 
+## Identity Correction (Amendment 2026-05-27)
+
+This document was originally drafted as the input contract for the MVP v1 launch-path ranking engine. After operator live verification of PR #334, the operator clarified that the current implementation is **OnePass Multi-Timeframe**, not the MVP v1 launch path.
+
+The schema specified in this document, `schema_version = "mvp_v1_history_v1"`, describes the OnePass Multi-Timeframe history artifact: per-secondary daily bars with five-timeframe signal state derived from each secondary's own per-interval signal libraries (`signal_library/data/stable/<TICKER>_stable_v1_0_0[_<INTERVAL>].pkl`). The producer is `trafficflow_v1_history_writer.py` and the consumer is `mvp_ranking_v1.py`. Both are reclassified as OnePass Multi-Timeframe components by this amendment, even though their filenames and schema labels still say "v1" today.
+
+This schema is **not suitable** for the stack-multi-timeframe launch path. The future stack-multi-timeframe build will require a separate history artifact contract whose signals are stack-derived (the K=6 stack's combined signal projected onto each of the five timeframes 1d, 1wk, 1mo, 3mo, 1y), not secondary-own. That contract will be defined in a separate future PR alongside the stack-multi-timeframe producer.
+
+The `schema_version` label `"mvp_v1_history_v1"` is **not renamed in this amendment**. The current label is temporary label debt that this amendment explicitly acknowledges. A future PR will address the rename, the new schema for stack-multi-timeframe history, and any downstream Dash schema-dispatch updates that flow from the rename.
+
+All sections below this Identity Correction section now describe the **OnePass Multi-Timeframe** history artifact specifically. The `bars` and `signals` definitions, the `date_range_*` fields, the schema invariants, and the fail-closed semantics all apply to OnePass Multi-Timeframe history artifacts. Where the prose says "MVP v1 history artifact," read it as "OnePass Multi-Timeframe history artifact" until the schema-rename PR lands.
+
+For the parent contract carrying the same Identity Correction and the full context (including the contrast between OnePass Multi-Timeframe and stack-multi-timeframe, the Codex audit diagnosis of possibility B spec drift, and the Concept 4 vocabulary that already existed in `md_library/shared/2026-05-25_CONFLUENCE_TERMINOLOGY_GLOSSARY.md`), see `md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md` (Identity Correction section).
+
+---
+
 ## Purpose
 
 This document specifies the contract for the MVP v1 per-secondary daily history artifact. The artifact is the data input required by MVP v1 ranking math, specifically Steps v1.2 through v1.8 in the MVP Ranking Contract.
@@ -302,6 +318,12 @@ The Phase 3a implementation PR must not:
 - Emit absolute filesystem paths.
 
 If Phase 3a finds it needs a field not specified here, it must stop and request a contract amendment rather than quietly extending the artifact.
+
+---
+
+## Amendment History
+
+Amendment 2026-05-27 (Identity Correction): This document is reclassified as describing the OnePass Multi-Timeframe history artifact, not the MVP v1 launch-path history artifact. The stack-multi-timeframe launch-path artifact will be defined in a separate future contract. No schema rename in this amendment. See the Identity Correction section at the top for details.
 
 ---
 

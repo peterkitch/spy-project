@@ -15,6 +15,31 @@
 
 ---
 
+## Identity Correction (Amendment 2026-05-27)
+
+This document was originally drafted to specify the MVP v1 launch-path ranking analysis. After operator live verification of PR #334, a design clarification surfaced: the current implementation, `mvp_ranking_v1.py` and `trafficflow_v1_history_writer.py`, does not implement the operator's intended MVP v1 launch path. It implements a different analysis that uses each secondary's own `signal_library/data/stable/<TICKER>_stable_v1_0_0[_<INTERVAL>].pkl` files as the multi-timeframe signal source.
+
+The corrected identity of what was built and merged is **OnePass Multi-Timeframe**. It is a legitimate analysis that extends OnePass single-window self-alignment scoring to five timeframes (1d, 1wk, 1mo, 3mo, 1y) using each secondary's own per-interval signal libraries. It is not the MVP v1 launch path. The MVP v1 launch path is **stack-multi-timeframe**: per-secondary analysis whose multi-timeframe signal source is the K=6 stack's combined signal projected onto each of the five timeframes, not the secondary's own signals. The stack-multi-timeframe launch path remains unbuilt as of this amendment and is parked as a future sprint.
+
+The contrast in one sentence each:
+
+- OnePass Multi-Timeframe asks: when this ticker's own five-timeframe signal state matched today's state, what happened next?
+- Stack-multi-timeframe asks: when this ticker's K=6 stack five-timeframe signal state matched today's stack state, what happened next?
+
+The schema labels currently in code, including `mvp_ranking_v1` (the v1 ranking artifact's `schema_version`) and `mvp_v1_history_v1` (the v1 history artifact's `schema_version`), are **not renamed in this amendment**. They are temporary label debt that this amendment explicitly acknowledges. A separate future PR will handle the rename, the new schema for stack-multi-timeframe history, and any downstream Dash schema-dispatch updates.
+
+All sections below this Identity Correction section now describe **OnePass Multi-Timeframe**, not the stack-multi-timeframe launch path. The math, the display contract, the ranking semantics, and the schema invariants in this document apply to OnePass Multi-Timeframe. Where the prose says "MVP v1," read it as "OnePass Multi-Timeframe" until the schema-rename PR lands.
+
+The prior Codex audit diagnosed this as possibility B (spec drift). The drift entered through ambiguity in this document at PR #325 (the original draft did not specify whether the five-timeframe signal state was stack-derived or secondary-own) and was hardened in `md_library/shared/2026-05-26_MVP_V1_HISTORY_ARTIFACT_CONTRACT.md` at PR #331 (which specified per-secondary signal libraries as the data source). PRs #332, #333, and #334 then faithfully implemented the drifted contracts.
+
+The vocabulary that should have been honored when this contract was drafted already existed: `md_library/shared/2026-05-25_CONFLUENCE_TERMINOLOGY_GLOSSARY.md` Concept 4 names the launch-path concept "Stack-aware multi-window K-build confluence." This amendment corrects the vocabulary by aligning the contract docs with Concept 4 for the launch path and by introducing "OnePass Multi-Timeframe" as the identity of what is actually built today.
+
+`trafficflow_multitimeframe_bridge.py` is referenced as a candidate producer or reference point for the future stack-multi-timeframe build, pending a separate readiness audit. No decision has been made in this PR about its readiness. No file is renamed and no schema is renamed here.
+
+For the upstream input contract carrying the same Identity Correction, see `md_library/shared/2026-05-26_MVP_V1_HISTORY_ARTIFACT_CONTRACT.md` (Identity Correction section).
+
+---
+
 ## Purpose
 
 This document specifies the MVP Ranking Contract: the math the MVP computes, the data flow that feeds it, and the display surface that shows it.
@@ -460,6 +485,12 @@ The following are deferred until after MVP:
 - Open source license choice.
 - Premium tier monetization.
 - Choice between retrofitting `daily_signal_board.py` and building a new MVP Dash app.
+
+---
+
+## Amendment History
+
+Amendment 2026-05-27 (Identity Correction): This document is reclassified as describing OnePass Multi-Timeframe, not the MVP v1 launch path. The stack-multi-timeframe launch path remains unbuilt and is parked as a future sprint. No code or schema renames in this amendment. See the Identity Correction section at the top for details.
 
 ---
 
