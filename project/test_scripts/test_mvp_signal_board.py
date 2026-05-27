@@ -414,8 +414,10 @@ def test_no_lower_level_reads_attempted(tmp_path, monkeypatch):
 def test_no_engine_imports_via_ast():
     forbidden_roots = {
         "mvp_ranking_v0",
+        "mvp_ranking_v1",
         "trafficflow_runner",
         "trafficflow_canonical_orchestrator",
+        "trafficflow_v1_history_writer",
         "trafficflow",
         "stackbuilder",
         "impactsearch",
@@ -1098,3 +1100,765 @@ def test_modal_disclaimer_is_final_body_element():
     assert disclaimer_idx == len(children) - 1, (
         "disclaimer must be the final body content element"
     )
+
+
+# ---------------------------------------------------------------------------
+# v1 (Phase 3c) helpers and tests
+# ---------------------------------------------------------------------------
+
+
+_FIVE_BUY_SIGS = {tf: "BUY" for tf in board.V1_TIMEFRAMES}
+_FIVE_SHORT_SIGS = {tf: "SHORT" for tf in board.V1_TIMEFRAMES}
+
+
+def _make_v1_row(
+    secondary,
+    *,
+    rank=1,
+    processing_status="ranked",
+    trade_direction="BUY",
+    zero_capture_direction_default=False,
+    current_alignment_state=None,
+    members=("AWR", "CP", "EXPO", "LLY", "FCFS", "CLH"),
+    k6_metrics=None,
+    phase_e_status=None,
+    v1_sharpe=0.87,
+    v1_total_capture_pct=12.5,
+    v1_avg_capture_pct=0.075,
+    v1_stddev_pct=1.2,
+    v1_n=120,
+    v1_win_count=66,
+    v1_loss_count=54,
+    v1_win_pct=55.0,
+    low_sample_warning=False,
+    ccc_series=None,
+    issues=None,
+    drop=(),
+):
+    if current_alignment_state is None:
+        current_alignment_state = dict(_FIVE_BUY_SIGS)
+    if k6_metrics is None:
+        k6_metrics = {
+            "k": 6,
+            "sharpe": 9.99,
+            "total_capture_pct": 30.51,
+            "triggers": 3669,
+            "wins": 1827,
+            "losses": 1842,
+            "win_pct": 49.68,
+            "avg_capture_pct": 0.0091,
+            "stddev_pct": 1.1419,
+            "p_value": 0.3362,
+            "low_sample_warning": False,
+        }
+    if phase_e_status is None:
+        phase_e_status = {
+            "Today": "2026-05-26",
+            "Now": -0.16,
+            "NEXT": -0.16,
+            "TMRW": "2026-05-27",
+            "MIX": "3/6",
+        }
+    if ccc_series is None:
+        ccc_series = [
+            {"date_utc": "1993-01-29", "cumulative_capture_pct": 0.0},
+            {"date_utc": "1993-02-01", "cumulative_capture_pct": 1.25},
+            {"date_utc": "1993-02-02", "cumulative_capture_pct": 2.75},
+            {"date_utc": "1993-02-03", "cumulative_capture_pct": 1.5},
+        ]
+    row = {
+        "rank": rank,
+        "secondary": secondary,
+        "processing_status": processing_status,
+        "trade_direction": trade_direction,
+        "zero_capture_direction_default": zero_capture_direction_default,
+        "current_alignment_state": current_alignment_state,
+        "members": list(members) if members is not None else None,
+        "k6_metrics": k6_metrics,
+        "phase_e_status": phase_e_status,
+        "v1_sharpe": v1_sharpe,
+        "v1_total_capture_pct": v1_total_capture_pct,
+        "v1_avg_capture_pct": v1_avg_capture_pct,
+        "v1_stddev_pct": v1_stddev_pct,
+        "v1_n": v1_n,
+        "v1_win_count": v1_win_count,
+        "v1_loss_count": v1_loss_count,
+        "v1_win_pct": v1_win_pct,
+        "low_sample_warning": bool(low_sample_warning),
+        "ccc_series": list(ccc_series),
+        "issues": list(issues or []),
+    }
+    for k in drop:
+        row.pop(k, None)
+    return row
+
+
+def _make_v1_artifact(
+    rows,
+    *,
+    run_id="RUN_V1_FAKE",
+    run_root="output/trafficflow/runs/RUN_V1_FAKE",
+    generated_at="2026-05-27T00:00:00.000000Z",
+    ranking_status="complete",
+    issues=None,
+):
+    ranked = [r["secondary"] for r in rows
+              if isinstance(r, dict) and r.get("rank") is not None
+              and r.get("processing_status") == "ranked"]
+    requested = [r["secondary"] for r in rows]
+    return {
+        "schema_version": board.V1_ARTIFACT_SCHEMA_VERSION,
+        "generated_at_utc": generated_at,
+        "ranking_status": ranking_status,
+        "trafficflow_run_root": run_root,
+        "trafficflow_run_id": run_id,
+        "trafficflow_run_status": "complete",
+        "trafficflow_orchestrator_invocation_id": None,
+        "secondaries_requested": requested,
+        "secondaries_ranked": ranked,
+        "per_secondary": rows,
+        "issues": list(issues or []),
+    }
+
+
+def _write_v1_artifact(tmp_path, payload):
+    path = tmp_path / "mvp_ranking_v1.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+# 2. v1 schema detection ---------------------------------------------------
+
+
+def test_v1_schema_detection_builds_app_with_v1_subheader(tmp_path):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    assert isinstance(app, dash.Dash)
+    subheader = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-subheader",
+    )
+    assert subheader is not None
+    assert getattr(subheader, "children", None) == "MVP v1"
+
+
+# 3. v1 board columns ------------------------------------------------------
+
+
+def test_v1_board_columns_exactly_rank_ticker_sharpe_direction(tmp_path):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table is not None
+    names = [c["name"] for c in table.columns]
+    ids = [c["id"] for c in table.columns]
+    # Display Contract amendment 2026-05-27: Sharpe Score precedes
+    # Trade Direction in the v1 landing board column order.
+    assert names == ["Rank", "Ticker", "Sharpe Score", "Trade Direction"]
+    assert ids == ["rank", "ticker", "sharpe_score", "trade_direction"]
+
+
+# 4. v1 board forbidden fields --------------------------------------------
+
+
+def test_v1_board_does_not_expose_forbidden_columns_or_data(tmp_path):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table is not None
+    forbidden_columns = {
+        "phase_e_status", "Phase E Status",
+        "Total %", "total_capture_pct", "Triggers", "triggers",
+        "Warning", "warning",
+        "current_alignment_state",
+        "v1_n", "v1_win_count", "v1_loss_count",
+        "trafficflow_run_id", "trafficflow_run_root",
+        "generated_at_utc", "disclaimer",
+    }
+    for col in table.columns:
+        assert col["name"] not in forbidden_columns, col
+        assert col["id"] not in forbidden_columns, col
+    allowed_row_keys = {"rank", "ticker", "trade_direction", "sharpe_score"}
+    for row in table.data:
+        assert set(row.keys()) == allowed_row_keys, row
+
+
+# 5. v1 row data -----------------------------------------------------------
+
+
+def test_v1_row_data_displays_engine_fields(tmp_path):
+    rows = [
+        _make_v1_row("AAA", rank=1, trade_direction="BUY",  v1_sharpe=0.87),
+        _make_v1_row("BBB", rank=2, trade_direction="SHORT", v1_sharpe=-0.45),
+    ]
+    payload = _make_v1_artifact(rows)
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    data = table.data
+    # Per the Display Contract amendment 2026-05-27, board row keys
+    # follow the column order Rank, Ticker, Sharpe Score, Trade Direction.
+    assert data[0] == {"rank": 1, "ticker": "AAA",
+                        "sharpe_score": "0.87", "trade_direction": "BUY"}
+    assert data[1] == {"rank": 2, "ticker": "BBB",
+                        "sharpe_score": "-0.45", "trade_direction": "SHORT"}
+    assert list(data[0].keys()) == [
+        "rank", "ticker", "sharpe_score", "trade_direction",
+    ]
+
+
+# 6. v1 Sharpe Score uses v1_sharpe, not k6 --------------------------------
+
+
+def test_v1_sharpe_score_uses_v1_sharpe_not_k6_sharpe(tmp_path):
+    row = _make_v1_row("SPY", v1_sharpe=0.87)
+    row["k6_metrics"]["sharpe"] = 9.99
+    payload = _make_v1_artifact([row])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table.data[0]["sharpe_score"] == "0.87"
+    assert table.data[0]["sharpe_score"] != "9.99"
+
+
+# 7. v1 trade direction (BUY and SHORT) -----------------------------------
+
+
+def test_v1_trade_direction_buy_and_short_render(tmp_path):
+    rows = [
+        _make_v1_row("BUY1", trade_direction="BUY", rank=1),
+        _make_v1_row("SHR1", trade_direction="SHORT", rank=2),
+    ]
+    payload = _make_v1_artifact(rows)
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    dirs = [r["trade_direction"] for r in table.data]
+    assert dirs == ["BUY", "SHORT"]
+    # Modal renders the trade direction for both.
+    modal_buy = board.render_v1_modal_content(rows[0], payload)
+    modal_short = board.render_v1_modal_content(rows[1], payload)
+    buy_text = _flatten_text(modal_buy)
+    short_text = _flatten_text(modal_short)
+    assert "Trade Direction:" in buy_text and "BUY" in buy_text
+    assert "Trade Direction:" in short_text and "SHORT" in short_text
+
+
+# 8. v1 modal content sections present ------------------------------------
+
+
+def test_v1_modal_includes_all_required_sections():
+    row = _make_v1_row("SPY")
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    component_ids = {
+        getattr(c, "id", None) for c in _walk_components(modal)
+    }
+    required_ids = {
+        "mvp-modal-title",
+        "mvp-modal-members",
+        "mvp-modal-trade-direction",
+        "mvp-modal-alignment",
+        "mvp-modal-ccc",
+        "mvp-modal-ccc-chart",
+        "mvp-modal-v1-metrics",
+        "mvp-modal-k6-metrics",
+        "mvp-modal-status",
+        "mvp-modal-provenance",
+        "mvp-modal-disclaimer",
+    }
+    for rid in required_ids:
+        assert rid in component_ids, rid
+    text = _flatten_text(modal)
+    assert "Members:" in text
+    assert "Trade Direction:" in text
+    assert "Current alignment state" in text
+    assert "Cumulative Capture Chart" in text
+    assert "v1 metrics" in text
+    assert "K=6 baseline metrics" in text
+    assert "Phase E Status" in text
+    assert "Provenance" in text
+    assert board.DISCLAIMER in text
+
+
+def test_v1_modal_close_button_present_in_layout(tmp_path):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    close_btn = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-modal-close",
+    )
+    assert close_btn is not None
+
+
+# 9. CCC chart presence ---------------------------------------------------
+
+
+def test_v1_ccc_chart_is_dcc_graph_with_id():
+    row = _make_v1_row("SPY")
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    chart = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    assert chart is not None
+    assert isinstance(chart, dcc.Graph)
+
+
+# 10. CCC chart data ------------------------------------------------------
+
+
+def test_v1_ccc_chart_data_matches_engine_series():
+    series = [
+        {"date_utc": "2026-05-01", "cumulative_capture_pct": 0.0},
+        {"date_utc": "2026-05-04", "cumulative_capture_pct": 1.5},
+        {"date_utc": "2026-05-05", "cumulative_capture_pct": -0.25},
+        {"date_utc": "2026-05-06", "cumulative_capture_pct": 3.75},
+    ]
+    row = _make_v1_row("SPY", ccc_series=series)
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    chart = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    figure = chart.figure
+    trace = figure["data"][0]
+    assert list(trace["x"]) == [pt["date_utc"] for pt in series]
+    assert list(trace["y"]) == [pt["cumulative_capture_pct"] for pt in series]
+    layout = figure["layout"]
+    assert layout["xaxis"]["title"] == "Date"
+    assert layout["yaxis"]["title"] == "Cumulative Capture (%)"
+    assert "SPY" in layout["title"]
+
+
+# 11. CCC empty series ----------------------------------------------------
+
+
+def test_v1_ccc_empty_series_renders_placeholder():
+    row = _make_v1_row("SPY", ccc_series=[])
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    empty = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-empty",
+    )
+    chart = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    assert empty is not None
+    assert chart is None
+    text = _flatten_text(empty)
+    assert "No matching historical bars" in text
+
+
+# 12. v1 modal toggle behavior --------------------------------------------
+
+
+def test_v1_modal_toggle_open_close_switch(tmp_path):
+    rows = [_make_v1_row("AAA", rank=1), _make_v1_row("BBB", rank=2)]
+    payload = _make_v1_artifact(rows)
+    # Open row 0.
+    style_open0, children_open0, state_open0 = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 0, "column": 0},
+        current_state={"row_index": None},
+        rows=rows,
+        payload=payload,
+    )
+    assert style_open0["display"] == "block"
+    assert state_open0 == {"row_index": 0}
+    # Same row, different cell -> close.
+    style_close, _, state_close = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 0, "column": 1},
+        current_state={"row_index": 0},
+        rows=rows,
+        payload=payload,
+    )
+    assert style_close == board._MODAL_CLOSED_STYLE
+    assert state_close == {"row_index": None}
+    # Different row -> switch.
+    style_switch, children_switch, state_switch = board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 1, "column": 0},
+        current_state={"row_index": 0},
+        rows=rows,
+        payload=payload,
+    )
+    assert style_switch["display"] == "block"
+    assert state_switch == {"row_index": 1}
+    text = _flatten_text(children_switch)
+    assert "BBB" in text
+    # Close button closes.
+    style_btn, _, state_btn = board.resolve_modal_state(
+        triggered_id="mvp-modal-close",
+        active_cell={"row": 1, "column": 0},
+        current_state={"row_index": 1},
+        rows=rows,
+        payload=payload,
+    )
+    assert style_btn == board._MODAL_CLOSED_STYLE
+    assert state_btn == {"row_index": None}
+
+
+# 13. Alignment tuple values render verbatim ------------------------------
+
+
+def test_v1_alignment_tuple_values_render_verbatim():
+    mixed = {
+        "1d": "BUY",
+        "1wk": "SHORT",
+        "1mo": "NONE",
+        "3mo": "UNAVAILABLE",
+        "1y": "BUY",
+    }
+    row = _make_v1_row("SPY", current_alignment_state=mixed)
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    text = _flatten_text(modal)
+    assert "1d = BUY" in text
+    assert "1wk = SHORT" in text
+    assert "1mo = NONE" in text
+    assert "3mo = UNAVAILABLE" in text
+    assert "1y = BUY" in text
+
+
+# 14. low_sample_warning ---------------------------------------------------
+
+
+def test_v1_low_sample_warning_renders_indicator_when_true():
+    row_warn = _make_v1_row("AAA", low_sample_warning=True)
+    row_ok = _make_v1_row("BBB", low_sample_warning=False)
+    payload = _make_v1_artifact([row_warn, row_ok])
+    modal_warn = board.render_v1_modal_content(row_warn, payload)
+    modal_ok = board.render_v1_modal_content(row_ok, payload)
+    warn_indicator = _find_component(
+        modal_warn,
+        lambda c: getattr(c, "id", None) == "mvp-modal-v1-low-sample-indicator",
+    )
+    ok_indicator = _find_component(
+        modal_ok,
+        lambda c: getattr(c, "id", None) == "mvp-modal-v1-low-sample-indicator",
+    )
+    assert warn_indicator is not None
+    assert ok_indicator is None
+    assert "low_sample_warning: True" in _flatten_text(modal_warn)
+    assert "low_sample_warning: False" in _flatten_text(modal_ok)
+
+
+# 15. Null metrics render "Unavailable" -----------------------------------
+
+
+def test_v1_null_v1_sharpe_renders_unavailable(tmp_path):
+    row = _make_v1_row("SPY", v1_sharpe=None)
+    payload = _make_v1_artifact([row])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table.data[0]["sharpe_score"] == board.UNAVAILABLE
+    modal = board.render_v1_modal_content(row, payload)
+    assert f"v1_sharpe: {board.UNAVAILABLE}" in _flatten_text(modal)
+
+
+# 16. Unknown schema error names both schemas plus actual ------------------
+
+
+def test_unknown_schema_error_names_both_supported_schemas(tmp_path):
+    bogus = {"schema_version": "mvp_ranking_v999", "per_secondary": []}
+    path = tmp_path / "weird.json"
+    path.write_text(json.dumps(bogus), encoding="utf-8")
+    app = board.build_mvp_signal_board_app(path)
+    err = _find_component(
+        app.layout,
+        lambda c: getattr(c, "id", None) == "mvp-error-message",
+    )
+    assert err is not None
+    text = err.children
+    assert "mvp_ranking_v0" in text
+    assert "mvp_ranking_v1" in text
+    assert "mvp_ranking_v999" in text
+
+
+# 17. Missing artifact still produces error layout ------------------------
+
+
+def test_v1_missing_artifact_renders_missing_error(tmp_path):
+    app = board.build_mvp_signal_board_app(tmp_path / "does_not_exist.json")
+    err = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-error-message",
+    )
+    assert err is not None
+    assert "not found" in err.children.lower()
+
+
+# 18. Malformed JSON still produces error layout --------------------------
+
+
+def test_v1_malformed_artifact_renders_unreadable_error(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("{not valid", encoding="utf-8")
+    app = board.build_mvp_signal_board_app(path)
+    err = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-error-message",
+    )
+    assert err is not None
+    assert "unreadable" in err.children.lower()
+
+
+# 19. Empty v1 per_secondary ----------------------------------------------
+
+
+def test_v1_empty_per_secondary_renders_empty_state(tmp_path):
+    payload = _make_v1_artifact([])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    empty = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-empty-state",
+    )
+    assert empty is not None
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table is None
+    subheader = _find_component(
+        app.layout, lambda c: getattr(c, "id", None) == "mvp-subheader",
+    )
+    assert subheader.children == "MVP v1"
+
+
+# 20. v1 landing footer absence -------------------------------------------
+
+
+def _visible_v1_landing_text(layout):
+    """Flatten visible landing text, excluding the modal subtree."""
+    chunks: list[str] = []
+    for c in _walk_components(layout):
+        if getattr(c, "id", None) == "mvp-modal":
+            # Skip the entire modal subtree.
+            break
+        children = getattr(c, "children", None)
+        if isinstance(children, str):
+            chunks.append(children)
+    return " ".join(chunks)
+
+
+def test_v1_landing_layout_has_no_visible_footer(tmp_path):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    landing_text = _visible_v1_landing_text(app.layout)
+    # Provenance / generated-at / disclaimer must not appear on the
+    # landing surface (they belong in the modal).
+    assert "Source Phase E run" not in landing_text
+    assert "Ranking generated at" not in landing_text
+    assert board.DISCLAIMER not in landing_text
+
+
+# 22. No runtime engine calls ---------------------------------------------
+
+
+def test_v1_app_construction_does_not_call_engines(tmp_path, monkeypatch):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+
+    def _raise_v0(*a, **k):
+        raise AssertionError("mvp_ranking_v0 must not be called at runtime")
+
+    def _raise_v1(*a, **k):
+        raise AssertionError("mvp_ranking_v1 must not be called at runtime")
+
+    monkeypatch.setitem(sys.modules, "mvp_ranking_v0",
+                         type(sys)("mvp_ranking_v0_stub"))
+    sys.modules["mvp_ranking_v0"].build_mvp_ranking_v0 = _raise_v0
+    monkeypatch.setitem(sys.modules, "mvp_ranking_v1",
+                         type(sys)("mvp_ranking_v1_stub"))
+    sys.modules["mvp_ranking_v1"].build_mvp_ranking_v1 = _raise_v1
+
+    app = board.build_mvp_signal_board_app(path)
+    assert isinstance(app, dash.Dash)
+    # Provoke modal rendering through the pure resolver, too.
+    rows = board._v1_visible_rows(payload)
+    board.resolve_modal_state(
+        triggered_id="mvp-board-table",
+        active_cell={"row": 0, "column": 0},
+        current_state={"row_index": None},
+        rows=rows,
+        payload=payload,
+    )
+
+
+# 24. Deterministic v1 layout ---------------------------------------------
+
+
+def test_v1_layout_deterministic_from_same_artifact(tmp_path):
+    payload = _make_v1_artifact([_make_v1_row("SPY")])
+    path = _write_v1_artifact(tmp_path, payload)
+    app_a = board.build_mvp_signal_board_app(path)
+    app_b = board.build_mvp_signal_board_app(path)
+    table_a = _find_component(
+        app_a.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    table_b = _find_component(
+        app_b.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table_a.data == table_b.data
+    assert table_a.columns == table_b.columns
+    # Modal content from the pure helper.
+    row = payload["per_secondary"][0]
+    modal_a = board.render_v1_modal_content(row, payload)
+    modal_b = board.render_v1_modal_content(row, payload)
+    assert _flatten_text(modal_a) == _flatten_text(modal_b)
+    # CCC chart figure is identical.
+    chart_a = _find_component(
+        modal_a, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    chart_b = _find_component(
+        modal_b, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    assert chart_a.figure == chart_b.figure
+
+
+# v1 visible-rows filter excludes failed records --------------------------
+
+
+def test_v1_visible_rows_excludes_failed_records(tmp_path):
+    rows = [
+        _make_v1_row("AAA", rank=1, processing_status="ranked"),
+        # Failed record: rank None, processing_status "failed".
+        {
+            "rank": None,
+            "secondary": "ZZZ",
+            "processing_status": "failed",
+            "trade_direction": None,
+            "current_alignment_state": None,
+            "members": [],
+            "k6_metrics": None,
+            "phase_e_status": {},
+            "v1_sharpe": None,
+            "v1_total_capture_pct": None,
+            "v1_avg_capture_pct": None,
+            "v1_stddev_pct": None,
+            "v1_n": 0,
+            "v1_win_count": None,
+            "v1_loss_count": None,
+            "v1_win_pct": None,
+            "low_sample_warning": False,
+            "ccc_series": [],
+            "issues": [],
+        },
+        _make_v1_row("BBB", rank=2, processing_status="ranked"),
+    ]
+    payload = _make_v1_artifact(rows)
+    path = _write_v1_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout, lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    tickers = [r["ticker"] for r in table.data]
+    assert tickers == ["AAA", "BBB"]
+    assert "ZZZ" not in tickers
+
+
+# ---------------------------------------------------------------------------
+# Codex audit visual fixes: step-shape CCC trace + v1 calendar note
+# ---------------------------------------------------------------------------
+
+
+def test_v1_ccc_chart_trace_uses_step_shape_hv():
+    """Audit fix Part A: the CCC chart trace renders as a step plot
+    (line.shape == 'hv') so cumulative capture stays flat between
+    consecutive matching bars and jumps at each matching bar. No
+    other trace fields are required by this test, but mode must
+    remain 'lines'."""
+    row = _make_v1_row("SPY")
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    chart = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    assert chart is not None
+    trace = chart.figure["data"][0]
+    assert trace.get("mode") == "lines"
+    line_cfg = trace.get("line")
+    assert isinstance(line_cfg, dict), "trace must carry a line config dict"
+    assert line_cfg.get("shape") == "hv"
+
+
+def test_v1_modal_ccc_calendar_note_present_when_series_non_empty():
+    """Audit fix Part B: the calendar note explains why CCC can end
+    before the modal Today/TMRW dates. Renders verbatim and only when
+    ccc_series is non-empty."""
+    row = _make_v1_row("SPY")
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    note = _find_component(
+        modal,
+        lambda c: getattr(c, "id", None) == "mvp-modal-ccc-calendar-note",
+    )
+    assert note is not None
+    expected = (
+        "CCC ends at the last match-candidate trading bar before "
+        "today's alignment reference."
+    )
+    assert note.children == expected
+    # Module-level constant must match the spec verbatim too.
+    assert board.CCC_CALENDAR_NOTE == expected
+
+
+def test_v0_modal_does_not_include_v1_ccc_calendar_note():
+    """Audit fix Part B: the calendar note is v1-only. v0 modals
+    rendered through render_detail_modal_content must not carry the
+    note id even incidentally."""
+    row = _make_row("SPY")
+    payload = _make_artifact([row])
+    modal = board.render_detail_modal_content(row, payload)
+    note = _find_component(
+        modal,
+        lambda c: getattr(c, "id", None) == "mvp-modal-ccc-calendar-note",
+    )
+    assert note is None
+
+
+def test_v1_modal_ccc_empty_series_does_not_include_calendar_note():
+    """Audit fix Part B: when ccc_series is empty the modal renders
+    the existing empty-series placeholder and must NOT render the
+    calendar note (there is no CCC end date to explain)."""
+    row = _make_v1_row("SPY", ccc_series=[])
+    payload = _make_v1_artifact([row])
+    modal = board.render_v1_modal_content(row, payload)
+    empty = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-empty",
+    )
+    note = _find_component(
+        modal,
+        lambda c: getattr(c, "id", None) == "mvp-modal-ccc-calendar-note",
+    )
+    chart = _find_component(
+        modal, lambda c: getattr(c, "id", None) == "mvp-modal-ccc-chart",
+    )
+    assert empty is not None
+    assert chart is None
+    assert note is None
