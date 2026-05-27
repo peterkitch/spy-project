@@ -355,6 +355,13 @@ v1 modal content extends v0 with the following additions:
 - **CCC time series chart** as the hero element of the v1 modal, positioned prominently after the alignment tuple.
 - **v1 metrics** from Step v1.6: v1 Sharpe, v1 total capture %, v1 N, v1 win count, v1 loss count, v1 win %.
 
+The v1 landing-board DataTable has exactly four visible columns, in this order:
+
+- **Rank**: 1 through N where N is the count of successfully ranked secondaries.
+- **Ticker**: the secondary ticker symbol.
+- **Sharpe Score**: the engine-emitted `v1_sharpe` value formatted to two decimals.
+- **Trade Direction**: the engine-emitted `trade_direction` value (BUY or SHORT) from Step v1.1.
+
 The Sharpe Score column on the v1 landing view reflects the v1 match-rule Sharpe, not the v0 Phase E K=6 Sharpe. v0 and v1 may therefore produce different rankings; that is expected and not an error.
 
 ### Modal Toggle Behavior
@@ -375,6 +382,8 @@ The Sharpe Score column on the v1 landing view reflects the v1 match-rule Sharpe
 ### Amendment History
 
 This Display Contract section was amended on 2026-05-26 to reflect operator-accepted refinements from live testing of PR #327 and PR #328: true modal overlay behavior, landing-board column simplification to Rank / Ticker / Sharpe Score, removal of the landing-view footer, and relocation of provenance plus the historical-performance disclaimer into the modal. The ranking math sections and data input sections are unchanged from the original 2026-05-25 publication.
+
+Amendment 2026-05-27: column order adjusted to place Sharpe Score before Trade Direction based on operator live verification preference.
 
 ---
 

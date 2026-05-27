@@ -1,24 +1,32 @@
-"""MVP v0 Dash front-end (PRJCT9 Daily Signal Board, MVP v0 surface).
+"""MVP Dash front-end (PRJCT9 Daily Signal Board, MVP v0 and v1).
 
-Phase 2 of the three-phase rollout described in the MVP Ranking
-Contract (PR #325, ``md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md``).
+Phase 2 (v0) and Phase 3c (v1) of the rollout described in the MVP
+Ranking Contract (PR #325, ``md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md``),
+including the Display Contract amendment (PR #330).
 
 This Dash app consumes exactly one input source:
 
-    mvp_ranking_v0.json
+    mvp_ranking_v0.json   (schema_version "mvp_ranking_v0")
+    mvp_ranking_v1.json   (schema_version "mvp_ranking_v1")
 
-produced by the MVP v0 ranking engine (PR #326,
-``mvp_ranking_v0.py``). It does NOT read Phase E artifacts directly,
-does NOT call the ranking engine at runtime, and does NOT import
-any pipeline engine module. If a field is needed but absent from
-the artifact, the correct response is to extend the engine in a
-separate PR rather than bypass the artifact here.
+produced by the MVP v0 ranking engine (PR #326, ``mvp_ranking_v0.py``)
+or the MVP v1 ranking engine (PR #333, ``mvp_ranking_v1.py``). The
+app auto-detects the schema and dispatches to the appropriate board
+and modal renderer.
 
-The v0 honesty principle from the contract is mandatory: this app
-does not sign-flip values, derive BUY/SHORT recommendations,
-recompute capture or Sharpe, perform match-rule scoring, compute
-CCC, render any chart, or relabel emitted columns under a semantic
-the artifact does not support.
+The app does NOT read Phase E artifacts directly, does NOT call any
+ranking engine at runtime, and does NOT import any pipeline engine
+module. If a field is needed but absent from the artifact, the
+correct response is to extend the engine in a separate PR rather
+than bypass the artifact here.
+
+The honesty principle from the contract is mandatory: this app does
+not sign-flip values, derive BUY/SHORT recommendations beyond the
+engine-emitted ``trade_direction``, recompute capture or Sharpe,
+perform match-rule scoring, compute CCC, or relabel emitted columns
+under a semantic the artifact does not support. The v1 modal renders
+the engine-emitted ``ccc_series`` as a chart but does not interpolate
+or annotate beyond title and axis labels.
 """
 from __future__ import annotations
 
@@ -33,17 +41,32 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html
 
 
 ARTIFACT_SCHEMA_VERSION = "mvp_ranking_v0"
+V1_ARTIFACT_SCHEMA_VERSION = "mvp_ranking_v1"
+SUPPORTED_SCHEMA_VERSIONS = (
+    ARTIFACT_SCHEMA_VERSION, V1_ARTIFACT_SCHEMA_VERSION,
+)
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8062
 UNAVAILABLE = "Unavailable"
 
 BOARD_HEADER = "PRJCT9 Daily Signal Board"
 BOARD_SUBHEADER = "MVP v0"
+V1_BOARD_SUBHEADER = "MVP v1"
 DISCLAIMER = "Historical performance does not guarantee future returns."
 EMPTY_TABLE_MESSAGE = "No ranked secondaries available in this run."
 EMPTY_PHASE_E_STATUS_DETAIL = (
     "No Phase E status fields emitted for this secondary."
 )
+CCC_EMPTY_MESSAGE = (
+    "No matching historical bars in this run; CCC chart unavailable."
+)
+CCC_CALENDAR_NOTE = (
+    "CCC ends at the last match-candidate trading bar before today's "
+    "alignment reference."
+)
+
+V1_TIMEFRAMES = ("1d", "1wk", "1mo", "3mo", "1y")
 
 # Optional Phase E status keys the engine forwards from board_rows.
 PHASE_E_STATUS_PRIMARY_KEY = "Now"
@@ -58,16 +81,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="mvp_signal_board",
         description=(
-            "Render the MVP v0 PRJCT9 Daily Signal Board from a "
-            "mvp_ranking_v0.json artifact. Reads exactly one input "
-            "artifact; does not call any engine, does not read Phase E "
-            "artifacts directly, does not render any chart."
+            "Render the PRJCT9 Daily Signal Board from a "
+            "mvp_ranking_v0.json (MVP v0) or mvp_ranking_v1.json "
+            "(MVP v1) artifact. Auto-detects the schema. Reads exactly "
+            "one input artifact; does not call any engine, does not "
+            "read Phase E artifacts directly. The v1 modal renders the "
+            "engine-emitted ccc_series as a chart."
         ),
     )
     p.add_argument(
         "--ranking-artifact", required=True,
-        help="Path to the mvp_ranking_v0.json artifact produced by "
-             "mvp_ranking_v0.py.",
+        help=("Path to a mvp_ranking_v0.json or mvp_ranking_v1.json "
+              "artifact produced by mvp_ranking_v0.py or "
+              "mvp_ranking_v1.py."),
     )
     p.add_argument("--host", default=DEFAULT_HOST, help="Host. Default 127.0.0.1.")
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
@@ -87,11 +113,12 @@ def load_ranking_artifact(path: Any) -> dict:
 
     Returns a dict with one of the following shapes:
 
-      {"status": "ok", "payload": <dict>}
+      {"status": "ok", "payload": <dict>, "schema": <str>}
       {"status": "missing"}
       {"status": "unreadable", "detail": <str>}
       {"status": "wrong_schema", "actual_schema": <str|None>}
 
+    Accepts both ``mvp_ranking_v0`` and ``mvp_ranking_v1`` schemas.
     The detail string is the str(...) of the underlying exception
     truncated to 240 characters; absolute filesystem paths are not
     intentionally surfaced to the UI from this layer.
@@ -109,10 +136,10 @@ def load_ranking_artifact(path: Any) -> dict:
     if not isinstance(payload, dict):
         return {"status": "unreadable", "detail": "artifact root is not a JSON object"}
     schema = payload.get("schema_version")
-    if schema != ARTIFACT_SCHEMA_VERSION:
+    if schema not in SUPPORTED_SCHEMA_VERSIONS:
         actual = schema if isinstance(schema, str) else None
         return {"status": "wrong_schema", "actual_schema": actual}
-    return {"status": "ok", "payload": payload}
+    return {"status": "ok", "payload": payload, "schema": schema}
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +469,13 @@ def resolve_modal_state(
     modal body (or an empty list when closed), and ``new_state_data``
     is the next value for the ``mvp-modal-state`` Store.
 
+    Schema-aware dispatch: when ``payload["schema_version"]`` is
+    ``mvp_ranking_v1`` the resolver calls :func:`render_v1_modal_content`
+    instead of the v0 modal content function. ``rows`` must be the
+    same list the v1 board passes as displayed-row data (failed
+    records excluded) so that ``active_cell["row"]`` indexes into it
+    correctly.
+
     Toggle rules:
 
       - Close button trigger -> close, reset row_index to None.
@@ -467,10 +501,367 @@ def resolve_modal_state(
     row = rows[row_idx]
     if not isinstance(row, dict):
         return closed
+    schema = payload.get("schema_version")
+    if schema == V1_ARTIFACT_SCHEMA_VERSION:
+        modal_children = render_v1_modal_content(row, payload)
+    else:
+        modal_children = render_detail_modal_content(row, payload)
     return (
         _MODAL_OPEN_STYLE,
-        render_detail_modal_content(row, payload),
+        modal_children,
         {"row_index": row_idx},
+    )
+
+
+# ---------------------------------------------------------------------------
+# v1 surface: board columns, table data, layout, modal content
+# ---------------------------------------------------------------------------
+
+
+_V1_BOARD_COLUMNS = [
+    {"name": "Rank", "id": "rank"},
+    {"name": "Ticker", "id": "ticker"},
+    {"name": "Sharpe Score", "id": "sharpe_score"},
+    {"name": "Trade Direction", "id": "trade_direction"},
+]
+
+
+def _v1_visible_rows(payload: dict) -> list:
+    """Return v1 per_secondary records with a non-null rank.
+
+    Per the Display Contract (PR #330) the landing table excludes
+    failed records with ``rank == None``. The same filtered list is
+    used by the modal-toggle resolver so ``active_cell["row"]``
+    indexes into the displayed data.
+    """
+    rows = payload.get("per_secondary") or []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("rank") is None:
+            continue
+        out.append(r)
+    return out
+
+
+def _v1_table_data(payload: dict) -> list[dict]:
+    """Build the v1 board table row dicts.
+
+    Columns are exactly Rank, Ticker, Sharpe Score, Trade Direction.
+    Sharpe Score uses the engine-emitted ``v1_sharpe`` field, not
+    ``k6_metrics.sharpe``. Failed records are excluded.
+    """
+    out: list[dict] = []
+    for row in _v1_visible_rows(payload):
+        rank = row.get("rank")
+        try:
+            rank_val: Any = int(rank)
+        except (TypeError, ValueError):
+            rank_val = rank
+        out.append({
+            "rank": rank_val,
+            "ticker": row.get("secondary") or UNAVAILABLE,
+            "sharpe_score": format_number(row.get("v1_sharpe")),
+            "trade_direction": row.get("trade_direction") or UNAVAILABLE,
+        })
+    return out
+
+
+def _ccc_chart_figure(row: dict) -> dict:
+    """Build the Plotly figure dict for the v1 CCC chart.
+
+    The figure is rendered as-is from the engine-emitted
+    ``ccc_series``. No interpolation, no synthesized points, no
+    annotations beyond title and axis labels.
+    """
+    series = row.get("ccc_series") or []
+    x = [pt.get("date_utc") for pt in series if isinstance(pt, dict)]
+    y = [
+        pt.get("cumulative_capture_pct") for pt in series
+        if isinstance(pt, dict)
+    ]
+    secondary = row.get("secondary") or UNAVAILABLE
+    direction = row.get("trade_direction") or UNAVAILABLE
+    return {
+        "data": [{
+            "type": "scatter",
+            "mode": "lines",
+            # Codex audit visual fix: the line "hv" shape renders the
+            # trace as a step plot so cumulative capture stays flat
+            # between consecutive matching bars and jumps at each
+            # matching bar. Underlying ccc_series data is unchanged.
+            "line": {"shape": "hv"},
+            "x": x,
+            "y": y,
+            "name": "CCC",
+        }],
+        "layout": {
+            "title": f"{secondary} CCC ({direction})",
+            "xaxis": {"title": "Date"},
+            "yaxis": {"title": "Cumulative Capture (%)"},
+            "margin": {"t": 48, "r": 12, "b": 40, "l": 56},
+        },
+    }
+
+
+def _render_alignment_block(row: dict) -> html.Section:
+    """Render the five-timeframe current alignment tuple.
+
+    Values render verbatim; ``NONE`` and ``UNAVAILABLE`` are not
+    collapsed or relabeled.
+    """
+    alignment = row.get("current_alignment_state")
+    if isinstance(alignment, dict):
+        items = []
+        for tf in V1_TIMEFRAMES:
+            v = alignment.get(tf, UNAVAILABLE)
+            items.append(html.Li(f"{tf} = {v}"))
+        body: Any = html.Ul(items, id="mvp-modal-alignment-list")
+    else:
+        body = html.Div(UNAVAILABLE, id="mvp-modal-alignment-empty")
+    return html.Section(id="mvp-modal-alignment", children=[
+        html.Strong("Current alignment state"),
+        body,
+    ])
+
+
+def _render_v1_metrics_block(row: dict) -> html.Section:
+    n = row.get("v1_n")
+    try:
+        n_str = str(int(n)) if n is not None else UNAVAILABLE
+    except (TypeError, ValueError):
+        n_str = UNAVAILABLE
+    low_sample = bool(row.get("low_sample_warning"))
+    items = [
+        html.Li(f"v1_sharpe: {format_number(row.get('v1_sharpe'))}"),
+        html.Li(
+            "v1_total_capture_pct: "
+            f"{format_number(row.get('v1_total_capture_pct'))}"
+        ),
+        html.Li(
+            "v1_avg_capture_pct: "
+            f"{format_number(row.get('v1_avg_capture_pct'))}"
+        ),
+        html.Li(
+            "v1_stddev_pct: "
+            f"{format_number(row.get('v1_stddev_pct'))}"
+        ),
+        html.Li(f"v1_n: {n_str}"),
+        html.Li(
+            "v1_win_count: "
+            f"{format_integer(row.get('v1_win_count'))}"
+        ),
+        html.Li(
+            "v1_loss_count: "
+            f"{format_integer(row.get('v1_loss_count'))}"
+        ),
+        html.Li(
+            "v1_win_pct: "
+            f"{format_number(row.get('v1_win_pct'))}"
+        ),
+        html.Li(
+            f"low_sample_warning: {low_sample}",
+            id="mvp-modal-v1-low-sample-warning",
+        ),
+    ]
+    children: list[Any] = [
+        html.Strong("v1 metrics"),
+        html.Ul(items),
+    ]
+    if low_sample:
+        children.append(html.Div("!", id="mvp-modal-v1-low-sample-indicator"))
+    return html.Section(id="mvp-modal-v1-metrics", children=children)
+
+
+def _render_k6_baseline_block(row: dict) -> html.Section:
+    """Render the K=6 baseline metrics nested under ``k6_metrics``.
+
+    These are supporting baseline metrics for context, not the v1
+    Sharpe Score. Missing values render ``Unavailable``.
+    """
+    k6 = row.get("k6_metrics")
+    if not isinstance(k6, dict):
+        k6 = {}
+    items = [
+        html.Li(f"Sharpe: {format_number(k6.get('sharpe'))}"),
+        html.Li(f"Total %: {format_number(k6.get('total_capture_pct'))}"),
+        html.Li(f"Triggers: {format_integer(k6.get('triggers'))}"),
+        html.Li(f"Wins: {format_integer(k6.get('wins'))}"),
+        html.Li(f"Losses: {format_integer(k6.get('losses'))}"),
+        html.Li(f"Win %: {format_number(k6.get('win_pct'))}"),
+        html.Li(f"Avg %: {format_number(k6.get('avg_capture_pct'))}"),
+        html.Li(f"StdDev %: {format_number(k6.get('stddev_pct'))}"),
+        html.Li(
+            "p-value: "
+            f"{format_number(k6.get('p_value'), decimals=4)}"
+        ),
+    ]
+    if "low_sample_warning" in k6:
+        items.append(html.Li(
+            "low_sample_warning: "
+            f"{bool(k6.get('low_sample_warning'))}",
+            id="mvp-modal-k6-low-sample-warning",
+        ))
+    return html.Section(id="mvp-modal-k6-metrics", children=[
+        html.Strong("K=6 baseline metrics"),
+        html.Ul(items),
+    ])
+
+
+def _render_ccc_block(row: dict) -> html.Section:
+    series = row.get("ccc_series") or []
+    calendar_note: Any = None
+    if not series:
+        body: Any = html.Div(
+            CCC_EMPTY_MESSAGE,
+            id="mvp-modal-ccc-empty",
+        )
+    else:
+        body = dcc.Graph(
+            id="mvp-modal-ccc-chart",
+            figure=_ccc_chart_figure(row),
+        )
+        # Codex audit visual fix: a small calendar note immediately
+        # below the chart explains why the CCC can end before the
+        # modal's Today / TMRW dates. The final historical bar in
+        # v1_history.json is excluded from match candidates by Step
+        # v1.3, and weekends / market holidays advance the calendar
+        # without producing new included bars. The note is rendered
+        # only for the non-empty-series case; the empty-series
+        # placeholder already explains the absence of any chart.
+        calendar_note = html.Div(
+            CCC_CALENDAR_NOTE,
+            id="mvp-modal-ccc-calendar-note",
+        )
+    summary = None
+    if isinstance(series, list) and series:
+        first = series[0]
+        last = series[-1]
+        if isinstance(first, dict) and isinstance(last, dict):
+            summary = html.Div(
+                (
+                    "CCC summary: "
+                    f"first {first.get('date_utc')} = "
+                    f"{format_number(first.get('cumulative_capture_pct'))}, "
+                    f"last {last.get('date_utc')} = "
+                    f"{format_number(last.get('cumulative_capture_pct'))}, "
+                    f"len = {len(series)}"
+                ),
+                id="mvp-modal-ccc-summary",
+            )
+    children: list[Any] = [
+        html.Strong("Cumulative Capture Chart"),
+        body,
+    ]
+    if calendar_note is not None:
+        children.append(calendar_note)
+    if summary is not None:
+        children.append(summary)
+    return html.Section(id="mvp-modal-ccc", children=children)
+
+
+def render_v1_modal_content(row: dict, payload: dict) -> html.Div:
+    """Compose the v1 modal body for a single per_secondary record.
+
+    Pure helper. Renders ticker, members, trade direction, current
+    alignment tuple, the required CCC chart hero element, v1 metrics,
+    K=6 baseline metrics for context, Phase E status, provenance, and
+    the disclaimer. Does not sign-flip, recompute, or relabel any
+    metric.
+    """
+    secondary = row.get("secondary") or UNAVAILABLE
+    trade_direction = row.get("trade_direction") or UNAVAILABLE
+
+    status = row.get("phase_e_status")
+    if isinstance(status, dict) and status:
+        status_lines = [
+            html.Li(f"{k} = {status[k]}")
+            for k in sorted(status.keys())
+        ]
+        status_block: Any = html.Ul(
+            status_lines, id="mvp-modal-status-list",
+        )
+    else:
+        status_block = html.Div(
+            EMPTY_PHASE_E_STATUS_DETAIL, id="mvp-modal-status-empty",
+        )
+
+    run_id = payload.get("trafficflow_run_id") or UNAVAILABLE
+    run_root = payload.get("trafficflow_run_root") or UNAVAILABLE
+    generated_at = payload.get("generated_at_utc") or UNAVAILABLE
+
+    return html.Div(
+        id="mvp-modal-body",
+        children=[
+            html.H3(secondary, id="mvp-modal-title"),
+            html.Section(id="mvp-modal-members", children=[
+                html.Strong("Members: "),
+                html.Span(format_members(row)),
+            ]),
+            html.Section(id="mvp-modal-trade-direction", children=[
+                html.Strong("Trade Direction: "),
+                html.Span(trade_direction),
+            ]),
+            _render_alignment_block(row),
+            _render_ccc_block(row),
+            _render_v1_metrics_block(row),
+            _render_k6_baseline_block(row),
+            html.Section(id="mvp-modal-status", children=[
+                html.Strong("Phase E Status"),
+                status_block,
+            ]),
+            html.Section(id="mvp-modal-provenance", children=[
+                html.Strong("Provenance"),
+                html.Ul([
+                    html.Li(f"Source Phase E run: {run_id}"),
+                    html.Li(f"trafficflow_run_root: {run_root}"),
+                    html.Li(f"Ranking generated at: {generated_at}"),
+                ]),
+            ]),
+            # Disclaimer is the final body content line of the modal.
+            html.Div(DISCLAIMER, id="mvp-modal-disclaimer"),
+        ],
+    )
+
+
+def render_v1_board_layout(payload: dict) -> html.Div:
+    """Render the v1 landing layout.
+
+    Header / subheader ``MVP v1`` / DataTable with the four-column v1
+    contract / hidden modal plumbing. Failed records (rank null) are
+    excluded from the table per the Display Contract amendment.
+    """
+    visible = _v1_visible_rows(payload)
+    if not visible:
+        body: Any = html.Div(EMPTY_TABLE_MESSAGE, id="mvp-empty-state")
+    else:
+        body = dash_table.DataTable(
+            id="mvp-board-table",
+            columns=_V1_BOARD_COLUMNS,
+            data=_v1_table_data(payload),
+            cell_selectable=True,
+            row_selectable=False,
+            sort_action="none",
+            page_action="none",
+            style_table={"overflowX": "auto"},
+            style_cell={"textAlign": "left", "padding": "6px"},
+            style_header={"fontWeight": "bold"},
+        )
+    return html.Div(
+        id="mvp-root",
+        children=[
+            html.H1(BOARD_HEADER, id="mvp-header"),
+            html.H2(V1_BOARD_SUBHEADER, id="mvp-subheader"),
+            html.Section(id="mvp-board", children=[body]),
+            # The visible landing layout carries no footer. Provenance
+            # and the disclaimer live inside the modal body, the same
+            # arrangement the v0 board uses post Display Contract
+            # amendment (PR #330).
+            _render_modal_container(),
+            dcc.Store(id="mvp-payload-store", data=payload),
+            dcc.Store(id="mvp-modal-state", data={"row_index": None}),
+        ],
     )
 
 
@@ -482,13 +873,15 @@ def resolve_modal_state(
 def build_mvp_signal_board_app(
     ranking_artifact_path: Any,
 ) -> Dash:
-    """Build the MVP v0 signal board Dash app.
+    """Build the MVP signal board Dash app.
 
-    On missing / unreadable / wrong-schema artifact, returns an app
-    whose layout renders a safe error state. Does not raise. Does not
-    spawn any thread, server, or background task. Does not write any
-    file. Does not call the ranking engine or import any pipeline
-    engine module.
+    Schema-aware: detects ``mvp_ranking_v0`` vs ``mvp_ranking_v1`` from
+    the artifact's ``schema_version`` and dispatches to the
+    appropriate board layout and modal renderer. On missing /
+    unreadable / wrong-schema artifact, returns an app whose layout
+    renders a safe error state. Does not raise. Does not spawn any
+    thread, server, or background task. Does not write any file. Does
+    not call any ranking engine or import any pipeline engine module.
     """
     result = load_ranking_artifact(ranking_artifact_path)
 
@@ -505,19 +898,25 @@ def build_mvp_signal_board_app(
         return app
     if result["status"] == "wrong_schema":
         actual = result.get("actual_schema")
-        msg = (
-            "Unrecognized artifact schema. Expected "
-            f"{ARTIFACT_SCHEMA_VERSION}."
-        )
+        expected = ", ".join(SUPPORTED_SCHEMA_VERSIONS)
+        msg = f"Unrecognized artifact schema. Expected one of: {expected}."
         if isinstance(actual, str) and actual:
             msg += f" Got: {actual}."
         app.layout = render_error_layout(msg)
         return app
 
     payload = result["payload"]
-    app.layout = render_board_layout(payload)
+    schema = result.get("schema") or payload.get("schema_version")
 
-    rows = payload.get("per_secondary") or []
+    if schema == V1_ARTIFACT_SCHEMA_VERSION:
+        app.layout = render_v1_board_layout(payload)
+        # The v1 board displays only rank-non-null records; the same
+        # filtered list must back the modal-toggle resolver so cell
+        # indices line up with the visible rows.
+        rows = _v1_visible_rows(payload)
+    else:
+        app.layout = render_board_layout(payload)
+        rows = payload.get("per_secondary") or []
 
     @app.callback(
         Output("mvp-modal", "style"),
