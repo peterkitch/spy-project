@@ -1,32 +1,34 @@
-"""MVP Dash front-end (PRJCT9 Daily Signal Board, MVP v0 and v1).
+"""MVP Dash front-end (PRJCT9 Daily Signal Board).
 
-Phase 2 (v0) and Phase 3c (v1) of the rollout described in the MVP
-Ranking Contract (PR #325, ``md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md``),
-including the Display Contract amendment (PR #330).
-
-This Dash app consumes exactly one input source:
+Schema-aware Dash app supporting three ranking artifact schemas:
 
     mvp_ranking_v0.json   (schema_version "mvp_ranking_v0")
     mvp_ranking_v1.json   (schema_version "mvp_ranking_v1")
+    k6_mtf_ranking.json   (schema_version "k6_mtf_ranking_v1")
 
-produced by the MVP v0 ranking engine (PR #326, ``mvp_ranking_v0.py``)
-or the MVP v1 ranking engine (PR #333, ``mvp_ranking_v1.py``). The
-app auto-detects the schema and dispatches to the appropriate board
-and modal renderer.
+The v0 (MVP) and v1 (OnePass-MTF) surfaces follow the MVP Ranking
+Contract (PR #325, ``md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md``)
+plus the Display Contract amendment (PR #330). The K=6 MTF surface
+follows the K=6 MTF launch-path contract
+(``md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md``).
+The app auto-detects the schema and dispatches to the appropriate
+board and modal renderer.
 
-The app does NOT read Phase E artifacts directly, does NOT call any
-ranking engine at runtime, and does NOT import any pipeline engine
-module. If a field is needed but absent from the artifact, the
-correct response is to extend the engine in a separate PR rather
-than bypass the artifact here.
+The app does NOT read history artifacts, member signal libraries,
+StackBuilder outputs, price caches, ``cache/results``, TrafficFlow
+outputs, OnePass-MTF artifacts directly for the K=6 MTF surface, or
+vendor data. It does NOT call any ranking engine at runtime, and
+does NOT import any pipeline engine module. If a field is needed but
+absent from the artifact, the correct response is to extend the
+engine in a separate PR rather than bypass the artifact here.
 
-The honesty principle from the contract is mandatory: this app does
+The honesty principle from the contracts is mandatory: this app does
 not sign-flip values, derive BUY/SHORT recommendations beyond the
 engine-emitted ``trade_direction``, recompute capture or Sharpe,
 perform match-rule scoring, compute CCC, or relabel emitted columns
-under a semantic the artifact does not support. The v1 modal renders
-the engine-emitted ``ccc_series`` as a chart but does not interpolate
-or annotate beyond title and axis labels.
+under a semantic the artifact does not support. The K=6 MTF and v1
+modals render the engine-emitted ``ccc_series`` as a step plot but
+do not interpolate or annotate beyond title and axis labels.
 """
 from __future__ import annotations
 
@@ -42,8 +44,11 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html
 
 ARTIFACT_SCHEMA_VERSION = "mvp_ranking_v0"
 V1_ARTIFACT_SCHEMA_VERSION = "mvp_ranking_v1"
+K6_MTF_ARTIFACT_SCHEMA_VERSION = "k6_mtf_ranking_v1"
 SUPPORTED_SCHEMA_VERSIONS = (
-    ARTIFACT_SCHEMA_VERSION, V1_ARTIFACT_SCHEMA_VERSION,
+    ARTIFACT_SCHEMA_VERSION,
+    V1_ARTIFACT_SCHEMA_VERSION,
+    K6_MTF_ARTIFACT_SCHEMA_VERSION,
 )
 
 DEFAULT_HOST = "127.0.0.1"
@@ -53,6 +58,17 @@ UNAVAILABLE = "Unavailable"
 BOARD_HEADER = "PRJCT9 Daily Signal Board"
 BOARD_SUBHEADER = "MVP v0"
 V1_BOARD_SUBHEADER = "MVP v1"
+K6_MTF_BOARD_SUBHEADER = "K=6 MTF"
+K6_MTF_SURFACE_DISTINGUISHER = (
+    "K=6 MTF (stack-derived; distinct from OnePass-MTF)"
+)
+K6_MTF_SHARPE_UNDEFINED = "undefined (insufficient sample)"
+K6_MTF_UNRANKED_EMPTY_MESSAGE = (
+    "No failed or unranked records in this run."
+)
+K6_MTF_UNRANKED_SECTION_TITLE = (
+    "Failed or unranked records (K=6 MTF)"
+)
 DISCLAIMER = "Historical performance does not guarantee future returns."
 EMPTY_TABLE_MESSAGE = "No ranked secondaries available in this run."
 EMPTY_PHASE_E_STATUS_DETAIL = (
@@ -81,19 +97,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="mvp_signal_board",
         description=(
-            "Render the PRJCT9 Daily Signal Board from a "
-            "mvp_ranking_v0.json (MVP v0) or mvp_ranking_v1.json "
-            "(MVP v1) artifact. Auto-detects the schema. Reads exactly "
-            "one input artifact; does not call any engine, does not "
-            "read Phase E artifacts directly. The v1 modal renders the "
-            "engine-emitted ccc_series as a chart."
+            "Render the PRJCT9 Daily Signal Board from one of three "
+            "ranking artifact schemas: mvp_ranking_v0 (MVP v0), "
+            "mvp_ranking_v1 (OnePass-MTF), or k6_mtf_ranking_v1 "
+            "(K=6 MTF launch path). Auto-detects the schema. Reads "
+            "exactly one input artifact; does not call any engine, "
+            "does not read Phase E artifacts directly. All three "
+            "modal surfaces render engine-emitted values without "
+            "recomputation."
         ),
     )
     p.add_argument(
         "--ranking-artifact", required=True,
-        help=("Path to a mvp_ranking_v0.json or mvp_ranking_v1.json "
-              "artifact produced by mvp_ranking_v0.py or "
-              "mvp_ranking_v1.py."),
+        help=("Path to a mvp_ranking_v0.json, mvp_ranking_v1.json, or "
+              "k6_mtf_ranking.json artifact."),
     )
     p.add_argument("--host", default=DEFAULT_HOST, help="Host. Default 127.0.0.1.")
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
@@ -502,7 +519,9 @@ def resolve_modal_state(
     if not isinstance(row, dict):
         return closed
     schema = payload.get("schema_version")
-    if schema == V1_ARTIFACT_SCHEMA_VERSION:
+    if schema == K6_MTF_ARTIFACT_SCHEMA_VERSION:
+        modal_children = render_k6_mtf_modal_content(row, payload)
+    elif schema == V1_ARTIFACT_SCHEMA_VERSION:
         modal_children = render_v1_modal_content(row, payload)
     else:
         modal_children = render_detail_modal_content(row, payload)
@@ -866,6 +885,512 @@ def render_v1_board_layout(payload: dict) -> html.Div:
 
 
 # ---------------------------------------------------------------------------
+# K=6 MTF surface: board columns, table data, layout, modal content
+#
+# Implements the third dispatch arm per the K=6 MTF launch-path
+# contract (PR introducing
+# md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md). The
+# render path:
+#   - reads ONLY the loaded k6_mtf_ranking_v1 artifact at runtime
+#   - does NOT recompute ranks, match logic, captures, Sharpe, CCC,
+#     counts, or low_sample_warning
+#   - displays values directly from the per_secondary records
+#   - renders CCC as a step plot ("line": {"shape": "hv"}) preserving
+#     no-trade flat segments
+#   - renders null sharpe_k6_mtf as
+#     "undefined (insufficient sample)" rather than 0.0
+#   - distinguishes the surface from OnePass-MTF in the subheader and
+#     surface text
+# ---------------------------------------------------------------------------
+
+
+_K6_MTF_BOARD_COLUMNS = [
+    {"name": "Rank", "id": "rank"},
+    {"name": "Ticker", "id": "ticker"},
+    {"name": "Sharpe Score", "id": "sharpe_score"},
+    {"name": "Status", "id": "status"},
+]
+
+
+def _format_k6_mtf_sharpe(value: Any) -> str:
+    """Format ``sharpe_k6_mtf``. Null renders as the explicit
+    undefined-sample label, never 0.0 and never an empty string."""
+    if value is None or isinstance(value, bool):
+        return K6_MTF_SHARPE_UNDEFINED
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return K6_MTF_SHARPE_UNDEFINED
+
+
+def _k6_mtf_visible_rows(payload: dict) -> list:
+    """Return per_secondary records with rank-non-null status.
+
+    The landing table excludes failed and unranked records (rank
+    null). The same filtered list backs the modal resolver so cell
+    indices line up. Failed and unranked records are surfaced in a
+    separate K=6 MTF section (see ``_k6_mtf_unranked_rows``) so the
+    operator still sees their status and issues.
+    """
+    rows = payload.get("per_secondary") or []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("rank") is None:
+            continue
+        out.append(r)
+    return out
+
+
+def _k6_mtf_unranked_rows(payload: dict) -> list:
+    """Return per_secondary records that are NOT in the ranked table.
+
+    A record qualifies as unranked/failed when either ``rank is None``
+    or ``status`` is one of ``"unranked"`` / ``"failed"``. This is the
+    informational surface that lets the operator see what happened to
+    secondaries the engine could not place in the ranked table. The
+    section does NOT participate in modal cell indexing.
+    """
+    rows = payload.get("per_secondary") or []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        status = r.get("status")
+        if r.get("rank") is None or status in ("unranked", "failed"):
+            out.append(r)
+    return out
+
+
+def _k6_mtf_table_data(payload: dict) -> list[dict]:
+    """Build the K=6 MTF board table row dicts.
+
+    Columns: Rank / Ticker / Sharpe Score / Status. Sharpe score uses
+    the engine-emitted ``sharpe_k6_mtf`` field. Null Sharpe renders
+    as the explicit undefined-sample string. Status renders verbatim
+    from the engine.
+    """
+    out: list[dict] = []
+    for row in _k6_mtf_visible_rows(payload):
+        rank = row.get("rank")
+        try:
+            rank_val: Any = int(rank)
+        except (TypeError, ValueError):
+            rank_val = rank
+        out.append({
+            "rank": rank_val,
+            "ticker": row.get("secondary") or UNAVAILABLE,
+            "sharpe_score": _format_k6_mtf_sharpe(
+                row.get("sharpe_k6_mtf"),
+            ),
+            "status": row.get("status") or UNAVAILABLE,
+        })
+    return out
+
+
+def _k6_mtf_ccc_chart_figure(row: dict) -> dict:
+    """Build the Plotly figure dict for the K=6 MTF CCC chart.
+
+    Step plot via ``"line": {"shape": "hv"}`` so cumulative capture
+    stays flat between matching bars and jumps at each matching bar.
+    No-trade 0.0 per-bar captures are present in ``ccc_series`` as
+    flat segments; the renderer preserves them verbatim. No
+    interpolation, no synthesized points.
+    """
+    series = row.get("ccc_series") or []
+    x = [pt.get("date_utc") for pt in series if isinstance(pt, dict)]
+    y = [
+        pt.get("cumulative_capture_pct") for pt in series
+        if isinstance(pt, dict)
+    ]
+    secondary = row.get("secondary") or UNAVAILABLE
+    return {
+        "data": [{
+            "type": "scatter",
+            "mode": "lines",
+            "line": {"shape": "hv"},
+            "x": x,
+            "y": y,
+            "name": "CCC",
+        }],
+        "layout": {
+            "title": f"{secondary} K=6 MTF CCC",
+            "xaxis": {"title": "Date"},
+            "yaxis": {"title": "Cumulative Capture (%)"},
+            "margin": {"t": 48, "r": 12, "b": 40, "l": 56},
+        },
+    }
+
+
+def _render_k6_mtf_snapshot_block(row: dict) -> html.Section:
+    """Render the engine-emitted current_snapshot five-tuple."""
+    snapshot = row.get("current_snapshot")
+    if isinstance(snapshot, dict):
+        items = []
+        for tf in V1_TIMEFRAMES:
+            v = snapshot.get(tf, UNAVAILABLE)
+            items.append(html.Li(f"{tf} = {v}"))
+        body: Any = html.Ul(items, id="k6mtf-modal-snapshot-list")
+    else:
+        body = html.Div(UNAVAILABLE, id="k6mtf-modal-snapshot-empty")
+    return html.Section(id="k6mtf-modal-snapshot", children=[
+        html.Strong("Current snapshot (K=6 MTF)"),
+        body,
+    ])
+
+
+def _render_k6_mtf_stack_block(row: dict) -> html.Section:
+    """Render the K=6 stack members and their [D]/[I] protocols."""
+    stack = row.get("k6_stack")
+    if isinstance(stack, dict):
+        members = stack.get("members")
+    else:
+        members = None
+    if isinstance(members, list) and members:
+        items = []
+        for m in members:
+            if isinstance(m, dict):
+                ticker = m.get("ticker") or UNAVAILABLE
+                protocol = m.get("protocol") or "?"
+                items.append(html.Li(f"{ticker} [{protocol}]"))
+            else:
+                items.append(html.Li(str(m)))
+        body: Any = html.Ul(items, id="k6mtf-modal-stack-list")
+    else:
+        body = html.Div(UNAVAILABLE, id="k6mtf-modal-stack-empty")
+    return html.Section(id="k6mtf-modal-stack", children=[
+        html.Strong("K=6 stack members"),
+        body,
+    ])
+
+
+def _render_k6_mtf_metrics_block(row: dict) -> html.Section:
+    """Render the K=6 MTF metrics. Null sharpe_k6_mtf renders as the
+    explicit undefined-sample string, never 0.0."""
+    low_sample = bool(row.get("low_sample_warning"))
+    items = [
+        html.Li(
+            "sharpe_k6_mtf: "
+            f"{_format_k6_mtf_sharpe(row.get('sharpe_k6_mtf'))}",
+            id="k6mtf-modal-sharpe",
+        ),
+        html.Li(
+            "total_capture_pct: "
+            f"{format_number(row.get('total_capture_pct'))}"
+        ),
+        html.Li(
+            "avg_capture_pct: "
+            f"{format_number(row.get('avg_capture_pct'))}"
+        ),
+        html.Li(
+            "stddev_pct: "
+            f"{format_number(row.get('stddev_pct'))}"
+        ),
+        html.Li(
+            "win_pct: "
+            f"{format_number(row.get('win_pct'))}"
+        ),
+        html.Li(
+            f"low_sample_warning: {low_sample}",
+            id="k6mtf-modal-low-sample-warning",
+        ),
+    ]
+    children: list[Any] = [
+        html.Strong("K=6 MTF metrics"),
+        html.Ul(items),
+    ]
+    if low_sample:
+        children.append(html.Div(
+            "!", id="k6mtf-modal-low-sample-indicator",
+        ))
+    return html.Section(id="k6mtf-modal-metrics", children=children)
+
+
+def _render_k6_mtf_counts_block(row: dict) -> html.Section:
+    """Render the K=6 MTF count taxonomy verbatim from the artifact."""
+    items = [
+        html.Li(
+            "match_count: "
+            f"{format_integer(row.get('match_count'))}"
+        ),
+        html.Li(
+            "capture_count: "
+            f"{format_integer(row.get('capture_count'))}"
+        ),
+        html.Li(
+            "trade_count: "
+            f"{format_integer(row.get('trade_count'))}"
+        ),
+        html.Li(
+            "no_trade_count: "
+            f"{format_integer(row.get('no_trade_count'))}"
+        ),
+        html.Li(
+            "skipped_capture_count: "
+            f"{format_integer(row.get('skipped_capture_count'))}"
+        ),
+        html.Li(
+            "win_count: "
+            f"{format_integer(row.get('win_count'))}"
+        ),
+        html.Li(
+            "loss_count: "
+            f"{format_integer(row.get('loss_count'))}"
+        ),
+    ]
+    return html.Section(id="k6mtf-modal-counts", children=[
+        html.Strong("Counts"),
+        html.Ul(items),
+    ])
+
+
+def _render_k6_mtf_ccc_block(row: dict) -> html.Section:
+    """Render the K=6 MTF CCC step plot from the engine-emitted
+    ``ccc_series``. Empty series renders the standard empty message."""
+    series = row.get("ccc_series") or []
+    if not series:
+        body: Any = html.Div(
+            CCC_EMPTY_MESSAGE,
+            id="k6mtf-modal-ccc-empty",
+        )
+    else:
+        body = dcc.Graph(
+            id="k6mtf-modal-ccc-chart",
+            figure=_k6_mtf_ccc_chart_figure(row),
+        )
+    summary = None
+    if isinstance(series, list) and series:
+        first = series[0]
+        last = series[-1]
+        if isinstance(first, dict) and isinstance(last, dict):
+            summary = html.Div(
+                (
+                    "CCC summary: "
+                    f"first {first.get('date_utc')} = "
+                    f"{format_number(first.get('cumulative_capture_pct'))}, "
+                    f"last {last.get('date_utc')} = "
+                    f"{format_number(last.get('cumulative_capture_pct'))}, "
+                    f"len = {len(series)}"
+                ),
+                id="k6mtf-modal-ccc-summary",
+            )
+    children: list[Any] = [
+        html.Strong("Cumulative Capture Chart (K=6 MTF)"),
+        body,
+    ]
+    if summary is not None:
+        children.append(summary)
+    return html.Section(id="k6mtf-modal-ccc", children=children)
+
+
+def _render_k6_mtf_issues_block(row: dict) -> html.Section:
+    """Render per-secondary issues from the artifact verbatim."""
+    issues = row.get("issues")
+    if isinstance(issues, list) and issues:
+        items = []
+        for entry in issues:
+            if isinstance(entry, dict):
+                code = entry.get("code") or "issue"
+                message = entry.get("message") or ""
+                items.append(html.Li(f"{code}: {message}"))
+            else:
+                items.append(html.Li(str(entry)))
+        body: Any = html.Ul(items, id="k6mtf-modal-issues-list")
+    else:
+        body = html.Div(
+            "No per-secondary issues recorded.",
+            id="k6mtf-modal-issues-empty",
+        )
+    return html.Section(id="k6mtf-modal-issues", children=[
+        html.Strong("Issues"),
+        body,
+    ])
+
+
+def render_k6_mtf_modal_content(row: dict, payload: dict) -> html.Div:
+    """Compose the K=6 MTF modal body for a single per_secondary
+    record.
+
+    Pure helper. Renders ticker, status, history-artifact provenance,
+    history_as_of_date, current_snapshot, K=6 stack with [D]/[I]
+    protocols, metrics (with null-Sharpe explicit handling), counts,
+    CCC step plot, per-secondary issues, and the disclaimer. Reads
+    only the loaded ranking artifact. Does not sign-flip, recompute,
+    or relabel any metric.
+    """
+    secondary = row.get("secondary") or UNAVAILABLE
+    status = row.get("status") or UNAVAILABLE
+    history_path = row.get("history_artifact_path") or UNAVAILABLE
+    as_of = row.get("history_as_of_date") or UNAVAILABLE
+
+    run_id = payload.get("run_id") or UNAVAILABLE
+    generated_at = payload.get("generated_at_utc") or UNAVAILABLE
+
+    return html.Div(
+        id="k6mtf-modal-body",
+        children=[
+            html.H3(secondary, id="k6mtf-modal-title"),
+            html.Div(
+                K6_MTF_SURFACE_DISTINGUISHER,
+                id="k6mtf-modal-distinguisher",
+            ),
+            html.Section(id="k6mtf-modal-status", children=[
+                html.Strong("Status: "),
+                html.Span(status),
+            ]),
+            html.Section(id="k6mtf-modal-as-of", children=[
+                html.Strong("history_as_of_date: "),
+                html.Span(as_of),
+            ]),
+            _render_k6_mtf_snapshot_block(row),
+            _render_k6_mtf_stack_block(row),
+            _render_k6_mtf_ccc_block(row),
+            _render_k6_mtf_metrics_block(row),
+            _render_k6_mtf_counts_block(row),
+            _render_k6_mtf_issues_block(row),
+            html.Section(id="k6mtf-modal-provenance", children=[
+                html.Strong("Provenance"),
+                html.Ul([
+                    html.Li(f"K=6 MTF run id: {run_id}"),
+                    html.Li(
+                        f"history_artifact_path: {history_path}"
+                    ),
+                    html.Li(f"Ranking generated at: {generated_at}"),
+                ]),
+            ]),
+            html.Div(DISCLAIMER, id="k6mtf-modal-disclaimer"),
+        ],
+    )
+
+
+def _render_k6_mtf_unranked_record(row: dict) -> html.Div:
+    """Render a single unranked/failed record as an informational
+    block. Carries secondary, status, sharpe_k6_mtf rendered with the
+    undefined-sample label when null, and the per-secondary issues
+    list (or a quiet placeholder when none)."""
+    secondary = row.get("secondary") or UNAVAILABLE
+    status = row.get("status") or UNAVAILABLE
+    sharpe_str = _format_k6_mtf_sharpe(row.get("sharpe_k6_mtf"))
+    issues = row.get("issues")
+    if isinstance(issues, list) and issues:
+        issue_items = []
+        for entry in issues:
+            if isinstance(entry, dict):
+                code = entry.get("code") or "issue"
+                message = entry.get("message") or ""
+                issue_items.append(html.Li(f"{code}: {message}"))
+            else:
+                issue_items.append(html.Li(str(entry)))
+        issues_block: Any = html.Ul(issue_items)
+    else:
+        issues_block = html.Div("No issues recorded.")
+    return html.Div(
+        className="k6mtf-unranked-record",
+        children=[
+            html.Div(
+                children=[
+                    html.Strong("Ticker: "), html.Span(secondary),
+                ],
+            ),
+            html.Div(
+                children=[
+                    html.Strong("Status: "), html.Span(status),
+                ],
+            ),
+            html.Div(
+                children=[
+                    html.Strong("sharpe_k6_mtf: "),
+                    html.Span(sharpe_str),
+                ],
+            ),
+            html.Div(
+                children=[
+                    html.Strong("Issues:"),
+                    issues_block,
+                ],
+            ),
+        ],
+    )
+
+
+def _render_k6_mtf_unranked_section(payload: dict) -> html.Section:
+    """Render the K=6 MTF Failed / unranked records section.
+
+    The section appears below the ranked table. When the artifact
+    carries no failed or unranked records the section renders a quiet
+    empty-state placeholder; the section itself is still emitted so
+    the operator can confirm the engine reported no failures rather
+    than the board silently dropping the data.
+    """
+    unranked = _k6_mtf_unranked_rows(payload)
+    if not unranked:
+        body: Any = html.Div(
+            K6_MTF_UNRANKED_EMPTY_MESSAGE,
+            id="k6mtf-unranked-empty",
+        )
+    else:
+        body = html.Div(
+            id="k6mtf-unranked-list",
+            children=[
+                _render_k6_mtf_unranked_record(row) for row in unranked
+            ],
+        )
+    return html.Section(
+        id="k6mtf-unranked-section",
+        children=[
+            html.H3(K6_MTF_UNRANKED_SECTION_TITLE),
+            body,
+        ],
+    )
+
+
+def render_k6_mtf_board_layout(payload: dict) -> html.Div:
+    """Render the K=6 MTF landing layout.
+
+    Header + ``K=6 MTF`` subheader + four-column ranked DataTable +
+    informational Failed / unranked records section. Records with
+    rank null (or status ``failed`` / ``unranked``) are excluded from
+    the ranked DataTable (which preserves modal cell indexing) and
+    surfaced in the unranked section so the operator can see their
+    status and issues. The page identity is clearly distinct from
+    OnePass-MTF.
+    """
+    visible = _k6_mtf_visible_rows(payload)
+    if not visible:
+        body: Any = html.Div(EMPTY_TABLE_MESSAGE, id="mvp-empty-state")
+    else:
+        body = dash_table.DataTable(
+            id="mvp-board-table",
+            columns=_K6_MTF_BOARD_COLUMNS,
+            data=_k6_mtf_table_data(payload),
+            cell_selectable=True,
+            row_selectable=False,
+            sort_action="none",
+            page_action="none",
+            style_table={"overflowX": "auto"},
+            style_cell={"textAlign": "left", "padding": "6px"},
+            style_header={"fontWeight": "bold"},
+        )
+    return html.Div(
+        id="mvp-root",
+        children=[
+            html.H1(BOARD_HEADER, id="mvp-header"),
+            html.H2(K6_MTF_BOARD_SUBHEADER, id="mvp-subheader"),
+            html.Div(
+                K6_MTF_SURFACE_DISTINGUISHER,
+                id="k6mtf-surface-distinguisher",
+            ),
+            html.Section(id="mvp-board", children=[body]),
+            _render_k6_mtf_unranked_section(payload),
+            _render_modal_container(),
+            dcc.Store(id="mvp-payload-store", data=payload),
+            dcc.Store(id="mvp-modal-state", data={"row_index": None}),
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -908,7 +1433,13 @@ def build_mvp_signal_board_app(
     payload = result["payload"]
     schema = result.get("schema") or payload.get("schema_version")
 
-    if schema == V1_ARTIFACT_SCHEMA_VERSION:
+    if schema == K6_MTF_ARTIFACT_SCHEMA_VERSION:
+        app.layout = render_k6_mtf_board_layout(payload)
+        # K=6 MTF board displays only ranked records (rank-non-null);
+        # the same filtered list must back the modal resolver so
+        # active_cell row indices line up.
+        rows = _k6_mtf_visible_rows(payload)
+    elif schema == V1_ARTIFACT_SCHEMA_VERSION:
         app.layout = render_v1_board_layout(payload)
         # The v1 board displays only rank-non-null records; the same
         # filtered list must back the modal-toggle resolver so cell
