@@ -8,9 +8,13 @@ md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md:
   - Next-bar capture from bars[i+1].secondary_close.
   - Capture validity (numeric, finite, positive).
   - Count taxonomy invariants.
-  - Honest Sharpe ddof=1 sqrt(252), null when undefined.
+  - Honest Sharpe ddof=1 sqrt(252), null when undefined. Computed
+    over the trade-only directional subset (per the 2026-05-28
+    amendment), not over capture_count.
   - CCC over capture_count bars only with no-trade 0.0 segments.
-  - low_sample_warning at capture_count < 30.
+    (total_capture_pct and ccc_series remain capture_count-basis;
+    per-trade metrics use trade_count.)
+  - low_sample_warning at trade_count < 30.
   - Ranking order; null-Sharpe below numeric-Sharpe; failed records
     excluded from secondaries_ranked.
   - Fail-closed on malformed inputs, all-fail emits no artifact.
@@ -460,7 +464,8 @@ def test_sharpe_null_when_capture_count_below_two():
 
 def test_sharpe_null_when_stddev_zero():
     """All BUY trades with identical raw returns produce stddev=0
-    over capture_count bars."""
+    over the trade-only directional subset (capture_count and
+    trade_count are equal here because no NONE bars are present)."""
     cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
     cand = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
     bars = [
@@ -525,6 +530,10 @@ def test_sharpe_never_zero_when_undefined():
 
 
 def test_win_loss_win_pct_basic():
+    """Per the 2026-05-28 metric-basis amendment, win_pct is computed
+    over the directional-trade subset, not over capture_count. With
+    1 BUY win, 1 BUY loss, and 1 NONE no-trade bar, trade_count=2 and
+    win_pct = 1 / 2 = 50.0 (NOT 1/3 = 33.3 under the old denominator)."""
     cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
     buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
     no_trade = _all_none_snapshot()
@@ -537,12 +546,28 @@ def test_win_loss_win_pct_basic():
     art = _make_artifact("TGT", bars)
     record = engine.score_history_artifact(art)
     assert record["capture_count"] == 3
+    assert record["trade_count"] == 2
+    assert record["no_trade_count"] == 1
     assert record["win_count"] == 1
     assert record["loss_count"] == 1
-    assert record["win_pct"] == pytest.approx(100.0 / 3.0)
+    # New trade-only basis: 1 win / 2 directional trades = 50.0%.
+    assert record["win_pct"] == pytest.approx(50.0)
+    # Count invariant: wins + losses == trade_count exactly.
+    assert record["win_count"] + record["loss_count"] == record["trade_count"]
 
 
 def test_win_pct_null_when_capture_count_zero():
+    """A valid artifact with zero matched bars still satisfies the
+    2026-05-28 amendment's count invariants:
+    - win_count and loss_count are 0 (not None) so
+      win_count + loss_count == trade_count holds when
+      trade_count == 0.
+    - total_capture_pct is 0.0 (there are no captured bars to sum).
+    - avg_capture_pct, stddev_pct, sharpe_k6_mtf, and win_pct remain
+      null because there is nothing to compute.
+    - CCC is empty because no captured bars exist.
+    - low_sample_warning is True because trade_count == 0 < 30.
+    """
     cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
     short_snap = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
     # All candidates have 1d=SHORT vs current 1d=BUY: no matches.
@@ -553,9 +578,27 @@ def test_win_pct_null_when_capture_count_zero():
     ]
     art = _make_artifact("TGT", bars)
     record = engine.score_history_artifact(art)
+    # Count taxonomy: nothing matched.
     assert record["match_count"] == 0
     assert record["capture_count"] == 0
+    assert record["trade_count"] == 0
+    assert record["no_trade_count"] == 0
+    assert record["skipped_capture_count"] == 0
+    # Win/loss are 0 so the trade_count == 0 invariant holds.
+    assert record["win_count"] == 0
+    assert record["loss_count"] == 0
+    assert record["win_count"] + record["loss_count"] == record["trade_count"]
+    # total_capture_pct is 0.0 (no captured bars to sum).
+    assert record["total_capture_pct"] == 0.0
+    # Per-trade metrics remain null.
+    assert record["avg_capture_pct"] is None
+    assert record["stddev_pct"] is None
+    assert record["sharpe_k6_mtf"] is None
     assert record["win_pct"] is None
+    # CCC is empty.
+    assert record["ccc_series"] == []
+    # trade_count == 0 < 30 -> low-sample warning.
+    assert record["low_sample_warning"] is True
     assert record["status"] == "unranked"
 
 
@@ -1258,3 +1301,458 @@ def test_malformed_candidate_does_not_silently_score():
     assert record["match_count"] == 0
     assert record["capture_count"] == 0
     assert record["skipped_capture_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 18. Per-trade metric basis (2026-05-28 amendment)
+# ---------------------------------------------------------------------------
+#
+# Locked rules pinned here:
+#   - avg_capture_pct, stddev_pct, sharpe_k6_mtf, win_count,
+#     loss_count, win_pct, and low_sample_warning use the directional-
+#     trade subset (own-1d == BUY or SHORT). NONE / UNAVAILABLE bars
+#     are excluded from those denominators.
+#   - total_capture_pct sums over capture_count (no-trade 0.0 bars
+#     included), preserving cumulative-capture semantics.
+#   - ccc_series carries capture_count points and keeps no-trade 0.0
+#     flat segments.
+#   - losses = trade_count - wins so directional captures exactly
+#     equal to 0.0 are losses. win_count + loss_count == trade_count
+#     exactly. Matches canonical_scoring.py:207-209.
+#   - low_sample_warning = trade_count < 30.
+
+
+def test_zero_return_buy_trade_counts_as_loss():
+    """A BUY trade whose raw return is exactly 0.0 must count as a
+    LOSS under the project-wide convention (canonical_scoring.py:207-
+    209). trade_count=1, win_count=0, loss_count=1, win_pct=0.0,
+    Sharpe null because n<2."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    bars = [
+        _make_bar("2024-01-01", 100.0, buy),
+        _make_bar("2024-01-02", 100.0, cur),  # 0% return
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["trade_count"] == 1
+    assert record["win_count"] == 0
+    assert record["loss_count"] == 1  # zero-return BUY is a loss
+    assert record["win_pct"] == pytest.approx(0.0)
+    assert record["sharpe_k6_mtf"] is None  # n < 2
+    assert record["status"] == "unranked"
+    # Count invariant.
+    assert record["win_count"] + record["loss_count"] == record["trade_count"]
+
+
+def test_zero_return_short_trade_counts_as_loss():
+    """Symmetric: a SHORT trade whose raw return is exactly 0.0 (so
+    SHORT capture = -0.0 = 0.0) must count as a LOSS."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    short = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    bars = [
+        _make_bar("2024-01-01", 100.0, short),
+        _make_bar("2024-01-02", 100.0, cur),  # 0% return
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["trade_count"] == 1
+    assert record["win_count"] == 0
+    assert record["loss_count"] == 1
+    assert record["win_pct"] == pytest.approx(0.0)
+    assert record["sharpe_k6_mtf"] is None
+    assert record["status"] == "unranked"
+    assert record["win_count"] + record["loss_count"] == record["trade_count"]
+
+
+def test_current_snapshot_none_wildcard_excludes_no_trade_bars_from_metrics():
+    """When current 1d == NONE, the match rule lets every candidate
+    pass for that slot. Mix BUY, SHORT, and NONE candidates: all
+    match, all enter capture_count, but per-trade metrics use only
+    BUY/SHORT captures. CCC keeps the NONE 0.0 flat point."""
+    # Build a current snapshot whose all five slots are NONE so any
+    # candidate matches.
+    cur = _all_none_snapshot()
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    short = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    no_trade = _all_none_snapshot()
+    bars = [
+        # 4 BUY trades with varied returns
+        _make_bar("2024-01-01", 100.0, buy),
+        _make_bar("2024-01-02", 101.0, buy),   # +1% win
+        _make_bar("2024-01-03", 100.0, buy),   # -1% loss
+        _make_bar("2024-01-04", 100.0, buy),   # 0% loss (zero-return)
+        # 2 SHORT trades
+        _make_bar("2024-01-05", 100.0, short),
+        _make_bar("2024-01-08", 99.0, short),  # short -> +1% win
+        # 2 no-trade NONE bars
+        _make_bar("2024-01-09", 100.0, no_trade),
+        _make_bar("2024-01-10", 105.0, no_trade),
+        _make_bar("2024-01-11", 105.0, cur),
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+
+    # All 8 candidate bars match; capture_count includes everything.
+    assert record["match_count"] == 8
+    assert record["capture_count"] == 8
+    # trade_count = 4 BUY + 2 SHORT = 6; no_trade_count = 2.
+    assert record["trade_count"] == 6
+    assert record["no_trade_count"] == 2
+
+    # win_count + loss_count == trade_count.
+    assert record["win_count"] + record["loss_count"] == record["trade_count"]
+
+    # Per-trade-basis win_pct uses 6, not 8.
+    # Trades in order: BUY +1%, BUY -1%, BUY -1%, BUY 0% (loss),
+    # SHORT 0% (loss), SHORT +1%. wins = 2 (the +1% BUY and the SHORT
+    # whose negation is +1%); losses = 4.
+    assert record["win_count"] == 2
+    assert record["loss_count"] == 4
+    assert record["win_pct"] == pytest.approx(2.0 / 6.0 * 100.0)
+
+    # CCC length equals capture_count.
+    assert len(record["ccc_series"]) == record["capture_count"]
+    # No-trade bars appear with per_bar=0.0 and direction NONE.
+    last_two = record["ccc_series"][-2:]
+    for pt in last_two:
+        assert pt["trade_direction"] == "NONE"
+        assert pt["per_bar_capture_pct"] == 0.0
+
+
+def test_current_buy_per_trade_metrics_exclude_wildcard_none_candidates():
+    """current 1d=BUY allows candidate BUY / NONE / UNAVAILABLE. Per-
+    trade metrics must exclude candidate-NONE/UNAVAILABLE bars even
+    though they enter the matched/capture set."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    no_trade = _all_none_snapshot()  # 1d=NONE
+    bars = [
+        _make_bar("2024-01-01", 100.0, buy),       # BUY trade, +2% win
+        _make_bar("2024-01-02", 102.0, no_trade),  # NONE match via wildcard
+        _make_bar("2024-01-03", 102.0, cur),
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["match_count"] == 2
+    assert record["capture_count"] == 2
+    assert record["trade_count"] == 1
+    assert record["no_trade_count"] == 1
+    # Per-trade metrics: only the BUY trade (+2%/0%) wait - bar 0
+    # capture = (102/100 - 1)*100 = +2.0; that's the only trade.
+    assert record["win_count"] == 1
+    assert record["loss_count"] == 0
+    assert record["win_pct"] == pytest.approx(100.0)
+    assert record["avg_capture_pct"] == pytest.approx(2.0)
+    # total_capture_pct sums over all captures: +2.0 + 0.0 = +2.0.
+    assert record["total_capture_pct"] == pytest.approx(2.0)
+    # Sharpe null because trade_count < 2.
+    assert record["sharpe_k6_mtf"] is None
+
+
+def test_current_short_per_trade_metrics_exclude_wildcard_none_candidates():
+    """Symmetric to the BUY case for current 1d=SHORT."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    short = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    no_trade = _all_none_snapshot()
+    bars = [
+        _make_bar("2024-01-01", 100.0, short),     # SHORT trade,
+        _make_bar("2024-01-02", 98.0, no_trade),   # NONE wildcard
+        _make_bar("2024-01-03", 98.0, cur),
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    # bar 0 SHORT: raw=(98/100-1)*100=-2.0; SHORT capture = +2.0 (win)
+    assert record["match_count"] == 2
+    assert record["capture_count"] == 2
+    assert record["trade_count"] == 1
+    assert record["no_trade_count"] == 1
+    assert record["win_count"] == 1
+    assert record["loss_count"] == 0
+    assert record["win_pct"] == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize(
+    "buy_close_pairs,short_close_pairs,no_trade_count_extra",
+    [
+        # all positive directional captures
+        ([(100.0, 101.0), (100.0, 105.0)], [], 0),
+        # all negative directional captures
+        ([(100.0, 99.0), (100.0, 95.0)], [], 0),
+        # all zero directional captures
+        ([(100.0, 100.0), (100.0, 100.0)], [], 0),
+        # mixed positive / negative / zero
+        ([(100.0, 101.0), (100.0, 99.0), (100.0, 100.0)], [], 0),
+        # mixed plus extra no-trade bars (should not break invariant)
+        ([(100.0, 102.0)], [(100.0, 99.0), (100.0, 100.0)], 3),
+        # all-cash (only no-trade bars; trade_count=0)
+        ([], [], 4),
+    ],
+)
+def test_win_plus_loss_equals_trade_count_invariant(
+    buy_close_pairs, short_close_pairs, no_trade_count_extra,
+):
+    """Parametrize across positive / negative / zero / mixed / all-
+    cash directional-capture fixtures and assert the count invariant
+    holds in every case."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    short = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    no_trade = _all_none_snapshot()
+    bars: List[Dict[str, Any]] = []
+    day = 1
+    for cur_close, _nxt_close in buy_close_pairs:
+        bars.append(_make_bar(f"2024-01-{day:02d}", cur_close, buy))
+        day += 1
+        bars.append(_make_bar(f"2024-01-{day:02d}", _nxt_close, buy))
+        day += 1
+    for cur_close, _nxt_close in short_close_pairs:
+        # Short candidates need current 1d=BUY+wildcard semantics to
+        # match. The test fixture uses a NONE-rich current snapshot
+        # for the all-cash row; build a cur-allows-all snapshot.
+        bars.append(_make_bar(f"2024-01-{day:02d}", cur_close, short))
+        day += 1
+        bars.append(_make_bar(f"2024-01-{day:02d}", _nxt_close, short))
+        day += 1
+    for _ in range(no_trade_count_extra):
+        bars.append(_make_bar(f"2024-01-{day:02d}", 50.0 + day, no_trade))
+        day += 1
+    # current snapshot bar (own-1d carries the wildcard set for the
+    # fixture; we use a 5-NONE current snapshot so all candidates can
+    # match regardless of their direction).
+    bars.append(_make_bar(f"2024-01-{day:02d}", 50.0 + day, _all_none_snapshot()))
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    if record["status"] == "failed":
+        # The parametric fixture sizes shouldn't trigger the failed
+        # path, but if it does the invariant doesn't apply.
+        return
+    if record["trade_count"] == 0:
+        assert record["win_count"] == 0
+        assert record["loss_count"] == 0
+    else:
+        assert (
+            record["win_count"] + record["loss_count"]
+            == record["trade_count"]
+        )
+
+
+def test_low_sample_warning_uses_trade_count_not_capture_count():
+    """capture_count > 30 but trade_count < 30 must trigger the
+    low-sample warning under the new basis. The fixture builds 35
+    matched bars: 5 BUY trades plus 30 no-trade NONE bars."""
+    cur = _all_none_snapshot()  # current 1d=NONE => everything matches
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    no_trade = _all_none_snapshot()
+    bars: List[Dict[str, Any]] = []
+    day = 1
+    # 5 BUY trades with non-flat returns to keep stddev > 0
+    closes = [100.0, 101.0, 100.5, 101.5, 100.8, 102.0]
+    for i in range(5):
+        bars.append(_make_bar(
+            f"2024-01-{day:02d}", closes[i], buy,
+        ))
+        day += 1
+    # Insert a final BUY closing bar so the 5th BUY has a next bar.
+    bars.append(_make_bar(f"2024-01-{day:02d}", closes[5], buy))
+    day += 1
+    # 30 no-trade NONE bars with varied closes.
+    for i in range(30):
+        bars.append(_make_bar(
+            f"2024-02-{(day - 6) % 28 + 1:02d}", 100.0 + i, no_trade,
+        ))
+        day += 1
+    # Current snapshot bar.
+    bars.append(_make_bar(f"2024-03-{(day) % 28 + 1:02d}", 200.0, cur))
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["capture_count"] > 30
+    assert record["trade_count"] < 30
+    assert record["low_sample_warning"] is True
+
+
+def test_low_sample_warning_false_when_trade_count_at_or_above_30():
+    """30 BUY trades (capture_count == trade_count == 30) clears the
+    threshold and low_sample_warning is False."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    bars: List[Dict[str, Any]] = []
+    for i in range(30):
+        bars.append(_make_bar(
+            f"2024-01-{i + 1:02d}", 100.0 + i * 0.1, buy,
+        ))
+    bars.append(_make_bar(f"2024-02-{(31) % 28 + 1:02d}", 110.0, cur))
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["trade_count"] == 30
+    assert record["low_sample_warning"] is False
+
+
+def test_all_cash_matched_record_has_zero_trade_count():
+    """A record whose matched bars are all NONE/UNAVAILABLE no-trade
+    bars has capture_count > 0 but trade_count == 0. Per-trade
+    metrics are null; win/loss are 0; CCC is populated with flat
+    0.0 points; status is unranked; Sharpe is null."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    no_trade = _all_none_snapshot()
+    bars = [
+        _make_bar("2024-01-01", 100.0, no_trade),
+        _make_bar("2024-01-02", 105.0, no_trade),
+        _make_bar("2024-01-03", 110.0, no_trade),
+        _make_bar("2024-01-04", 115.0, cur),
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["capture_count"] == 3
+    assert record["trade_count"] == 0
+    assert record["no_trade_count"] == 3
+    assert record["win_count"] == 0
+    assert record["loss_count"] == 0
+    assert record["win_pct"] is None
+    assert record["avg_capture_pct"] is None
+    assert record["stddev_pct"] is None
+    assert record["sharpe_k6_mtf"] is None
+    assert record["status"] == "unranked"
+    # total_capture_pct still summed over capture_count: 0.0+0.0+0.0=0.0.
+    assert record["total_capture_pct"] == pytest.approx(0.0)
+    # CCC populated with flat 0.0 points.
+    assert len(record["ccc_series"]) == 3
+    for pt in record["ccc_series"]:
+        assert pt["per_bar_capture_pct"] == 0.0
+        assert pt["cumulative_capture_pct"] == 0.0
+        assert pt["trade_direction"] == "NONE"
+    issue_codes = [i["code"] for i in record["issues"]]
+    assert "sharpe_undefined" in issue_codes
+
+
+def test_unavailable_own_1d_excluded_from_per_trade_metrics():
+    """UNAVAILABLE own-1d bars must be excluded from per-trade
+    metrics symmetrically with NONE bars."""
+    cur = _set_slot(
+        _all_none_snapshot(), "1d", engine.SIGNAL_BUY,
+    )
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    unavail = _set_slot(
+        _all_none_snapshot(), "1d", engine.SIGNAL_UNAVAILABLE,
+    )
+    bars = [
+        _make_bar("2024-01-01", 100.0, buy),
+        _make_bar("2024-01-02", 101.0, unavail),  # UNAVAILABLE matches BUY
+        _make_bar("2024-01-03", 105.0, cur),
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["match_count"] == 2
+    assert record["capture_count"] == 2
+    assert record["trade_count"] == 1
+    assert record["no_trade_count"] == 1
+    # CCC includes the UNAVAILABLE bar as a 0.0 flat point.
+    direction_at_unavail = record["ccc_series"][1]["trade_direction"]
+    assert direction_at_unavail == "NONE"
+    assert record["ccc_series"][1]["per_bar_capture_pct"] == 0.0
+
+
+def test_ccc_length_equals_capture_count_not_trade_count():
+    """CCC must continue to render capture_count points regardless of
+    the per-trade metric-basis split."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    no_trade = _all_none_snapshot()
+    bars = [
+        _make_bar("2024-01-01", 100.0, buy),
+        _make_bar("2024-01-02", 102.0, no_trade),
+        _make_bar("2024-01-03", 102.0, buy),
+        _make_bar("2024-01-04", 104.0, no_trade),
+        _make_bar("2024-01-05", 104.0, cur),
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    assert record["capture_count"] == 4
+    assert record["trade_count"] == 2
+    assert len(record["ccc_series"]) == record["capture_count"]
+
+
+def test_canonical_equivalence_predicate():
+    """Sanity check that the K=6 MTF local predicate is equivalent to
+    canonical_scoring.py:207-209 on a deterministic mix of positive,
+    negative, and zero directional captures.
+
+    canonical: wins = (caps > 0).sum(); losses = n - wins.
+    K=6 MTF:   win_count = wins;       loss_count = trade_count - wins.
+    """
+    # Build a fixture with explicit returns: +2%, -1%, 0%, +0.5%, 0%.
+    # n=5 directional trades. wins (caps>0) = 2 (+2%, +0.5%);
+    # losses = 5 - 2 = 3 (the -1% and the two zero-returns).
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    bars = [
+        _make_bar("2024-01-01", 100.0, buy),
+        _make_bar("2024-01-02", 102.0, buy),      # +2%
+        _make_bar("2024-01-03", 100.98, buy),     # -1% (~from 102)
+        _make_bar("2024-01-04", 100.98, buy),     # 0%
+        _make_bar("2024-01-05", 101.485, buy),    # +0.5%
+        _make_bar("2024-01-06", 101.485, cur),    # 0% (final BUY trade)
+    ]
+    art = _make_artifact("TGT", bars)
+    record = engine.score_history_artifact(art)
+    captures = [pt["per_bar_capture_pct"] for pt in record["ccc_series"]]
+    n = record["trade_count"]
+    canonical_wins = sum(1 for c in captures if c > 0)
+    canonical_losses = n - canonical_wins
+    assert record["win_count"] == canonical_wins
+    assert record["loss_count"] == canonical_losses
+    assert record["win_count"] + record["loss_count"] == record["trade_count"]
+
+
+def test_compute_metrics_helper_kwargs_signature():
+    """The amended _compute_metrics signature is keyword-only with
+    captures_for_ccc and trade_captures_for_metrics. Confirms the
+    helper rejects a positional-style call that worked under the old
+    single-list signature."""
+    with pytest.raises(TypeError):
+        engine._compute_metrics([1.0, 2.0, 3.0])
+    out = engine._compute_metrics(
+        captures_for_ccc=[1.0, 2.0, 3.0],
+        trade_captures_for_metrics=[1.0, 2.0, 3.0],
+    )
+    assert out["total_capture_pct"] == pytest.approx(6.0)
+    assert out["avg_capture_pct"] == pytest.approx(2.0)
+    # n=3 wins, 0 losses.
+    assert out["win_count"] == 3
+    assert out["loss_count"] == 0
+
+
+def test_compute_metrics_total_capture_summed_over_ccc_basis():
+    """total_capture_pct sums over captures_for_ccc (which includes
+    no-trade 0.0 bars), not over trade_captures_for_metrics."""
+    out = engine._compute_metrics(
+        captures_for_ccc=[2.0, 0.0, 0.0, -1.0],
+        trade_captures_for_metrics=[2.0, -1.0],
+    )
+    # sum is 2.0 + 0.0 + 0.0 + (-1.0) == 1.0
+    assert out["total_capture_pct"] == pytest.approx(1.0)
+    # Per-trade avg uses only the two trades: (2.0 + -1.0) / 2 = 0.5.
+    assert out["avg_capture_pct"] == pytest.approx(0.5)
+    # 1 win, 1 loss, trade_count==2.
+    assert out["win_count"] == 1
+    assert out["loss_count"] == 1
+
+
+def test_null_sharpe_record_with_zero_trade_count_sorts_below_numeric():
+    """An all-cash unranked record (trade_count=0) must sort below a
+    numeric-Sharpe record."""
+    all_cash = {
+        "secondary": "AAA", "status": "unranked", "rank": None,
+        "sharpe_k6_mtf": None, "total_capture_pct": 0.0,
+    }
+    numeric = {
+        "secondary": "BBB", "status": "ranked", "rank": None,
+        "sharpe_k6_mtf": 0.5, "total_capture_pct": 5.0,
+    }
+    sorted_records = engine._rank_records([all_cash, numeric])
+    # Numeric record first; all-cash null-Sharpe record last with
+    # rank None.
+    assert sorted_records[0]["secondary"] == "BBB"
+    assert sorted_records[0]["rank"] == 1
+    assert sorted_records[1]["secondary"] == "AAA"
+    assert sorted_records[1]["rank"] is None

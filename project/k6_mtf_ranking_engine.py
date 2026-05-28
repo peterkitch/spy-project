@@ -40,10 +40,27 @@ Per-secondary scoring flow:
      either close is missing/non-finite/non-positive, the bar is
      skipped (counted in ``match_count`` and
      ``skipped_capture_count`` but excluded from metrics and CCC).
-  6. Compute honest Sharpe over capture-count bars only:
-     ``(avg / stddev) * sqrt(252)`` with ddof=1 sample stddev.
-     Undefined Sharpe is null (never 0.0).
-  7. ``low_sample_warning = capture_count < 30``.
+  6. Compute metrics under the trade-only per-trade basis locked by
+     the 2026-05-28 contract amendment:
+       - ``total_capture_pct`` is summed over ``capture_count`` bars
+         (no-trade bars contribute ``0.0``); ``ccc_series`` also
+         carries ``capture_count`` points with no-trade ``0.0`` flat
+         segments preserved.
+       - ``avg_capture_pct``, ``stddev_pct``, ``sharpe_k6_mtf``,
+         ``win_count``, ``loss_count``, ``win_pct``, and
+         ``low_sample_warning`` are computed over ``trade_count``
+         (the directional-trade subset: matched bars whose own ``1d``
+         direction is ``BUY`` or ``SHORT``). NONE / UNAVAILABLE
+         no-position bars are excluded from these per-trade
+         denominators.
+       - Honest Sharpe is ``(avg / stddev) * sqrt(252)`` with
+         ddof=1 sample stddev over trade-only captures. Undefined
+         Sharpe is null (never 0.0).
+       - Zero-return BUY / SHORT directional trades count as losses
+         via ``losses = trade_count - wins``, matching the
+         project-wide convention at ``canonical_scoring.py:207-209``.
+         ``win_count + loss_count == trade_count`` exactly.
+  7. ``low_sample_warning = trade_count < 30``.
 
 Ranking: numeric-Sharpe records sorted by Sharpe desc, total
 capture desc, secondary alphabetical. Null-Sharpe records sort
@@ -316,9 +333,29 @@ def score_history_artifact(
             issues=issues,
         )
 
-    captures: List[float] = []
+    # Two parallel capture series per the 2026-05-28 metric-basis
+    # amendment to the K=6 MTF launch-path contract:
+    #
+    #   captures_for_ccc:
+    #       all captured matching bars (BUY, SHORT, and no-trade
+    #       NONE / UNAVAILABLE bars with 0.0). Used by
+    #       total_capture_pct and ccc_series.
+    #
+    #   trade_captures_for_metrics:
+    #       only captured matching bars whose own 1d direction is BUY
+    #       or SHORT. Used by avg_capture_pct, stddev_pct,
+    #       sharpe_k6_mtf, win_count, loss_count, win_pct, and
+    #       low_sample_warning.
+    #
+    # Loss predicate is locked at losses = trade_count - wins
+    # downstream (in _compute_metrics) so directional captures
+    # exactly equal to 0.0 are losses; this matches the project-wide
+    # convention at canonical_scoring.py:207-209 without importing
+    # that module (the ranking engine remains self-contained).
+    captures_for_ccc: List[float] = []
     dates: List[str] = []
     directions: List[str] = []
+    trade_captures_for_metrics: List[float] = []
     match_count = 0
     capture_count = 0
     trade_count = 0
@@ -356,22 +393,33 @@ def score_history_artifact(
         if direction == TRADE_DIRECTION_BUY:
             capture = raw_return_pct
             trade_count += 1
+            trade_captures_for_metrics.append(capture)
         elif direction == TRADE_DIRECTION_SHORT:
             capture = -raw_return_pct
             trade_count += 1
+            trade_captures_for_metrics.append(capture)
         else:
             capture = 0.0
             no_trade_count += 1
         capture_count += 1
-        captures.append(capture)
+        captures_for_ccc.append(capture)
         dates.append(str(cand.get("date_utc")))
         directions.append(direction)
 
     # Defensive count-invariant check; should always hold.
     assert match_count == capture_count + skipped_capture_count
     assert capture_count == trade_count + no_trade_count
+    assert trade_count == len(trade_captures_for_metrics)
 
-    metrics = _compute_metrics(captures)
+    metrics = _compute_metrics(
+        captures_for_ccc=captures_for_ccc,
+        trade_captures_for_metrics=trade_captures_for_metrics,
+    )
+    # Emit a sharpe_undefined issue whenever the record produced any
+    # captures but Sharpe is null. Covers:
+    #   - trade_count == 0 (all-cash matched): reason "no_trades"
+    #   - trade_count < 2: reason "n_less_than_two"
+    #   - stddev_pct == 0: reason "stddev_zero"
     if metrics["sharpe_k6_mtf"] is None and capture_count > 0:
         issues.append({
             "code": "sharpe_undefined",
@@ -380,7 +428,9 @@ def score_history_artifact(
             ),
         })
 
-    ccc_series = _compute_ccc_series(captures, dates, directions)
+    ccc_series = _compute_ccc_series(
+        captures_for_ccc, dates, directions,
+    )
 
     status = (
         STATUS_RANKED
@@ -408,7 +458,7 @@ def score_history_artifact(
         "win_count": metrics["win_count"],
         "loss_count": metrics["loss_count"],
         "win_pct": metrics["win_pct"],
-        "low_sample_warning": capture_count < LOW_SAMPLE_THRESHOLD,
+        "low_sample_warning": trade_count < LOW_SAMPLE_THRESHOLD,
         "ccc_series": ccc_series,
         "issues": issues,
     }
@@ -432,16 +482,37 @@ def _normalize_snapshot(snapshot: Any) -> Dict[str, str]:
     return out
 
 
-def _compute_metrics(captures: List[float]) -> Dict[str, Any]:
-    """Compute honest-Sharpe metrics over the per-bar capture list.
+def _compute_metrics(
+    *,
+    captures_for_ccc: List[float],
+    trade_captures_for_metrics: List[float],
+) -> Dict[str, Any]:
+    """Compute honest-Sharpe metrics under the per-trade metric-basis
+    rule locked in the 2026-05-28 contract amendment.
+
+    - ``total_capture_pct`` is the sum over ``captures_for_ccc`` and
+      preserves cumulative-capture semantics (no-trade bars contribute
+      ``0.0``).
+    - ``avg_capture_pct``, ``stddev_pct``, ``sharpe_k6_mtf``,
+      ``win_count``, ``loss_count``, and ``win_pct`` are computed over
+      ``trade_captures_for_metrics`` only (the directional-trade
+      subset). NONE / UNAVAILABLE no-position bars are excluded from
+      these denominators.
+    - ``losses = trade_count - wins`` so directional captures exactly
+      equal to ``0.0`` are losses. This matches the project-wide
+      convention at ``canonical_scoring.py:207-209`` without
+      importing that module.
+
+    Undefined Sharpe is ``None`` (never ``0.0``). When
+    ``trade_count == 0``, all per-trade metrics are ``None``;
+    ``win_count`` and ``loss_count`` are ``0``;
+    ``sharpe_undefined_reason`` is ``"no_trades"``.
 
     Returns a dict with keys ``total_capture_pct``,
     ``avg_capture_pct``, ``stddev_pct``, ``sharpe_k6_mtf``,
     ``win_count``, ``loss_count``, ``win_pct``,
-    ``sharpe_undefined_reason``. Undefined Sharpe is ``None`` (never
-    ``0.0``).
+    ``sharpe_undefined_reason``.
     """
-    n = len(captures)
     out: Dict[str, Any] = {
         "total_capture_pct": None,
         "avg_capture_pct": None,
@@ -452,20 +523,48 @@ def _compute_metrics(captures: List[float]) -> Dict[str, Any]:
         "win_pct": None,
         "sharpe_undefined_reason": None,
     }
-    if n == 0:
+
+    # total_capture_pct: sum over the full captured-matching-bar set
+    # so cumulative-capture semantics are preserved across CCC. When
+    # there are zero captured bars the sum is 0.0; per-trade metrics
+    # (avg / stddev / sharpe / win_pct) remain null but win_count and
+    # loss_count are 0 so the count invariant
+    # ``win_count + loss_count == trade_count`` holds for the
+    # trade_count == 0 case too.
+    if len(captures_for_ccc) == 0:
+        out["total_capture_pct"] = 0.0
+        out["win_count"] = 0
+        out["loss_count"] = 0
         out["sharpe_undefined_reason"] = "no_captures"
         return out
-    total = sum(captures)
-    avg = total / n
-    out["total_capture_pct"] = total
+    out["total_capture_pct"] = sum(captures_for_ccc)
+
+    # Per-trade metrics use the directional-trade subset only.
+    n_trade = len(trade_captures_for_metrics)
+    if n_trade == 0:
+        # No directional trades in this record: per-trade metrics are
+        # null, but win/loss counts are 0 (not None) so the count
+        # invariant win_count + loss_count == trade_count == 0 holds.
+        out["win_count"] = 0
+        out["loss_count"] = 0
+        out["sharpe_undefined_reason"] = "no_trades"
+        return out
+
+    # Loss predicate locked at losses = trade_count - wins so
+    # directional captures exactly equal to 0.0 are losses. This
+    # matches canonical_scoring.py:207-209 without importing it.
+    wins = sum(1 for c in trade_captures_for_metrics if c > 0)
+    losses = n_trade - wins
+    avg = sum(trade_captures_for_metrics) / n_trade
     out["avg_capture_pct"] = avg
-    out["win_count"] = sum(1 for c in captures if c > 0)
-    out["loss_count"] = sum(1 for c in captures if c < 0)
-    out["win_pct"] = out["win_count"] / n * 100.0
-    if n < 2:
+    out["win_count"] = wins
+    out["loss_count"] = losses
+    out["win_pct"] = wins / n_trade * 100.0
+
+    if n_trade < 2:
         out["sharpe_undefined_reason"] = "n_less_than_two"
         return out
-    stddev = _sample_stddev(captures)
+    stddev = _sample_stddev(trade_captures_for_metrics)
     out["stddev_pct"] = stddev
     if stddev == 0.0:
         out["sharpe_undefined_reason"] = "stddev_zero"
@@ -547,9 +646,28 @@ def _unranked_record(
     directions: List[str],
     issues: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Per-secondary record for an input-valid artifact that produces
-    no scoreable captures (e.g. ``capture_count < 2``)."""
-    metrics = _compute_metrics(captures)
+    """Per-secondary record for an input-valid artifact that yields
+    null Sharpe under the trade-only per-trade metric basis. Typical
+    undefined-Sharpe cases here include ``trade_count == 0`` (no
+    directional trades), ``trade_count < 2`` (insufficient sample for
+    sample-stddev), and ``stddev == 0`` (degenerate trade-only
+    captures). ``capture_count`` is NOT the Sharpe denominator.
+
+    Per the 2026-05-28 metric-basis amendment, the unranked-record
+    builder constructs the trade-only capture subset from
+    ``captures`` / ``directions`` so the per-trade metric basis is
+    consistent with the scoring loop's behavior. CCC continues to
+    receive the full captures list (``capture_count`` points).
+    ``low_sample_warning`` uses ``trade_count < 30``.
+    """
+    trade_captures = [
+        c for c, d in zip(captures, directions)
+        if d in (TRADE_DIRECTION_BUY, TRADE_DIRECTION_SHORT)
+    ]
+    metrics = _compute_metrics(
+        captures_for_ccc=list(captures),
+        trade_captures_for_metrics=trade_captures,
+    )
     return {
         "secondary": secondary,
         "rank": None,
@@ -570,7 +688,7 @@ def _unranked_record(
         "win_count": metrics["win_count"],
         "loss_count": metrics["loss_count"],
         "win_pct": metrics["win_pct"],
-        "low_sample_warning": capture_count < LOW_SAMPLE_THRESHOLD,
+        "low_sample_warning": trade_count < LOW_SAMPLE_THRESHOLD,
         "ccc_series": _compute_ccc_series(captures, dates, directions),
         "issues": issues,
     }

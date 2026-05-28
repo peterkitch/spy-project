@@ -263,30 +263,41 @@ If current close or next close is missing, invalid, or non-positive, **skip that
 Counts:
 
 - `match_count`: all historical bars passing the match rule.
-- `capture_count`: matched bars with valid current and next close (the count used in metrics denominators).
+- `capture_count`: matched bars with valid current and next close. Used as the basis for `total_capture_pct` and `ccc_series`. Per the 2026-05-28 amendment, per-trade metric denominators (`avg_capture_pct`, `stddev_pct`, `sharpe_k6_mtf`, `win_count`, `loss_count`, `win_pct`, `low_sample_warning`) use `trade_count` (the directional-trade subset), not `capture_count`.
 - `trade_count`: `capture_count` bars with `BUY` or `SHORT` direction.
 - `no_trade_count`: `capture_count` bars with `NONE` or `UNAVAILABLE` direction.
 - `skipped_capture_count`: matched bars skipped due to invalid close data.
 
 ### Honest Sharpe
 
-Locked formula:
+**Metric basis split (locked as of 2026-05-28 amendment).** Per-trade metrics use the directional-trade subset only; `total_capture_pct` and CCC use the full captured-matching-bar set.
 
-- `total_capture_pct = sum(per_bar_capture)` over `capture_count` bars (no-trade bars contribute `0.0`).
-- `avg_capture_pct = total_capture_pct / capture_count`.
-- `stddev_pct` = sample standard deviation of `per_bar_capture` values, **`ddof=1`**.
-- `sharpe_k6_mtf = (avg_capture_pct / stddev_pct) * sqrt(252)`.
+- **`total_capture_pct`** = `sum(per_bar_capture)` over `capture_count` bars (no-trade bars contribute `0.0`). Preserves cumulative-capture semantics.
+- **Per-trade metric basis.** `avg_capture_pct`, `stddev_pct`, `sharpe_k6_mtf`, `win_count`, `loss_count`, `win_pct`, and `low_sample_warning` use the **directional-trade subset**: captured matching bars whose own `1d` slot is `BUY` or `SHORT`. `NONE` / `UNAVAILABLE` no-position bars are **excluded** from these per-trade denominators, even when they enter the matched set through wildcard matching of the current snapshot.
+- **`avg_capture_pct`** = `sum(trade_captures) / trade_count`.
+- **`stddev_pct`** = sample standard deviation of `trade_captures`, **`ddof=1`**.
+- **`sharpe_k6_mtf`** = `(avg_capture_pct / stddev_pct) * sqrt(252)`.
+
+#### Win, loss, and win_pct predicate
+
+- `win_count` = number of `trade_count` bars with `per_bar_capture_pct > 0`.
+- `loss_count` = `trade_count - win_count`. Directional-trade captures **exactly equal to `0.0`** are losses.
+- `win_pct` = `win_count / trade_count * 100.0` when `trade_count > 0`; `null` otherwise.
+- **Invariant: `win_count + loss_count == trade_count` exactly.** There is no third zero-return bucket and no `zero_trade_count` field.
+
+This matches the project-wide convention at `canonical_scoring.py:207-209` (`wins = (trigger_caps > 0).sum()`, `losses = trigger_days - wins`). The K=6 MTF ranking engine implements the equivalent predicate **locally** because the engine must remain self-contained and preserve the artifact-as-boundary rule; it does not import `canonical_scoring`.
 
 #### Undefined Sharpe policy
 
-- If `capture_count < 2`, `sharpe_k6_mtf` is `null` (not `0.0`).
+- If `trade_count < 2`, `sharpe_k6_mtf` is `null` (not `0.0`).
 - If `stddev_pct == 0`, `sharpe_k6_mtf` is `null`.
+- If `trade_count == 0`, all per-trade metrics (`avg_capture_pct`, `stddev_pct`, `sharpe_k6_mtf`, `win_pct`) are `null`; `win_count = 0`, `loss_count = 0`.
 - Undefined-Sharpe records sort **below** numeric-Sharpe records in the ranking.
 - Record a per-secondary issue such as `sharpe_undefined`.
 
-This intentionally follows the OnePass-MTF undefined-Sharpe behavior in `mvp_ranking_v1.py:417-449` `_compute_v1_metrics(captures)`: ddof=1 sample stddev (L401-L414), sqrt(252) annualization (`TRADING_DAYS_PER_YEAR = 252` at L54, used at L448), and null Sharpe when n<2 or stddev==0 with a `sharpe_undefined_reason` field. The K=6 MTF launch path reuses the same convention. **Do NOT use `0.0` for undefined Sharpe.**
+This intentionally follows the OnePass-MTF undefined-Sharpe behavior in `mvp_ranking_v1.py:417-449` `_compute_v1_metrics(captures)`: ddof=1 sample stddev (L401-L414), sqrt(252) annualization (`TRADING_DAYS_PER_YEAR = 252` at L54, used at L448), and null Sharpe when n<2 or stddev==0 with a `sharpe_undefined_reason` field. The K=6 MTF launch path reuses the same convention, with the per-trade basis substitution above. **Do NOT use `0.0` for undefined Sharpe.**
 
-This is **NOT** TrafficFlow's displayed subset-averaged Sharpe. TrafficFlow's UI Sharpe averages subset metrics: `trafficflow.py:2690` `compute_build_metrics_spymaster_parity(...)` produces the displayed UI metrics, and the explicit comments at `trafficflow.py:2842` ("Create snapshot with AVERAGES Sharpe (not unanimous combination Sharpe)") and L2865-L2866 ("`# Use AVERAGES Sharpe`") confirm that the displayed Sharpe is a mean across subsets. K=6 MTF Sharpe is computed directly over the same matching-bar captures that produce CCC; the two values are not interchangeable.
+This is **NOT** TrafficFlow's displayed subset-averaged Sharpe. TrafficFlow's UI Sharpe averages subset metrics: `trafficflow.py:2690` `compute_build_metrics_spymaster_parity(...)` produces the displayed UI metrics, and the explicit comments at `trafficflow.py:2842` ("Create snapshot with AVERAGES Sharpe (not unanimous combination Sharpe)") and L2865-L2866 ("`# Use AVERAGES Sharpe`") confirm that the displayed Sharpe is a mean across subsets. K=6 MTF Sharpe is computed directly over the same matching-bar captures whose directional subset produces the metric basis; the two values are not interchangeable.
 
 ### CCC Time Series
 
@@ -299,7 +310,7 @@ Each CCC point includes:
 - `per_bar_capture_pct`
 - `trade_direction`
 
-No-trade bars (matching bars whose `1d` slot is `NONE` / `UNAVAILABLE`) are included with `per_bar_capture_pct = 0.0`. This intentionally creates **flat CCC segments** when the matched state is all-cash.
+No-trade bars (matching bars whose `1d` slot is `NONE` / `UNAVAILABLE`) are included with `per_bar_capture_pct = 0.0`. This intentionally creates **flat CCC segments** when the matched state is all-cash. CCC continues to render `capture_count` points regardless of the per-trade metric-basis split established in "Honest Sharpe" above; CCC length therefore equals `capture_count`, not `trade_count`.
 
 The Dash chart should render CCC as a step plot, following the PR #334 visual precedent (`line.shape = "hv"` and the modal calendar note in `mvp_signal_board.py`).
 
@@ -315,10 +326,10 @@ Failed secondaries and null-Sharpe secondaries remain in `per_secondary` but are
 
 #### Low-sample warning
 
-- `low_sample_warning = True` when `capture_count < 30`.
+- `low_sample_warning = True` when `trade_count < 30`.
 - `False` otherwise.
 
-This reuses the OnePass-MTF threshold at `mvp_ranking_v1.py:53` `LOW_SAMPLE_THRESHOLD = 30`.
+Threshold reuses the OnePass-MTF value at `mvp_ranking_v1.py:53` `LOW_SAMPLE_THRESHOLD = 30`. The basis is `trade_count` (directional-trade subset), not `capture_count`, consistent with the per-trade metric-basis rule in "Honest Sharpe" above: a record with hundreds of matched bars but only a handful of directional trades is genuinely under-sampled for per-trade statistics.
 
 ---
 
@@ -414,6 +425,8 @@ If `member_signals_by_timeframe` is omitted for file-size reasons, the producer 
 - `low_sample_warning`
 - `ccc_series` (array of `{date_utc, cumulative_capture_pct, per_bar_capture_pct, trade_direction}`)
 - `issues`
+
+**Field semantics under the per-trade metric basis (2026-05-28 amendment).** Field **names** and the `k6_mtf_ranking_v1` schema label are unchanged from the initial contract; only the semantics of `avg_capture_pct`, `stddev_pct`, `sharpe_k6_mtf`, `win_count`, `loss_count`, `win_pct`, and `low_sample_warning` are clarified to use the directional-trade subset (see "Honest Sharpe" above). `total_capture_pct` continues to sum over `capture_count` bars and `ccc_series` continues to carry `capture_count` points including no-trade `0.0` flat segments. `match_count`, `capture_count`, `trade_count`, `no_trade_count`, and `skipped_capture_count` retain their original taxonomic meaning.
 
 The ranking artifact is the **only** Dash input for the K=6 MTF board. Dash MUST NOT read history artifacts directly unless a future contract says otherwise. This is the same stable-boundary discipline established for OnePass-MTF in `md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md` L146 ("The artifact is the stable boundary.").
 
@@ -563,8 +576,11 @@ Future implementation PRs must add focused tests for:
 - match-rule wildcard semantics for `NONE` and `UNAVAILABLE` on both sides
 - per-bar direction from the historical 1d slot (NOT a global scalar)
 - no-trade zero captures
-- undefined Sharpe (`capture_count < 2`; `stddev_pct == 0`)
-- low-sample warning at `capture_count < 30`
+- undefined Sharpe (`trade_count < 2`; `stddev_pct == 0`)
+- low-sample warning at `trade_count < 30`
+- zero-return BUY / SHORT directional trades count as losses (`losses = trade_count - wins`; loses-includes-zero rule per `canonical_scoring.py:207-209`)
+- `win_count + loss_count == trade_count` exactly (no third zero-return bucket; no `zero_trade_count` field)
+- `NONE` / `UNAVAILABLE` no-position bars are excluded from per-trade metric denominators (`avg_capture_pct`, `stddev_pct`, `sharpe_k6_mtf`, `win_count`, `loss_count`, `win_pct`, `low_sample_warning`) and are retained as no-trade `0.0` flat segments in `ccc_series`
 - CCC step-series data shape (including no-trade flat segments)
 - ranking tie-breaks (Sharpe desc -> total_capture_pct desc -> alphabetical)
 - fail-closed missing inputs (each entry in "Fail-Closed Behavior" above)
@@ -600,3 +616,5 @@ Current line numbers verified at this PR's HEAD; future edits to the cited files
 2026-05-27 (initial): Launch-path contract created for the 8-secondary K=6 MTF MVP. Locks daily-close raw source, per-timeframe resample-prices-then-compute-signals behavior, K=6 unanimity combine, forward-fill snapshot alignment, per-bar direction from the historical 1d slot, honest Sharpe, CCC, ranking, artifacts, freshness policy, and deferred items.
 
 2026-05-27 (amendment, combine-rule clarification): Clarified the K=6 combined-signal rule to be TrafficFlow-style active-signal unanimity: neutral member values (`NONE` / `Cash` / `UNAVAILABLE` / `missing` / blank / null / unrecognized) abstain, active members must not conflict, and one or more aligned active members can carry `BUY` or `SHORT`. "K=6" identifies the six-member StackBuilder build being evaluated; it does NOT impose a six-active-vote threshold on every bar. The contract now explicitly states that `research_artifacts.combine_member_signals(..., K=6)` thresholding is NOT the launch-path combine rule. The `k6_mtf_history_v1` per-bar `availability` object now records per-slot `active_buy_count` / `active_short_count` / `neutral_count` as descriptive provenance only (sums to six per slot per bar). The provenance counts do not change the combine rule, match rule, trade-direction rule, capture rule, Sharpe computation, ranking, or any MVP filtering behavior; participation-depth filtering is a separate future enhancement.
+
+2026-05-28 (amendment, per-trade metric basis correction): Corrected the metric basis for `avg_capture_pct`, `stddev_pct`, `sharpe_k6_mtf`, `win_count`, `loss_count`, `win_pct`, and `low_sample_warning`. These per-trade metrics now use the directional-trade subset only (matched bars whose own `1d` slot is `BUY` or `SHORT`), not `capture_count`. `NONE` / `UNAVAILABLE` no-position bars are excluded from per-trade denominators. The loss predicate is locked as `losses = trade_count - wins`, so directional captures exactly equal to `0.0` are losses (matching the project-wide convention at `canonical_scoring.py:207-209`). `win_count + loss_count == trade_count` is now an invariant; there is no third zero-return bucket. `total_capture_pct` continues to sum over `capture_count` bars and `ccc_series` continues to render `capture_count` points including no-trade `0.0` flat segments. The undefined-Sharpe policy is updated to use `trade_count < 2` (instead of `capture_count < 2`). `low_sample_warning` is updated to use `trade_count < 30`. Schema label `k6_mtf_ranking_v1` and all per-secondary field names are unchanged; only the semantics of the affected fields are clarified. This amendment is implemented in PR A; PR B propagates the same predicate fix to other divergent project surfaces (`mvp_ranking_v1.py`, `multiwindow_k_engine_core.py`, `confluence_mtf_artifact_builder.py`, `trafficflow_multitimeframe_bridge.py`, `research_artifacts.py`, and two Spymaster fallback paths).
