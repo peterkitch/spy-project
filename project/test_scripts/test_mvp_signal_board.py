@@ -148,6 +148,101 @@ def test_app_factory_builds_without_error(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 1b. Schema-aware browser-tab title
+# ---------------------------------------------------------------------------
+
+
+def test_v0_artifact_yields_v0_browser_tab_title(tmp_path):
+    """A mvp_ranking_v0 artifact yields app.title carrying the
+    MVP v0 subheader constant. The title suffix must equal the
+    in-page H2 constant, not a duplicate literal."""
+    payload = _make_artifact([_make_row("SPY")])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    assert app.title == (
+        f"{board.BOARD_HEADER} - {board.BOARD_SUBHEADER}"
+    )
+    assert app.title == "PRJCT9 Daily Signal Board - MVP v0"
+
+
+def test_v1_artifact_yields_v1_browser_tab_title(tmp_path):
+    """A mvp_ranking_v1 artifact yields app.title carrying the
+    OnePass-MTF v1 subheader. The MVP v0 suffix must NOT appear."""
+    v1_payload = {
+        "schema_version": "mvp_ranking_v1",
+        "generated_at_utc": "2026-05-28T00:00:00Z",
+        "trafficflow_run_root": "output/trafficflow/runs/X",
+        "trafficflow_run_id": "X",
+        "secondaries_requested": ["SPY"],
+        "secondaries_ranked": ["SPY"],
+        "per_secondary": [{
+            "rank": 1, "secondary": "SPY", "k": 6,
+            "members": ["A", "B"], "trade_direction": "BUY",
+            "v1_sharpe": 1.0, "v1_total_capture_pct": 5.0,
+            "v1_avg_capture_pct": 0.1, "v1_stddev_pct": 0.5,
+            "v1_n": 30, "v1_win_count": 18, "v1_loss_count": 12,
+            "v1_win_pct": 60.0, "low_sample_warning": False,
+            "ccc_series": [
+                {"date_utc": "2024-01-01",
+                 "cumulative_capture_pct": 1.0},
+            ],
+            "k6_metrics": {},
+            "current_alignment_state": {
+                "1d": "BUY", "1wk": "BUY", "1mo": "NONE",
+                "3mo": "NONE", "1y": "NONE",
+            },
+            "phase_e_status": {},
+        }],
+        "issues": [],
+    }
+    path = tmp_path / "mvp_ranking_v1.json"
+    path.write_text(json.dumps(v1_payload), encoding="utf-8")
+    app = board.build_mvp_signal_board_app(path)
+    assert app.title == (
+        f"{board.BOARD_HEADER} - {board.V1_BOARD_SUBHEADER}"
+    )
+    assert app.title == "PRJCT9 Daily Signal Board - MVP v1"
+    assert "MVP v0" not in app.title
+
+
+def test_missing_artifact_keeps_safe_default_browser_tab_title(tmp_path):
+    """A missing-artifact path returns the safe-default title
+    without raising. The default is the v0 suffix, matching the
+    pre-amendment behavior for unrecognized / unreadable paths."""
+    missing_path = tmp_path / "does_not_exist.json"
+    app = board.build_mvp_signal_board_app(missing_path)
+    assert isinstance(app, dash.Dash)
+    assert app.title == (
+        f"{board.BOARD_HEADER} - {board.BOARD_SUBHEADER}"
+    )
+
+
+def test_unreadable_artifact_keeps_safe_default_browser_tab_title(tmp_path):
+    """An unreadable / malformed JSON file falls back to the safe
+    default title."""
+    bad = tmp_path / "bad.json"
+    bad.write_text("this is not json", encoding="utf-8")
+    app = board.build_mvp_signal_board_app(bad)
+    assert app.title == (
+        f"{board.BOARD_HEADER} - {board.BOARD_SUBHEADER}"
+    )
+
+
+def test_wrong_schema_artifact_keeps_safe_default_browser_tab_title(tmp_path):
+    """An artifact with an unrecognized schema_version falls back
+    to the safe default title."""
+    wrong = tmp_path / "wrong_schema.json"
+    wrong.write_text(
+        json.dumps({"schema_version": "not_supported_v9"}),
+        encoding="utf-8",
+    )
+    app = board.build_mvp_signal_board_app(wrong)
+    assert app.title == (
+        f"{board.BOARD_HEADER} - {board.BOARD_SUBHEADER}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 2. Board renders rows in artifact order (no front-end re-sort)
 # ---------------------------------------------------------------------------
 
