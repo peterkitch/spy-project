@@ -217,6 +217,41 @@ def test_k6_mtf_schema_routes_to_k6_mtf_layout(tmp_path):
     assert board.BOARD_SUBHEADER not in text
 
 
+def test_k6_mtf_artifact_yields_k6_mtf_browser_tab_title(tmp_path):
+    """A k6_mtf_ranking_v1 artifact yields app.title carrying the
+    K=6 MTF subheader. The MVP v0 / MVP v1 suffixes must NOT appear
+    so the browser tab matches the in-page H2 for this surface."""
+    rec = _make_k6_mtf_record("TGT")
+    payload = _make_k6_mtf_artifact([rec])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    assert app.title == (
+        f"{board.BOARD_HEADER} - {board.K6_MTF_BOARD_SUBHEADER}"
+    )
+    assert app.title == "PRJCT9 Daily Signal Board - K=6 MTF"
+    assert "MVP v0" not in app.title
+    assert "MVP v1" not in app.title
+
+
+def test_board_title_for_schema_helper_returns_expected_suffixes():
+    """The helper drives the title and must return the same subheader
+    constants the in-page H2 uses, for all three supported schemas."""
+    assert board._board_title_for_schema(
+        board.ARTIFACT_SCHEMA_VERSION
+    ) == board.BOARD_SUBHEADER
+    assert board._board_title_for_schema(
+        board.V1_ARTIFACT_SCHEMA_VERSION
+    ) == board.V1_BOARD_SUBHEADER
+    assert board._board_title_for_schema(
+        board.K6_MTF_ARTIFACT_SCHEMA_VERSION
+    ) == board.K6_MTF_BOARD_SUBHEADER
+    # Unknown schemas fall back to the safe default subheader.
+    assert board._board_title_for_schema("nonsense_v9") == (
+        board.BOARD_SUBHEADER
+    )
+    assert board._board_title_for_schema(None) == board.BOARD_SUBHEADER
+
+
 def test_v0_schema_still_routes_to_v0_layout(tmp_path):
     """Existing v0 dispatch unchanged."""
     payload = {

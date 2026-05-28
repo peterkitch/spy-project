@@ -84,6 +84,23 @@ CCC_CALENDAR_NOTE = (
 
 V1_TIMEFRAMES = ("1d", "1wk", "1mo", "3mo", "1y")
 
+
+def _board_title_for_schema(schema_version: Any) -> str:
+    """Return the Dash browser-tab title suffix matching a given
+    ranking-artifact schema_version.
+
+    The returned subheader value is the same constant the in-page H2
+    uses, so the browser-tab title and the in-page surface label
+    cannot disagree for a valid artifact. Unknown / missing schemas
+    fall back to ``BOARD_SUBHEADER`` so the safe default title is
+    preserved for bad-artifact paths.
+    """
+    if schema_version == K6_MTF_ARTIFACT_SCHEMA_VERSION:
+        return K6_MTF_BOARD_SUBHEADER
+    if schema_version == V1_ARTIFACT_SCHEMA_VERSION:
+        return V1_BOARD_SUBHEADER
+    return BOARD_SUBHEADER
+
 # Optional Phase E status keys the engine forwards from board_rows.
 PHASE_E_STATUS_PRIMARY_KEY = "Now"
 
@@ -1432,6 +1449,14 @@ def build_mvp_signal_board_app(
 
     payload = result["payload"]
     schema = result.get("schema") or payload.get("schema_version")
+
+    # Make the browser-tab title schema-aware. The initial title was
+    # constructed with the v0 subheader as a safe default for bad-
+    # artifact paths (the early returns above keep that default). For
+    # valid artifacts the title suffix now matches the in-page
+    # subheader constant, so the tab title and the in-page H2 cannot
+    # disagree.
+    app.title = f"{BOARD_HEADER} - {_board_title_for_schema(schema)}"
 
     if schema == K6_MTF_ARTIFACT_SCHEMA_VERSION:
         app.layout = render_k6_mtf_board_layout(payload)
