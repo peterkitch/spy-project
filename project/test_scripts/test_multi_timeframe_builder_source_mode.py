@@ -1,28 +1,30 @@
-"""K=6 MTF launch-path source-mode tests for multi_timeframe_builder.
+"""Source-mode tests for multi_timeframe_builder.
 
-Pins the opt-in source-mode contract added in PR 1 of the K=6 MTF
-launch-path implementation chain. Design authority:
+Pins the source-mode contract across the K=6 MTF launch-path chain.
+Design authority:
 
   - md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md
-    "Per-Timeframe Signal Generation"
+    "Raw Price Source" and "Per-Timeframe Signal Generation"
 
-Required default behavior:
+PR 1 (#337) introduced the opt-in source-mode mechanism with an
+initial vendor-daily-resampled value for 1wk/1mo. PR 2a renamed
+that value to ``vendor_daily_resampled`` for accurate provenance
+and added the contract-compliant ``launch_path_local_pkl_resampled``
+mode (covered in a sibling local-PKL test file).
 
-  - Existing callers that do not pass source_mode observe the
-    historic Yahoo-native interval fetch for 1wk and 1mo.
+This file covers:
 
-Required launch-path behavior:
-
-  - source_mode="launch_path_daily_resampled" routes 1wk and 1mo
-    through daily-Close fetch + local resample to W-MON last
-    (1wk) or MS first (1mo). SMA crossover signals are then
-    computed on those resampled timeframe bars.
-
-Required invariants in both modes:
-
-  - 3mo continues to resample daily Close to QS first.
-  - 1y continues to resample daily Close to YE-DEC last.
-  - 1d behavior and daily-protection behavior are unchanged.
+  - Default ``legacy_native`` behavior unchanged: 1wk/1mo via the
+    Yahoo-native interval fetch.
+  - ``vendor_daily_resampled`` behavior unchanged from PR #337: 1wk
+    and 1mo via daily fetch + W-MON last / MS first local resample.
+  - 3mo continues to resample daily Close to QS first in both modes.
+  - 1y continues to resample daily Close to YE-DEC last in both
+    modes.
+  - 1d behavior unchanged in both modes; save-protection guard
+    intact regardless of source_mode.
+  - The old PR #337 value ``launch_path_daily_resampled`` is no
+    longer supported.
   - No projection of daily signals onto longer windows; the
     trafficflow_multitimeframe_bridge projection module is not
     imported by the builder.
@@ -160,31 +162,31 @@ def test_default_1mo_via_generate_signals_uses_native_interval(recorder):
 
 
 # ---------------------------------------------------------------------------
-# 3. Launch-path 1wk uses daily-resampled source
+# 3. Vendor daily-resampled mode for 1wk
 # ---------------------------------------------------------------------------
 
 
-def test_launch_path_1wk_fetches_daily_not_native(recorder):
+def test_vendor_1wk_fetches_daily_not_native(recorder):
     out = builder.fetch_interval_data(
         "TEST", "1wk",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
     assert out is not None and not out.empty
     intervals_seen = [c["interval"] for c in recorder.calls]
     assert intervals_seen == ["1d"], (
-        f"launch-path 1wk must call yfinance with interval='1d', got "
-        f"{intervals_seen!r}"
+        f"vendor_daily_resampled 1wk must call yfinance with "
+        f"interval='1d', got {intervals_seen!r}"
     )
 
 
-def test_launch_path_1wk_resamples_W_MON_last(recorder):
+def test_vendor_1wk_resamples_W_MON_last(recorder):
     daily_df = recorder._payload_by_interval["1d"]
     expected = (
         daily_df[["Close"]].resample("W-MON").last().dropna()
     )
     out = builder.fetch_interval_data(
         "TEST", "1wk",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
     # Compare on the overlapping date range (T-1 skip is bypassed in
     # the recorder fixture).
@@ -198,7 +200,7 @@ def test_launch_path_1wk_resamples_W_MON_last(recorder):
     )
 
 
-def test_launch_path_1wk_signals_computed_on_resampled_bars(recorder):
+def test_vendor_1wk_signals_computed_on_resampled_bars(recorder):
     """SMA crossover signals must be aligned to weekly bars, not
     daily bars. We assert this structurally: the returned library's
     ``dates`` axis matches the weekly-resample axis, not the daily
@@ -209,7 +211,7 @@ def test_launch_path_1wk_signals_computed_on_resampled_bars(recorder):
     )
     library = builder.generate_signals_for_interval(
         "TEST", "1wk",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
     assert library is not None
     n_dates = len(library["dates"])
@@ -224,31 +226,31 @@ def test_launch_path_1wk_signals_computed_on_resampled_bars(recorder):
 
 
 # ---------------------------------------------------------------------------
-# 4. Launch-path 1mo uses daily-resampled source
+# 4. Vendor daily-resampled mode for 1mo
 # ---------------------------------------------------------------------------
 
 
-def test_launch_path_1mo_fetches_daily_not_native(recorder):
+def test_vendor_1mo_fetches_daily_not_native(recorder):
     out = builder.fetch_interval_data(
         "TEST", "1mo",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
     assert out is not None and not out.empty
     intervals_seen = [c["interval"] for c in recorder.calls]
     assert intervals_seen == ["1d"], (
-        f"launch-path 1mo must call yfinance with interval='1d', got "
-        f"{intervals_seen!r}"
+        f"vendor_daily_resampled 1mo must call yfinance with "
+        f"interval='1d', got {intervals_seen!r}"
     )
 
 
-def test_launch_path_1mo_resamples_MS_first(recorder):
+def test_vendor_1mo_resamples_MS_first(recorder):
     daily_df = recorder._payload_by_interval["1d"]
     expected = (
         daily_df[["Close"]].resample("MS").first().dropna()
     )
     out = builder.fetch_interval_data(
         "TEST", "1mo",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
     assert "Close" in out.columns
     common_idx = out.index.intersection(expected.index)
@@ -260,14 +262,14 @@ def test_launch_path_1mo_resamples_MS_first(recorder):
     )
 
 
-def test_launch_path_1mo_signals_computed_on_resampled_bars(recorder):
+def test_vendor_1mo_signals_computed_on_resampled_bars(recorder):
     daily_df = recorder._payload_by_interval["1d"]
     monthly_expected = (
         daily_df[["Close"]].resample("MS").first().dropna()
     )
     library = builder.generate_signals_for_interval(
         "TEST", "1mo",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
     assert library is not None
     n_dates = len(library["dates"])
@@ -286,7 +288,7 @@ def test_launch_path_1mo_signals_computed_on_resampled_bars(recorder):
     "source_mode",
     [
         builder.SOURCE_MODE_LEGACY_NATIVE,
-        builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     ],
 )
 def test_3mo_uses_daily_QS_first_in_both_modes(recorder, source_mode):
@@ -314,7 +316,7 @@ def test_3mo_uses_daily_QS_first_in_both_modes(recorder, source_mode):
     "source_mode",
     [
         builder.SOURCE_MODE_LEGACY_NATIVE,
-        builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     ],
 )
 def test_1y_uses_daily_YE_DEC_last_in_both_modes(recorder, source_mode):
@@ -347,7 +349,7 @@ def test_1y_uses_daily_YE_DEC_last_in_both_modes(recorder, source_mode):
     "source_mode",
     [
         builder.SOURCE_MODE_LEGACY_NATIVE,
-        builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     ],
 )
 def test_1d_uses_yahoo_native_in_both_modes(recorder, source_mode):
@@ -379,26 +381,26 @@ def test_1d_save_protection_unchanged_in_both_modes(tmp_path):
 
 
 def test_library_key_set_matches_across_modes(recorder):
-    """Both source modes must produce a library dict with the same
-    canonical key set for a non-daily interval. The transient
-    source-close key is popped only at save time, so it is allowed
-    here in both libraries."""
+    """Legacy and vendor source modes must produce a library dict
+    with the same canonical key set for a non-daily interval. The
+    transient source-close key is popped only at save time, so it is
+    allowed here in both libraries."""
     legacy = builder.generate_signals_for_interval(
         "TEST", "1wk",
         source_mode=builder.SOURCE_MODE_LEGACY_NATIVE,
     )
-    launch = builder.generate_signals_for_interval(
+    vendor = builder.generate_signals_for_interval(
         "TEST", "1wk",
-        source_mode=builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+        source_mode=builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
     )
-    assert legacy is not None and launch is not None
-    assert set(legacy.keys()) == set(launch.keys()), (
-        f"key-set drift between modes:\n"
-        f"  legacy-only: {set(legacy) - set(launch)!r}\n"
-        f"  launch-only: {set(launch) - set(legacy)!r}"
+    assert legacy is not None and vendor is not None
+    assert set(legacy.keys()) == set(vendor.keys()), (
+        f"key-set drift between modes - "
+        f"legacy-only={set(legacy) - set(vendor)!r}, "
+        f"vendor-only={set(vendor) - set(legacy)!r}"
     )
     for k in ("dates", "signals", "close"):
-        assert len(launch[k]) == len(launch["dates"])
+        assert len(vendor[k]) == len(vendor["dates"])
         assert len(legacy[k]) == len(legacy["dates"])
 
 
@@ -447,10 +449,49 @@ def test_unsupported_source_mode_raises():
 def test_source_mode_constants_are_distinct_strings():
     assert builder.SOURCE_MODE_LEGACY_NATIVE == "legacy_native"
     assert (
-        builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED
-        == "launch_path_daily_resampled"
+        builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED
+        == "vendor_daily_resampled"
     )
     assert (
-        builder.SOURCE_MODE_LEGACY_NATIVE
-        != builder.SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED
+        builder.SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED
+        == "launch_path_local_pkl_resampled"
     )
+    constants = {
+        builder.SOURCE_MODE_LEGACY_NATIVE,
+        builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
+        builder.SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED,
+    }
+    assert len(constants) == 3, (
+        "source-mode constants must be distinct strings"
+    )
+
+
+def test_supported_source_modes_registry_holds_only_locked_values():
+    """The supported-modes registry MUST list exactly the three locked
+    values (legacy_native, vendor_daily_resampled,
+    launch_path_local_pkl_resampled) and MUST NOT silently accept the
+    pre-rename PR #337 value (``launch_path_daily_resampled``)."""
+    assert set(builder._SUPPORTED_SOURCE_MODES) == {
+        builder.SOURCE_MODE_LEGACY_NATIVE,
+        builder.SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
+        builder.SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED,
+    }
+    assert (
+        "launch_path_daily_resampled"
+        not in builder._SUPPORTED_SOURCE_MODES
+    )
+
+
+def test_old_pr337_mode_value_rejected():
+    """The pre-rename PR #337 value ``launch_path_daily_resampled``
+    must no longer be accepted by either entry point."""
+    with pytest.raises(ValueError, match="Unsupported source_mode"):
+        builder.fetch_interval_data(
+            "TEST", "1wk",
+            source_mode="launch_path_daily_resampled",
+        )
+    with pytest.raises(ValueError, match="Unsupported source_mode"):
+        builder.generate_signals_for_interval(
+            "TEST", "1wk",
+            source_mode="launch_path_daily_resampled",
+        )

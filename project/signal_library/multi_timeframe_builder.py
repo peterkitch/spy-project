@@ -65,18 +65,52 @@ EPS = 1e-12  # tie/equality tolerance for float parity
 
 # K=6 MTF launch-path source modes (see
 # md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md
-# "Per-Timeframe Signal Generation"). The default preserves the
-# historic Yahoo-native interval fetch for 1wk and 1mo. The launch-path
-# mode routes 1wk and 1mo through the same daily-resample pattern
-# already used by 3mo and 1y so SMA crossover signals are computed on
-# locally-resampled timeframe bars rather than Yahoo-native interval
-# bars. 3mo, 1y, and 1d behavior is unchanged in both modes.
+# "Raw Price Source" and "Per-Timeframe Signal Generation").
+#
+# legacy_native (default): preserves the historic Yahoo-native interval
+#   fetch for 1wk and 1mo, and the existing 3mo/1y daily-resample
+#   convention. Existing callers that pass no source_mode see this
+#   behavior. Unchanged.
+#
+# vendor_daily_resampled: routes 1wk and 1mo through a fresh vendor
+#   daily fetch and resamples to W-MON/MS locally. Behavior is the same
+#   as the mode introduced in PR #337; only the name changed in PR 2a.
+#   The renamed value makes the source provenance explicit (the daily
+#   bars come from the vendor, not from the local cache).
+#
+# launch_path_local_pkl_resampled: contract-compliant K=6 MTF launch
+#   path. Reads the member's daily Close history from the local
+#   cache/results/<TICKER>_precomputed_results.pkl under the
+#   ``preprocessed_data['Close']`` key and locally resamples to each
+#   non-daily timeframe. All five timeframes (1d, 1wk, 1mo, 3mo, 1y)
+#   derive from the same local daily series, preserving one source and
+#   one end-date for that member. No vendor fetch.
 SOURCE_MODE_LEGACY_NATIVE = "legacy_native"
-SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED = "launch_path_daily_resampled"
+SOURCE_MODE_VENDOR_DAILY_RESAMPLED = "vendor_daily_resampled"
+SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED = "launch_path_local_pkl_resampled"
 _SUPPORTED_SOURCE_MODES = (
     SOURCE_MODE_LEGACY_NATIVE,
-    SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+    SOURCE_MODE_VENDOR_DAILY_RESAMPLED,
+    SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED,
 )
+
+# Default cache-results directory for the local-PKL source mode. This
+# mirrors the spymaster/onepass convention (cache/results) without
+# importing those modules. Callers may override via cache_dir.
+DEFAULT_CACHE_RESULTS_DIR = os.environ.get(
+    'CACHE_RESULTS_DIR', 'cache/results',
+)
+
+# Local-PKL resample contract for the launch_path_local_pkl_resampled
+# mode. Mirrors the (frequency, aggregation) convention used by the
+# existing 3mo/1y branches in fetch_interval_data and by the Phase 6I-30
+# sandbox builder. 1d passes through.
+_LOCAL_PKL_INTERVAL_FREQ_MAP: dict = {
+    '1wk': ('W-MON', 'last'),
+    '1mo': ('MS', 'first'),
+    '3mo': ('QS', 'first'),
+    '1y': ('YE-DEC', 'last'),
+}
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -85,6 +119,118 @@ logger = logging.getLogger(__name__)
 # Network timeout and retry configuration
 YF_TIMEOUT = int(os.getenv('CONFLUENCE_YF_TIMEOUT', '15'))   # seconds
 YF_RETRIES = int(os.getenv('CONFLUENCE_YF_RETRIES', '2'))    # total attempts
+
+def _load_daily_close_from_local_pkl(
+    ticker: str,
+    cache_dir: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Load the member's daily Close history from the local cache PKL.
+
+    Reads ``<cache_dir>/<TICKER>_precomputed_results.pkl`` via the
+    project's central provenance loader and returns a single-column
+    ``Close`` DataFrame with a tz-naive ``DatetimeIndex``, sorted
+    ascending, with ``Close`` cast to float64.
+
+    This is the contract-compliant source for the
+    ``SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED`` mode (see
+    md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md
+    "Raw Price Source"). It mirrors the safe-read pattern used by
+    ``signal_library/multi_timeframe_sandbox_builder.load_daily_close_from_cache``
+    without importing the sandbox module, which carries sandbox-only
+    write guards. Performs no network fetch.
+
+    Raises FileNotFoundError if the PKL does not exist. Raises
+    ValueError if the PKL is unreadable, provenance verification
+    rejected the artifact, or the expected
+    ``preprocessed_data["Close"]`` shape is absent.
+    """
+    if cache_dir is None:
+        cache_dir = DEFAULT_CACHE_RESULTS_DIR
+    pkl_path = os.path.join(
+        cache_dir, f"{ticker}_precomputed_results.pkl",
+    )
+    if not os.path.exists(pkl_path):
+        raise FileNotFoundError(
+            f"local PKL missing for {ticker}: {pkl_path}"
+        )
+
+    try:
+        from provenance_manifest import load_verified_pickle_artifact
+    except ImportError as exc:
+        raise ValueError(
+            f"provenance loader unavailable for {ticker}: {exc!r}"
+        )
+
+    data, vresult = load_verified_pickle_artifact(pkl_path)
+    if data is None:
+        raise ValueError(
+            f"could not load local PKL for {ticker}: {pkl_path} "
+            f"(verification mismatches={vresult.mismatches!r})"
+        )
+    if not (vresult.ok or vresult.legacy):
+        raise ValueError(
+            f"provenance mismatch on local PKL for {ticker}: "
+            f"{pkl_path} (mismatches={vresult.mismatches!r})"
+        )
+
+    pre = data.get("preprocessed_data") if hasattr(data, "get") else None
+    if pre is None or not hasattr(pre, "columns"):
+        raise ValueError(
+            f"local PKL for {ticker} missing preprocessed_data: "
+            f"{pkl_path}"
+        )
+    if "Close" not in list(pre.columns):
+        raise ValueError(
+            f"local PKL for {ticker} preprocessed_data has no "
+            f"Close column: {pkl_path}"
+        )
+
+    out = pre[["Close"]].copy()
+    # tz-naive DatetimeIndex
+    if hasattr(out.index, "tz") and out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    else:
+        out.index = pd.to_datetime(out.index).tz_localize(None)
+    out = out.sort_index()
+    # Drop duplicate timestamps (keep last); silent if none present.
+    if out.index.has_duplicates:
+        out = out[~out.index.duplicated(keep="last")]
+    out["Close"] = out["Close"].astype(np.float64)
+    return out
+
+
+def _resample_local_daily_to_interval(
+    daily_df: pd.DataFrame, interval: str,
+) -> pd.DataFrame:
+    """
+    Resample a local daily ``Close`` DataFrame to the requested
+    interval using the launch-path convention. 1d passes through.
+
+    The (frequency, aggregation) pairs mirror the existing 3mo/1y
+    behavior in ``fetch_interval_data`` and the Phase 6I-30 sandbox
+    builder:
+
+    - 1wk: W-MON last
+    - 1mo: MS first
+    - 3mo: QS first
+    - 1y:  YE-DEC last
+    """
+    if interval == '1d':
+        return daily_df
+    if interval not in _LOCAL_PKL_INTERVAL_FREQ_MAP:
+        raise ValueError(
+            f"unsupported interval for local-PKL launch path: "
+            f"{interval!r}"
+        )
+    freq, agg = _LOCAL_PKL_INTERVAL_FREQ_MAP[interval]
+    rs = daily_df[["Close"]].resample(freq)
+    if agg == 'last':
+        out = rs.last()
+    else:
+        out = rs.first()
+    return out.dropna()
+
 
 def _yf_download_with_retry(*args, **kwargs):
     """
@@ -117,6 +263,7 @@ def fetch_interval_data(
     interval: str,
     *,
     source_mode: str = SOURCE_MODE_LEGACY_NATIVE,
+    cache_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Fetch OHLCV data for specified interval with T-1 skip applied.
@@ -124,19 +271,30 @@ def fetch_interval_data(
     Args:
         ticker: Ticker symbol (e.g., 'SPY')
         interval: '1d', '1wk', '1mo', '3mo', or '1y'
-        source_mode: Opt-in K=6 MTF launch-path source mode. When set to
-            SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED, 1wk and 1mo are
-            built from daily Close bars resampled locally (W-MON last
-            and MS first respectively) instead of the Yahoo-native
-            interval fetch. Default SOURCE_MODE_LEGACY_NATIVE preserves
-            existing behavior. 3mo, 1y, and 1d are unaffected by this
-            argument.
+        source_mode: Opt-in source mode. Default
+            SOURCE_MODE_LEGACY_NATIVE preserves the existing
+            Yahoo-native interval fetch for 1wk/1mo (3mo and 1y
+            already resample from a daily vendor fetch in this
+            branch). SOURCE_MODE_VENDOR_DAILY_RESAMPLED routes
+            1wk/1mo through a fresh vendor daily fetch and resamples
+            locally (renamed from PR #337's value; behavior unchanged).
+            SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED is the
+            contract-compliant K=6 MTF launch path: reads daily Close
+            from the local cache PKL and resamples all five timeframes
+            from that same daily series. The local-PKL mode performs
+            no vendor fetch.
+        cache_dir: Directory holding local cache PKLs. Used only by the
+            SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED mode. Defaults
+            to ``DEFAULT_CACHE_RESULTS_DIR`` (``cache/results``) when
+            ``None``. Other modes ignore this argument.
 
     Returns:
         DataFrame with 'Close' column, indexed by date, T-1 skipped for non-daily
 
     Raises:
         ValueError: If interval not supported or data validation fails
+        FileNotFoundError: If the local cache PKL is missing in
+            local-PKL mode.
 
     Note: Raw `Close` is the only allowed price basis per spec v0.5 §3.
     No Adj Close fallback.
@@ -153,13 +311,31 @@ def fetch_interval_data(
         f"(source_mode={source_mode})..."
     )
 
-    # K=6 MTF launch-path source mode: route 1wk and 1mo through the
-    # same daily-resample pattern already used by 3mo and 1y. The
-    # frequency / aggregation choices mirror Yahoo's native bar
-    # conventions (1wk: W-MON last; 1mo: MS first) so downstream
-    # alignment expectations are unchanged.
-    if (
-        source_mode == SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED
+    # Contract-compliant K=6 MTF launch path: read daily Close from the
+    # local cache PKL and resample all five timeframes from that same
+    # daily series. No vendor fetch. See
+    # md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md
+    # "Raw Price Source" and "Per-Timeframe Signal Generation".
+    if source_mode == SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED:
+        logger.info(
+            f"{vendor}: local-PKL launch path -> {interval} "
+            f"(cache_dir={cache_dir or DEFAULT_CACHE_RESULTS_DIR})"
+        )
+        daily_local = _load_daily_close_from_local_pkl(
+            ticker, cache_dir=cache_dir,
+        )
+        if daily_local is None or daily_local.empty:
+            raise ValueError(
+                f"No local daily data available for {ticker}"
+            )
+        df = _resample_local_daily_to_interval(daily_local, interval)
+
+    # vendor_daily_resampled: PR #337's mode, renamed in PR 2a for
+    # accurate provenance. Behavior unchanged: daily fetch + local
+    # resample for 1wk/1mo only. 3mo / 1y / 1d fall through to their
+    # existing branches below.
+    elif (
+        source_mode == SOURCE_MODE_VENDOR_DAILY_RESAMPLED
         and interval in ('1wk', '1mo')
     ):
         if interval == '1wk':
@@ -169,7 +345,7 @@ def fetch_interval_data(
             resample_freq = 'MS'
             agg_mode = 'first'
         logger.info(
-            f"{vendor}: launch-path resample daily -> {interval} "
+            f"{vendor}: vendor daily resample -> {interval} "
             f"({resample_freq} {agg_mode})"
         )
         df_daily = _yf_download_with_retry(
@@ -353,6 +529,7 @@ def generate_signals_for_interval(
     *,
     df: Optional[pd.DataFrame] = None,
     source_mode: str = SOURCE_MODE_LEGACY_NATIVE,
+    cache_dir: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Generate complete signal library for specified interval.
@@ -360,20 +537,28 @@ def generate_signals_for_interval(
 
     Args:
         ticker: Ticker symbol
-        interval: '1wk', '1mo', '3mo', or '1y' (NOT '1d' - protected)
+        interval: '1d', '1wk', '1mo', '3mo', or '1y'. ``1d`` is
+            normally rebuilt only by the contract-compliant local-PKL
+            launch path; the daily save-protection guard in
+            ``save_signal_library`` still requires explicit opt-in
+            (``force_overwrite=True`` or
+            ``CONFLUENCE_ALLOW_DAILY_OVERWRITE=1``) to persist the
+            resulting 1d library regardless of source_mode.
         df: Optional injected OHLCV DataFrame (Phase 6I-30 seam). When
             supplied, the function uses this DataFrame directly instead
-            of calling ``fetch_interval_data`` (which goes to yfinance).
-            The injected DataFrame must carry a single ``Close`` column
-            and a ``DatetimeIndex``. This seam exists so the sandbox
-            local-cache builder can avoid yfinance; production callers
-            still leave it as ``None`` to preserve the historic
-            yfinance-backed default.
-        source_mode: Opt-in K=6 MTF launch-path source mode. Threaded
-            through to ``fetch_interval_data`` when ``df`` is not
-            injected. Ignored when ``df`` is supplied, because the
-            caller has already chosen the bar series. Default
-            SOURCE_MODE_LEGACY_NATIVE preserves existing behavior.
+            of calling ``fetch_interval_data``. The injected DataFrame
+            must carry a single ``Close`` column and a
+            ``DatetimeIndex``. ``source_mode`` and ``cache_dir`` are
+            ignored on the injection path because the caller has
+            already chosen the bar series.
+        source_mode: Opt-in source mode. Threaded to
+            ``fetch_interval_data`` when ``df`` is not injected.
+            Default SOURCE_MODE_LEGACY_NATIVE preserves existing
+            behavior.
+        cache_dir: Directory holding local cache PKLs. Threaded to
+            ``fetch_interval_data`` when ``df`` is not injected and
+            ``source_mode`` is the local-PKL launch path. Other modes
+            ignore it.
 
     Returns:
         Library dictionary or None if generation fails
@@ -393,7 +578,9 @@ def generate_signals_for_interval(
     if df is None:
         try:
             df = fetch_interval_data(
-                ticker, interval, source_mode=source_mode,
+                ticker, interval,
+                source_mode=source_mode,
+                cache_dir=cache_dir,
             )
         except Exception as e:
             logger.error(f"Failed to fetch {ticker} {interval}: {e}")
@@ -1009,11 +1196,25 @@ def main():
         choices=list(_SUPPORTED_SOURCE_MODES),
         default=SOURCE_MODE_LEGACY_NATIVE,
         help=(
-            "Opt-in K=6 MTF launch-path source mode. Default "
-            "'legacy_native' preserves existing Yahoo-native 1wk/1mo "
-            "fetch. 'launch_path_daily_resampled' routes 1wk/1mo "
-            "through daily-resample (W-MON last / MS first). 3mo, 1y, "
-            "and 1d are unaffected by this flag."
+            "Source mode. 'legacy_native' (default) preserves the "
+            "historic Yahoo-native interval fetch for 1wk/1mo. "
+            "'vendor_daily_resampled' fetches daily from the vendor "
+            "and resamples 1wk/1mo locally (W-MON last / MS first); "
+            "renamed from the PR #337 value, behavior unchanged. "
+            "'launch_path_local_pkl_resampled' is the contract-"
+            "compliant K=6 MTF launch path: reads daily Close from "
+            "the local cache PKL and resamples all five timeframes "
+            "from that same daily series. The local-PKL mode does "
+            "not fetch from any vendor."
+        ),
+    )
+    parser.add_argument(
+        '--cache-dir',
+        default=None,
+        help=(
+            "Directory holding local cache PKLs. Used only by the "
+            "'launch_path_local_pkl_resampled' source mode. Defaults "
+            "to the CACHE_RESULTS_DIR env var or 'cache/results'."
         ),
     )
 
@@ -1033,13 +1234,16 @@ def main():
 
     logger.info(
         f"Building libraries for {ticker}: {intervals} "
-        f"(source_mode={args.source_mode})"
+        f"(source_mode={args.source_mode}, "
+        f"cache_dir={args.cache_dir or DEFAULT_CACHE_RESULTS_DIR})"
     )
 
     for interval in intervals:
         try:
             library = generate_signals_for_interval(
-                ticker, interval, source_mode=args.source_mode,
+                ticker, interval,
+                source_mode=args.source_mode,
+                cache_dir=args.cache_dir,
             )
             if library:
                 save_signal_library(library, interval, force_overwrite=args.force_overwrite)
