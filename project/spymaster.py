@@ -2121,11 +2121,28 @@ class PerformanceMetrics:
         # Show last 10 positions (including current open if applicable)
         recent_positions = positions_to_display[-10:]
         
-        # Calculate performance summary statistics
-        completed_trades = [p for p in recent_positions if p.get('exit_price') is not None]
+        # Calculate performance summary statistics.
+        #
+        # Two-step filter for the canonical predicate at
+        # canonical_scoring.py:207-209:
+        #   1. closed positions only (exit_price-set)
+        #   2. directional positions only (Buy / Short); Cash / NONE
+        #      / no-position rows are explicitly excluded so they
+        #      cannot enter wins / losses even if upstream ever emits
+        #      them with a non-null exit_price.
+        # losses = len(completed_trades) - wins via the <= 0 form so
+        # zero-pnl directional trades count as losses.
+        closed_positions = [
+            p for p in recent_positions
+            if p.get('exit_price') is not None
+        ]
+        completed_trades = [
+            p for p in closed_positions
+            if p.get('position') in ('Buy', 'Short')
+        ]
         if completed_trades:
             wins = [t for t in completed_trades if t.get('pnl', 0) > 0]
-            losses = [t for t in completed_trades if t.get('pnl', 0) < 0]
+            losses = [t for t in completed_trades if t.get('pnl', 0) <= 0]
             
             # Calculate streaks
             current_streak = 0
@@ -9788,12 +9805,26 @@ def update_dynamic_strategy_display(ticker, combined_fig, n_intervals, position_
         else:
             status_icon = "❌"  # Poor
         
-        # Fallback for wins/losses/win_ratio using position_history_data
+        # Fallback for wins/losses/win_ratio using position_history_data.
+        #
+        # Two-step filter for the canonical predicate at
+        # canonical_scoring.py:207-209:
+        #   1. closed positions only (exit_price-set)
+        #   2. directional positions only (Buy / Short); Cash / NONE
+        #      / no-position rows are explicitly excluded so they
+        #      cannot enter wins_calc / losses_calc even if upstream
+        #      ever emits them with a non-null exit_price.
+        # losses_calc = len(completed) - wins_calc so zero-pnl
+        # directional trades count as losses.
         try:
             if (wins is None or losses is None) and position_history_data:
-                completed = [p for p in position_history_data if p.get('exit_price') is not None]
+                completed = [
+                    p for p in position_history_data
+                    if p.get('exit_price') is not None
+                    and p.get('position') in ('Buy', 'Short')
+                ]
                 wins_calc = sum(1 for t in completed if (t.get('pnl') or 0) > 0)
-                losses_calc = sum(1 for t in completed if (t.get('pnl') or 0) < 0)
+                losses_calc = len(completed) - wins_calc
                 if wins is None: wins = wins_calc
                 if losses is None: losses = losses_calc
                 if (win_ratio is None or not isinstance(win_ratio, (int, float))) and (wins + losses) > 0:

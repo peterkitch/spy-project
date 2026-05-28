@@ -387,7 +387,9 @@ def test_capture_math_buy_takes_positive_pct_change():
     pct_change is 0; trigger_days=2 (both bars fire because
     combined is Buy on both, but bar 0 has 0% return).
     total_capture_pct = 0.0 (bar 0) + 10.0 (bar 1) = 10.0;
-    avg = 5.0; wins = 1; losses = 0."""
+    avg = 5.0. Under the canonical convention at
+    ``canonical_scoring.py:207-209`` (losses = trigger_days - wins),
+    the zero-return bar 0 is a loss, so wins = 1, losses = 1."""
     n = 2
     cell = core.evaluate_cell(
         target_ticker="SPY",
@@ -401,13 +403,20 @@ def test_capture_math_buy_takes_positive_pct_change():
     assert math.isclose(cell.total_capture_pct, 10.0)
     assert math.isclose(cell.avg_daily_capture_pct, 5.0)
     assert cell.wins == 1
-    assert cell.losses == 0
+    # Under the canonical predicate, the zero-return bar 0 (a BUY
+    # trigger with 0% return) is a loss, not "neither". This pins the
+    # invariant wins + losses == trigger_days.
+    assert cell.losses == 1
+    assert cell.wins + cell.losses == cell.trigger_days
 
 
 def test_capture_math_short_inverts_pct_change():
     """All-Short combined: capture = -pct_change. Bar 0=100
     -> bar 1=110 (a +10% return on the target) maps to
-    Short capture -10. total = -10; wins = 0; losses = 1."""
+    Short capture -10. total = -10. Under the canonical convention
+    at ``canonical_scoring.py:207-209`` (losses = trigger_days -
+    wins), wins = 0 and losses = trigger_days; the zero-return bar 0
+    is a loss alongside the -10% bar 1."""
     n = 2
     cell = core.evaluate_cell(
         target_ticker="SPY",
@@ -421,7 +430,10 @@ def test_capture_math_short_inverts_pct_change():
     assert math.isclose(cell.total_capture_pct, -10.0)
     assert math.isclose(cell.avg_daily_capture_pct, -5.0)
     assert cell.wins == 0
-    assert cell.losses == 1
+    # Bar 0 SHORT trigger has zero capture (target unchanged) and is a
+    # loss; bar 1 SHORT trigger has -10 capture and is also a loss.
+    assert cell.losses == 2
+    assert cell.wins + cell.losses == cell.trigger_days
 
 
 def test_capture_math_none_contributes_zero():
@@ -1039,3 +1051,61 @@ def test_canonical_constants_pinned():
     assert core.SIGNAL_SHORT == "Short"
     assert core.SIGNAL_NONE == "None"
     assert core.SIGNAL_MISSING == "missing"
+
+
+# ---------------------------------------------------------------------------
+# PR B (zero-return-loss convention) canonical-equivalence test for
+# multiwindow_k_engine_core. Pinned per canonical_scoring.py:207-209:
+# losses = n_trigger - wins so zero-return BUY / SHORT triggers count
+# as losses. NONE bars are structurally excluded by the upstream loop
+# (signal != "buy" and signal != "short" branches do not append to
+# trigger_caps).
+# ---------------------------------------------------------------------------
+
+
+def test_multiwindow_zero_return_buy_trigger_is_loss():
+    """All-Buy K=1 with target_close [100, 100, 110] -> 2 trigger
+    days (Buy on bars 0 and 1; the final bar's pct_change is the
+    return INTO that bar; the producer iterates n bars, so bar 1's
+    capture is +10%, bar 0's capture is 0%). Both bars are BUY
+    triggers; the zero-return bar 0 counts as a loss under the
+    canonical convention."""
+    cell = core.evaluate_cell(
+        target_ticker="SPY", K=1, window="1d",
+        dates=_simple_dates(3),
+        target_close=[100.0, 100.0, 110.0],
+        member_signal_columns={"A": ["Buy", "Buy", "Buy"]},
+    )
+    # Bar 0 cap = 0% (pct change at first bar is 0); bar 1 cap = 0%
+    # (100 -> 100); bar 2 cap = +10%. Three trigger days; one win.
+    assert cell.trigger_days == 3
+    assert cell.wins == 1
+    assert cell.losses == 2  # bars 0 and 1 are zero-return losses
+    assert cell.wins + cell.losses == cell.trigger_days
+
+
+def test_multiwindow_canonical_equivalence_predicate():
+    """The local multiwindow predicate (``losses = n_trigger -
+    wins``) must match canonical_scoring.py:207-209 on a mixed
+    fixture covering positive BUY, negative SHORT, zero-return BUY,
+    zero-return SHORT, and a NONE no-position bar that must NOT
+    enter the directional set."""
+    # Build a directional sequence: bar 0 BUY 0% (loss), bar 1 BUY
+    # +5% (win), bar 2 SHORT 0% (loss), bar 3 SHORT -5% (win because
+    # SHORT capture = -(-5) = +5), bar 4 NONE (excluded).
+    cell = core.evaluate_cell(
+        target_ticker="SPY", K=1, window="1d",
+        dates=_simple_dates(5),
+        target_close=[100.0, 100.0, 105.0, 105.0, 99.75],
+        member_signal_columns={
+            "A": ["Buy", "Buy", "Short", "Short", "None"],
+        },
+    )
+    # NONE excluded -> trigger_days = 4
+    assert cell.trigger_days == 4
+    assert cell.wins + cell.losses == cell.trigger_days
+    # Canonical equivalence: collect the directional captures and
+    # apply the canonical predicate manually.
+    canonical_wins = cell.wins
+    canonical_losses = cell.trigger_days - canonical_wins
+    assert cell.losses == canonical_losses

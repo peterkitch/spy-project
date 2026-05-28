@@ -497,8 +497,12 @@ def build_multitimeframe_bridge_for_artifact(
     if n_trigger > 0:
         total_capture_pct = float(trigger_caps.sum())
         avg_daily_capture_pct = float(trigger_caps.mean())
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps is filtered through
+        # is_trigger_day so NONE / no-position bars are excluded;
+        # zero-return BUY / SHORT directional bars now count as losses.
         wins = int((trigger_caps > 0).sum())
-        losses = int((trigger_caps < 0).sum())
+        losses = n_trigger - wins
     else:
         total_capture_pct = 0.0
         avg_daily_capture_pct = 0.0

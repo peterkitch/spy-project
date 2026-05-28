@@ -829,8 +829,13 @@ def build_confluence_from_mtf_trafficflow(
     if n_trigger > 0:
         total_capture_pct = sum(trigger_caps)
         avg = total_capture_pct / n_trigger
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps is filtered to
+        # is_trigger_day rows (NONE / no-position bars are excluded
+        # upstream), so zero-return BUY / SHORT directional bars now
+        # correctly count as losses.
         wins = sum(1 for v in trigger_caps if v > 0)
-        losses = sum(1 for v in trigger_caps if v < 0)
+        losses = n_trigger - wins
     else:
         total_capture_pct = 0.0
         avg = 0.0

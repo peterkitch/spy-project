@@ -937,3 +937,126 @@ def test_bridge_present_but_confluence_stale_still_blocks_leader(
         cpr.ISSUE_MISSING_MULTITIMEFRAME_TRAFFICFLOW_BRIDGE
         not in r.issue_codes
     )
+
+
+# ---------------------------------------------------------------------------
+# PR B (zero-return-loss convention) canonical-equivalence tests for
+# trafficflow_multitimeframe_bridge. Pinned per
+# canonical_scoring.py:207-209: losses = n_trigger - wins, so
+# zero-return BUY / SHORT trigger captures count as losses. NONE
+# bars are structurally excluded by ``is_trigger_day`` so they never
+# enter trigger_caps.
+# ---------------------------------------------------------------------------
+
+
+def _bridge_summary(rows: list[dict[str, Any]], tmp_path: Path) -> dict:
+    """Run the per-artifact bridge over a synthetic daily fixture
+    and return the emitted summary dict from the output artifact."""
+    daily_path = _write_daily_k_artifact(
+        tmp_path,
+        target="SPY",
+        seed_run_id="seedTC__AAA-D_BBB-D",
+        K=1,
+        daily_rows=rows,
+    )
+    art_in = ra.read_research_day_artifact(daily_path)
+    art_out = mtfb.build_multitimeframe_bridge_for_artifact(art_in)
+    return art_out.summary
+
+
+def test_bridge_zero_return_buy_trigger_is_loss(tmp_path: Path):
+    """Bridge fixture engineered with a flat-close BUY day: a zero-
+    return BUY trigger must count as a loss under
+    canonical_scoring.py:207-209. The amended predicate
+    (``losses = n_trigger - wins``) makes the invariant
+    ``wins + losses == trigger_days`` hold."""
+    import pandas as pd
+    dates = pd.bdate_range(end="2026-05-08", periods=5)
+    closes = [100.0, 110.0, 110.0, 121.0, 121.0]
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), closes[i], "Buy")
+        for i, d in enumerate(dates)
+    ]
+    summary = _bridge_summary(rows, tmp_path)
+    # 5 BUY trigger days: bar 0 has return 0 (first bar, loss);
+    # bar 1 +10% (win); bar 2 0% (loss); bar 3 +10% (win);
+    # bar 4 0% (loss). 2 wins / 3 losses.
+    assert summary["trigger_days"] == 5
+    assert summary["wins"] == 2
+    assert summary["losses"] == 3
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_bridge_zero_return_short_trigger_is_loss(tmp_path: Path):
+    """SHORT capture = -target_return_pct, so a zero-return SHORT
+    bar gives capture == 0.0 and counts as a loss."""
+    import pandas as pd
+    dates = pd.bdate_range(end="2026-05-08", periods=4)
+    closes = [100.0, 100.0, 95.0, 95.0]
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), closes[i], "Short")
+        for i, d in enumerate(dates)
+    ]
+    summary = _bridge_summary(rows, tmp_path)
+    # 4 SHORT trigger days: bar 0 return 0 (loss), bar 1 return 0
+    # (loss), bar 2 return -5% -> SHORT cap = +5% (win), bar 3
+    # return 0 (loss).
+    assert summary["trigger_days"] == 4
+    assert summary["wins"] == 1
+    assert summary["losses"] == 3
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_bridge_none_bars_excluded_from_trigger_count(tmp_path: Path):
+    """NONE bars must be excluded from is_trigger_day so they do not
+    enter the win/loss count even when their close changes."""
+    import pandas as pd
+    dates = pd.bdate_range(end="2026-05-08", periods=5)
+    closes = [100.0, 110.0, 121.0, 133.1, 146.41]
+    signals = ["Buy", "None", "None", "Buy", "None"]
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), closes[i], signals[i])
+        for i, d in enumerate(dates)
+    ]
+    summary = _bridge_summary(rows, tmp_path)
+    # 2 BUY trigger days: bar 0 +0% (loss; no prev) and bar 3 +10%
+    # (win). NONE bars are not triggers.
+    assert summary["trigger_days"] == 2
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_bridge_canonical_equivalence_invariant(tmp_path: Path):
+    """Verify the bridge's emitted summary exactly satisfies the
+    canonical_scoring.py:207-209 invariant (``losses == n_trigger -
+    wins``) on an all-BUY fixture with mixed positive / negative /
+    zero returns. All-BUY is used here so the bridge's strict-
+    unanimity combine across projected timeframes does not shift
+    bars between trigger / non-trigger; that combine is exercised
+    by the other tests in this file. NONE-exclusion is covered by
+    ``test_bridge_none_bars_excluded_from_trigger_count`` above."""
+    import pandas as pd
+    dates = pd.bdate_range(end="2026-05-08", periods=8)
+    # 8 BUY days with engineered closes: returns are
+    # bar 0: 0% (first bar) -> loss
+    # bar 1: +10% -> win
+    # bar 2: 0% -> loss
+    # bar 3: -5% -> loss
+    # bar 4: 0% -> loss
+    # bar 5: +5% -> win
+    # bar 6: 0% -> loss
+    # bar 7: +10% -> win
+    closes = [100.0, 110.0, 110.0, 104.5, 104.5, 109.725,
+              109.725, 120.6975]
+    rows = [
+        _daily_row(d.strftime("%Y-%m-%d"), closes[i], "Buy")
+        for i, d in enumerate(dates)
+    ]
+    summary = _bridge_summary(rows, tmp_path)
+    assert summary["trigger_days"] == 8
+    assert summary["wins"] == 3
+    assert summary["losses"] == 5
+    # Canonical-equivalence invariant: losses = trigger_days - wins.
+    assert summary["losses"] == summary["trigger_days"] - summary["wins"]
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]

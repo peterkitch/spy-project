@@ -273,8 +273,13 @@ def build_impactsearch_day_artifact(
     if n_trigger > 0:
         total_capture_pct = float(trigger_caps.sum())
         avg_daily_capture_pct = float(trigger_caps.mean())
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps is filtered through
+        # the is_trigger_day mask (NONE / no-position bars are
+        # excluded upstream), so zero-return BUY / SHORT directional
+        # bars now correctly count as losses.
         wins = int((trigger_caps > 0).sum())
-        losses = int((trigger_caps < 0).sum())
+        losses = n_trigger - wins
     else:
         total_capture_pct = 0.0
         avg_daily_capture_pct = 0.0
@@ -810,8 +815,13 @@ def build_stackbuilder_day_artifact(
     if n_trigger > 0:
         total_capture_pct = float(trigger_caps.sum())
         avg_daily_capture_pct = float(trigger_caps.mean())
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps is filtered through
+        # the is_trigger_day mask (NONE / no-position bars are
+        # excluded upstream), so zero-return BUY / SHORT directional
+        # bars now correctly count as losses.
         wins = int((trigger_caps > 0).sum())
-        losses = int((trigger_caps < 0).sum())
+        losses = n_trigger - wins
     else:
         total_capture_pct = 0.0
         avg_daily_capture_pct = 0.0
@@ -1617,8 +1627,13 @@ def build_confluence_day_artifact(
     if n_trigger > 0:
         total_capture_pct = float(trigger_caps.sum())
         avg_daily_capture_pct = float(trigger_caps.mean())
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps is filtered through
+        # the is_trigger_day mask (NONE / no-position bars are
+        # excluded upstream), so zero-return BUY / SHORT directional
+        # bars now correctly count as losses.
         wins = int((trigger_caps > 0).sum())
-        losses = int((trigger_caps < 0).sum())
+        losses = n_trigger - wins
     else:
         total_capture_pct = 0.0
         avg_daily_capture_pct = 0.0
@@ -2302,8 +2317,13 @@ def build_trafficflow_day_artifact(
     if n_trigger > 0:
         total_capture_pct = float(trigger_caps.sum())
         avg_daily_capture_pct = float(trigger_caps.mean())
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps is filtered through
+        # the is_trigger_day mask (NONE / no-position bars are
+        # excluded upstream), so zero-return BUY / SHORT directional
+        # bars now correctly count as losses.
         wins = int((trigger_caps > 0).sum())
-        losses = int((trigger_caps < 0).sum())
+        losses = n_trigger - wins
     else:
         total_capture_pct = 0.0
         avg_daily_capture_pct = 0.0

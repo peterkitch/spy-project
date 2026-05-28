@@ -170,6 +170,69 @@ When in doubt: spec wins, then ledger, then inventory, then
 code. If code disagrees with spec, the code is wrong unless
 an explicit ledger entry classifies the divergence.
 
+### 5a. Scoring Math Convention (project-wide)
+
+The project-wide win / loss convention is encoded at
+`canonical_scoring.py:207-209` and reflects spec v0.5 section 15
+(zero-capture trigger-day rule). The locked rules are:
+
+  - Wins are directional captures `> 0`.
+  - Losses are `trade_count - wins` (i.e., `trigger_days - wins` in
+    the canonical wording). Zero-return BUY / SHORT directional
+    trades are losses.
+  - NONE / no-position / Cash bars are excluded from the
+    directional-trade set before win / loss classification.
+  - `win_count + loss_count == trade_count` exactly. There is no
+    third zero-return bucket and no `zero_trade_count` field.
+  - `win_pct` / `win_rate` uses `trade_count` (or `trigger_days`) as
+    its denominator when `trade_count > 0`; null otherwise.
+
+This guardrail is mandatory for every PRJCT9 scoring surface, new
+or existing:
+
+  - Prefer delegating to `canonical_scoring.score_captures` when
+    the surface's input boundary permits it.
+  - When delegation is not clean (e.g., the surface must remain
+    self-contained for artifact-as-boundary reasons), implement the
+    canonical-equivalent local predicate AND include explicit tests
+    proving:
+      1. Zero-return BUY directional trades count as losses.
+      2. Zero-return SHORT directional trades count as losses.
+      3. `win_count + loss_count == trade_count` across a mixed
+         positive / negative / zero / NONE-excluded fixture.
+      4. NONE / no-position bars are excluded from the per-trade
+         metric basis.
+      5. A canonical-equivalence assertion against `wins > 0` /
+         `losses = n - wins` on a deterministic synthetic fixture.
+
+The K=6 MTF surface (PR #343) and the additional divergent surfaces
+fixed in this guardrail-introduction PR (`mvp_ranking_v1.py`,
+`multiwindow_k_engine_core.py`, `confluence_mtf_artifact_builder.py`,
+`trafficflow_multitimeframe_bridge.py`, `research_artifacts.py`,
+two `spymaster.py` completed-trade sites) all carry these tests.
+Future scoring code MUST follow the same pattern.
+
+Background: a Codex audit during PR #343 (K=6 MTF metric-basis
+correction) found several sprint-created scoring surfaces had
+locally reimplemented win / loss math using `losses = captures < 0`
+(i.e., strict less-than zero), which silently dropped zero-return
+directional captures into a third "neither" bucket. PR #343 fixed
+K=6 MTF; the follow-up guardrail-introduction PR propagated the
+predicate fix to the remaining divergent surfaces and added this
+section so the convention cannot drift again without an explicit
+contract amendment.
+
+Out-of-scope for this guardrail: the `stackbuilder.py` legacy
+`metrics_from_captures(captures)` single-arg fallback at L1007 still
+uses `captures.ne(0.0)` as a stand-in mask when callers do not
+supply an explicit `trigger_mask`. The docstring at L1012-1022
+documents this as a known deviation pending a follow-up PR to plumb
+real trigger masks through every caller. Until then, the fallback
+silently drops zero-capture trigger days. Phase 1A baseline-lock
+tests pin its existing behavior, so a fix requires an explicit
+re-baseline authorization. Treat this as a known caveat, not a
+license to copy the divergent predicate into new code.
+
 ### 6. Current Sprint State (post Phase E PR Epsilon)
 
 **Phase 6I sprint closed** (historical context). Production StackBuilder outputs for the 8 PRJCT9 secondaries (AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA) live under canonical `output/stackbuilder/` and each `selected_build.json` points to its production run directory. These are runtime artifacts, not staged in git.

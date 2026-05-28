@@ -1285,3 +1285,74 @@ def test_artifact_run_id_helper_defaults_and_overrides():
     assert cmab.artifact_run_id_for_mtf_consensus(
         seed_run_id="seed", run_id="custom",
     ) == "custom__from__seed"
+
+
+# ---------------------------------------------------------------------------
+# PR B (zero-return-loss convention) canonical-equivalence test for
+# confluence_mtf_artifact_builder. The wins/losses predicate is pinned
+# to canonical_scoring.py:207-209: losses = n_trigger - wins so
+# zero-return BUY / SHORT triggers count as losses, and
+# wins + losses == trigger_days at the summary level.
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_equivalence_wins_plus_losses_equals_trigger_days(
+    tmp_path: Path,
+):
+    """All-Buy fixture produces wins = trigger_days and losses = 0
+    (every BUY day has a strictly positive return), but the invariant
+    wins + losses == trigger_days must hold by construction under
+    the local canonical-equivalent predicate."""
+    dirs = _layout(tmp_path)
+    dates = _build_dates(10)
+    per_day = {
+        d: {tf: "Buy" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in dates
+    }
+    _write_full_mtf_pipeline(
+        dirs["artifact_root"], "SPY",
+        dates=dates, per_day_per_tf=per_day,
+    )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    assert res.built
+    art = ra.read_research_day_artifact(res.artifact_path)
+    summary = art.summary
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+    # Sanity: count BUY trigger days from the emitted daily rows and
+    # confirm the canonical equivalence at the row level.
+    trigger_caps = [
+        float(r["daily_capture_pct"]) for r in art.daily
+        if r["is_trigger_day"]
+        and r.get("cumulative_capture_pct") is not None
+    ]
+    canonical_wins = sum(1 for v in trigger_caps if v > 0)
+    canonical_losses = len(trigger_caps) - canonical_wins
+    assert summary["wins"] == canonical_wins
+    assert summary["losses"] == canonical_losses
+
+
+def test_canonical_equivalence_all_short_and_mixed(tmp_path: Path):
+    """All-Short fixture: every SHORT day produces a strictly negative
+    SHORT capture (since target_close strictly increases, raw_return
+    > 0 and SHORT capture = -raw_return < 0). All trigger days are
+    losses; wins == 0; the invariant wins + losses == trigger_days
+    holds."""
+    dirs = _layout(tmp_path)
+    dates = _build_dates(10)
+    per_day = {
+        d: {tf: "Short" for tf in cmab.DEFAULT_EXPECTED_TIMEFRAMES}
+        for d in dates
+    }
+    _write_full_mtf_pipeline(
+        dirs["artifact_root"], "SPY",
+        dates=dates, per_day_per_tf=per_day,
+    )
+    res = cmab.build_confluence_from_mtf_trafficflow(
+        "SPY", artifact_root=dirs["artifact_root"], write=True,
+    )
+    art = ra.read_research_day_artifact(res.artifact_path)
+    summary = art.summary
+    assert summary["wins"] == 0
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
