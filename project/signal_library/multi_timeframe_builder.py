@@ -63,6 +63,21 @@ MAX_SMA_DAY = 114
 SIGNAL_LIBRARY_DIR = os.environ.get('SIGNAL_LIBRARY_DIR', 'signal_library/data/stable')
 EPS = 1e-12  # tie/equality tolerance for float parity
 
+# K=6 MTF launch-path source modes (see
+# md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md
+# "Per-Timeframe Signal Generation"). The default preserves the
+# historic Yahoo-native interval fetch for 1wk and 1mo. The launch-path
+# mode routes 1wk and 1mo through the same daily-resample pattern
+# already used by 3mo and 1y so SMA crossover signals are computed on
+# locally-resampled timeframe bars rather than Yahoo-native interval
+# bars. 3mo, 1y, and 1d behavior is unchanged in both modes.
+SOURCE_MODE_LEGACY_NATIVE = "legacy_native"
+SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED = "launch_path_daily_resampled"
+_SUPPORTED_SOURCE_MODES = (
+    SOURCE_MODE_LEGACY_NATIVE,
+    SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED,
+)
+
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -97,13 +112,25 @@ def _yf_download_with_retry(*args, **kwargs):
                 raise last_exception
 
 
-def fetch_interval_data(ticker: str, interval: str) -> pd.DataFrame:
+def fetch_interval_data(
+    ticker: str,
+    interval: str,
+    *,
+    source_mode: str = SOURCE_MODE_LEGACY_NATIVE,
+) -> pd.DataFrame:
     """
     Fetch OHLCV data for specified interval with T-1 skip applied.
 
     Args:
         ticker: Ticker symbol (e.g., 'SPY')
         interval: '1d', '1wk', '1mo', '3mo', or '1y'
+        source_mode: Opt-in K=6 MTF launch-path source mode. When set to
+            SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED, 1wk and 1mo are
+            built from daily Close bars resampled locally (W-MON last
+            and MS first respectively) instead of the Yahoo-native
+            interval fetch. Default SOURCE_MODE_LEGACY_NATIVE preserves
+            existing behavior. 3mo, 1y, and 1d are unaffected by this
+            argument.
 
     Returns:
         DataFrame with 'Close' column, indexed by date, T-1 skipped for non-daily
@@ -114,11 +141,55 @@ def fetch_interval_data(ticker: str, interval: str) -> pd.DataFrame:
     Note: Raw `Close` is the only allowed price basis per spec v0.5 §3.
     No Adj Close fallback.
     """
-    vendor, _ = resolve_symbol(ticker)
-    logger.info(f"Fetching {interval} data for {vendor}...")
+    if source_mode not in _SUPPORTED_SOURCE_MODES:
+        raise ValueError(
+            f"Unsupported source_mode {source_mode!r}; "
+            f"expected one of {_SUPPORTED_SOURCE_MODES}"
+        )
 
-    # Fetch based on interval
-    if interval == '1y':
+    vendor, _ = resolve_symbol(ticker)
+    logger.info(
+        f"Fetching {interval} data for {vendor} "
+        f"(source_mode={source_mode})..."
+    )
+
+    # K=6 MTF launch-path source mode: route 1wk and 1mo through the
+    # same daily-resample pattern already used by 3mo and 1y. The
+    # frequency / aggregation choices mirror Yahoo's native bar
+    # conventions (1wk: W-MON last; 1mo: MS first) so downstream
+    # alignment expectations are unchanged.
+    if (
+        source_mode == SOURCE_MODE_LAUNCH_PATH_DAILY_RESAMPLED
+        and interval in ('1wk', '1mo')
+    ):
+        if interval == '1wk':
+            resample_freq = 'W-MON'
+            agg_mode = 'last'
+        else:
+            resample_freq = 'MS'
+            agg_mode = 'first'
+        logger.info(
+            f"{vendor}: launch-path resample daily -> {interval} "
+            f"({resample_freq} {agg_mode})"
+        )
+        df_daily = _yf_download_with_retry(
+            vendor, period='max', interval='1d', auto_adjust=False,
+        )
+
+        if df_daily is None or df_daily.empty:
+            raise ValueError(f"No daily data available for {vendor}")
+
+        # Flatten MultiIndex if present
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+
+        rs = df_daily[['Close']].resample(resample_freq)
+        if agg_mode == 'last':
+            df = rs.last()
+        else:
+            df = rs.first()
+
+    elif interval == '1y':
         # Yahoo doesn't provide 1y interval - resample from daily
         logger.info(f"{vendor}: Resampling daily -> yearly (YE-DEC: last trading day of calendar year)")
         df_daily = _yf_download_with_retry(vendor, period='max', interval='1d',
@@ -281,6 +352,7 @@ def generate_signals_for_interval(
     interval: str,
     *,
     df: Optional[pd.DataFrame] = None,
+    source_mode: str = SOURCE_MODE_LEGACY_NATIVE,
 ) -> Optional[dict]:
     """
     Generate complete signal library for specified interval.
@@ -297,16 +369,32 @@ def generate_signals_for_interval(
             local-cache builder can avoid yfinance; production callers
             still leave it as ``None`` to preserve the historic
             yfinance-backed default.
+        source_mode: Opt-in K=6 MTF launch-path source mode. Threaded
+            through to ``fetch_interval_data`` when ``df`` is not
+            injected. Ignored when ``df`` is supplied, because the
+            caller has already chosen the bar series. Default
+            SOURCE_MODE_LEGACY_NATIVE preserves existing behavior.
 
     Returns:
         Library dictionary or None if generation fails
     """
-    logger.info(f"Generating {interval} library for {ticker}...")
+    if source_mode not in _SUPPORTED_SOURCE_MODES:
+        raise ValueError(
+            f"Unsupported source_mode {source_mode!r}; "
+            f"expected one of {_SUPPORTED_SOURCE_MODES}"
+        )
+
+    logger.info(
+        f"Generating {interval} library for {ticker} "
+        f"(source_mode={source_mode})..."
+    )
 
     # Fetch data with T-1 skip
     if df is None:
         try:
-            df = fetch_interval_data(ticker, interval)
+            df = fetch_interval_data(
+                ticker, interval, source_mode=source_mode,
+            )
         except Exception as e:
             logger.error(f"Failed to fetch {ticker} {interval}: {e}")
             return None
@@ -916,6 +1004,18 @@ def main():
                        help='Allow rebuilding daily library (NOT recommended)')
     parser.add_argument('--force-overwrite', action='store_true',
                        help='Force overwrite of daily library (bypasses environment variable check)')
+    parser.add_argument(
+        '--source-mode',
+        choices=list(_SUPPORTED_SOURCE_MODES),
+        default=SOURCE_MODE_LEGACY_NATIVE,
+        help=(
+            "Opt-in K=6 MTF launch-path source mode. Default "
+            "'legacy_native' preserves existing Yahoo-native 1wk/1mo "
+            "fetch. 'launch_path_daily_resampled' routes 1wk/1mo "
+            "through daily-resample (W-MON last / MS first). 3mo, 1y, "
+            "and 1d are unaffected by this flag."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -931,11 +1031,16 @@ def main():
         logger.error("No intervals to process")
         return
 
-    logger.info(f"Building libraries for {ticker}: {intervals}")
+    logger.info(
+        f"Building libraries for {ticker}: {intervals} "
+        f"(source_mode={args.source_mode})"
+    )
 
     for interval in intervals:
         try:
-            library = generate_signals_for_interval(ticker, interval)
+            library = generate_signals_for_interval(
+                ticker, interval, source_mode=args.source_mode,
+            )
             if library:
                 save_signal_library(library, interval, force_overwrite=args.force_overwrite)
         except Exception as e:
