@@ -74,6 +74,21 @@ Each entry uses the following structure:
 - **Revisit trigger:** Revisit before exposing Concept 1 publicly or before relying on `confluence.py` as a serious operator surface. If BUG-001 is fixed, this should likely be fixed in the same PR or an adjacent PR.
 - **Status:** Open.
 
+### BUG-003: OnePass-MTF Step v1.1 derives trade direction from K=6 total capture sign
+
+- **ID:** BUG-003
+- **Discovered:** 2026-05-27
+- **Discovered during:** K=6 MTF launch-path contract scoping (PR introducing `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`). A Codex audit comparing the OnePass-MTF identity (locked in PR #335) to the OnePass-MTF ranking engine's Step v1.1 surfaced that the engine still derives direction from a stack metric.
+- **Affected scripts:** `mvp_ranking_v1.py`.
+- **Affected lines:** `mvp_ranking_v1.py:303` `_step_trade_direction(k6_total_capture_pct)` is the function. Called from `_process_secondary` inside the same module (the call site uses `k6_total = _coerce_float(k6_row.get("Total %"))` then `direction, zero_default = _step_trade_direction(k6_total)`). The engine then carries that single scalar `direction` through `_collect_matching_captures(v1_hist, direction, current_alignment)` at `mvp_ranking_v1.py:363`.
+- **Symptom:** OnePass-MTF rankings can carry a trade direction whose sign reflects the K=6 stack's historical aggregate capture rather than the secondary's current 1d signal. For secondaries whose own 1d signal and whose K=6 stack total-capture sign disagree, the OnePass-MTF Sharpe is computed against captures signed by the wrong direction. The error is silent: the engine does not record an issue when this happens because, from the engine's local perspective, Step v1.1 succeeded.
+- **Root cause:** Verified. Step v1.1's input is the K=6 row's `Total %` from `board_rows_k=6.json`, which is a stack-level historical aggregate. OnePass-MTF is supposed to analyze the secondary's own per-timeframe signals (per the Identity Correction in `md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md` L18-L40 and `md_library/shared/2026-05-26_MVP_V1_HISTORY_ARTIFACT_CONTRACT.md` L18-L36). The correct rule for OnePass-MTF direction is the secondary's own most recent 1d signal (i.e., `current_alignment_state["1d"]` from the OnePass-MTF history artifact's last bar). The current implementation conflates the stack-level metric with a per-secondary direction decision.
+- **Blast radius:** Concept 4 (the K=6 MTF launch path) is NOT affected because K=6 MTF uses per-matching-bar direction from the historical 1d slot (see "Trade Direction" in `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`); the K=6 MTF launch path explicitly does NOT reuse Step v1.1. OnePass-MTF (the currently-shipped MVP v1 surface from PR #332 / PR #333 / PR #334) IS affected. Concepts 1, 2, and 3 are not affected because they do not consume `mvp_ranking_v1.py`.
+- **Deferral rationale:** OnePass-MTF Step v1.1 is silently miscomputing direction in a subset of cases, but the misbehavior is bounded to OnePass-MTF and does not block the K=6 MTF launch path. The K=6 MTF launch path is the current sprint focus; introducing a Step v1.1 fix to OnePass-MTF in parallel risks churn on a surface that is itself being de-prioritized in favor of K=6 MTF. Scheduled for after K=6 MTF MVP ships.
+- **Revisit trigger:** Fix immediately after K=6 MTF MVP merges. The fix should also re-emit the OnePass-MTF v1 ranking artifact for any in-flight test bed (e.g., the SPY Phase 3a real-data artifact under `output/trafficflow/runs/spy_phase3a_members_refreshed_20260527T011505Z/SPY/v1_history.json` consumed by `mvp_ranking_v1.py`).
+- **Cross-reference:** `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md` Deferred Items section "OnePass-MTF Step v1.1 Trade-Direction Bug."
+- **Status:** Open.
+
 ---
 
 ## Resolved Entries
