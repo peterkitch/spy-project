@@ -1,20 +1,31 @@
-"""Phase 6I-75: StackBuilder consumer-only signal-library loader tests.
+"""Phase 6I-75: StackBuilder consumer-only signal-library loader tests
+(Slice 2b/4 amendment: strict manifest verification restored).
 
-These tests pin the consumer-loader contract introduced in Phase 6I-75:
+These tests originated around PR #290's Phase 6I-75 StackBuilder
+runtime-boundary work. The Slice 2b/4 amendment unwinds only the
+manifest-bypass portion of that contract to restore the Phase 3A
+consumer-verifies contract (PR #140 / F11-F15); every other PR #290
+goal is still pinned here.
+
+The contract this file enforces:
 
   * StackBuilder must NOT import or call ``onepass.load_signal_library``
-    or any other OnePass entry point from its signal-library load path.
-  * Library loads must go through ``load_signal_library_for_stackbuilder``
-    (and the legacy aliases ``fallback_load_signal_library`` /
-    ``load_lib_or_none``), all of which route through a direct
-    ``pickle.load`` and accept readable libraries even when manifest
-    metadata is stale or missing.
-  * Loads must be memoized per-run on both success and failure, keyed by
-    file identity (path + mtime_ns + size).
-  * Diagnostics must use the ``[STACKBUILDER:*]`` prefix family — never
-    ``[ONEPASS:*]`` and never ``Forcing rebuild``.
-  * No network call, PKL write, or manifest write is permitted from the
-    consumer load path.
+    or any other OnePass entry point from its signal-library load
+    path (PR #290 OnePass-decoupling preserved).
+  * Library loads route through ``fallback_load_signal_library`` (the
+    Phase 3A-named consumer entry point that the B12 AST guard
+    inspects), with ``load_signal_library_for_stackbuilder`` and
+    ``load_lib_or_none`` as thin forward-compatibility aliases. The
+    loader delegates pickle reading and manifest verification to
+    ``provenance_manifest.load_verified_signal_library`` (the central
+    Phase 3A loader); manifest / content_hash mismatches are
+    rejected, legacy no-manifest libraries are accepted.
+  * Loads must be memoized per-run on both success and failure, keyed
+    by file identity (path + mtime_ns + size).
+  * Diagnostics must use the ``[STACKBUILDER:*]`` prefix family,
+    never ``[ONEPASS:*]`` and never ``Forcing rebuild``.
+  * No network call, PKL write, or manifest write is permitted from
+    the consumer load path.
 """
 
 from __future__ import annotations
@@ -36,6 +47,9 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 
+import provenance_manifest as pm  # noqa: E402
+
+
 @pytest.fixture
 def sb():
     """Fresh-imported stackbuilder module with consumer-loader cache cleared."""
@@ -45,24 +59,56 @@ def sb():
     module._reset_consumer_loader_cache()
 
 
-def _write_lib(path: Path, with_manifest: bool = True) -> dict:
+def _write_lib(
+    path: Path,
+    with_manifest: bool = True,
+    mutate_after_attach: bool = False,
+) -> dict:
     """Write a minimal-but-valid signal-library PKL at ``path``.
 
     Schema mirrors the OnePass on-disk shape that StackBuilder
     consumes: ``primary_signals`` is a 1D scalar-per-day sequence
     parallel to ``dates``.
+
+    Slice 2b/4 amendment: when ``with_manifest=True`` the manifest is
+    attached via ``provenance_manifest.attach_manifest`` so the
+    ``content_hash`` reflects the real canonical payload. The Phase 3A
+    central loader recomputes and compares this hash on every load,
+    so a phony hash would (correctly) trip the manifest-rejection
+    path. ``with_manifest=False`` writes a legacy library with no
+    ``_manifest`` field; the central loader accepts these as
+    ``legacy=True``. ``mutate_after_attach=True`` mirrors the F14
+    fixture pattern (``test_provenance_manifest.py:445-447``): the
+    payload is overwritten AFTER the manifest is attached, leaving the
+    on-disk pickle with a ``_manifest.content_hash`` that no longer
+    matches the on-disk ``primary_signals``. The loader must reject
+    such tampered fixtures.
     """
     lib = {
         "primary_signals": [0, 1, -1, 0],
         "dates": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
         "tags": ["BUY[D]"],
     }
-    if with_manifest:
-        lib["_manifest"] = {
-            "content_hash": "deadbeef" * 8,
-            "schema_version": 1,
-        }
     path.parent.mkdir(parents=True, exist_ok=True)
+    if with_manifest:
+        ticker = path.stem.split("_")[0]
+        pm.attach_manifest(
+            lib,
+            path,
+            artifact_type="signal_library_daily",
+            ticker=ticker,
+            interval="1d",
+            params={
+                "engine_version": "1.0.0",
+                "MAX_SMA_DAY": 114,
+                "price_source": "Close",
+                "interval": "1d",
+            },
+            engine_version="1.0.0",
+        )
+        if mutate_after_attach:
+            # Tamper after manifest attach -> content_hash mismatch.
+            lib["primary_signals"] = [1, 1, 1, 1]
     with open(path, "wb") as fh:
         pickle.dump(lib, fh)
     return lib
@@ -297,49 +343,66 @@ def test_corrupt_pkl_returns_none_without_writes(sb, tmp_path, monkeypatch):
     assert "yfinance" not in text.lower()
 
 
-def test_readable_pkl_with_stale_manifest_is_accepted(sb, tmp_path, monkeypatch):
-    """A readable PKL whose ``_manifest`` metadata is stale or
-    mismatched still loads in consumer mode as long as the data
-    payload is valid. Provenance verification is not the gate here."""
-    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
-    lib_path = tmp_path / "STALE_stable_v1.pkl"
-    payload = {
-        "primary_signals": [0, 1, -1, 0],
-        "dates": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
-        "tags": ["BUY[D]"],
-        # Intentionally stale manifest: the content_hash here is for a
-        # different payload and the schema_version is wrong. The
-        # consumer loader must not reject on these grounds.
-        "_manifest": {
-            "content_hash": "0" * 64,
-            "schema_version": -999,
-            "engine_version": "stale.0.0",
-            "stale": True,
-        },
-    }
-    with open(lib_path, "wb") as fh:
-        pickle.dump(payload, fh)
+def test_readable_pkl_with_mismatched_manifest_is_rejected(sb, tmp_path, monkeypatch):
+    """A readable PKL whose payload was tampered with after the
+    manifest was attached must be rejected by the StackBuilder
+    consumer loader.
 
-    loaded = sb.load_signal_library_for_stackbuilder("STALE")
-    assert loaded is not None
-    assert loaded["primary_signals"] == [0, 1, -1, 0]
+    Slice 2b/4 amendment: inverts the prior Phase 6I-75 acceptance
+    pin. The restored Phase 3A consumer-verifies contract (PR #140 /
+    F11-F15) requires that every signal-library consumer detect a
+    ``content_hash`` mismatch and refuse to return the corrupted
+    library. ``stackbuilder.fallback_load_signal_library`` now joins
+    onepass / impactsearch / impact_fastpath / confluence in
+    enforcing that contract via
+    ``provenance_manifest.load_verified_signal_library``."""
+    monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
+    lib_path = tmp_path / "MISMATCH_stable_v1.pkl"
+    _write_lib(lib_path, mutate_after_attach=True)
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        loaded = sb.load_signal_library_for_stackbuilder("MISMATCH")
+
+    assert loaded is None
+    assert "[STACKBUILDER:library_manifest_failed]" in out.getvalue()
 
 
 def test_memoization_key_includes_mtime_and_size(sb, tmp_path, monkeypatch):
     """Modifying the underlying PKL forces a re-read because mtime_ns
-    and/or size change."""
+    and/or size change.
+
+    Slice 2b/4 amendment: the second write attaches a fresh manifest
+    (which also overwrites the sidecar JSON) so the central loader's
+    Phase 3A verification accepts the new payload. The cache-
+    invalidation invariant being tested is unchanged.
+    """
     monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
     lib_path = tmp_path / "MOD_stable_v1.pkl"
     _write_lib(lib_path)
     first = sb.load_signal_library_for_stackbuilder("MOD")
     assert first is not None
 
-    # Rewrite with a different payload + bump mtime.
+    # Rewrite with a different payload + fresh manifest + bump mtime.
     lib_v2 = {
         "primary_signals": [1, 0, 0, 0],
         "dates": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
         "tags": ["SHORT[D]"],
     }
+    pm.attach_manifest(
+        lib_v2,
+        lib_path,
+        artifact_type="signal_library_daily",
+        ticker="MOD",
+        interval="1d",
+        params={
+            "engine_version": "1.0.0",
+            "MAX_SMA_DAY": 114,
+            "price_source": "Close",
+            "interval": "1d",
+        },
+        engine_version="1.0.0",
+    )
     with open(lib_path, "wb") as fh:
         pickle.dump(lib_v2, fh)
     # Advance mtime by 2 seconds so the cache key (mtime_ns) changes.
@@ -429,16 +492,31 @@ def test_load_lib_or_none_routes_through_consumer_loader(sb, tmp_path, monkeypat
     assert consumer_calls["n"] == 1
 
 
-def test_fallback_load_signal_library_is_alias(sb, tmp_path, monkeypatch):
-    """``fallback_load_signal_library`` aliases the consumer loader and
-    no longer routes through provenance manifest verification."""
+def test_fallback_load_signal_library_is_phase3a_consumer_entry_point(sb, tmp_path, monkeypatch):
+    """``fallback_load_signal_library`` is the Phase 3A-named consumer
+    entry point that the B12 AST guard inspects, and it routes through
+    ``provenance_manifest.load_verified_signal_library`` per the
+    restored Phase 3A consumer-verifies contract.
+
+    Slice 2b/4 amendment: PR #290 had made this name a thin alias for
+    ``load_signal_library_for_stackbuilder`` that bypassed manifest
+    verification. The amendment reverses the alias direction so the
+    B12-named function carries the verification call statically, and
+    confirms that both names continue to return the same library
+    object for a valid input (so callers pinned on either name keep
+    working).
+    """
     monkeypatch.setattr(sb, "SIGNAL_LIB_DIR_RUNTIME", str(tmp_path))
     lib_path = tmp_path / "ALIAS_stable_v1.pkl"
     _write_lib(lib_path)
 
-    loaded = sb.fallback_load_signal_library("ALIAS")
-    assert loaded is not None
-    assert loaded["primary_signals"] == [0, 1, -1, 0]
+    via_fallback = sb.fallback_load_signal_library("ALIAS")
+    via_forward = sb.load_signal_library_for_stackbuilder("ALIAS")
+    assert via_fallback is not None
+    assert via_forward is not None
+    assert via_fallback["primary_signals"] == [0, 1, -1, 0]
+    assert via_forward["primary_signals"] == [0, 1, -1, 0]
+    assert via_fallback is via_forward
 
 
 # ---------------------------------------------------------------------------

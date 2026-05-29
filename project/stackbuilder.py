@@ -30,7 +30,7 @@ from canonical_scoring import (
     metrics_to_legacy_dict as _canonical_metrics_to_legacy_dict,
 )
 from provenance_manifest import (
-    verify_manifest as _verify_manifest,
+    load_verified_signal_library as _load_verified_signal_library,
     build_output_manifest as _build_output_manifest,
     file_sha256 as _file_sha256,
     load_verified_xlsx_artifact as _load_verified_xlsx_artifact,
@@ -787,62 +787,119 @@ def _consumer_validate_lib_payload(lib: Any) -> bool:
     return True
 
 
-def _consumer_load_pkl(path: str) -> Tuple[Optional[dict], Optional[str]]:
-    """Direct ``pickle.load`` of a signal-library PKL. Returns
-    ``(lib_or_None, reason_or_None)``. ``reason`` is the short
-    diagnostic tag used by the warn-once channel.
+def _interpret_verified_result(
+    lib: Optional[dict], result: Any,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Map the central loader's ``(lib, VerificationResult)`` tuple to
+    the legacy ``(lib_or_None, reason_or_None)`` tuple consumed by the
+    StackBuilder candidate loop.
 
-    Catches a broad ``Exception`` band because malformed pickle streams
-    can raise practically anything from ``pickle.UnpicklingError`` to
-    ``MemoryError`` / ``IndexError`` / ``OverflowError`` depending on
-    how the stream is broken. A consumer loader must never re-raise
-    on a single corrupt PKL; the safe contract is "return ``None`` and
-    let the run continue without this primary".
+    Outcome map:
+
+      * ``lib is None`` with ``load_error`` of ``FileNotFoundError`` ->
+        ``(None, "missing")``.
+      * ``lib is None`` with any other ``load_error`` ->
+        ``(None, "unreadable:<Type>")``.
+      * ``lib is None`` with ``type_error`` -> ``(None, "invalid_payload")``.
+      * ``result.ok == False`` (content_hash mismatch or strict-mode
+        manifest rejection) -> ``(None, "manifest_failed")``.
+      * Shape-invalid payload (missing / length-mismatched
+        ``primary_signals``/``dates``) -> ``(None, "invalid_payload")``.
+      * Valid manifest or legacy no-manifest library with a valid
+        StackBuilder-required shape -> ``(lib, None)``.
     """
-    try:
-        with open(path, 'rb') as fh:
-            lib = pickle.load(fh)
-    except FileNotFoundError:
-        return None, "missing"
-    except Exception as exc:
-        return None, f"unreadable:{type(exc).__name__}"
+    if lib is None:
+        for mismatch in (result.mismatches if result is not None else ()):
+            if mismatch and mismatch[0] == "load_error":
+                if mismatch[1] == "FileNotFoundError":
+                    return None, "missing"
+                return None, f"unreadable:{mismatch[1]}"
+            if mismatch and mismatch[0] == "type_error":
+                return None, "invalid_payload"
+        return None, "unreadable:VerificationFailed"
+    if not result.ok:
+        return None, "manifest_failed"
     if not _consumer_validate_lib_payload(lib):
         return None, "invalid_payload"
     return lib, None
 
 
-def load_signal_library_for_stackbuilder(
-    ticker: str,
-) -> Optional[dict]:
-    """Phase 6I-75 consumer-only signal-library loader.
+def _consumer_load_pkl(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Load a signal-library PKL via the central provenance loader.
 
-    Glob-finds stable signal-library PKL candidates for ``ticker`` under
-    the runtime-configured stable directory, opens the first usable
-    one read-only via ``pickle.load``, validates the minimal payload
-    StackBuilder needs (signals + dates of matching length), and
-    returns the dict. Returns ``None`` on missing / unreadable /
-    invalid PKLs.
+    Delegates pickle reading and manifest verification to
+    ``provenance_manifest.load_verified_signal_library`` per the
+    Phase 3A consumer-verifies contract (PR #140). The central loader
+    bundles open + ``pickle_load_compat`` + type-check +
+    ``verify_manifest`` and returns ``(library_dict, VerificationResult)``;
+    this helper maps the outcome to the existing
+    ``(lib_or_None, reason_or_None)`` tuple consumed by
+    ``fallback_load_signal_library``.
+
+    Outcome map (see ``_interpret_verified_result`` for the full
+    table): missing file -> ``"missing"``; unreadable pickle ->
+    ``"unreadable:<Type>"``; type-error or shape-invalid payload ->
+    ``"invalid_payload"``; content_hash mismatch or strict-mode
+    rejection -> ``"manifest_failed"``; valid manifest or legacy
+    no-manifest library with shape-valid payload -> ``(lib, None)``.
+
+    A consumer loader must never re-raise on a single corrupt PKL.
+    The broad ``Exception`` catch around the central loader call
+    preserves the Phase 6I-75 fail-safe contract.
+
+    OnePass decoupling from PR #290 is preserved: this helper has no
+    ``onepass`` import / call and no rebuild / write side effect.
+    """
+    try:
+        lib, result = _load_verified_signal_library(path, expected_type=dict)
+    except Exception as exc:
+        return None, f"unreadable:{type(exc).__name__}"
+    return _interpret_verified_result(lib, result)
+
+
+def fallback_load_signal_library(ticker: str) -> Optional[dict]:
+    """Phase 6I-75 consumer-only signal-library loader (Slice 2b/4
+    amendment: strict manifest verification restored).
+
+    This is the Phase 3A-named consumer entry point that the B12
+    static guard inspects (``test_b12_signal_library_consumers_use_
+    verify_manifest`` at ``test_static_regression_guards.py:615``).
+    The candidate loop directly invokes the central provenance loader
+    ``_load_verified_signal_library`` so the manifest-verification
+    call is statically visible to the guard. The Phase 6I-75 name
+    ``load_signal_library_for_stackbuilder`` is preserved below as a
+    thin alias for any caller pinned on it.
+
+    Glob-finds stable signal-library PKL candidates for ``ticker``
+    under the runtime-configured stable directory and delegates
+    pickle reading + manifest verification to
+    ``provenance_manifest.load_verified_signal_library`` (the central
+    Phase 3A loader). Returns the first candidate that the central
+    loader accepts as either a strictly-verified manifest or a
+    legacy no-manifest library; otherwise returns ``None``.
 
     **Memoization.** Both success and failure are memoized in
     ``_CONSUMER_LOADER_CACHE`` keyed by ``(ticker, candidate_path,
     mtime_ns, size)``. Repeated calls for the same ticker do not
-    re-read the PKL or re-run validation.
+    re-read the PKL or re-run verification.
 
     **Loud-fail discipline.** StackBuilder is a consumer. This loader:
 
       * never calls ``onepass.load_signal_library`` or any other
-        OnePass function;
+        OnePass function (PR #290 OnePass-decoupling preserved);
       * never writes to ``signal_library/`` or any subdirectory;
       * never fetches from yfinance or any network;
       * never rewrites the library manifest;
       * never asks any other engine to rebuild anything;
-      * accepts readable libraries even when the only problem is
-        metadata-level manifest mismatch (the payload is what matters
-        for consumer mode).
+      * accepts legacy no-manifest libraries (Phase 3A
+        ``VerificationResult.legacy == True`` path);
+      * rejects content_hash mismatch and other manifest verification
+        failures (Phase 3A consumer-verifies contract, matching every
+        other named signal-library consumer).
 
-    **Diagnostics.** A library that's missing / unreadable / invalid
-    emits at most one ``[STACKBUILDER:library_*]`` diagnostic per
-    (ticker, reason) pair via the warn-once channel.
+    **Diagnostics.** A library that is missing / unreadable / invalid
+    / manifest-rejected emits at most one ``[STACKBUILDER:library_*]``
+    diagnostic per (ticker, reason) pair via the warn-once channel.
     """
     # Phase 6I-75 amendment: cache the no-candidates outcome BEFORE
     # touching the filesystem. Repeated missing-library calls for the
@@ -876,7 +933,24 @@ def load_signal_library_for_stackbuilder(
                     return lib
                 last_reason = cached_reason
                 continue
-        lib, reason = _consumer_load_pkl(path)
+        # Direct call to the central provenance loader so the manifest-
+        # verification site is visible to the Phase 3A B12 AST guard at
+        # ``test_static_regression_guards.py:601`` (the guard inspects
+        # ``fallback_load_signal_library``'s function body directly and
+        # does not recurse through helper calls). ``_consumer_load_pkl``
+        # is kept as a thin wrapper that routes through the same call so
+        # other call sites continue to work; both routes share
+        # ``_interpret_verified_result``.
+        try:
+            verified_lib, verified_result = _load_verified_signal_library(
+                path, expected_type=dict,
+            )
+        except Exception as exc:
+            lib, reason = (None, f"unreadable:{type(exc).__name__}")
+        else:
+            lib, reason = _interpret_verified_result(
+                verified_lib, verified_result,
+            )
         with _CONSUMER_LOADER_LOCK:
             _CONSUMER_LOADER_CACHE[cache_key] = (lib, reason)
         if lib is not None:
@@ -896,6 +970,14 @@ def load_signal_library_for_stackbuilder(
                 f"[STACKBUILDER:library_invalid] {ticker} at {path}: "
                 f"signals/dates missing or length-mismatched",
             )
+        elif reason == "manifest_failed":
+            _consumer_warn_once(
+                warn_key,
+                f"[STACKBUILDER:library_manifest_failed] {ticker} at {path}: "
+                f"manifest verification failed (content_hash mismatch or "
+                f"strict-mode rejection); rejected per Phase 3A consumer-"
+                f"verifies contract",
+            )
     # All candidates exhausted without success.
     if last_reason == "missing" or last_reason is None:
         warn_key = f"missing-all:{ticker}"
@@ -907,15 +989,17 @@ def load_signal_library_for_stackbuilder(
     return None
 
 
-def fallback_load_signal_library(ticker: str) -> Optional[dict]:
-    """Phase 6I-75: thin alias preserved for backward compatibility.
+def load_signal_library_for_stackbuilder(ticker: str) -> Optional[dict]:
+    """Phase 6I-75: thin alias preserved for forward compatibility.
 
-    Old call sites that referenced ``fallback_load_signal_library``
-    explicitly continue to work; new code should call
-    ``load_signal_library_for_stackbuilder`` directly. Both paths route
-    through the same consumer-only loader.
+    Phase 6I-75 (PR #290) introduced this name as the new consumer
+    entry point. After the Slice 2b/4 amendment restores the Phase 3A
+    consumer-verifies contract, the implementation lives in
+    ``fallback_load_signal_library`` (the historically Phase-3A-named
+    function the B12 AST guard inspects); this name remains as a thin
+    alias so existing call sites continue to work.
     """
-    return load_signal_library_for_stackbuilder(ticker)
+    return fallback_load_signal_library(ticker)
 
 
 def load_lib_or_none(t: str) -> Optional[dict]:
