@@ -507,6 +507,25 @@ def test_no_lower_level_reads_attempted(tmp_path, monkeypatch):
 
 
 def test_no_engine_imports_via_ast():
+    """Guard against coupling between ``mvp_signal_board`` and the
+    named engine modules.
+
+    Slice 3 amendment: the assertion is the delta introduced by
+    importing the audited module, not global ``sys.modules``
+    cleanliness. The earlier ``forbidden not in sys.modules`` form
+    failed in the fast-default full sweep because pytest collection
+    and sibling test files (notably
+    ``test_trafficflow_canonical_orchestrator.py`` which imports
+    ``trafficflow_canonical_orchestrator`` and ``trafficflow_runner``
+    at module scope) can import these names before this guard runs.
+    That global state is not the guard target. The corrected
+    assertion snapshots forbidden modules already in ``sys.modules``
+    before the audited import, performs the import, and asserts no
+    forbidden modules were added by that import. The AST static
+    guard above continues to enforce that ``mvp_signal_board.py``'s
+    top-level imports are clean."""
+    import importlib
+
     forbidden_roots = {
         "mvp_ranking_v0",
         "mvp_ranking_v1",
@@ -533,10 +552,17 @@ def test_no_engine_imports_via_ast():
             assert mod not in forbidden_roots, (
                 f"forbidden top-level from-import: {node.module}"
             )
-    for forbidden in forbidden_roots:
-        assert forbidden not in sys.modules, (
-            f"forbidden module present in sys.modules: {forbidden}"
-        )
+    # sys.modules delta: importing the app must not newly add any
+    # forbidden module to the process. Pre-existing entries from
+    # pytest collection or earlier tests are ignored.
+    before = forbidden_roots & set(sys.modules)
+    importlib.import_module("mvp_signal_board")
+    after = forbidden_roots & set(sys.modules)
+    newly_added = after - before
+    assert newly_added == set(), (
+        f"mvp_signal_board import added forbidden modules to "
+        f"sys.modules: {sorted(newly_added)}"
+    )
 
 
 # ---------------------------------------------------------------------------

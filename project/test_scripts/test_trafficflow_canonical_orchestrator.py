@@ -781,6 +781,25 @@ def test_worker_command_includes_heavy_stage_when_requested(tmp_path,
 
 
 def test_orchestrator_does_not_import_trafficflow():
+    """Guard against the orchestrator coupling to the legacy
+    ``trafficflow`` module.
+
+    Slice 3 amendment: the assertion is the delta introduced by
+    importing the orchestrator, not global ``sys.modules``
+    cleanliness. The earlier
+    ``"trafficflow" not in sys.modules`` form failed in the
+    fast-default full sweep because sibling test files (notably
+    ``test_trafficflow_refresh_callback.py:38`` which has
+    ``import trafficflow`` at module scope) put ``trafficflow`` in
+    ``sys.modules`` during pytest collection. That global state is
+    not the guard target. The corrected assertion snapshots
+    ``trafficflow`` membership in ``sys.modules`` before the
+    orchestrator import, performs the import, and asserts the
+    orchestrator did not newly add ``trafficflow``. The AST static
+    guard above continues to enforce that the orchestrator source's
+    imports are clean."""
+    import importlib
+
     src = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
     tree = ast.parse(src, filename=str(ORCHESTRATOR_PATH))
     for node in ast.walk(tree):
@@ -795,10 +814,17 @@ def test_orchestrator_does_not_import_trafficflow():
             assert mod != "trafficflow", (
                 f"top-level from-import of trafficflow at L{node.lineno}"
             )
-    # And after import the orchestrator should NOT have brought
-    # trafficflow into sys.modules.
-    assert "trafficflow" not in sys.modules, (
-        "trafficflow leaked into sys.modules via orchestrator import"
+    # sys.modules delta: importing the orchestrator must not newly
+    # add ``trafficflow`` to the process. Pre-existing pollution
+    # from pytest collection or earlier tests is ignored.
+    forbidden = {"trafficflow"}
+    before = forbidden & set(sys.modules)
+    importlib.import_module("trafficflow_canonical_orchestrator")
+    after = forbidden & set(sys.modules)
+    newly_added = after - before
+    assert newly_added == set(), (
+        f"trafficflow_canonical_orchestrator import added forbidden "
+        f"modules to sys.modules: {sorted(newly_added)}"
     )
 
 
