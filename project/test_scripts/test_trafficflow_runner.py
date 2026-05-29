@@ -14,6 +14,7 @@ import pickle
 import re
 import sys
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,34 @@ import trafficflow_runner as runner  # noqa: E402
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+# Dynamic fixture-date helpers. trafficflow_runner.PRICE_CACHE_STALE_DAYS
+# is 7 and classify_price_cache uses a strict greater-than comparison
+# against datetime.now(timezone.utc). A hardcoded YYYY-MM-DD literal in
+# a tail_date= argument decays past the threshold N days after the test
+# was written; the helpers below derive tail dates from the test-run
+# "today" so the freshness semantics survive wall-clock drift. The fresh
+# helper sits well inside the 7-day window; the stale helper sits well
+# past it. The 12-day skew between the two matches the original
+# hardcoded "2026-05-22" minus "2026-05-10" skew, so STALE-vs-fresh
+# tests retain their intended relationship.
+_FRESH_TAIL_DAYS_OLD = 2
+_STALE_TAIL_DAYS_OLD = 14
+
+
+def _today_utc_date():
+    return datetime.now(timezone.utc).date()
+
+
+def _fresh_tail_date():
+    return (_today_utc_date()
+            - timedelta(days=_FRESH_TAIL_DAYS_OLD)).isoformat()
+
+
+def _stale_tail_date():
+    return (_today_utc_date()
+            - timedelta(days=_STALE_TAIL_DAYS_OLD)).isoformat()
 
 
 def _no_conflict(write_requested=False):
@@ -107,8 +136,15 @@ def _make_fake_leaderboard(run_dir, *, k_to_members):
     return run_dir / "combo_leaderboard.csv"
 
 
-def _write_price_cache(price_cache_dir, secondary, *, tail_date="2026-05-22"):
-    """Write a minimal CSV price cache."""
+def _write_price_cache(price_cache_dir, secondary, *, tail_date=None):
+    """Write a minimal CSV price cache.
+
+    ``tail_date`` defaults to a freshness-helper value so the cache is
+    classified OK by trafficflow_runner.classify_price_cache regardless
+    of wall-clock drift.
+    """
+    if tail_date is None:
+        tail_date = _fresh_tail_date()
     d = Path(price_cache_dir)
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{secondary}.csv").write_text(
@@ -891,9 +927,9 @@ def test_stale_pkl_gates_cell(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl_with_tail(tmp_path / "cache" / "results", "STALEM",
-                         tail_date="2026-05-10")
+                         tail_date=_stale_tail_date())
     argv = ["--secondaries", "SPY",
             "--stackbuilder-root", str(sb_root),
             "--k", "1"]
@@ -913,9 +949,9 @@ def test_refresh_missing_pkls_includes_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl_with_tail(tmp_path / "cache" / "results", "STALEM",
-                         tail_date="2026-05-10")
+                         tail_date=_stale_tail_date())
     argv = ["--secondaries", "SPY",
             "--stackbuilder-root", str(sb_root),
             "--k", "1",
@@ -1063,7 +1099,7 @@ def _eligible_fixture(tmp_path, monkeypatch, *, secondary="SPY",
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", secondary,
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", member,
                declared_max_sma_day=114, has_sma_114=True)
     out_dir = tmp_path / "smoke_out"
@@ -1134,7 +1170,7 @@ def test_phase_c_isolated_write_skips_ineligible_cell(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", "AAA",
                declared_max_sma_day=114, has_sma_114=True)
     # BBB intentionally NOT written -> K=2 cell is PKL-GATED.
@@ -1208,7 +1244,7 @@ def test_phase_c_refresh_flags_remain_report_only_with_write(tmp_path, monkeypat
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     # MISSINGM's PKL intentionally not written.
     invoked = {"count": 0}
     def _no_subproc(*a, **kw):
@@ -1256,7 +1292,7 @@ def test_phase_c_compute_exception_handled_gracefully(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", "AAA",
                declared_max_sma_day=114, has_sma_114=True)
     _write_pkl(tmp_path / "cache" / "results", "BBB",
@@ -1385,7 +1421,7 @@ def test_phase_c_no_writes_when_all_cells_ineligible(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     # No PKL for GONE -> K=1 cell is PKL-GATED.
     out_dir = tmp_path / "smoke_out"
 
@@ -1564,7 +1600,7 @@ def test_phase_c_on_disk_artifact_lists_are_complete(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", "AAA",
                declared_max_sma_day=114, has_sma_114=True)
     out_dir = PROJECT_ROOT / f"logs/_pytest_phase_c_artifact_list_{os.getpid()}"
@@ -1674,7 +1710,7 @@ def test_phase_c_manifest_uses_actual_selected_build_path_not_default_root(
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", "AAA",
                declared_max_sma_day=114, has_sma_114=True)
 
@@ -2338,7 +2374,7 @@ def _canonical_eligible_fixture(tmp_path, monkeypatch, *,
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", secondary,
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     seen = set()
     for ks_members in members_by_k.values():
         for tm in ks_members:
@@ -2905,7 +2941,7 @@ def test_phase_e_beta_amendment_empty_k_eligibility_quarantines(
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", "AAA",
                declared_max_sma_day=114, has_sma_114=True)
     canonical_root = Path("output") / "trafficflow" / "runs" / "RUN_EMPTY_K"
@@ -2959,7 +2995,7 @@ def test_phase_e_beta_amendment_requested_k_not_eligible_quarantines(
     monkeypatch.setattr(runner, "DEFAULT_CACHE_RESULTS_DIR",
                         str(tmp_path / "cache" / "results"))
     _write_price_cache(tmp_path / "price_cache" / "daily", "SPY",
-                       tail_date="2026-05-22")
+                       tail_date=_fresh_tail_date())
     _write_pkl(tmp_path / "cache" / "results", "AAA",
                declared_max_sma_day=114, has_sma_114=True)
     # MISS has no PKL written.
