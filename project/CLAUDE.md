@@ -5,10 +5,10 @@
 ## PRJCT9 SPRINT OPERATIONAL CONTEXT
 
 This section captures the durable operational shape of the
-PRJCT9 sprint on this repo (currently post-Phase 5D-1
-onboarding; Phase 5C validation is closed and Phase 5D
-controlled compute is in progress). Read this before doing any
-work in `project/`.
+PRJCT9 sprint on this repo. For live sprint state see section 6
+"Current Sprint State" below and the carryforward ledger at
+`md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md`
+named in section 8. Read this before doing any work in `project/`.
 
 ### 1. Pinned Python interpreter (CRITICAL)
 
@@ -368,6 +368,8 @@ Stay aligned with the existing script family — **OnePass** / **ImpactSearch** 
 #### Recent merged phase trail (post Phase 6I-79)
 
 For the recent phase trail, run `git log --oneline main --grep="Phase 6I"`. Phase 6I-77 through Phase 6I-79 are described in the current-sprint-state block above; earlier Phase 6I phases are preserved in the historical sub-sections (sub-section 6.0, sub-section 6.1, and the 2026-05-10 / 2026-05-08 blocks) further down.
+
+After Phase 6I-79, the post-PR-#345 fast-default cleanup chain (PRs #345 through #350, with the closeout recorded in PR #351) took the default `pytest test_scripts/` sweep from 34 residual failures to 0 without touching scoring math, ranking engines, contracts, or generated artifacts. See carryforward-ledger item #5 ("Post-PR-#345 fast-default cleanup chain") at `md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md` for the per-PR cluster breakdown, terminal verification, and operational caveats; this file intentionally does not duplicate that record.
 
 ---
 
