@@ -647,6 +647,21 @@ def test_b3_impactsearch_fastpath_metrics_parity(monkeypatch, tmp_path):
     This pins the assertion that the fast-path's signal extraction
     + the metrics wrapper produce a result the canonical scoring
     module would also produce on the same inputs.
+
+    Slice 5 amendment: ``signal_library.impact_fastpath``'s
+    ``_load_signal_library_quick`` is wrapped with
+    ``functools.lru_cache`` keyed by ticker only
+    (``impact_fastpath.py:332-334``). ``_lib_path_for(ticker)`` resolves
+    ``SIGNAL_LIBRARY_DIR`` at call time, so the first call for a given
+    ticker fixes the cached library; subsequent calls return that
+    cached library even when ``SIGNAL_LIBRARY_DIR`` has been
+    monkeypatched. If any earlier test in the full sweep called the
+    fastpath against an ``"AAA"`` library with a shorter calendar (for
+    example the 10-bday fixture in ``_build_returns_with_zero_trigger``
+    at L78-89), the cached entry would survive into this test and the
+    fastpath would report ``incomplete_calendar``. Clearing the cache
+    at the top of this test isolates it from sibling-test pollution
+    without changing the cache semantics in production.
     """
     fp = importlib.import_module("signal_library.impact_fastpath")
     isr = _get_module("impactsearch")
@@ -654,6 +669,7 @@ def test_b3_impactsearch_fastpath_metrics_parity(monkeypatch, tmp_path):
 
     pre_dir = fp.SIGNAL_LIBRARY_DIR
     pre_trust = fp.IMPACT_TRUST_LIBRARY
+    fp._load_signal_library_quick.cache_clear()
 
     try:
         # Build a primary library that the fast-path will accept:
@@ -720,6 +736,10 @@ def test_b3_impactsearch_fastpath_metrics_parity(monkeypatch, tmp_path):
     finally:
         fp.SIGNAL_LIBRARY_DIR = pre_dir
         fp.IMPACT_TRUST_LIBRARY = pre_trust
+        # Slice 5 amendment: also clear the lru_cache on exit so this
+        # test does not leak its tmp_path-backed library to later
+        # tests that may run against a different SIGNAL_LIBRARY_DIR.
+        fp._load_signal_library_quick.cache_clear()
 
 
 # ===========================================================================
