@@ -106,6 +106,47 @@ Open questions:
 - Does the cadence interact with the eventual public Wikipedia-of-pattern-finding site, where build refresh frequency may be visible to users?
 - How is an off-cadence rebuild triggered when needed?
 
+### 5. Post-PR-#345 fast-default cleanup chain
+
+Status: RESOLVED 2026-05-29. PRs #345 through #350 (squash-merged to main).
+
+Description: PR #345 ("restore fast default test suite with slow and production-smoke discipline") introduced a `pytest.ini` at project root with `slow` and `production_smoke` markers and `addopts = -m "not slow and not production_smoke"`. The first fast-default invocation against the existing test surface revealed 34 residual failures - tests that had drifted out of contract or pinned now-stale behavior while the suite was effectively un-runnable in its prior monolithic form. The cleanup chain remediated each cluster in scope-tight, single-purpose PRs.
+
+Why it qualifies as a carry-forward record: this was not a pre-identified Phase 6I carry-forward item; it emerged as soon as the fast-default sweep ran cleanly. Per CLAUDE.md section 8 the durable record belongs in this doc. Recording the chain here gives future sessions a single citation point linking the residual-fixture / contract-drift / pollution / production-state-dependent buckets to their resolutions.
+
+Per-PR breakdown:
+
+| PR | Squash SHA | Title | Cluster resolved | Delta |
+|---|---|---|---|---|
+| #345 | 8b45ac8 | restore fast default test suite with slow and production-smoke discipline | infrastructure (markers + addopts); gated 4 hazard tests; new CLAUDE.md section 5b "Test Suite Discipline" | exposed 34 |
+| #346 | bd27ea3 | prevent TrafficFlow fixture date decay | hardcoded `tail_date="2026-05-22"` in `_eligible_fixture` / `_canonical_eligible_fixture` decayed past `PRICE_CACHE_STALE_DAYS=7`; replaced with `_fresh_tail_date()` / `_stale_tail_date()` helpers | -23 |
+| #347 | f14918f | gate production-state tests behind production_smoke | 3 tests inspecting real `output/`, `cache/`, `signal_library/`, or `price_cache/` operator state gained the production_smoke marker + `PRJCT9_RUN_PRODUCTION_SMOKES=1` env-var gate | -3 |
+| #348 | c253dc6 | restore StackBuilder manifest verification and update PR 290 tests | restored Phase 3A consumer-verifies contract by routing `stackbuilder.fallback_load_signal_library` through `provenance_manifest.load_verified_signal_library`; updated PR #290 test surface to pin strict contract; cleared test_f14 + both B12 static guards in one source change | -3 |
+| #349 | 13913bc | make import-guard tests resilient to sys.modules pollution | reframed 3 import-guard assertions from global `sys.modules` cleanliness checks to snapshot-before / `importlib.import_module` / diff-after; forbidden sets and audited modules unchanged | -3 |
+| #350 | 595c8fb | resolve final fast-default residual failures | (1) redirected dead-since-PR-#289 monkeypatch from `_score_primary_both_modes` to `_score_primary` in `test_3b2b`; (2) added `fp._load_signal_library_quick.cache_clear()` to `test_b3` to isolate from lru-cache pollution that survived `SIGNAL_LIBRARY_DIR` monkeypatch | -2 |
+
+Net: fast-default residual went 34 to 0.
+
+Terminal verification: from `<PROJECT_ROOT>` against pinned `spyproject2` interpreter on 2026-05-29:
+
+    pytest test_scripts/ -q --no-header --tb=short -p no:cacheprovider
+
+Result: 3287 passed, 5 skipped, 5 deselected, 0 failed, 0 errors, 466.61s wall (7m 47s). Reproduced the same green result on the PR #350 validation baseline.
+
+Doctrinal artifacts produced or amended by the chain:
+
+- New `pytest.ini` at project root.
+- New CLAUDE.md section 5b "Test Suite Discipline" (verified marker commands documented, including fast default, opt-in `slow or production_smoke`, and full validation via `--override-ini="addopts="`).
+- Forensic worktree-comparison pattern established in PR #345 amendment (validating that residual failures are not PR-caused by re-running them against `origin/main` in a temporary worktree).
+
+Operational caveats preserved as carry-forward (not part of this resolution):
+
+- Opt-in `production_smoke` execution can exceed a 300-second bounded validation window on a populated developer machine. PR #345's CLAUDE.md section 5b acknowledges this explicitly; the fast default never selects these tests.
+- `signal_library/impact_fastpath.py` retains its `functools.lru_cache` keyed by ticker only. PR #350 isolates `test_b3` from this in the test fixture; the production cache-key shape is unchanged. Future tests exercising the fastpath with monkeypatched `SIGNAL_LIBRARY_DIR` should follow the same `cache_clear()` discipline.
+- `stackbuilder.py` still defines `_score_primary_both_modes` (dead since PR #289) as untouched dead code. A future cleanup PR can delete the dead helper alongside any unreached inverse-mode call paths; out of scope for the cleanup chain.
+
+PR references: #345, #346, #347, #348, #349, #350.
+
 ## How This Doc Is Used
 
 This doc is the source-of-truth tracker for sprint-relevant work between the Phase 6I sprint and the next named sprint, currently expected to be TrafficFlow headless development.
