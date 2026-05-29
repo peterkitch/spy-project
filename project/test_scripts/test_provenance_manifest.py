@@ -2303,8 +2303,22 @@ def test_3b2b_stackbuilder_strict_primaries_provided_falls_through(
 ):
     """When fast-path is rejected under --strict-manifests but primaries
     ARE provided, phase2_rank_all does NOT SystemExit; it falls through
-    to the slow path. We monkeypatch _score_primary_both_modes to terminate
-    the slow path quickly with all-None results.
+    to the slow path. We monkeypatch ``_score_primary`` to terminate the
+    slow path quickly with a None result (so the
+    ``_direct_score`` closure inside ``phase2_rank_all`` returns
+    ``None`` for the AAA ticker and the loop records it in ``missing``
+    rather than executing the full scoring code).
+
+    Slice 5 amendment: PR #289 (Phase 6I-73, ``95ce9de``) changed
+    ``phase2_rank_all``'s slow path from calling
+    ``_score_primary_both_modes`` to calling ``_score_primary`` (mode
+    'D') via a ``_direct_score`` closure (``stackbuilder.py:1609-1614``).
+    The original monkeypatch on ``_score_primary_both_modes`` became
+    dead code at that point; the slow path then actually executed and
+    crashed in ``apply_signals_to_secondary`` on the
+    integer-indexed ``sec_rets`` fixture below. Redirecting the
+    monkeypatch to ``_score_primary`` (single return value, not a
+    2-tuple) restores the intended short-circuit.
     """
     sys.path.insert(0, str(PROJECT_DIR))
     import stackbuilder
@@ -2315,8 +2329,8 @@ def test_3b2b_stackbuilder_strict_primaries_provided_falls_through(
         lambda *a, **k: None,
     )
     monkeypatch.setattr(
-        stackbuilder, "_score_primary_both_modes",
-        lambda *a, **k: (None, None),
+        stackbuilder, "_score_primary",
+        lambda *a, **k: None,
     )
     args = SimpleNamespace(
         secondary="ZZZ",
