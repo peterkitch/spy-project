@@ -233,6 +233,80 @@ tests pin its existing behavior, so a fix requires an explicit
 re-baseline authorization. Treat this as a known caveat, not a
 license to copy the divergent predicate into new code.
 
+### 5b. Test Suite Discipline (project-wide)
+
+The default `test_scripts/` suite is the fast suite. It must
+complete reliably without inspecting real operational state on
+the developer machine. Two pytest markers govern selection:
+
+  - `slow` is for integration or heavy-compute tests.
+  - `production_smoke` is for tests that inspect real
+    operational state under `output/`, `signal_library/`,
+    `cache/`, or `price_cache/` (i.e., dev-machine state
+    outside `tmp_path`).
+
+The `pytest.ini` at the project root sets
+`addopts = -m "not slow and not production_smoke"`, so the fast
+default deselects both classes. A pytest-style command-line `-m`
+expression overrides this addopts entry rather than appending to
+it (verified in-session at PR introduction time, see Validation
+section below for exact commands).
+
+Rules for new tests:
+
+  - Any new test that touches real operational state outside
+    `tmp_path` must be marked `@pytest.mark.production_smoke` and
+    should gate on an explicit environment opt-in (the
+    introductory PR uses `PRJCT9_RUN_PRODUCTION_SMOKES=1` for the
+    `output/impactsearch` reader).
+  - Any new test that takes more than 30 seconds individually
+    should be marked `@pytest.mark.slow` or redesigned.
+  - Autouse fixtures must not recursively walk operational
+    roots; either drop autouse and make the fixture opt-in, or
+    monkeypatch the production-root provider to a `tmp_path`
+    layout inside the fixture.
+  - Production-root refusal tests should prefer a direct call to
+    the narrow guard function (e.g.,
+    `runner._path_is_inside_production_root`) rather than
+    invoking the full runner entry point per parametrization
+    round.
+
+Verified commands (validated at PR introduction time against the
+pinned `spyproject2` interpreter):
+
+  - Fast default (skips `slow` + `production_smoke`):
+    ```
+    pytest test_scripts/
+    ```
+  - Opt-in slow / production-smoke subset only:
+    ```
+    pytest test_scripts/ -m "slow or production_smoke"
+    ```
+  - Full validation across every marker class (clears the
+    `addopts` `-m` filter from `pytest.ini`):
+    ```
+    pytest test_scripts/ --override-ini="addopts="
+    ```
+
+Operational note: an opt-in `production_smoke` test that walks
+real operational state on a populated developer machine can
+take significantly longer than the fast suite. The introductory
+PR's `output/impactsearch` reader exceeded a 300-second bounded
+validation window in-session when opted in. This is expected
+operational-state dependency, not a hang. Treat `production_smoke`
+runtime as unbounded relative to the fast-default budget; the
+fast default never selects these tests, so the operational-state
+cost does not affect default CI / contributor workflow.
+
+Background: a Codex audit at PR introduction time identified one
+primary full-suite stall and three secondary timeout hazards in
+which production state under `output/`, `signal_library/`,
+`cache/`, or `price_cache/` was making the default suite hang
+for hours. This section is the durable rule that prevents the
+same drift; the introductory PR adds the marker infrastructure,
+gates the four hazard tests, and documents the verified
+commands.
+
 ### 6. Current Sprint State (post Phase E PR Epsilon)
 
 **Phase 6I sprint closed** (historical context). Production StackBuilder outputs for the 8 PRJCT9 secondaries (AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA) live under canonical `output/stackbuilder/` and each `selected_build.json` points to its production run directory. These are runtime artifacts, not staged in git.

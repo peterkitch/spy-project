@@ -516,12 +516,42 @@ def test_cli_mutual_exclusion_rc_2():
     assert rc == 2
 
 
-def test_cli_happy_path_emits_json(tmp_path: Path):
+def test_cli_happy_path_emits_json(
+    tmp_path: Path, monkeypatch,
+):
     """End-to-end CLI smoke against tmp_path. The audit
     runs without writes; the writer-static + spymaster-
     helper stages always pass; the upstream / contract /
     ranking / queue+gate stages run against empty tmp
-    roots and short-circuit. JSON to stdout, rc=0."""
+    roots and short-circuit. JSON to stdout, rc=0.
+
+    The CLI default is ``snapshot_production_roots=True``,
+    which (without intervention) walks the real
+    operational production roots returned by
+    ``audit._production_roots()`` and turns the test into
+    a multi-minute recursive directory scan on a
+    populated developer machine. The monkeypatch below
+    redirects the production-root provider to empty
+    tmp_path subdirectories so the snapshot-root walk
+    traverses empty trees and completes instantly. The
+    snapshot code path itself is still exercised; only
+    its inputs are pinned to tmp_path."""
+    fake_prod_roots = {
+        "cache_results": tmp_path / "prod_cache_results",
+        "cache_status": tmp_path / "prod_cache_status",
+        "research_artifacts": (
+            tmp_path / "prod_research_artifacts"
+        ),
+        "signal_library_stable": (
+            tmp_path / "prod_signal_library_stable"
+        ),
+        "stackbuilder": tmp_path / "prod_stackbuilder",
+    }
+    for p in fake_prod_roots.values():
+        p.mkdir()
+    monkeypatch.setattr(
+        audit, "_production_roots", lambda: fake_prod_roots,
+    )
     dirs = _layout(tmp_path)
     buf = io.StringIO()
     with redirect_stdout(buf):
