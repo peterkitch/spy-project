@@ -39,6 +39,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 _HERE = Path(__file__).resolve().parent.parent
 if str(_HERE) not in sys.path:
@@ -407,9 +409,17 @@ def test_output_path_guard_rejects_production_root_paths(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.production_smoke
 def test_production_state_preflight_matches_known_states():
-    """Informational production smoke. Two recognized
-    states:
+    """Informational production smoke. Inspects the real
+    operational ``price_cache/daily/`` directory under the
+    project root and is opt-in: skipped by default in the
+    fast suite (the ``production_smoke`` marker is
+    deselected by ``pytest.ini`` addopts) and additionally
+    requires ``PRJCT9_RUN_PRODUCTION_SMOKES=1`` to actually
+    run when the marker is opted in.
+
+    Two recognized states:
 
       * **Pre-Phase-6I-54b**: ``price_cache/daily/`` does
         not exist; every Phase 6I-52 pilot ticker
@@ -424,7 +434,12 @@ def test_production_state_preflight_matches_known_states():
     the test portable across the Codex clean-worktree,
     the pre-write worktree, AND the post-write worktree.
     """
-    import pytest
+    import os
+    if os.environ.get("PRJCT9_RUN_PRODUCTION_SMOKES") != "1":
+        pytest.skip(
+            "production smoke opt-in not set "
+            "(PRJCT9_RUN_PRODUCTION_SMOKES=1)"
+        )
 
     here = Path(__file__).resolve().parent.parent
     pcd = here / "price_cache" / "daily"

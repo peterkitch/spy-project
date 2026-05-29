@@ -71,6 +71,7 @@ def _existing_leaks(base: Path) -> list[str]:
     return found
 
 
+@pytest.mark.production_smoke
 def test_no_rank_xlsx_or_price_cache_leak_under_project_or_repo_root():
     """Pin: regression tests must NOT generate rank_*.xlsx or
     price_cache artifacts under either the project tree or the repo
@@ -78,7 +79,22 @@ def test_no_rank_xlsx_or_price_cache_leak_under_project_or_repo_root():
     ``test_stackbuilder_validation_integration.py`` and
     ``test_trafficflow_refresh_callback.py``) and route its output to
     pytest's ``tmp_path`` instead of cwd.
+
+    This guard walks the real project and repo roots, so it is
+    sensitive to real operator-created operational state under
+    ``price_cache/`` or similar paths that exist on a populated
+    developer machine but not on a clean worktree. It is opt-in:
+    skipped by default in the fast suite (the ``production_smoke``
+    marker is deselected by ``pytest.ini`` addopts) and additionally
+    requires ``PRJCT9_RUN_PRODUCTION_SMOKES=1`` to actually run when
+    the marker is opted in.
     """
+    import os
+    if os.environ.get("PRJCT9_RUN_PRODUCTION_SMOKES") != "1":
+        pytest.skip(
+            "production smoke opt-in not set "
+            "(PRJCT9_RUN_PRODUCTION_SMOKES=1)"
+        )
     repo_leaks = _existing_leaks(REPO_ROOT)
     project_leaks = _existing_leaks(PROJECT_DIR)
     leaks = repo_leaks + project_leaks
