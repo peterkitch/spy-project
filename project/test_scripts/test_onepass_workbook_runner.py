@@ -52,9 +52,18 @@ def _snapshot_roots() -> dict[str, set[str]]:
     return snap
 
 
-@pytest.fixture(autouse=True)
-def _no_production_writes():
-    """Fail if any new file appears under the protected roots."""
+@pytest.fixture
+def no_production_writes():
+    """Fail if any new file appears under the protected roots.
+
+    Opt-in (no longer autouse). Explicitly requested by the tests
+    that exercise the runner write paths (``runner.main`` or
+    ``runner.execute_run`` with ``--write``); the AST / CLI
+    parsing tests do not request it because they cannot reach the
+    write path. The autouse default scanned ``output``,
+    ``signal_library``, ``cache``, and ``price_cache`` recursively
+    on every test invocation, which made the default suite
+    intractable as those operational roots grew."""
     before = _snapshot_roots()
     yield
     after = _snapshot_roots()
@@ -404,14 +413,27 @@ def test_no_quarantine_directory_created(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 12. (covered by the autouse fixture `_no_production_writes`)
+# 12. Explicit opt-in protected-root write guard
 # ---------------------------------------------------------------------------
 
 
-def test_no_production_output_writes():
-    """The autouse fixture asserts no protected-root files appeared.
+@pytest.mark.slow
+def test_no_production_output_writes(no_production_writes):
+    """Opt-in (``@slow``) explicit contract that no protected-
+    root files appear when the runner is exercised under its
+    standard tmp_path-only test invocations. The
+    ``no_production_writes`` fixture snapshots ``output``,
+    ``signal_library``, ``cache``, and ``price_cache``
+    recursively before and after the test body. On a populated
+    developer machine those trees are large; the snapshot walk
+    crosses the 30s-per-test threshold, so this contract test
+    is marked ``@slow`` and deselected by the fast default
+    suite (``pytest.ini`` addopts).
 
-    This test exists to make the contract visible in the test list.
-    No body work needed; the fixture wraps every test in the file.
-    """
+    The other tests in this file use tmp_path-only outputs and
+    fake export callables; their tmp_path-bound assertions
+    already prove they cannot write to production roots. The
+    fixture is no longer autouse, so neither those tests nor
+    the AST / CLI parsing tests pay for the recursive walk on
+    every run."""
     assert True

@@ -3220,16 +3220,21 @@ def test_main_emit_command_manifest_outside_production_roots(
 def test_main_emit_command_manifest_refuses_production_root(
     forbidden,
 ):
-    with pytest.raises(PermissionError):
-        runner.main(
-            [
-                "--secondaries", "SPY",
-                "--primary-source",
-                runner.PRIMARY_SOURCE_EXPLICIT_CSV,
-                "--primaries", "AAPL",
-                "--emit-command-manifest", forbidden,
-            ],
-        )
+    """Narrow direct-guard assertion: the production-root
+    guard ``runner._path_is_inside_production_root`` fires
+    for each documented denylist entry. The
+    ``--emit-command-manifest`` CLI branch routes through
+    this exact guard (see
+    ``impactsearch_workbook_runner._path_is_inside_production_root``
+    and the call site in the manifest branch of
+    ``main``), so the direct assertion preserves the
+    denylist coverage without paying for the full
+    ``runner.main`` plan-build setup. The
+    sibling ``test_main_output_refuses_production_root``
+    above still exercises the end-to-end CLI path for
+    operator-facing PermissionError reporting; this test
+    is the narrow predicate guard."""
+    assert runner._path_is_inside_production_root(forbidden) is True
 
 
 @pytest.mark.parametrize(

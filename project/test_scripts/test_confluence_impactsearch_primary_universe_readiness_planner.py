@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import pytest
+
 
 _HERE = Path(__file__).resolve().parent.parent
 if str(_HERE) not in sys.path:
@@ -795,12 +797,28 @@ def test_output_path_guard_rejects_guarded_roots(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.production_smoke
 def test_production_state_smoke_skips_when_impact_xlsx_dir_absent():
-    """Informational production smoke. Skips when
+    """Informational production smoke. Inspects real
+    operational ``output/impactsearch`` workbooks when
+    present and is opt-in: skipped by default in the fast
+    suite (the ``production_smoke`` marker is deselected by
+    ``pytest.ini`` addopts) and additionally requires
+    ``PRJCT9_RUN_PRODUCTION_SMOKES=1`` to actually run when
+    the marker is opted in. Skips cleanly when
     ``output/impactsearch`` is absent (clean Codex
-    worktree); otherwise reports the actual
-    classification without asserting specific counts."""
-    import pytest
+    worktree); otherwise reports the actual classification
+    without asserting specific counts. The fixture-based
+    tests above pin the cascade deterministically and
+    remain in the fast default suite."""
+    import os
+    if os.environ.get("PRJCT9_RUN_PRODUCTION_SMOKES") != "1":
+        pytest.skip(
+            "production smoke opt-in not set "
+            "(PRJCT9_RUN_PRODUCTION_SMOKES=1); the "
+            "fixture-based tests above pin the cascade "
+            "deterministically."
+        )
     here = Path(__file__).resolve().parent.parent
     ixd = here / "output" / "impactsearch"
     if not ixd.exists():
