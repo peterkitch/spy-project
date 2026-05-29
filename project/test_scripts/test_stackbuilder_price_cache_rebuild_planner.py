@@ -39,6 +39,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 _HERE = Path(__file__).resolve().parent.parent
 if str(_HERE) not in sys.path:
@@ -620,18 +622,31 @@ def test_future_write_contract_is_well_formed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.production_smoke
 def test_production_state_classification_skips_when_cache_absent():
     """Phase 6I-54a amendment-1: this test is the only
     one that touches the real production cache. It
-    SKIPS cleanly when ``cache/results`` is absent or
-    has none of the 6 currently-ready pilot tickers
-    present, so a clean Codex worktree (no untracked
-    production cache) does not fail the suite. The
-    fixture-based ``test_six_use_existing_and_nineteen_
-    needs_source_refresh_against_fixture`` test (below)
-    pins the same 6/19 classification deterministically.
+    inspects the real operational ``cache/results``
+    directory under the project root and is opt-in:
+    skipped by default in the fast suite (the
+    ``production_smoke`` marker is deselected by
+    ``pytest.ini`` addopts) and additionally requires
+    ``PRJCT9_RUN_PRODUCTION_SMOKES=1`` to actually run
+    when the marker is opted in. It SKIPS cleanly when
+    ``cache/results`` is absent or has none of the 6
+    currently-ready pilot tickers present, so a clean
+    Codex worktree (no untracked production cache) does
+    not fail the suite. The fixture-based
+    ``test_six_use_existing_and_nineteen_needs_source_
+    refresh_against_fixture`` test (below) pins the
+    same 6/19 classification deterministically.
     """
-    import pytest
+    import os
+    if os.environ.get("PRJCT9_RUN_PRODUCTION_SMOKES") != "1":
+        pytest.skip(
+            "production smoke opt-in not set "
+            "(PRJCT9_RUN_PRODUCTION_SMOKES=1)"
+        )
 
     here = Path(__file__).resolve().parent.parent
     real_cache_dir = here / "cache" / "results"
