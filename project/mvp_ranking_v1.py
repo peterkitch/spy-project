@@ -434,8 +434,14 @@ def _compute_v1_metrics(captures: list[float]) -> dict[str, Any]:
     avg = total / n
     metrics["v1_total_capture_pct"] = total
     metrics["v1_avg_capture_pct"] = avg
+    # Loss predicate aligned with canonical_scoring.py:207-209:
+    # losses = n - wins, so zero-return directional captures count as
+    # losses. captures here is the directional-trade subset emitted by
+    # _collect_matching_captures (every entry carries a defined trade
+    # direction; NONE / no-position bars do not enter the list), so
+    # the local subtraction is equivalent to the canonical predicate.
     metrics["v1_win_count"] = sum(1 for c in captures if c > 0)
-    metrics["v1_loss_count"] = sum(1 for c in captures if c < 0)
+    metrics["v1_loss_count"] = n - metrics["v1_win_count"]
     metrics["v1_win_pct"] = metrics["v1_win_count"] / n * 100.0
     if n < 2:
         metrics["sharpe_undefined_reason"] = "n_less_than_two"

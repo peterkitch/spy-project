@@ -84,8 +84,14 @@ Semantics (reused from the existing local engine family)
     ``avg_daily_capture_pct = mean(trigger capture)``,
     ``sharpe_ratio = avg / std`` over trigger bars (sample
     std, ddof=1; returns 0.0 when ``trigger_days <= 1`` or
-    std is zero), ``wins / losses = #positive / #negative
-    trigger captures``.
+    std is zero), and the canonical win / loss predicate
+    locked at ``canonical_scoring.py:207-209``:
+    ``wins = #(trigger captures > 0)`` and
+    ``losses = trigger_days - wins``. Zero-return BUY / SHORT
+    trigger captures are losses (matching spec v0.5
+    section 15); ``wins + losses == trigger_days`` exactly.
+    NONE / no-position bars do not enter the trigger set
+    (the producer above skips them).
   * **No persist-skip in the core.** Persist-skip / T-1 trim
     is an upstream artifact-layer concern (the Phase 6D-1
     daily-K builder already trims 1 bar by default). The
@@ -457,8 +463,14 @@ def evaluate_cell(
     if n_trigger > 0:
         total = float(sum(trigger_caps))
         avg = total / n_trigger
+        # Loss predicate aligned with canonical_scoring.py:207-209:
+        # losses = n_trigger - wins. trigger_caps already excludes
+        # NONE / no-position bars (the loop above skips them at the
+        # signal == "none" branch), so zero-return BUY / SHORT bars
+        # remain in the directional set and now correctly count as
+        # losses.
         wins = sum(1 for c in trigger_caps if c > 0)
-        losses = sum(1 for c in trigger_caps if c < 0)
+        losses = n_trigger - wins
     else:
         total = 0.0
         avg = 0.0

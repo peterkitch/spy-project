@@ -1103,3 +1103,69 @@ def test_54_v1_history_secondary_mismatch_mixed_success_and_failure(tmp_path):
     assert spy_rec["rank"] is None
     spy_codes = [i["error_code"] for i in spy_rec["issues"]]
     assert "v1_history_secondary_mismatch" in spy_codes
+
+
+# ---------------------------------------------------------------------------
+# PR B (zero-return-loss convention) canonical-equivalence tests for
+# mvp_ranking_v1._compute_v1_metrics. Pinned per
+# canonical_scoring.py:207-209: losses = n - wins so zero-return
+# directional captures count as losses, win_count + loss_count == n.
+# ---------------------------------------------------------------------------
+
+
+def _v1_metrics(captures):
+    """Convenience wrapper around the engine helper."""
+    import mvp_ranking_v1 as engine
+    return engine._compute_v1_metrics(list(captures))
+
+
+def test_v1_zero_return_buy_directional_trade_is_loss():
+    """A single BUY trade whose return is exactly 0.0 must count as a
+    loss under the canonical convention."""
+    m = _v1_metrics([0.0])
+    assert m["v1_n"] == 1
+    assert m["v1_win_count"] == 0
+    assert m["v1_loss_count"] == 1
+    assert m["v1_win_pct"] == 0.0
+    assert m["v1_win_count"] + m["v1_loss_count"] == m["v1_n"]
+
+
+def test_v1_zero_return_short_directional_trade_is_loss():
+    """SHORT captures are emitted as the negation of the raw return;
+    a zero-return SHORT trade therefore enters captures as 0.0, and
+    must count as a loss exactly like the zero-return BUY case."""
+    m = _v1_metrics([0.0])
+    assert m["v1_loss_count"] == 1
+    assert m["v1_win_count"] == 0
+
+
+def test_v1_win_plus_loss_equals_n_across_mixed_fixture():
+    """+2, -1, 0, +0.5, 0: 5 directional captures, 2 wins, 3 losses."""
+    m = _v1_metrics([2.0, -1.0, 0.0, 0.5, 0.0])
+    assert m["v1_n"] == 5
+    assert m["v1_win_count"] == 2
+    assert m["v1_loss_count"] == 3
+    assert m["v1_win_count"] + m["v1_loss_count"] == m["v1_n"]
+
+
+def test_v1_canonical_equivalence_predicate():
+    """The local mvp_ranking_v1 predicate must match
+    canonical_scoring.py:207-209 (``wins = (caps > 0).sum()``,
+    ``losses = n - wins``) on a fixture covering positive BUY,
+    negative SHORT, zero-return BUY, and zero-return SHORT
+    captures. NONE / no-position bars never enter the v1 captures
+    list (the upstream walker passes a scalar direction), so the
+    exclusion side of the invariant is structurally enforced."""
+    fixture = [+2.0, -1.5, 0.0, +0.5, 0.0]
+    m = _v1_metrics(fixture)
+    canonical_wins = sum(1 for c in fixture if c > 0)
+    canonical_losses = len(fixture) - canonical_wins
+    assert m["v1_win_count"] == canonical_wins
+    assert m["v1_loss_count"] == canonical_losses
+
+
+def test_v1_win_pct_uses_n_denominator():
+    fixture = [+2.0, 0.0, 0.0]
+    m = _v1_metrics(fixture)
+    # 1 win out of 3 directional trades = 33.33%
+    assert m["v1_win_pct"] == pytest.approx(100.0 / 3.0)

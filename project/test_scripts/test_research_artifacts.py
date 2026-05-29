@@ -2656,3 +2656,320 @@ def test_local_ticker_form_candidates_engine_agnostic_alias():
         ra._confluence_ticker_form_candidates("^GSPC")
         == ra._local_ticker_form_candidates("^GSPC")
     )
+
+
+# ---------------------------------------------------------------------------
+# PR B (zero-return-loss convention) canonical-equivalence tests for
+# research_artifacts. All four divergent loss blocks now compute
+# ``losses = n_trigger - wins`` per canonical_scoring.py:207-209.
+# Zero-return BUY / SHORT trigger days count as losses; NONE / no-
+# position bars are filtered upstream by the is_trigger_day mask.
+# ---------------------------------------------------------------------------
+
+
+def test_research_artifacts_zero_return_buy_trigger_day_is_loss():
+    """ImpactSearch builder fixture engineered with a zero-return BUY
+    day: target_close repeats so daily_capture_pct == 0.0 on a BUY
+    signal. Under the canonical predicate the day enters
+    is_trigger_day=True and counts as a loss (not as a third
+    zero-return bucket)."""
+    import pandas as pd
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    # Day 0: Buy on first bar -> 0% return (no prev bar).
+    # Day 1: Buy 100 -> 100 = 0% return (zero-return BUY trigger -> loss).
+    # Day 2: Buy 100 -> 105 = +5% (win).
+    # Day 3: Buy 105 -> 105 = 0% (zero-return BUY trigger -> loss).
+    closes = [100.0, 100.0, 105.0, 105.0]
+    signals = ["Buy", "Buy", "Buy", "Buy"]
+    art = ra.build_impactsearch_day_artifact(
+        target_ticker="TGT",
+        signal_source="SRC",
+        dates=idx,
+        signals=signals,
+        target_close=closes,
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    # Trigger days: 4 BUY bars all firing. Day 1 zero-return is loss,
+    # Day 2 +5% is win, Day 0 and Day 3 zero-return are losses.
+    assert summary["trigger_days"] == 4
+    assert summary["wins"] == 1  # only the +5% day
+    assert summary["losses"] == 3  # three zero-return BUY days
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_research_artifacts_zero_return_short_trigger_day_is_loss():
+    """Symmetric SHORT fixture. SHORT capture = -raw_return, so a
+    zero-return SHORT bar gives capture == 0.0 and counts as a loss
+    under the canonical predicate."""
+    import pandas as pd
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    closes = [100.0, 100.0, 95.0]
+    signals = ["Short", "Short", "Short"]
+    art = ra.build_impactsearch_day_artifact(
+        target_ticker="TGT",
+        signal_source="SRC",
+        dates=idx,
+        signals=signals,
+        target_close=closes,
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    # Day 0: SHORT trigger, 0% return -> cap 0 (loss).
+    # Day 1: SHORT trigger, 0% return -> cap 0 (loss).
+    # Day 2: SHORT trigger, -5% return -> SHORT cap = +5% (win).
+    assert summary["trigger_days"] == 3
+    assert summary["wins"] == 1
+    assert summary["losses"] == 2
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_research_artifacts_none_bars_excluded_from_directional_set():
+    """NONE bars must not appear in trigger_caps / wins / losses
+    accounting. is_trigger_day is False for them."""
+    import pandas as pd
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    closes = [100.0, 110.0, 110.0, 121.0]
+    signals = ["Buy", "None", "None", "Buy"]
+    art = ra.build_impactsearch_day_artifact(
+        target_ticker="TGT",
+        signal_source="SRC",
+        dates=idx,
+        signals=signals,
+        target_close=closes,
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    # Day 0: BUY, 0% (no prev) -> trigger, loss.
+    # Day 1: NONE -> not a trigger.
+    # Day 2: NONE -> not a trigger.
+    # Day 3: BUY, +10% -> trigger, win.
+    assert summary["trigger_days"] == 2
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_research_artifacts_canonical_equivalence_mixed_fixture():
+    """Mixed BUY / SHORT / NONE fixture: validate that
+    research_artifacts emits the exact canonical predicate's
+    wins/losses on the directional-trade subset."""
+    import pandas as pd
+    idx = pd.bdate_range("2024-01-02", periods=6)
+    closes = [100.0, 110.0, 110.0, 100.0, 100.0, 105.0]
+    signals = ["Buy", "Buy", "Short", "Short", "None", "Buy"]
+    art = ra.build_impactsearch_day_artifact(
+        target_ticker="TGT",
+        signal_source="SRC",
+        dates=idx,
+        signals=signals,
+        target_close=closes,
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    # Day 0 BUY 0% -> loss. Day 1 BUY +10% -> win.
+    # Day 2 SHORT 0% -> loss. Day 3 SHORT -9.09% -> SHORT cap +9.09% -> win.
+    # Day 4 NONE -> excluded.
+    # Day 5 BUY +5% -> win.
+    # Expected: trigger_days=5, wins=3, losses=2.
+    trigger_caps = [
+        float(r["daily_capture_pct"]) for r in art.daily
+        if r["is_trigger_day"]
+    ]
+    assert summary["trigger_days"] == len(trigger_caps) == 5
+    canonical_wins = sum(1 for v in trigger_caps if v > 0)
+    canonical_losses = len(trigger_caps) - canonical_wins
+    assert summary["wins"] == canonical_wins
+    assert summary["losses"] == canonical_losses
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_stackbuilder_zero_return_buy_trigger_day_is_loss():
+    """StackBuilder builder fixture: all members agree Buy on every bar
+    so the K-of-N combine fires Buy on every trigger day. Engineered
+    closes produce zero-return BUY days that must count as losses under
+    the canonical predicate."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    # Day 0 BUY 0% (first bar) -> loss.
+    # Day 1 BUY 100->100 = 0% -> loss.
+    # Day 2 BUY 100->105 = +5% -> win.
+    # Day 3 BUY 105->105 = 0% -> loss.
+    art = ra.build_stackbuilder_day_artifact(
+        target_ticker="TGT", run_id="run-zr-buy", K=2,
+        dates=idx, target_close=[100.0, 100.0, 105.0, 105.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy", "Buy"],
+            "BBB": ["Buy", "Buy", "Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    assert summary["trigger_days"] == 4
+    assert summary["wins"] == 1
+    assert summary["losses"] == 3
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_stackbuilder_canonical_equivalence_mixed_fixture():
+    """StackBuilder builder mixed fixture: a NONE combined day (mixed
+    member signals below K agreement) is excluded from the directional
+    trade set; the canonical invariant
+    ``wins + losses == trigger_days`` holds on the emitted summary."""
+    idx = pd.bdate_range("2024-01-02", periods=5)
+    art = ra.build_stackbuilder_day_artifact(
+        target_ticker="TGT", run_id="run-mix", K=2,
+        dates=idx, target_close=[100.0, 110.0, 110.0, 99.0, 99.0],
+        member_signal_columns={
+            # Day 0 Buy + Buy -> Buy, +0% (first bar) -> loss.
+            # Day 1 Buy + Buy -> Buy, +10% -> win.
+            # Day 2 Buy + Short -> None (below K) -> excluded.
+            # Day 3 Short + Short -> Short, target -10% -> SHORT cap +10% -> win.
+            # Day 4 Short + Short -> Short, 0% -> loss.
+            "AAA": ["Buy", "Buy", "Buy", "Short", "Short"],
+            "BBB": ["Buy", "Buy", "Short", "Short", "Short"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    trigger_caps = [
+        float(r["daily_capture_pct"]) for r in art.daily
+        if r["is_trigger_day"]
+    ]
+    assert summary["trigger_days"] == len(trigger_caps) == 4
+    canonical_wins = sum(1 for v in trigger_caps if v > 0)
+    canonical_losses = len(trigger_caps) - canonical_wins
+    assert summary["wins"] == canonical_wins
+    assert summary["losses"] == canonical_losses
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_confluence_zero_return_buy_trigger_day_is_loss():
+    """Confluence builder fixture: every bar carries a Buy tier so the
+    confluence_signal fires Buy. Engineered closes give zero-return
+    BUY days that must count as losses under the canonical
+    predicate."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    closes = [100.0, 100.0, 105.0, 105.0]
+    tiers = ["Strong Buy", "Buy", "Strong Buy", "Buy"]
+    snaps = [
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "Buy", "1y": "Buy"},
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "None", "1y": "None"},
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "Buy", "1y": "Buy"},
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "None", "1y": "None"},
+    ]
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx, target_close=closes,
+        confluence_tiers=tiers, timeframe_signals=snaps,
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    assert summary["trigger_days"] == 4
+    assert summary["wins"] == 1
+    assert summary["losses"] == 3
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_confluence_canonical_equivalence_mixed_fixture():
+    """Confluence builder mixed fixture: a Neutral tier collapses to
+    confluence_signal=None and is excluded from the directional trade
+    set; the canonical invariant holds on the emitted summary."""
+    idx = pd.bdate_range("2024-01-02", periods=6)
+    closes = [100.0, 110.0, 110.0, 110.0, 99.0, 99.0]
+    tiers = [
+        "Strong Buy", "Buy", "Neutral", "Strong Short", "Short", "Short",
+    ]
+    snaps = [
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "Buy", "1y": "Buy"},
+        {"1d": "Buy", "1wk": "Buy", "1mo": "Buy",
+         "3mo": "None", "1y": "None"},
+        {"1d": "Buy", "1wk": "Short", "1mo": "None",
+         "3mo": "None", "1y": "None"},
+        {"1d": "Short", "1wk": "Short", "1mo": "Short",
+         "3mo": "Short", "1y": "Short"},
+        {"1d": "Short", "1wk": "Short", "1mo": "Short",
+         "3mo": "None", "1y": "None"},
+        {"1d": "Short", "1wk": "Short", "1mo": "Short",
+         "3mo": "None", "1y": "None"},
+    ]
+    art = ra.build_confluence_day_artifact(
+        target_ticker="SPY", dates=idx, target_close=closes,
+        confluence_tiers=tiers, timeframe_signals=snaps,
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    trigger_caps = [
+        float(r["daily_capture_pct"]) for r in art.daily
+        if r["is_trigger_day"]
+    ]
+    assert summary["trigger_days"] == len(trigger_caps) == 5
+    canonical_wins = sum(1 for v in trigger_caps if v > 0)
+    canonical_losses = len(trigger_caps) - canonical_wins
+    assert summary["wins"] == canonical_wins
+    assert summary["losses"] == canonical_losses
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_trafficflow_zero_return_buy_trigger_day_is_loss():
+    """TrafficFlow builder fixture: all members agree Buy on every bar
+    (strict-unanimity combine -> pressure Buy every day). Engineered
+    closes give zero-return BUY days that must count as losses under
+    the canonical predicate."""
+    idx = pd.bdate_range("2024-01-02", periods=4)
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run-zr-buy",
+        dates=idx, target_close=[100.0, 100.0, 105.0, 105.0],
+        member_signal_columns={
+            "AAA": ["Buy", "Buy", "Buy", "Buy"],
+            "BBB": ["Buy", "Buy", "Buy", "Buy"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    pressures = [r["pressure_signal"] for r in art.daily]
+    assert pressures == ["Buy", "Buy", "Buy", "Buy"]
+    assert summary["trigger_days"] == 4
+    assert summary["wins"] == 1
+    assert summary["losses"] == 3
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
+
+
+def test_trafficflow_canonical_equivalence_mixed_fixture():
+    """TrafficFlow builder mixed fixture: a bar with mixed member
+    signals collapses to pressure None under strict-unanimity combine
+    and is excluded from the directional trade set; the canonical
+    invariant holds on the emitted summary."""
+    idx = pd.bdate_range("2024-01-02", periods=5)
+    art = ra.build_trafficflow_day_artifact(
+        "SPY", "run-mix",
+        dates=idx, target_close=[100.0, 110.0, 110.0, 99.0, 99.0],
+        member_signal_columns={
+            # Day 0 Buy + Buy -> Buy, 0% (first bar) -> loss.
+            # Day 1 Buy + Buy -> Buy, +10% -> win.
+            # Day 2 Buy + Short -> None (strict unanimity violated) -> excluded.
+            # Day 3 Short + Short -> Short, target -10% -> SHORT cap +10% -> win.
+            # Day 4 Short + Short -> Short, 0% -> loss.
+            "AAA": ["Buy", "Buy", "Buy", "Short", "Short"],
+            "BBB": ["Buy", "Buy", "Short", "Short", "Short"],
+        },
+        protocol_per_member={"AAA": "D", "BBB": "D"},
+        persist_skip_bars=0,
+    )
+    summary = art.summary
+    trigger_caps = [
+        float(r["daily_capture_pct"]) for r in art.daily
+        if r["is_trigger_day"]
+    ]
+    assert summary["trigger_days"] == len(trigger_caps) == 4
+    canonical_wins = sum(1 for v in trigger_caps if v > 0)
+    canonical_losses = len(trigger_caps) - canonical_wins
+    assert summary["wins"] == canonical_wins
+    assert summary["losses"] == canonical_losses
+    assert summary["wins"] + summary["losses"] == summary["trigger_days"]
