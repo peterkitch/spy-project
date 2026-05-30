@@ -965,7 +965,7 @@ def test_no_forbidden_top_level_imports():
 #   * The documented command template MUST use ``--secondary
 #     <TICKER>`` (NOT ``--ticker <TICKER>`` -- which is not
 #     a real stackbuilder.py argument).
-#   * Observed defaults k_patience=0 and
+#   * Observed defaults k_patience=1 and
 #     combine_mode='intersection' MUST match the actual
 #     argparse defaults in stackbuilder.parse_args.
 #   * Unresolved policy questions MUST NOT claim that
@@ -1030,8 +1030,10 @@ def test_observed_defaults_match_stackbuilder_parse_args_defaults():
     ns = stackbuilder.parse_args([])
     observed = lup.STACKBUILDER_OBSERVED_DEFAULTS
 
-    # Phase 6I-50 amendment-1 pins.
-    assert ns.k_patience == 0
+    # Phase 6I-50 amendment-1 pins, with k_patience updated
+    # to 1 per the operator-decided carryforward item #3
+    # engine-to-runner alignment.
+    assert ns.k_patience == 1
     assert observed["k_patience"] == ns.k_patience
     assert ns.combine_mode == "intersection"
     assert observed["combine_mode"] == ns.combine_mode

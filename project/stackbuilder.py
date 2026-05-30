@@ -3983,7 +3983,7 @@ def parse_args(argv=None):
                    help='Enumerate all combinations up to this K')
     p.add_argument('--both-modes', action='store_true',
                    help='Evaluate both Direct and Inverse modes for each candidate ticker')
-    p.add_argument('--k-patience', type=int, default=0,
+    p.add_argument('--k-patience', type=int, default=1,
                    help='Number of K levels to continue searching even without Sharpe improvement')
     p.add_argument('--combine-mode', choices=['intersection','union'], default='intersection',
                    help='How to combine trigger days: intersection (all members) or union (any member)')
