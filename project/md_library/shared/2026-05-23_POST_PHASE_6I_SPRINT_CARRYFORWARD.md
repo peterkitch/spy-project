@@ -50,7 +50,15 @@ Open questions:
 
 ### 2. TrafficFlow refresh callback
 
-Status: OPEN. Scope determination needed before classification is finalized.
+Status: RESOLVED 2026-05-30. Original flag resolved by PR #158 (squash 3f3044a, "Phase 5B Item 8: surface TrafficFlow refresh callback errors"). Final classification: OBSOLETE / ALREADY-RESOLVED. See Resolution note below.
+
+Resolution (audit-evidence-based ledger update, 2026-05-30):
+
+- Origin: Phase 5A cleanup ledger item 8 at `md_library/shared/2026-05-05_PHASE_5A_CLEANUP_LEDGER.md:115-125`, deferred from PR #145 (Post Phase 3 Sprint Bug Cleanup audit). The Phase 5A entry explicitly cites PR #145 as the source-of-record for the deferral.
+- Original issue: silent error swallowing in the TrafficFlow price-refresh callback path; operators saw absences of expected results without diagnostics. Phase 5A intended outcome: "Surface refresh callback errors as visible operator-facing messages."
+- Original resolution: PR #158 (squash `3f3044a`, "Phase 5B Item 8: surface TrafficFlow refresh callback errors"). In-source evidence on current main: `trafficflow.py:200-233` introduces the diagnostic surface (reason-code constants `REFRESH_EXCEPTION` / `REFRESH_SYMBOL_FAILED` / `REFRESH_NO_DATA` / `REFRESH_UNAVAILABLE` / `PRICE_LOAD_FAILED`, bound `_REFRESH_ISSUES_DISPLAY_LIMIT`, and the `_format_trafficflow_issue` helper). The `_refresh` callback collects per-stage failures and appends a bounded `[TRAFFICFLOW:<reason>]` summary to the status text; the previously-silent failure paths are marked by `# Phase 5B Item 8` comments at `trafficflow.py:3173`, `:3202`, and `:3227`, with the bounded-segment construction at `:3322`.
+- Headless conclusion: the TrafficFlow headless runner/orchestrator bypass the Dash refresh callback entirely. `trafficflow_runner.py` (module docstring L43-47) makes the repair flags (`--refresh-missing-pkls`, `--refresh-stale-prices`) report-only and explicitly states the runner does not call `trafficflow.refresh_secondary_caches`. `trafficflow_runner._patch_engine_network_surface` (L1750) and `_default_compute_loader` (L1814+) pin the engine's compute-time freshness gate to read-only (`_needs_refresh` returns False, `_fetch_secondary_from_yf` returns empty, `_write_cache_file` and `_persist_cache` raise `engine_price_cache_write_blocked`). `trafficflow_canonical_orchestrator.py` imports `trafficflow_runner` (L48 `import trafficflow_runner as _tfr`; L50 `from trafficflow_runner import (...)`), not `trafficflow`, per its own module docstring at L20 ("does NOT import `trafficflow`").
+- Final classification: OBSOLETE / ALREADY-RESOLVED. No precursor PR needed before future TrafficFlow / MTF / Confluence work. The original flag is resolved in source; the headless surface deliberately and fully bypasses the callback's data path with multi-layer fail-closed guards. The open questions captured below were the scope-determination inputs and are now answered by this Resolution note; they are preserved as historical record per the ledger's convention.
 
 Description: A deferred UI / operational issue from a prior audit referencing TrafficFlow's refresh callback behavior. The exact scope of the issue is not documented. Before deciding whether this is current-sprint work or can be re-deferred, a read-only source inspection should determine:
 
