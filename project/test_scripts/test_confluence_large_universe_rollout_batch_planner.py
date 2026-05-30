@@ -93,13 +93,13 @@ def _launch_plan(rows: list[dict[str, Any]]) -> dict[
             "inspected_count": len(rows),
         },
         "stackbuilder_policy": {
-            "unresolved_policy_questions": [
-                "both_modes: ...",
-                "combine_mode: ...",
-                "seed_by/optimize_by: ...",
-                "member-universe sizing: ...",
-                "invalid-member rotation: ...",
-            ],
+            # All six launch-policy questions are now settled
+            # at the launch planner; the unresolved list is
+            # empty. The rollout planner's launch-authorization
+            # gate is independent of this list and stays
+            # fail-closed by default; settlement is not
+            # authorization.
+            "unresolved_policy_questions": [],
         },
     }
 
@@ -393,8 +393,9 @@ def test_stackbuilder_rerun_uses_secondary_not_ticker():
     ):
         assert flag in argv
         assert argv[argv.index(flag) + 1] == val
-    # --both-modes is NOT auto-added (unresolved policy
-    # question).
+    # --both-modes is NOT auto-added (settled launch
+    # policy is both_modes=False; the candidate command
+    # therefore omits the --both-modes flag).
     assert "--both-modes" not in argv
 
 
@@ -421,9 +422,15 @@ def test_stackbuilder_rerun_policy_gating():
     assert (
         sb_default["blocked_by_policy_decision"] is True
     )
+    # After the five-question settlement PR the default-
+    # blocked basis is launch_authorization_required
+    # rather than unresolved_questions. The constant
+    # POLICY_BASIS_UNRESOLVED_QUESTIONS is preserved for
+    # backward symbol compat but is no longer the active
+    # blocked basis.
     assert (
         sb_default["policy_basis"]
-        == rbp.POLICY_BASIS_UNRESOLVED_QUESTIONS
+        == rbp.POLICY_BASIS_LAUNCH_AUTHORIZATION_REQUIRED
     )
     assert sb_default["operator_policy_required"] is True
     # With accept-proposed flag.
@@ -689,22 +696,89 @@ def test_unresolved_policy_questions_carry_through():
     rollout = rbp.build_rollout_batch_plan(plan)
     questions = rollout["unresolved_policy_questions"]
     assert isinstance(questions, list)
-    # Re-run cadence was settled by carryforward item #4
-    # (manual_supervised, no scheduler) and is no longer in
-    # the unresolved list; the remaining five questions
-    # still carry through verbatim from the input plan.
-    assert len(questions) == 5
-    # The strings are passed through verbatim from the
-    # input launch plan.
-    assert any(
-        q.startswith("both_modes") for q in questions
+    # All six launch-policy questions are now settled at
+    # the launch planner; the unresolved list carries
+    # through verbatim from the input plan as an empty
+    # list. Membership assertions are not applicable
+    # because the list has no members; this test only
+    # pins the verbatim-pass-through behavior at the
+    # zero-question state.
+    assert questions == []
+
+
+# ---------------------------------------------------------------------------
+# 12a. Fail-closed launch-authorization gate survives the unresolved-
+#      policy count reaching zero. This is the load-bearing safety
+#      property of the five-question settlement PR: settling policy
+#      MUST NOT auto-authorize launch.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_remains_default_blocked_at_zero_unresolved_questions():
+    """Settling all six launch-policy questions empties the launch
+    planner's unresolved-policy list. The rollout planner's launch-
+    authorization gate is independent of that list and must remain
+    fail-closed by default: blocked_by_policy_decision stays True on
+    a fresh rollout plan unless the operator passes the explicit
+    --accept-proposed-stackbuilder-defaults override. Candidate
+    StackBuilder commands stay emitted as strings only, never
+    executed."""
+    # Establish the precondition the test is named for:
+    # the launch planner reports zero unresolved questions.
+    plan = _launch_plan([
+        _row(ticker="FFF", action="rerun_stackbuilder"),
+    ])
+    assert plan["stackbuilder_policy"][
+        "unresolved_policy_questions"
+    ] == []
+    # Default rollout: blocked.
+    rollout_default = rbp.build_rollout_batch_plan(plan)
+    sb_default = [
+        c for c in rollout_default["command_manifest"]
+        if c["batch"] == (
+            rbp.BATCH_STACKBUILDER_RERUN_CANDIDATES
+        )
+    ][0]
+    assert sb_default["blocked_by_policy_decision"] is True
+    assert (
+        sb_default["policy_basis"]
+        == rbp.POLICY_BASIS_LAUNCH_AUTHORIZATION_REQUIRED
     )
-    assert any(
-        q.startswith("combine_mode") for q in questions
+    assert sb_default["operator_policy_required"] is True
+    # Candidate command emitted as a string, not executed.
+    assert isinstance(sb_default["command"], str)
+    assert sb_default["command"].strip() != ""
+    # Override still flips blocked off and retags the
+    # basis as proposed_defaults.
+    rollout_accept = rbp.build_rollout_batch_plan(
+        plan, accept_proposed_stackbuilder_defaults=True,
     )
-    assert any(
-        q.startswith("invalid-member rotation")
-        for q in questions
+    sb_accept = [
+        c for c in rollout_accept["command_manifest"]
+        if c["batch"] == (
+            rbp.BATCH_STACKBUILDER_RERUN_CANDIDATES
+        )
+    ][0]
+    assert sb_accept["blocked_by_policy_decision"] is False
+    assert (
+        sb_accept["policy_basis"]
+        == rbp.POLICY_BASIS_PROPOSED_DEFAULTS
+    )
+    assert sb_accept["operator_policy_required"] is False
+
+
+def test_policy_basis_unresolved_questions_constant_still_defined():
+    """POLICY_BASIS_UNRESOLVED_QUESTIONS is preserved as an exported
+    symbol for backward compatibility (other consumers may have
+    imported the name) even though it is no longer the active
+    default-blocked basis."""
+    assert hasattr(rbp, "POLICY_BASIS_UNRESOLVED_QUESTIONS")
+    assert isinstance(
+        rbp.POLICY_BASIS_UNRESOLVED_QUESTIONS, str,
+    )
+    assert (
+        rbp.POLICY_BASIS_UNRESOLVED_QUESTIONS
+        != rbp.POLICY_BASIS_LAUNCH_AUTHORIZATION_REQUIRED
     )
 
 
