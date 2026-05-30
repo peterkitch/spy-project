@@ -3951,8 +3951,25 @@ def parse_args(argv=None):
                    help='Metric to choose the initial K=1 seed (Total Capture only)')
     p.add_argument('--optimize-by', choices=['total_capture'], default=None,
                    help='Metric to optimize for K>=2 (Total Capture only; defaults to seed-by)')
-    p.add_argument('--allow-decreasing', action='store_true',
-                   help='Allow metric to decrease across K levels (find best at each K independently)')
+    # Carryforward item #3 (operator-decided): the headless allow-decreasing
+    # default is True on both the engine CLI and the runner CLI. The opt-out
+    # is --no-allow-decreasing. Both flags share dest=allow_decreasing; if
+    # both are passed on one command line, argparse processes them left to
+    # right and the last one wins. set_defaults below pins the True default
+    # unambiguously regardless of which add_argument is consulted first.
+    p.add_argument('--allow-decreasing', dest='allow_decreasing',
+                   action='store_true',
+                   help=('Allow metric to decrease across K levels (find best '
+                         'at each K independently). Default True on headless '
+                         'launches; pass --no-allow-decreasing to opt out and '
+                         'reinstate the strict monotone-improvement gate.'))
+    p.add_argument('--no-allow-decreasing', dest='allow_decreasing',
+                   action='store_false',
+                   help=('Opt out of the default-True allow-decreasing '
+                         'behavior; reinstates the strict monotone-improvement '
+                         'gate (engine rejects any K stack whose Total Capture '
+                         'does not exceed the previous K by --sharpe-eps).'))
+    p.set_defaults(allow_decreasing=True)
     p.add_argument('--grace-days', type=int, default=None,
                    help=('Max calendar pad when aligning primary signals to '
                          'secondary. Unset (None) uses DEFAULT_GRACE_DAYS=10 '
