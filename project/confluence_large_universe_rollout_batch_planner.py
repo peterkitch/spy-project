@@ -37,8 +37,10 @@ What this module IS
   * A StackBuilder policy gate. By default, stackbuilder
     rerun candidates are marked
     ``blocked_by_policy_decision=true`` (the Phase 6I-50
-    StackBuilder policy section's 6 unresolved questions
-    are unresolved). Passing
+    StackBuilder policy section's 5 unresolved questions
+    are unresolved; the earlier rerun-cadence question was
+    settled by carryforward item #4 and is no longer in
+    the block). Passing
     ``--accept-proposed-stackbuilder-defaults`` flips the
     block off so the operator can review the candidate
     commands as ``ready_for_authorization`` -- but the
