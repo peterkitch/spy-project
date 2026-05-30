@@ -113,9 +113,27 @@ Open questions:
 - What is the desired remediation pattern when drift is found: align CLI to UI defaults, align UI to CLI defaults, or document the divergence?
 - Should the audit produce a fixture or test that prevents future drift, or is documentation sufficient?
 
-### 4. Monthly StackBuilder rebuild cadence
+### 4. StackBuilder transparency policy (formerly monthly rebuild cadence)
 
-Status: OPEN. Operational policy decision.
+Status: RESOLVED 2026-05-30. Reframed by operator from cadence-enforcement / scheduling decision to a transparency policy. Current source already implements the policy: missing data is the only hard block; stale-but-present data is surfaced via advisory labels and freshness fields, not blocked; cadence is operator-managed (`manual_supervised`) with no scheduler. No resolving code PR; this closeout cites in-source evidence. See Resolution note below.
+
+Resolution (operator transparency reframe, 2026-05-30):
+
+- Operator reframe: item #4 is a transparency requirement, not a cadence-enforcement or scheduling decision. Do not block a ticker merely because its StackBuilder stack is old; hard-block only when required data is genuinely missing; surface staleness instead of enforcing it; cadence is operator-managed.
+- Missing data is the only hard block on the StackBuilder consumer chain. Verified anchors:
+  - `trafficflow_runner.py:779` (`selected_build_missing`), `:813` (`selected_build_missing_required_fields`), `:854` (`selected_build_missing_selected_run_dir`) - each is a `status: "refused"` outcome.
+  - `trafficflow_runner.py:1184` (`classification: "MISSING"`), `:1225-1226` (`classification: "UNREADABLE"` with `pkl_unreadable` issue), `:1230-1231` (`classification: "INVALID"` with `pkl_top_level_not_dict` issue) - the per-member PKL classification block.
+  - `confluence_ranking_contract_validator.py:129` (`ISSUE_STACKBUILDER_MISSING`), `:130` (`ISSUE_STACKBUILDER_SELECTION_AMBIGUOUS`), with the block-return sites at `:471` (missing) and `:478` (ambiguous).
+- Stale-but-present data is surfaced, not blocked. Verified anchors:
+  - `trafficflow_runner.py:1252-1263` computes `freshness_class` and is explicitly advisory; the inline comment at `:1252-1253` reads "Compute freshness class (advisory; STALE may be overridden by a more severe classification below)".
+  - `confluence_ranking_contract_validator.py:464-465` documents the contract as "NO age-based stale window; saved variants are durable regardless of mtime".
+  - `daily_signal_board.py:80` (`STALE_DAYS = 30`), `:84` (`COVERAGE_STALE = "Stale"` label), `:930-931` (staleness branch resolves to a label only, not a block) - the board emits the `Stale` label rather than dropping the ticker.
+  - `daily_signal_board.py:955` (within the surrounding defensive block read in audit at `:953-956`) - "caller-side bug never causes the row to silently disappear" - the transparency rule expressed in code.
+- Cadence is operator-managed; no scheduler exists or is required for this item. Verified anchors:
+  - `confluence_stackbuilder_rollout_policy.py:227` (`POLICY_RERUN_CADENCE: str = "manual_supervised"`).
+  - `confluence_stackbuilder_rollout_policy.py:219` (locked policy comment: `manual_supervised -- no scheduler`).
+- Future public-UI freshness display is Phase 6/7 UI scope, not a current blocker. The underlying freshness signals (build timestamps, `selected_run_id` / `selected_run_dir`, `freshness_class`, `last_updated_at_utc`, `COVERAGE_STALE` labels) are already produced by the StackBuilder, runner, orchestrator, and Daily Signal Board surfaces.
+- The historical Description, Why sprint-relevant, Expected scope, and Open questions are preserved below per the ledger's "How This Doc Is Used" convention. The older calendar-month vs trading-day vs rolling-window vs operator-triggered questions are answered as moot by the reframe: cadence is operator-managed, so calendar-form is not enforced anywhere; staleness flowing into a future public UI inherits the transparency rule by design.
 
 Description: Operator stated intent that StackBuilder rebuilds monthly rather than daily. Daily TrafficFlow / MTF / Confluence runs consume StackBuilder's monthly outputs. The existing timestamped run_dir structure already preserves history; only operational policy and scheduling work is needed to enforce the cadence.
 
