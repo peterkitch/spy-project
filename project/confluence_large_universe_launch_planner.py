@@ -83,6 +83,7 @@ Public surface
 
     STACKBUILDER_OBSERVED_DEFAULTS
     STACKBUILDER_PROPOSED_LAUNCH_DEFAULTS
+    STACKBUILDER_SETTLED_POLICY_DECISIONS
     STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS
 
     DEFAULT_KNOWN_INVALID_MEMBERS
@@ -412,6 +413,41 @@ STACKBUILDER_PROPOSED_LAUNCH_DEFAULTS: dict[str, Any] = {
 }
 
 
+# Settled policy decisions captured here so the report
+# documents what the operator HAS decided, distinct from
+# observed/proposed defaults and from items still open
+# below. Style mirrors the {value, rationale, evidence}
+# shape used by LOCKED_POLICY_DECISIONS in
+# confluence_stackbuilder_rollout_policy.py.
+STACKBUILDER_SETTLED_POLICY_DECISIONS: dict[
+    str, dict[str, str],
+] = {
+    "rerun_cadence": {
+        "value": "manual_supervised",
+        "rationale": (
+            "Operator reframed the original cadence "
+            "question (calendar-month vs trading-day vs "
+            "rolling-window vs operator-triggered) into "
+            "a transparency policy. Cadence is "
+            "operator-managed; no scheduler, no cron, "
+            "no automation runner. Each ticker is a "
+            "separate explicitly authorized "
+            "invocation."
+        ),
+        "evidence": (
+            "Carryforward item #4 "
+            "(md_library/shared/2026-05-23_POST_PHASE_6I"
+            "_SPRINT_CARRYFORWARD.md): "
+            "Status RESOLVED 2026-05-30. "
+            "In-source pin: "
+            "confluence_stackbuilder_rollout_policy.py "
+            "POLICY_RERUN_CADENCE = 'manual_supervised' "
+            "(no-scheduler comment colocated)."
+        ),
+    },
+}
+
+
 # Items the launch planner CANNOT decide on its own and
 # that need an explicit operator decision before a
 # large-universe StackBuilder rerun is authorized.
@@ -449,10 +485,6 @@ STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS: tuple[
     "for a large-universe launch. Operator decision: "
     "fixed 12, fixed N, per-ticker N tuned by market-cap "
     "/ liquidity, or other criterion.",
-    "Re-run cadence: the planner does NOT yet have a "
-    "policy for how often a ticker's StackBuilder run "
-    "should be regenerated (daily / weekly / on "
-    "invalid-member-detected). Operator decision.",
     "Invalid-member rotation: when a member is flagged "
     "``invalid_or_delisted`` (Phase 6I-43), should the "
     "next StackBuilder run for the affected ticker(s) "
@@ -1599,6 +1631,9 @@ def build_large_universe_launch_plan(
         ),
         "proposed_launch_defaults": (
             STACKBUILDER_PROPOSED_LAUNCH_DEFAULTS
+        ),
+        "settled_policy_decisions": dict(
+            STACKBUILDER_SETTLED_POLICY_DECISIONS,
         ),
         "unresolved_policy_questions": list(
             STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS,

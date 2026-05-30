@@ -98,7 +98,6 @@ def _launch_plan(rows: list[dict[str, Any]]) -> dict[
                 "combine_mode: ...",
                 "seed_by/optimize_by: ...",
                 "member-universe sizing: ...",
-                "rerun cadence: ...",
                 "invalid-member rotation: ...",
             ],
         },
@@ -690,7 +689,11 @@ def test_unresolved_policy_questions_carry_through():
     rollout = rbp.build_rollout_batch_plan(plan)
     questions = rollout["unresolved_policy_questions"]
     assert isinstance(questions, list)
-    assert len(questions) == 6
+    # Re-run cadence was settled by carryforward item #4
+    # (manual_supervised, no scheduler) and is no longer in
+    # the unresolved list; the remaining five questions
+    # still carry through verbatim from the input plan.
+    assert len(questions) == 5
     # The strings are passed through verbatim from the
     # input launch plan.
     assert any(

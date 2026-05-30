@@ -722,11 +722,14 @@ def _candidate_stackbuilder_rerun_commands(
 
     Without ``--accept-proposed-stackbuilder-defaults``
     the candidate is marked ``blocked_by_policy_decision
-    =True`` because the 6 unresolved policy questions
+    =True`` because the 5 unresolved policy questions
     (both_modes, combine_mode intersection-vs-union,
     seed_by/optimize_by, member-universe sizing,
-    rerun cadence, invalid-member rotation) have not
-    been accepted yet."""
+    invalid-member rotation) have not been accepted yet.
+    The earlier rerun-cadence question was settled by
+    carryforward item #4 and is now recorded as settled
+    policy (manual_supervised) rather than as an open
+    question; it does not contribute to the block."""
     argv = [
         PINNED_INTERPRETER,
         "stackbuilder.py",
@@ -766,14 +769,17 @@ def _candidate_stackbuilder_rerun_commands(
         operator_policy_required = True
         notes = (
             "BLOCKED_BY_POLICY_DECISION: the Phase 6I-50 "
-            "StackBuilder policy section's 6 unresolved "
+            "StackBuilder policy section's 5 unresolved "
             "questions (both_modes, combine_mode "
             "intersection-vs-union, seed_by/optimize_by, "
-            "member-universe sizing, rerun cadence, "
-            "invalid-member rotation) have NOT been "
-            "accepted. Pass --accept-proposed-"
-            "stackbuilder-defaults to flip this candidate "
-            "to ready_for_authorization (but the command "
+            "member-universe sizing, invalid-member "
+            "rotation) have NOT been accepted. The earlier "
+            "rerun-cadence question was settled by "
+            "carryforward item #4 (manual_supervised, no "
+            "scheduler) and no longer contributes to this "
+            "block. Pass --accept-proposed-stackbuilder-"
+            "defaults to flip this candidate to "
+            "ready_for_authorization (but the command "
             "STILL is not executed by this planner)."
         )
     return [{
