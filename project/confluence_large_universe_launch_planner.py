@@ -350,10 +350,11 @@ STACKBUILDER_OBSERVED_DEFAULTS: dict[str, Any] = {
     "both_modes": False,
     "alpha": 0.05,
     "min_marginal_capture": 0.0,
-    # Phase 6I-50 amendment-1 correction: k_patience
-    # default is 0 (not 1 as the original block
-    # claimed). Source: ``--k-patience type=int default=0``.
-    "k_patience": 0,
+    # Carryforward item #3 (operator-decided): the engine
+    # argparse --k-patience default was aligned from 0 to 1
+    # to match the runner CLI default and the Dash UI
+    # hardcode. Source: ``--k-patience type=int default=1``.
+    "k_patience": 1,
     # Phase 6I-50 amendment-1 correction: combine_mode IS
     # exposed as a CLI argument with documented default
     # ``intersection``. Source:
