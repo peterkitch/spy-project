@@ -415,12 +415,24 @@ STACKBUILDER_PROPOSED_LAUNCH_DEFAULTS: dict[str, Any] = {
 
 # Settled policy decisions captured here so the report
 # documents what the operator HAS decided, distinct from
-# observed/proposed defaults and from items still open
-# below. Style mirrors the {value, rationale, evidence}
-# shape used by LOCKED_POLICY_DECISIONS in
+# observed/proposed defaults. Style mirrors the
+# {value, rationale, evidence} shape used by
+# LOCKED_POLICY_DECISIONS in
 # confluence_stackbuilder_rollout_policy.py.
+#
+# All six launch-policy questions are now settled. The
+# launch authorization gate in
+# confluence_large_universe_rollout_batch_planner.py
+# remains fail-closed by default regardless of this
+# settlement: policy settlement is NOT launch
+# authorization. The operator's explicit
+# --accept-proposed-stackbuilder-defaults flag is still
+# required to flip a candidate to
+# ready_for_authorization, and candidate StackBuilder
+# commands are still emitted as strings only and not
+# executed by the planner.
 STACKBUILDER_SETTLED_POLICY_DECISIONS: dict[
-    str, dict[str, str],
+    str, dict[str, Any],
 ] = {
     "rerun_cadence": {
         "value": "manual_supervised",
@@ -445,53 +457,180 @@ STACKBUILDER_SETTLED_POLICY_DECISIONS: dict[
             "(no-scheduler comment colocated)."
         ),
     },
+    "both_modes": {
+        "value": False,
+        "rationale": (
+            "Operator-ratified: the large-universe "
+            "launch remains single-direction. "
+            "both_modes=True is deferred because it "
+            "adds 2^K combinatorial work per K level "
+            "and is not needed for the K=6 MTF launch "
+            "path, which is single-direction by "
+            "construction."
+        ),
+        "evidence": (
+            "Convergent source defaults at every layer: "
+            "stackbuilder.py argparse default "
+            "(store_true => False); "
+            "stackbuilder_workbook_runner.py SimpleNamespace "
+            "handoff hardcodes both_modes=False; "
+            "stackbuilder.py run_dash callback hardcodes "
+            "both_modes=False; "
+            "STACKBUILDER_OBSERVED_DEFAULTS records "
+            "both_modes=False; "
+            "confluence_stackbuilder_rollout_policy.py "
+            "POLICY_BOTH_MODES = False (first-rollout "
+            "lock with explicit rationale)."
+        ),
+    },
+    "combine_mode": {
+        "value": "intersection",
+        "rationale": (
+            "Operator-ratified: use the conservative "
+            "all-members-agree path. Intersection matches "
+            "the current defaults at every layer and "
+            "preserves output comparability with prior "
+            "intersection-mode runs (including the "
+            "8-secondary K=6 MTF MVP). Union is deferred "
+            "because the Phase 6I-22 multi-window K input "
+            "adapter has no combine_mode awareness today, "
+            "so a switch to union would require a "
+            "separate downstream audit."
+        ),
+        "evidence": (
+            "stackbuilder.py argparse "
+            "--combine-mode default='intersection'; "
+            "stackbuilder_workbook_runner.py SimpleNamespace "
+            "handoff hardcodes combine_mode='intersection'; "
+            "STACKBUILDER_OBSERVED_DEFAULTS and "
+            "STACKBUILDER_PROPOSED_LAUNCH_DEFAULTS both "
+            "record intersection; "
+            "confluence_stackbuilder_rollout_policy.py "
+            "POLICY_COMBINE_MODE = 'intersection' "
+            "(first-rollout lock)."
+        ),
+    },
+    "seed_by": {
+        "value": "total_capture",
+        "rationale": (
+            "Operator-ratified: total_capture is the "
+            "only engine-supported selection axis after "
+            "Phase 6I-73 removed Sharpe as a selection "
+            "criterion. The earlier unresolved-question "
+            "wording's 'vs sharpe_ratio' suggestion is "
+            "obsolete; the engine's argparse choices "
+            "list now accepts only total_capture."
+        ),
+        "evidence": (
+            "stackbuilder.py argparse "
+            "--seed-by choices=['total_capture']; "
+            "Phase 6I-73 comment colocated in the same "
+            "argparse block; "
+            "confluence_stackbuilder_rollout_policy.py "
+            "POLICY_SEED_BY = 'total_capture' "
+            "(first-rollout lock)."
+        ),
+    },
+    "optimize_by": {
+        "value": "total_capture",
+        "rationale": (
+            "Operator-ratified: total_capture is the "
+            "only engine-supported optimize axis after "
+            "Phase 6I-73. Explicit pin matches seed_by; "
+            "stackbuilder.py auto-resolves an unset "
+            "--optimize-by to --seed-by, so this pin is "
+            "redundant at runtime but explicit for "
+            "audit clarity."
+        ),
+        "evidence": (
+            "stackbuilder.py argparse "
+            "--optimize-by choices=['total_capture'] "
+            "with default=None auto-resolving to "
+            "seed_by; "
+            "confluence_stackbuilder_rollout_policy.py "
+            "POLICY_OPTIMIZE_BY = 'total_capture' "
+            "(first-rollout lock)."
+        ),
+    },
+    "member_universe_sizing": {
+        "value": "fixed_k6_mtf_member_structure",
+        "rationale": (
+            "Operator-ratified: the launch uses the "
+            "K=6 MTF launch path's member structure as "
+            "defined by the K=6 MTF launch path "
+            "contract. K=6 here names the stack size. "
+            "Variable per-ticker sizing tuned by "
+            "market-cap or liquidity is deferred to "
+            "Phase 7+ because no per-ticker sizing "
+            "module exists in current source; choosing "
+            "it would imply a separate design and build "
+            "(criterion, data source, thresholds, "
+            "recompute cadence, audit). This entry "
+            "deliberately does NOT pin any specific "
+            "member-count number; the legacy SPY "
+            "seed-run observation was explicitly "
+            "classified background-only by Phase 6I-52 "
+            "amendment-1 and is not a locked guarantee."
+        ),
+        "evidence": (
+            "md_library/shared/2026-05-27_K6_MTF_LAUNCH"
+            "_PATH_CONTRACT.md (the K=6 MTF launch path "
+            "contract); "
+            "confluence_stackbuilder_rollout_policy.py "
+            "Phase 6I-52 amendment-1 comment block on "
+            "background-not-locked member-count "
+            "observation."
+        ),
+    },
+    "invalid_member_rotation": {
+        "value": "partial_effective_members_with_warning",
+        "rationale": (
+            "Operator-ratified: keep the current "
+            "implemented behavior. When a member is "
+            "flagged invalid_or_delisted (Phase 6I-43), "
+            "the StackBuilder run completes and the "
+            "downstream Phase 6I-46 / 6I-47 / 6I-48 / "
+            "6I-49 partial-payload contract carries the "
+            "partial result with a visible warning. "
+            "Auto-substitution is deferred because "
+            "substituting a member changes the build "
+            "balance and requires fresh design and "
+            "build (substitution algorithm, fallback "
+            "pool, invalidation tracking, audit "
+            "trail) -- not a launch-policy flip."
+        ),
+        "evidence": (
+            "confluence_stackbuilder_rollout_policy.py "
+            "POLICY_INVALID_MEMBER_ROTATION = "
+            "'partial_effective_members_with_warning' "
+            "(first-rollout lock with explicit "
+            "no-auto-substitution rationale)."
+        ),
+    },
 }
 
 
-# Items the launch planner CANNOT decide on its own and
-# that need an explicit operator decision before a
-# large-universe StackBuilder rerun is authorized.
+# All six launch-policy questions above have been
+# ratified by the operator and recorded in
+# STACKBUILDER_SETTLED_POLICY_DECISIONS. No items remain
+# open in this tuple. The tuple is preserved as an empty
+# tuple so downstream code that iterates over it
+# (counts, list-converts, threads it through the
+# stackbuilder_policy report block) continues to work
+# without conditional branches. Future questions can
+# append here if they arise.
+#
+# Important: policy settlement is NOT launch
+# authorization. The launch gate in
+# confluence_large_universe_rollout_batch_planner.py
+# remains fail-closed by default regardless of this
+# tuple being empty; the operator's explicit
+# --accept-proposed-stackbuilder-defaults flag is still
+# the only path to flip a candidate to
+# ready_for_authorization.
 STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS: tuple[
     str, ...,
-] = (
-    "both_modes: observed default is False. Should the "
-    "large-universe launch run both Buy + Short pairs "
-    "(``both_modes=True``) or stick with the current "
-    "single-direction default? The Phase 6I-50 prompt "
-    "asked the planner to leave this unresolved.",
-    "combine_mode: stackbuilder.py exposes "
-    "``--combine-mode choices=['intersection','union'] "
-    "default='intersection'`` (Phase 6I-50 amendment-1 "
-    "correction; the original Phase 6I-50 block "
-    "incorrectly claimed the CLI did not expose this "
-    "argument). The observed default is ``intersection``; "
-    "the operator must confirm whether the large-universe "
-    "launch should KEEP intersection (the conservative "
-    "all-members-agree path) or switch to ``union`` "
-    "(any-member-agree). The same confirmation should "
-    "verify the Phase 6I-22 multi-window K input adapter "
-    "respects the chosen combine mode.",
-    "seed_by / optimize_by: stackbuilder.py treats these "
-    "as dashboard-layer settings, with optimize_by "
-    "auto-resolving to seed_by when unset. The planner's "
-    "proposal (both set to ``total_capture``) needs "
-    "operator confirmation that ``total_capture`` is the "
-    "intended large-universe launch metric (vs. "
-    "``sharpe_ratio`` or another seed/optimize axis).",
-    "Per-ticker member-universe sizing: each StackBuilder "
-    "run encodes a fixed member set (12 for the SPY "
-    "K-universe). The planner does NOT yet have a policy "
-    "for how to choose member-universe size per ticker "
-    "for a large-universe launch. Operator decision: "
-    "fixed 12, fixed N, per-ticker N tuned by market-cap "
-    "/ liquidity, or other criterion.",
-    "Invalid-member rotation: when a member is flagged "
-    "``invalid_or_delisted`` (Phase 6I-43), should the "
-    "next StackBuilder run for the affected ticker(s) "
-    "auto-substitute another candidate member, or stay "
-    "with the partial-multiwindow contract until manual "
-    "review? Operator decision.",
-)
+] = ()
 
 
 # ---------------------------------------------------------------------------

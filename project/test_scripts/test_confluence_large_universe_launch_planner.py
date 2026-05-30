@@ -886,8 +886,15 @@ def test_aggregate_report_shape_and_stackbuilder_policy(
         policy["proposed_launch_defaults"]["search"]
         == "beam"
     )
+    # All six launch-policy questions are now settled at
+    # the launch planner; the unresolved-questions list
+    # is empty. Settlement does NOT auto-authorize the
+    # large-universe launch -- the rollout planner's
+    # launch-authorization gate remains fail-closed by
+    # default (verified separately in
+    # test_confluence_large_universe_rollout_batch_planner).
     assert (
-        len(policy["unresolved_policy_questions"]) >= 4
+        len(policy["unresolved_policy_questions"]) == 0
     )
     assert "CCC" in (
         policy["tickers_with_invalid_members_in_run"]
@@ -1065,14 +1072,18 @@ def test_observed_defaults_match_stackbuilder_parse_args_defaults():
     assert observed["entry_argument"] == "--secondary"
 
 
-def test_unresolved_questions_no_longer_claim_combine_mode_missing():
+def test_combine_mode_is_settled_to_intersection_not_unresolved():
     """Phase 6I-50 amendment-1 reworded the combine_mode
-    unresolved-policy entry so it no longer incorrectly
-    claims the CLI lacks a ``--combine-mode`` argument.
-    The reworded entry should affirm that the argument IS
-    exposed and that the unresolved question is whether
-    the operator wants to keep ``intersection`` or switch
-    to ``union``."""
+    unresolved-policy entry to no longer incorrectly
+    claim the CLI lacks a ``--combine-mode`` argument.
+    The operator has now ratified combine_mode as
+    intersection; the entry must live in
+    STACKBUILDER_SETTLED_POLICY_DECISIONS rather than the
+    unresolved list, and the recorded value must be
+    ``intersection`` with rationale and evidence
+    fields."""
+    # No combine_mode entry remains in the (now-empty)
+    # unresolved-questions tuple.
     questions = list(
         lup.STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS,
     )
@@ -1080,23 +1091,23 @@ def test_unresolved_questions_no_longer_claim_combine_mode_missing():
         q for q in questions
         if q.startswith("combine_mode")
     ]
-    # The block still includes a combine_mode entry (the
-    # operator may want to keep it on the unresolved list
-    # so the launch run is explicitly authorized), but
-    # the wording must not claim CLI absence.
-    assert len(combine_entries) == 1
-    entry = combine_entries[0]
-    # Forbidden wording from the original (wrong) block.
-    # The corrective wording may reference the historical
-    # error in past tense, which is allowed; the guards
-    # below pin only the literal regression shapes.
-    assert "does NOT expose" not in entry
-    assert "lacks ``--combine-mode``" not in entry
-    # Affirmative wording: the CLI exposes combine_mode +
-    # the default is intersection.
-    assert "exposes" in entry
-    assert "intersection" in entry
-    assert "union" in entry
+    assert combine_entries == []
+    # Settled-policy entry records the ratified value.
+    settled = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS
+    assert "combine_mode" in settled
+    entry = settled["combine_mode"]
+    assert entry["value"] == "intersection"
+    # Rationale must not regress to the historical
+    # ``does NOT expose`` / ``lacks --combine-mode``
+    # wording the original Phase 6I-50 block carried.
+    rationale = entry["rationale"]
+    assert "does NOT expose" not in rationale
+    assert "lacks ``--combine-mode``" not in rationale
+    # Evidence must reference the engine default and the
+    # rollout-policy lock so future readers can audit.
+    evidence = entry["evidence"]
+    assert "intersection" in evidence
+    assert "POLICY_COMBINE_MODE" in evidence
 
 
 # ---------------------------------------------------------------------------
@@ -1117,11 +1128,10 @@ def test_rerun_cadence_is_no_longer_unresolved_and_appears_as_settled_policy():
         q for q in questions if q.startswith("Re-run cadence")
     ]
     assert cadence_entries == []
-    # The other operator-decision questions remain open and
-    # blocking; the unresolved-list size dropped by exactly
-    # one (from six to five) compared with the pre-item-#4
-    # shape.
-    assert len(questions) == 5
+    # After the five-question settlement PR, all launch-
+    # policy questions are settled; the unresolved-list
+    # is empty.
+    assert len(questions) == 0
     # Settled-policy block now records cadence with the
     # locked value and an evidence pointer that future
     # readers can audit.
@@ -1137,12 +1147,12 @@ def test_rerun_cadence_is_no_longer_unresolved_and_appears_as_settled_policy():
 
 
 def test_settled_policy_decisions_appear_in_stackbuilder_policy_block():
-    """The build_large_universe_launch_plan report exposes the new
+    """The build_large_universe_launch_plan report exposes the
     settled_policy_decisions key alongside observed defaults, proposed
-    defaults, and the (now smaller) unresolved-policy-questions list.
-    The block fail-closed default behavior is unchanged: this test
-    only pins that the new key is present and carries the cadence
-    decision."""
+    defaults, and the (now-empty) unresolved-policy-questions list.
+    The launch-authorization gate is verified separately in the
+    rollout-batch-planner tests; this test only pins the launch
+    planner's report shape."""
     report = lup.build_large_universe_launch_plan(
         [],
         artifact_root=None,
@@ -1156,8 +1166,93 @@ def test_settled_policy_decisions_appear_in_stackbuilder_policy_block():
     assert isinstance(settled, dict)
     assert "rerun_cadence" in settled
     assert settled["rerun_cadence"]["value"] == "manual_supervised"
-    # The unresolved-questions list is still present, still
-    # a list, and still carries the remaining five operator
-    # decisions.
+    # All six launch-policy questions are now settled; the
+    # unresolved-questions list is present, still a list,
+    # and empty.
     assert isinstance(policy["unresolved_policy_questions"], list)
-    assert len(policy["unresolved_policy_questions"]) == 5
+    assert len(policy["unresolved_policy_questions"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Five-question settlement: each new settled-policy entry exists with the
+# expected operator-ratified value, plus the member_universe_sizing guard.
+# ---------------------------------------------------------------------------
+
+
+def test_unresolved_policy_questions_is_empty_tuple_after_full_settlement():
+    """All six launch-policy questions are now settled; the unresolved
+    tuple is empty and the symbol is still defined for downstream code
+    that iterates over it."""
+    assert isinstance(
+        lup.STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS, tuple,
+    )
+    assert lup.STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS == ()
+
+
+def test_both_modes_settled_to_false():
+    """Operator-ratified: large-universe launch stays single-direction."""
+    entry = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS["both_modes"]
+    assert entry["value"] is False
+    assert "single-direction" in entry["rationale"]
+    assert "2^K" in entry["rationale"]
+    assert "POLICY_BOTH_MODES" in entry["evidence"]
+
+
+def test_seed_by_settled_to_total_capture():
+    """Operator-ratified: total_capture is the only engine-supported axis
+    after Phase 6I-73."""
+    entry = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS["seed_by"]
+    assert entry["value"] == "total_capture"
+    assert "Phase 6I-73" in entry["rationale"]
+    assert "choices=['total_capture']" in entry["evidence"]
+
+
+def test_optimize_by_settled_to_total_capture():
+    """Operator-ratified: total_capture; matches seed_by; explicit pin
+    for audit clarity even though the engine auto-resolves an unset
+    --optimize-by to --seed-by."""
+    entry = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS["optimize_by"]
+    assert entry["value"] == "total_capture"
+    assert "seed_by" in entry["rationale"]
+    assert "choices=['total_capture']" in entry["evidence"]
+
+
+def test_invalid_member_rotation_settled_to_partial_effective_with_warning():
+    """Operator-ratified: keep the current Phase 6I-43 + Phase 6I-46/47/48/49
+    partial-payload contract; auto-substitute deferred because it requires
+    fresh design and build."""
+    entry = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS[
+        "invalid_member_rotation"
+    ]
+    assert (
+        entry["value"] == "partial_effective_members_with_warning"
+    )
+    assert "Auto-substitution is deferred" in entry["rationale"]
+    assert (
+        "POLICY_INVALID_MEMBER_ROTATION" in entry["evidence"]
+    )
+
+
+def test_member_universe_sizing_settled_to_k6_mtf_member_structure_without_pin():
+    """Operator-ratified: launch uses the K=6 MTF launch-path member
+    structure. The entry must NOT pin the legacy '12' member-count
+    observation and must NOT pin any 'member_universe_size' number;
+    variable per-ticker sizing is deferred to Phase 7+."""
+    entry = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS[
+        "member_universe_sizing"
+    ]
+    assert entry["value"] == "fixed_k6_mtf_member_structure"
+    # Phase 7+ deferral wording.
+    assert "Phase 7+" in entry["rationale"]
+    # Evidence cites the K=6 MTF launch path contract.
+    assert (
+        "2026-05-27_K6_MTF_LAUNCH" in entry["evidence"]
+    )
+    # Guard: no literal "12" and no "member_universe_size"
+    # appear anywhere in this entry. The Phase 6I-52
+    # amendment-1 background-only classification of the
+    # legacy SPY 12-member observation must not be
+    # re-elevated into a locked guarantee here.
+    flat = " ".join(str(v) for v in entry.values())
+    assert "12" not in flat
+    assert "member_universe_size" not in flat

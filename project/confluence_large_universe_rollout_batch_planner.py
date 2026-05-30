@@ -34,13 +34,19 @@ What this module IS
     would run next (with the pinned interpreter path) plus
     an ``authorization_class`` tag describing the kind of
     authorization that command would require.
-  * A StackBuilder policy gate. By default, stackbuilder
-    rerun candidates are marked
-    ``blocked_by_policy_decision=true`` (the Phase 6I-50
-    StackBuilder policy section's 5 unresolved questions
-    are unresolved; the earlier rerun-cadence question was
-    settled by carryforward item #4 and is no longer in
-    the block). Passing
+  * A StackBuilder launch-authorization gate. By default,
+    stackbuilder rerun candidates are marked
+    ``blocked_by_policy_decision=true`` because the
+    launch is gated on the operator's explicit
+    authorization, NOT on whether policy is settled. The
+    six Phase 6I-50 / carryforward-item-#4 launch-policy
+    questions (rerun_cadence, both_modes, combine_mode,
+    seed_by, optimize_by, member_universe_sizing,
+    invalid_member_rotation) are now all settled and
+    recorded in
+    ``confluence_large_universe_launch_planner.
+    STACKBUILDER_SETTLED_POLICY_DECISIONS``; settlement
+    is not authorization. Passing
     ``--accept-proposed-stackbuilder-defaults`` flips the
     block off so the operator can review the candidate
     commands as ``ready_for_authorization`` -- but the
@@ -56,9 +62,12 @@ What this module IS NOT
     documented as **strings** in the JSON output; the
     operator runs them (or not) in a separate, explicitly
     authorized session.
-  * **NOT a policy authority.** The Phase 6I-50
-    StackBuilder unresolved questions remain operator
-    decisions; this module surfaces them through unchanged.
+  * **NOT a policy authority.** The Phase 6I-50 /
+    carryforward-item-#4 StackBuilder launch policy is
+    settled at the launch planner and this module
+    surfaces those decisions through unchanged; this
+    module does not authorize launch even when policy is
+    fully settled.
   * **NOT a renderer.** This module emits JSON; rendering
     is the job of ``confluence_static_board_renderer``.
 
@@ -221,6 +230,18 @@ POLICY_BASIS_OBSERVED_DEFAULTS: str = "observed_defaults"
 POLICY_BASIS_PROPOSED_DEFAULTS: str = "proposed_defaults"
 POLICY_BASIS_UNRESOLVED_QUESTIONS: str = (
     "unresolved_questions"
+)
+# After all six launch-policy questions were settled at
+# the launch planner, the default-blocked path now tags
+# its basis as launch_authorization_required: the
+# candidate is blocked NOT because policy is unresolved,
+# but because launch authorization is a separate
+# operator step. POLICY_BASIS_UNRESOLVED_QUESTIONS is
+# preserved as an exported symbol for backward
+# compatibility but is no longer the active blocked
+# basis.
+POLICY_BASIS_LAUNCH_AUTHORIZATION_REQUIRED: str = (
+    "launch_authorization_required"
 )
 
 
@@ -724,14 +745,16 @@ def _candidate_stackbuilder_rerun_commands(
 
     Without ``--accept-proposed-stackbuilder-defaults``
     the candidate is marked ``blocked_by_policy_decision
-    =True`` because the 5 unresolved policy questions
-    (both_modes, combine_mode intersection-vs-union,
-    seed_by/optimize_by, member-universe sizing,
-    invalid-member rotation) have not been accepted yet.
-    The earlier rerun-cadence question was settled by
-    carryforward item #4 and is now recorded as settled
-    policy (manual_supervised) rather than as an open
-    question; it does not contribute to the block."""
+    =True`` because launch authorization is a separate
+    explicit operator step. The six Phase 6I-50 /
+    carryforward-item-#4 launch-policy questions
+    (rerun_cadence, both_modes, combine_mode, seed_by,
+    optimize_by, member_universe_sizing,
+    invalid_member_rotation) are now all settled at the
+    launch planner; policy settlement is NOT launch
+    authorization. The default-blocked basis is now
+    ``launch_authorization_required`` rather than
+    ``unresolved_questions``."""
     argv = [
         PINNED_INTERPRETER,
         "stackbuilder.py",
@@ -767,21 +790,25 @@ def _candidate_stackbuilder_rerun_commands(
             "authorized session."
         )
     else:
-        policy_basis = POLICY_BASIS_UNRESOLVED_QUESTIONS
+        policy_basis = (
+            POLICY_BASIS_LAUNCH_AUTHORIZATION_REQUIRED
+        )
         operator_policy_required = True
         notes = (
-            "BLOCKED_BY_POLICY_DECISION: the Phase 6I-50 "
-            "StackBuilder policy section's 5 unresolved "
-            "questions (both_modes, combine_mode "
-            "intersection-vs-union, seed_by/optimize_by, "
-            "member-universe sizing, invalid-member "
-            "rotation) have NOT been accepted. The earlier "
-            "rerun-cadence question was settled by "
-            "carryforward item #4 (manual_supervised, no "
-            "scheduler) and no longer contributes to this "
-            "block. Pass --accept-proposed-stackbuilder-"
-            "defaults to flip this candidate to "
-            "ready_for_authorization (but the command "
+            "BLOCKED_BY_POLICY_DECISION: launch "
+            "authorization is required as a separate "
+            "explicit operator step. The six Phase 6I-50 "
+            "/ carryforward-item-#4 launch-policy "
+            "questions (rerun_cadence, both_modes, "
+            "combine_mode, seed_by, optimize_by, "
+            "member_universe_sizing, "
+            "invalid_member_rotation) are settled at the "
+            "launch planner and recorded in "
+            "STACKBUILDER_SETTLED_POLICY_DECISIONS, but "
+            "policy settlement is not launch "
+            "authorization. Pass --accept-proposed-"
+            "stackbuilder-defaults to flip this candidate "
+            "to ready_for_authorization (but the command "
             "STILL is not executed by this planner)."
         )
     return [{
