@@ -22,7 +22,15 @@ This doc covers only the SPRINT-RELEVANT bucket.
 
 ### 1. CLAUDE.md sprint-state drift
 
-Status: OPEN. Highest priority. Touches every future Claude Code session.
+Status: OPEN. Highest priority. CLAUDE.md sprint-state drift surface was resolved by PR #352 (merge commit 8a73cad6f6349934cf8421f0093689c0bd71a38a, 2026-05-29). Item kept OPEN to track one remaining sub-bullet that is blocked on operator-supplied evidence; see Progress note below. Touches every future Claude Code session.
+
+Progress (PR #352, 2026-05-29):
+
+- PR #352 was a documentation-only CLAUDE.md edit (single-commit, single-file). Two surgical edits applied: (1) the opening operational context dropped the stale "post-Phase 5D-1 onboarding / Phase 5C closed / Phase 5D controlled compute in progress" wording and redirected readers to section 6 "Current Sprint State" and the carryforward ledger named in section 8; (2) the "Recent merged phase trail (post Phase 6I-79)" block in section 6 gained a single paragraph forward-referencing item #5 of this ledger for the post-PR-#345 fast-default cleanup chain (PRs #345 through #350, closeout in PR #351). The cleanup chain is documented by reference, not duplicated.
+- Sub-bullet (a) "Phase 6I sprint closed, with Phase 6I-77, 6I-78, and 6I-79 merged" - applied via redirect. CLAUDE.md section 6 already describes Phase 6I as closed; PR #352 brought the opening operational context into agreement with it.
+- Sub-bullet (b) "Phase 7+ scoping doc exists and has been amended with carry-forward items" - already current in CLAUDE.md section 8 pre-PR #352, which names both this ledger and the Phase 7+ scoping doc as durable tracking docs. No edit was needed.
+- Sub-bullet (c) "Next sprint: TrafficFlow headless development" - moot, not pending. Current CLAUDE.md section 6 already supersedes this older wording: TrafficFlow headless development is documented as substantially complete through Phase E PR Epsilon, and the named next direction is "MTF and Confluence integration with canonical TrafficFlow output". Regressing CLAUDE.md to the older sub-bullet wording would be a backward step. PR #352 correctly preserved the newer section 6 wording.
+- Sub-bullet (d) "ImpactSearch capture-metric integrity audit is operator-confirmed RESOLVED. Remove or correct the parked-investigation note." - pending. The parked-investigation note lives at CLAUDE.md L995 inside a clearly-historical "## Sprint State (as of 2026-05-08 - HISTORICAL, superseded by section 6 Current Sprint State as of 2026-05-10 above)" block. No independently verifiable resolution PR was found in the recent merged history to cite when amending the historical note. Item #1 stays OPEN until an operator-supplied resolution-PR reference is available; at that point the historical note can be corrected in a follow-up docs-only PR and item #1 can transition OPEN -> RESOLVED with the resolution date and final PR reference per "How This Doc Is Used".
 
 Description: CLAUDE.md still references older Phase 5D and Phase 6I-33 sprint state despite main being past Phase 6I-79. Future Claude Code sessions reading CLAUDE.md will receive inaccurate context about the current state of the project. The doc should be updated to reflect:
 
