@@ -184,7 +184,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("total_capture", "auto"),
         default=DEFAULT_OPTIMIZE_BY,
     )
-    p.add_argument("--allow-decreasing", action="store_true", default=False)
+    # Carryforward item #3 (operator-decided): the headless allow-decreasing
+    # default is True on the runner CLI. The opt-out is --no-allow-decreasing.
+    # Both flags share dest=allow_decreasing; if both are passed on one
+    # command line, argparse processes them left to right and the last one
+    # wins. set_defaults below pins the True default unambiguously.
+    p.add_argument(
+        "--allow-decreasing",
+        dest="allow_decreasing",
+        action="store_true",
+        help=(
+            "Default True on headless runs; pass --no-allow-decreasing to "
+            "opt out and reinstate the strict monotone-improvement gate."
+        ),
+    )
+    p.add_argument(
+        "--no-allow-decreasing",
+        dest="allow_decreasing",
+        action="store_false",
+        help=(
+            "Opt out of the default-True allow-decreasing behavior; "
+            "reinstates the strict monotone-improvement gate."
+        ),
+    )
+    p.set_defaults(allow_decreasing=True)
     p.add_argument(
         "--k-patience",
         type=int,

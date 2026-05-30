@@ -128,7 +128,9 @@ def test_parse_args_defaults_match_locked_v1():
     assert args.sharpe_eps == pytest.approx(0.01)
     assert args.seed_by == "total_capture"
     assert args.optimize_by == "auto"
-    assert args.allow_decreasing is False
+    # Carryforward item #3: operator-decided headless flip. Runner CLI
+    # defaults allow_decreasing to True; --no-allow-decreasing opts out.
+    assert args.allow_decreasing is True
     assert args.jobs == 1
     assert args.write is False
     assert args.allow_network_fetch is False
@@ -747,7 +749,9 @@ def test_build_stackbuilder_args_namespace_matches_dash_defaults():
     assert ns.optimize_by == "total_capture"
     assert ns.search == "beam"
     assert ns.beam_width == 12
-    assert ns.allow_decreasing is False
+    # Carryforward item #3: handoff propagates the runner CLI's new
+    # default-True allow_decreasing through build_stackbuilder_args_namespace.
+    assert ns.allow_decreasing is True
     assert ns.prefer_impact_xlsx is True
 
 
@@ -1285,10 +1289,48 @@ def test_dry_run_plan_effective_config_includes_k_patience_and_allow_decreasing(
     assert cfg["allow_decreasing"] is True
 
 
-def test_allow_decreasing_default_unchanged_by_k_patience_addition():
-    """Adding --k-patience must not change --allow-decreasing default
-    behavior."""
+def test_runner_allow_decreasing_default_true_with_backcompat_legacy_flag():
+    """Carryforward item #3 (operator-decided): the runner CLI defaults
+    allow_decreasing to True. The legacy --allow-decreasing flag remains
+    parseable and still resolves to True (backward compatibility)."""
     args_default = runner.parse_args(["--secondaries", "SPY"])
-    assert args_default.allow_decreasing is False
+    assert args_default.allow_decreasing is True
     args_set = runner.parse_args(["--secondaries", "SPY", "--allow-decreasing"])
     assert args_set.allow_decreasing is True
+
+
+def test_runner_parse_args_no_allow_decreasing_opts_out_to_false():
+    """Carryforward item #3: --no-allow-decreasing is the explicit opt-out
+    from the new default-True contract; it sets allow_decreasing to False."""
+    args = runner.parse_args(["--secondaries", "SPY", "--no-allow-decreasing"])
+    assert args.allow_decreasing is False
+
+
+def test_runner_build_stackbuilder_args_namespace_propagates_no_allow_decreasing_opt_out():
+    """The runner handoff carries the --no-allow-decreasing opt-out value
+    through to the engine's SimpleNamespace."""
+    args = runner.parse_args(["--secondaries", "SPY", "--no-allow-decreasing"])
+    ns = runner.build_stackbuilder_args_namespace(
+        args, "SPY",
+        primaries_resolution={
+            "status": "ok", "primary_source": "impact_xlsx",
+            "primaries": [], "primary_count": 0,
+            "source_path": None, "issues": [],
+        },
+    )
+    assert ns.allow_decreasing is False
+
+
+def test_runner_build_stackbuilder_args_namespace_propagates_backcompat_allow_decreasing_flag():
+    """The runner handoff carries the legacy --allow-decreasing flag value
+    (True) through to the engine's SimpleNamespace."""
+    args = runner.parse_args(["--secondaries", "SPY", "--allow-decreasing"])
+    ns = runner.build_stackbuilder_args_namespace(
+        args, "SPY",
+        primaries_resolution={
+            "status": "ok", "primary_source": "impact_xlsx",
+            "primaries": [], "primary_count": 0,
+            "source_path": None, "issues": [],
+        },
+    )
+    assert ns.allow_decreasing is True

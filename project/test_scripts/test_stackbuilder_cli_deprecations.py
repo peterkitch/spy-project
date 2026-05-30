@@ -171,3 +171,30 @@ def test_alpha_equals_form_emits_deprecation_warning(capsys):
         f"expected --alpha deprecation line for equals-form; got:\n{err}"
     )
     assert ns.alpha == 0.10
+
+
+# ---------------------------------------------------------------------------
+# E - allow-decreasing default and opt-out (carryforward item #3)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_allow_decreasing_default_is_true_when_no_flag():
+    """Carryforward item #3 (operator-decided): the engine CLI defaults
+    allow_decreasing to True when neither --allow-decreasing nor
+    --no-allow-decreasing is passed."""
+    ns = stackbuilder.parse_args(["--secondary", "SPY"])
+    assert ns.allow_decreasing is True
+
+
+def test_engine_no_allow_decreasing_opts_out_to_false():
+    """--no-allow-decreasing is the explicit opt-out from the new
+    default-True contract; it sets allow_decreasing to False."""
+    ns = stackbuilder.parse_args(["--secondary", "SPY", "--no-allow-decreasing"])
+    assert ns.allow_decreasing is False
+
+
+def test_engine_allow_decreasing_flag_remains_true_for_backcompat():
+    """The legacy --allow-decreasing flag remains parseable and still
+    resolves to True (backward compatibility for existing invocations)."""
+    ns = stackbuilder.parse_args(["--secondary", "SPY", "--allow-decreasing"])
+    assert ns.allow_decreasing is True
