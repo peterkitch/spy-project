@@ -1097,3 +1097,67 @@ def test_unresolved_questions_no_longer_claim_combine_mode_missing():
     assert "exposes" in entry
     assert "intersection" in entry
     assert "union" in entry
+
+
+# ---------------------------------------------------------------------------
+# Carryforward item #4 reconciliation: re-run cadence is settled, not open.
+# ---------------------------------------------------------------------------
+
+
+def test_rerun_cadence_is_no_longer_unresolved_and_appears_as_settled_policy():
+    """Carryforward item #4 resolved re-run cadence as operator-managed
+    (manual_supervised) with no scheduler. The launch planner must no
+    longer list re-run cadence as an unresolved policy question and
+    must record it as a settled policy decision instead."""
+    questions = list(
+        lup.STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS,
+    )
+    # No remaining entry starts with the cadence wording.
+    cadence_entries = [
+        q for q in questions if q.startswith("Re-run cadence")
+    ]
+    assert cadence_entries == []
+    # The other operator-decision questions remain open and
+    # blocking; the unresolved-list size dropped by exactly
+    # one (from six to five) compared with the pre-item-#4
+    # shape.
+    assert len(questions) == 5
+    # Settled-policy block now records cadence with the
+    # locked value and an evidence pointer that future
+    # readers can audit.
+    settled = lup.STACKBUILDER_SETTLED_POLICY_DECISIONS
+    assert isinstance(settled, dict)
+    assert "rerun_cadence" in settled
+    cadence_entry = settled["rerun_cadence"]
+    assert cadence_entry["value"] == "manual_supervised"
+    assert "carryforward item #4" in cadence_entry["evidence"].lower()
+    assert (
+        "POLICY_RERUN_CADENCE" in cadence_entry["evidence"]
+    )
+
+
+def test_settled_policy_decisions_appear_in_stackbuilder_policy_block():
+    """The build_large_universe_launch_plan report exposes the new
+    settled_policy_decisions key alongside observed defaults, proposed
+    defaults, and the (now smaller) unresolved-policy-questions list.
+    The block fail-closed default behavior is unchanged: this test
+    only pins that the new key is present and carries the cadence
+    decision."""
+    report = lup.build_large_universe_launch_plan(
+        [],
+        artifact_root=None,
+        cache_dir=None,
+        signal_library_dir=None,
+        stackbuilder_root=None,
+    )
+    policy = report["stackbuilder_policy"]
+    assert "settled_policy_decisions" in policy
+    settled = policy["settled_policy_decisions"]
+    assert isinstance(settled, dict)
+    assert "rerun_cadence" in settled
+    assert settled["rerun_cadence"]["value"] == "manual_supervised"
+    # The unresolved-questions list is still present, still
+    # a list, and still carries the remaining five operator
+    # decisions.
+    assert isinstance(policy["unresolved_policy_questions"], list)
+    assert len(policy["unresolved_policy_questions"]) == 5
