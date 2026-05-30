@@ -34,8 +34,13 @@ What this module IS
     *actual* StackBuilder defaults discovered from
     ``stackbuilder.py`` source, (b) the proposed
     large-universe launch defaults the Phase 6I-50 prompt
-    suggested, and (c) the unresolved policy questions.
-    The planner NEVER runs StackBuilder.
+    suggested, (c) the settled launch-policy decisions
+    the operator has ratified (recorded in
+    ``STACKBUILDER_SETTLED_POLICY_DECISIONS``), and (d) a
+    list reserved for any future unresolved policy
+    questions (currently empty; all known launch-policy
+    questions are settled). The planner NEVER runs
+    StackBuilder.
 
 What this module IS NOT
 -----------------------
@@ -405,11 +410,12 @@ STACKBUILDER_PROPOSED_LAUNCH_DEFAULTS: dict[str, Any] = {
     "combine_mode": "intersection",
     "top_n": 20,
     "bottom_n": 20,
-    # ``both_modes`` deliberately left unresolved (see
-    # STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS below) --
-    # observed default is False, but the operator's
-    # prompt explicitly asked the planner to flag this
-    # as unresolved.
+    # ``both_modes`` is intentionally omitted from the
+    # proposed launch defaults because it is recorded as
+    # a settled operator decision in
+    # STACKBUILDER_SETTLED_POLICY_DECISIONS below
+    # (both_modes=False). Including it here would conflate
+    # the proposed-default and settled-decision layers.
 }
 
 

@@ -393,8 +393,9 @@ def test_stackbuilder_rerun_uses_secondary_not_ticker():
     ):
         assert flag in argv
         assert argv[argv.index(flag) + 1] == val
-    # --both-modes is NOT auto-added (unresolved policy
-    # question).
+    # --both-modes is NOT auto-added (settled launch
+    # policy is both_modes=False; the candidate command
+    # therefore omits the --both-modes flag).
     assert "--both-modes" not in argv
 
 
