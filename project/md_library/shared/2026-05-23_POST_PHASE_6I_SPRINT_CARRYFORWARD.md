@@ -79,6 +79,18 @@ Open questions:
 
 Status: OPEN. Architectural integrity question with current evidence.
 
+Progress (defaults-diff audit completed, 2026-05-29):
+
+- Defaults-diff audit for StackBuilder is complete. The named Deliverable (a defaults-diff markdown table identifying drift points across `stackbuilder.py` argparse, the Dash UI callback, and `stackbuilder_workbook_runner.py` argparse) was produced from current `main` and recorded against in-source citations.
+- The production-relevant comparison is the headless engine argparse defaults vs the `stackbuilder_workbook_runner.py` CLI defaults. Dash UI defaults were inventoried for completeness but are informational only, because the production launch surface is headless.
+- `allow-decreasing`: engine argparse and runner CLI both currently default False, so there is no engine-vs-runner headless drift today. Operator has already decided the headless default should become True. Future remediation is a mechanical change once authorized; it is not implemented by this Progress note.
+- `k-patience`: live headless drift. Engine argparse defaults 0; runner CLI defaults 1 (documented in the runner help text as preserving the runner's prior hardcoded behavior introduced in Phase 6I-78). Alignment direction is an operator decision before remediation.
+- `sharpe-eps`: live headless drift. Engine argparse defaults 1e-6; runner CLI defaults 0.01 in Total Capture (%) units. The engine uses this value as the epsilon in the Total Capture monotone-improvement reject branch when `allow_decreasing` is False, making it a live-path knob, not inert. Alignment direction is an operator decision before remediation.
+- `optimize-by`: literal CLI defaults differ (engine None, runner `auto`), but both resolve to `total_capture` before the engine consumes them. No live remediation is needed; any future change is documentation-only.
+- Other audited defaults are aligned or are informational-only differences.
+- The audit was read-only. No source files, tests, contract docs, generated artifacts, or `.claude/` content were modified.
+- Item #3 stays OPEN because remediation work is pending: two operator decisions (k-patience and sharpe-eps alignment direction) and one mechanical follow-up PR (allow-decreasing headless flip). When those land, item #3 can transition OPEN -> RESOLVED per "How This Doc Is Used", citing the resolution date and final PR references.
+
 Description: Phase 6I-77 revealed that the LEGACY Dash UI checkbox default for `--allow-decreasing` differs from the `stackbuilder_workbook_runner.py` CLI default. The same engine can produce materially different traversal behavior depending on which interface launched the run. Phase 6I-78 added `--k-patience` runner wiring because that flag was hardcoded in the namespace, not exposed via CLI.
 
 This is likely not the only parameter pair where Dash UI defaults and runner CLI defaults disagree. A systematic audit would compare every parameter pair across:
