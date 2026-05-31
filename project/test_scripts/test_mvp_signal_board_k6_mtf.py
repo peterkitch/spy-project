@@ -1020,17 +1020,20 @@ def test_hiding_status_in_primary_table_does_not_change_unranked_section(tmp_pat
     assert "failed" in unranked_text
 
 
-def test_k6_mtf_board_columns_for_visible_returns_full_list_for_empty_visible():
-    """Defensive: when there are no visible rows (degenerate case;
-    layout takes the empty-state branch and never invokes the helper),
-    the helper should not crash and should return a consistent shape.
-    With no rows, the all-ranked predicate is vacuously true, so the
-    Status column is omitted; but the helper must still return a list
-    of the remaining columns rather than raising."""
+def test_k6_mtf_board_columns_for_visible_omits_status_for_empty_visible():
+    """Defensive path: empty visible rows.
+
+    Empty visible rows are a defensive input. In normal layout flow
+    the build-layout helper takes the empty-state branch (rendering
+    EMPTY_TABLE_MESSAGE) and never calls
+    _k6_mtf_board_columns_for_visible at all, so this code path is
+    not exercised in production. The helper must still behave
+    consistently with its no-meaningful-status predicate when it is
+    called directly: with no rows, the predicate is vacuously true,
+    so the Status column is omitted and the returned list is
+    [rank, ticker, sharpe_score]. This test pins that behavior.
+    """
     columns = board._k6_mtf_board_columns_for_visible([])
     assert isinstance(columns, list)
-    # Either shape is acceptable; the contract is "no crash and a
-    # well-formed list." The all-ranked branch is taken, so Status
-    # is omitted.
     column_ids = [c["id"] for c in columns]
     assert column_ids == ["rank", "ticker", "sharpe_score"]
