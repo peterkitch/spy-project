@@ -113,3 +113,24 @@ cleanup_*.py
 #   parity/import-smoke/synthetic tests at test_scripts/*.py.
 test_scripts/*/
 !test_scripts/*.py
+
+# Greenfield React MVP under project/frontend/ for the K=6 MTF
+# board. The repo-root .gitignore globally ignores *.json,
+# test_*.py, and the project-level rule above ignores *.md;
+# narrowly re-include the frontend's JSON / package metadata /
+# README docs / the committed fixture, plus the fixture-schema
+# smoke test under test_scripts/shared/. The output/ ignore at
+# the top of this file is unchanged.
+!frontend/**/*.md
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!frontend/public/fixtures/k6_mtf_ranking.json
+# Re-include the test_scripts/shared/ directory itself so the
+# narrow fixture-schema smoke test is trackable, then re-ignore
+# every other *.py in that directory (existing local-only audit
+# scripts must remain untracked), then re-include only the
+# specific test file.
+!test_scripts/shared/
+test_scripts/shared/*.py
+!test_scripts/shared/test_k6_mtf_fixture_schema.py
