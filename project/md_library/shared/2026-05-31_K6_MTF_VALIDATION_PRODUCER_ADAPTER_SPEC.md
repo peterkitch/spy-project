@@ -139,18 +139,19 @@ PROPOSED producer identity for the K=6 MTF adapter:
 - `producer_engine`: **PROPOSED value `"k6_mtf"`.** The
   current `validation_engine.py` does not enforce a closed
   set of `producer_engine` strings at the engine level; the
-  string is passed through into the contract. However, the
-  Phase 5C methodology Section 13 currently names producers
-  by per-app current-state mapping (StackBuilder, OnePass,
-  ImpactSearch, Confluence, Spymaster) and does NOT yet list
-  K=6 MTF. The string `"k6_mtf"` is therefore **NOT yet
-  valid at the methodology contract level**. The later
-  implementation PR MUST amend Section 13 of the Phase 5C
-  methodology document to add K=6 MTF as a producer before
-  the adapter emits any sidecars labelled `"k6_mtf"`. No
-  `validation_engine.py` code change is required to add the
-  string; only the methodology contract amendment is
-  required.
+  string is passed through into the contract. The current
+  `validation_contract_v1` `producer_engine` list names
+  `spymaster`, `impactsearch`, `confluence`, and
+  `stackbuilder`; the Phase 5C methodology Section 13 per-app
+  mapping covers those producers and does NOT list K=6 MTF.
+  The string `"k6_mtf"` is therefore **NOT yet valid at the
+  methodology contract level**. The later implementation PR
+  MUST amend Section 13 of the Phase 5C methodology document
+  to add K=6 MTF as a producer before the adapter emits any
+  sidecars labelled `"k6_mtf"`. No `validation_engine.py`
+  code change is required for the string itself, unless a
+  later implementation chooses to add stricter engine-level
+  enforcement.
 - `app_surface`: **PROPOSED value `"run_directory"`.**
   Mirrors the StackBuilder value. Justification: like
   StackBuilder, a K=6 MTF run produces a per-secondary
@@ -214,9 +215,20 @@ populates them as follows.
   - `k6_stack.selected_run_dir` (string, project-relative).
   - `k6_stack.combo_k6_path` (string, project-relative).
   - `history_artifact_path` (string, project-relative).
+    **Provenance / audit metadata only.** The string records
+    which live history artifact this candidate corresponds
+    to for traceability; the adapter MUST NOT open or read
+    that file as per-fold evaluation input. See Section 5
+    for the load-bearing no-lookahead rule.
   - `history_as_of_date` (string).
   - `current_snapshot` (object with `1d` / `1wk` / `1mo` /
-    `3mo` / `1y` keys).
+    `3mo` / `1y` keys). **Provenance / audit metadata
+    only.** This is the live `current_snapshot` captured at
+    the artifact's `history_as_of_date` and is recorded for
+    traceability; it is NOT a per-fold evaluation input.
+    The per-fold synthetic `current_snapshot` is generated
+    from `ctx.train_end` inside `evaluate_candidate(ctx)`
+    per Section 5.
 
 ### Divergence from StackBuilder, justified
 
@@ -489,17 +501,25 @@ report:
   `<PROJECT_DIR>/k6_mtf_validation_adapter.py` or
   `<PROJECT_DIR>/utils/k6_mtf_validation/adapter.py`)
   imports `validation_engine`, implements the
-  `SelectionAdapter` Protocol, reads K=6 MTF history
-  artifacts and StackBuilder selected builds as inputs,
-  and writes the sidecar. `controlled_compute` job-specs
-  invoke this module as the producer command. Pros: keeps
-  the ranking-engine code path clean; mirrors the
-  separation-of-concerns the StackBuilder integration
-  achieves (StackBuilder's adapter class is wired through
-  the run but is structurally separable); easiest to test
-  with `tmp_path` fixtures; easiest to evolve the adapter
-  contract without disturbing the production ranking
-  engine.
+  `SelectionAdapter` Protocol, derives per-fold synthetic
+  histories from cutoff-safe raw / member inputs (member
+  signal libraries, secondary daily close source, and the
+  upstream StackBuilder selected build's frozen member set
+  and `[D]/[I]` protocols), and writes the sidecar.
+  **The adapter MUST NOT read live K=6 MTF output
+  artifacts (`output/k6_mtf/<RUN>/k6_mtf_ranking.json` or
+  sibling `k6_mtf_history.json`) as per-fold evaluation
+  input.** Those artifacts are not validation inputs; they
+  are the live public claim being validated and would
+  reopen the lookahead path Section 5 forbids.
+  `controlled_compute` job-specs invoke this module as the
+  producer command. Pros: keeps the ranking-engine code
+  path clean; mirrors the separation-of-concerns the
+  StackBuilder integration achieves (StackBuilder's
+  adapter class is wired through the run but is
+  structurally separable); easiest to test with `tmp_path`
+  fixtures; easiest to evolve the adapter contract without
+  disturbing the production ranking engine.
 - **Option E3 -- `controlled_compute` wrapper only.** The
   orchestrator wraps a ranking-engine invocation and
   expects the sidecar to appear. Pros: minimal-touch. Cons:
@@ -519,14 +539,23 @@ keeps writing `k6_mtf_ranking.json` only; the adapter
 writes the sidecar). Side effects:
 
 - The adapter module imports `validation_engine`.
-- The adapter module imports the same input-reading
-  primitives the K=6 MTF history producer / ranking engine
-  use (member signal libraries, secondary daily close
-  source, K=6 stack member parsing). Whether the adapter
-  reuses helper functions from `k6_mtf_history_producer.py`
-  / `k6_mtf_ranking_engine.py` directly or copies the
-  minimum subset is a design decision for the
-  implementation PR.
+- The adapter module may reuse K=6 MTF helper logic and
+  input-reading primitives used by the K=6 MTF history
+  producer / ranking engine (member signal libraries,
+  secondary daily close source, K=6 stack member parsing,
+  the `[D]/[I]` protocol application, the timeframe
+  resample, the active-signal-unanimity combine, the
+  forward-fill rule, the match-rule wildcard pass).
+  Whether the adapter reuses helper functions from
+  `k6_mtf_history_producer.py` / `k6_mtf_ranking_engine.py`
+  directly or copies the minimum subset is a design
+  decision for the implementation PR. **In all cases the
+  adapter must derive per-fold synthetic histories /
+  evaluation rows from cutoff-safe raw or member inputs
+  (or `tmp_path` synthetic fixtures in tests), NOT from
+  live K=6 MTF output artifacts under `output/k6_mtf/`.**
+  Live ranking / history artifacts are not validation
+  inputs; they are the public claim being validated.
 - The adapter writes `output/validation/<run_id>/validation.json`
   via the engine's `write_validation_sidecar` helper, so
   discovery by `controlled_compute` and
@@ -592,14 +621,32 @@ The K=6 MTF adapter is durable-tier (per PR #369 Section 5
 classification and Phase 5C Section 3) and inherits the
 durable-tier MUST-emit rule. Specific fail-closed cases:
 
-- **Missing K=6 stack inputs for a secondary.** If a
+- **Missing K=6 stack inputs for a secondary -- visible,
+  not silently dropped.** The run-spec launch family is
+  fixed before validation begins, and the candidate family
+  delivered to `validate_strategy_set` MUST match that
+  launch family unless the run-spec explicitly defines a
+  narrower eligible universe before execution. If a
   secondary's `selected_build.json` / `combo_k=6.json` /
   member PKL set / per-(member, timeframe) library is
-  missing, the per-secondary candidate is excluded from the
-  fold (consistent with the K=6 MTF launch-path contract
-  Fail-Closed Behavior section) and the issue is reported
-  in the per-fold `StrategyFoldResult.issues`. The
-  run-level contract status reflects the missing inputs.
+  missing, the missing-input secondary MUST remain visible
+  in the validation contract / report rather than being
+  silently removed from `n_strategies_tested`. The required
+  posture is to emit an unavailable / failed candidate
+  outcome (per the engine status taxonomy, e.g. a per-fold
+  `StrategyFoldResult` whose `daily_capture` and
+  `trigger_mask` are empty with a recorded
+  `StrategyFoldResult.issues` entry such as
+  `"missing_member_pkl"` or `"missing_selected_build"`, or
+  a run-level per-candidate disclosure with the same issue
+  code). `n_strategies_tested` reflects the input family,
+  not the silently shrunk output. Public-launch report
+  completion is blocked until missing-input candidates are
+  resolved or explicitly disclosed as non-survivors /
+  unavailable under the methodology. Silently dropping a
+  launch-family secondary from the tested family
+  contradicts the full-survivorship-disclosure rule in
+  Section 8 and the `validation_methodology_v1` posture.
 - **Engine-level evaluation failure.** If
   `evaluate_candidate` raises, the adapter MUST surface the
   failure rather than swallow it. Mirroring StackBuilder's
@@ -664,8 +711,15 @@ none.** All tests use `tmp_path` only; none touch the real
   hand-computed same-secondary buy-and-hold Sharpe to
   expected precision.
 - **Fail-closed missing-input tests.** Remove a member PKL
-  for one secondary; assert the per-secondary candidate is
-  excluded and the issue is surfaced; assert the run
+  for one secondary in a synthetic launch family of N
+  secondaries; assert the missing-input secondary remains
+  visible in the contract / report (it is NOT silently
+  dropped from `n_strategies_tested`); assert
+  `n_strategies_tested` equals the input family size N;
+  assert the missing-input candidate carries an
+  unavailable / failed outcome with a recorded
+  `StrategyFoldResult.issues` entry naming the missing
+  input (e.g. `"missing_member_pkl"`); assert the run
   contract still validates with the engine's
   `validate_validation_contract_v1`.
 - **Ledger-ingestion test.** Write the synthetic sidecar
