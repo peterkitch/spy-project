@@ -495,3 +495,14 @@ dependency):**
   PR-based refresh, defines the Option B promotion-manifest
   schema for future implementation, and presents deployment
   target options without selecting one.
+- 2026-05-31 (helper introduction). Implements the
+  private / internal Option A promotion mechanic and
+  manifest writer as a stdlib-only operator-run helper at
+  `project/utils/react_publish/promote_k6_mtf_artifact.py`.
+  Dry-run by default. Fail-closed. Public mode hard-refuses
+  without a verified Phase 5 honest-validation report. Does
+  NOT deploy, does NOT mutate `output/`, does NOT change
+  React runtime behavior, and does NOT select a deployment
+  target. Targeted tests under
+  `project/test_scripts/shared/test_react_publish_promote_k6_mtf_artifact.py`.
+  No real artifact promoted by the helper's introduction PR.
