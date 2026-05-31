@@ -898,3 +898,142 @@ def test_ccc_series_is_passed_through_not_recomputed():
     rec = _make_k6_mtf_record("TGT", ccc_series=series)
     fig = board._k6_mtf_ccc_chart_figure(rec)
     assert fig["data"][0]["y"] == [5.0, 3.0, 3.0, 4.0]
+
+
+# ---------------------------------------------------------------------------
+# 14. Conditional Status-column hide on the primary ranked table
+# ---------------------------------------------------------------------------
+
+
+def test_primary_table_hides_status_column_when_all_visible_rows_are_ranked(tmp_path):
+    """When every visible ranked row carries status=="ranked" (the
+    common case: the operator already knows these rows are "ranked"
+    by virtue of being in the ranked table), the Status column is
+    redundant and is omitted from the primary table to reduce visual
+    noise."""
+    payload = _make_k6_mtf_artifact([
+        _make_k6_mtf_record("TSLA", rank=1, status="ranked"),
+        _make_k6_mtf_record("AAPL", rank=2, status="ranked"),
+        _make_k6_mtf_record("MSFT", rank=3, status="ranked"),
+    ])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    table = _find_component(
+        app.layout,
+        lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table is not None
+    column_ids = [c["id"] for c in table.columns]
+    assert column_ids == ["rank", "ticker", "sharpe_score"]
+    assert "status" not in column_ids
+    # The row dicts must still carry the status field so a future
+    # column-show scenario or downstream consumer keeps working.
+    for row in table.data:
+        assert "status" in row
+
+
+def test_primary_table_hides_status_column_when_visible_rows_have_no_status_value(
+    tmp_path,
+):
+    """When status is missing or empty on every visible row (None /
+    empty-string defensive cases), the Status column is also redundant
+    in the primary table and is omitted."""
+    visible = [
+        {"secondary": "A", "rank": 1, "status": None,
+         "sharpe_k6_mtf": 1.5},
+        {"secondary": "B", "rank": 2, "status": "",
+         "sharpe_k6_mtf": 1.2},
+    ]
+    columns = board._k6_mtf_board_columns_for_visible(visible)
+    column_ids = [c["id"] for c in columns]
+    assert column_ids == ["rank", "ticker", "sharpe_score"]
+    assert "status" not in column_ids
+
+
+def test_primary_table_preserves_status_column_when_visible_row_has_meaningful_non_ranked_status():
+    """If even one visible ranked row carries a status that is neither
+    None / empty nor "ranked" (e.g. a future "queued" / "stale" /
+    "manual_review" value the engine emits to flag a divergence the
+    operator should see in place), the Status column is preserved on
+    the primary table so the divergence is visible without opening the
+    modal."""
+    visible = [
+        {"secondary": "A", "rank": 1, "status": "ranked",
+         "sharpe_k6_mtf": 1.5},
+        {"secondary": "B", "rank": 2, "status": "queued",
+         "sharpe_k6_mtf": 1.2},
+        {"secondary": "C", "rank": 3, "status": "ranked",
+         "sharpe_k6_mtf": 1.1},
+    ]
+    columns = board._k6_mtf_board_columns_for_visible(visible)
+    column_ids = [c["id"] for c in columns]
+    assert column_ids == ["rank", "ticker", "sharpe_score", "status"]
+
+
+def test_hiding_status_in_primary_table_does_not_remove_status_from_modal(tmp_path):
+    """The Status column hide is a primary-table presentation concern
+    only. The modal / details surface must continue to render the
+    record's status verbatim, so the operator can inspect it on demand
+    even when the column is hidden."""
+    rec = _make_k6_mtf_record("TGT", rank=1, status="ranked")
+    payload = _make_k6_mtf_artifact([rec])
+    modal = board.render_k6_mtf_modal_content(rec, payload)
+    text = _flatten_text(modal)
+    assert "ranked" in text
+
+
+def test_hiding_status_in_primary_table_does_not_change_unranked_section(tmp_path):
+    """The conditional Status-column hide on the primary table is
+    independent of the separate unranked / failed informational
+    section. Mixed artifacts where the visible rows are all "ranked"
+    still surface failed / unranked records (with their status text)
+    in the unranked section."""
+    payload = _make_k6_mtf_artifact([
+        _make_k6_mtf_record("GOOD1", rank=1, status="ranked"),
+        _make_k6_mtf_record("GOOD2", rank=2, status="ranked"),
+        _make_k6_mtf_record(
+            "BAD", rank=None, status="failed", sharpe=None,
+            issues=[{"code": "history_artifact_invalid",
+                     "message": "schema_version mismatch"}],
+        ),
+    ])
+    path = _write_artifact(tmp_path, payload)
+    app = board.build_mvp_signal_board_app(path)
+    # Primary table: Status hidden (visible rows are all ranked).
+    table = _find_component(
+        app.layout,
+        lambda c: isinstance(c, dash_table.DataTable)
+        and getattr(c, "id", None) == "mvp-board-table",
+    )
+    assert table is not None
+    column_ids = [c["id"] for c in table.columns]
+    assert "status" not in column_ids
+    # Unranked section: still emitted with BAD + "failed" text.
+    unranked_section = _find_component(
+        app.layout,
+        lambda c: getattr(c, "id", None) == "k6mtf-unranked-section",
+    )
+    assert unranked_section is not None
+    unranked_text = _flatten_text(unranked_section)
+    assert "BAD" in unranked_text
+    assert "failed" in unranked_text
+
+
+def test_k6_mtf_board_columns_for_visible_omits_status_for_empty_visible():
+    """Defensive path: empty visible rows.
+
+    Empty visible rows are a defensive input. In normal layout flow
+    the build-layout helper takes the empty-state branch (rendering
+    EMPTY_TABLE_MESSAGE) and never calls
+    _k6_mtf_board_columns_for_visible at all, so this code path is
+    not exercised in production. The helper must still behave
+    consistently with its no-meaningful-status predicate when it is
+    called directly: with no rows, the predicate is vacuously true,
+    so the Status column is omitted and the returned list is
+    [rank, ticker, sharpe_score]. This test pins that behavior.
+    """
+    columns = board._k6_mtf_board_columns_for_visible([])
+    assert isinstance(columns, list)
+    column_ids = [c["id"] for c in columns]
+    assert column_ids == ["rank", "ticker", "sharpe_score"]
