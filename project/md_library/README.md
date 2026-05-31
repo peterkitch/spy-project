@@ -19,6 +19,10 @@
 >   -- K=6 MTF -> Phase 5C validation linkage; layered
 >   validation target; minimal-change linkage to PR #367 /
 >   #368 promotion manifest.
+> - `<PROJECT_DIR>/md_library/shared/2026-05-31_K6_MTF_VALIDATION_PRODUCER_ADAPTER_SPEC.md`
+>   -- K=6 MTF validation producer / adapter contract
+>   following the StackBuilder template; PROPOSED producer
+>   identity pending methodology Section 13 amendment.
 > - `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
 >   -- deferred bugs and revisit triggers.
 >
