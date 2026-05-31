@@ -1,9 +1,50 @@
-# Current sprint location — V8 OnePass gate
+# Current sprint location -- V8 OnePass gate
 
 **Date:** 2026-05-15
-**Scope:** sprint-position handoff doc. Read this first in any fresh terminal that resumes work on this repo.
 
-> **Pin this:** the sprint is **upstream** at a V8 OnePass gate. It is **not** at "Phase 6I-57 supervised ImpactSearch workbook generation." Earlier sprint narrative treated 6I-57 as the immediate next action; the operator pivoted to V8 universe hygiene first. **Do not resume downstream until the audit below lands.**
+**Status:** **SUPERSEDED AS ACTIVE SPRINT CURSOR.** This
+doc is preserved as historical record of the V8 OnePass /
+master ticker list gate. The V8 / master ticker list work
+described below remains historically important (the
+operator-curated master ticker list and ban-list filter on
+`registry.export_active` are still load-bearing), but the
+V8 OnePass gate has passed and downstream work has
+progressed through the StackBuilder Phase 6I-77 / 6I-79
+production-run chain, Phase E TrafficFlow canonical writes,
+the MVP v0 / v1 / OnePass-MTF arc (PRs #325-#334), the K=6
+MTF launch-path contract (PR #336), the K=6 MTF history
+producer / ranking engine / Dash dispatch (PRs #339-#341,
+#343), the React migration declaration (PR #329), the
+post-PR-#345 fast-default cleanup chain (PRs #345-#350,
+closeout #351), the carryforward closeouts (PRs #352-#361),
+the large-universe StackBuilder policy settlement (PR
+#363), and the K=6 MTF board polish (PR #364). For the
+current sprint cursor read, in order:
+`<PROJECT_DIR>/CLAUDE.md` Section 6;
+`<PROJECT_DIR>/md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md`;
+`<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`;
+`<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`;
+`<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`.
+
+**Scope (original, preserved as historical context):**
+sprint-position handoff doc. Originally written as "Read
+this first in any fresh terminal that resumes work on this
+repo" -- that direction is superseded by the Status banner
+above; the body below is preserved as historical record of
+the V8 OnePass gate and remains useful operational
+reference for the V8 / master ticker list infrastructure.
+
+> **Pin this (historical, no longer operative):** the
+> sprint is **upstream** at a V8 OnePass gate. It is **not**
+> at "Phase 6I-57 supervised ImpactSearch workbook
+> generation." Earlier sprint narrative treated 6I-57 as
+> the immediate next action; the operator pivoted to V8
+> universe hygiene first. **Do not resume downstream until
+> the audit below lands.** (This pin was operative as of
+> 2026-05-15; it is preserved verbatim as historical
+> context. The V8 OnePass audit was completed and downstream
+> work has resumed; see the Status banner above for the
+> current sprint cursor.)
 
 ## TL;DR
 

@@ -10,6 +10,24 @@
 can be evaluated against direction, not just internal
 consistency.
 
+**Status note (added post K=6 MTF MVP launch):** This North
+Star is a **directional destination document**, NOT the
+current sprint cursor. For the current sprint cursor read,
+in order: `<PROJECT_DIR>/CLAUDE.md` Section 6;
+`<PROJECT_DIR>/md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md`
+(carryforward ledger);
+`<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`
+(current launch path);
+`<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`
+(next major phase);
+`<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
+(deferred bugs). The Phase 5 honest-validation paragraph
+at L189-L193 below remains **standing as a public-credibility
+gate before public launch** and is NOT weakened by this
+note; the local 8-ticker K=6 MTF MVP board may serve as the
+operator cockpit while Phase 5 validation work and React
+migration work continue in parallel.
+
 ## The vision
 
 PRJCT9 becomes an open-source, public-facing pattern-finding

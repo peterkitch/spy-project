@@ -1,5 +1,17 @@
 # Phase 6I-35: website-ready Confluence export package + reader contract
 
+> **Status banner (added post K=6 MTF MVP launch):** This
+> doc is preserved as **historical / parallel-rail website
+> surface record**. The multi-window K engine `(K, window)`
+> cell website surface described below is a **parallel /
+> future surface**, NOT the current website-launch path.
+> The current launch surface is the **K=6 MTF MVP board**
+> (`mvp_signal_board.py` rendering `k6_mtf_ranking_v1`).
+> For the current sprint cursor read:
+> `<PROJECT_DIR>/CLAUDE.md` Section 6;
+> `<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`;
+> `<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`.
+
 Sprint date: **2026-05-14**.
 Branch: `phase-6i-35-website-confluence-export-package`.
 Doc: this file.
