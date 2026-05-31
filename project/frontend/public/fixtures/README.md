@@ -62,3 +62,12 @@ That PR does NOT change React app code unless the schema
 itself changes; if the schema changes, the contract at
 `project/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`
 must be amended in the same chain.
+
+The operator-run, stdlib-only helper at
+`project/utils/react_publish/promote_k6_mtf_artifact.py`
+implements steps 1-3 plus the PR #367 promotion-manifest
+write under the React Publish / Deploy Contract Option A.
+Dry-run by default. Fail-closed. Public mode hard-refuses
+without a verified Phase 5 honest-validation report. The
+helper does NOT deploy, does NOT mutate `output/`, and does
+NOT change React runtime behavior.
