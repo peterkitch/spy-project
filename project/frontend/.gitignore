@@ -1,0 +1,12 @@
+# Node / Vite build outputs
+node_modules/
+dist/
+.vite/
+
+# Local env / per-machine overrides
+*.local
+.env.local
+.env.*.local
+
+# Editor / OS noise
+.DS_Store
