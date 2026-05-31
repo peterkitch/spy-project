@@ -321,7 +321,7 @@ commands.
 
 **Next major phase -- React frontend migration.** Per `md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md` (as amended for the K=6 MTF launch path). Dash (`mvp_signal_board.py`) remains the operator cockpit / prototype until React. No further broad Dash-cosmetic investment is intended beyond completed / in-flight surgical polish (PR #364 hides the redundant Status column from the K=6 MTF primary ranking table when all visible rows are ranked / no meaningful status; presentation-only).
 
-**Phase 5 honest validation report standing.** The Phase 5 honest validation report (per `md_library/shared/2026-05-04_PRJCT9_NORTH_STAR.md` L189-L193 and `md_library/shared/2026-04-30_PRJCT9_SPRINT_PLAN.md` Section 5 Phase 5) remains a gate **before public launch** as a public-credibility requirement. It is **not** a blocker to using the local 8-ticker K=6 MTF board as the operator cockpit.
+**Phase 5 honest validation report standing.** The Phase 5 honest validation report (per `md_library/shared/2026-05-04_PRJCT9_NORTH_STAR.md` Phase 5 honest-validation paragraph and `md_library/shared/2026-04-30_PRJCT9_SPRINT_PLAN.md` Section 5 Phase 5) remains a gate **before public launch** as a public-credibility requirement. It is **not** a blocker to using the local 8-ticker K=6 MTF board as the operator cockpit.
 
 **Historical TrafficFlow headless development trail (preserved verbatim; NOT the active K=6 MTF launch path).** Phases delivered, in order:
 

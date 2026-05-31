@@ -59,7 +59,7 @@ When all four are true, the next implementation PR may begin the React rebuild. 
 
 ### Trigger Condition Amendment (post K=6 MTF launch path / post Identity Correction)
 
-The original four-item trigger condition above predates the **Identity Correction** in PR #335 (recorded in `md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md` L18-L40), which reclassified the earlier v1 surface as **OnePass Multi-Timeframe** rather than the operator-intended stack-multi-timeframe launch path. The original trigger paragraph above is **superseded for the current website launch path** but is preserved as historical record of the pre-Identity-Correction v1 definition.
+The original four-item trigger condition above predates the **Identity Correction** in PR #335 (recorded in `md_library/shared/2026-05-25_MVP_RANKING_CONTRACT.md` Identity Correction amendment), which reclassified the earlier v1 surface as **OnePass Multi-Timeframe** rather than the operator-intended stack-multi-timeframe launch path. The original trigger paragraph above is **superseded for the current website launch path** but is preserved as historical record of the pre-Identity-Correction v1 definition.
 
 For the current website launch path, the React migration trigger is **reconciled to the K=6 MTF MVP launch path** as locked in `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`. The reconciled trigger requires ALL of the following:
 
@@ -73,7 +73,7 @@ For the current website launch path, the React migration trigger is **reconciled
 
 This amendment **does not authorize compute**, does not authorize the React rebuild itself, and **does not change React's artifact-boundary rules or any of the Forbidden Behaviors** below. Dash (`mvp_signal_board.py`) remains the operator cockpit / prototype until React. The artifact remains the stable boundary; the React app reads only the ranking artifact and never calls the Python ranking engine, reads raw signal libraries, or reads price caches at runtime.
 
-This amendment also acknowledges that the Phase 5 honest validation report (per `md_library/shared/2026-05-04_PRJCT9_NORTH_STAR.md` L189-L193) remains a separate **public-credibility gate before public launch** that is independent of, and in addition to, the React migration trigger above.
+This amendment also acknowledges that the Phase 5 honest validation report (per `md_library/shared/2026-05-04_PRJCT9_NORTH_STAR.md` Phase 5 honest-validation paragraph) remains a separate **public-credibility gate before public launch** that is independent of, and in addition to, the React migration trigger above.
 
 ---
 

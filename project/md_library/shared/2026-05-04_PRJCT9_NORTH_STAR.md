@@ -22,11 +22,12 @@ in order: `<PROJECT_DIR>/CLAUDE.md` Section 6;
 (next major phase);
 `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
 (deferred bugs). The Phase 5 honest-validation paragraph
-at L189-L193 below remains **standing as a public-credibility
-gate before public launch** and is NOT weakened by this
-note; the local 8-ticker K=6 MTF MVP board may serve as the
-operator cockpit while Phase 5 validation work and React
-migration work continue in parallel.
+in the Sprint scope section below remains **standing as a
+public-credibility gate before public launch** and is NOT
+weakened by this note; the local 8-ticker K=6 MTF MVP
+board may serve as the operator cockpit while Phase 5
+validation work and React migration work continue in
+parallel.
 
 ## The vision
 
