@@ -87,6 +87,7 @@ Each entry uses the following structure:
 - **Deferral rationale:** OnePass-MTF Step v1.1 is silently miscomputing direction in a subset of cases, but the misbehavior is bounded to OnePass-MTF and does not block the K=6 MTF launch path. The K=6 MTF launch path is the current sprint focus; introducing a Step v1.1 fix to OnePass-MTF in parallel risks churn on a surface that is itself being de-prioritized in favor of K=6 MTF. Scheduled for after K=6 MTF MVP ships.
 - **Revisit trigger:** Fix immediately after K=6 MTF MVP merges. The fix should also re-emit the OnePass-MTF v1 ranking artifact for any in-flight test bed (e.g., the SPY Phase 3a real-data artifact under `output/trafficflow/runs/spy_phase3a_members_refreshed_20260527T011505Z/SPY/v1_history.json` consumed by `mvp_ranking_v1.py`).
 - **Cross-reference:** `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md` Deferred Items section "OnePass-MTF Step v1.1 Trade-Direction Bug."
+- **Revisit-trigger status (added post K=6 MTF MVP launch):** The revisit trigger has **fired**: K=6 MTF MVP is shipped (history producer PR #339, ranking engine PR #340, Dash dispatch PR #341, metric-basis correction PR #343, board polish PR #364). Scheduling and fix work still requires **explicit operator approval**; the bug is not auto-promoted into the active queue by trigger firing alone. **Status remains Open**; this entry is not moved to Resolved Entries.
 - **Status:** Open.
 
 ---

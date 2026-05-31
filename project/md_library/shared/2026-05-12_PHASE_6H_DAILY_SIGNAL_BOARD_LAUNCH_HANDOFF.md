@@ -1,5 +1,17 @@
 # Phase 6H-1 — Daily Signal Board launch / design handoff
 
+> **Status banner (added post K=6 MTF MVP launch):** This
+> doc is preserved as **historical / parallel-rail
+> operating record**. The Phase 6H / 6I daily-board
+> automation chain described below is preserved, but it is
+> **NOT** the current website-launch path and is **NOT**
+> the active sprint cursor. The current launch surface is
+> the **K=6 MTF MVP board** (`mvp_signal_board.py`
+> rendering `k6_mtf_ranking_v1`). For the current sprint
+> cursor read: `<PROJECT_DIR>/CLAUDE.md` Section 6;
+> `<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`;
+> `<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`.
+
 **Status:** launch-readiness handoff. The board is in the
 best practical state for design/product review and is
 operationally honest about its only current-leader gap. No

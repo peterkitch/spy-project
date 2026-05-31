@@ -4,6 +4,30 @@ Document date: 2026-04-30
 Branch: prjct9-sprint-plan
 Status: Source-of-truth coordination document (non-implementation).
 
+> **Status banner (added post K=6 MTF MVP launch):** This
+> document is **superseded as the active sprint source of
+> truth**. It is preserved as the **founding PRJCT9 sprint
+> plan and historical record** of the original Phase -1
+> through Phase 6 ladder. The actual sprint execution moved
+> through Phases 6A through 6I and beyond (MVP v0 / v1 /
+> OnePass-MTF; K=6 MTF launch path; React migration
+> declaration), and the Section 5 Phase 6 "static explainer"
+> framing is superseded by the React migration declaration.
+> The phase ladder, per-phase detail, and Phase 6 body below
+> are preserved verbatim as historical record; do NOT treat
+> them as the current sprint cursor.
+>
+> For the current sprint cursor read, in order:
+> `<PROJECT_DIR>/CLAUDE.md` Section 6;
+> `<PROJECT_DIR>/md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md`;
+> `<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`;
+> `<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`;
+> `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`.
+>
+> The Phase 5 honest-validation paragraph at Section 5 Phase
+> 5 below remains a **public-credibility gate before public
+> launch**; it is not weakened by this banner.
+
 This document defines the sprint goal, scope boundaries, locked
 decisions, phase structure, per-phase detail, codex audit findings,
 working tree policy, and usage protocol. Implementation prompts live

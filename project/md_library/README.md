@@ -1,5 +1,25 @@
 # MD Library - Project Documentation
 
+> **Current sprint cursor (read in this order before any new
+> work on PRJCT9):**
+>
+> - `<PROJECT_DIR>/CLAUDE.md` Section 6 -- live operating
+>   contract.
+> - `<PROJECT_DIR>/md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md`
+>   -- sprint-relevant carryforward items (all currently
+>   RESOLVED).
+> - `<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`
+>   -- current launch path (K=6 MTF MVP, 8 secondaries).
+> - `<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`
+>   -- planned post-Dash launch frontend.
+> - `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
+>   -- deferred bugs and revisit triggers.
+>
+> The 2025-era content below is preserved as historical
+> record of script-level fixes (Spymaster / ImpactSearch /
+> OnePass / GTL / shared infrastructure). It does NOT
+> describe the current sprint cursor.
+
 This library contains all documentation for the SPY Project trading analysis platform.
 
 ## Structure

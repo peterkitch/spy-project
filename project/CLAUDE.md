@@ -307,11 +307,23 @@ same drift; the introductory PR adds the marker infrastructure,
 gates the four hazard tests, and documents the verified
 commands.
 
-### 6. Current Sprint State (post Phase E PR Epsilon)
+### 6. Current Sprint State (post K=6 MTF MVP launch, post PR #364)
 
-**Phase 6I sprint closed** (historical context). Production StackBuilder outputs for the 8 PRJCT9 secondaries (AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA) live under canonical `output/stackbuilder/` and each `selected_build.json` points to its production run directory. These are runtime artifacts, not staged in git.
+**Current launch surface.** The live operator-facing surface is the K=6 MTF MVP board: `mvp_signal_board.py` rendering a `k6_mtf_ranking_v1` artifact for the 8 Tier 1 secondaries (AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY, TSLA). The operator-authorized live ranking artifact is `output/k6_mtf/20260528T083411Z_post_fix/k6_mtf_ranking.json`. The full launch-path math, artifacts, freshness policy, and deferred items are locked in `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`.
 
-**TrafficFlow headless development sprint substantially complete.** Phases delivered, in order:
+**Operating model -- "serve narrow, build wide."** Tier 1 serves the 8 K=6 MTF-ready secondaries now as the fresh ranked surface. Tier 2 is the expanded `output/stackbuilder/` directory inventory, used as a transparent growth / build queue. Stale or legacy builds may be surfaced only with freshness / readiness metadata in a separate coverage or queue view; they MUST NOT be silently mixed into the fresh primary ranking as if comparable. Non-equity, malformed, or special entries in `output/stackbuilder` (caret / index symbols, leveraged or inverse ETF hints, etc.) require operator review before inclusion. The full automated start-to-finish build loop is NOT part of the website launch; the growth queue remains operator-supervised and fail-closed.
+
+**Settled launch policies (PR #363).** All large-universe StackBuilder launch policies are settled and `STACKBUILDER_UNRESOLVED_POLICY_QUESTIONS` is empty. Settled values: `both_modes=False`, `combine_mode=intersection`, `seed_by=total_capture`, `optimize_by=total_capture`, fixed K=6 MTF member structure, invalid-member rotation = `partial_effective_members_with_warning`. The fail-closed launch-authorization gate remains the default even at zero unresolved questions. **Policy settlement is not launch authorization.**
+
+**ImpactSearch / StackBuilder seed framing.** ImpactSearch is provenance and a possible / default StackBuilder primary-source mode via `impact_xlsx`. It is NOT the current Tier 2 universe seed; the immediate growth-universe seed is `output/stackbuilder`. Sharpe was removed as a StackBuilder seed / optimize criterion after Phase 6I-73; total capture is the supported StackBuilder selection axis (with `allow_decreasing=True` default after PR #356 making the `sharpe_eps` gate dormant on default headless runs; see carryforward item #3 for the two accepted documented caveats).
+
+**Parallel rails (off the K=6 MTF critical path).** TrafficFlow K=1..6 canonical writes are proven at full 8-secondary scale via `trafficflow_canonical_orchestrator.py` (the Phase A-E history is preserved verbatim below as historical context). TrafficFlow remains a parallel rail or future integration surface; no `trafficflow_canonical_reader.py` is being built for the K=6 MTF launch path. The Phase 6H / 6I daily-board automation chain (two-key writer gate, supervised-run gate, contract validator, flow integrity audit) is preserved but is no longer the live launch surface. The multi-window K engine `(K, window)` cell surface (Phase 6I-23 / 6I-37) is a separate scoring axis from K=6 MTF.
+
+**Next major phase -- React frontend migration.** Per `md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md` (as amended for the K=6 MTF launch path). Dash (`mvp_signal_board.py`) remains the operator cockpit / prototype until React. No further broad Dash-cosmetic investment is intended beyond completed / in-flight surgical polish (PR #364 hides the redundant Status column from the K=6 MTF primary ranking table when all visible rows are ranked / no meaningful status; presentation-only).
+
+**Phase 5 honest validation report standing.** The Phase 5 honest validation report (per `md_library/shared/2026-05-04_PRJCT9_NORTH_STAR.md` Phase 5 honest-validation paragraph and `md_library/shared/2026-04-30_PRJCT9_SPRINT_PLAN.md` Section 5 Phase 5) remains a gate **before public launch** as a public-credibility requirement. It is **not** a blocker to using the local 8-ticker K=6 MTF board as the operator cockpit.
+
+**Historical TrafficFlow headless development trail (preserved verbatim; NOT the active K=6 MTF launch path).** Phases delivered, in order:
 
 - **Phase A** -- scoping doc and execution-surface contract for the headless runner.
 - **Phase B** -- dry-run preflight scaffold (`trafficflow_runner.py`); reads `selected_build.json` per secondary, classifies input readiness, emits a single sanitized JSON envelope on stdout, never imports `trafficflow`.
@@ -324,17 +336,17 @@ commands.
   - Delta first real canonical-write smoke (SPY + AAPL, K=1..6, `--workers 2`).
   - Epsilon broader real smoke for all 8 secondaries at K=1..6 with `--workers 4`.
 
-**Current operational baseline.** TrafficFlow K=1..6 canonical writes are proven at full 8-secondary scale via the orchestrator. The downstream discovery pointer is `output/trafficflow/selected_output.json`; it references the most recent canonical run root under `output/trafficflow/runs/<UTC_TIMESTAMP>/`, which is the single source of truth for that run's `progress.json`, `run_status.json`, `run_manifest.json`, and per-secondary `board_rows_k=*.{json,csv}` + `secondary_manifest.json` + `.done`.
+**TrafficFlow operational baseline (parallel rail, NOT the K=6 MTF launch path).** TrafficFlow K=1..6 canonical writes are proven at full 8-secondary scale via the orchestrator. The downstream discovery pointer is `output/trafficflow/selected_output.json`; it references the most recent canonical run root under `output/trafficflow/runs/<UTC_TIMESTAMP>/`, which is the single source of truth for that run's `progress.json`, `run_status.json`, `run_manifest.json`, and per-secondary `board_rows_k=*.{json,csv}` + `secondary_manifest.json` + `.done`. The K=6 MTF launch path does NOT consume this TrafficFlow canonical-write output today; it reads StackBuilder `selected_build.json` directly per the K=6 MTF launch-path contract.
 
-**Deferred to a future phase.** Heavy-stage K=7..12 is gated by `--heavy-stage` at both the runner and the orchestrator and is not yet exercised against real canonical writes. 250-500 secondary real runs remain inference-only.
+**Deferred TrafficFlow work.** Heavy-stage K=7..12 is gated by `--heavy-stage` at both the runner and the orchestrator and is not yet exercised against real canonical writes. 250-500 secondary real runs remain inference-only. Future MTF / Confluence integration with canonical TrafficFlow output remains a parallel / future rail and is NOT the current K=6 MTF MVP launch path.
 
-**Next named sprint direction: MTF and Confluence integration with canonical TrafficFlow output**, in service of the 250-500 secondary launch universe. Downstream consumers should read the canonical contract via `output/trafficflow/selected_output.json` -> run root -> per-secondary board_rows; they should not import `trafficflow` directly.
-
-**Authoritative source-of-truth.** Run `git log -10 --oneline main` for current head; sprint cursor lives in the auto-memory `sprint_state.md`. PR-level detail and per-PR amendment cycles are recorded in `md_library/shared/*PHASE_*` evidence docs and do not belong in this file.
+**Authoritative source-of-truth.** Run `git log -10 --oneline main` for current head; the live sprint cursor lives in this CLAUDE.md Section 6, in `md_library/shared/2026-05-23_POST_PHASE_6I_SPRINT_CARRYFORWARD.md` (carryforward ledger; all items currently RESOLVED), in `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md` (current launch contract), in `md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md` (next major phase), and in `md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md` (deferred bugs). PR-level detail and per-PR amendment cycles are recorded in `md_library/shared/*PHASE_*` evidence docs and do not belong in this file.
 
 ---
 
-#### Product North Star / Do Not Drift (Phase 6I-37)
+#### Product North Star / Do Not Drift (Phase 6I-37) -- preserved as historical / parallel-rail north-star context
+
+**Bridge note (post K=6 MTF MVP launch):** The Phase 6I-37 Product North Star block below is preserved verbatim because its "do not drift" guardrails and its multi-window K engine `(K, window)` cell vocabulary remain useful for future scoring / parity work. However, the **active launch path is K=6 MTF** (fixed K=6 stack-derived MTF per `md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`), not the multi-window K engine `(K, window)` cell grid. The launch-verdict wording at the end of this block (the multi-ticker `(K, window)` cell-grid framing) describes a parallel / future surface and is NOT the K=6 MTF MVP launch verdict. Treat the Phase 6I-37 block as historical / parallel-rail north-star context, not as the current launch-path definition.
 
 The current SPY path is a **pilot/proof path**, not the final product. **SPY remains parked until source readiness flips.**
 

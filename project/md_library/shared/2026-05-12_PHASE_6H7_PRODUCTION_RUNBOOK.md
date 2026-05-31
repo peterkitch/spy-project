@@ -1,5 +1,18 @@
 # Phase 6H-7 — Production-readiness runbook for the Daily Signal Board automation chain
 
+> **Status banner (added post K=6 MTF MVP launch):** This
+> doc is preserved as **historical / parallel-rail
+> operating record**. The Phase 6H / 6I daily-board
+> automation chain described below is preserved and remains
+> operable for its original surface, but it is **NOT** the
+> current website-launch path and is **NOT** the active
+> sprint cursor. The current launch surface is the **K=6
+> MTF MVP board** (`mvp_signal_board.py` rendering
+> `k6_mtf_ranking_v1`). For the current sprint cursor read:
+> `<PROJECT_DIR>/CLAUDE.md` Section 6;
+> `<PROJECT_DIR>/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`;
+> `<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`.
+
 **Status:** operator-facing runbook. This is the human
 companion to the static
 `2026-05-12_PHASE_6H7_OPERATOR_COMMAND_MANIFEST.json`
