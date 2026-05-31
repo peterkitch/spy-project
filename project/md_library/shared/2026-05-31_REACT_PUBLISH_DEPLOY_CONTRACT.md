@@ -161,14 +161,14 @@ Declaration:
 Citations:
 
 - `project/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`
-  "Architecture Target" L93-L104 (publish step deferred,
+  Architecture Target section (publish step deferred,
   static site fetches published JSON, no Python server, no
   recomputation).
-- Same doc "Data Contract" L108-L164 (reads only the ranking
+- Same doc Data Contract section (reads only the ranking
   artifact; the artifact is the stable boundary).
-- Same doc "Forbidden Behaviors" L206-L220.
+- Same doc Forbidden Behaviors section.
 - `project/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`
-  Ranking Artifact section L389-L431 (the `k6_mtf_ranking_v1`
+  Ranking Artifact section (the `k6_mtf_ranking_v1`
   schema lock and the "ranking artifact is the only Dash
   input" stable-boundary discipline that the React app
   inherits).
@@ -196,9 +196,10 @@ fetches anything other than a `k6_mtf_ranking_v1` JSON.
   `output/k6_mtf/20260528T083411Z_post_fix/k6_mtf_ranking.json`
   with SHA-256
   `cf716b0d1e5ea1d92afb30b6ebe85845a4e19ed276f5fe9f27c58be44f9a5dfa`.
-- **Why this option for now:** `output/` is gitignored at
-  `project/.gitignore:10` and is local-only; the React app
-  cannot read it at runtime from a clean checkout / deploy.
+- **Why this option for now:** `output/` is gitignored by
+  the `project/.gitignore` `output/` rule and is local-only;
+  the React app cannot read it at runtime from a clean
+  checkout / deploy.
   The committed fixture is the smallest faithful stand-in
   consistent with the React Migration Declaration's "publish
   step is deferred" wording and the artifact-boundary rule.
@@ -406,11 +407,12 @@ deferred to a later operator decision.
 - **Specific target: NOT selected.**
 - **Target choice: DEFERRED** to a later operator decision.
 - GitHub Pages project sites would require a `vite.config.ts`
-  `base` change (currently `base: "/"` at
-  `project/frontend/vite.config.ts:12`). The React loader
-  already resolves the fetch URL via `document.baseURI` at
-  `project/frontend/src/loadArtifact.ts:22`, so a future
-  `base` change does NOT require component rewrites.
+  `base` change (currently `base: "/"` per the
+  `project/frontend/vite.config.ts` base setting). The React
+  loader already resolves the fetch URL via `document.baseURI`
+  per the `project/frontend/src/loadArtifact.ts`
+  `document.baseURI` resolution, so a future `base` change
+  does NOT require component rewrites.
 - Public targets are listed for awareness only. Section 3
   blocks them.
 
