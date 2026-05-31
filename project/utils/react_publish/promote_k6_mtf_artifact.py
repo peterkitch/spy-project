@@ -265,33 +265,31 @@ def _validate_payload(payload: Any) -> dict:
             _validate_path_field(sec, f, row.get(f))
         for f in PATH_FIELDS_K6_STACK:
             _validate_path_field(sec, f"k6_stack.{f}", stack.get(f))
-    # secondaries_ranked vs per_secondary coherence:
-    # - same count
-    # - same ticker set
-    # - secondaries_ranked order coherently matches the ranked
-    #   per_secondary order (records with non-null integer rank,
-    #   sorted by rank ascending).
-    row_tickers = [r.get("secondary") for r in rows]
-    if len(ranked_list) != len(rows):
-        raise PromotionError(
-            f"secondaries_ranked length {len(ranked_list)} != per_secondary length {len(rows)}"
+    # secondaries_ranked vs per_secondary coherence (per the K=6 MTF
+    # launch-path contract): failed and null-Sharpe secondaries remain
+    # in per_secondary but are excluded from secondaries_ranked. The
+    # single load-bearing predicate is that secondaries_ranked equals
+    # exactly the rank-ordered ranked-record ticker list. This rejects:
+    #   - failed or unranked tickers appearing in secondaries_ranked,
+    #   - unknown tickers in secondaries_ranked,
+    #   - duplicate tickers in secondaries_ranked,
+    #   - rank-order mismatches,
+    #   - count mismatches.
+    expected_ranked_tickers = [
+        r.get("secondary") for r in sorted(
+            (
+                r for r in rows
+                if r.get("status") == "ranked"
+                and isinstance(r.get("rank"), int)
+            ),
+            key=lambda r: r.get("rank"),
         )
-    if set(ranked_list) != set(row_tickers):
-        raise PromotionError(
-            "secondaries_ranked ticker set does not match per_secondary ticker set"
-        )
-    ranked_records = [
-        r for r in rows if isinstance(r.get("rank"), int)
     ]
-    ranked_records_sorted = sorted(
-        ranked_records, key=lambda r: r.get("rank"),
-    )
-    expected_ranked_prefix = [
-        r.get("secondary") for r in ranked_records_sorted
-    ]
-    if ranked_list[: len(expected_ranked_prefix)] != expected_ranked_prefix:
+    if list(ranked_list) != expected_ranked_tickers:
         raise PromotionError(
-            "secondaries_ranked order does not match per_secondary rank ordering"
+            "secondaries_ranked must equal the rank-ordered ranked-record "
+            "tickers (status=='ranked' and integer rank, ascending by rank); "
+            f"expected {expected_ranked_tickers!r}, got {list(ranked_list)!r}"
         )
     return payload
 
@@ -305,14 +303,24 @@ def _verify_phase5_inputs(
     public_mode: bool,
     report_path: Path | None,
     declared_sha256: str | None,
-) -> None:
+    project_root: Path,
+) -> str | None:
     """Hard refuse if public mode is requested without a verified
-    Phase 5 honest-validation report. Same predicate applies in
-    dry-run; there is no code path that produces a public-ready
-    manifest without a verified Phase 5 report.
+    Phase 5 honest-validation report.
+
+    Same predicate applies in dry-run; there is no code path that
+    produces a public-ready manifest without a verified Phase 5 report.
+    On success in public mode, returns the project-relative POSIX path
+    of the verified report file. The PR #367 contract requires
+    ``phase_5_validation_report_path`` to be project-relative (or an
+    artifact URL; artifact-URL support is intentionally not in this
+    helper, so the local-file form must be project-relative). Reports
+    living outside ``<PROJECT_DIR>`` are refused.
+
+    Returns ``None`` when not in public mode.
     """
     if not public_mode:
-        return
+        return None
     if report_path is None:
         raise PromotionError(
             "public mode requires --phase5-report; refusing"
@@ -336,6 +344,15 @@ def _verify_phase5_inputs(
             "Phase 5 report SHA-256 mismatch: expected "
             f"{declared}, computed {actual}"
         )
+    try:
+        rel = report_path.resolve().relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise PromotionError(
+            "Phase 5 report must live under <PROJECT_DIR> so the manifest "
+            "can record a project-relative phase_5_validation_report_path; "
+            "artifact-URL forms are not supported by this helper"
+        ) from exc
+    return rel.as_posix()
 
 
 # ---------------------------------------------------------------------------
@@ -347,29 +364,18 @@ def _build_manifest(
     inputs: PromotionInputs,
     outcome: ValidationOutcome,
     promoted_at_utc: str,
+    phase5_report_relative_path: str | None,
 ) -> dict:
     payload = outcome.payload
     if inputs.public_mode:
-        rp = inputs.phase5_report_path
-        rp_str: str
-        if rp is None:
-            # Refused earlier; defensive guard.
+        if phase5_report_relative_path is None:
+            # Refused earlier in _verify_phase5_inputs; defensive guard.
             raise PromotionError(
-                "public mode reached manifest build without phase5 report; refusing"
+                "public mode reached manifest build without a verified, "
+                "project-relative Phase 5 report path; refusing"
             )
-        try:
-            rp_resolved = rp.resolve()
-            project_root_resolved = inputs.project_root.resolve()
-            rel = rp_resolved.relative_to(project_root_resolved).as_posix()
-            rp_str = rel
-        except ValueError:
-            # Report lives outside <PROJECT_DIR>; record absolute-form
-            # POSIX path. The public-mode SHA verification already
-            # happened against the file's bytes; this string is a
-            # provenance label, not a re-fetch target.
-            rp_str = rp.as_posix()
         validation_results: Any = {
-            "phase_5_validation_report_path": rp_str,
+            "phase_5_validation_report_path": phase5_report_relative_path,
             "phase_5_validation_report_sha256": (
                 (inputs.phase5_report_sha256 or "").strip().lower()
             ),
@@ -480,11 +486,14 @@ def promote(
         )
     # 2. Public-mode safety: verify Phase 5 inputs before any
     #    decision that might produce a public-ready manifest.
-    #    Same predicate applies in dry-run.
-    _verify_phase5_inputs(
+    #    Same predicate applies in dry-run. The verifier returns the
+    #    project-relative POSIX path of the report; reports outside
+    #    <PROJECT_DIR> are refused here.
+    phase5_report_relative_path = _verify_phase5_inputs(
         public_mode=inputs.public_mode,
         report_path=inputs.phase5_report_path,
         declared_sha256=inputs.phase5_report_sha256,
+        project_root=inputs.project_root,
     )
     # 3. Validate the source artifact and record provenance.
     payload = _validate_payload(_load_json(inputs.source_path))
@@ -501,7 +510,9 @@ def promote(
     # 4. Build the manifest. Always built (validates the path
     #    even on dry-run) so dry-run output is meaningful.
     promoted_at_utc = now_provider()
-    manifest = _build_manifest(inputs, outcome, promoted_at_utc)
+    manifest = _build_manifest(
+        inputs, outcome, promoted_at_utc, phase5_report_relative_path,
+    )
     # 5. Write (or report dry-run).
     summary: dict[str, Any] = {
         "mode": "public" if inputs.public_mode else "private_internal",

@@ -555,3 +555,231 @@ def test_artifact_payload_can_be_deepcopied() -> None:
     payload = _make_artifact([_make_secondary("TSLA")])
     payload2 = deepcopy(payload)
     assert payload == payload2
+
+
+# ---------------------------------------------------------------------------
+# Codex audit amendment: secondaries_ranked must equal the rank-ordered
+# ranked-record tickers; failed and unranked records remain in
+# per_secondary but are excluded from secondaries_ranked.
+# ---------------------------------------------------------------------------
+
+
+def _make_failed(ticker: str) -> dict:
+    rec = _make_secondary(ticker)
+    rec["status"] = "failed"
+    rec["rank"] = None
+    return rec
+
+
+def _make_unranked(ticker: str) -> dict:
+    rec = _make_secondary(ticker)
+    rec["status"] = "unranked"
+    rec["rank"] = None
+    return rec
+
+
+def test_ranked_plus_failed_is_accepted_when_failed_excluded_from_ranked(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+        _make_failed("BAD"),
+    ])
+    # _make_artifact builds secondaries_ranked from records with
+    # integer rank; the failed record (rank=None) is excluded
+    # automatically, which matches the contract.
+    assert payload["secondaries_ranked"] == ["TSLA"]
+    source, root = _write_source(tmp_path, payload)
+    summary = promote(_default_inputs(root, source))
+    assert summary["secondaries_ranked"] == ["TSLA"]
+    assert summary["per_secondary_count"] == 2
+
+
+def test_ranked_plus_unranked_is_accepted_when_unranked_excluded_from_ranked(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+        _make_unranked("UNR"),
+    ])
+    assert payload["secondaries_ranked"] == ["TSLA"]
+    source, root = _write_source(tmp_path, payload)
+    summary = promote(_default_inputs(root, source))
+    assert summary["secondaries_ranked"] == ["TSLA"]
+    assert summary["per_secondary_count"] == 2
+
+
+def test_secondaries_ranked_containing_failed_ticker_is_rejected(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+        _make_failed("BAD"),
+    ])
+    payload["secondaries_ranked"] = ["TSLA", "BAD"]
+    source, root = _write_source(tmp_path, payload)
+    with pytest.raises(PromotionError):
+        promote(_default_inputs(root, source))
+
+
+def test_secondaries_ranked_containing_unranked_ticker_is_rejected(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+        _make_unranked("UNR"),
+    ])
+    payload["secondaries_ranked"] = ["TSLA", "UNR"]
+    source, root = _write_source(tmp_path, payload)
+    with pytest.raises(PromotionError):
+        promote(_default_inputs(root, source))
+
+
+def test_secondaries_ranked_containing_unknown_ticker_is_rejected(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+    ])
+    payload["secondaries_ranked"] = ["TSLA", "UNKNOWN_TICKER"]
+    source, root = _write_source(tmp_path, payload)
+    with pytest.raises(PromotionError):
+        promote(_default_inputs(root, source))
+
+
+def test_secondaries_ranked_duplicate_tickers_are_rejected(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+        _make_secondary("AAPL", rank=2, status="ranked"),
+    ])
+    payload["secondaries_ranked"] = ["TSLA", "TSLA"]
+    source, root = _write_source(tmp_path, payload)
+    with pytest.raises(PromotionError):
+        promote(_default_inputs(root, source))
+
+
+def test_secondaries_ranked_must_be_rank_sorted_ascending(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([
+        _make_secondary("TSLA", rank=1, status="ranked"),
+        _make_secondary("AAPL", rank=2, status="ranked"),
+    ])
+    # Reverse order: rank-1 ticker should come first.
+    payload["secondaries_ranked"] = ["AAPL", "TSLA"]
+    source, root = _write_source(tmp_path, payload)
+    with pytest.raises(PromotionError):
+        promote(_default_inputs(root, source))
+
+
+# ---------------------------------------------------------------------------
+# Codex audit amendment: public-mode manifest must record a
+# project-relative phase_5_validation_report_path. Reports outside
+# <PROJECT_DIR> hard-refuse.
+# ---------------------------------------------------------------------------
+
+
+def test_public_mode_phase5_report_path_is_project_relative(
+    tmp_path: Path,
+) -> None:
+    payload = _make_artifact([_make_secondary("TSLA")])
+    source, root = _write_source(tmp_path, payload)
+    report = root / "md_library" / "shared" / "phase5_report.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("synthetic phase 5 report content", encoding="utf-8")
+    report_sha = hashlib.sha256(report.read_bytes()).hexdigest()
+    inputs = _default_inputs(
+        root, source,
+        public_mode=True,
+        phase5_report_path=report,
+        phase5_report_sha256=report_sha,
+        write=True,
+        operator_approved=True,
+    )
+    summary = promote(inputs)
+    manifest_path = (
+        root / "frontend" / "public" / "fixtures"
+        / "k6_mtf_ranking.promotion_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    vr = manifest["validation_results"]
+    assert isinstance(vr, dict)
+    recorded = vr["phase_5_validation_report_path"]
+    # Project-relative: must not start with a drive letter, not start
+    # with /, and must start with md_library/ for this fixture layout.
+    assert recorded.startswith("md_library/shared/phase5_report.md")
+    assert not recorded.startswith("/")
+    assert ":" not in recorded[:3]
+    assert chr(92) not in recorded
+    # Summary mirrors the manifest.
+    summary_vr = summary["validation_results"]
+    assert isinstance(summary_vr, dict)
+    assert summary_vr["phase_5_validation_report_path"] == recorded
+
+
+def test_public_mode_phase5_report_outside_project_refuses(
+    tmp_path: Path,
+) -> None:
+    # Put the project root in a SUB-directory of tmp_path so the
+    # outside-the-project report can live at a sibling path that is
+    # genuinely outside the project root.
+    project_root = tmp_path / "project"
+    source_dir = project_root / "output" / "k6_mtf" / "RUN"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    payload = _make_artifact([_make_secondary("TSLA")])
+    source = source_dir / "k6_mtf_ranking.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    outside_root = tmp_path / "outside_project"
+    outside_root.mkdir()
+    report = outside_root / "phase5_report.md"
+    report.write_text("synthetic phase 5 report outside project", encoding="utf-8")
+    report_sha = hashlib.sha256(report.read_bytes()).hexdigest()
+    inputs = _default_inputs(
+        project_root, source,
+        public_mode=True,
+        phase5_report_path=report,
+        phase5_report_sha256=report_sha,
+        write=True,
+        operator_approved=True,
+    )
+    with pytest.raises(PromotionError):
+        promote(inputs)
+    dest = project_root / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.json"
+    manifest_path = (
+        project_root / "frontend" / "public" / "fixtures"
+        / "k6_mtf_ranking.promotion_manifest.json"
+    )
+    assert not dest.exists()
+    assert not manifest_path.exists()
+
+
+def test_public_manifest_contains_no_absolute_local_path(tmp_path: Path) -> None:
+    payload = _make_artifact([_make_secondary("TSLA")])
+    source, root = _write_source(tmp_path, payload)
+    report = root / "md_library" / "shared" / "phase5_report.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("synthetic phase 5 report content", encoding="utf-8")
+    report_sha = hashlib.sha256(report.read_bytes()).hexdigest()
+    inputs = _default_inputs(
+        root, source,
+        public_mode=True,
+        phase5_report_path=report,
+        phase5_report_sha256=report_sha,
+        write=True,
+        operator_approved=True,
+    )
+    promote(inputs)
+    manifest_path = (
+        root / "frontend" / "public" / "fixtures"
+        / "k6_mtf_ranking.promotion_manifest.json"
+    )
+    text = manifest_path.read_text(encoding="utf-8")
+    # No drive-letter pattern, no absolute slashes leaking from tmp_path,
+    # no backslash leaking from a Windows-form raw path. The exact
+    # str(tmp_path) substring must not appear in the manifest text.
+    assert chr(92) not in text
+    assert str(tmp_path) not in text
+    import re as _re
+    assert _re.search(r"[A-Za-z]:/", text) is None
