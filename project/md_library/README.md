@@ -12,6 +12,9 @@
 >   -- current launch path (K=6 MTF MVP, 8 secondaries).
 > - `<PROJECT_DIR>/md_library/shared/2026-05-26_REACT_MIGRATION_DECLARATION_AND_FRONTEND_CONTRACT.md`
 >   -- planned post-Dash launch frontend.
+> - `<PROJECT_DIR>/md_library/shared/2026-05-31_REACT_PUBLISH_DEPLOY_CONTRACT.md`
+>   -- React MVP publish / deploy posture (private / internal
+>   for now; public deployment gated by Phase 5).
 > - `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
 >   -- deferred bugs and revisit triggers.
 >
