@@ -929,6 +929,32 @@ _K6_MTF_BOARD_COLUMNS = [
 ]
 
 
+def _k6_mtf_board_columns_for_visible(visible_rows: list) -> list:
+    """Return the K=6 MTF board columns, omitting Status when no
+    visible ranked row carries a meaningful primary-table status.
+
+    Predicate: a visible ranked row has "no meaningful primary-table
+    status" when its raw ``status`` value is in ``{None, "", "ranked"}``.
+    When every visible row matches that predicate, Status would be a
+    redundant column (every cell would read "ranked" or "Unavailable"),
+    so it is hidden. As soon as one visible row carries any other
+    non-empty status (e.g. a future "queued" / "stale" / "manual_review"
+    value), Status is preserved in the ranked table itself so the
+    operator can see the divergence in place.
+
+    Status is always preserved in the modal / details surface and in
+    the separate unranked / failed informational section regardless of
+    what this helper returns.
+    """
+    no_meaningful_status = all(
+        (r.get("status") in (None, "", "ranked"))
+        for r in visible_rows
+    )
+    if not no_meaningful_status:
+        return _K6_MTF_BOARD_COLUMNS
+    return [c for c in _K6_MTF_BOARD_COLUMNS if c.get("id") != "status"]
+
+
 def _format_k6_mtf_sharpe(value: Any) -> str:
     """Format ``sharpe_k6_mtf``. Null renders as the explicit
     undefined-sample label, never 0.0 and never an empty string."""
@@ -1379,7 +1405,7 @@ def render_k6_mtf_board_layout(payload: dict) -> html.Div:
     else:
         body = dash_table.DataTable(
             id="mvp-board-table",
-            columns=_K6_MTF_BOARD_COLUMNS,
+            columns=_k6_mtf_board_columns_for_visible(visible),
             data=_k6_mtf_table_data(payload),
             cell_selectable=True,
             row_selectable=False,
