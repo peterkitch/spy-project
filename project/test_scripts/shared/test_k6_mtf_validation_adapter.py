@@ -230,6 +230,79 @@ def _build_fold(
     )
 
 
+def _build_universe_with_signal_program(
+    root: Path,
+    *,
+    secondary: str,
+    n_bars: int,
+    member_signals: Sequence[str],
+    closes: Sequence[float],
+) -> Dict[str, Path]:
+    """Build a one-secondary synthetic universe with the operator's
+    explicit per-bar member-signal program and per-bar close path.
+
+    Every member of the K=6 stack carries the SAME ``member_signals``
+    sequence (same length as ``closes``), so the K=6 unanimity combine
+    at each bar reduces to the bar's literal signal. With all-D
+    protocols this means: ``combined[i] == member_signals[i]`` on
+    every bar. The 1d slot then equals that combined value; non-daily
+    timeframes forward-fill from the same series.
+
+    The match-rule wildcard (``_bar_matches_alignment``) becomes:
+
+    - current_snapshot = snapshot at the last in-sample bar (=
+      ``member_signals[train_end_position]``).
+    - For an OOS bar with the same literal token, it matches.
+    - For an OOS bar with the opposite directional token (BUY when
+      current is SHORT, or SHORT when current is BUY), it does NOT
+      match (the contradiction fails the alignment rule).
+    - NONE / UNAVAILABLE tokens are wildcards on both sides.
+
+    Use this helper when a test needs a controlled mix of matched
+    and non-matched OOS bars (e.g. empirical-pool full-population
+    semantics).
+    """
+    assert len(member_signals) == n_bars
+    assert len(closes) == n_bars
+    stackbuilder_root = root / "stackbuilder"
+    stable_dir = root / "signal_library" / "stable"
+    price_cache_dir = root / "price_cache" / "daily"
+    cache_dir = root / "cache" / "results"
+    stable_dir.mkdir(parents=True, exist_ok=True)
+
+    member_tickers = ("ABC", "DEF", "GHI", "JKL", "MNO", "PQR")
+    protocols = ("D",) * 6
+    members = list(zip(member_tickers, protocols))
+
+    dates = pd.bdate_range("2020-01-02", periods=n_bars)
+    timeframes = ("1d", "1wk", "1mo", "3mo", "1y")
+
+    for ticker, _protocol in members:
+        for tf in timeframes:
+            if tf == "1d":
+                name = f"{ticker}_stable_v1_0_0.pkl"
+            else:
+                name = f"{ticker}_stable_v1_0_0_{tf}.pkl"
+            _build_member_library_pickle(
+                stable_dir / name, ticker, tf, dates, member_signals,
+            )
+
+    sec_run_dir = stackbuilder_root / secondary / "selected_run"
+    _write_combo_k6(sec_run_dir, members)
+    _write_selected_build(stackbuilder_root, secondary, sec_run_dir)
+    _write_secondary_close_csv(
+        price_cache_dir, secondary, dates, closes,
+    )
+
+    return {
+        "stackbuilder_root": stackbuilder_root,
+        "stable_dir": stable_dir,
+        "price_cache_dir": price_cache_dir,
+        "cache_dir": cache_dir,
+        "dates": dates,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -1206,3 +1279,658 @@ class TestCliInvocationPathProof:
             PROJECT_DIR / "output" / "validation" / run_id
         )
         assert not real_output_validation.exists()
+
+
+class TestEmpiricalMetadata:
+    """Direction-preserving empirical-layer metadata.
+
+    The adapter MUST populate StrategyFoldResult.metadata with two
+    pd.Series that validation_engine._permutation_p_value consumes
+    in its direction-preserving mode:
+
+    - signal_state: Buy / Short / None tokens over the FULL eligible
+      OOS bar population (matched + non-matched), indexed by bar date.
+    - permutation_return_pool: raw unsigned (next_close/cur_close-1)
+      percent returns over the same eligible population. No synthetic
+      0.0 for no-trade bars. No NaN. No signed captures.
+
+    The engine then counts literal "Buy" / "Short" tokens, samples
+    n_buy + n_short raw returns without replacement from the pool,
+    and assigns +pool[i] / -pool[j] signs itself. The pool MUST span
+    the eligible-bar population (typically larger than n_buy +
+    n_short) so the without-replacement sample succeeds and the null
+    distribution is the eligible-bar return distribution -- NOT a
+    trigger-only distribution that would collapse to boundary
+    behavior.
+
+    Mirrors the StackBuilder precedent at
+    ``stackbuilder.py:3608-3614``.
+    """
+
+    @staticmethod
+    def _build_mixed_match_fixture(tmp_path, n_bars=80):
+        """Build a fixture with a controlled mix of matched and
+        non-matched OOS bars.
+
+        Signal program:
+            bar 0..29 (in-sample): all BUY -> current_snapshot=BUY.
+            bar 30..79 (OOS): alternating BUY, SHORT, BUY, SHORT, ...
+                              with the BUY bars matching the
+                              current_snapshot (BUY) and the SHORT
+                              bars NOT matching (current BUY
+                              wildcards allow BUY/NONE/UNAVAILABLE
+                              only -- SHORT contradicts).
+
+        Close path: deterministic increasing.
+        """
+        signals = [SIGNAL_BUY] * 30 + [
+            (SIGNAL_BUY if i % 2 == 0 else SIGNAL_SHORT)
+            for i in range(n_bars - 30)
+        ]
+        assert signals[-1] == SIGNAL_BUY or signals[-1] == SIGNAL_SHORT
+        # Close path: increasing, so BUY raw returns are positive and
+        # SHORT raw returns are also positive (the SHORT direction
+        # flips sign in daily_capture but raw return remains positive).
+        closes = [100.0 + 0.1 * i for i in range(n_bars)]
+        roots = _build_universe_with_signal_program(
+            tmp_path,
+            secondary="AAPL",
+            n_bars=n_bars,
+            member_signals=signals,
+            closes=closes,
+        )
+        return roots, signals, closes
+
+    def _evaluate_one_fold(self, roots, *, n_bars):
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=n_bars)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[29],
+            test_start=idx[30], test_end=idx[n_bars - 1],
+        )
+        cands = adapter.select_for_fold(fold)
+        result = adapter.evaluate_candidate(cands[0], fold)
+        return adapter, fold, result
+
+    def test_metadata_emits_signal_state_and_pool(self, tmp_path):
+        roots, _signals, _closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        assert "signal_state" in result.metadata
+        assert "permutation_return_pool" in result.metadata
+        ss = result.metadata["signal_state"]
+        pool = result.metadata["permutation_return_pool"]
+        assert isinstance(ss, pd.Series)
+        assert isinstance(pool, pd.Series)
+        assert pool.dtype.kind == "f"
+
+    def test_metadata_shares_index(self, tmp_path):
+        roots, _signals, _closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        ss = result.metadata["signal_state"]
+        pool = result.metadata["permutation_return_pool"]
+        assert list(ss.index) == list(pool.index)
+        assert len(ss) == len(pool)
+
+    def test_signal_state_tokens_constrained(self, tmp_path):
+        roots, _signals, _closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        ss = result.metadata["signal_state"]
+        token_set = set(ss.unique())
+        assert token_set.issubset({"Buy", "Short", "None"})
+
+    def test_pool_is_full_eligible_population(self, tmp_path):
+        """The pool MUST be larger than the trigger count (otherwise
+        the engine cannot sample without replacement). The fixture is
+        designed so the OOS window has 50 bars but only ~half are
+        matched (the BUY half); the pool spans the FULL eligible
+        population including non-matched SHORT bars.
+        """
+        roots, _signals, _closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        ss = result.metadata["signal_state"]
+        pool = result.metadata["permutation_return_pool"]
+        trigger_mask = result.trigger_mask
+        n_triggers = int(trigger_mask.sum())
+        n_buy = int((ss == "Buy").sum())
+        n_short = int((ss == "Short").sum())
+        # n_buy + n_short must equal n_triggers (trigger_mask is true
+        # only on Buy/Short captured rows).
+        assert n_buy + n_short == n_triggers
+        # The pool must strictly exceed the trigger count: the fixture
+        # has at least some non-matched bars that contribute to the
+        # pool with signal_state="None".
+        assert len(pool) > n_triggers
+        # Sanity: alternating-Buy/Short OOS window -> roughly half the
+        # OOS bars are matched (Buy) and half are not (Short).
+        assert n_buy >= 5
+        assert (ss == "None").sum() >= 5
+
+    def test_pool_carries_real_raw_returns_not_zero(self, tmp_path):
+        """No-trade and non-trigger eligible bars carry the REAL raw
+        next-close return, NOT synthetic 0.0 and NOT NaN.
+        """
+        roots, _signals, closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        ss = result.metadata["signal_state"]
+        pool = result.metadata["permutation_return_pool"]
+        # Synthetic closes are strictly increasing by +0.1 per bar so
+        # every raw return is strictly positive and finite.
+        assert pool.notna().all()
+        assert (pool > 0).all()
+        # The first non-matched OOS bar (signal_state=="None") in the
+        # series should be the bar at position 31 in the OOS window
+        # (alternating starts at OOS bar 0 = train_end+1 = idx[30] =
+        # BUY, then idx[31] = SHORT -> non-matched). Pull the raw
+        # return at that date and compare against the close ratio.
+        none_indices = ss[ss == "None"].index
+        assert len(none_indices) >= 1
+        first_none_date = none_indices[0]
+        pool_val = float(pool.loc[first_none_date])
+        # Raw next-close return is (closes[pos+1]/closes[pos] - 1)*100
+        # for whichever positional row matches first_none_date in the
+        # capped close series.
+        full_dates = pd.bdate_range("2020-01-02", periods=80)
+        pos = list(full_dates).index(first_none_date)
+        expected = (
+            (closes[pos + 1] / closes[pos] - 1.0) * 100.0
+        )
+        assert abs(pool_val - expected) < 1e-9
+
+    def test_buy_short_capture_signs_unchanged(self, tmp_path):
+        """daily_capture sign semantics must NOT change. Buy captured
+        rows = +raw_return_pct; Short captured rows would be
+        -raw_return_pct (the fixture's all-D protocol stack with
+        increasing closes only produces Buy directional trades, but
+        the predicate that Buy capture == +raw_return is verifiable).
+        """
+        roots, _signals, closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        dc = result.daily_capture
+        tm = result.trigger_mask
+        pool = result.metadata["permutation_return_pool"]
+        ss = result.metadata["signal_state"]
+        # Trigger rows -> Buy in this fixture (no Short triggers because
+        # current_snapshot=Buy excludes Short candidates via match rule).
+        triggered = dc.index[tm]
+        assert len(triggered) >= 1
+        for d in triggered[:5]:
+            assert ss.loc[d] == "Buy"
+            # daily_capture at a Buy row equals the raw return: +raw.
+            assert abs(dc.loc[d] - pool.loc[d]) < 1e-9
+
+    def test_no_lookahead_pool_entry_within_cutoff(self, tmp_path):
+        """No pool entry uses a next-close beyond context.evaluation
+        _cutoff. The fixture caps secondary close at idx[79]; pool
+        rows can only be drawn for bars with valid next close inside
+        the cap, so the last possible pool date is idx[78].
+        """
+        roots, _signals, _closes = self._build_mixed_match_fixture(tmp_path)
+        _adapter, fold, result = self._evaluate_one_fold(roots, n_bars=80)
+        pool = result.metadata["permutation_return_pool"]
+        # eval_cutoff = test_end = idx[79]. The last bar with a valid
+        # NEXT close inside the cutoff is idx[78]. So pool dates must
+        # all be <= idx[78].
+        last_idx = pd.Timestamp(pd.bdate_range("2020-01-02", periods=80)[78])
+        assert pool.index.max() <= last_idx
+        # No bar past eval_cutoff is included.
+        assert pool.index.max() <= pd.Timestamp(fold.evaluation_cutoff)
+
+    def test_no_output_k6_mtf_open_during_evaluate(
+        self, tmp_path, monkeypatch,
+    ):
+        """The new metadata code path must NOT introduce any
+        output/k6_mtf/** read. Reuses the sentinel monkeypatch.
+        """
+        roots, _signals, _closes = self._build_mixed_match_fixture(tmp_path)
+
+        real_open = open
+        opened: List[str] = []
+
+        def _guarded_open(file, *args, **kwargs):
+            spath = str(file).replace("\\", "/")
+            opened.append(spath)
+            if "output/k6_mtf" in spath:
+                raise AssertionError(
+                    f"adapter opened output/k6_mtf path: {spath}"
+                )
+            return real_open(file, *args, **kwargs)
+
+        import builtins
+        monkeypatch.setattr(builtins, "open", _guarded_open)
+
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=80)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[29],
+            test_start=idx[30], test_end=idx[79],
+        )
+        for c in adapter.select_for_fold(fold):
+            adapter.evaluate_candidate(c, fold)
+
+    def test_engine_permutation_consumes_metadata(self, tmp_path):
+        """Drive validation_engine._permutation_p_value with the
+        adapter-emitted metadata directly and assert a non-degenerate
+        empirical p-value strictly inside (1/(n_perm+1), 1.0).
+
+        A trigger-only pool would collapse this test to boundary
+        behavior (the only feasible sample equals the observed set
+        so the p-value tends to 1.0 or NaN). Passing a non-boundary
+        p-value proves the pool is the full eligible population.
+        """
+        roots, _signals, _closes = self._build_mixed_match_fixture(
+            tmp_path, n_bars=120,
+        )
+        _adapter, _fold, result = self._evaluate_one_fold(roots, n_bars=120)
+        from validation_engine import _permutation_p_value
+        rng = np.random.default_rng(20260601)
+        n_perm = 200
+        p_val = _permutation_p_value(
+            result.daily_capture, result.trigger_mask,
+            n_permutations=n_perm,
+            rng=rng,
+            signal_state=result.metadata["signal_state"],
+            permutation_return_pool=result.metadata["permutation_return_pool"],
+        )
+        assert p_val is not None, "p-value None: metadata not consumed"
+        lower_bound = 1.0 / (n_perm + 1)
+        # Non-degenerate band: strictly inside (lower_bound, 1.0).
+        assert p_val > lower_bound
+        assert p_val < 1.0
+
+    def test_run_validation_no_missing_metadata_failure(self, tmp_path):
+        """End-to-end run_validation on a synthetic fixture: the
+        previously-observed validation_empirical_failed issue with
+        "empirical permutation requires signal_state +
+        permutation_return_pool" wording MUST NOT appear in the
+        contract issues. (Other empirical statuses such as legitimate
+        p-value > alpha or empirical_validated are acceptable; the
+        assertion targets the missing-metadata wording only.)
+        """
+        roots, _signals, _closes = self._build_mixed_match_fixture(
+            tmp_path, n_bars=160,
+        )
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        result = run_validation(
+            adapter,
+            run_id="test-empirical-metadata",
+            output_dir=tmp_path / "vout" / "test-empirical-metadata",
+            initial_train_days=60,
+            test_window_days=40,
+            step_days=40,
+            n_permutations=200,
+            n_bootstrap_samples=200,
+            rng_seed=20260601,
+        )
+        contract = result["contract"]
+        missing_wording = "empirical permutation requires"
+        offending = [
+            iss for iss in contract.get("issues", [])
+            if missing_wording in iss
+        ]
+        assert not offending, (
+            f"missing-metadata empirical_failed wording still present: "
+            f"{offending}"
+        )
+        # Sidecar contract still validates.
+        validate_validation_contract_v1(contract)
+        # same_secondary_baseline still persisted.
+        for strat in contract["strategies"]:
+            for entry in strat["per_fold_metrics"]:
+                assert "same_secondary_baseline" in entry
+        # Engine-level per_fold_baseline_delta still null for K=6 MTF.
+        for strat in contract["strategies"]:
+            for d in strat["per_fold_baseline_delta"]:
+                assert d["sharpe_delta"] is None
+                assert d["return_delta"] is None
+
+
+class TestEmpiricalMetadataMatchedShort:
+    """Matched Short raw-return semantics.
+
+    The prior TestEmpiricalMetadata.test_buy_short_capture_signs
+    _unchanged only exercises matched Buy bars (the all-Buy current
+    _snapshot fixture cannot produce matched Short candidates). This
+    class adds a fixture where current_snapshot is all-SHORT and the
+    OOS window contains matched SHORT bars, plus non-matched BUY
+    bars that contribute to the pool. The fixture pins that:
+
+    - signal_state.loc[matched_short_bar] == "Short".
+    - trigger_mask.loc[matched_short_bar] is True.
+    - daily_capture.loc[matched_short_bar] == -raw_return_pct.
+    - permutation_return_pool.loc[matched_short_bar] == +raw_return_pct.
+      (i.e., the pool is unsigned raw returns, NOT signed captures.)
+    - The pool also contains None-token rows from non-matched bars.
+    """
+
+    @staticmethod
+    def _build_short_current_fixture(tmp_path, n_bars=80):
+        # In-sample bars 0..29: all SHORT -> current_snapshot all SHORT.
+        # OOS bars 30..n-1: alternating SHORT (matched) and BUY (non-
+        # matched against the all-SHORT current_snapshot).
+        signals = [SIGNAL_SHORT] * 30 + [
+            (SIGNAL_SHORT if i % 2 == 0 else SIGNAL_BUY)
+            for i in range(n_bars - 30)
+        ]
+        # Deterministic increasing closes -> raw returns strictly
+        # positive on every bar.
+        closes = [100.0 + 0.1 * i for i in range(n_bars)]
+        roots = _build_universe_with_signal_program(
+            tmp_path,
+            secondary="AAPL",
+            n_bars=n_bars,
+            member_signals=signals,
+            closes=closes,
+        )
+        return roots, signals, closes
+
+    def _evaluate_one_fold(self, roots, n_bars):
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=n_bars)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[29],
+            test_start=idx[30], test_end=idx[n_bars - 1],
+        )
+        cands = adapter.select_for_fold(fold)
+        result = adapter.evaluate_candidate(cands[0], fold)
+        return adapter, fold, result, idx
+
+    def test_matched_short_raw_return_semantics(self, tmp_path):
+        roots, _signals, closes = self._build_short_current_fixture(tmp_path)
+        _adapter, _fold, result, idx = self._evaluate_one_fold(
+            roots, n_bars=80,
+        )
+        ss = result.metadata["signal_state"]
+        pool = result.metadata["permutation_return_pool"]
+        dc = result.daily_capture
+        tm = result.trigger_mask
+        # At least one matched Short row must exist.
+        short_rows = ss[ss == "Short"].index
+        assert len(short_rows) >= 1, (
+            "fixture produced no matched Short bars"
+        )
+        # Take the first matched Short bar and pin its semantics.
+        d = short_rows[0]
+        assert tm.loc[d] is True or bool(tm.loc[d]) is True
+        # Reconstruct raw_return_pct positionally from closes.
+        full_dates = pd.bdate_range("2020-01-02", periods=80)
+        pos = list(full_dates).index(d)
+        raw_return_pct = (closes[pos + 1] / closes[pos] - 1.0) * 100.0
+        # daily_capture at a Short row equals -raw_return_pct.
+        assert abs(dc.loc[d] - (-raw_return_pct)) < 1e-9
+        # permutation_return_pool at the SAME bar equals +raw_return_pct.
+        assert abs(pool.loc[d] - raw_return_pct) < 1e-9
+        # Signed-capture leakage check: dc != pool at Short rows
+        # (because dc is signed and pool is unsigned). With strictly
+        # positive raw returns, dc < 0 and pool > 0.
+        assert dc.loc[d] < 0 < pool.loc[d]
+        # Full-population semantics still hold: pool length strictly
+        # exceeds the trigger count (the non-matched BUY bars
+        # contribute None-token pool rows).
+        n_triggers = int(tm.sum())
+        assert len(pool) > n_triggers
+        # Some None-token rows exist (the non-matched BUY bars).
+        assert (ss == "None").sum() >= 1
+
+
+class TestEmpiricalPlantedEdgePairedSanity:
+    """Matched-pair planted-edge vs no-edge empirical sanity.
+
+    Two paired fixtures share an identical eligible raw-return pool
+    (identical close path) and identical Buy / Short trigger counts.
+    The ONLY difference is trigger placement:
+
+    - planted-edge: Buy triggers placed on top-rank raw-return bars.
+    - no-edge: Buy triggers placed on bottom-rank raw-return bars.
+
+    Both fixtures are driven through K6MtfValidationAdapter (no
+    hand-built metadata). The adapter-emitted ``signal_state`` and
+    ``permutation_return_pool`` are then fed to
+    ``validation_engine._permutation_p_value`` with the same
+    ``rng_seed`` and same ``n_permutations`` for both cases.
+
+    Assertions:
+
+    - planted_p < no_edge_p (the central relative assertion).
+    - both p-values are strictly inside (1 / (n_perm + 1), 1.0).
+    - eligible-pool values are identical between the paired cases.
+    - Buy and Short trigger counts are identical.
+    """
+
+    # Pool geometry: 17 eligible OOS bars with descending raw returns
+    # from +3.0% down to -1.0%. The small pool size is deliberate:
+    # validation_engine._permutation_p_value samples 15 of the 17
+    # eligible bars without replacement, so there are C(17, 15) = 136
+    # distinct possible samples. With n_perm = 500 the engine cycles
+    # through all 136 samples multiple times, which keeps both
+    # p-values strictly inside the open band (1 / (n_perm + 1), 1.0)
+    # even when the planted-edge and no-edge sets sit at the ranked
+    # extremes of the pool -- multiple permutations naturally land on
+    # the observed subset and contribute to ge_count. A substantially
+    # larger pool (where 15-from-pool combinations vastly exceed
+    # n_perm) would put the planted observation at the literal
+    # maximum of the permutation distribution and collapse p_planted
+    # to 1 / (n + 1) exactly (boundary failure).
+    N_IN_SAMPLE = 30
+    N_OOS_ELIGIBLE = 17
+    N_BARS = N_IN_SAMPLE + N_OOS_ELIGIBLE + 1  # 48
+    N_BUY_TRIGGERS = 15
+    # Descending raw returns from +3.0% to -1.0% across 17 OOS bars.
+    OOS_RETURNS_DESCENDING = tuple(
+        np.linspace(3.0, -1.0, N_OOS_ELIGIBLE)
+    )
+
+    @classmethod
+    def _build_close_path(cls):
+        closes = [100.0]
+        # In-sample: constant +0.5% return for the 30 in-sample bars.
+        for _ in range(cls.N_IN_SAMPLE):
+            closes.append(closes[-1] * 1.005)
+        # OOS returns in descending order; the trailing test_end bar
+        # (index N_BARS - 1) receives the last of the 17 OOS returns
+        # as its "input return", so the final close is computed from
+        # the previous close times (1 + last_oos_return / 100). The
+        # trailing bar is itself not OOS-eligible (it has no next
+        # close inside the evaluation cutoff).
+        for r in cls.OOS_RETURNS_DESCENDING:
+            closes.append(closes[-1] * (1.0 + r / 100.0))
+        assert len(closes) == cls.N_BARS
+        return closes
+
+    @classmethod
+    def _build_signal_program(cls, *, planted: bool):
+        """Build the per-bar member signal program.
+
+        In-sample: all-BUY -> current_snapshot all-BUY at train_end.
+        OOS signal layout (17 eligible OOS bars with descending raw
+        returns from +3.0% to -1.0%; the 18th OOS bar is the
+        test_end / non-eligible trailing bar):
+
+        - planted: Buy on OOS positions 0..14 (the 15 highest-return
+          bars, ranks 1..15 of the 17-bar pool); Short on OOS
+          positions 15..16 (ranks 16..17 of the pool).
+        - no-edge: Short on OOS positions 0..1 (ranks 1..2 of the
+          pool); Buy on OOS positions 2..16 (the 15 lowest-return
+          bars, ranks 3..17 of the pool).
+
+        Trailing test_end bar carries Buy for symmetry; it is not
+        OOS-eligible (no next close inside eval_cutoff).
+        """
+        in_sample = [SIGNAL_BUY] * cls.N_IN_SAMPLE
+        oos = [SIGNAL_SHORT] * cls.N_OOS_ELIGIBLE
+        if planted:
+            for i in range(0, cls.N_BUY_TRIGGERS):
+                oos[i] = SIGNAL_BUY
+        else:
+            for i in range(
+                cls.N_OOS_ELIGIBLE - cls.N_BUY_TRIGGERS,
+                cls.N_OOS_ELIGIBLE,
+            ):
+                oos[i] = SIGNAL_BUY
+        trailing = [SIGNAL_BUY]
+        full = in_sample + oos + trailing
+        assert len(full) == cls.N_BARS
+        assert oos.count(SIGNAL_BUY) == cls.N_BUY_TRIGGERS
+        return full
+
+    def _build_paired_fixture(self, tmp_path, *, planted: bool):
+        closes = self._build_close_path()
+        signals = self._build_signal_program(planted=planted)
+        # Use a distinct secondary ticker per fixture so the helper's
+        # per-secondary stackbuilder/selected_build paths do not
+        # collide when building both fixtures under sibling tmp dirs.
+        secondary = "AAPL"
+        roots = _build_universe_with_signal_program(
+            tmp_path,
+            secondary=secondary,
+            n_bars=self.N_BARS,
+            member_signals=signals,
+            closes=closes,
+        )
+        return roots, signals, closes
+
+    def _evaluate(self, roots):
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=self.N_BARS)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[self.N_IN_SAMPLE - 1],
+            test_start=idx[self.N_IN_SAMPLE],
+            test_end=idx[self.N_BARS - 1],
+        )
+        cands = adapter.select_for_fold(fold)
+        result = adapter.evaluate_candidate(cands[0], fold)
+        return result
+
+    def test_paired_planted_vs_no_edge_p_values(self, tmp_path):
+        planted_dir = tmp_path / "planted"
+        no_edge_dir = tmp_path / "no_edge"
+        planted_dir.mkdir()
+        no_edge_dir.mkdir()
+
+        planted_roots, _ps, planted_closes = self._build_paired_fixture(
+            planted_dir, planted=True,
+        )
+        no_edge_roots, _ns, no_edge_closes = self._build_paired_fixture(
+            no_edge_dir, planted=False,
+        )
+        # Identical close path means identical raw-return pool values.
+        assert planted_closes == no_edge_closes
+
+        planted_result = self._evaluate(planted_roots)
+        no_edge_result = self._evaluate(no_edge_roots)
+
+        planted_pool = planted_result.metadata["permutation_return_pool"]
+        no_edge_pool = no_edge_result.metadata["permutation_return_pool"]
+        planted_ss = planted_result.metadata["signal_state"]
+        no_edge_ss = no_edge_result.metadata["signal_state"]
+
+        # Identical pool size + identical sorted values.
+        assert len(planted_pool) == len(no_edge_pool)
+        assert sorted(planted_pool.to_list()) == sorted(no_edge_pool.to_list())
+        # Identical trigger counts.
+        p_n_buy = int((planted_ss == "Buy").sum())
+        p_n_short = int((planted_ss == "Short").sum())
+        n_n_buy = int((no_edge_ss == "Buy").sum())
+        n_n_short = int((no_edge_ss == "Short").sum())
+        assert p_n_buy == n_n_buy == self.N_BUY_TRIGGERS
+        assert p_n_short == n_n_short == 0
+        assert int(planted_result.trigger_mask.sum()) == self.N_BUY_TRIGGERS
+        assert int(no_edge_result.trigger_mask.sum()) == self.N_BUY_TRIGGERS
+        # Pool strictly exceeds trigger count.
+        assert len(planted_pool) > self.N_BUY_TRIGGERS
+
+        # Drive the engine's direction-preserving p-value path with
+        # adapter-emitted metadata, identical rng_seed and
+        # n_permutations for both cases.
+        from validation_engine import _permutation_p_value
+        n_perm = 500
+        seed = 20260601
+
+        rng_planted = np.random.default_rng(seed)
+        p_planted = _permutation_p_value(
+            planted_result.daily_capture,
+            planted_result.trigger_mask,
+            n_permutations=n_perm,
+            rng=rng_planted,
+            signal_state=planted_ss,
+            permutation_return_pool=planted_pool,
+        )
+        rng_no_edge = np.random.default_rng(seed)
+        p_no_edge = _permutation_p_value(
+            no_edge_result.daily_capture,
+            no_edge_result.trigger_mask,
+            n_permutations=n_perm,
+            rng=rng_no_edge,
+            signal_state=no_edge_ss,
+            permutation_return_pool=no_edge_pool,
+        )
+        assert p_planted is not None
+        assert p_no_edge is not None
+        lower_bound = 1.0 / (n_perm + 1)
+        # Non-degeneracy: strictly inside (1/(n+1), 1.0) for both.
+        assert p_planted > lower_bound, (
+            f"planted p-value at lower boundary: {p_planted}"
+        )
+        assert p_planted < 1.0
+        assert p_no_edge > lower_bound, (
+            f"no-edge p-value at lower boundary: {p_no_edge}"
+        )
+        assert p_no_edge < 1.0
+        # Central relative assertion: planted < no-edge by a clear
+        # margin. The fixture pins the gap at well over 0.3 with
+        # n_perm=500 and seed=20260601; require a robust 0.2 margin
+        # to absorb any future engine-internal RNG-call reordering.
+        margin = 0.2
+        assert p_planted + margin < p_no_edge, (
+            f"planted ({p_planted}) and no-edge ({p_no_edge}) "
+            f"p-values did not separate by the required margin "
+            f"{margin}; relative empirical sanity failed"
+        )

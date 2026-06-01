@@ -747,6 +747,22 @@ class K6MtfValidationAdapter:
         captures: List[float] = []
         trigger_flags: List[bool] = []
         capture_dates: List[pd.Timestamp] = []
+        # Direction-preserving empirical-layer metadata mirrors the
+        # StackBuilder precedent at stackbuilder.py:3608-3614:
+        #   signal_state    -- full Buy/Short/None token series over
+        #                      eligible OOS bars (matched + non-matched).
+        #   raw_return_pool -- full raw unsigned (next_close/cur_close-1)
+        #                      percent-return series over the same
+        #                      eligible bars.
+        # validation_engine._permutation_p_value counts literal "Buy"
+        # and "Short" tokens, then samples n_buy+n_short raw returns
+        # without replacement from the pool. The pool must therefore
+        # span the FULL eligible OOS population (typically larger than
+        # the trigger count) so the without-replacement sample succeeds
+        # and the empirical null is the eligible-bar return distribution.
+        empirical_signal_states: List[str] = []
+        empirical_raw_returns: List[float] = []
+        empirical_dates: List[pd.Timestamp] = []
         match_count = 0
         capture_count = 0
         trade_count = 0
@@ -761,35 +777,60 @@ class K6MtfValidationAdapter:
         for bar in bars:
             bar_date = bar["bar_date"]
             cand_snapshot = bar["snapshot"]
-            if not _bar_matches_alignment(cand_snapshot, current_snapshot):
-                continue
-            match_count += 1
+            matched = _bar_matches_alignment(
+                cand_snapshot, current_snapshot,
+            )
+            if matched:
+                match_count += 1
             pos = idx.searchsorted(bar_date, side="right") - 1
             if pos < 0 or pos >= len(idx) - 1:
-                skipped_capture_count += 1
+                # Bar is not eligible: no valid next close inside the
+                # evaluation cutoff. Skipped-capture accounting is
+                # matched-only per the K=6 MTF launch-path contract.
+                if matched:
+                    skipped_capture_count += 1
                 continue
             cur_close = _safe_positive_close(close_lookup.iloc[pos])
             nxt_close = _safe_positive_close(close_lookup.iloc[pos + 1])
             if cur_close is None or nxt_close is None:
-                skipped_capture_count += 1
+                if matched:
+                    skipped_capture_count += 1
                 continue
             raw_return_pct = (nxt_close / cur_close - 1.0) * 100.0
-            direction = _candidate_trade_direction(cand_snapshot)
-            if direction == TRADE_DIRECTION_BUY:
-                cap = raw_return_pct
-                trade_count += 1
-                trigger_flags.append(True)
-            elif direction == TRADE_DIRECTION_SHORT:
-                cap = -raw_return_pct
-                trade_count += 1
-                trigger_flags.append(True)
+            # Eligible bar (valid current and next close inside
+            # evaluation_cutoff): contribute one row to the empirical
+            # pool. signal_state is "Buy"/"Short" only for matched
+            # directional-trade bars; matched no-trade bars and every
+            # non-matched bar carry signal_state="None". The pool
+            # entry is ALWAYS the real raw next-close return,
+            # regardless of trigger direction -- no synthetic 0.0 and
+            # no NaN.
+            empirical_dates.append(pd.Timestamp(bar_date))
+            empirical_raw_returns.append(float(raw_return_pct))
+            if matched:
+                direction = _candidate_trade_direction(cand_snapshot)
+                if direction == TRADE_DIRECTION_BUY:
+                    cap = raw_return_pct
+                    trade_count += 1
+                    trigger_flags.append(True)
+                    empirical_signal_states.append("Buy")
+                elif direction == TRADE_DIRECTION_SHORT:
+                    cap = -raw_return_pct
+                    trade_count += 1
+                    trigger_flags.append(True)
+                    empirical_signal_states.append("Short")
+                else:
+                    cap = 0.0
+                    no_trade_count += 1
+                    trigger_flags.append(False)
+                    empirical_signal_states.append("None")
+                capture_count += 1
+                captures.append(float(cap))
+                capture_dates.append(pd.Timestamp(bar_date))
             else:
-                cap = 0.0
-                no_trade_count += 1
-                trigger_flags.append(False)
-            capture_count += 1
-            captures.append(float(cap))
-            capture_dates.append(pd.Timestamp(bar_date))
+                # Non-matched eligible bar: pool participant only;
+                # does not contribute to daily_capture / trigger_mask.
+                empirical_signal_states.append("None")
 
         if capture_count == 0:
             issues.append(_format_reason(
@@ -824,6 +865,13 @@ class K6MtfValidationAdapter:
         trigger_mask = pd.Series(
             trigger_flags, index=daily_capture.index, dtype=bool,
         )
+        empirical_index = pd.DatetimeIndex(empirical_dates)
+        signal_state = pd.Series(
+            empirical_signal_states, index=empirical_index, dtype=object,
+        )
+        permutation_return_pool = pd.Series(
+            empirical_raw_returns, index=empirical_index, dtype=float,
+        )
 
         return StrategyFoldResult(
             fold_index=context.fold_index,
@@ -842,6 +890,8 @@ class K6MtfValidationAdapter:
                 "skipped_capture_count": skipped_capture_count,
                 "low_sample_warning": trade_count < LOW_SAMPLE_THRESHOLD,
                 "same_secondary_baseline": same_secondary_baseline,
+                "signal_state": signal_state,
+                "permutation_return_pool": permutation_return_pool,
             },
         )
 
