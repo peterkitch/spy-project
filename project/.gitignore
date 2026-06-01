@@ -135,6 +135,7 @@ test_scripts/*/
 test_scripts/shared/*.py
 !test_scripts/shared/test_k6_mtf_fixture_schema.py
 !test_scripts/shared/test_react_publish_promote_k6_mtf_artifact.py
+!test_scripts/shared/test_k6_mtf_validation_adapter.py
 
 # React publish promotion-manifest sidecar (written by the
 # operator-run helper at utils/react_publish/promote_k6_mtf_artifact.py
