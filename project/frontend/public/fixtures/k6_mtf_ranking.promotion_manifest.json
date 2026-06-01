@@ -1,0 +1,26 @@
+{
+  "operator_approval_marker": true,
+  "per_secondary_count": 8,
+  "promoted_at_utc": "2026-06-01T06:43:56Z",
+  "promoted_by": "the operator",
+  "schema_version": "k6_mtf_ranking_v1",
+  "secondaries_ranked": [
+    "TSLA",
+    "GOOGL",
+    "META",
+    "AMZN",
+    "NVDA",
+    "SPY",
+    "AAPL",
+    "MSFT"
+  ],
+  "source_artifact_path": "output/k6_mtf/20260528T083411Z_post_fix/k6_mtf_ranking.json",
+  "source_generated_at_utc": "2026-05-28T21:16:41Z",
+  "source_run_id": "20260528T083411Z",
+  "source_sha256": "cf716b0d1e5ea1d92afb30b6ebe85845a4e19ed276f5fe9f27c58be44f9a5dfa",
+  "validation_results": {
+    "operator_acknowledgment_of_public_launch_gate": true,
+    "phase_5_validation_report_path": "md_library/shared/2026-06-01_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT.md",
+    "phase_5_validation_report_sha256": "48efeb072c11a2abfe10eebfccde01604b74fd25f22392e414c8ab30a422e4bd"
+  }
+}
