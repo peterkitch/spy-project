@@ -3,3 +3,12 @@
 
 # Auto-detect for other files
 * text=auto
+
+# Pin the K=6 MTF Phase 5 honest-validation report to LF so the
+# PR #368 promotion helper's --phase5-sha256 reproduces the same
+# canonical SHA across Windows and non-Windows checkouts. Without
+# this pin, the * text=auto rule above renormalizes the file to
+# CRLF on Windows checkout, producing a platform-dependent
+# on-disk SHA that diverges from the canonical LF SHA recorded
+# in the merged PR record and the operator brief.
+md_library/shared/2026-06-01_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT.md text eol=lf
