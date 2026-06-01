@@ -181,7 +181,7 @@ In all rollback cases the operator commits to: (a) preserving the existing audit
 | Date | 2026-06-01 |
 | Recorded by | the operator |
 
-This record does NOT use the word "CLEARED." The decision status is "OPERATOR-AUTHORIZED UNDER ACCEPTED RISK." Future qualified counsel clearance or provider-permission grants would require a follow-up Phase 5G amendment that records the counsel's findings or the provider's grant.
+This record does NOT use "CLEARED" as the decision status or as a legal-clearance conclusion. The decision status is "OPERATOR-AUTHORIZED UNDER ACCEPTED RISK." Future qualified counsel clearance or provider-permission grants would require a follow-up Phase 5G amendment that records the counsel's findings or the provider's grant.
 
 ---
 
