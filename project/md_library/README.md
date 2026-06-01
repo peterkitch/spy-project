@@ -23,6 +23,10 @@
 >   -- K=6 MTF validation producer / adapter contract
 >   following the StackBuilder template; PROPOSED producer
 >   identity pending methodology Section 13 amendment.
+> - `<PROJECT_DIR>/md_library/shared/2026-06-01_K6_MTF_VALIDATION_CAMPAIGN_SPEC.md`
+>   -- operator-supervised K=6 MTF Phase 5 evidence-production
+>   campaign over the 8 Tier 1 launch universe via the merged
+>   adapter; docs-only (does not run compute).
 > - `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
 >   -- deferred bugs and revisit triggers.
 >
