@@ -32,6 +32,12 @@
 >   derived from the empirical-only ledger; operator-review
 >   surface for public-promotion review; docs-only (does not
 >   resolve Phase 5G data licensing).
+> - `<PROJECT_DIR>/md_library/shared/2026-06-01_PHASE_5G_2_OPERATOR_ACCEPTED_RISK_DECISION_RECORD.md`
+>   -- Phase 5G-2 operator accepted-risk decision record
+>   authorizing the narrow Mode B derived-only non-commercial
+>   public surface; not legal clearance; counsel review
+>   pending; public promotion remains procedurally allowed
+>   only under this record's Mode B controls.
 > - `<PROJECT_DIR>/md_library/shared/2026-05-25_KNOWN_BUGS_LOG.md`
 >   -- deferred bugs and revisit triggers.
 >
