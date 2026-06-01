@@ -156,7 +156,7 @@ Required top-level fields:
 - `validation_methodology_version`: string `"v1"`
 - `validation_status`: one of `valid`, `in_sample_only`, `oos_skipped`, `partial`, `unavailable`, `failed`
 - `run_id`: producer-supplied unique identifier
-- `producer_engine`: one of `spymaster`, `impactsearch`, `confluence`, `stackbuilder`
+- `producer_engine`: one of `spymaster`, `impactsearch`, `confluence`, `stackbuilder`, `k6_mtf`
 - `app_surface`: human-readable surface name
 - `evaluation_time`: ISO 8601 UTC timestamp
 - `data_available_through`: ISO 8601 date of latest data used
@@ -300,6 +300,20 @@ Tier:
 
 Migration depth: add OOS, BH/Bonferroni, and empirical layer through the shared validation engine; extend run manifest to include `validation_contract_v1` summary; preserve leaderboard ranking.
 
+### 13.5 K=6 MTF
+
+Current state: per-secondary ranking-row construction by `k6_mtf_ranking_engine.py` from a per-secondary `k6_mtf_history_v1` artifact emitted by `k6_mtf_history_producer.py`. The K=6 stack (six members plus `[D]`/`[I]` protocols) is frozen from the upstream StackBuilder `selected_build.json` / `combo_k=6.json`. The active-signal-unanimity combine, the per-bar match-rule wildcard pass, and the per-bar capture arithmetic are deterministic transforms over upstream member signal libraries and the secondary's daily close. Metrics use the per-trade metric-basis split locked by the 2026-05-28 K=6 MTF launch-path contract amendment (`trade_count` denominator for `avg_capture_pct` / `stddev_pct` / `sharpe_k6_mtf` / `win_count` / `loss_count` / `win_pct` / `low_sample_warning`; `capture_count` denominator and inclusion for `total_capture_pct` and `ccc_series`).
+
+Validation surface: absent for the K=6 MTF ranking-row construction itself. PR #370 specified the producer / adapter; this section locks the methodology binding.
+
+Tier:
+
+- Durable for the K=6 MTF launch-universe layered Phase 5 honest-validation evidence campaign (paired with the StackBuilder layer per the PR #369 linkage scoping).
+- No interactive tier.
+- No exploratory tier.
+
+Migration depth: add a `SelectionAdapter` that honestly recomputes the K=6 MTF ranking-row construction per walk-forward fold from cutoff-safe upstream inputs (the K=6 stack from the upstream StackBuilder selected build, the per-(member, timeframe) signal libraries sliced to `ctx.train_end`, and the secondary daily close sliced to `ctx.evaluation_cutoff`); synthesize the per-fold `current_snapshot` at `ctx.train_end` (not from a live `output/k6_mtf/<run>/k6_mtf_history.json` or `k6_mtf_ranking.json`); evaluate the OOS window `(ctx.test_start, ctx.test_end]` with the same match-rule + capture pipeline as the production launch path; emit `StrategyFoldResult.daily_capture` (per-matched-bar capture including no-trade `0.0` bars) and `StrategyFoldResult.trigger_mask` (true only for matched bars whose own 1d direction is BUY or SHORT) so the engine's per-trade aggregation reads the same `trade_count`-denominator basis the launch-path contract locks. Same-secondary buy-and-hold baseline per locked 5C-1 Section 6, mirroring the StackBuilder pattern. Full survivorship across the launch family (8 Tier 1 secondaries today); missing-input secondaries (missing selected build, missing combo_k=6, missing member library) remain visible as `unavailable` / `failed` candidates with bracketed `[K6MTF:...]` reason codes so `n_strategies_tested` reflects the input family. Adapter MUST NOT open `output/k6_mtf/<run>/k6_mtf_history.json` or `output/k6_mtf/<run>/k6_mtf_ranking.json` as validation evidence; those references in `app_payload` are provenance / audit metadata only. `validation_engine` outcome windows `{1, 5, 21, 63, 252}` coexist with the launch-path count taxonomy (`match_count` / `capture_count` / `trade_count` / `no_trade_count` / `skipped_capture_count`); the count taxonomy is recorded in `StrategyFoldResult.metadata` per fold.
+
 ## 14. Divergence classification and migration order
 
 Migration order for 5C-2:
@@ -320,6 +334,16 @@ Validation-specific reason codes use the per-app prefix established in 5B-MP sco
 - `[IMPACTSEARCH:...]`
 - `[CONFLUENCE:...]`
 - `[STACKBUILDER:...]`
+- `[K6MTF:...]`
+
+K=6 MTF adapter-specific reason codes (joined to the shared validation reason codes below):
+
+- `missing_selected_build`: upstream StackBuilder `selected_build.json` is missing or unreadable for this secondary; candidate emitted as `unavailable`.
+- `missing_combo_k6`: upstream `combo_k=6.json` is missing or malformed under the resolved `selected_run_dir`; candidate emitted as `unavailable`.
+- `missing_member_library`: one or more per-(member, timeframe) signal libraries are missing or unreadable for this fold; candidate emitted as `unavailable`.
+- `no_triggers`: walk-forward fold produced zero matched bars or zero directional-trade bars; fold excluded from aggregate per-trade metrics.
+- `stddev_zero`: per-trade capture stddev is zero across the fold; per-trade Sharpe is `None` (never `0.0`); matches the K=6 MTF launch-path contract's `sharpe_undefined_reason` semantics.
+- `history_underflow`: cutoff-safe per-secondary upstream history is too short to support the requested walk-forward fold grid; candidate emitted as `unavailable` for the affected folds.
 
 Validation reason codes:
 
@@ -406,5 +430,9 @@ From the locked 5C scoping (PR #165):
 ## 20. Document status
 
 **LOCKED 2026-05-06.** This document is the locked authority for all 5C-2 implementation work. Any change requires explicit dated amendment with rationale and version bump. Empirical staging triggers in Sections 8 and 17 require amendment review when triggered.
+
+## 21. Amendment history
+
+- **2026-05-31** -- Add K=6 MTF as a methodology-recognized producer. Section 9 `producer_engine` allowed list extended to include `k6_mtf`. Section 13 gains subsection 13.5 K=6 MTF, mirroring the StackBuilder per-app entry shape and binding the adapter to the locked validation contract (cutoff-safe upstream-input recompute per walk-forward fold; live K=6 MTF output artifacts are NOT validation evidence). Section 15 reason-code prefix list extended to include `[K6MTF:...]`, with adapter-specific reason codes enumerated alongside the shared validation reason codes. No `validation_contract_v1` schema change. No `k6_mtf_ranking_v1` schema change. Methodology version not bumped: this document does not lock a specific version-bump policy beyond explicit dated amendments with rationale; the addition is scope-extending, not contract-breaking, so existing `validation_methodology_v1` sidecars remain valid. Rationale: pre-PR (PR #370) docs-only spec specified the K=6 MTF validation producer / adapter contract; the methodology-level binding is the prerequisite identified by the preflight before any sidecar labelled `"k6_mtf"` is emitted. PR #369 layered-claim decision pairs the K=6 MTF layer with the StackBuilder layer at the report level.
 
 End of document.

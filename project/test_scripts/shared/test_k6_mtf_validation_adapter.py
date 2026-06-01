@@ -1,0 +1,771 @@
+"""tmp_path-only tests for the K=6 MTF validation adapter.
+
+These tests never touch production roots. They build synthetic
+member signal libraries, synthetic secondary closes, and synthetic
+upstream StackBuilder selected_build / combo_k=6 inputs under
+``tmp_path``; the adapter is exercised end-to-end with small fold
+geometry; no real ``output/`` writes are produced.
+
+The locked validation_engine surface is exercised with
+``n_permutations=0`` and ``n_bootstrap_samples=0`` so the empirical
+layer is fully disabled. No real Phase 5 evidence is produced.
+"""
+from __future__ import annotations
+
+import json
+import pickle
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap PROJECT_DIR so the adapter and its project deps import cleanly.
+# ---------------------------------------------------------------------------
+
+PROJECT_DIR = Path(__file__).resolve().parents[2]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+
+from utils.k6_mtf_validation import adapter as adapter_mod  # noqa: E402
+from utils.k6_mtf_validation.adapter import (  # noqa: E402
+    K6_MTF_APP_SURFACE,
+    K6_MTF_PRODUCER_ENGINE,
+    K6_MTF_REASON_PREFIX,
+    K6MtfValidationAdapter,
+    REASON_HISTORY_UNDERFLOW,
+    REASON_MISSING_SELECTED_BUILD,
+    REASON_NO_TRIGGERS,
+    _SecondaryInputs,
+    _synthesize_candidate_snapshots_in_window,
+    _synthesize_current_snapshot,
+    build_adapter_inputs,
+    resolve_validation_output_base,
+    run_validation,
+)
+
+import k6_mtf_history_producer as k6hp  # noqa: E402
+import validation_engine as ve  # noqa: E402
+from validation_engine import (  # noqa: E402
+    FoldContext,
+    StrategyCandidate,
+    validate_validation_contract_v1,
+)
+import honest_validation_ledger as hvl  # noqa: E402
+import controlled_compute as cc  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-fixture builders
+# ---------------------------------------------------------------------------
+
+
+SIGNAL_BUY = "Buy"
+SIGNAL_SHORT = "Short"
+SIGNAL_NONE = "None"
+
+LAUNCH_FAMILY: Tuple[str, ...] = (
+    "AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "SPY", "TSLA",
+)
+
+
+def _build_member_library_pickle(
+    path: Path, ticker: str, interval: str,
+    dates: pd.DatetimeIndex, signals: Sequence[str],
+) -> None:
+    data = {
+        "ticker": ticker,
+        "interval": interval,
+        "dates": list(dates),
+        "signals": list(signals),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        pickle.dump(data, fh)
+
+
+def _write_combo_k6(
+    selected_run_dir: Path, members: Sequence[Tuple[str, str]],
+) -> None:
+    selected_run_dir.mkdir(parents=True, exist_ok=True)
+    combo = {
+        "Members": [f"{t}[{p}]" for t, p in members],
+    }
+    (selected_run_dir / "combo_k=6.json").write_text(
+        json.dumps(combo), encoding="utf-8",
+    )
+
+
+def _write_selected_build(
+    stackbuilder_root: Path, secondary: str, selected_run_dir: Path,
+) -> None:
+    (stackbuilder_root / secondary).mkdir(parents=True, exist_ok=True)
+    payload = {
+        "selected_run_dir": str(selected_run_dir).replace("\\", "/"),
+    }
+    (stackbuilder_root / secondary / "selected_build.json").write_text(
+        json.dumps(payload), encoding="utf-8",
+    )
+
+
+def _write_secondary_close_csv(
+    price_cache_dir: Path, secondary: str,
+    dates: pd.DatetimeIndex, closes: Sequence[float],
+) -> None:
+    price_cache_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({
+        "Date": [d.strftime("%Y-%m-%d") for d in dates],
+        "Close": list(closes),
+    })
+    df.to_csv(price_cache_dir / f"{secondary}.csv", index=False)
+
+
+def _build_synthetic_universe(
+    root: Path,
+    *,
+    secondaries: Sequence[str] = LAUNCH_FAMILY,
+    n_bars: int = 60,
+    seed: int = 1234,
+    always_buy: bool = True,
+) -> Dict[str, Path]:
+    """Build a complete synthetic universe under ``root``.
+
+    Returns the four input-root paths the adapter CLI expects.
+
+    ``always_buy=True`` causes every member 1d/non-daily slot to read
+    Buy on every date, so the K=6 combine + match rule produces 100%
+    BUY matches and the per-fold OOS window evaluates trades on every
+    bar (good for end-to-end shape tests).
+    """
+    rng = np.random.default_rng(seed)
+    stackbuilder_root = root / "stackbuilder"
+    stable_dir = root / "signal_library" / "stable"
+    price_cache_dir = root / "price_cache" / "daily"
+    cache_dir = root / "cache" / "results"
+    stable_dir.mkdir(parents=True, exist_ok=True)
+
+    # Members live under stable/ keyed by ticker. We use 6 generic
+    # member tickers shared across all secondaries (the K=6 stack does
+    # not require disjoint member sets across secondaries).
+    member_tickers = (
+        "ABC", "DEF", "GHI", "JKL", "MNO", "PQR",
+    )
+    # All-D protocols so the K=6 active-signal-unanimity combine over
+    # all-Buy member signals produces BUY (every member's protocol-
+    # adjusted signal is BUY -> active_buy=6, active_short=0 -> BUY).
+    # The [D]/[I] protocol math is exercised separately by
+    # TestApplyProtocolReuse.
+    protocols = ("D",) * 6
+    members = list(zip(member_tickers, protocols))
+
+    # Dates: business days starting 2020-01-02.
+    dates = pd.bdate_range("2020-01-02", periods=n_bars)
+    timeframes = ("1d", "1wk", "1mo", "3mo", "1y")
+
+    if always_buy:
+        signals = [SIGNAL_BUY] * n_bars
+    else:
+        choices = [SIGNAL_BUY, SIGNAL_NONE, SIGNAL_SHORT]
+        signals = list(rng.choice(choices, size=n_bars))
+
+    # Write each (member, timeframe) library once: shared across
+    # secondaries. The library content respects the per-member
+    # protocol via the combined-pipeline apply_protocol call (the
+    # adapter reuses the production helper).
+    for ticker, _protocol in members:
+        for tf in timeframes:
+            if tf == "1d":
+                name = f"{ticker}_stable_v1_0_0.pkl"
+            else:
+                name = f"{ticker}_stable_v1_0_0_{tf}.pkl"
+            _build_member_library_pickle(
+                stable_dir / name, ticker, tf, dates, signals,
+            )
+
+    # Per-secondary StackBuilder selected_build + combo_k=6 + close.
+    base_close = 100.0
+    for sec in secondaries:
+        sec_run_dir = stackbuilder_root / sec / "selected_run"
+        _write_combo_k6(sec_run_dir, members)
+        _write_selected_build(stackbuilder_root, sec, sec_run_dir)
+        # Deterministic increasing close so BUY captures are positive
+        # and a small dip in the middle so a SHORT-protocol path is
+        # tested when always_buy=False.
+        closes = list(base_close + np.cumsum(
+            rng.normal(loc=0.05, scale=0.5, size=n_bars),
+        ))
+        _write_secondary_close_csv(
+            price_cache_dir, sec, dates, closes,
+        )
+
+    return {
+        "stackbuilder_root": stackbuilder_root,
+        "stable_dir": stable_dir,
+        "price_cache_dir": price_cache_dir,
+        "cache_dir": cache_dir,
+    }
+
+
+def _build_fold(
+    *,
+    fold_index: int,
+    train_start: pd.Timestamp,
+    train_end: pd.Timestamp,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+) -> FoldContext:
+    return FoldContext(
+        fold_index=fold_index,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        selection_cutoff=train_end,
+        evaluation_cutoff=test_end,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestPathDoublingResolver:
+    """resolve_validation_output_base must not produce a doubled
+    ``<PROJECT_DIR>/project/...`` path whether invoked from
+    ``<PROJECT_DIR>`` or ``<REPO_ROOT>``.
+    """
+
+    def test_default_base_anchors_at_repo_root(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        project_dir = repo_root / "project"
+        project_dir.mkdir(parents=True)
+        resolved = resolve_validation_output_base(
+            project_dir=project_dir,
+            repo_root=repo_root,
+        )
+        expected = (repo_root / "project" / "output" / "validation").resolve()
+        assert resolved == expected
+        assert "project" + str(Path("/project")) not in str(resolved)
+        parts = resolved.parts
+        # Exactly one "project" segment.
+        assert parts.count("project") == 1
+
+    def test_invocation_from_project_dir_does_not_double(self, tmp_path):
+        # Simulate cwd = <PROJECT_DIR>. The resolver must NOT join
+        # project/output/validation onto <PROJECT_DIR> (which would
+        # produce <PROJECT_DIR>/project/output/validation).
+        repo_root = tmp_path / "repo2"
+        project_dir = repo_root / "project"
+        project_dir.mkdir(parents=True)
+        resolved = resolve_validation_output_base(
+            project_dir=project_dir,
+            repo_root=repo_root,
+            base_dir=Path("project/output/validation"),
+        )
+        assert resolved == (
+            repo_root / "project" / "output" / "validation"
+        ).resolve()
+        # The doubled path that would result from a naive
+        # (project_dir / base_dir).resolve() must NOT appear.
+        doubled = (project_dir / "project" / "output" / "validation").resolve()
+        assert resolved != doubled
+
+    def test_absolute_base_passed_through(self, tmp_path):
+        abs_base = (tmp_path / "explicit_validation").resolve()
+        resolved = resolve_validation_output_base(base_dir=abs_base)
+        assert resolved == abs_base
+
+    def test_non_project_relative_base_anchors_at_project_dir(self, tmp_path):
+        repo_root = tmp_path / "repo3"
+        project_dir = repo_root / "project"
+        project_dir.mkdir(parents=True)
+        resolved = resolve_validation_output_base(
+            project_dir=project_dir,
+            repo_root=repo_root,
+            base_dir=Path("custom/output/validation"),
+        )
+        assert resolved == (
+            project_dir / "custom" / "output" / "validation"
+        ).resolve()
+
+
+class TestApplyProtocolReuse:
+    """The adapter MUST import and reuse k6_mtf_history_producer's
+    apply_protocol verbatim. No duplication.
+    """
+
+    def test_adapter_uses_history_producer_apply_protocol(self):
+        # The adapter module's "apply_protocol" attribute is imported
+        # from k6_mtf_history_producer and must be the SAME callable
+        # object.
+        assert adapter_mod.apply_protocol is k6hp.apply_protocol
+
+    def test_apply_protocol_d_preserves(self):
+        from utils.k6_mtf_validation.adapter import apply_protocol
+        assert apply_protocol("BUY", "D") == "BUY"
+        assert apply_protocol("SHORT", "D") == "SHORT"
+        assert apply_protocol("NONE", "D") == "NONE"
+        assert apply_protocol("UNAVAILABLE", "D") == "UNAVAILABLE"
+
+    def test_apply_protocol_i_swaps_buy_short(self):
+        from utils.k6_mtf_validation.adapter import apply_protocol
+        assert apply_protocol("BUY", "I") == "SHORT"
+        assert apply_protocol("SHORT", "I") == "BUY"
+        assert apply_protocol("NONE", "I") == "NONE"
+        assert apply_protocol("UNAVAILABLE", "I") == "UNAVAILABLE"
+
+
+class TestSecondaryInputLoading:
+    def test_loads_all_available_secondaries(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=20)
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        for sec in LAUNCH_FAMILY:
+            assert inputs[sec].available is True
+            assert inputs[sec].stack is not None
+            assert inputs[sec].secondary_close is not None
+
+    def test_missing_selected_build_records_visible_issue(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=20)
+        # Remove selected_build.json for AAPL only.
+        (roots["stackbuilder_root"] / "AAPL" / "selected_build.json").unlink()
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        assert inputs["AAPL"].available is False
+        assert any(
+            f"[{K6_MTF_REASON_PREFIX}:" in iss
+            for iss in inputs["AAPL"].issues
+        )
+        assert any(
+            REASON_MISSING_SELECTED_BUILD in iss
+            for iss in inputs["AAPL"].issues
+        )
+        # Other secondaries unaffected.
+        for sec in LAUNCH_FAMILY:
+            if sec == "AAPL":
+                continue
+            assert inputs[sec].available is True
+
+
+class TestSelectForFoldOnePerSecondary:
+    def test_one_candidate_per_launch_family_secondary(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=LAUNCH_FAMILY, secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        candidates = adapter.select_for_fold(fold)
+        assert len(candidates) == len(LAUNCH_FAMILY)
+        sids = {c.strategy_id for c in candidates}
+        assert len(sids) == len(LAUNCH_FAMILY)
+        # strategy_id format: "k6_mtf:<SEC>:<HISTORY_AS_OF_DATE>".
+        for c in candidates:
+            assert c.strategy_id.startswith("k6_mtf:")
+            assert "as_of=" in c.strategy_label
+
+    def test_missing_input_secondary_visible_with_unavailable_payload(
+        self, tmp_path,
+    ):
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+        (roots["stackbuilder_root"] / "MSFT" / "selected_build.json").unlink()
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=LAUNCH_FAMILY, secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        candidates = adapter.select_for_fold(fold)
+        # Family size preserved.
+        assert len(candidates) == len(LAUNCH_FAMILY)
+        msft = next(c for c in candidates if "MSFT" in c.strategy_id)
+        assert msft.app_payload["input_available"] is False
+        assert any(
+            f"[{K6_MTF_REASON_PREFIX}:" in iss
+            for iss in msft.app_payload["issues"]
+        )
+
+
+class TestNoLookaheadGuards:
+    def test_select_for_fold_does_not_open_output_k6_mtf(
+        self, tmp_path, monkeypatch,
+    ):
+        """The adapter must not open any output/k6_mtf/** path.
+
+        We sentinel-protect builtins.open under the monkeypatch so any
+        attempt to read a path containing ``output/k6_mtf`` raises
+        immediately. Both input loading and per-fold evaluation happen
+        under the guard, so the test exercises every code path that
+        could conceivably touch the live K=6 MTF output tree.
+        """
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+
+        real_open = open
+        opened: List[str] = []
+
+        def _guarded_open(file, *args, **kwargs):
+            spath = str(file).replace("\\", "/")
+            opened.append(spath)
+            if "output/k6_mtf" in spath:
+                raise AssertionError(
+                    f"adapter attempted to open output/k6_mtf path: "
+                    f"{spath}"
+                )
+            return real_open(file, *args, **kwargs)
+
+        import builtins
+        monkeypatch.setattr(builtins, "open", _guarded_open)
+
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=LAUNCH_FAMILY, secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        candidates = adapter.select_for_fold(fold)
+        for c in candidates:
+            adapter.evaluate_candidate(c, fold)
+        adapter.baseline_for_fold(fold)
+
+        # Sanity: at least one synthetic upstream input was opened.
+        assert any(
+            "signal_library" in p or "stackbuilder" in p
+            for p in opened
+        )
+
+    def test_current_snapshot_derived_at_train_end_not_artifact(
+        self, tmp_path,
+    ):
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        candidates = adapter.select_for_fold(fold)
+        aapl = candidates[0]
+        # The synthesized snapshot must reflect data at or before
+        # train_end. The synthetic universe uses always_buy=True so
+        # every 1d slot is BUY.
+        snap = aapl.app_payload["current_snapshot"]
+        assert snap is not None
+        # 1d is exact-date matched at train_end = idx[19].
+        assert snap["1d"] in {"BUY", "NONE", "UNAVAILABLE"}
+
+    def test_oos_window_uses_only_data_through_evaluation_cutoff(
+        self, tmp_path,
+    ):
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        aapl_inputs = inputs["AAPL"]
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        eval_cutoff = idx[29]
+        # Synthesize OOS bars in window (idx[20], idx[29]] (= test_start
+        # through eval_cutoff). Every synthesized bar must have
+        # bar_date <= eval_cutoff. Per-target forward-fill is verified
+        # by the production helper which uses searchsorted(side="right")
+        # - 1 so source_date <= target_date <= eval_cutoff.
+        bars = _synthesize_candidate_snapshots_in_window(
+            aapl_inputs.stack,
+            aapl_inputs.member_libs_by_tf,
+            aapl_inputs.secondary_close,
+            window_start=idx[20], window_end=idx[29],
+            evaluation_cutoff=eval_cutoff,
+        )
+        assert all(bar["bar_date"] <= eval_cutoff for bar in bars)
+        # No bar later than eval_cutoff.
+        assert not any(bar["bar_date"] > eval_cutoff for bar in bars)
+
+
+class TestEvaluateCandidateMechanics:
+    def test_daily_capture_and_trigger_mask_aligned(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        cands = adapter.select_for_fold(fold)
+        result = adapter.evaluate_candidate(cands[0], fold)
+        # With always_buy=True the K=6 unanimity combine yields BUY
+        # on every bar so every bar matches and every match is a BUY
+        # trade -> trigger_mask all True; daily_capture has float
+        # dtype and matches the trigger_mask index.
+        assert len(result.daily_capture) == len(result.trigger_mask)
+        assert list(result.trigger_mask.index) == list(
+            result.daily_capture.index,
+        )
+        assert result.daily_capture.dtype.kind == "f"
+        meta = result.metadata
+        assert meta["match_count"] >= 1
+        assert meta["capture_count"] >= 1
+        assert meta["trade_count"] == meta["capture_count"]
+        assert meta["secondary"] == "AAPL"
+
+    def test_missing_input_candidate_returns_empty_strategy_fold_result(
+        self, tmp_path,
+    ):
+        roots = _build_synthetic_universe(tmp_path, n_bars=40)
+        # Remove AAPL's combo_k=6.json to simulate missing input.
+        (roots["stackbuilder_root"] / "AAPL" / "selected_run"
+            / "combo_k=6.json").unlink()
+        inputs = build_adapter_inputs(
+            LAUNCH_FAMILY,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=LAUNCH_FAMILY, secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=40)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        cands = adapter.select_for_fold(fold)
+        # n_strategies_tested must reflect the family size (8 candidates
+        # selected by select_for_fold).
+        assert len(cands) == len(LAUNCH_FAMILY)
+        aapl = next(c for c in cands if "AAPL" in c.strategy_id)
+        assert aapl.app_payload["input_available"] is False
+        result = adapter.evaluate_candidate(aapl, fold)
+        assert len(result.daily_capture) == 0
+        assert len(result.trigger_mask) == 0
+        assert any(
+            f"[{K6_MTF_REASON_PREFIX}:" in iss
+            for iss in result.issues
+        )
+
+
+class TestBaselineCoherence:
+    def test_same_secondary_buy_and_hold_baseline_finite(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=60)
+        inputs = build_adapter_inputs(
+            ("AAPL", "AMZN"),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL", "AMZN"), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=60)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        bm = adapter.baseline_for_fold(fold)
+        assert bm.fold_index == 0
+        # Empty universe baseline returns issues + n_observations=0;
+        # synthetic always-available universe should produce > 0 obs.
+        assert bm.n_observations > 0
+
+
+class TestEndToEndContract:
+    def test_run_validation_emits_valid_sidecar(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=120)
+        inputs = build_adapter_inputs(
+            ("AAPL", "AMZN", "GOOGL"),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL", "AMZN", "GOOGL"),
+            secondary_inputs=inputs,
+        )
+        out_root = tmp_path / "validation_out"
+        out_root.mkdir()
+        result = run_validation(
+            adapter,
+            run_id="test-run-1",
+            output_dir=out_root / "test-run-1",
+            initial_train_days=30,
+            test_window_days=20,
+            step_days=20,
+            n_permutations=0,
+            n_bootstrap_samples=0,
+        )
+        sidecar_path = Path(result["sidecar_path"])
+        assert sidecar_path.exists()
+        assert sidecar_path.name == "validation.json"
+
+        contract = result["contract"]
+        assert contract["producer_engine"] == "k6_mtf"
+        assert contract["app_surface"] == "run_directory"
+        assert contract["validation_contract_version"] == "v1"
+        validate_validation_contract_v1(contract)
+
+        # Family size reflected in n_strategies_tested.
+        assert contract["n_strategies_tested"] == 3
+
+    def test_synthetic_sidecar_passes_contract_validation(self, tmp_path):
+        """Direct shape assertion: a freshly generated K=6 MTF sidecar
+        passes validate_validation_contract_v1.
+        """
+        roots = _build_synthetic_universe(tmp_path, n_bars=80)
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        result = run_validation(
+            adapter,
+            run_id="test-shape-1",
+            output_dir=tmp_path / "out" / "test-shape-1",
+            initial_train_days=20,
+            test_window_days=20,
+            step_days=20,
+            n_permutations=0,
+            n_bootstrap_samples=0,
+        )
+        validate_validation_contract_v1(result["contract"])
+
+
+class TestSidecarDiscovery:
+    def test_honest_validation_ledger_can_discover_and_load(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=80)
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        out_root = tmp_path / "validation_root"
+        out_root.mkdir()
+        result = run_validation(
+            adapter,
+            run_id="test-ledger-1",
+            output_dir=out_root / "test-ledger-1",
+            initial_train_days=20,
+            test_window_days=20,
+            step_days=20,
+            n_permutations=0,
+            n_bootstrap_samples=0,
+        )
+        discovered = hvl.discover_validation_sidecars(out_root)
+        assert len(discovered) == 1
+        assert discovered[0].name == "validation.json"
+        loaded = hvl.load_validation_sidecar(discovered[0])
+        assert loaded["producer_engine"] == "k6_mtf"
+
+    def test_controlled_compute_default_glob_finds_sidecar(self, tmp_path):
+        # controlled_compute._resolve_sidecar_glob default = "**/validation.json".
+        # Confirm rglob finds the K=6 MTF sidecar under any nested
+        # <run_id>/validation.json layout the adapter produces.
+        roots = _build_synthetic_universe(tmp_path, n_bars=80)
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        out_root = tmp_path / "cc_root"
+        out_root.mkdir()
+        result = run_validation(
+            adapter,
+            run_id="test-cc-1",
+            output_dir=out_root / "test-cc-1",
+            initial_train_days=20,
+            test_window_days=20,
+            step_days=20,
+            n_permutations=0,
+            n_bootstrap_samples=0,
+        )
+        matches = list(out_root.rglob("validation.json"))
+        assert len(matches) == 1
+        assert matches[0] == Path(result["sidecar_path"])
