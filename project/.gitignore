@@ -136,6 +136,14 @@ test_scripts/shared/*.py
 !test_scripts/shared/test_k6_mtf_fixture_schema.py
 !test_scripts/shared/test_react_publish_promote_k6_mtf_artifact.py
 !test_scripts/shared/test_k6_mtf_validation_adapter.py
+# OnePass tests: re-include the directory and narrowly track the
+# OnePass-specific regression tests. Mirrors the shared/ precedent
+# so local-only audit / diagnostic scripts under onepass/ stay
+# ignored unless they are explicitly allow-listed here.
+!test_scripts/onepass/
+test_scripts/onepass/*.py
+!test_scripts/onepass/test_onepass_rejection_diagnostics.py
+!test_scripts/onepass/test_onepass_provenance_engine_version.py
 
 # React publish promotion-manifest sidecar (written by the
 # operator-run helper at utils/react_publish/promote_k6_mtf_artifact.py
