@@ -652,8 +652,23 @@ class K6MtfValidationAdapter:
             )
             return _empty_fold_result(
                 context, candidate, issues_seq,
-                metadata_extra={"secondary": sec},
+                metadata_extra={
+                    "secondary": sec,
+                    "same_secondary_baseline": _empty_per_strategy_baseline(),
+                },
             )
+
+        # Per-(strategy, fold) same-secondary buy-and-hold. Computed
+        # once and threaded onto every return path so the engine's
+        # fold-level baseline_for_fold (which is deliberately empty
+        # for K=6 MTF) does not become the source of misleading
+        # baseline deltas.
+        same_secondary_baseline = _compute_same_secondary_baseline(
+            inputs.secondary_close,
+            test_start=oos_test_start,
+            test_end=oos_test_end,
+            evaluation_cutoff=eval_cutoff,
+        )
 
         current_snapshot = self._fold_current_snapshot.get(
             (context.fold_index, sec),
@@ -666,7 +681,10 @@ class K6MtfValidationAdapter:
                     f"{sec}: no current_snapshot for fold "
                     f"{context.fold_index}",
                 ),),
-                metadata_extra={"secondary": sec},
+                metadata_extra={
+                    "secondary": sec,
+                    "same_secondary_baseline": same_secondary_baseline,
+                },
             )
 
         # Build the OOS candidate-bar synthesis using cutoff-safe
@@ -692,7 +710,10 @@ class K6MtfValidationAdapter:
                     f"{oos_test_start.strftime('%Y-%m-%d')}..."
                     f"{oos_test_end.strftime('%Y-%m-%d')}",
                 ),),
-                metadata_extra={"secondary": sec},
+                metadata_extra={
+                    "secondary": sec,
+                    "same_secondary_baseline": same_secondary_baseline,
+                },
             )
 
         sec_capped = inputs.secondary_close[
@@ -762,6 +783,7 @@ class K6MtfValidationAdapter:
                     "trade_count": trade_count,
                     "no_trade_count": no_trade_count,
                     "skipped_capture_count": skipped_capture_count,
+                    "same_secondary_baseline": same_secondary_baseline,
                 },
             )
 
@@ -796,96 +818,138 @@ class K6MtfValidationAdapter:
                 "no_trade_count": no_trade_count,
                 "skipped_capture_count": skipped_capture_count,
                 "low_sample_warning": trade_count < LOW_SAMPLE_THRESHOLD,
+                "same_secondary_baseline": same_secondary_baseline,
             },
         )
 
     def baseline_for_fold(
         self, context: FoldContext,
     ) -> BaselineFoldMetrics:
-        """Same-secondary buy-and-hold over the fold OOS window.
+        """Return a deliberately empty fold-level baseline.
 
-        Mirrors the StackBuilder pattern at ``stackbuilder.py:3618``
-        but for a multi-secondary launch family: returns aggregate
-        baseline metrics averaged across the launch family's
-        available-input secondaries so the locked 5C-1 Section6 same-ticker
-        contract is honored per-secondary AND the engine receives a
-        single ``BaselineFoldMetrics`` per fold. The aggregate is
-        computed via canonical scoring on a concatenated daily-return
-        series, so empty launch families fall back to the engine's
-        baseline-unavailable path.
+        ``validation_engine`` v1 carries exactly one
+        ``BaselineFoldMetrics`` per fold via
+        ``adapter.baseline_for_fold``; the engine then applies that
+        single baseline to every per-strategy ``baseline_delta`` entry
+        for that fold. For the K=6 MTF launch family (multiple
+        secondaries evaluated under the same fold) no single
+        fold-level baseline can honestly represent the locked 5C-1
+        Section 6 same-secondary buy-and-hold contract -- a
+        family-blended baseline would deliver misleading baseline
+        deltas to every per-secondary strategy, and any per-secondary
+        choice would be wrong for the other secondaries.
+
+        Honest design: leave the fold-level baseline unavailable
+        (``n_observations=0`` and all metric fields ``None``, with a
+        bracketed ``[K6MTF:validation_baseline_unavailable]`` issue)
+        so the engine's per-strategy ``per_fold_baseline_delta``
+        entries surface as ``sharpe_delta=None``/``return_delta=None``
+        rather than blended values. The actual same-secondary
+        buy-and-hold metrics ARE computed inside
+        ``evaluate_candidate`` and recorded on
+        ``StrategyFoldResult.metadata['same_secondary_baseline']`` per
+        ``(strategy, fold)`` so the evidence is preserved.
+
+        A future ``validation_engine`` amendment that lets adapters
+        emit per-``(strategy, fold)`` baselines would let the K=6
+        MTF adapter pipe the same-secondary baseline through the
+        contract's ``baseline_per_fold`` and per-strategy
+        ``per_fold_baseline_delta`` fields. Until then the metadata
+        path is the honest answer.
         """
-        all_returns: List[pd.Series] = []
-        issues: List[str] = []
-        for sec in self.secondaries:
-            inputs = self._inputs.get(sec)
-            if inputs is None or not inputs.available:
-                continue
-            sec_capped = inputs.secondary_close[
-                inputs.secondary_close.index <= pd.Timestamp(
-                    context.evaluation_cutoff,
-                )
-            ]
-            test_window = slice_between(
-                sec_capped, context.test_start, context.test_end,
-            )
-            if test_window is None or test_window.empty:
-                continue
-            prices = test_window.astype(float)
-            daily_returns = prices.pct_change().fillna(0.0) * 100.0
-            if not daily_returns.empty:
-                all_returns.append(daily_returns)
-        if not all_returns:
-            formatted = _format_reason(
-                "validation_baseline_unavailable",
-                f"fold-{context.fold_index}: no available-input secondary "
-                f"contributed a non-empty same-secondary buy-and-hold "
-                f"window",
-            )
-            return BaselineFoldMetrics(
-                fold_index=context.fold_index, n_observations=0,
-                baseline_sharpe=None, baseline_total_return=None,
-                baseline_mean_return=None, baseline_std=None,
-                issues=(formatted,),
-            )
-        concatenated = pd.concat(all_returns).reset_index(drop=True)
-        n_obs = int(len(concatenated))
-        all_true = pd.Series([True] * n_obs, index=concatenated.index)
-        try:
-            score = _canonical_score_captures(
-                concatenated, all_true,
-                risk_free_rate=5.0,
-                periods_per_year=252,
-                ddof=1,
-            )
-        except Exception as exc:
-            formatted = _format_reason(
-                "validation_baseline_unavailable",
-                f"fold-{context.fold_index}: baseline scoring raised "
-                f"{type(exc).__name__}: {exc}",
-            )
-            return BaselineFoldMetrics(
-                fold_index=context.fold_index, n_observations=n_obs,
-                baseline_sharpe=None, baseline_total_return=None,
-                baseline_mean_return=None, baseline_std=None,
-                issues=(formatted,),
-            )
+        formatted = _format_reason(
+            "validation_baseline_unavailable",
+            (
+                f"fold-{context.fold_index}: K=6 MTF launch family carries "
+                f"per-secondary baselines; same-secondary buy-and-hold "
+                f"metrics for each strategy are recorded on "
+                f"StrategyFoldResult.metadata['same_secondary_baseline']"
+            ),
+        )
         return BaselineFoldMetrics(
             fold_index=context.fold_index,
-            n_observations=n_obs,
-            baseline_sharpe=_safe_score_float(
-                getattr(score, "sharpe", None),
-            ),
-            baseline_total_return=_safe_score_float(
-                getattr(score, "total_capture", None),
-            ),
-            baseline_mean_return=_safe_score_float(
-                getattr(score, "avg_daily_capture", None),
-            ),
-            baseline_std=_safe_score_float(
-                getattr(score, "std_dev", None),
-            ),
-            issues=tuple(issues),
+            n_observations=0,
+            baseline_sharpe=None,
+            baseline_total_return=None,
+            baseline_mean_return=None,
+            baseline_std=None,
+            issues=(formatted,),
         )
+
+
+def _compute_same_secondary_baseline(
+    secondary_close: pd.Series,
+    *,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+    evaluation_cutoff: pd.Timestamp,
+) -> Dict[str, Optional[float]]:
+    """Compute per-(strategy, fold) same-secondary buy-and-hold for
+    the fold OOS window, bounded by ``evaluation_cutoff``.
+
+    Returns a dict suitable for
+    ``StrategyFoldResult.metadata['same_secondary_baseline']``. Honors
+    the locked 5C-1 Section 6 same-secondary buy-and-hold contract
+    per-strategy. Fields:
+
+    - ``n_observations``: number of OOS daily bars used.
+    - ``baseline_sharpe`` / ``baseline_total_return`` /
+      ``baseline_mean_return`` / ``baseline_std``: floats or ``None``.
+    - ``issues``: list of bracketed ``[K6MTF:...]`` reason strings
+      (currently only populated on canonical-scoring exceptions).
+    """
+    out: Dict[str, Optional[float]] = {
+        "n_observations": 0,
+        "baseline_sharpe": None,
+        "baseline_total_return": None,
+        "baseline_mean_return": None,
+        "baseline_std": None,
+        "issues": [],
+    }
+    if secondary_close is None or secondary_close.empty:
+        return out
+    sec_capped = secondary_close[
+        secondary_close.index <= pd.Timestamp(evaluation_cutoff)
+    ]
+    test_window = slice_between(sec_capped, test_start, test_end)
+    if test_window is None or test_window.empty:
+        return out
+    prices = test_window.astype(float)
+    daily_returns = prices.pct_change().fillna(0.0) * 100.0
+    n_obs = int(len(daily_returns))
+    out["n_observations"] = n_obs
+    if n_obs == 0:
+        return out
+    all_true = pd.Series([True] * n_obs, index=daily_returns.index)
+    try:
+        score = _canonical_score_captures(
+            daily_returns, all_true,
+            risk_free_rate=5.0,
+            periods_per_year=252,
+            ddof=1,
+        )
+    except Exception as exc:
+        out["issues"] = [_format_reason(
+            "validation_baseline_unavailable",
+            (
+                f"per-strategy baseline scoring raised "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )]
+        return out
+    out["baseline_sharpe"] = _safe_score_float(
+        getattr(score, "sharpe", None),
+    )
+    out["baseline_total_return"] = _safe_score_float(
+        getattr(score, "total_capture", None),
+    )
+    out["baseline_mean_return"] = _safe_score_float(
+        getattr(score, "avg_daily_capture", None),
+    )
+    out["baseline_std"] = _safe_score_float(
+        getattr(score, "std_dev", None),
+    )
+    return out
 
 
 def _safe_score_float(x: Any) -> Optional[float]:
@@ -898,6 +962,21 @@ def _safe_score_float(x: Any) -> Optional[float]:
     if not np.isfinite(f):
         return None
     return f
+
+
+def _empty_per_strategy_baseline() -> Dict[str, Optional[float]]:
+    """Placeholder same-secondary baseline used by empty-fold result
+    paths (missing input, no history). Same shape as the success path
+    so downstream readers can inspect a single stable schema.
+    """
+    return {
+        "n_observations": 0,
+        "baseline_sharpe": None,
+        "baseline_total_return": None,
+        "baseline_mean_return": None,
+        "baseline_std": None,
+        "issues": [],
+    }
 
 
 def _empty_fold_result(

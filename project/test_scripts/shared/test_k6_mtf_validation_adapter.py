@@ -616,7 +616,20 @@ class TestEvaluateCandidateMechanics:
 
 
 class TestBaselineCoherence:
-    def test_same_secondary_buy_and_hold_baseline_finite(self, tmp_path):
+    """Post-Codex-audit baseline contract.
+
+    validation_engine v1 calls adapter.baseline_for_fold once per fold
+    and applies that single BaselineFoldMetrics to every per-strategy
+    per_fold_baseline_delta entry. For the K=6 MTF launch family
+    (multiple secondaries per fold), the adapter's baseline_for_fold
+    MUST return an empty BaselineFoldMetrics so the engine does not
+    deliver misleading blended baseline deltas. The actual
+    same-secondary buy-and-hold metrics live on
+    StrategyFoldResult.metadata['same_secondary_baseline'] per
+    (strategy, fold). This class pins both halves of that contract.
+    """
+
+    def test_baseline_for_fold_is_deliberately_empty(self, tmp_path):
         roots = _build_synthetic_universe(tmp_path, n_bars=60)
         inputs = build_adapter_inputs(
             ("AAPL", "AMZN"),
@@ -636,9 +649,109 @@ class TestBaselineCoherence:
         )
         bm = adapter.baseline_for_fold(fold)
         assert bm.fold_index == 0
-        # Empty universe baseline returns issues + n_observations=0;
-        # synthetic always-available universe should produce > 0 obs.
-        assert bm.n_observations > 0
+        assert bm.n_observations == 0
+        assert bm.baseline_sharpe is None
+        assert bm.baseline_total_return is None
+        assert bm.baseline_mean_return is None
+        assert bm.baseline_std is None
+        # Issue carries the bracketed [K6MTF:validation_baseline_unavailable]
+        # prefix and points downstream readers at the metadata path.
+        assert any(
+            f"[{K6_MTF_REASON_PREFIX}:validation_baseline_unavailable]"
+            in iss
+            for iss in bm.issues
+        )
+        assert any(
+            "StrategyFoldResult.metadata" in iss
+            for iss in bm.issues
+        )
+
+    def test_per_strategy_baseline_lives_in_metadata(self, tmp_path):
+        roots = _build_synthetic_universe(tmp_path, n_bars=60)
+        inputs = build_adapter_inputs(
+            ("AAPL", "AMZN"),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL", "AMZN"), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=60)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        cands = adapter.select_for_fold(fold)
+        results_by_sec = {
+            c.app_payload["secondary"]: adapter.evaluate_candidate(c, fold)
+            for c in cands
+        }
+        for sec, result in results_by_sec.items():
+            ss = result.metadata.get("same_secondary_baseline")
+            assert ss is not None, sec
+            assert isinstance(ss, dict)
+            # Same shape on every return path (success + empty fold).
+            for k in (
+                "n_observations",
+                "baseline_sharpe",
+                "baseline_total_return",
+                "baseline_mean_return",
+                "baseline_std",
+                "issues",
+            ):
+                assert k in ss, f"{sec} missing {k}"
+        # Synthetic universe always-available secondaries -> finite
+        # baseline_sharpe and baseline_total_return on at least one
+        # per-(strategy, fold) baseline.
+        finite = [
+            results_by_sec[sec].metadata["same_secondary_baseline"]
+            for sec in ("AAPL", "AMZN")
+            if results_by_sec[sec].metadata["same_secondary_baseline"][
+                "n_observations"
+            ] > 0
+        ]
+        assert finite
+        assert any(
+            ss["baseline_total_return"] is not None for ss in finite
+        )
+
+    def test_per_secondary_baselines_differ_across_secondaries(
+        self, tmp_path,
+    ):
+        """Distinct synthetic close paths must produce distinct
+        per-secondary baselines (sanity check that we are NOT blending).
+        """
+        roots = _build_synthetic_universe(tmp_path, n_bars=80, seed=42)
+        inputs = build_adapter_inputs(
+            ("AAPL", "AMZN", "GOOGL"),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL", "AMZN", "GOOGL"), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=80)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[39],
+            test_start=idx[40], test_end=idx[59],
+        )
+        cands = adapter.select_for_fold(fold)
+        totals = []
+        for c in cands:
+            result = adapter.evaluate_candidate(c, fold)
+            ss = result.metadata["same_secondary_baseline"]
+            totals.append(ss["baseline_total_return"])
+        finite_totals = [t for t in totals if t is not None]
+        # All three secondaries have distinct synthetic prices so their
+        # per-secondary buy-and-hold totals should not all be equal.
+        assert len(finite_totals) >= 2
+        assert len(set(round(t, 6) for t in finite_totals)) > 1
 
 
 class TestEndToEndContract:
@@ -769,3 +882,121 @@ class TestSidecarDiscovery:
         matches = list(out_root.rglob("validation.json"))
         assert len(matches) == 1
         assert matches[0] == Path(result["sidecar_path"])
+
+
+class TestCliInvocationPathProof:
+    """End-to-end CLI exercise that proves the sidecar lands at the
+    intended discovery root with no ``project/project`` doubling
+    when the adapter is invoked the way ``controlled_compute`` would
+    invoke it (no explicit ``--output-dir``, working under a
+    simulated ``<REPO_ROOT>/project`` cwd).
+
+    The test monkeypatches the adapter module's
+    ``_PROJECT_DIR_DEFAULT`` so ``resolve_validation_output_base``
+    resolves to a tmp_path-based synthetic ``<REPO_ROOT>/project``
+    instead of the real repo. It then invokes ``adapter.main(argv)``
+    (the same callable the ``python -m utils.k6_mtf_validation.adapter``
+    entry point uses) and asserts:
+
+    1. ``main`` returns 0 and prints a stdout JSON envelope.
+    2. The sidecar lands at exactly
+       ``<simulated repo>/project/output/validation/<run_id>/validation.json``
+       -- no ``project/project`` doubling.
+    3. ``rglob("validation.json")`` discovers the same path.
+    4. ``honest_validation_ledger.load_validation_sidecar`` round-trips
+       the contract.
+    5. Re-checking the resolver under the simulated layout confirms
+       the resolved base lives strictly under the simulated REPO_ROOT
+       and has exactly one ``project`` segment.
+
+    No real ``output/`` directory under the actual repo is touched.
+    No real ``controlled_compute`` invocation happens.
+    """
+
+    def test_main_cli_writes_to_resolved_base_with_no_project_doubling(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        # 1. Synthetic <REPO_ROOT>/project layout under tmp_path.
+        sim_repo_root = tmp_path / "sim_repo"
+        sim_project_dir = sim_repo_root / "project"
+        sim_project_dir.mkdir(parents=True)
+        # The synthetic universe lives anywhere under sim_project_dir
+        # so the adapter inputs can be loaded from real on-disk pickles.
+        roots = _build_synthetic_universe(sim_project_dir, n_bars=80)
+
+        # 2. Point the adapter resolver at the synthetic repo. The
+        # resolver derives repo_root from project_dir.parent, so only
+        # _PROJECT_DIR_DEFAULT needs swapping.
+        monkeypatch.setattr(
+            adapter_mod, "_PROJECT_DIR_DEFAULT", sim_project_dir,
+        )
+
+        # Sanity: resolver lands under the simulated repo, exactly one
+        # "project" segment, no doubling.
+        resolved_base = adapter_mod.resolve_validation_output_base()
+        assert resolved_base == (
+            sim_project_dir / "output" / "validation"
+        ).resolve()
+        # Parts of the resolved path relative to sim_repo_root must
+        # contain exactly one "project" segment.
+        rel_parts = resolved_base.relative_to(
+            sim_repo_root.resolve(),
+        ).parts
+        assert rel_parts == ("project", "output", "validation")
+
+        # 3. Invoke adapter.main(argv) the same way an operator-supervised
+        # job-spec command would, with no --output-dir (so the resolver
+        # owns sidecar placement).
+        run_id = "test-cli-pathproof"
+        rc = adapter_mod.main([
+            "--secondaries", "AAPL",
+            "--stackbuilder-root", str(roots["stackbuilder_root"]),
+            "--signal-library-dir", str(roots["stable_dir"]),
+            "--price-cache-dir", str(roots["price_cache_dir"]),
+            "--cache-dir", str(roots["cache_dir"]),
+            "--run-id", run_id,
+            "--initial-train-days", "20",
+            "--test-window-days", "20",
+            "--step-days", "20",
+            "--n-permutations", "0",
+            "--n-bootstrap-samples", "0",
+        ])
+        assert rc == 0
+
+        # 4. main prints a JSON envelope; parse the sidecar_path back out.
+        captured = capsys.readouterr()
+        envelope = json.loads(captured.out)
+        sidecar_path = Path(envelope["sidecar_path"])
+        assert sidecar_path.exists()
+        assert sidecar_path.name == "validation.json"
+
+        # 5. The sidecar landed at exactly
+        # <sim_repo>/project/output/validation/<run_id>/validation.json.
+        expected = (
+            sim_project_dir / "output" / "validation" / run_id
+            / "validation.json"
+        ).resolve()
+        assert sidecar_path == expected
+
+        # 6. No project/project doubling anywhere in the resolved path.
+        path_str = str(sidecar_path).replace("\\", "/")
+        assert "project/project" not in path_str
+
+        # 7. controlled_compute-style discovery: rglob from the
+        # validation base finds exactly this sidecar.
+        discovery_root = resolved_base
+        matches = list(discovery_root.rglob("validation.json"))
+        assert matches == [expected]
+
+        # 8. honest_validation_ledger round-trip.
+        loaded = hvl.load_validation_sidecar(expected)
+        assert loaded["producer_engine"] == "k6_mtf"
+        assert loaded["app_surface"] == "run_directory"
+        assert loaded["run_id"] == run_id
+
+        # 9. The real repo's output/validation must NOT have grown a
+        # sidecar named test-cli-pathproof from this test.
+        real_output_validation = (
+            PROJECT_DIR / "output" / "validation" / run_id
+        )
+        assert not real_output_validation.exists()
