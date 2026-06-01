@@ -884,6 +884,212 @@ class TestSidecarDiscovery:
         assert matches[0] == Path(result["sidecar_path"])
 
 
+class TestPersistedSameSecondaryBaseline:
+    """The locked 5C-1 Section 6 same-secondary buy-and-hold contract
+    MUST land on disk in the K=6 MTF sidecar, not just on the
+    transient ``StrategyFoldResult.metadata``. ``validation_engine``
+    v1 does not serialize arbitrary fold metadata into the contract;
+    the adapter's ``run_validation()`` post-processes the contract
+    dict and injects ``same_secondary_baseline`` into every
+    ``strategies[].per_fold_metrics[]`` entry BEFORE
+    ``write_validation_sidecar`` writes the JSON.
+
+    These tests pin:
+
+    1. The in-memory contract returned by ``run_validation()`` carries
+       ``same_secondary_baseline`` on every per-fold metric for every
+       K=6 MTF strategy, with the stable six-key schema.
+    2. The on-disk JSON sidecar contains the same per-fold sub-object
+       (proving it actually persisted, not just lived on transient
+       metadata).
+    3. Engine-level ``per_fold_baseline_delta`` entries remain
+       ``sharpe_delta=None`` / ``return_delta=None`` for K=6 MTF
+       rows, so the engine never delivers a misleading blended
+       baseline.
+    4. Distinct synthetic-close per-secondary baselines produce
+       distinct ``baseline_total_return`` values in the persisted
+       contract (proves the data is NOT blended on disk).
+    """
+
+    _BASELINE_KEYS = (
+        "n_observations",
+        "baseline_sharpe",
+        "baseline_total_return",
+        "baseline_mean_return",
+        "baseline_std",
+        "issues",
+    )
+
+    def _build_run(self, tmp_path, *, n_bars=120, secondaries=(
+        "AAPL", "AMZN", "GOOGL",
+    )):
+        roots = _build_synthetic_universe(tmp_path, n_bars=n_bars, seed=11)
+        inputs = build_adapter_inputs(
+            secondaries,
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=secondaries, secondary_inputs=inputs,
+        )
+        result = run_validation(
+            adapter,
+            run_id="test-persisted-baseline",
+            output_dir=tmp_path / "vout" / "test-persisted-baseline",
+            initial_train_days=30,
+            test_window_days=20,
+            step_days=20,
+            n_permutations=0,
+            n_bootstrap_samples=0,
+        )
+        return adapter, result
+
+    def test_returned_contract_carries_per_fold_baseline(self, tmp_path):
+        _adapter, result = self._build_run(tmp_path)
+        contract = result["contract"]
+        assert contract["producer_engine"] == "k6_mtf"
+        strategies = contract["strategies"]
+        assert strategies, "no strategies in contract"
+        for strat in strategies:
+            per_fold = strat["per_fold_metrics"]
+            assert per_fold, f"strategy {strat['strategy_id']} has 0 folds"
+            for entry in per_fold:
+                ss = entry.get("same_secondary_baseline")
+                assert ss is not None, (
+                    f"strategy {strat['strategy_id']} fold "
+                    f"{entry.get('fold_index')} missing "
+                    f"same_secondary_baseline"
+                )
+                for k in self._BASELINE_KEYS:
+                    assert k in ss, (
+                        f"strategy {strat['strategy_id']} fold "
+                        f"{entry['fold_index']} missing key {k!r}"
+                    )
+
+    def test_persisted_sidecar_carries_per_fold_baseline(self, tmp_path):
+        _adapter, result = self._build_run(tmp_path)
+        sidecar_path = Path(result["sidecar_path"])
+        assert sidecar_path.exists()
+        on_disk = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        strategies = on_disk["strategies"]
+        assert strategies
+        for strat in strategies:
+            per_fold = strat["per_fold_metrics"]
+            assert per_fold
+            for entry in per_fold:
+                ss = entry.get("same_secondary_baseline")
+                assert ss is not None, (
+                    f"strategy {strat['strategy_id']} fold "
+                    f"{entry.get('fold_index')} missing "
+                    f"same_secondary_baseline in PERSISTED sidecar"
+                )
+                for k in self._BASELINE_KEYS:
+                    assert k in ss, (
+                        f"persisted strategy {strat['strategy_id']} fold "
+                        f"{entry['fold_index']} missing key {k!r}"
+                    )
+                # Stable schema on disk: n_observations is int and
+                # issues is a list (possibly empty).
+                assert isinstance(ss["n_observations"], int)
+                assert isinstance(ss["issues"], list)
+
+    def test_persisted_sidecar_passes_engine_contract_validation(
+        self, tmp_path,
+    ):
+        _adapter, result = self._build_run(tmp_path)
+        on_disk = json.loads(
+            Path(result["sidecar_path"]).read_text(encoding="utf-8"),
+        )
+        validate_validation_contract_v1(on_disk)
+
+    def test_engine_per_fold_baseline_delta_remains_null(self, tmp_path):
+        _adapter, result = self._build_run(tmp_path)
+        contract = result["contract"]
+        on_disk = json.loads(
+            Path(result["sidecar_path"]).read_text(encoding="utf-8"),
+        )
+        for source_label, source in (
+            ("in-memory contract", contract),
+            ("on-disk sidecar", on_disk),
+        ):
+            for strat in source["strategies"]:
+                deltas = strat.get("per_fold_baseline_delta")
+                assert deltas is not None
+                assert deltas, (
+                    f"{source_label}: strategy "
+                    f"{strat['strategy_id']} has empty "
+                    f"per_fold_baseline_delta"
+                )
+                for d in deltas:
+                    assert d["sharpe_delta"] is None, (
+                        f"{source_label}: strategy "
+                        f"{strat['strategy_id']} fold "
+                        f"{d['fold_index']} engine sharpe_delta is "
+                        f"not None (blended baseline regression)"
+                    )
+                    assert d["return_delta"] is None, (
+                        f"{source_label}: strategy "
+                        f"{strat['strategy_id']} fold "
+                        f"{d['fold_index']} engine return_delta is "
+                        f"not None (blended baseline regression)"
+                    )
+
+    def test_persisted_baselines_differ_across_secondaries(self, tmp_path):
+        _adapter, result = self._build_run(
+            tmp_path, n_bars=160,
+            secondaries=("AAPL", "AMZN", "GOOGL", "META"),
+        )
+        on_disk = json.loads(
+            Path(result["sidecar_path"]).read_text(encoding="utf-8"),
+        )
+        by_sec_fold0_total: Dict[str, Optional[float]] = {}
+        for strat in on_disk["strategies"]:
+            sid = strat["strategy_id"]
+            # strategy_id format: "k6_mtf:<SEC>".
+            sec = sid.split(":", 1)[1]
+            for entry in strat["per_fold_metrics"]:
+                if entry.get("fold_index") == 0:
+                    by_sec_fold0_total[sec] = (
+                        entry["same_secondary_baseline"][
+                            "baseline_total_return"
+                        ]
+                    )
+                    break
+        finite = [
+            v for v in by_sec_fold0_total.values() if v is not None
+        ]
+        assert len(finite) >= 2, (
+            "expected at least two secondaries with finite fold-0 "
+            f"baselines, got {by_sec_fold0_total!r}"
+        )
+        rounded = {round(v, 6) for v in finite}
+        assert len(rounded) > 1, (
+            f"persisted fold-0 baselines look blended: {finite!r}"
+        )
+
+    def test_baseline_for_fold_remains_deliberately_empty(self, tmp_path):
+        adapter, _result = self._build_run(tmp_path)
+        idx = pd.bdate_range("2020-01-02", periods=80)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[19],
+            test_start=idx[20], test_end=idx[39],
+        )
+        bm = adapter.baseline_for_fold(fold)
+        assert bm.n_observations == 0
+        assert bm.baseline_sharpe is None
+        assert bm.baseline_total_return is None
+        assert bm.baseline_mean_return is None
+        assert bm.baseline_std is None
+        assert any(
+            f"[{K6_MTF_REASON_PREFIX}:validation_baseline_unavailable]"
+            in iss
+            for iss in bm.issues
+        )
+
+
 class TestCliInvocationPathProof:
     """End-to-end CLI exercise that proves the sidecar lands at the
     intended discovery root with no ``project/project`` doubling

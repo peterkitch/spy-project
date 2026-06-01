@@ -512,6 +512,19 @@ class K6MtfValidationAdapter:
         self._fold_current_snapshot: Dict[
             Tuple[int, str], Optional[Dict[str, str]]
         ] = {}
+        # Per-(strategy_id, fold_index) same-secondary baseline cache,
+        # populated by evaluate_candidate on every return path. Read by
+        # run_validation() after validate_strategy_set returns, before
+        # write_validation_sidecar, so each
+        # strategies[].per_fold_metrics[] entry can carry a persisted
+        # same_secondary_baseline field in the JSON sidecar.
+        # StrategyFoldResult.metadata is NOT serialized into the
+        # contract by validation_engine v1 (_merge_strategy_metadata
+        # keeps only empirical-layer keys), so transient-only metadata
+        # would lose the per-strategy baseline evidence on persistence.
+        self._fold_baseline_cache: Dict[
+            Tuple[str, int], Dict[str, Any]
+        ] = {}
 
     # ----- SelectionAdapter Protocol --------------------------------------
 
@@ -650,11 +663,15 @@ class K6MtfValidationAdapter:
                     ),
                 )
             )
+            empty_baseline = _empty_per_strategy_baseline()
+            self._fold_baseline_cache[
+                (candidate.strategy_id, context.fold_index)
+            ] = empty_baseline
             return _empty_fold_result(
                 context, candidate, issues_seq,
                 metadata_extra={
                     "secondary": sec,
-                    "same_secondary_baseline": _empty_per_strategy_baseline(),
+                    "same_secondary_baseline": empty_baseline,
                 },
             )
 
@@ -662,13 +679,19 @@ class K6MtfValidationAdapter:
         # once and threaded onto every return path so the engine's
         # fold-level baseline_for_fold (which is deliberately empty
         # for K=6 MTF) does not become the source of misleading
-        # baseline deltas.
+        # baseline deltas. Also cached on the adapter so run_validation
+        # can post-process the contract dict before sidecar
+        # persistence (validation_engine v1 does not serialize
+        # StrategyFoldResult.metadata into the contract).
         same_secondary_baseline = _compute_same_secondary_baseline(
             inputs.secondary_close,
             test_start=oos_test_start,
             test_end=oos_test_end,
             evaluation_cutoff=eval_cutoff,
         )
+        self._fold_baseline_cache[
+            (candidate.strategy_id, context.fold_index)
+        ] = same_secondary_baseline
 
         current_snapshot = self._fold_current_snapshot.get(
             (context.fold_index, sec),
@@ -1003,6 +1026,68 @@ def _empty_fold_result(
 
 
 # ---------------------------------------------------------------------------
+# Contract post-processor (persists per-(strategy, fold) baseline)
+# ---------------------------------------------------------------------------
+
+
+def _enrich_contract_with_same_secondary_baseline(
+    contract: Dict[str, Any],
+    baseline_cache: Mapping[Tuple[str, int], Mapping[str, Any]],
+) -> None:
+    """Inject ``same_secondary_baseline`` into every
+    ``strategies[].per_fold_metrics[]`` entry of an already-built
+    ``validation_contract_v1`` dict, in place.
+
+    ``validation_engine`` v1 does not serialize arbitrary
+    ``StrategyFoldResult.metadata`` into the emitted contract; it
+    only keeps engine-recognized fields on ``per_fold_metrics`` and
+    only empirical-layer keys on ``_merge_strategy_metadata``. The
+    K=6 MTF same-secondary buy-and-hold evidence (locked 5C-1
+    Section 6) MUST live on disk in the sidecar, not just in the
+    transient ``StrategyFoldResult.metadata``, so adapter-local
+    post-processing fills the gap without requiring a
+    ``validation_engine`` contract change.
+
+    Lookup key: ``(strategy_id, fold_index)`` from each per-fold
+    entry. Missing entries get ``_empty_per_strategy_baseline()`` so
+    the per-fold metric schema is uniform across all strategies and
+    folds. The injected dict shape:
+
+    ``{"n_observations": int, "baseline_sharpe": Optional[float],
+    "baseline_total_return": Optional[float],
+    "baseline_mean_return": Optional[float],
+    "baseline_std": Optional[float], "issues": List[str]}``.
+
+    Engine-level ``per_fold_baseline_delta`` entries are left
+    untouched (they remain ``sharpe_delta=None`` /
+    ``return_delta=None`` because the adapter's ``baseline_for_fold``
+    is deliberately empty). Downstream readers (honest_validation
+    _ledger, future Phase 5 report tooling) should read the
+    per-strategy ``same_secondary_baseline`` for K=6 MTF rows.
+    """
+    strategies = contract.get("strategies")
+    if not isinstance(strategies, list):
+        return
+    for strat in strategies:
+        if not isinstance(strat, dict):
+            continue
+        sid = strat.get("strategy_id")
+        per_fold = strat.get("per_fold_metrics")
+        if not isinstance(sid, str) or not isinstance(per_fold, list):
+            continue
+        for entry in per_fold:
+            if not isinstance(entry, dict):
+                continue
+            fi = entry.get("fold_index")
+            if not isinstance(fi, int):
+                continue
+            cached = baseline_cache.get((sid, fi))
+            if cached is None:
+                cached = _empty_per_strategy_baseline()
+            entry["same_secondary_baseline"] = dict(cached)
+
+
+# ---------------------------------------------------------------------------
 # Top-level run helper + CLI
 # ---------------------------------------------------------------------------
 
@@ -1077,6 +1162,17 @@ def run_validation(
         n_bootstrap_samples=n_bootstrap_samples,
         borderline_tolerance_multiplier=borderline_tolerance_multiplier,
         rng_seed=rng_seed,
+    )
+    # Persist per-(strategy, fold) same-secondary buy-and-hold into the
+    # contract dict BEFORE write_validation_sidecar serializes it.
+    # validation_engine v1 does not carry adapter-local
+    # StrategyFoldResult.metadata into the sidecar, so the locked 5C-1
+    # Section 6 same-secondary baseline evidence would otherwise be
+    # lost on persistence. baseline_for_fold remains deliberately
+    # empty (so engine-level per_fold_baseline_delta entries stay None
+    # rather than becoming misleading blended values).
+    _enrich_contract_with_same_secondary_baseline(
+        contract, adapter._fold_baseline_cache,
     )
     sidecar_path = write_validation_sidecar(
         contract, output_dir, allow_overwrite=allow_overwrite,
