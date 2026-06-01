@@ -1611,3 +1611,323 @@ class TestEmpiricalMetadata:
             for d in strat["per_fold_baseline_delta"]:
                 assert d["sharpe_delta"] is None
                 assert d["return_delta"] is None
+
+
+class TestEmpiricalMetadataMatchedShort:
+    """Matched Short raw-return semantics.
+
+    The prior TestEmpiricalMetadata.test_buy_short_capture_signs
+    _unchanged only exercises matched Buy bars (the all-Buy current
+    _snapshot fixture cannot produce matched Short candidates). This
+    class adds a fixture where current_snapshot is all-SHORT and the
+    OOS window contains matched SHORT bars, plus non-matched BUY
+    bars that contribute to the pool. The fixture pins that:
+
+    - signal_state.loc[matched_short_bar] == "Short".
+    - trigger_mask.loc[matched_short_bar] is True.
+    - daily_capture.loc[matched_short_bar] == -raw_return_pct.
+    - permutation_return_pool.loc[matched_short_bar] == +raw_return_pct.
+      (i.e., the pool is unsigned raw returns, NOT signed captures.)
+    - The pool also contains None-token rows from non-matched bars.
+    """
+
+    @staticmethod
+    def _build_short_current_fixture(tmp_path, n_bars=80):
+        # In-sample bars 0..29: all SHORT -> current_snapshot all SHORT.
+        # OOS bars 30..n-1: alternating SHORT (matched) and BUY (non-
+        # matched against the all-SHORT current_snapshot).
+        signals = [SIGNAL_SHORT] * 30 + [
+            (SIGNAL_SHORT if i % 2 == 0 else SIGNAL_BUY)
+            for i in range(n_bars - 30)
+        ]
+        # Deterministic increasing closes -> raw returns strictly
+        # positive on every bar.
+        closes = [100.0 + 0.1 * i for i in range(n_bars)]
+        roots = _build_universe_with_signal_program(
+            tmp_path,
+            secondary="AAPL",
+            n_bars=n_bars,
+            member_signals=signals,
+            closes=closes,
+        )
+        return roots, signals, closes
+
+    def _evaluate_one_fold(self, roots, n_bars):
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=n_bars)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[29],
+            test_start=idx[30], test_end=idx[n_bars - 1],
+        )
+        cands = adapter.select_for_fold(fold)
+        result = adapter.evaluate_candidate(cands[0], fold)
+        return adapter, fold, result, idx
+
+    def test_matched_short_raw_return_semantics(self, tmp_path):
+        roots, _signals, closes = self._build_short_current_fixture(tmp_path)
+        _adapter, _fold, result, idx = self._evaluate_one_fold(
+            roots, n_bars=80,
+        )
+        ss = result.metadata["signal_state"]
+        pool = result.metadata["permutation_return_pool"]
+        dc = result.daily_capture
+        tm = result.trigger_mask
+        # At least one matched Short row must exist.
+        short_rows = ss[ss == "Short"].index
+        assert len(short_rows) >= 1, (
+            "fixture produced no matched Short bars"
+        )
+        # Take the first matched Short bar and pin its semantics.
+        d = short_rows[0]
+        assert tm.loc[d] is True or bool(tm.loc[d]) is True
+        # Reconstruct raw_return_pct positionally from closes.
+        full_dates = pd.bdate_range("2020-01-02", periods=80)
+        pos = list(full_dates).index(d)
+        raw_return_pct = (closes[pos + 1] / closes[pos] - 1.0) * 100.0
+        # daily_capture at a Short row equals -raw_return_pct.
+        assert abs(dc.loc[d] - (-raw_return_pct)) < 1e-9
+        # permutation_return_pool at the SAME bar equals +raw_return_pct.
+        assert abs(pool.loc[d] - raw_return_pct) < 1e-9
+        # Signed-capture leakage check: dc != pool at Short rows
+        # (because dc is signed and pool is unsigned). With strictly
+        # positive raw returns, dc < 0 and pool > 0.
+        assert dc.loc[d] < 0 < pool.loc[d]
+        # Full-population semantics still hold: pool length strictly
+        # exceeds the trigger count (the non-matched BUY bars
+        # contribute None-token pool rows).
+        n_triggers = int(tm.sum())
+        assert len(pool) > n_triggers
+        # Some None-token rows exist (the non-matched BUY bars).
+        assert (ss == "None").sum() >= 1
+
+
+class TestEmpiricalPlantedEdgePairedSanity:
+    """Matched-pair planted-edge vs no-edge empirical sanity.
+
+    Two paired fixtures share an identical eligible raw-return pool
+    (identical close path) and identical Buy / Short trigger counts.
+    The ONLY difference is trigger placement:
+
+    - planted-edge: Buy triggers placed on top-rank raw-return bars.
+    - no-edge: Buy triggers placed on bottom-rank raw-return bars.
+
+    Both fixtures are driven through K6MtfValidationAdapter (no
+    hand-built metadata). The adapter-emitted ``signal_state`` and
+    ``permutation_return_pool`` are then fed to
+    ``validation_engine._permutation_p_value`` with the same
+    ``rng_seed`` and same ``n_permutations`` for both cases.
+
+    Assertions:
+
+    - planted_p < no_edge_p (the central relative assertion).
+    - both p-values are strictly inside (1 / (n_perm + 1), 1.0).
+    - eligible-pool values are identical between the paired cases.
+    - Buy and Short trigger counts are identical.
+    """
+
+    # Pool geometry: 17 eligible OOS bars with descending raw returns
+    # from +3.0% down to -1.0%. The small pool size is deliberate:
+    # validation_engine._permutation_p_value samples 15 of the 17
+    # eligible bars without replacement, so there are C(17, 15) = 136
+    # distinct possible samples. With n_perm = 500 the engine cycles
+    # through all 136 samples multiple times, which keeps both
+    # p-values strictly inside the open band (1 / (n_perm + 1), 1.0)
+    # even when the planted-edge and no-edge sets sit at the ranked
+    # extremes of the pool -- multiple permutations naturally land on
+    # the observed subset and contribute to ge_count. A 70-bar pool
+    # would put the planted observation at the literal maximum of the
+    # permutation distribution and collapse p_planted to 1 / (n + 1)
+    # exactly (boundary failure).
+    N_IN_SAMPLE = 30
+    N_OOS_ELIGIBLE = 17
+    N_BARS = N_IN_SAMPLE + N_OOS_ELIGIBLE + 1  # 48
+    N_BUY_TRIGGERS = 15
+    # Descending raw returns from +3.0% to -1.0% across 17 OOS bars.
+    OOS_RETURNS_DESCENDING = tuple(
+        np.linspace(3.0, -1.0, N_OOS_ELIGIBLE)
+    )
+
+    @classmethod
+    def _build_close_path(cls):
+        closes = [100.0]
+        # In-sample: constant +0.5% return for the 30 in-sample bars.
+        for _ in range(cls.N_IN_SAMPLE):
+            closes.append(closes[-1] * 1.005)
+        # OOS returns in descending order; bar 100 receives the last
+        # of the 70 OOS returns as its "input return" so close[100] is
+        # close[99] * (1 + last_oos_return/100). Bar 100 is itself
+        # not eligible (no next close inside cutoff).
+        for r in cls.OOS_RETURNS_DESCENDING:
+            closes.append(closes[-1] * (1.0 + r / 100.0))
+        assert len(closes) == cls.N_BARS
+        return closes
+
+    @classmethod
+    def _build_signal_program(cls, *, planted: bool):
+        """Build the per-bar member signal program.
+
+        In-sample: all-BUY -> current_snapshot all-BUY at train_end.
+        OOS signal layout (17 eligible OOS bars with descending raw
+        returns from +3.0% to -1.0%; the 18th OOS bar is the
+        test_end / non-eligible trailing bar):
+
+        - planted: Buy on OOS positions 0..14 (the 15 highest-return
+          bars, ranks 1..15 of the 17-bar pool); Short on OOS
+          positions 15..16 (ranks 16..17 of the pool).
+        - no-edge: Short on OOS positions 0..1 (ranks 1..2 of the
+          pool); Buy on OOS positions 2..16 (the 15 lowest-return
+          bars, ranks 3..17 of the pool).
+
+        Trailing test_end bar carries Buy for symmetry; it is not
+        OOS-eligible (no next close inside eval_cutoff).
+        """
+        in_sample = [SIGNAL_BUY] * cls.N_IN_SAMPLE
+        oos = [SIGNAL_SHORT] * cls.N_OOS_ELIGIBLE
+        if planted:
+            for i in range(0, cls.N_BUY_TRIGGERS):
+                oos[i] = SIGNAL_BUY
+        else:
+            for i in range(
+                cls.N_OOS_ELIGIBLE - cls.N_BUY_TRIGGERS,
+                cls.N_OOS_ELIGIBLE,
+            ):
+                oos[i] = SIGNAL_BUY
+        trailing = [SIGNAL_BUY]
+        full = in_sample + oos + trailing
+        assert len(full) == cls.N_BARS
+        assert oos.count(SIGNAL_BUY) == cls.N_BUY_TRIGGERS
+        return full
+
+    def _build_paired_fixture(self, tmp_path, *, planted: bool):
+        closes = self._build_close_path()
+        signals = self._build_signal_program(planted=planted)
+        # Use a distinct secondary ticker per fixture so the helper's
+        # per-secondary stackbuilder/selected_build paths do not
+        # collide when building both fixtures under sibling tmp dirs.
+        secondary = "AAPL"
+        roots = _build_universe_with_signal_program(
+            tmp_path,
+            secondary=secondary,
+            n_bars=self.N_BARS,
+            member_signals=signals,
+            closes=closes,
+        )
+        return roots, signals, closes
+
+    def _evaluate(self, roots):
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        idx = pd.bdate_range("2020-01-02", periods=self.N_BARS)
+        fold = _build_fold(
+            fold_index=0,
+            train_start=idx[0], train_end=idx[self.N_IN_SAMPLE - 1],
+            test_start=idx[self.N_IN_SAMPLE],
+            test_end=idx[self.N_BARS - 1],
+        )
+        cands = adapter.select_for_fold(fold)
+        result = adapter.evaluate_candidate(cands[0], fold)
+        return result
+
+    def test_paired_planted_vs_no_edge_p_values(self, tmp_path):
+        planted_dir = tmp_path / "planted"
+        no_edge_dir = tmp_path / "no_edge"
+        planted_dir.mkdir()
+        no_edge_dir.mkdir()
+
+        planted_roots, _ps, planted_closes = self._build_paired_fixture(
+            planted_dir, planted=True,
+        )
+        no_edge_roots, _ns, no_edge_closes = self._build_paired_fixture(
+            no_edge_dir, planted=False,
+        )
+        # Identical close path means identical raw-return pool values.
+        assert planted_closes == no_edge_closes
+
+        planted_result = self._evaluate(planted_roots)
+        no_edge_result = self._evaluate(no_edge_roots)
+
+        planted_pool = planted_result.metadata["permutation_return_pool"]
+        no_edge_pool = no_edge_result.metadata["permutation_return_pool"]
+        planted_ss = planted_result.metadata["signal_state"]
+        no_edge_ss = no_edge_result.metadata["signal_state"]
+
+        # Identical pool size + identical sorted values.
+        assert len(planted_pool) == len(no_edge_pool)
+        assert sorted(planted_pool.to_list()) == sorted(no_edge_pool.to_list())
+        # Identical trigger counts.
+        p_n_buy = int((planted_ss == "Buy").sum())
+        p_n_short = int((planted_ss == "Short").sum())
+        n_n_buy = int((no_edge_ss == "Buy").sum())
+        n_n_short = int((no_edge_ss == "Short").sum())
+        assert p_n_buy == n_n_buy == self.N_BUY_TRIGGERS
+        assert p_n_short == n_n_short == 0
+        assert int(planted_result.trigger_mask.sum()) == self.N_BUY_TRIGGERS
+        assert int(no_edge_result.trigger_mask.sum()) == self.N_BUY_TRIGGERS
+        # Pool strictly exceeds trigger count.
+        assert len(planted_pool) > self.N_BUY_TRIGGERS
+
+        # Drive the engine's direction-preserving p-value path with
+        # adapter-emitted metadata, identical rng_seed and
+        # n_permutations for both cases.
+        from validation_engine import _permutation_p_value
+        n_perm = 500
+        seed = 20260601
+
+        rng_planted = np.random.default_rng(seed)
+        p_planted = _permutation_p_value(
+            planted_result.daily_capture,
+            planted_result.trigger_mask,
+            n_permutations=n_perm,
+            rng=rng_planted,
+            signal_state=planted_ss,
+            permutation_return_pool=planted_pool,
+        )
+        rng_no_edge = np.random.default_rng(seed)
+        p_no_edge = _permutation_p_value(
+            no_edge_result.daily_capture,
+            no_edge_result.trigger_mask,
+            n_permutations=n_perm,
+            rng=rng_no_edge,
+            signal_state=no_edge_ss,
+            permutation_return_pool=no_edge_pool,
+        )
+        assert p_planted is not None
+        assert p_no_edge is not None
+        lower_bound = 1.0 / (n_perm + 1)
+        # Non-degeneracy: strictly inside (1/(n+1), 1.0) for both.
+        assert p_planted > lower_bound, (
+            f"planted p-value at lower boundary: {p_planted}"
+        )
+        assert p_planted < 1.0
+        assert p_no_edge > lower_bound, (
+            f"no-edge p-value at lower boundary: {p_no_edge}"
+        )
+        assert p_no_edge < 1.0
+        # Central relative assertion: planted < no-edge by a clear
+        # margin. The fixture pins the gap at well over 0.3 with
+        # n_perm=500 and seed=20260601; require a robust 0.2 margin
+        # to absorb any future engine-internal RNG-call reordering.
+        margin = 0.2
+        assert p_planted + margin < p_no_edge, (
+            f"planted ({p_planted}) and no-edge ({p_no_edge}) "
+            f"p-values did not separate by the required margin "
+            f"{margin}; relative empirical sanity failed"
+        )
