@@ -1744,10 +1744,11 @@ class TestEmpiricalPlantedEdgePairedSanity:
     # p-values strictly inside the open band (1 / (n_perm + 1), 1.0)
     # even when the planted-edge and no-edge sets sit at the ranked
     # extremes of the pool -- multiple permutations naturally land on
-    # the observed subset and contribute to ge_count. A 70-bar pool
-    # would put the planted observation at the literal maximum of the
-    # permutation distribution and collapse p_planted to 1 / (n + 1)
-    # exactly (boundary failure).
+    # the observed subset and contribute to ge_count. A substantially
+    # larger pool (where 15-from-pool combinations vastly exceed
+    # n_perm) would put the planted observation at the literal
+    # maximum of the permutation distribution and collapse p_planted
+    # to 1 / (n + 1) exactly (boundary failure).
     N_IN_SAMPLE = 30
     N_OOS_ELIGIBLE = 17
     N_BARS = N_IN_SAMPLE + N_OOS_ELIGIBLE + 1  # 48
@@ -1763,10 +1764,12 @@ class TestEmpiricalPlantedEdgePairedSanity:
         # In-sample: constant +0.5% return for the 30 in-sample bars.
         for _ in range(cls.N_IN_SAMPLE):
             closes.append(closes[-1] * 1.005)
-        # OOS returns in descending order; bar 100 receives the last
-        # of the 70 OOS returns as its "input return" so close[100] is
-        # close[99] * (1 + last_oos_return/100). Bar 100 is itself
-        # not eligible (no next close inside cutoff).
+        # OOS returns in descending order; the trailing test_end bar
+        # (index N_BARS - 1) receives the last of the 17 OOS returns
+        # as its "input return", so the final close is computed from
+        # the previous close times (1 + last_oos_return / 100). The
+        # trailing bar is itself not OOS-eligible (it has no next
+        # close inside the evaluation cutoff).
         for r in cls.OOS_RETURNS_DESCENDING:
             closes.append(closes[-1] * (1.0 + r / 100.0))
         assert len(closes) == cls.N_BARS
