@@ -3,6 +3,7 @@ import {
   BOARD_HEADER,
   K6_MTF_BOARD_SUBHEADER,
   K6_MTF_SURFACE_DISTINGUISHER,
+  K6_MTF_VALIDATION_DISCLOSURE,
 } from "./constants";
 import { loadRankingArtifact, type LoadOutcome } from "./loadArtifact";
 import { RankedTable } from "./components/RankedTable";
@@ -45,6 +46,12 @@ export function App() {
           className="mvp-surface-distinguisher"
         >
           {K6_MTF_SURFACE_DISTINGUISHER}
+        </div>
+        <div
+          id="mvp-validation-disclosure"
+          className="state-block"
+        >
+          {K6_MTF_VALIDATION_DISCLOSURE}
         </div>
       </header>
       <main>{renderBody(outcome, activeTicker, setActiveTicker)}</main>
