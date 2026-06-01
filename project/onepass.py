@@ -1371,10 +1371,20 @@ def load_signal_library(ticker, *, rejection_out=None):
                 # The loader bundles open + pickle_load_compat + type check
                 # + verify_manifest, with the LRU content_hash cache keyed
                 # by (resolved_path, mtime_ns, size).
+                # engine_version lives at the manifest top level (alongside
+                # content_hash / build_timestamp), NOT inside
+                # manifest.params. Listing it in requested_params made the
+                # verifier look for manifest.params.engine_version and
+                # report a spurious mismatch on every fresh OnePass
+                # library, forcing a full rebuild on every run. Top-level
+                # engine_version is still enforced downstream against
+                # signal_data['engine_version'] at the "Verify version
+                # compatibility" block below. MAX_SMA_DAY and price_source
+                # DO live inside manifest.params and remain enforced here.
+                # Mirrors the Phase 6I-57 fix in impactsearch.py.
                 signal_data, _vresult = _load_verified_signal_library(
                     filepath,
                     requested_params={
-                        'engine_version': ENGINE_VERSION,
                         'MAX_SMA_DAY': MAX_SMA_DAY,
                         'price_source': 'Close',
                     },
