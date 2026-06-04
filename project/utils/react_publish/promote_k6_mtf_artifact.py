@@ -140,6 +140,11 @@ class PromotionInputs:
     phase5_report_sha256: str | None
     write: bool
     operator_approved: bool
+    # PR-2a v2 binding inputs (optional; required only for a v2 public
+    # promotion). v1 promotion ignores these entirely.
+    phase5_report_manifest_path: Path | None = None
+    validation_sidecar_path: Path | None = None
+    validation_sidecar_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +589,365 @@ def validate_k6_mtf_ranking_v2_payload(
 
 
 # ---------------------------------------------------------------------------
+# PR-2a: v2 promotion binding (report-manifest <-> sidecar <-> fixture)
+# ---------------------------------------------------------------------------
+
+PHASE5_REPORT_MANIFEST_SCHEMA = "k6_mtf_phase5_report_manifest"
+PHASE5_REPORT_MANIFEST_VERSION = "v1"
+
+# Path prefixes allowed for cited paths in the report manifest. These are
+# the project-relative roots the report/sidecar/fixture live under.
+_ALLOWED_MANIFEST_PATH_PREFIXES = ("output/", "md_library/", "frontend/")
+
+
+def _assert_no_local_abs(value: Any, *, where: str) -> None:
+    """Reject any local absolute path / leak token in a manifest path
+    field (drive letter, leading slash, backslash, users/home markers)."""
+    if not isinstance(value, str) or not value:
+        raise PromotionError(f"{where} must be a non-empty string")
+    if _DRIVE_LETTER_RE.match(value):
+        raise PromotionError(f"{where} contains a drive letter: {value!r}")
+    if value.startswith("/"):
+        raise PromotionError(f"{where} starts with absolute slash: {value!r}")
+    if _BACKSLASH in value:
+        raise PromotionError(f"{where} contains a backslash: {value!r}")
+    low = value.lower()
+    for marker in _USERNAME_MARKERS:
+        if marker in low:
+            raise PromotionError(f"{where} contains a local marker {marker!r}: {value!r}")
+
+
+def _load_validation_sidecar_for_gate(path: Path) -> dict:
+    """Load + parse the validation sidecar JSON for the gate's semantic
+    binding checks. Fail closed (PromotionError) on any read/parse/shape
+    problem."""
+    if not path.is_file():
+        raise PromotionError(f"validation sidecar file does not exist: {path!s}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PromotionError(
+            f"validation sidecar unreadable/invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PromotionError("validation sidecar root is not a JSON object")
+    return payload
+
+
+def _derive_sidecar_counts(sidecar: Mapping[str, Any]) -> dict:
+    """Derive outcome counts from the SIDECAR contents (not the fixture
+    or manifest). Fail closed (PromotionError) on non-'valid' status,
+    missing alpha, a malformed strategies list, or a 'validated' strategy
+    lacking a real finite bh_q_value (same finite-q rule as PR-1)."""
+    if sidecar.get("validation_status") != "valid":
+        raise PromotionError(
+            "validation sidecar validation_status must be 'valid'; got "
+            f"{sidecar.get('validation_status')!r}"
+        )
+    alpha = sidecar.get("multiple_comparisons_control_alpha")
+    if not isinstance(alpha, (int, float)):
+        raise PromotionError(
+            "validation sidecar missing multiple_comparisons_control_alpha"
+        )
+    alpha = float(alpha)
+    strategies = sidecar.get("strategies")
+    if not isinstance(strategies, list) or not strategies:
+        raise PromotionError(
+            "validation sidecar 'strategies' must be a non-empty list"
+        )
+    tested = len(strategies)
+    board = 0
+    validated = 0
+    empirical_not_run = 0
+    empirical_failed = 0
+    for s in strategies:
+        if not isinstance(s, dict):
+            raise PromotionError("validation sidecar strategy is not an object")
+        status = s.get("empirical_validation_status")
+        if status == "validated":
+            validated += 1
+            bh_q = s.get("bh_q_value")
+            if not _is_finite_number(bh_q):
+                raise PromotionError(
+                    "validation sidecar has a validated strategy with a "
+                    f"non-finite bh_q_value: {s.get('strategy_id')!r} -> {bh_q!r}"
+                )
+            if float(bh_q) <= alpha:
+                board += 1
+        elif status == "empirical_not_run":
+            empirical_not_run += 1
+        elif status == "empirical_failed":
+            empirical_failed += 1
+    return {
+        "tested": tested,
+        "board_validated": board,
+        "not_validated": tested - board,
+        "empirical_validated": validated,
+        "empirical_not_run": empirical_not_run,
+        "empirical_failed": empirical_failed,
+        "validated_but_not_bh": validated - board,
+    }
+
+
+def verify_v2_promotion_binding(
+    *,
+    fixture_payload: Any,
+    report_path: Path,
+    report_sha256: str,
+    manifest_path: Path,
+    validation_sidecar_path: Path,
+    validation_sidecar_sha256: str,
+    project_root: Path,
+) -> dict:
+    """Verify report <-> manifest <-> sidecar <-> fixture binding for a v2
+    public promotion. Reads the JSON manifest (never Markdown prose).
+    Fail-closed: raises ``PromotionError`` (used the same way in dry-run).
+    Returns the parsed manifest on success.
+    """
+    # (1) fixture must be v2 and pass the full PR-1 v2 validator with the
+    #     sidecar hash bound to validation_metadata.artifact_sha256.
+    if not isinstance(fixture_payload, dict) or (
+        fixture_payload.get("schema_version") != SCHEMA_VERSION_V2
+    ):
+        raise PromotionError(
+            "v2 promotion binding requires a k6_mtf_ranking_v2 fixture; got "
+            f"{fixture_payload.get('schema_version') if isinstance(fixture_payload, dict) else type(fixture_payload).__name__!r}"
+        )
+    sidecar_declared = str(validation_sidecar_sha256).strip().lower()
+    validate_k6_mtf_ranking_v2_payload(
+        fixture_payload,
+        validation_sidecar_path=validation_sidecar_path,
+        expected_sidecar_sha256=sidecar_declared,
+        for_public_promotion=True,
+    )
+
+    # (2) report file exists, raw SHA matches supplied, under project root.
+    declared_report_sha = str(report_sha256).strip().lower()
+    if len(declared_report_sha) != 64 or any(
+        c not in "0123456789abcdef" for c in declared_report_sha
+    ):
+        raise PromotionError(
+            f"report SHA-256 is not a 64-char lowercase hex digest: {report_sha256!r}"
+        )
+    if not report_path.is_file():
+        raise PromotionError(f"Phase 5 report file does not exist: {report_path!s}")
+    actual_report_sha = _compute_sha256(report_path)
+    if actual_report_sha != declared_report_sha:
+        raise PromotionError(
+            "Phase 5 report SHA-256 mismatch: supplied "
+            f"{declared_report_sha}, computed {actual_report_sha}"
+        )
+    try:
+        report_path.resolve().relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise PromotionError(
+            "Phase 5 report must live under <PROJECT_DIR>"
+        ) from exc
+
+    # (3) manifest exists/readable; expected schema + version.
+    if not manifest_path.is_file():
+        raise PromotionError(f"report manifest does not exist: {manifest_path!s}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PromotionError(f"report manifest unreadable/invalid: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise PromotionError("report manifest root is not a JSON object")
+    if manifest.get("report_manifest_schema") != PHASE5_REPORT_MANIFEST_SCHEMA:
+        raise PromotionError(
+            "report manifest schema mismatch: expected "
+            f"{PHASE5_REPORT_MANIFEST_SCHEMA!r}, got "
+            f"{manifest.get('report_manifest_schema')!r}"
+        )
+    if manifest.get("version") != PHASE5_REPORT_MANIFEST_VERSION:
+        raise PromotionError(
+            "report manifest version mismatch: expected "
+            f"{PHASE5_REPORT_MANIFEST_VERSION!r}, got {manifest.get('version')!r}"
+        )
+
+    # path-privacy on manifest path fields.
+    for f in ("report_path", "ranking_artifact_path", "validation_sidecar_path"):
+        _assert_no_local_abs(manifest.get(f), where=f"manifest.{f}")
+        if not str(manifest.get(f)).startswith(_ALLOWED_MANIFEST_PATH_PREFIXES):
+            raise PromotionError(
+                f"manifest.{f} is not under an allowed project-relative root: "
+                f"{manifest.get(f)!r}"
+            )
+
+    # (4) manifest report_sha256 == computed report file SHA.
+    if str(manifest.get("report_sha256")).strip().lower() != actual_report_sha:
+        raise PromotionError(
+            "manifest report_sha256 does not match the report file SHA-256: "
+            f"manifest {manifest.get('report_sha256')!r}, file {actual_report_sha}"
+        )
+
+    # (5) manifest validation_sidecar_sha256 == supplied/recomputed sidecar SHA.
+    actual_sidecar_sha = _compute_sha256(Path(validation_sidecar_path))
+    if actual_sidecar_sha != sidecar_declared:
+        raise PromotionError(
+            "supplied validation sidecar SHA-256 does not match the sidecar "
+            f"file: supplied {sidecar_declared}, file {actual_sidecar_sha}"
+        )
+    if str(manifest.get("validation_sidecar_sha256")).strip().lower() != actual_sidecar_sha:
+        raise PromotionError(
+            "manifest validation_sidecar_sha256 does not match the sidecar "
+            f"file SHA-256: manifest {manifest.get('validation_sidecar_sha256')!r}, "
+            f"file {actual_sidecar_sha}"
+        )
+
+    # (5b) Parse the sidecar JSON and bind the manifest + fixture to its
+    #      ACTUAL contents (semantic binding, not just the file SHA). The
+    #      gate reads the JSON sidecar -- never Markdown prose.
+    sidecar = _load_validation_sidecar_for_gate(Path(validation_sidecar_path))
+    sidecar_counts = _derive_sidecar_counts(sidecar)
+
+    # (5b-i) manifest validation_run_id == sidecar run_id (catches a
+    #        manifest that matches the fixture but not the real sidecar).
+    if manifest.get("validation_run_id") != sidecar.get("run_id"):
+        raise PromotionError(
+            "manifest validation_run_id does not match the sidecar run_id: "
+            f"manifest {manifest.get('validation_run_id')!r}, sidecar "
+            f"{sidecar.get('run_id')!r}"
+        )
+
+    # (5b-ii) manifest counts == sidecar-derived counts (carried fields).
+    mcounts_chk = manifest.get("counts") or {}
+    if not isinstance(mcounts_chk, dict):
+        raise PromotionError("manifest.counts must be a JSON object")
+    _SIDECAR_COUNT_KEYS = (
+        "tested", "board_validated", "not_validated", "empirical_validated",
+        "empirical_not_run", "validated_but_not_bh",
+    )
+    for key in _SIDECAR_COUNT_KEYS:
+        if key in mcounts_chk and mcounts_chk.get(key) != sidecar_counts[key]:
+            raise PromotionError(
+                f"manifest.counts.{key} ({mcounts_chk.get(key)!r}) does not "
+                f"match the sidecar-derived count ({sidecar_counts[key]!r})"
+            )
+    if "empirical_failed" in mcounts_chk and (
+        mcounts_chk.get("empirical_failed") != sidecar_counts["empirical_failed"]
+    ):
+        raise PromotionError(
+            "manifest.counts.empirical_failed "
+            f"({mcounts_chk.get('empirical_failed')!r}) does not match the "
+            f"sidecar-derived count ({sidecar_counts['empirical_failed']!r})"
+        )
+
+    # (5b-iii) fixture counts == sidecar-derived counts (overlapping fields).
+    fmeta = fixture_payload.get("validation_metadata") or {}
+    fsummary = fixture_payload.get("validation_summary") or {}
+    fixture_sidecar_pairs = [
+        ("validation_metadata.n_strategies_tested",
+         fmeta.get("n_strategies_tested"), sidecar_counts["tested"]),
+        ("validation_metadata.n_strategies_reported",
+         fmeta.get("n_strategies_reported"), sidecar_counts["board_validated"]),
+        ("validation_summary.board_validated_count",
+         fsummary.get("board_validated_count"), sidecar_counts["board_validated"]),
+        ("validation_summary.not_validated_count",
+         fsummary.get("not_validated_count"), sidecar_counts["not_validated"]),
+        ("validation_summary.displayed_ranked_count",
+         fsummary.get("displayed_ranked_count"), sidecar_counts["tested"]),
+    ]
+    for label, fixture_val, sidecar_val in fixture_sidecar_pairs:
+        if fixture_val != sidecar_val:
+            raise PromotionError(
+                f"fixture {label} ({fixture_val!r}) does not match the "
+                f"sidecar-derived count ({sidecar_val!r})"
+            )
+    esc = fsummary.get("empirical_status_counts")
+    if isinstance(esc, dict):
+        esc_pairs = [
+            ("validated", sidecar_counts["empirical_validated"]),
+            ("empirical_not_run", sidecar_counts["empirical_not_run"]),
+            ("empirical_failed", sidecar_counts["empirical_failed"]),
+        ]
+        for key, sidecar_val in esc_pairs:
+            if key in esc and esc.get(key) != sidecar_val:
+                raise PromotionError(
+                    f"fixture validation_summary.empirical_status_counts[{key!r}] "
+                    f"({esc.get(key)!r}) does not match the sidecar-derived "
+                    f"count ({sidecar_val!r})"
+                )
+
+    # (5b-iv) manifest methodology == sidecar methodology fields.
+    method = manifest.get("methodology")
+    if not isinstance(method, dict):
+        raise PromotionError("manifest.methodology must be a JSON object")
+    method_pairs = [
+        ("n_permutations", sidecar.get("n_permutations")),
+        ("n_bootstrap_samples", sidecar.get("n_bootstrap_samples")),
+        ("walk_forward_n_folds", sidecar.get("walk_forward_n_folds")),
+        ("mc_method", sidecar.get("multiple_comparisons_control_method")),
+        ("alpha", sidecar.get("multiple_comparisons_control_alpha")),
+        ("contract_version", sidecar.get("validation_contract_version")),
+        ("methodology_version", sidecar.get("validation_methodology_version")),
+    ]
+    for key, sidecar_val in method_pairs:
+        if method.get(key) != sidecar_val:
+            raise PromotionError(
+                f"manifest.methodology.{key} ({method.get(key)!r}) does not "
+                f"match the sidecar ({sidecar_val!r})"
+            )
+    if "bootstrap_ci_level" in sidecar and (
+        method.get("bootstrap_ci_level") != sidecar.get("bootstrap_ci_level")
+    ):
+        raise PromotionError(
+            "manifest.methodology.bootstrap_ci_level "
+            f"({method.get('bootstrap_ci_level')!r}) does not match the "
+            f"sidecar ({sidecar.get('bootstrap_ci_level')!r})"
+        )
+    # rng_seed: an absent sidecar rng_seed is treated as null.
+    if method.get("rng_seed") != sidecar.get("rng_seed"):
+        raise PromotionError(
+            "manifest.methodology.rng_seed "
+            f"({method.get('rng_seed')!r}) does not match the sidecar "
+            f"({sidecar.get('rng_seed')!r}; absent treated as null)"
+        )
+
+    # (7) manifest validation_run_id == fixture validation_metadata.run_id.
+    meta = fixture_payload.get("validation_metadata") or {}
+    if manifest.get("validation_run_id") != meta.get("run_id"):
+        raise PromotionError(
+            "manifest validation_run_id does not match fixture "
+            "validation_metadata.run_id: manifest "
+            f"{manifest.get('validation_run_id')!r}, fixture {meta.get('run_id')!r}"
+        )
+
+    # (8) manifest ranking_run_id == fixture top-level run_id.
+    if manifest.get("ranking_run_id") != fixture_payload.get("run_id"):
+        raise PromotionError(
+            "manifest ranking_run_id does not match fixture run_id: manifest "
+            f"{manifest.get('ranking_run_id')!r}, fixture {fixture_payload.get('run_id')!r}"
+        )
+
+    # (9) manifest counts == fixture validation_summary / metadata counts.
+    summary = fixture_payload.get("validation_summary") or {}
+    mcounts = manifest.get("counts") or {}
+    if not isinstance(mcounts, dict):
+        raise PromotionError("manifest.counts must be a JSON object")
+    expected_pairs = [
+        ("tested", meta.get("n_strategies_tested")),
+        ("board_validated", summary.get("board_validated_count")),
+        ("not_validated", summary.get("not_validated_count")),
+        ("stage_a_excluded", summary.get("stage_a_excluded_count")),
+    ]
+    for key, fixture_val in expected_pairs:
+        if mcounts.get(key) != fixture_val:
+            raise PromotionError(
+                f"manifest.counts.{key} ({mcounts.get(key)!r}) does not match "
+                f"fixture count ({fixture_val!r})"
+            )
+    # fixture_schema_version_expected sanity.
+    if manifest.get("fixture_schema_version_expected") != SCHEMA_VERSION_V2:
+        raise PromotionError(
+            "manifest fixture_schema_version_expected must be "
+            f"{SCHEMA_VERSION_V2!r}; got "
+            f"{manifest.get('fixture_schema_version_expected')!r}"
+        )
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # Public-mode safety: Phase 5 verification (load-bearing)
 # ---------------------------------------------------------------------------
 
@@ -785,7 +1149,47 @@ def promote(
         project_root=inputs.project_root,
     )
     # 3. Validate the source artifact and record provenance.
-    payload = _validate_payload(_load_json(inputs.source_path))
+    raw_payload = _load_json(inputs.source_path)
+    is_v2 = (
+        isinstance(raw_payload, dict)
+        and raw_payload.get("schema_version") == SCHEMA_VERSION_V2
+    )
+    if is_v2:
+        # PR-2a v2 public-promotion binding path. v1 _validate_payload is
+        # NOT used for v2 (it would reject the v2 schema); the v2 validator
+        # + report-manifest <-> sidecar <-> fixture binding is enforced
+        # here. Same predicate applies in dry-run.
+        if not inputs.public_mode:
+            raise PromotionError(
+                "k6_mtf_ranking_v2 fixtures are handled only by the v2 "
+                "public-promotion path; supply --public with the v2 binding "
+                "inputs (--phase5-report, --phase5-sha256, "
+                "--phase5-report-manifest, --validation-sidecar, "
+                "--validation-sidecar-sha256)"
+            )
+        if inputs.phase5_report_manifest_path is None:
+            raise PromotionError(
+                "v2 public promotion requires --phase5-report-manifest"
+            )
+        if inputs.validation_sidecar_path is None or not (
+            inputs.validation_sidecar_sha256
+        ):
+            raise PromotionError(
+                "v2 public promotion requires --validation-sidecar and "
+                "--validation-sidecar-sha256"
+            )
+        verify_v2_promotion_binding(
+            fixture_payload=raw_payload,
+            report_path=inputs.phase5_report_path,
+            report_sha256=inputs.phase5_report_sha256,
+            manifest_path=inputs.phase5_report_manifest_path,
+            validation_sidecar_path=inputs.validation_sidecar_path,
+            validation_sidecar_sha256=inputs.validation_sidecar_sha256,
+            project_root=inputs.project_root,
+        )
+        payload = raw_payload
+    else:
+        payload = _validate_payload(raw_payload)
     source_sha = _compute_sha256(inputs.source_path)
     source_relative = _resolve_project_relative_source(
         inputs.source_path, inputs.project_root,
@@ -908,6 +1312,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Expected SHA-256 of the Phase 5 report file.",
     )
     p.add_argument(
+        "--phase5-report-manifest", default=None,
+        help=(
+            "Path to the paired Phase 5 report JSON manifest (required for "
+            "a k6_mtf_ranking_v2 public promotion). The gate reads this "
+            "manifest for binding checks; it never parses Markdown prose."
+        ),
+    )
+    p.add_argument(
+        "--validation-sidecar", default=None,
+        help=(
+            "Path to the validation sidecar (required for a "
+            "k6_mtf_ranking_v2 public promotion)."
+        ),
+    )
+    p.add_argument(
+        "--validation-sidecar-sha256", default=None,
+        help=(
+            "Expected SHA-256 of the validation sidecar (required for a "
+            "k6_mtf_ranking_v2 public promotion)."
+        ),
+    )
+    p.add_argument(
         "--write", action="store_true",
         help=(
             "Perform the real write. Default is dry-run. Requires "
@@ -944,6 +1370,14 @@ def _inputs_from_args(args: argparse.Namespace) -> PromotionInputs:
     phase5_report = (
         Path(args.phase5_report).resolve() if args.phase5_report else None
     )
+    phase5_report_manifest = (
+        Path(args.phase5_report_manifest).resolve()
+        if getattr(args, "phase5_report_manifest", None) else None
+    )
+    validation_sidecar = (
+        Path(args.validation_sidecar).resolve()
+        if getattr(args, "validation_sidecar", None) else None
+    )
     return PromotionInputs(
         source_path=source,
         destination_path=destination,
@@ -954,6 +1388,9 @@ def _inputs_from_args(args: argparse.Namespace) -> PromotionInputs:
         phase5_report_sha256=args.phase5_sha256,
         write=bool(args.write),
         operator_approved=bool(args.operator_approved),
+        phase5_report_manifest_path=phase5_report_manifest,
+        validation_sidecar_path=validation_sidecar,
+        validation_sidecar_sha256=getattr(args, "validation_sidecar_sha256", None),
     )
 
 

@@ -1296,3 +1296,451 @@ def test_v2_validator_empirical_not_run_null_q_accepted():
         emp_p=None, boot_lo=None, boot_hi=None, bh_q=None, bonferroni=None,
     )])
     validate_k6_mtf_ranking_v2_payload(payload)  # no raise
+
+
+# ===========================================================================
+# PR-2a: Phase 5 report generator + report-manifest<->sidecar<->fixture gate
+# ===========================================================================
+
+from utils.react_publish.k6_mtf_phase5_report_generator import (  # noqa: E402
+    ReportGenerationError,
+    generate_report_and_manifest,
+)
+from utils.react_publish.promote_k6_mtf_artifact import (  # noqa: E402
+    PHASE5_REPORT_MANIFEST_SCHEMA,
+    verify_v2_promotion_binding,
+)
+
+
+def _phase5_world(tmp_path: Path, *, stage_a=None) -> dict:
+    """Build a coherent ranking+sidecar+report+manifest+v2-fixture world
+    under tmp_path so the gate binding can be exercised end to end."""
+    secs = ["AAA", "BBB"]
+    strategies = [
+        _make_strategy("AAA", bh_q=0.01),   # board_validated
+        _make_strategy("BBB", bh_q=0.20),   # not_validated (validated, q>alpha)
+    ]
+    ranking = _make_artifact(
+        [_make_secondary("AAA", rank=1), _make_secondary("BBB", rank=2)]
+    )
+    sidecar = _make_sidecar(strategies)
+    if stage_a is None:
+        stage_a = [{
+            "secondary": "ZZZ",
+            "reason": "stage_a_unavailable:dead_no_history",
+            "causes": [{
+                "ticker": "PCH",
+                "ticker_classification": "dead_no_history",
+                "dependent_role": "member",
+                "member_token": "PCH[D]",
+                "member_protocol": "D",
+            }],
+        }]
+    rank_file = tmp_path / "ranking.json"
+    side_file = tmp_path / "sidecar.json"
+    rank_file.write_text(json.dumps(ranking), encoding="utf-8")
+    side_file.write_text(json.dumps(sidecar), encoding="utf-8")
+    sidecar_sha = compute_file_sha256(side_file)
+    report_file = tmp_path / "md_library" / "shared" / "report.md"
+    manifest_file = tmp_path / "md_library" / "shared" / "report.manifest.json"
+    res = generate_report_and_manifest(
+        ranking_path=rank_file,
+        validation_sidecar_path=side_file,
+        report_output_path=report_file,
+        manifest_output_path=manifest_file,
+        report_relative_path="md_library/shared/report.md",
+        ranking_relative_path="output/test/ranking.json",
+        sidecar_relative_path="output/test/sidecar.json",
+        generated_at_utc="2026-06-04T00:00:00Z",
+        report_date="2026-06-04",
+        expected_validation_sidecar_sha256=sidecar_sha,
+        stage_a_excluded_secondaries=stage_a,
+    )
+    fixture = build_k6_mtf_ranking_v2_fixture(
+        ranking, sidecar,
+        validation_sidecar_sha256=sidecar_sha,
+        stage_a_excluded_secondaries=stage_a,
+    )
+    return {
+        "tmp_path": tmp_path,
+        "ranking": ranking,
+        "sidecar": sidecar,
+        "sidecar_file": side_file,
+        "sidecar_sha": sidecar_sha,
+        "report_file": report_file,
+        "manifest_file": manifest_file,
+        "report_sha": res["report_sha256"],
+        "fixture": fixture,
+        "stage_a": stage_a,
+    }
+
+
+def _bind(w, **over):
+    kwargs = dict(
+        fixture_payload=w["fixture"],
+        report_path=w["report_file"],
+        report_sha256=w["report_sha"],
+        manifest_path=w["manifest_file"],
+        validation_sidecar_path=w["sidecar_file"],
+        validation_sidecar_sha256=w["sidecar_sha"],
+        project_root=w["tmp_path"],
+    )
+    kwargs.update(over)
+    return verify_v2_promotion_binding(**kwargs)
+
+
+def _rewrite_manifest(w, mutate) -> None:
+    m = json.loads(w["manifest_file"].read_text(encoding="utf-8"))
+    mutate(m)
+    w["manifest_file"].write_text(json.dumps(m, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+# --- Generator tests -------------------------------------------------------
+
+
+def test_generator_builds_report_and_manifest(tmp_path):
+    w = _phase5_world(tmp_path)
+    assert w["report_file"].is_file()
+    assert w["manifest_file"].is_file()
+    m = json.loads(w["manifest_file"].read_text(encoding="utf-8"))
+    assert m["report_manifest_schema"] == PHASE5_REPORT_MANIFEST_SCHEMA
+    assert m["version"] == "v1"
+    assert m["validation_sidecar_sha256"] == w["sidecar_sha"]
+    assert m["report_sha256"] == w["report_sha"]
+    assert m["ranking_run_id"] == "RUN"
+    assert m["validation_run_id"] == w["sidecar"]["run_id"]
+    assert m["fixture_schema_version_expected"] == "k6_mtf_ranking_v2"
+    assert m["counts"] == {
+        "tested": 2, "board_validated": 1, "not_validated": 1,
+        "stage_a_excluded": 1, "empirical_validated": 2,
+        "empirical_not_run": 0, "validated_but_not_bh": 1,
+    }
+    assert m["methodology"]["rng_seed"] is None
+
+
+def test_generator_report_excludes_own_sha(tmp_path):
+    w = _phase5_world(tmp_path)
+    text = w["report_file"].read_text(encoding="utf-8")
+    assert w["report_sha"] not in text
+
+
+def test_generator_outputs_project_relative_only(tmp_path):
+    w = _phase5_world(tmp_path)
+    import re as _re
+    for f in (w["report_file"], w["manifest_file"]):
+        blob = f.read_text(encoding="utf-8")
+        assert _re.search(r"[A-Za-z]:[\\/]", blob) is None
+        assert chr(92) not in blob
+        assert "/Users/" not in blob and "/home/" not in blob and "/mnt/" not in blob
+
+
+def test_generator_does_not_echo_execute_summary_path(tmp_path):
+    # Stage-A via a fake execute summary at a marked path; that input path
+    # must not appear in either output.
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    sidecar = _make_sidecar([_make_strategy("AAA", bh_q=0.01)])
+    rank_file = tmp_path / "ranking.json"
+    side_file = tmp_path / "sidecar.json"
+    rank_file.write_text(json.dumps(ranking), encoding="utf-8")
+    side_file.write_text(json.dumps(sidecar), encoding="utf-8")
+    exec_dir = tmp_path / "scratch_exec_input_dir"
+    exec_dir.mkdir()
+    exec_file = exec_dir / "execute_summary.json"
+    exec_file.write_text(json.dumps({
+        "stageA": {"excluded_secondaries": [
+            {"secondary": "ZZZ", "causes": [
+                {"ticker": "PCH", "ticker_classification": "dead_no_history",
+                 "dependent_role": "member"}]},
+        ]},
+        "exclusions": [],
+    }), encoding="utf-8")
+    report_file = tmp_path / "md_library" / "shared" / "r.md"
+    manifest_file = tmp_path / "md_library" / "shared" / "r.manifest.json"
+    generate_report_and_manifest(
+        ranking_path=rank_file, validation_sidecar_path=side_file,
+        report_output_path=report_file, manifest_output_path=manifest_file,
+        report_relative_path="md_library/shared/r.md",
+        ranking_relative_path="output/test/ranking.json",
+        sidecar_relative_path="output/test/sidecar.json",
+        generated_at_utc="2026-06-04T00:00:00Z", report_date="2026-06-04",
+        execute_summary_path=exec_file,
+    )
+    for f in (report_file, manifest_file):
+        blob = f.read_text(encoding="utf-8")
+        assert "scratch_exec_input_dir" not in blob
+        assert "execute_summary.json" not in blob
+    # exclusion data IS present.
+    assert "ZZZ" in report_file.read_text(encoding="utf-8")
+
+
+def test_generator_fails_closed_without_stage_a(tmp_path):
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    sidecar = _make_sidecar([_make_strategy("AAA", bh_q=0.01)])
+    rank_file = tmp_path / "ranking.json"
+    side_file = tmp_path / "sidecar.json"
+    rank_file.write_text(json.dumps(ranking), encoding="utf-8")
+    side_file.write_text(json.dumps(sidecar), encoding="utf-8")
+    with pytest.raises(ReportGenerationError):
+        generate_report_and_manifest(
+            ranking_path=rank_file, validation_sidecar_path=side_file,
+            report_output_path=tmp_path / "r.md",
+            manifest_output_path=tmp_path / "r.manifest.json",
+            report_relative_path="md_library/shared/r.md",
+            ranking_relative_path="output/test/ranking.json",
+            sidecar_relative_path="output/test/sidecar.json",
+            generated_at_utc="2026-06-04T00:00:00Z", report_date="2026-06-04",
+        )
+
+
+# --- v2 gate binding tests -------------------------------------------------
+
+
+def test_v2_gate_accepts_coherent_triple(tmp_path):
+    w = _phase5_world(tmp_path)
+    manifest = _bind(w)  # no raise
+    assert manifest["report_manifest_schema"] == PHASE5_REPORT_MANIFEST_SCHEMA
+
+
+def test_v2_gate_refuses_report_sha_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+    with pytest.raises(PromotionError):
+        _bind(w, report_sha256="0" * 64)
+
+
+def test_v2_gate_refuses_wrong_manifest_schema(tmp_path):
+    w = _phase5_world(tmp_path)
+    _rewrite_manifest(w, lambda m: m.__setitem__("report_manifest_schema", "bogus"))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_wrong_manifest_version(tmp_path):
+    w = _phase5_world(tmp_path)
+    _rewrite_manifest(w, lambda m: m.__setitem__("version", "v9"))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_manifest_report_sha_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+    _rewrite_manifest(w, lambda m: m.__setitem__("report_sha256", "0" * 64))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_manifest_sidecar_sha_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+    _rewrite_manifest(w, lambda m: m.__setitem__("validation_sidecar_sha256", "0" * 64))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_fixture_sidecar_sha_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+    # Rebuild the fixture stamping a wrong sidecar hash into its metadata.
+    bad_fixture = build_k6_mtf_ranking_v2_fixture(
+        w["ranking"], w["sidecar"],
+        validation_sidecar_sha256="0" * 64,
+        stage_a_excluded_secondaries=w["stage_a"],
+    )
+    with pytest.raises(PromotionError):
+        _bind(w, fixture_payload=bad_fixture)
+
+
+def test_v2_gate_refuses_validation_run_id_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+    _rewrite_manifest(w, lambda m: m.__setitem__("validation_run_id", "WRONG"))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_ranking_run_id_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+    _rewrite_manifest(w, lambda m: m.__setitem__("ranking_run_id", "WRONG"))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_count_mismatch(tmp_path):
+    w = _phase5_world(tmp_path)
+
+    def _bump(m):
+        m["counts"] = dict(m["counts"])
+        m["counts"]["board_validated"] = 999
+    _rewrite_manifest(w, _bump)
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_local_abs_path_in_manifest(tmp_path):
+    w = _phase5_world(tmp_path)
+    # Runtime-constructed backslash path (no committed local-path literal);
+    # _assert_no_local_abs rejects any backslash in a manifest path field.
+    bad = "output/k6_mtf" + chr(92) + "ranking.json"
+    _rewrite_manifest(w, lambda m: m.__setitem__("ranking_artifact_path", bad))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+# --- promote() v2 wiring (dry-run only; no public fixture write) -----------
+
+
+def _v2_promote_inputs(w, tmp_path, **over):
+    src_dir = tmp_path / "output" / "k6_mtf" / "RUN"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "k6_mtf_ranking.json"
+    src.write_text(json.dumps(w["fixture"]), encoding="utf-8")
+    kwargs = dict(
+        source_path=src,
+        destination_path=tmp_path / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.json",
+        manifest_destination_path=tmp_path / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.promotion_manifest.json",
+        project_root=tmp_path,
+        public_mode=True,
+        phase5_report_path=w["report_file"],
+        phase5_report_sha256=w["report_sha"],
+        write=False,
+        operator_approved=False,
+        phase5_report_manifest_path=w["manifest_file"],
+        validation_sidecar_path=w["sidecar_file"],
+        validation_sidecar_sha256=w["sidecar_sha"],
+    )
+    kwargs.update(over)
+    return PromotionInputs(**kwargs)
+
+
+def test_promote_v2_dry_run_happy_path(tmp_path):
+    w = _phase5_world(tmp_path)
+    summary = promote(_v2_promote_inputs(w, tmp_path))  # no raise, dry-run
+    assert summary["dry_run"] is True
+    assert summary["wrote_destination"] is False
+
+
+def test_promote_v2_refuses_missing_manifest(tmp_path):
+    w = _phase5_world(tmp_path)
+    with pytest.raises(PromotionError):
+        promote(_v2_promote_inputs(w, tmp_path, phase5_report_manifest_path=None))
+
+
+def test_promote_v2_refuses_missing_sidecar_inputs(tmp_path):
+    w = _phase5_world(tmp_path)
+    with pytest.raises(PromotionError):
+        promote(_v2_promote_inputs(w, tmp_path, validation_sidecar_sha256=None))
+
+
+def test_promote_v2_refuses_private_mode(tmp_path):
+    w = _phase5_world(tmp_path)
+    with pytest.raises(PromotionError):
+        promote(_v2_promote_inputs(
+            w, tmp_path, public_mode=False,
+            phase5_report_path=None, phase5_report_sha256=None,
+        ))
+
+
+def test_promote_v2_refuses_write_without_operator_approved(tmp_path):
+    w = _phase5_world(tmp_path)
+    with pytest.raises(PromotionError):
+        promote(_v2_promote_inputs(w, tmp_path, write=True, operator_approved=False))
+
+
+# --- amendment: report-manifest <-> sidecar semantic binding ---------------
+
+
+def _retamper_sidecar(w, mutate):
+    """Mutate the sidecar file, restamp the fixture's
+    validation_metadata.artifact_sha256 and the manifest's
+    validation_sidecar_sha256 to the new file SHA, and update the world's
+    sidecar_sha so SHA-only checks pass. The new semantic sidecar checks
+    must still catch the tampered contents."""
+    s = json.loads(w["sidecar_file"].read_text(encoding="utf-8"))
+    mutate(s)
+    w["sidecar_file"].write_text(json.dumps(s), encoding="utf-8")
+    new_sha = compute_file_sha256(w["sidecar_file"])
+    w["sidecar_sha"] = new_sha
+    w["fixture"]["validation_metadata"]["artifact_sha256"] = new_sha
+    _rewrite_manifest(w, lambda m: m.__setitem__("validation_sidecar_sha256", new_sha))
+    return new_sha
+
+
+def test_v2_gate_refuses_manifest_run_id_not_matching_sidecar(tmp_path):
+    # manifest validation_run_id still matches the fixture, but the actual
+    # sidecar run_id was changed -> refuse on the sidecar binding.
+    w = _phase5_world(tmp_path)
+    _retamper_sidecar(w, lambda s: s.__setitem__("run_id", "DIFFERENT_RUN"))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_manifest_counts_not_matching_sidecar(tmp_path):
+    # manifest counts still match the fixture, but the sidecar's derived
+    # board count differs (AAA bh_q flipped above alpha) -> refuse.
+    w = _phase5_world(tmp_path)
+
+    def _flip(s):
+        s["strategies"][0]["bh_q_value"] = 0.20  # AAA no longer board
+    _retamper_sidecar(w, _flip)
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_fixture_counts_not_matching_sidecar(tmp_path):
+    # fixture counts still match the manifest, but the sidecar's empirical
+    # mix differs (BBB flipped to empirical_not_run) -> refuse.
+    w = _phase5_world(tmp_path)
+
+    def _flip(s):
+        s["strategies"][1]["empirical_validation_status"] = "empirical_not_run"
+        s["strategies"][1]["empirical_p_value"] = None
+        s["strategies"][1]["bootstrap_sharpe_ci_lower"] = None
+        s["strategies"][1]["bootstrap_sharpe_ci_upper"] = None
+    _retamper_sidecar(w, _flip)
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_methodology_not_matching_sidecar(tmp_path):
+    # Tamper the manifest methodology (not the sidecar) -> refuse.
+    w = _phase5_world(tmp_path)
+
+    def _bump(m):
+        m["methodology"] = dict(m["methodology"])
+        m["methodology"]["n_permutations"] = 999
+    _rewrite_manifest(w, _bump)
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_sidecar_status_not_valid(tmp_path):
+    w = _phase5_world(tmp_path)
+    _retamper_sidecar(w, lambda s: s.__setitem__("validation_status", "failed"))
+    with pytest.raises(PromotionError):
+        _bind(w)
+
+
+def test_v2_gate_refuses_sidecar_invalid_json(tmp_path):
+    w = _phase5_world(tmp_path)
+    w["sidecar_file"].write_text("{not valid json", encoding="utf-8")
+    new_sha = compute_file_sha256(w["sidecar_file"])
+    w["fixture"]["validation_metadata"]["artifact_sha256"] = new_sha
+    _rewrite_manifest(w, lambda m: m.__setitem__("validation_sidecar_sha256", new_sha))
+    with pytest.raises(PromotionError):
+        _bind(w, validation_sidecar_sha256=new_sha)
+
+
+def test_v2_gate_refuses_sidecar_non_object(tmp_path):
+    w = _phase5_world(tmp_path)
+    w["sidecar_file"].write_text("[]", encoding="utf-8")
+    new_sha = compute_file_sha256(w["sidecar_file"])
+    w["fixture"]["validation_metadata"]["artifact_sha256"] = new_sha
+    _rewrite_manifest(w, lambda m: m.__setitem__("validation_sidecar_sha256", new_sha))
+    with pytest.raises(PromotionError):
+        _bind(w, validation_sidecar_sha256=new_sha)
+
+
+def test_v2_gate_refuses_sidecar_validated_non_finite_q(tmp_path):
+    w = _phase5_world(tmp_path)
+
+    def _nullq(s):
+        s["strategies"][0]["bh_q_value"] = None  # validated row, null q
+    _retamper_sidecar(w, _nullq)
+    with pytest.raises(PromotionError):
+        _bind(w)
