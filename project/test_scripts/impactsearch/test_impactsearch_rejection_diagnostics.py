@@ -517,9 +517,24 @@ def test_export_xlsx_manifest_failed_populates_rejection(
 # ---------------------------------------------------------------------------
 
 
-def test_process_single_ticker_no_data_forwards_fetch_rejection(monkeypatch):
+def test_process_single_ticker_no_data_forwards_fetch_rejection(
+    tmp_path, monkeypatch,
+):
     """When the underlying fetch returns empty, process_single_ticker
     forwards the structured fetch rejection up to the caller."""
+    # Isolation: disable the FASTPATH so the test cannot read real
+    # operational state. A leaked ``ZZZ_stable_*.pkl`` in the real
+    # ``signal_library/data/stable`` would otherwise make
+    # ``get_primary_signals_fast`` return library signals and bypass the
+    # monkeypatched ``fetch_data_raw`` (the impact_fastpath module reads its
+    # OWN ``SIGNAL_LIBRARY_DIR``, so patching impactsearch's copy is not
+    # enough). Disabling FASTPATH forces the intended slow-path fetch
+    # rejection; also point the slow-path library root at an empty tmp dir.
+    monkeypatch.setattr(impactsearch, "FASTPATH_AVAILABLE", False)
+    monkeypatch.setattr(
+        impactsearch, "SIGNAL_LIBRARY_DIR",
+        str(tmp_path / "signal_library" / "data"),
+    )
     monkeypatch.setattr(
         impactsearch, "fetch_data_raw",
         lambda t, *a, **kw: (pd.DataFrame(), t),
@@ -549,6 +564,12 @@ def test_process_single_ticker_insufficient_data_populates_rejection(
 ):
     """A primary that fetches successfully but yields a frame with
     fewer than 2 bars must surface insufficient_data."""
+    # Isolation: disable FASTPATH so the leaked real ``ZZZ_stable_*.pkl`` is
+    # not consulted (the impact_fastpath module reads its own
+    # ``SIGNAL_LIBRARY_DIR``, so the patch below alone does not cover it).
+    # The slow path then uses the monkeypatched fetch_data_raw plus the
+    # isolated, empty signal-library root.
+    monkeypatch.setattr(impactsearch, "FASTPATH_AVAILABLE", False)
     monkeypatch.setattr(
         impactsearch, "SIGNAL_LIBRARY_DIR",
         str(tmp_path / "signal_library" / "data"),
