@@ -300,27 +300,68 @@ def test_resolve_union_dedupe():
 # ---------------------------------------------------------------------------
 
 
-def test_aprime_rebuild_uses_overwrite():
-    calls = {}
-
+def _fake_aprime_report(calls):
     def fake_report(tickers, *, signal_cache_dir, stackbuilder_price_cache_dir,
                     format, write, overwrite):
         calls["overwrite"] = overwrite
         calls["write"] = write
+        calls["format"] = format
         calls["tickers"] = list(tickers)
         rows = [{"ticker": t, "issue_codes": []} for t in tickers]
         return {"write_count": len(rows), "verification_pass_count": len(rows),
-                "rows": rows}
+                "rows": rows, "format": format}
+    return fake_report
 
+
+def test_aprime_rebuild_default_csv_and_overwrite():
+    calls = {}
     report, kept, excluded = drv.stage_aprime_rebuild(
         ["SPY", "AAPL"], cache_dir="c", price_cache_dir="p",
-        write=True, report_fn=fake_report,
+        write=True, report_fn=_fake_aprime_report(calls),
     )
-    # Rebuild overwrites stale parquet/csv so it cannot shadow a fresh PKL.
+    # Default format is CSV (repo convention; no parquet engine in env).
+    assert calls["format"] == "csv"
+    # Rebuild overwrites stale csv/parquet so it cannot shadow a fresh PKL.
     assert calls["overwrite"] is True
     assert calls["write"] is True
     assert kept == ["SPY", "AAPL"]
     assert excluded == []
+
+
+def test_aprime_rebuild_explicit_parquet_passthrough():
+    calls = {}
+    drv.stage_aprime_rebuild(
+        ["SPY"], cache_dir="c", price_cache_dir="p", write=True,
+        fmt="parquet", report_fn=_fake_aprime_report(calls),
+    )
+    assert calls["format"] == "parquet"
+    assert calls["overwrite"] is True
+    assert calls["write"] is True
+
+
+def test_aprime_rebuild_no_clear_delete_mode():
+    # The seam only ever calls the writer with write/overwrite; it never
+    # deletes/clears. Assert the report_fn is invoked without any
+    # clear/delete-style kwarg and that exclusions (not deletions) handle
+    # unbuildable secondaries.
+    seen_kwargs = {}
+
+    def fake_report(tickers, **kwargs):
+        seen_kwargs.update(kwargs)
+        return {"write_count": 0, "verification_pass_count": 0,
+                "rows": [{"ticker": t, "issue_codes": ["x"]} for t in tickers],
+                "format": kwargs.get("format")}
+
+    _report, kept, excluded = drv.stage_aprime_rebuild(
+        ["SPY"], cache_dir="c", price_cache_dir="p", write=True,
+        report_fn=fake_report,
+    )
+    assert set(seen_kwargs.keys()) == {
+        "signal_cache_dir", "stackbuilder_price_cache_dir",
+        "format", "write", "overwrite",
+    }
+    assert "clear" not in seen_kwargs and "delete" not in seen_kwargs
+    assert excluded == ["SPY"] and kept == []
 
 
 def test_aprime_excludes_pkl_less_secondary_never_clears():
@@ -580,10 +621,10 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         drv, "stage_aprime_rebuild",
-        lambda secs, *, cache_dir, price_cache_dir, write: (
+        lambda secs, *, cache_dir, price_cache_dir, write, fmt="csv": (
             order.append(("Aprime", tuple(secs))),
-            ({"write_count": len(secs), "verification_pass_count": len(secs)},
-             list(secs), []),
+            ({"write_count": len(secs), "verification_pass_count": len(secs),
+              "format": fmt}, list(secs), []),
         )[1],
     )
     monkeypatch.setattr(
@@ -625,7 +666,7 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
         output_root=str(tmp_path / "out"), stackbuilder_root="sb",
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
-        fetch_backoff_max_seconds=8.0,
+        fetch_backoff_max_seconds=8.0, price_cache_format="csv",
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -650,6 +691,8 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
     assert max(e_idx) < min(f_idx)
     assert max(f_idx) < min(h_idx)
     assert kinds.count("E") == 1 and kinds.count("F") == 1 and kinds.count("H") == 1
+    # Execute Stage Aprime summary reports the selected (default csv) format.
+    assert envelope["stageAprime"]["format"] == "csv"
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1077,7 @@ def test_execute_chain_halts_on_stage_a_failure(tmp_path, monkeypatch):
         output_root=str(tmp_path / "out"), stackbuilder_root="sb",
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
-        fetch_backoff_max_seconds=8.0,
+        fetch_backoff_max_seconds=8.0, price_cache_format="csv",
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1324,7 +1367,7 @@ def test_stage_a_summary_has_retry_fields_and_halts(tmp_path, monkeypatch):
         output_root=str(tmp_path / "out"), stackbuilder_root="sb",
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
-        fetch_backoff_max_seconds=8.0,
+        fetch_backoff_max_seconds=8.0, price_cache_format="csv",
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1364,3 +1407,50 @@ def test_dry_run_does_not_run_stage_a(tmp_path, monkeypatch):
     assert j["status"] == "dry_run"
     assert rc == 0
     assert j["schema_version"] == "k6_recook_summary_v1"
+
+
+# ---------------------------------------------------------------------------
+# Amendment: Stage Aprime price-cache format selection (csv default)
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_stage_aprime_format_defaults_csv(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run" and rc == 0
+    assert j["stageAprime"]["format"] == "csv"
+
+
+def test_dry_run_stage_aprime_format_explicit_parquet(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+        "--price-cache-format", "parquet",
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run" and rc == 0
+    assert j["stageAprime"]["format"] == "parquet"
+
+
+def test_invalid_price_cache_format_rejected(tmp_path):
+    # argparse choices rejection -> SystemExit (standard CLI usage error).
+    with pytest.raises(SystemExit):
+        _run_main([
+            "--price-cache-format", "feather",
+            "--stackbuilder-root", str(tmp_path / "sb"),
+        ])
+
+
+def test_price_cache_format_default_constant():
+    assert drv.DEFAULT_PRICE_CACHE_FORMAT == "csv"
+    assert "csv" in drv.PRICE_CACHE_FORMATS
+    assert "parquet" in drv.PRICE_CACHE_FORMATS

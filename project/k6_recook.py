@@ -62,6 +62,12 @@ DAILY_TIMEFRAME = "1d"
 # resample path (reads local cache PKL Close; no vendor fetch).
 LAUNCH_PATH_SOURCE_MODE = "launch_path_local_pkl_resampled"
 
+# Stage Aprime price-cache on-disk format. CSV is the default because the
+# repo's price_cache/daily convention is CSV and the pinned spyproject2 env
+# ships no parquet engine; parquet is an explicit opt-in.
+PRICE_CACHE_FORMATS: Tuple[str, ...] = ("csv", "parquet")
+DEFAULT_PRICE_CACHE_FORMAT = "csv"
+
 # Stable-library engine version embedded in filenames
 # (<TICKER>_stable_v1_0_0[_<interval>].pkl). Mirrors
 # signal_library.multi_timeframe_builder.ENGINE_VERSION; verified at build
@@ -947,11 +953,18 @@ def stage_aprime_rebuild(
     cache_dir: Optional[str],
     price_cache_dir: Optional[str],
     write: bool,
+    fmt: str = DEFAULT_PRICE_CACHE_FORMAT,
     report_fn: Optional[Callable[..., dict]] = None,
 ) -> Tuple[dict, List[str], List[str]]:
     """Rebuild price_cache/daily for ``secs`` from their fresh cache PKLs.
 
-    Uses ``overwrite=True`` so a stale parquet/csv cannot shadow a freshly
+    ``fmt`` selects the on-disk price-cache format ("csv" by default, or
+    "parquet" when explicitly requested). CSV is the default because the
+    repo's price_cache/daily convention is CSV and the pinned spyproject2
+    env ships no parquet engine; parquet remains available as an explicit
+    opt-in via --price-cache-format.
+
+    Uses ``overwrite=True`` so a stale csv/parquet cannot shadow a freshly
     refreshed PKL inside the producer. NEVER deletes/clears a price-cache
     file: a secondary that lacks a usable PKL surfaces an issue code and is
     excluded, not cleared.
@@ -967,7 +980,7 @@ def stage_aprime_rebuild(
             list(secs),
             signal_cache_dir=cache_dir,
             stackbuilder_price_cache_dir=price_cache_dir,
-            format="parquet",
+            format=fmt,
             write=write,
             overwrite=True,
         )
@@ -1182,6 +1195,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fetch-backoff-max-seconds", type=float, default=8.0,
         help="Stage A backoff ceiling seconds (nonnegative). Default 8.0.",
+    )
+    p.add_argument(
+        "--price-cache-format",
+        choices=list(PRICE_CACHE_FORMATS),
+        default=DEFAULT_PRICE_CACHE_FORMAT,
+        help=(
+            "Stage Aprime price_cache/daily on-disk format. Default 'csv' "
+            "(repo convention; spyproject2 has no parquet engine). 'parquet' "
+            "is an explicit opt-in and requires pyarrow/fastparquet."
+        ),
     )
     p.add_argument("--stages", default=None)
     p.add_argument("--restage-all", action="store_true", default=False)
@@ -1472,6 +1495,7 @@ def _plan_stage_counts(
         "ran": False,
         "planned": True,
         "mode": "rebuild",
+        "format": driver.args.price_cache_format,
         "planned_writes": len(rankable),
         "note": "price_cache rebuilt from fresh PKLs at execute time",
     }
@@ -1822,6 +1846,7 @@ def _run_execute_chain(
             cache_dir=args.cache_dir,
             price_cache_dir=args.price_cache_dir,
             write=True,
+            fmt=args.price_cache_format,
         )
         for sec in excluded:
             if sec in rankable:
@@ -1832,6 +1857,7 @@ def _run_execute_chain(
         envelope["stageAprime"] = {
             "ran": True,
             "mode": "rebuild",
+            "format": report.get("format", args.price_cache_format),
             "write_count": report.get("write_count"),
             "verification_pass_count": report.get("verification_pass_count"),
             "excluded": excluded,
