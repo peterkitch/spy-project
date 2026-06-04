@@ -30,9 +30,8 @@ export function UnreadableArtifactState({ detail }: { detail: string }) {
 }
 
 export function WrongSchemaState({ actual }: { actual: string | null }) {
-  const tail = actual
-    ? `Expected k6_mtf_ranking_v1. Got: ${actual}.`
-    : "Expected k6_mtf_ranking_v1.";
+  const expected = "Expected k6_mtf_ranking_v1 or k6_mtf_ranking_v2.";
+  const tail = actual ? `${expected} Got: ${actual}.` : expected;
   return (
     <div className="state-block state-error">
       <div>{"Unrecognized artifact schema."}</div>

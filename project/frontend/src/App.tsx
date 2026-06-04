@@ -4,11 +4,14 @@ import {
   K6_MTF_BOARD_SUBHEADER,
   K6_MTF_SURFACE_DISTINGUISHER,
   K6_MTF_VALIDATION_DISCLOSURE,
+  buildK6MtfV2ValidationDisclosure,
 } from "./constants";
 import { loadRankingArtifact, type LoadOutcome } from "./loadArtifact";
 import { RankedTable } from "./components/RankedTable";
 import { DetailModal } from "./components/DetailModal";
 import { UnrankedSection } from "./components/UnrankedSection";
+import { ValidationStamp } from "./components/ValidationStamp";
+import { StageAExclusionSection } from "./components/StageAExclusionSection";
 import {
   LoadingState,
   MissingArtifactState,
@@ -51,12 +54,29 @@ export function App() {
           id="mvp-validation-disclosure"
           className="state-block"
         >
-          {K6_MTF_VALIDATION_DISCLOSURE}
+          {disclosureFor(outcome)}
         </div>
       </header>
       <main>{renderBody(outcome, activeTicker, setActiveTicker)}</main>
     </div>
   );
+}
+
+// Schema-aware header disclosure. v2 artifacts get copy generated from
+// validation_summary / validation_metadata (counts not hardcoded); all
+// other states fall back to the v1 disclosure constant.
+function disclosureFor(outcome: LoadOutcome | null): string {
+  if (outcome && outcome.kind === "ok" && outcome.payload.validation_metadata) {
+    const meta = outcome.payload.validation_metadata;
+    const summary = outcome.payload.validation_summary;
+    return buildK6MtfV2ValidationDisclosure(
+      summary?.board_validated_count,
+      summary?.not_validated_count,
+      meta.n_strategies_tested,
+      meta.run_id,
+    );
+  }
+  return K6_MTF_VALIDATION_DISCLOSURE;
 }
 
 function renderBody(
@@ -83,6 +103,7 @@ function renderBody(
     : null;
   return (
     <>
+      <ValidationStamp artifact={payload} />
       <section id="mvp-board" className="mvp-board-section">
         {visible.length === 0 ? (
           <EmptyTableState />
@@ -95,6 +116,7 @@ function renderBody(
         )}
       </section>
       <UnrankedSection rows={payload.per_secondary} />
+      <StageAExclusionSection artifact={payload} />
       {activeRow && (
         <DetailModal
           row={activeRow}

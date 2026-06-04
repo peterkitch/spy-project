@@ -2,6 +2,7 @@ import type { PerSecondary } from "../types";
 import { columnsForVisible, type RankedTableColumn } from "../columnsFor";
 import { formatSharpe } from "../format";
 import { UNAVAILABLE } from "../format";
+import { ValidationBadge } from "./ValidationBadge";
 
 interface RankedTableProps {
   visibleRows: PerSecondary[];
@@ -48,7 +49,13 @@ export function RankedTable({
             }}
           >
             {columns.map((c) => (
-              <td key={c.id}>{renderCell(c, row)}</td>
+              <td key={c.id}>
+                {c.id === "validation" ? (
+                  <ValidationBadge row={row} />
+                ) : (
+                  renderCell(c, row)
+                )}
+              </td>
             ))}
           </tr>
         ))}

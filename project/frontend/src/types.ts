@@ -166,3 +166,21 @@ export interface K6MtfRankingArtifactV2
   extends Omit<K6MtfRankingArtifact, "schema_version"> {
   schema_version: typeof K6_MTF_SCHEMA_VERSION_V2;
 }
+
+// Loader/UI union: a successfully-loaded artifact may be either schema
+// version. Both carry per_secondary / run_id / generated_at_utc; the v2
+// validation blocks are optional on both so components branch on
+// presence (PR-2 display layer).
+export type K6MtfRankingArtifactAny =
+  | K6MtfRankingArtifact
+  | K6MtfRankingArtifactV2;
+
+// PR-2 display-only badge states derived from validation_outcome +
+// empirical_validation_status. "none" is the no-badge sentinel for v1 /
+// absent validation_outcome rows. There is intentionally no fourth
+// state and no near_threshold.
+export type ValidationBadgeState =
+  | "none"
+  | "pass"
+  | "fail"
+  | "not_enough_triggers";

@@ -2,10 +2,27 @@ import { useEffect, useRef } from "react";
 import type { PerSecondary, PerSecondaryIssue } from "../types";
 import {
   DISCLAIMER,
+  K6_MTF_RANKING_VS_VALIDATION_NOTE,
   K6_MTF_SURFACE_DISTINGUISHER,
   V1_TIMEFRAMES,
 } from "../constants";
-import { UNAVAILABLE, formatInteger, formatNumber, formatSharpe } from "../format";
+import {
+  UNAVAILABLE,
+  formatInteger,
+  formatNumber,
+  formatSharpe,
+  formatShortSha,
+  formatText,
+} from "../format";
+import {
+  badgeForRow,
+  displayBhQ,
+  displayBonferroni,
+  displayBootstrapCi,
+  displayEmpiricalP,
+  displayParametricP,
+  hasValidationOutcome,
+} from "../validationDisplay";
 import { CccStepChart } from "./CccStepChart";
 
 interface DetailModalProps {
@@ -82,6 +99,7 @@ export function DetailModal({
         {renderStack(row)}
         {renderCcc(row)}
         {renderMetrics(row)}
+        {renderValidation(row)}
         {renderCounts(row)}
         {renderIssues(row)}
         {renderProvenance(row, runId, generatedAtUtc)}
@@ -176,6 +194,60 @@ function renderMetrics(row: PerSecondary): JSX.Element {
           {"!"}
         </div>
       )}
+    </section>
+  );
+}
+
+function renderValidation(row: PerSecondary): JSX.Element {
+  // v1 / no-outcome rows: render a small neutral note, never a badge.
+  if (!hasValidationOutcome(row)) {
+    return (
+      <section id="k6mtf-modal-validation" className="modal-section">
+        <strong>{"Phase 5 validation"}</strong>
+        <div id="k6mtf-modal-validation-none" className="modal-validation-none">
+          {"Validation data is not available for this artifact."}
+        </div>
+      </section>
+    );
+  }
+  const badge = badgeForRow(row);
+  const shortSha = formatShortSha(row.validation_artifact_sha256);
+  return (
+    <section id="k6mtf-modal-validation" className="modal-section">
+      <strong>{"Phase 5 validation"}</strong>
+      {badge.label && badge.variant && (
+        <div
+          id="k6mtf-modal-validation-badge"
+          className={`validation-badge ${badge.variant}`}
+          data-validation-state={badge.state}
+        >
+          {badge.label}
+        </div>
+      )}
+      <ul className="modal-list">
+        <li id="k6mtf-modal-ranking-status">
+          {`Ranking status (leaderboard): ${row.status || UNAVAILABLE}`}
+        </li>
+        <li id="k6mtf-modal-validation-outcome">
+          {`Validation outcome: ${formatText(row.validation_outcome)}`}
+        </li>
+        <li>{`empirical_validation_status: ${formatText(row.empirical_validation_status)}`}</li>
+        <li>{`empirical_p_value: ${displayEmpiricalP(row)}`}</li>
+        <li>{`parametric_p_value: ${displayParametricP(row)}`}</li>
+        <li>{`bh_q_value: ${displayBhQ(row)}`}</li>
+        <li>{`bonferroni_p_value: ${displayBonferroni(row)}`}</li>
+        <li>{`bootstrap_sharpe_ci: ${displayBootstrapCi(row)}`}</li>
+        <li>{`validation_trigger_days: ${formatInteger(row.validation_trigger_days)}`}</li>
+        <li>{`validation_strategy_id: ${formatText(row.validation_strategy_id)}`}</li>
+        <li>{`validation_run_id: ${formatText(row.validation_run_id)}`}</li>
+        <li>{`validation_artifact_sha256 (short): ${shortSha}`}</li>
+      </ul>
+      <div
+        id="k6mtf-modal-validation-guardrail"
+        className="modal-validation-guardrail"
+      >
+        {K6_MTF_RANKING_VS_VALIDATION_NOTE}
+      </div>
     </section>
   );
 }

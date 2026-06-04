@@ -1,4 +1,8 @@
-import { K6_MTF_SCHEMA_VERSION, type K6MtfRankingArtifact } from "./types";
+import {
+  K6_MTF_SCHEMA_VERSION,
+  K6_MTF_SCHEMA_VERSION_V2,
+  type K6MtfRankingArtifactAny,
+} from "./types";
 
 // Discriminated union mirroring the Dash loader outcomes
 // (mvp_signal_board.py load_ranking_artifact returns
@@ -6,9 +10,20 @@ import { K6_MTF_SCHEMA_VERSION, type K6MtfRankingArtifact } from "./types";
 // React loader applies the same classification at the artifact
 // boundary; it does NOT validate metric values, recompute, or
 // derive anything.
+//
+// PR-2: the loader now accepts BOTH k6_mtf_ranking_v1 and
+// k6_mtf_ranking_v2. The committed public fixture remains v1; a v2
+// fixture reaches this path only through a later gated operator
+// promotion. The ok payload is the v1|v2 union so components branch on
+// the optional validation blocks.
+
+const ACCEPTED_SCHEMA_VERSIONS: readonly string[] = [
+  K6_MTF_SCHEMA_VERSION,
+  K6_MTF_SCHEMA_VERSION_V2,
+];
 
 export type LoadOutcome =
-  | { kind: "ok"; payload: K6MtfRankingArtifact }
+  | { kind: "ok"; payload: K6MtfRankingArtifactAny }
   | { kind: "missing" }
   | { kind: "unreadable"; detail: string }
   | { kind: "wrong_schema"; actual: string | null };
@@ -49,10 +64,10 @@ export async function loadRankingArtifact(): Promise<LoadOutcome> {
   }
   const obj = payload as { schema_version?: unknown };
   const actual = typeof obj.schema_version === "string" ? obj.schema_version : null;
-  if (actual !== K6_MTF_SCHEMA_VERSION) {
+  if (actual === null || !ACCEPTED_SCHEMA_VERSIONS.includes(actual)) {
     return { kind: "wrong_schema", actual };
   }
-  return { kind: "ok", payload: payload as K6MtfRankingArtifact };
+  return { kind: "ok", payload: payload as K6MtfRankingArtifactAny };
 }
 
 function truncate(s: string): string {
