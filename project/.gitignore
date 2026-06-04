@@ -145,6 +145,14 @@ test_scripts/onepass/*.py
 !test_scripts/onepass/test_onepass_rejection_diagnostics.py
 !test_scripts/onepass/test_onepass_provenance_engine_version.py
 
+# K=6 recook driver tests: re-include the directory and narrowly track
+# the SPRINT 500 driver regression tests. Mirrors the shared/ and
+# onepass/ precedent so any local-only scratch scripts under
+# k6_recook/ stay ignored unless explicitly allow-listed here.
+!test_scripts/k6_recook/
+test_scripts/k6_recook/*.py
+!test_scripts/k6_recook/test_k6_recook.py
+
 # React publish promotion-manifest sidecar (written by the
 # operator-run helper at utils/react_publish/promote_k6_mtf_artifact.py
 # per the publish/deploy contract). The repo-root *.json

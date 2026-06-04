@@ -1,0 +1,1082 @@
+"""Tests for the SPRINT 500 K=6 recook driver (project/k6_recook.py).
+
+All tests use tmp_path and injected/fake callables. No network, no real
+output/cache/signal_library roots. Fast-suite compatible.
+
+Covers the locked behaviors:
+  - Stage 0 pointer synthesis + producer round-trip.
+  - Dotted-secondary routing (DX-Y.NYB) preserved (no '.'->'_').
+  - Seed selection: one / unique-newest / tied / zero.
+  - Pin awareness and existing pointer untouched without --restage-all.
+  - [D]/[I] vs -D/-I member-token parsing (parity with producer).
+  - Union dedupe.
+  - Stage Aprime rebuild policy (overwrite, never clear; exclude PKL-less).
+  - Offline skip gate (skip equal/ahead, never call refresher).
+  - Active-stale refusal (2026-05-26 vs target 2026-06-03).
+  - Dead/no-history exclusion (no invented terminal semantics).
+  - Stage A/B structured result inspection.
+  - Stage B no-vendor-fetch (launch-path local PKL).
+  - Daily stable rule: existing 1d never overwritten; missing 1d created.
+  - Barrier order A -> Aprime -> B -> E -> F -> H.
+  - Single-instance lock: held refuses, stale reclaimed, dry-run no lock.
+  - Envelope/stdout: exactly one JSON object, schema_version.
+  - Stage H private dry-run only (no public/write/operator-approved).
+  - Global refusals.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pickle
+import sys
+import types
+from io import StringIO
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+_HERE = Path(__file__).resolve().parents[2]  # project/
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import k6_recook as drv  # noqa: E402
+
+
+SIX = ["AAA[D]", "BBB[I]", "CCC[D]", "DDD[I]", "EEE[D]", "FFF[I]"]
+
+
+# ---------------------------------------------------------------------------
+# Fixture helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_combo(seed_dir: Path, members=SIX) -> None:
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    (seed_dir / "combo_k=6.json").write_text(
+        json.dumps({"Members": members}), encoding="utf-8"
+    )
+
+
+def _make_secondary(root: Path, sec: str, seed_name="seedTC__x", members=SIX) -> Path:
+    seed = root / sec / seed_name
+    _make_combo(seed, members)
+    return seed
+
+
+def _run_main(argv):
+    buf = StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        rc = drv.main(argv)
+    finally:
+        sys.stdout = old
+    return rc, buf.getvalue()
+
+
+def _must_not_run(*a, **k):
+    raise AssertionError("this stage must not run after the prior halt")
+
+
+def _boom_write(target, payload):
+    raise OSError("simulated pointer write failure")
+
+
+# ---------------------------------------------------------------------------
+# 1. Stage 0 payload + producer round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_stage0_payload_and_producer_round_trip(tmp_path):
+    root = tmp_path / "stackbuilder"
+    sec_dir = root / "FOO"
+    _make_secondary(root, "FOO")
+    plan = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=False
+    )
+    assert plan.status == "synthesize"
+    assert plan.would_write_pointer is True
+    assert plan.members is not None and len(plan.members) == 6
+
+    payload = drv.build_pointer_payload(plan.secondary, plan.chosen_run_dir)
+    assert payload["selected_run_dir"] == plan.chosen_run_dir
+    target = sec_dir / "selected_build.json"
+    drv.write_pointer_atomic(target, payload)
+    assert target.is_file()
+
+    import k6_mtf_history_producer as producer
+
+    stack = producer.resolve_k6_stack("FOO", stackbuilder_root=str(root))
+    assert len(stack.members) == 6
+
+
+# ---------------------------------------------------------------------------
+# 2. Dotted-secondary routing (DX-Y.NYB)
+# ---------------------------------------------------------------------------
+
+
+def test_dotted_secondary_routing(tmp_path):
+    root = tmp_path / "stackbuilder"
+    sec = "DX-Y.NYB"
+    sec_dir = root / sec
+    _make_secondary(root, sec)
+    plan = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=False
+    )
+    assert plan.status == "synthesize"
+    payload = drv.build_pointer_payload(plan.secondary, plan.chosen_run_dir)
+    target = root / sec / "selected_build.json"
+    drv.write_pointer_atomic(target, payload)
+
+    # Dots preserved; no sanitized DX-Y_NYB directory created.
+    assert (root / "DX-Y.NYB" / "selected_build.json").is_file()
+    assert not (root / "DX-Y_NYB").exists()
+
+    import k6_mtf_history_producer as producer
+
+    stack = producer.resolve_k6_stack("DX-Y.NYB", stackbuilder_root=str(root))
+    assert len(stack.members) == 6
+
+
+# ---------------------------------------------------------------------------
+# 3. Seed selection: one / unique-newest / tied / zero
+# ---------------------------------------------------------------------------
+
+
+def test_choose_seed_dir_variants(tmp_path):
+    assert drv.choose_seed_dir([]) == (None, "zero_combo_dir")
+
+    d1 = tmp_path / "a"
+    d1.mkdir()
+    assert drv.choose_seed_dir([d1]) == (d1, "ok")
+
+    d2 = tmp_path / "b"
+    d2.mkdir()
+    os.utime(d1, (1000, 1000))
+    os.utime(d2, (2000, 2000))
+    chosen, status = drv.choose_seed_dir([d1, d2])
+    assert status == "ok" and chosen == d2
+
+    os.utime(d1, (3000, 3000))
+    os.utime(d2, (3000, 3000))
+    chosen, status = drv.choose_seed_dir([d1, d2])
+    assert chosen is None and status == "ambiguous_seed_mtime_tie"
+
+
+def test_plan_secondary_two_rundirs_picks_newest(tmp_path):
+    root = tmp_path / "stackbuilder"
+    sec_dir = root / "FOO"
+    older = _make_secondary(root, "FOO", seed_name="seedTC__old")
+    newer = _make_secondary(root, "FOO", seed_name="seedTC__new")
+    os.utime(older, (1000, 1000))
+    os.utime(newer, (5000, 5000))
+    plan = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=False
+    )
+    assert plan.status == "synthesize"
+    assert plan.chosen_run_dir.endswith("seedTC__new")
+
+
+def test_plan_secondary_zero_combo(tmp_path):
+    root = tmp_path / "stackbuilder"
+    sec_dir = root / "EMPTY"
+    sec_dir.mkdir(parents=True)
+    plan = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=False
+    )
+    assert plan.status == "excluded"
+    assert plan.reason == "zero_combo_dir"
+
+
+# ---------------------------------------------------------------------------
+# 4. Pin awareness + existing pointer untouched
+# ---------------------------------------------------------------------------
+
+
+def test_existing_pointer_untouched_without_restage(tmp_path):
+    root = tmp_path / "stackbuilder"
+    sec_dir = root / "FOO"
+    seed = _make_secondary(root, "FOO")
+    sel = sec_dir / "selected_build.json"
+    sel.write_text(json.dumps({"selected_run_dir": str(seed)}), encoding="utf-8")
+    before = sel.read_text(encoding="utf-8")
+
+    plan = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=False
+    )
+    assert plan.status == "existing"
+    assert plan.would_write_pointer is False
+    assert plan.members is not None and len(plan.members) == 6
+    # plan_secondary never writes; existing pointer is byte-identical.
+    assert sel.read_text(encoding="utf-8") == before
+
+
+def test_pin_blocks_synthesis_unless_unpin(tmp_path):
+    root = tmp_path / "stackbuilder"
+    sec_dir = root / "FOO"
+    _make_secondary(root, "FOO")
+    (sec_dir / "selected_build.pinned.json").write_text("{}", encoding="utf-8")
+
+    plan = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=False
+    )
+    assert plan.status == "blocked_by_pin"
+
+    plan_unpin = drv.plan_secondary(
+        sec_dir, stackbuilder_root=str(root), restage_all=False, unpin=True
+    )
+    assert plan_unpin.status == "synthesize"
+
+
+# ---------------------------------------------------------------------------
+# 5. [D]/[I] vs -D/-I parsing (parity with producer)
+# ---------------------------------------------------------------------------
+
+
+def test_member_token_parsing_and_parity():
+    assert drv.parse_member_token("AWR[D]") == ("AWR", "D", "AWR[D]")
+    assert drv.parse_member_token("CP[I]") == ("CP", "I", "CP[I]")
+    assert drv.parse_member_token("600058.SS[I]") == ("600058.SS", "I", "600058.SS[I]")
+
+    with pytest.raises(ValueError):
+        drv.parse_member_token("AWR-D")
+    with pytest.raises(ValueError):
+        drv.parse_member_token("CP-I")
+    with pytest.raises(ValueError):
+        drv.parse_member_token("PLAIN")
+
+    import k6_mtf_history_producer as producer
+
+    for tok in ["AWR[D]", "CP[I]", "600058.SS[I]"]:
+        m = producer._parse_member_token(tok)
+        ticker, protocol, _raw = drv.parse_member_token(tok)
+        assert (ticker, protocol) == (m.ticker, m.protocol)
+
+
+def test_parse_combo_members_rejects_dash_form(tmp_path):
+    seed = tmp_path / "seed"
+    _make_combo(seed, members=["AAA-D", "BBB-I", "CCC-D", "DDD-I", "EEE-D", "FFF-I"])
+    members, err = drv.parse_combo_members(seed / "combo_k=6.json")
+    assert members is None
+    assert err == "member_token_invalid"
+
+
+def test_parse_combo_members_requires_six(tmp_path):
+    seed = tmp_path / "seed"
+    _make_combo(seed, members=["AAA[D]", "BBB[I]"])
+    members, err = drv.parse_combo_members(seed / "combo_k=6.json")
+    assert members is None and err == "members_not_six"
+
+
+# ---------------------------------------------------------------------------
+# 6. Union resolution dedupe
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_union_dedupe():
+    P = drv.SecondaryPlan
+    plan_a = P(
+        secondary="aaa",
+        secondary_dir="x",
+        status="synthesize",
+        members=[("MMM", "D", "MMM[D]"), ("nnn", "I", "nnn[I]")],
+    )
+    plan_b = P(
+        secondary="BBB",
+        secondary_dir="y",
+        status="synthesize",
+        members=[("mmm", "D", "mmm[D]"), ("ZZZ", "I", "ZZZ[I]")],
+    )
+    union = drv.resolve_union([plan_a, plan_b])
+    assert set(union.keys()) == {"AAA", "MMM", "NNN", "BBB", "ZZZ"}
+    # First-seen display preserved (plan_a's "MMM" before plan_b's "mmm").
+    assert union["MMM"] == "MMM"
+
+
+# ---------------------------------------------------------------------------
+# 7 + 8. Stage Aprime rebuild policy (overwrite, never clear; exclude PKL-less)
+# ---------------------------------------------------------------------------
+
+
+def test_aprime_rebuild_uses_overwrite():
+    calls = {}
+
+    def fake_report(tickers, *, signal_cache_dir, stackbuilder_price_cache_dir,
+                    format, write, overwrite):
+        calls["overwrite"] = overwrite
+        calls["write"] = write
+        calls["tickers"] = list(tickers)
+        rows = [{"ticker": t, "issue_codes": []} for t in tickers]
+        return {"write_count": len(rows), "verification_pass_count": len(rows),
+                "rows": rows}
+
+    report, kept, excluded = drv.stage_aprime_rebuild(
+        ["SPY", "AAPL"], cache_dir="c", price_cache_dir="p",
+        write=True, report_fn=fake_report,
+    )
+    # Rebuild overwrites stale parquet/csv so it cannot shadow a fresh PKL.
+    assert calls["overwrite"] is True
+    assert calls["write"] is True
+    assert kept == ["SPY", "AAPL"]
+    assert excluded == []
+
+
+def test_aprime_excludes_pkl_less_secondary_never_clears():
+    def fake_report(tickers, *, signal_cache_dir, stackbuilder_price_cache_dir,
+                    format, write, overwrite):
+        rows = []
+        for t in tickers:
+            if t == "NOPKL":
+                rows.append({"ticker": t, "issue_codes": ["source_pkl_missing"]})
+            else:
+                rows.append({"ticker": t, "issue_codes": []})
+        return {"write_count": 1, "verification_pass_count": 1, "rows": rows}
+
+    report, kept, excluded = drv.stage_aprime_rebuild(
+        ["SPY", "NOPKL"], cache_dir="c", price_cache_dir="p",
+        write=True, report_fn=fake_report,
+    )
+    assert "NOPKL" in excluded
+    assert "SPY" in kept
+    # The driver never deletes a price-cache file; it only excludes.
+
+
+# ---------------------------------------------------------------------------
+# 9. Offline skip gate skips equal/ahead, never calls refresher
+# ---------------------------------------------------------------------------
+
+
+class _FakeCutoffState:
+    def __init__(self, ahead=False, equal=False, end=None):
+        self.cache_ahead_of_cutoff = ahead
+        self.cache_equal_to_cutoff = equal
+        self.cache_date_range_end = end
+
+
+def _boom_refresh(*a, **k):
+    raise AssertionError("refresher must not be called on a fresh ticker")
+
+
+def test_skip_gate_skips_ahead_and_equal_never_refreshes():
+    for state in (
+        _FakeCutoffState(ahead=True, end="2026-06-03"),
+        _FakeCutoffState(equal=True, end="2026-06-03"),
+    ):
+        res = drv.stage_a_process_ticker(
+            "SPY", cache_dir=None, status_dir=None, write=True,
+            target_as_of="2026-06-03",
+            evaluate_fn=lambda *a, **k: state,
+            refresh_fn=_boom_refresh,
+        )
+        assert res["classification"] == "skipped_fresh"
+        assert res["refresh_called"] is False
+
+
+# ---------------------------------------------------------------------------
+# 10. Active-stale refusal (2026-05-26 vs target 2026-06-03)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRefreshResult:
+    def __init__(self, issue_codes=(), new_end=None, current_after=False, refreshed=False):
+        self.issue_codes = tuple(issue_codes)
+        self.new_cache_date_range_end = new_end
+        self.current_after = current_after
+        self.refreshed = refreshed
+
+
+def test_active_stale_cache_is_not_fresh_and_fails_if_unrefreshed():
+    calls = {"n": 0}
+
+    def refresh_fn(ticker, **k):
+        calls["n"] += 1
+        # Refresh produced no newer data: still 2026-05-26, not current.
+        return _FakeRefreshResult(new_end="2026-05-26", current_after=False)
+
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03",
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(end="2026-05-26"),
+        refresh_fn=refresh_fn,
+    )
+    assert calls["n"] == 1  # stale cache is NOT skipped as fresh
+    assert res["classification"] == "failed"
+
+
+def test_refresh_to_target_is_success():
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03",
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(end="2026-05-26"),
+        refresh_fn=lambda ticker, **k: _FakeRefreshResult(
+            new_end="2026-06-03", current_after=True, refreshed=True
+        ),
+    )
+    assert res["classification"] == "refreshed"
+
+
+# ---------------------------------------------------------------------------
+# 11. Dead/no-history exclusion (no invented terminal semantics)
+# ---------------------------------------------------------------------------
+
+
+def _classify_with_issue(code):
+    return drv.stage_a_process_ticker(
+        "DEAD", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03",
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(end=None),
+        refresh_fn=lambda ticker, **k: _FakeRefreshResult(issue_codes=(code,)),
+    )["classification"]
+
+
+def test_transient_fetch_failure_is_not_dead_no_history():
+    # data_fetch_failed is a transient provider failure -> Stage A failure,
+    # NOT a dead/no-history dependent-secondary exclusion.
+    assert "data_fetch_failed" not in drv.DEAD_NO_HISTORY_ISSUE_CODES
+    assert _classify_with_issue("data_fetch_failed") == "failed"
+
+
+def test_data_empty_and_no_close_are_dead_no_history():
+    assert _classify_with_issue("data_empty") == "dead_no_history"
+    assert _classify_with_issue("data_no_close_column") == "dead_no_history"
+
+
+# ---------------------------------------------------------------------------
+# 12. Stage A structured-result inspection
+# ---------------------------------------------------------------------------
+
+
+def test_stage_a_result_carries_structured_fields():
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03",
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(end="2026-05-26"),
+        refresh_fn=lambda ticker, **k: _FakeRefreshResult(
+            new_end="2026-06-03", current_after=True, refreshed=True
+        ),
+    )
+    assert res["ticker"] == "SPY"
+    assert res["new_cache_date_range_end"] == "2026-06-03"
+    assert res["current_after"] is True
+    assert res["refresh_called"] is True
+    assert "issue_codes" in res
+
+
+# ---------------------------------------------------------------------------
+# 13 + 15. Stage B worker result + daily stable rule
+# ---------------------------------------------------------------------------
+
+
+def _b_generate(member, interval, *, source_mode, cache_dir):
+    assert source_mode == drv.LAUNCH_PATH_SOURCE_MODE  # never vendor mode
+    return {"ticker": member, "interval": interval}
+
+
+def test_stage_b_builds_nondaily_and_creates_missing_daily():
+    saved = []
+
+    def save(lib, interval, *, force_overwrite):
+        saved.append((interval, force_overwrite))
+
+    res = drv.stage_b_process_member(
+        "MMM",
+        intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
+        stable_dir="s",
+        cache_dir="c",
+        generate_fn=_b_generate,
+        save_fn=save,
+        daily_exists_fn=lambda m, s: False,  # 1d missing -> create
+        set_library_dir_fn=lambda d: None,
+    )
+    assert set(res["built"]) == {"1wk", "1mo", "3mo", "1y", "1d"}
+    assert ("1d", True) in saved
+    assert res["ok"] is True
+
+
+def test_stage_b_existing_daily_never_overwritten():
+    saved = []
+
+    res = drv.stage_b_process_member(
+        "MMM",
+        intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
+        stable_dir="s",
+        cache_dir="c",
+        generate_fn=_b_generate,
+        save_fn=lambda lib, interval, *, force_overwrite: saved.append(interval),
+        daily_exists_fn=lambda m, s: True,  # 1d already present
+        set_library_dir_fn=lambda d: None,
+    )
+    assert "1d" in res["skipped"]
+    assert "1d" not in saved
+
+
+def test_daily_stable_exists_path(tmp_path):
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    assert drv.daily_stable_exists("MMM", str(stable)) is False
+    (stable / "MMM_stable_v1_0_0.pkl").write_text("x", encoding="utf-8")
+    assert drv.daily_stable_exists("MMM", str(stable)) is True
+
+
+# ---------------------------------------------------------------------------
+# 14. Stage B no-vendor-fetch (launch-path local PKL)
+# ---------------------------------------------------------------------------
+
+
+def test_launch_path_reads_local_pkl_without_vendor_fetch(tmp_path, monkeypatch):
+    import provenance_manifest as pm
+    import signal_library.multi_timeframe_builder as mtb
+
+    idx = pd.date_range("2018-01-01", periods=1200, freq="D")
+    close = pd.Series(
+        100.0 + np.sin(np.arange(1200) / 15.0) * 5 + np.arange(1200) * 0.05,
+        index=idx,
+    )
+    obj = {"preprocessed_data": pd.DataFrame({"Close": close})}
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with open(cache / "MMM_precomputed_results.pkl", "wb") as fh:
+        pickle.dump(obj, fh)
+
+    # Accept the test PKL via the verified loader seam (legacy-ok shape).
+    monkeypatch.setattr(
+        pm,
+        "load_verified_pickle_artifact",
+        lambda p: (obj, types.SimpleNamespace(ok=True, legacy=False, mismatches=[])),
+    )
+    # Any vendor fetch must raise; the launch path must never reach it.
+    def _no_vendor(*a, **k):
+        raise AssertionError("vendor fetch attempted on launch path")
+
+    monkeypatch.setattr(mtb, "_yf_download_with_retry", _no_vendor)
+
+    df = mtb.fetch_interval_data(
+        "MMM",
+        "1wk",
+        source_mode=mtb.SOURCE_MODE_LAUNCH_PATH_LOCAL_PKL_RESAMPLED,
+        cache_dir=str(cache),
+    )
+    assert df is not None and "Close" in df.columns and len(df) > 0
+
+
+# ---------------------------------------------------------------------------
+# 16. Barrier order A -> Aprime -> B -> E -> F -> H
+# ---------------------------------------------------------------------------
+
+
+def test_execute_chain_barrier_order(tmp_path, monkeypatch):
+    order = []
+
+    monkeypatch.setattr(
+        drv, "_parallel_map",
+        lambda worker, payloads, workers: [worker(p) for p in payloads],
+    )
+    monkeypatch.setattr(
+        drv, "_stage_a_worker",
+        lambda p: (order.append(("A", p["ticker"])),
+                   {"ticker": p["ticker"], "classification": "refreshed"})[1],
+    )
+    monkeypatch.setattr(
+        drv, "stage_aprime_rebuild",
+        lambda secs, *, cache_dir, price_cache_dir, write: (
+            order.append(("Aprime", tuple(secs))),
+            ({"write_count": len(secs), "verification_pass_count": len(secs)},
+             list(secs), []),
+        )[1],
+    )
+    monkeypatch.setattr(
+        drv, "_stage_b_worker",
+        lambda p: (order.append(("B", p["member"])),
+                   {"member": p["member"], "ok": True})[1],
+    )
+
+    import k6_mtf_history_producer as producer
+    import k6_mtf_ranking_engine as ranking
+
+    monkeypatch.setattr(
+        producer, "run",
+        lambda secs, **k: (order.append(("E", tuple(secs))),
+                           {"run_id": k.get("run_id"),
+                            "written_paths": list(secs), "failures": []})[1],
+    )
+    monkeypatch.setattr(
+        ranking, "run",
+        lambda run_dir, **k: (order.append(("F", run_dir)),
+                              {"ranking_artifact_path": str(tmp_path / "r.json"),
+                               "all_failed": False, "failed_records": []})[1],
+    )
+    monkeypatch.setattr(
+        drv, "_stage_h_dry_run",
+        lambda driver, rp, blocked: (order.append(("H", rp)),
+                                     {"ran": True, "status": "dry_run_ok"})[1],
+    )
+
+    P = drv.SecondaryPlan
+    included = [
+        P(secondary="FOO", secondary_dir="x", status="synthesize",
+          members=[("M1", "D", "M1[D]"), ("M2", "I", "M2[I]")]),
+        P(secondary="BAR", secondary_dir="y", status="synthesize",
+          members=[("M2", "D", "M2[D]"), ("M3", "I", "M3[I]")]),
+    ]
+    args = types.SimpleNamespace(
+        cache_dir="c", status_dir="cs", price_cache_dir="p", stable_dir="s",
+        output_root=str(tmp_path / "out"), stackbuilder_root="sb",
+        a_workers=2, b_workers=2, promote_dry_run=True,
+    )
+    driver = drv.Driver(
+        args=args, stages=list(drv.STAGE_ORDER), executed=True,
+        target_as_of="2026-06-03", driver_run_id="rid",
+        project_root=tmp_path,
+    )
+    envelope = drv._new_envelope(driver)
+    rc = drv._run_execute_chain(driver, envelope, included, None)
+    assert rc == 0
+
+    kinds = [k for k, _ in order]
+    a_idx = [i for i, (k, _) in enumerate(order) if k == "A"]
+    ap_idx = [i for i, (k, _) in enumerate(order) if k == "Aprime"]
+    b_idx = [i for i, (k, _) in enumerate(order) if k == "B"]
+    e_idx = [i for i, (k, _) in enumerate(order) if k == "E"]
+    f_idx = [i for i, (k, _) in enumerate(order) if k == "F"]
+    h_idx = [i for i, (k, _) in enumerate(order) if k == "H"]
+    # All Stage A before Aprime; all Aprime before B; all B before E.
+    assert max(a_idx) < min(ap_idx)
+    assert max(ap_idx) < min(b_idx)
+    assert max(b_idx) < min(e_idx)
+    assert max(e_idx) < min(f_idx)
+    assert max(f_idx) < min(h_idx)
+    assert kinds.count("E") == 1 and kinds.count("F") == 1 and kinds.count("H") == 1
+
+
+# ---------------------------------------------------------------------------
+# 17. Single-instance lock
+# ---------------------------------------------------------------------------
+
+
+def test_lock_held_refuses_then_releases(tmp_path):
+    lp = tmp_path / ".recook.lock"
+    h = drv.acquire_lock(lp, driver_run_id="r1", ttl_seconds=3600)
+    assert h.acquired and lp.is_file()
+    with pytest.raises(RuntimeError):
+        drv.acquire_lock(lp, driver_run_id="r2", ttl_seconds=3600)
+    drv.release_lock(h)
+    assert not lp.is_file()
+
+
+def test_lock_stale_by_ttl_reclaimed(tmp_path):
+    lp = tmp_path / ".recook.lock"
+    h = drv.acquire_lock(lp, driver_run_id="r1", ttl_seconds=3600)
+    data = json.loads(lp.read_text(encoding="utf-8"))
+    data["started_at_utc"] = "2000-01-01T00:00:00Z"  # ancient
+    lp.write_text(json.dumps(data), encoding="utf-8")
+    h2 = drv.acquire_lock(lp, driver_run_id="r2", ttl_seconds=1)
+    assert h2.reclaimed_stale is True
+    drv.release_lock(h2)
+
+
+def test_lock_dead_pid_reclaimed(tmp_path):
+    lp = tmp_path / ".recook.lock"
+    drv.acquire_lock(lp, driver_run_id="r1", ttl_seconds=3600)
+    data = json.loads(lp.read_text(encoding="utf-8"))
+    data["pid"] = -1  # never-alive pid
+    lp.write_text(json.dumps(data), encoding="utf-8")
+    h2 = drv.acquire_lock(lp, driver_run_id="r2", ttl_seconds=3600)
+    assert h2.reclaimed_stale is True
+    drv.release_lock(h2)
+
+
+# ---------------------------------------------------------------------------
+# 18. Envelope / stdout discipline + dry-run creates no lock
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_one_json_object_and_no_lock(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    _make_secondary(root, "BAR")
+    out = tmp_path / "out"
+    rc, stdout = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(out),
+        "--stable-dir", str(tmp_path / "stable"),
+        "--target-as-of", "2026-06-03",
+    ])
+    parsed = json.loads(stdout)  # exactly one JSON object, parseable
+    assert parsed["schema_version"] == "k6_recook_summary_v1"
+    assert parsed["status"] == "dry_run"
+    assert parsed["executed"] is False
+    assert rc == 0
+    assert parsed["stage0"]["buildable_secondaries"] == 2
+    assert parsed["stage0"]["selected_build_would_synthesize_count"] == 2
+    assert parsed["union"]["refresh_union_count"] >= 2
+    # Dry-run never acquires the execute lock.
+    assert not (out / ".recook.lock").exists()
+    assert parsed["lock"]["acquired"] is False
+
+
+def test_dry_run_writes_no_pointer(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    rc, stdout = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    assert rc == 0
+    assert not (root / "FOO" / "selected_build.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 19. Stage H private dry-run only
+# ---------------------------------------------------------------------------
+
+
+def test_stage_h_dry_run_private_only(tmp_path, monkeypatch):
+    import utils.react_publish.promote_k6_mtf_artifact as ph
+
+    captured = {}
+
+    def fake_promote(inputs, **k):
+        captured["inputs"] = inputs
+        return {
+            "dry_run": True,
+            "mode": "private_internal",
+            "wrote_destination": False,
+            "per_secondary_count": 3,
+        }
+
+    monkeypatch.setattr(ph, "promote", fake_promote)
+
+    rp = tmp_path / "k6_mtf_ranking.json"
+    rp.write_text("{}", encoding="utf-8")
+    driver = drv.Driver(
+        args=types.SimpleNamespace(), stages=[], executed=True,
+        target_as_of="2026-06-03", driver_run_id="rid", project_root=tmp_path,
+    )
+    out = drv._stage_h_dry_run(driver, str(rp), blocked=False)
+    inp = captured["inputs"]
+    assert inp.public_mode is False
+    assert inp.write is False
+    assert inp.operator_approved is False
+    assert inp.phase5_report_path is None
+    assert out["status"] == "dry_run_ok"
+    assert out["wrote_destination"] is False
+
+
+def test_stage_h_blocked_flag_when_failures(tmp_path, monkeypatch):
+    import utils.react_publish.promote_k6_mtf_artifact as ph
+
+    monkeypatch.setattr(
+        ph, "promote",
+        lambda inputs, **k: {"dry_run": True, "mode": "private_internal",
+                             "wrote_destination": False, "per_secondary_count": 1},
+    )
+    rp = tmp_path / "k6_mtf_ranking.json"
+    rp.write_text("{}", encoding="utf-8")
+    driver = drv.Driver(
+        args=types.SimpleNamespace(), stages=[], executed=True,
+        target_as_of="2026-06-03", driver_run_id="rid", project_root=tmp_path,
+    )
+    out = drv._stage_h_dry_run(driver, str(rp), blocked=True)
+    assert out["promotion_blocked_by_failures"] is True
+
+
+# ---------------------------------------------------------------------------
+# Global refusals
+# ---------------------------------------------------------------------------
+
+
+def test_execute_without_network_flag_refuses_no_writes(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    out = tmp_path / "out"
+    rc, stdout = _run_main([
+        "--execute",
+        "--stackbuilder-root", str(root),
+        "--output-root", str(out),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    parsed = json.loads(stdout)
+    assert parsed["status"] == "refused"
+    assert rc != 0
+    # Refused before any write: no lock, no synthesized pointer.
+    assert not (out / ".recook.lock").exists()
+    assert not (root / "FOO" / "selected_build.json").exists()
+
+
+def test_unknown_stage_refused(tmp_path):
+    rc, stdout = _run_main([
+        "--stages", "bogus",
+        "--stackbuilder-root", str(tmp_path / "stackbuilder"),
+    ])
+    assert json.loads(stdout)["status"] == "refused"
+    assert rc != 0
+
+
+def test_stages_out_of_order_refused(tmp_path):
+    rc, stdout = _run_main([
+        "--stages", "B,A",
+        "--stackbuilder-root", str(tmp_path / "stackbuilder"),
+    ])
+    assert json.loads(stdout)["status"] == "refused"
+    assert rc != 0
+
+
+def test_invalid_target_date_refused(tmp_path):
+    rc, stdout = _run_main([
+        "--target-as-of", "06-03-2026",
+        "--stackbuilder-root", str(tmp_path / "stackbuilder"),
+    ])
+    assert json.loads(stdout)["status"] == "refused"
+    assert rc != 0
+
+
+def test_missing_stackbuilder_root_refused(tmp_path):
+    rc, stdout = _run_main([
+        "--stackbuilder-root", str(tmp_path / "does_not_exist"),
+    ])
+    assert json.loads(stdout)["status"] == "refused"
+    assert rc != 0
+
+
+def test_no_buildable_secondaries_refused(tmp_path):
+    root = tmp_path / "stackbuilder"
+    root.mkdir()
+    rc, stdout = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+    ])
+    parsed = json.loads(stdout)
+    assert parsed["status"] == "refused"
+    assert rc != 0
+
+
+# ---------------------------------------------------------------------------
+# Parsing utilities
+# ---------------------------------------------------------------------------
+
+
+def test_parse_lock_ttl_forms():
+    assert drv.parse_lock_ttl("6h") == 6 * 3600
+    assert drv.parse_lock_ttl("360m") == 360 * 60
+    assert drv.parse_lock_ttl("21600s") == 21600
+    assert drv.parse_lock_ttl("21600") == 21600
+    with pytest.raises(ValueError):
+        drv.parse_lock_ttl("later")
+
+
+def test_parse_stages_default_and_validation():
+    assert drv.parse_stages(None) == list(drv.STAGE_ORDER)
+    assert drv.parse_stages("A,B,E") == ["A", "B", "E"]
+    with pytest.raises(ValueError):
+        drv.parse_stages("E,A")
+    with pytest.raises(ValueError):
+        drv.parse_stages("nope")
+
+
+def test_parse_target_date():
+    assert drv.parse_target_date("2026-06-03") == "2026-06-03"
+    with pytest.raises(ValueError):
+        drv.parse_target_date("2026/06/03")
+
+
+# ---------------------------------------------------------------------------
+# Amendment 1: safe --stages semantics (contiguous prefix under execute)
+# ---------------------------------------------------------------------------
+
+
+def test_is_contiguous_prefix():
+    assert drv.is_contiguous_prefix(["stage0"]) is True
+    assert drv.is_contiguous_prefix(["stage0", "A"]) is True
+    assert drv.is_contiguous_prefix(["stage0", "A", "Aprime"]) is True
+    assert drv.is_contiguous_prefix(list(drv.STAGE_ORDER)) is True
+    # Non-prefixes:
+    assert drv.is_contiguous_prefix([]) is False
+    assert drv.is_contiguous_prefix(["A", "Aprime"]) is False
+    assert drv.is_contiguous_prefix(["stage0", "A", "B"]) is False
+    assert drv.is_contiguous_prefix(["E", "F", "H"]) is False
+    assert drv.is_contiguous_prefix(["stage0", "A", "Aprime", "E"]) is False
+
+
+@pytest.mark.parametrize(
+    "stages", ["E,F,H", "A,B,E", "stage0,A,B", "stage0,A,Aprime,E", "B"]
+)
+def test_execute_refuses_unsafe_stage_subsets(tmp_path, stages):
+    rc, out = _run_main([
+        "--execute", "--allow-network-fetch",
+        "--stages", stages,
+        "--stackbuilder-root", str(tmp_path / "sb"),
+        "--output-root", str(tmp_path / "out"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "refused"
+    assert j["halted_at"] == "preflight"
+    assert rc != 0
+    assert any("contiguous prefix" in w for w in j["warnings"])
+    # Refused before any write: no lock, no pointer.
+    assert not (tmp_path / "out" / ".recook.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "stages",
+    ["stage0", "stage0,A", "stage0,A,Aprime", "stage0,A,Aprime,B",
+     "stage0,A,Aprime,B,E", "stage0,A,Aprime,B,E,F",
+     "stage0,A,Aprime,B,E,F,H"],
+)
+def test_execute_allowed_prefixes_pass_prefix_check(tmp_path, stages):
+    # A valid prefix that includes Stage A must get PAST the prefix check
+    # and be refused (if at all) for the NETWORK reason, never the prefix
+    # reason. (stage0-only proceeds past both and is not asserted here.)
+    root = tmp_path / "sb"
+    _make_secondary(root, "FOO")
+    rc, out = _run_main([
+        "--execute", "--stages", stages,
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert not any("contiguous prefix" in w for w in j["warnings"])
+    if "A" in stages.split(","):
+        assert j["status"] == "refused"
+        assert any("allow-network-fetch" in w for w in j["warnings"])
+
+
+def test_dry_run_allows_noncontiguous_stages(tmp_path):
+    root = tmp_path / "sb"
+    _make_secondary(root, "FOO")
+    rc, out = _run_main([
+        "--stages", "E,F,H",
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run"
+    assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Amendment 2: halt after Stage 0 write / resolve failures (execute)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_halts_on_pointer_write_failure(tmp_path, monkeypatch):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    monkeypatch.setattr(drv, "write_pointer_atomic", _boom_write)
+    monkeypatch.setattr(drv, "_run_execute_chain", _must_not_run)
+    rc, out = _run_main([
+        "--execute", "--allow-network-fetch",
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "failed"
+    assert j["halted_at"] == "stage0"
+    assert rc != 0
+    assert j["stage0"]["pointer_write_failures"]
+
+
+def test_execute_halts_on_resolve_failure(tmp_path, monkeypatch):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    import k6_mtf_history_producer as producer
+
+    def boom_resolve(secondary, *, stackbuilder_root):
+        raise producer.K6StackResolutionError("simulated resolve failure")
+
+    monkeypatch.setattr(producer, "resolve_k6_stack", boom_resolve)
+    monkeypatch.setattr(drv, "_run_execute_chain", _must_not_run)
+    rc, out = _run_main([
+        "--execute", "--allow-network-fetch",
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "failed"
+    assert j["halted_at"] == "stage0"
+    assert rc != 0
+    assert j["stage0"]["resolve_failures"]
+
+
+# ---------------------------------------------------------------------------
+# Amendment 3: execute chain halts Stage A on data_fetch_failed
+# ---------------------------------------------------------------------------
+
+
+def test_execute_chain_halts_on_stage_a_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        drv, "_parallel_map",
+        lambda worker, payloads, workers: [worker(p) for p in payloads],
+    )
+    monkeypatch.setattr(
+        drv, "_stage_a_worker",
+        lambda p: {"ticker": p["ticker"], "classification": "failed",
+                   "issue_codes": ["data_fetch_failed"]},
+    )
+    # Stage Aprime must never run after a Stage A failure.
+    monkeypatch.setattr(drv, "stage_aprime_rebuild", _must_not_run)
+
+    P = drv.SecondaryPlan
+    included = [
+        P(secondary="FOO", secondary_dir="x", status="synthesize",
+          members=[("M1", "D", "M1[D]"), ("M2", "I", "M2[I]")]),
+    ]
+    args = types.SimpleNamespace(
+        cache_dir="c", status_dir="cs", price_cache_dir="p", stable_dir="s",
+        output_root=str(tmp_path / "out"), stackbuilder_root="sb",
+        a_workers=2, b_workers=2, promote_dry_run=True,
+    )
+    driver = drv.Driver(
+        args=args, stages=list(drv.STAGE_ORDER), executed=True,
+        target_as_of="2026-06-03", driver_run_id="rid", project_root=tmp_path,
+    )
+    envelope = drv._new_envelope(driver)
+    rc = drv._run_execute_chain(driver, envelope, included, None)
+    assert rc == 1
+    assert envelope["halted_at"] == "A"
+    assert envelope["status"] == "failed"
+    assert envelope["stageA"]["failed"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Amendment 4: exact Stage 0 dry-run pointer plan
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_pointer_write_plan_complete_and_raw_paths(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    _make_secondary(root, "DX-Y.NYB")
+    # An existing-pointer secondary should be counted but NOT listed.
+    seed_baz = _make_secondary(root, "BAZ")
+    (root / "BAZ" / "selected_build.json").write_text(
+        json.dumps({"selected_run_dir": str(seed_baz)}), encoding="utf-8"
+    )
+
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    plan = j["stage0"]["pointer_write_plan"]
+    secs = {e["secondary"] for e in plan}
+    # All synthesize candidates present; existing BAZ excluded from writes.
+    assert secs == {"FOO", "DX-Y.NYB"}
+    assert j["stage0"]["selected_build_existing_count"] == 1
+
+    by = {e["secondary"]: e for e in plan}
+    # Raw dotted directory preserved (no '.'->'_').
+    assert by["DX-Y.NYB"]["target"].endswith("/DX-Y.NYB/selected_build.json")
+    assert "DX-Y_NYB" not in by["DX-Y.NYB"]["target"]
+    assert by["FOO"]["chosen_run_dir"] and by["FOO"]["combo_path"]
+
+    # Dry-run wrote nothing.
+    assert not (root / "FOO" / "selected_build.json").exists()
+    assert not (root / "DX-Y.NYB" / "selected_build.json").exists()
