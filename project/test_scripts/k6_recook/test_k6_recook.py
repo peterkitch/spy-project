@@ -624,6 +624,8 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
         cache_dir="c", status_dir="cs", price_cache_dir="p", stable_dir="s",
         output_root=str(tmp_path / "out"), stackbuilder_root="sb",
         a_workers=2, b_workers=2, promote_dry_run=True,
+        fetch_retries=2, fetch_backoff_base_seconds=1.0,
+        fetch_backoff_max_seconds=8.0,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1031,6 +1033,8 @@ def test_execute_chain_halts_on_stage_a_failure(tmp_path, monkeypatch):
         cache_dir="c", status_dir="cs", price_cache_dir="p", stable_dir="s",
         output_root=str(tmp_path / "out"), stackbuilder_root="sb",
         a_workers=2, b_workers=2, promote_dry_run=True,
+        fetch_retries=2, fetch_backoff_base_seconds=1.0,
+        fetch_backoff_max_seconds=8.0,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1080,3 +1084,283 @@ def test_dry_run_pointer_write_plan_complete_and_raw_paths(tmp_path):
     # Dry-run wrote nothing.
     assert not (root / "FOO" / "selected_build.json").exists()
     assert not (root / "DX-Y.NYB" / "selected_build.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Amendment: Stage A transient-fetch retry / backoff
+# ---------------------------------------------------------------------------
+
+
+def _no_sleep(_delay):
+    raise AssertionError("sleep must not be called on a successful fetch")
+
+
+def _fake_refresh_via_fetcher(
+    ticker, *, cache_dir, status_dir, write, max_sma_day,
+    current_as_of_date, data_fetcher=None, provider_name=None,
+):
+    """Mirror the real refresher's fetcher-driven classification: a fetch
+    exception -> data_fetch_failed; empty DataFrame -> data_empty; missing
+    Close -> data_no_close_column; otherwise success."""
+    try:
+        df = data_fetcher(ticker)
+    except Exception:
+        return _FakeRefreshResult(
+            issue_codes=("data_fetch_failed",), new_end=None, current_after=False
+        )
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return _FakeRefreshResult(issue_codes=("data_empty",))
+    if "Close" not in list(getattr(df, "columns", [])):
+        return _FakeRefreshResult(issue_codes=("data_no_close_column",))
+    return _FakeRefreshResult(
+        new_end="2026-06-03", current_after=True, refreshed=True
+    )
+
+
+def _stale_eval(*a, **k):
+    return _FakeCutoffState(end="2026-05-26")
+
+
+def _good_close_df():
+    idx = pd.date_range("2020-01-01", periods=2, freq="D")
+    return pd.DataFrame({"Close": [1.0, 2.0]}, index=idx)
+
+
+def test_compute_backoff_delay_growth_and_cap():
+    assert drv.compute_backoff_delay(0, base_seconds=1.0, max_seconds=8.0) == 1.0
+    assert drv.compute_backoff_delay(1, base_seconds=1.0, max_seconds=8.0) == 2.0
+    assert drv.compute_backoff_delay(2, base_seconds=1.0, max_seconds=8.0) == 4.0
+    # Capped at max even with large exponent + jitter.
+    assert drv.compute_backoff_delay(
+        10, base_seconds=10.0, max_seconds=3.0, jitter=5.0
+    ) == 3.0
+
+
+def test_stage_a_retry_success_counts_and_backoff():
+    df = _good_close_df()
+    calls = {"n": 0}
+
+    def underlying(ticker):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError(f"transient {calls['n']}")
+        return df
+
+    sleeps = []
+    fetcher = drv.RetryingFetcher(
+        underlying=underlying,
+        config=drv.RetryConfig(retries=2, base_seconds=1.0, max_seconds=8.0),
+        sleep_fn=lambda d: sleeps.append(d),
+        jitter_fn=lambda: 0.0,
+    )
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03", evaluate_fn=_stale_eval,
+        refresh_fn=_fake_refresh_via_fetcher, fetcher=fetcher,
+        provider_name="yfinance_retry",
+    )
+    assert res["classification"] == "refreshed"
+    assert "data_fetch_failed" not in res["issue_codes"]
+    assert res["fetch_attempts"] == 3
+    assert res["fetch_retries"] == 2
+    assert res["retry_exhausted"] is False
+    # Injected sleep -> no real sleep; exponential 1,2 (jitter 0).
+    assert sleeps == [1.0, 2.0]
+
+
+def test_stage_a_retry_exhaustion_is_failed_and_fail_closed():
+    def underlying(ticker):
+        raise RuntimeError("persistent provider outage")
+
+    sleeps = []
+    fetcher = drv.RetryingFetcher(
+        underlying=underlying,
+        config=drv.RetryConfig(retries=2, base_seconds=1.0, max_seconds=8.0),
+        sleep_fn=lambda d: sleeps.append(d),
+        jitter_fn=lambda: 0.0,
+    )
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03", evaluate_fn=_stale_eval,
+        refresh_fn=_fake_refresh_via_fetcher, fetcher=fetcher,
+    )
+    assert res["classification"] == "failed"
+    assert "data_fetch_failed" in res["issue_codes"]
+    assert res["retry_exhausted"] is True
+    assert res["fetch_attempts"] == 3
+    assert res["fetch_retries"] == 2
+    assert res["retry_error_count"] == 3
+    assert len(sleeps) == 2  # delays between 3 attempts
+
+
+def test_stage_a_no_retry_on_empty_dataframe():
+    calls = {"n": 0}
+
+    def underlying(ticker):
+        calls["n"] += 1
+        return pd.DataFrame()
+
+    fetcher = drv.RetryingFetcher(
+        underlying=underlying,
+        config=drv.RetryConfig(retries=3, base_seconds=1.0, max_seconds=8.0),
+        sleep_fn=_no_sleep,
+        jitter_fn=lambda: 0.0,
+    )
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03", evaluate_fn=_stale_eval,
+        refresh_fn=_fake_refresh_via_fetcher, fetcher=fetcher,
+    )
+    assert calls["n"] == 1  # exactly one fetch, no retry
+    assert res["fetch_attempts"] == 1
+    assert res["retry_exhausted"] is False
+    assert res["classification"] == "dead_no_history"  # via data_empty
+
+
+def test_stage_a_no_retry_on_missing_close():
+    calls = {"n": 0}
+
+    def underlying(ticker):
+        calls["n"] += 1
+        return pd.DataFrame({"Open": [1.0]})
+
+    fetcher = drv.RetryingFetcher(
+        underlying=underlying,
+        config=drv.RetryConfig(retries=3, base_seconds=1.0, max_seconds=8.0),
+        sleep_fn=_no_sleep,
+        jitter_fn=lambda: 0.0,
+    )
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03", evaluate_fn=_stale_eval,
+        refresh_fn=_fake_refresh_via_fetcher, fetcher=fetcher,
+    )
+    assert calls["n"] == 1
+    assert res["fetch_attempts"] == 1
+    assert res["classification"] == "dead_no_history"  # via data_no_close_column
+
+
+def test_offline_skip_does_not_call_retrying_fetcher():
+    calls = {"n": 0}
+
+    def underlying(ticker):
+        calls["n"] += 1
+        raise AssertionError("fresh ticker must not fetch")
+
+    fetcher = drv.RetryingFetcher(
+        underlying=underlying, config=drv.RetryConfig(), sleep_fn=_no_sleep,
+    )
+    res = drv.stage_a_process_ticker(
+        "SPY", cache_dir=None, status_dir=None, write=True,
+        target_as_of="2026-06-03",
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(ahead=True, end="2026-06-03"),
+        refresh_fn=_boom_refresh, fetcher=fetcher,
+    )
+    assert res["classification"] == "skipped_fresh"
+    assert res["refresh_called"] is False
+    assert res["fetch_attempts"] == 0
+    assert calls["n"] == 0
+
+
+def test_backoff_never_exceeds_max_in_fetcher():
+    def underlying(ticker):
+        raise RuntimeError("x")
+
+    sleeps = []
+    fetcher = drv.RetryingFetcher(
+        underlying=underlying,
+        config=drv.RetryConfig(retries=5, base_seconds=1.0, max_seconds=4.0),
+        sleep_fn=lambda d: sleeps.append(d),
+        jitter_fn=lambda: 0.5,  # injected jitter
+    )
+    with pytest.raises(RuntimeError):
+        fetcher("SPY")
+    assert fetcher.exhausted is True
+    assert len(sleeps) == 5  # 6 attempts -> 5 backoff sleeps
+    assert all(s <= 4.0 for s in sleeps)
+
+
+@pytest.mark.parametrize(
+    "flag", [
+        ["--fetch-retries", "-1"],
+        ["--fetch-backoff-base-seconds", "-0.5"],
+        ["--fetch-backoff-max-seconds", "-2"],
+    ],
+)
+def test_negative_fetch_flags_refused(tmp_path, flag):
+    rc, out = _run_main(flag + [
+        "--stackbuilder-root", str(tmp_path / "sb"),
+        "--output-root", str(tmp_path / "out"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "refused"
+    assert rc != 0
+
+
+def test_stage_a_summary_has_retry_fields_and_halts(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        drv, "_parallel_map",
+        lambda worker, payloads, workers: [worker(p) for p in payloads],
+    )
+
+    def fake_worker(payload):
+        return {
+            "ticker": payload["ticker"], "classification": "failed",
+            "issue_codes": ["data_fetch_failed"], "fetch_attempts": 3,
+            "fetch_retries": 2, "retry_exhausted": True,
+            "retry_error_count": 3, "retry_errors": ["RuntimeError: x"],
+        }
+
+    monkeypatch.setattr(drv, "_stage_a_worker", fake_worker)
+    monkeypatch.setattr(drv, "stage_aprime_rebuild", _must_not_run)
+
+    P = drv.SecondaryPlan
+    included = [
+        P(secondary="FOO", secondary_dir="x", status="synthesize",
+          members=[("M1", "D", "M1[D]"), ("M2", "I", "M2[I]")]),
+    ]
+    args = types.SimpleNamespace(
+        cache_dir="c", status_dir="cs", price_cache_dir="p", stable_dir="s",
+        output_root=str(tmp_path / "out"), stackbuilder_root="sb",
+        a_workers=2, b_workers=2, promote_dry_run=True,
+        fetch_retries=2, fetch_backoff_base_seconds=1.0,
+        fetch_backoff_max_seconds=8.0,
+    )
+    driver = drv.Driver(
+        args=args, stages=list(drv.STAGE_ORDER), executed=True,
+        target_as_of="2026-06-03", driver_run_id="rid", project_root=tmp_path,
+    )
+    envelope = drv._new_envelope(driver)
+    rc = drv._run_execute_chain(driver, envelope, included, None)
+    # Persistent data_fetch_failed after retry exhaustion halts at A.
+    assert rc == 1
+    assert envelope["halted_at"] == "A"
+    sa = envelope["stageA"]
+    assert sa["fetch_retries_attempted"] >= 2
+    assert sa["fetch_retry_exhausted"] >= 1
+    assert sa["fetch_retry_config"]["retries"] == 2
+    assert sa["fetch_retry_config"]["base_seconds"] == 1.0
+    assert sa["fetch_retry_config"]["max_seconds"] == 8.0
+    assert sa["retry_details"]
+    assert all("fetch_attempts" in d for d in sa["retry_details"])
+
+
+def test_dry_run_does_not_run_stage_a(tmp_path, monkeypatch):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    monkeypatch.setattr(drv, "_stage_a_worker", _must_not_run)
+    monkeypatch.setattr(
+        drv, "_parallel_map",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("no parallel map / fetch / sleep in dry-run")
+        ),
+    )
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run"
+    assert rc == 0
+    assert j["schema_version"] == "k6_recook_summary_v1"

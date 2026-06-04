@@ -496,6 +496,133 @@ def _is_fresh_state(state: Any) -> bool:
     )
 
 
+# Bounds on the retry-error audit trail kept per ticker (sanitized).
+_RETRY_ERROR_MAX = 5
+_RETRY_ERROR_STR_MAX = 200
+
+
+@dataclass
+class RetryConfig:
+    """Bounded retry/backoff settings for the Stage A fetch seam.
+
+    ``retries`` is the number of ADDITIONAL attempts after the first, so the
+    total number of fetch attempts is ``retries + 1``.
+    """
+
+    retries: int = 2
+    base_seconds: float = 1.0
+    max_seconds: float = 8.0
+
+    @property
+    def max_attempts(self) -> int:
+        return int(self.retries) + 1
+
+    def as_dict(self) -> dict:
+        return {
+            "retries": int(self.retries),
+            "base_seconds": float(self.base_seconds),
+            "max_seconds": float(self.max_seconds),
+        }
+
+
+def compute_backoff_delay(
+    failed_attempt_index: int,
+    *,
+    base_seconds: float,
+    max_seconds: float,
+    jitter: float = 0.0,
+) -> float:
+    """Exponential backoff for the delay AFTER a failed attempt.
+
+    ``failed_attempt_index`` is 0-based for the attempt that just failed
+    (0 after the first failure). The exponential term ``base * 2**i`` is
+    capped at ``max_seconds``; a small non-negative ``jitter`` is then added
+    and the TOTAL is still capped at ``max_seconds`` so the returned delay
+    never exceeds ``--fetch-backoff-max-seconds``.
+    """
+    expo = float(base_seconds) * (2 ** int(failed_attempt_index))
+    capped = min(expo, float(max_seconds))
+    delayed = capped + max(0.0, float(jitter))
+    return min(delayed, float(max_seconds))
+
+
+class RetryingFetcher:
+    """Module-level, ProcessPool-spawn-safe retrying wrapper around a fetch
+    callable with signature ``fetch(ticker) -> DataFrame``.
+
+    Retries ONLY exceptions raised by the underlying fetcher. A successful
+    call is returned untouched -- including one that returns an empty
+    DataFrame or a DataFrame missing Close -- so the refresher keeps its
+    existing ``data_empty`` / ``data_no_close_column`` classification. On
+    retry exhaustion the final exception is re-raised so
+    ``refresh_signal_engine_cache`` returns ``data_fetch_failed`` and the
+    driver stays fail-closed. No terminal/delisted semantics are invented.
+
+    The instance is created INSIDE the worker process (never pickled across
+    the pool boundary) and accumulates audit metadata that the caller reads
+    back after the refresh call returns.
+    """
+
+    def __init__(
+        self,
+        *,
+        underlying: Callable[[str], Any],
+        config: RetryConfig,
+        sleep_fn: Callable[[float], Any] = time.sleep,
+        jitter_fn: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self._underlying = underlying
+        self._config = config
+        self._sleep_fn = sleep_fn
+        self._jitter_fn = jitter_fn
+        self.attempts = 0
+        self.errors: List[str] = []
+        self.exhausted = False
+        self.delays: List[float] = []
+
+    def __call__(self, ticker: str) -> Any:
+        last_exc: Optional[BaseException] = None
+        for i in range(self._config.max_attempts):
+            self.attempts += 1
+            try:
+                return self._underlying(ticker)
+            except Exception as exc:  # only fetch exceptions are retried
+                last_exc = exc
+                if len(self.errors) < _RETRY_ERROR_MAX:
+                    self.errors.append(
+                        f"{type(exc).__name__}: {exc}"[:_RETRY_ERROR_STR_MAX]
+                    )
+                if i < self._config.max_attempts - 1:
+                    jitter = 0.0
+                    if self._jitter_fn is not None:
+                        jitter = float(self._jitter_fn())
+                    delay = compute_backoff_delay(
+                        i,
+                        base_seconds=self._config.base_seconds,
+                        max_seconds=self._config.max_seconds,
+                        jitter=jitter,
+                    )
+                    self.delays.append(delay)
+                    self._sleep_fn(delay)
+        self.exhausted = True
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("retrying fetcher exhausted with no exception")
+
+    @property
+    def retries_done(self) -> int:
+        return max(0, self.attempts - 1)
+
+    def metadata(self) -> dict:
+        return {
+            "fetch_attempts": self.attempts,
+            "fetch_retries": self.retries_done,
+            "retry_exhausted": bool(self.exhausted),
+            "retry_error_count": len(self.errors),
+            "retry_errors": list(self.errors),
+        }
+
+
 def stage_a_process_ticker(
     ticker: str,
     *,
@@ -505,6 +632,8 @@ def stage_a_process_ticker(
     target_as_of: str,
     evaluate_fn: Callable[..., Any],
     refresh_fn: Callable[..., Any],
+    fetcher: Optional["RetryingFetcher"] = None,
+    provider_name: Optional[str] = None,
 ) -> dict:
     """Process one ticker for Stage A. Offline freshness gate first; the
     refresher is called ONLY when the ticker is not already fresh.
@@ -513,6 +642,11 @@ def stage_a_process_ticker(
     ``refresh_fn`` is the cache refresher. Both are injected so the unit
     tests can substitute fakes and assert the refresher is never called on
     a fresh ticker.
+
+    When ``fetcher`` is supplied it is threaded into the refresher via
+    ``data_fetcher=`` (with ``provider_name``) and its audit metadata is
+    merged into the result. An already-fresh ticker never touches the
+    fetcher (the offline skip gate is preserved).
     """
     result: dict = {"ticker": ticker, "classification": None, "issue_codes": []}
     state = evaluate_fn(
@@ -522,17 +656,28 @@ def stage_a_process_ticker(
     if _is_fresh_state(state):
         result["classification"] = "skipped_fresh"
         result["refresh_called"] = False
+        if fetcher is not None:
+            # Never invoked: metadata confirms zero fetch attempts.
+            result.update(fetcher.metadata())
         return result
 
     result["refresh_called"] = True
-    rr = refresh_fn(
-        ticker,
+    refresh_kwargs: Dict[str, Any] = dict(
         cache_dir=cache_dir,
         status_dir=status_dir,
         write=write,
         max_sma_day=None,
         current_as_of_date=target_as_of,
     )
+    if fetcher is not None:
+        refresh_kwargs["data_fetcher"] = fetcher
+        if provider_name is not None:
+            refresh_kwargs["provider_name"] = provider_name
+    rr = refresh_fn(ticker, **refresh_kwargs)
+    if fetcher is not None:
+        # Present on every path, including the data_fetch_failed path where
+        # the refresher caught the final re-raised exception.
+        result.update(fetcher.metadata())
     issue_codes = list(getattr(rr, "issue_codes", ()) or ())
     result["issue_codes"] = issue_codes
     result["new_cache_date_range_end"] = getattr(
@@ -570,13 +715,36 @@ def _stage_a_worker(payload: dict) -> dict:
             import random
 
             from cache_cutoff_watcher import evaluate_cache_cutoff_state
-            from signal_engine_cache_refresher import refresh_signal_engine_cache
+            from signal_engine_cache_refresher import (
+                refresh_signal_engine_cache,
+                _default_yfinance_fetcher,
+            )
 
             # Deterministic-but-spread jitter keyed by ticker hash so spawned
             # workers do not all hit the provider on the same tick. Bounded.
             if payload.get("write"):
                 jitter = (abs(hash(payload["ticker"])) % 250) / 1000.0
                 time.sleep(jitter)
+
+            # Bounded retry/backoff wrapper around the real yfinance fetcher.
+            config = RetryConfig(
+                retries=int(payload.get("fetch_retries", 2)),
+                base_seconds=float(payload.get("fetch_backoff_base", 1.0)),
+                max_seconds=float(payload.get("fetch_backoff_max", 8.0)),
+            )
+            jitter_cap = min(0.25 * config.base_seconds, 0.5)
+
+            def _retry_jitter() -> float:
+                if jitter_cap <= 0:
+                    return 0.0
+                return random.uniform(0.0, jitter_cap)
+
+            fetcher = RetryingFetcher(
+                underlying=_default_yfinance_fetcher,
+                config=config,
+                sleep_fn=time.sleep,
+                jitter_fn=_retry_jitter,
+            )
             out = stage_a_process_ticker(
                 payload["ticker"],
                 cache_dir=payload.get("cache_dir"),
@@ -585,6 +753,8 @@ def _stage_a_worker(payload: dict) -> dict:
                 target_as_of=payload["target_as_of"],
                 evaluate_fn=evaluate_cache_cutoff_state,
                 refresh_fn=refresh_signal_engine_cache,
+                fetcher=fetcher,
+                provider_name="yfinance_retry",
             )
     except Exception as exc:  # pragma: no cover - defensive
         out = {
@@ -998,6 +1168,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--b-workers", type=int, default=(os.cpu_count() or 1)
     )
+    p.add_argument(
+        "--fetch-retries", type=int, default=2,
+        help=(
+            "Stage A transient-fetch retries AFTER the first attempt "
+            "(nonnegative; total attempts = retries + 1). Default 2."
+        ),
+    )
+    p.add_argument(
+        "--fetch-backoff-base-seconds", type=float, default=1.0,
+        help="Stage A exponential backoff base seconds (nonnegative). Default 1.0.",
+    )
+    p.add_argument(
+        "--fetch-backoff-max-seconds", type=float, default=8.0,
+        help="Stage A backoff ceiling seconds (nonnegative). Default 8.0.",
+    )
     p.add_argument("--stages", default=None)
     p.add_argument("--restage-all", action="store_true", default=False)
     p.add_argument("--unpin", action="store_true", default=False)
@@ -1277,6 +1462,11 @@ def _plan_stage_counts(
         "skipped_fresh": 0,
         "note": "freshness gate runs offline at execute time, not in dry-run",
         "workers": driver.args.a_workers,
+        "fetch_retry_config": {
+            "retries": driver.args.fetch_retries,
+            "base_seconds": driver.args.fetch_backoff_base_seconds,
+            "max_seconds": driver.args.fetch_backoff_max_seconds,
+        },
     }
     envelope["stageAprime"] = {
         "ran": False,
@@ -1376,6 +1566,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 halted_at="preflight",
             )
         )
+        return envelope["exit_code"]
+
+    # Retry/backoff config must be nonnegative (both modes).
+    if args.fetch_retries < 0:
+        emit_envelope(_refuse(
+            envelope,
+            f"--fetch-retries must be >= 0; got {args.fetch_retries}",
+            halted_at="preflight",
+        ))
+        return envelope["exit_code"]
+    if args.fetch_backoff_base_seconds < 0:
+        emit_envelope(_refuse(
+            envelope,
+            "--fetch-backoff-base-seconds must be >= 0; got "
+            f"{args.fetch_backoff_base_seconds}",
+            halted_at="preflight",
+        ))
+        return envelope["exit_code"]
+    if args.fetch_backoff_max_seconds < 0:
+        emit_envelope(_refuse(
+            envelope,
+            "--fetch-backoff-max-seconds must be >= 0; got "
+            f"{args.fetch_backoff_max_seconds}",
+            halted_at="preflight",
+        ))
         return envelope["exit_code"]
 
     try:
@@ -1505,6 +1720,9 @@ def _run_execute_chain(
                 "status_dir": args.status_dir,
                 "write": True,
                 "target_as_of": driver.target_as_of,
+                "fetch_retries": args.fetch_retries,
+                "fetch_backoff_base": args.fetch_backoff_base_seconds,
+                "fetch_backoff_max": args.fetch_backoff_max_seconds,
             }
             for disp in union.values()
         ]
@@ -1540,6 +1758,18 @@ def _run_execute_chain(
             driver.failures.append(
                 {"ticker": r.get("ticker"), "stage": "A", "reason": "refresh_not_current", "issue_codes": r.get("issue_codes")}
             )
+        fetch_retries_attempted = sum(
+            int(r.get("fetch_retries", 0) or 0) for r in a_results
+        )
+        fetch_retry_exhausted = sum(
+            1 for r in a_results if r.get("retry_exhausted")
+        )
+        fetch_retry_successes = sum(
+            1 for r in a_results
+            if int(r.get("fetch_retries", 0) or 0) > 0
+            and not r.get("retry_exhausted")
+            and r.get("classification") != "failed"
+        )
         envelope["stageA"] = {
             "ran": True,
             "submitted": len(payloads),
@@ -1548,6 +1778,28 @@ def _run_execute_chain(
             "dead_no_history": sorted(dead),
             "failed": len(failed_a),
             "workers": args.a_workers,
+            "fetch_retries_attempted": fetch_retries_attempted,
+            "fetch_retry_successes": fetch_retry_successes,
+            "fetch_retry_exhausted": fetch_retry_exhausted,
+            "fetch_retry_config": {
+                "retries": args.fetch_retries,
+                "base_seconds": args.fetch_backoff_base_seconds,
+                "max_seconds": args.fetch_backoff_max_seconds,
+            },
+            # Bounded per-ticker audit: only tickers that actually retried
+            # or exhausted are listed (empty on a clean run).
+            "retry_details": [
+                {
+                    "ticker": r.get("ticker"),
+                    "fetch_attempts": r.get("fetch_attempts"),
+                    "fetch_retries": r.get("fetch_retries"),
+                    "retry_exhausted": bool(r.get("retry_exhausted")),
+                    "retry_error_count": r.get("retry_error_count"),
+                }
+                for r in a_results
+                if int(r.get("fetch_retries", 0) or 0) > 0
+                or r.get("retry_exhausted")
+            ],
         }
         if failed_a:
             envelope["halted_at"] = "A"
