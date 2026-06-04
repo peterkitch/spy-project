@@ -12,3 +12,12 @@
 # on-disk SHA that diverges from the canonical LF SHA recorded
 # in the merged PR record and the operator brief.
 md_library/shared/2026-06-01_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT.md text eol=lf
+
+# Pin the scoped K=6 MTF Phase 5 honest-validation report family
+# (e.g. *_REPORT_205.md) AND its paired report manifest to LF for the
+# same reason: the v2 promotion gate binds manifest.report_sha256 to
+# the raw on-disk report bytes, so the report file must hash to the
+# canonical LF SHA on every platform. The * text=auto rule above would
+# otherwise produce CRLF on Windows checkout and break the binding.
+md_library/shared/*K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_*.md text eol=lf
+md_library/shared/*K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_*.manifest.json text eol=lf

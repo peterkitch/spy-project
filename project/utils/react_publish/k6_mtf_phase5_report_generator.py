@@ -550,15 +550,18 @@ def build_markdown_report(
     L.append("## 10. Promotion-helper inputs (FUTURE; do NOT run from this PR)")
     L.append("")
     L.append(
-        "When the operator later authorizes v2 public promotion (and Phase 5G "
-        "data licensing is separately cleared), the promotion gate consumes "
-        "the binding manifest plus this report and the sidecar. Required "
+        "When the operator later authorizes v2 public promotion, the "
+        "promotion gate consumes the binding manifest plus this report and "
+        "the sidecar. Phase 5G is governed by the existing accepted-risk "
+        "documentation for the Mode B derived-only, non-commercial public "
+        "surface; this report does not claim legal clearance. Required "
         "inputs (paths project-relative): the v2 fixture, this report path + "
         "its computed SHA-256, the paired report-manifest path, and the "
         "validation sidecar path + SHA-256. The gate verifies report <-> "
         "manifest <-> sidecar <-> fixture agreement and refuses on any "
         "mismatch. Public promotion remains a separate, explicit "
-        "operator-authorized action; merging this report does not promote."
+        "operator-authorized action and remains subject to the existing "
+        "Mode B controls; merging this report does not promote."
     )
     L.append("")
     # 11. Final status
@@ -569,9 +572,11 @@ def build_markdown_report(
         "is prepared once this report and its manifest are merged."
     )
     L.append(
-        "- Public promotion remains separately gated and BLOCKED until the "
-        "operator explicitly authorizes it AND Phase 5G data licensing is "
-        "separately cleared."
+        "- Public promotion remains a separate, explicit operator action. "
+        "Phase 5G is governed by the existing accepted-risk documentation "
+        "for the Mode B derived-only, non-commercial public surface; this "
+        "report does not claim legal clearance, and promotion remains "
+        "subject to the existing Mode B controls."
     )
     L.append("")
     L.append("End of report.")
@@ -742,7 +747,15 @@ def generate_report_and_manifest(
 
     report_out = Path(report_output_path)
     report_out.parent.mkdir(parents=True, exist_ok=True)
-    report_bytes = markdown.encode("utf-8")
+    # Deterministic LF bytes across platforms: normalize any stray CR and
+    # write raw bytes (NOT write_text, which would translate \n to the
+    # platform line separator on Windows). The v2 promotion gate binds
+    # manifest.report_sha256 to these raw on-disk bytes, so the report
+    # must hash to the canonical LF SHA everywhere. A matching
+    # `.gitattributes` `eol=lf` pin keeps the committed file LF on
+    # checkout. See utils/react_publish/promote_k6_mtf_artifact.py gate.
+    report_text = markdown.replace("\r\n", "\n").replace("\r", "\n")
+    report_bytes = report_text.encode("utf-8")
     report_out.write_bytes(report_bytes)
     report_sha256 = compute_file_sha256(report_out)
 
@@ -763,7 +776,10 @@ def generate_report_and_manifest(
 
     manifest_out = Path(manifest_output_path)
     manifest_out.parent.mkdir(parents=True, exist_ok=True)
-    manifest_out.write_text(manifest_text, encoding="utf-8")
+    # LF-deterministic bytes (write_bytes, not write_text) so the committed
+    # manifest is stable across platforms; the matching `.gitattributes`
+    # `eol=lf` pin keeps it LF on checkout.
+    manifest_out.write_bytes(manifest_text.encode("utf-8"))
 
     return {
         "report_path": report_relative_path,

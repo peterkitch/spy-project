@@ -222,11 +222,11 @@ Unavailable source tickers (22): `011810.KS, AVLA.F, BCDMF, BLKC, BTA, CDTX, CFX
 
 ## 10. Promotion-helper inputs (FUTURE; do NOT run from this PR)
 
-When the operator later authorizes v2 public promotion (and Phase 5G data licensing is separately cleared), the promotion gate consumes the binding manifest plus this report and the sidecar. Required inputs (paths project-relative): the v2 fixture, this report path + its computed SHA-256, the paired report-manifest path, and the validation sidecar path + SHA-256. The gate verifies report <-> manifest <-> sidecar <-> fixture agreement and refuses on any mismatch. Public promotion remains a separate, explicit operator-authorized action; merging this report does not promote.
+When the operator later authorizes v2 public promotion, the promotion gate consumes the binding manifest plus this report and the sidecar. Phase 5G is governed by the existing accepted-risk documentation for the Mode B derived-only, non-commercial public surface; this report does not claim legal clearance. Required inputs (paths project-relative): the v2 fixture, this report path + its computed SHA-256, the paired report-manifest path, and the validation sidecar path + SHA-256. The gate verifies report <-> manifest <-> sidecar <-> fixture agreement and refuses on any mismatch. Public promotion remains a separate, explicit operator-authorized action and remains subject to the existing Mode B controls; merging this report does not promote.
 
 ## 11. Final status
 
 - Phase 5 honest-validation report for the 205-secondary candidate is prepared once this report and its manifest are merged.
-- Public promotion remains separately gated and BLOCKED until the operator explicitly authorizes it AND Phase 5G data licensing is separately cleared.
+- Public promotion remains a separate, explicit operator action. Phase 5G is governed by the existing accepted-risk documentation for the Mode B derived-only, non-commercial public surface; this report does not claim legal clearance, and promotion remains subject to the existing Mode B controls.
 
 End of report.

@@ -25,7 +25,7 @@
   "ranking_run_id": "20260604T110400Z_recook_full248_clean_csv",
   "report_manifest_schema": "k6_mtf_phase5_report_manifest",
   "report_path": "md_library/shared/2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.md",
-  "report_sha256": "e6951f217988e08a1d8801509bbf7c99c7178cbdb12b68487856ca3d2d131be7",
+  "report_sha256": "1f6e166c7f27dd09b430b4210a885ccebf997865bd3e921bb23e5579516d9c12",
   "validation_run_id": "20260604T120000Z_validation_full205",
   "validation_sidecar_path": "output/validation/20260604T120000Z_validation_full205/validation.json",
   "validation_sidecar_sha256": "8e48fd56dc2c9f4f16598c2c01b71f2b87e691caf855b53c97fc704baf3871ef",

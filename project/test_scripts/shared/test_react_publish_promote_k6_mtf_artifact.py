@@ -1744,3 +1744,71 @@ def test_v2_gate_refuses_sidecar_validated_non_finite_q(tmp_path):
     _retamper_sidecar(w, _nullq)
     with pytest.raises(PromotionError):
         _bind(w)
+
+
+# --- PR-2b: deterministic report-SHA / LF line endings ---------------------
+
+_STALE_5G_PHRASE = "Phase 5G data licensing is separately cleared"
+
+_COMMITTED_205_REPORT = (
+    PROJECT_ROOT / "md_library" / "shared"
+    / "2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.md"
+)
+_COMMITTED_205_MANIFEST = (
+    PROJECT_ROOT / "md_library" / "shared"
+    / "2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.manifest.json"
+)
+
+
+def test_generator_manifest_report_sha_matches_report_bytes(tmp_path):
+    w = _phase5_world(tmp_path)
+    manifest = json.loads(w["manifest_file"].read_text(encoding="utf-8"))
+    assert manifest["report_sha256"] == compute_file_sha256(w["report_file"])
+
+
+def test_generator_report_bytes_are_lf(tmp_path):
+    w = _phase5_world(tmp_path)
+    raw = w["report_file"].read_bytes()
+    assert b"\r\n" not in raw
+    assert b"\r" not in raw
+
+
+def test_generator_manifest_bytes_are_lf(tmp_path):
+    w = _phase5_world(tmp_path)
+    raw = w["manifest_file"].read_bytes()
+    assert b"\r\n" not in raw
+    assert b"\r" not in raw
+
+
+def test_generator_does_not_emit_stale_5g_wording(tmp_path):
+    w = _phase5_world(tmp_path)
+    text = w["report_file"].read_text(encoding="utf-8")
+    assert _STALE_5G_PHRASE not in text
+    assert "separately cleared" not in text
+
+
+def test_generator_replacement_wording_no_legal_clearance(tmp_path):
+    w = _phase5_world(tmp_path)
+    text = w["report_file"].read_text(encoding="utf-8")
+    # The neutral wording explicitly disclaims legal clearance and must
+    # never assert the posture is legally cleared.
+    assert "does not claim legal clearance" in text
+    assert "legally cleared" not in text
+    assert "legal clearance is granted" not in text
+
+
+def test_committed_205_report_manifest_sha_match():
+    assert _COMMITTED_205_REPORT.is_file()
+    assert _COMMITTED_205_MANIFEST.is_file()
+    manifest = json.loads(_COMMITTED_205_MANIFEST.read_text(encoding="utf-8"))
+    # The committed manifest must be byte-bound to the committed report on
+    # any checkout (guards the CRLF/LF regression: the .gitattributes
+    # eol=lf pin keeps the report LF so this SHA matches everywhere).
+    assert manifest["report_sha256"] == compute_file_sha256(_COMMITTED_205_REPORT)
+
+
+def test_committed_205_report_no_stale_5g_wording():
+    text = _COMMITTED_205_REPORT.read_text(encoding="utf-8")
+    assert _STALE_5G_PHRASE not in text
+    assert "separately cleared" not in text
+    assert "does not claim legal clearance" in text
