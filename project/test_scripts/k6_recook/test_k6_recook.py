@@ -667,6 +667,7 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
+        allow_stage_a_exclusions=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1078,6 +1079,7 @@ def test_execute_chain_halts_on_stage_a_failure(tmp_path, monkeypatch):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
+        allow_stage_a_exclusions=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1368,6 +1370,7 @@ def test_stage_a_summary_has_retry_fields_and_halts(tmp_path, monkeypatch):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
+        allow_stage_a_exclusions=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1454,3 +1457,349 @@ def test_price_cache_format_default_constant():
     assert drv.DEFAULT_PRICE_CACHE_FORMAT == "csv"
     assert "csv" in drv.PRICE_CACHE_FORMATS
     assert "parquet" in drv.PRICE_CACHE_FORMATS
+
+
+# ---------------------------------------------------------------------------
+# Amendment: Stage A unavailable-data policy (--allow-stage-a-exclusions)
+# ---------------------------------------------------------------------------
+
+
+def _plan(sec, members):
+    P = drv.SecondaryPlan
+    return P(secondary=sec, secondary_dir="x", status="synthesize",
+             members=[(t, p, f"{t}[{p}]") for (t, p) in members])
+
+
+def _mk_args(tmp_path, **over):
+    base = dict(
+        cache_dir="c", status_dir="cs", price_cache_dir="p", stable_dir="s",
+        output_root=str(tmp_path / "out"), stackbuilder_root="sb",
+        a_workers=2, b_workers=2, promote_dry_run=True,
+        fetch_retries=2, fetch_backoff_base_seconds=1.0,
+        fetch_backoff_max_seconds=8.0, price_cache_format="csv",
+        allow_stage_a_exclusions=False,
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
+               allow=False, target="2026-06-03"):
+    calls = {"aprime": [], "b_members": [], "e_secs": [], "f_secs": [], "h": []}
+    monkeypatch.setattr(
+        drv, "_parallel_map",
+        lambda worker, payloads, workers: [worker(p) for p in payloads],
+    )
+    arb = {k.upper(): v for k, v in (a_by_ticker or {}).items()}
+
+    def a_worker(p):
+        t = p["ticker"]
+        r = dict(arb.get(t.upper(), {"classification": "refreshed"}))
+        r.setdefault("ticker", t)
+        r.setdefault("classification", "refreshed")
+        return r
+
+    monkeypatch.setattr(drv, "_stage_a_worker", a_worker)
+
+    def fake_aprime(secs, *, cache_dir, price_cache_dir, write, fmt="csv"):
+        calls["aprime"].append(list(secs))
+        return ({"write_count": len(secs), "verification_pass_count": len(secs),
+                 "format": fmt}, list(secs), [])
+
+    monkeypatch.setattr(drv, "stage_aprime_rebuild", fake_aprime)
+
+    def b_worker(p):
+        calls["b_members"].append(p["member"])
+        return {"member": p["member"], "ok": True}
+
+    monkeypatch.setattr(drv, "_stage_b_worker", b_worker)
+
+    import k6_mtf_history_producer as producer
+    import k6_mtf_ranking_engine as ranking
+
+    def prod_run(secs, **k):
+        calls["e_secs"].append(list(secs))
+        return {"run_id": k.get("run_id"), "written_paths": list(secs),
+                "failures": []}
+
+    monkeypatch.setattr(producer, "run", prod_run)
+
+    def rank_run(run_dir, **k):
+        calls["f_secs"].append(list(k.get("secondaries") or []))
+        return {"ranking_artifact_path": str(tmp_path / "r.json"),
+                "all_failed": False, "failed_records": []}
+
+    monkeypatch.setattr(ranking, "run", rank_run)
+
+    def fake_h(driver, rp, blocked):
+        calls["h"].append({"rp": rp, "blocked": blocked})
+        return {"ran": True, "status": "dry_run_ok",
+                "mode": "private_internal_dry_run", "dry_run": True,
+                "wrote_destination": False,
+                "promotion_blocked_by_failures": blocked}
+
+    monkeypatch.setattr(drv, "_stage_h_dry_run", fake_h)
+
+    args = _mk_args(tmp_path, allow_stage_a_exclusions=allow)
+    driver = drv.Driver(args=args, stages=list(drv.STAGE_ORDER), executed=True,
+                        target_as_of=target, driver_run_id="rid",
+                        project_root=tmp_path)
+    envelope = drv._new_envelope(driver)
+    rc = drv._run_execute_chain(driver, envelope, included, None)
+    return rc, envelope, driver, calls
+
+
+# Result-dict factories for the fake Stage A worker.
+_NOT_CURRENT = {"classification": "failed", "issue_codes": [],
+                "current_after": False, "new_cache_date_range_end": "2026-05-30"}
+_DEAD = {"classification": "dead_no_history", "issue_codes": ["data_empty"]}
+_INSUFF = {"classification": "failed",
+           "issue_codes": ["optimizer_failed", "insufficient_history"]}
+_DFF = {"classification": "failed", "issue_codes": ["data_fetch_failed"]}
+_RETRY_EXH = {"classification": "failed", "issue_codes": [],
+              "retry_exhausted": True, "fetch_retries": 2}
+_MIXED = {"classification": "failed",
+          "issue_codes": ["optimizer_failed", "insufficient_history",
+                          "data_fetch_failed"]}
+
+
+# --- 1. Strict default fail-closed ---
+
+
+def test_strict_default_failed_ticker_halts(tmp_path, monkeypatch):
+    inc = [_plan("FOO", [("M1", "D"), ("M2", "I")])]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"M1": _NOT_CURRENT}, allow=False)
+    assert rc == 1 and env["halted_at"] == "A" and env["status"] == "failed"
+    assert calls["aprime"] == [] and calls["e_secs"] == []
+    assert env["stageA"]["strict_default_fail_closed"] is True
+
+
+def test_strict_default_dead_no_history_halts(tmp_path, monkeypatch):
+    inc = [_plan("FOO", [("M1", "D"), ("M2", "I")])]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"M2": _DEAD}, allow=False)
+    assert rc == 1 and env["halted_at"] == "A"
+    assert calls["aprime"] == []
+
+
+# --- 2/3/4. Allowed exclusions continue under the flag ---
+
+
+@pytest.mark.parametrize("bad", [_NOT_CURRENT, _DEAD, _INSUFF])
+def test_allowed_exclusion_continues_with_flag(tmp_path, monkeypatch, bad):
+    inc = [
+        _plan("KEEP", [("G1", "D"), ("G2", "I")]),
+        _plan("DROP", [("BAD", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": bad}, allow=True)
+    # DROP excluded; KEEP continues through downstream.
+    assert env["status"] == "partial" and rc != 0 and env["halted_at"] is None
+    assert calls["aprime"] == [["KEEP"]]
+    assert calls["e_secs"] == [["KEEP"]]
+    assert calls["f_secs"] == [["KEEP"]]
+    secs_excluded = {e["secondary"] for e in drv_.exclusions}
+    assert secs_excluded == {"DROP"}
+    # Same scenario WITHOUT the flag halts.
+    rc2, env2, _d2, calls2 = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": bad}, allow=False)
+    assert rc2 == 1 and env2["halted_at"] == "A" and calls2["aprime"] == []
+
+
+# --- 5/6/7. Network/systemic always halt even with flag ---
+
+
+@pytest.mark.parametrize("bad", [_DFF, _RETRY_EXH, _MIXED])
+def test_blocking_outcomes_halt_even_with_flag(tmp_path, monkeypatch, bad):
+    inc = [
+        _plan("KEEP", [("G1", "D"), ("G2", "I")]),
+        _plan("DROP", [("BAD", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": bad}, allow=True)
+    assert rc == 1 and env["halted_at"] == "A" and env["status"] == "failed"
+    assert calls["aprime"] == [] and calls["e_secs"] == []
+    assert env["stageA"]["blocked_unavailable_ticker_count"] >= 1
+
+
+# --- 8. Exclusions remove all secondaries -> halt ---
+
+
+def test_all_excluded_halts_at_a(tmp_path, monkeypatch):
+    inc = [_plan("FOO", [("BAD", "D"), ("M2", "I")])]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": _NOT_CURRENT}, allow=True)
+    assert rc == 1 and env["halted_at"] == "A" and env["status"] == "failed"
+    assert calls["aprime"] == []
+    assert env["stageA"]["remaining_rankable_secondary_count"] == 0
+
+
+# --- 9. Downstream scoping ---
+
+
+def test_downstream_scoped_to_remaining(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("K1", "D"), ("K2", "I")]),
+        _plan("DROP", [("BADONLY", "D"), ("D2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BADONLY": _DEAD}, allow=True)
+    assert calls["aprime"] == [["KEEP"]]
+    assert calls["e_secs"] == [["KEEP"]] and calls["f_secs"] == [["KEEP"]]
+    built = set(calls["b_members"])
+    # Only KEEP's members built; DROP-only members not built.
+    assert built == {"K1", "K2"}
+    assert "BADONLY" not in built and "D2" not in built
+
+
+# --- 10. Multi-hit secondary keeps every cause, removed once ---
+
+
+def test_multi_cause_secondary_dedup_with_evidence(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("K1", "D"), ("K2", "I")]),
+        _plan("DROP", [("BAD1", "D"), ("BAD2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc,
+        a_by_ticker={"BAD1": _NOT_CURRENT, "BAD2": _DEAD}, allow=True)
+    drop_recs = [e for e in drv_.exclusions if e["secondary"] == "DROP"]
+    assert len(drop_recs) == 2  # both causes preserved
+    assert {r["ticker"] for r in drop_recs} == {"BAD1", "BAD2"}
+    # Removed once from rankable -> only one DROP entry in stageA list.
+    es = [x for x in env["stageA"]["excluded_secondaries"]
+          if x["secondary"] == "DROP"]
+    assert len(es) == 1 and len(es[0]["causes"]) == 2
+    assert env["stageA"]["excluded_secondary_count"] == 1
+    assert calls["aprime"] == [["KEEP"]]
+
+
+# --- 11. Stage H private/blocked on partial ---
+
+
+def test_partial_stage_h_private_and_blocked(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("G1", "D"), ("G2", "I")]),
+        _plan("DROP", [("BAD", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": _NOT_CURRENT}, allow=True)
+    assert len(calls["h"]) == 1
+    assert calls["h"][0]["blocked"] is True
+    assert env["stageH"]["promotion_blocked_by_failures"] is True
+    assert env["stageH"]["mode"] == "private_internal_dry_run"
+    assert env["stageH"]["wrote_destination"] is False
+
+
+# --- 12. Exit/status policy ---
+
+
+def test_clean_run_is_ok_zero(tmp_path, monkeypatch):
+    inc = [_plan("FOO", [("M1", "D"), ("M2", "I")])]
+    rc, env, drv_, calls = _run_chain(tmp_path, monkeypatch, inc, allow=True)
+    assert rc == 0 and env["status"] == "ok" and env["halted_at"] is None
+    assert drv_.exclusions == [] and drv_.failures == []
+    assert calls["aprime"] == [["FOO"]]
+
+
+def test_partial_is_nonzero(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("G1", "D"), ("G2", "I")]),
+        _plan("DROP", [("BAD", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": _NOT_CURRENT}, allow=True)
+    assert env["status"] == "partial" and rc != 0
+    assert env.get("partial_reasons")
+
+
+# --- 13. JSON reporting on a partial run ---
+
+
+def test_stage_a_policy_json_fields(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("G1", "D"), ("G2", "I")]),
+        _plan("DROP", [("BAD", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BAD": _NOT_CURRENT}, allow=True)
+    sa = env["stageA"]
+    for key in ("allow_stage_a_exclusions", "strict_default_fail_closed",
+                "unavailable_ticker_count", "allowed_unavailable_ticker_count",
+                "blocked_unavailable_ticker_count", "excluded_secondary_count",
+                "remaining_rankable_secondary_count", "unavailable_tickers",
+                "dependency_map_by_ticker", "excluded_secondaries",
+                "issue_code_distribution", "data_fetch_failed",
+                "retry_exhausted", "not_current", "insufficient_history",
+                "dead_no_history"):
+        assert key in sa, f"missing stageA.{key}"
+    assert sa["allow_stage_a_exclusions"] is True
+    assert sa["not_current"] == 1
+    assert "BAD" in sa["dependency_map_by_ticker"]
+    assert "DROP" in sa["dependency_map_by_ticker"]["BAD"]
+    # Top-level exclusions populated; record has full evidence fields.
+    assert drv_.exclusions
+    rec = drv_.exclusions[0]
+    for f in ("secondary", "stage", "reason", "ticker", "ticker_classification",
+              "issue_codes", "current_after", "new_cache_date_range_end",
+              "target_as_of", "dependent_role", "message", "action"):
+        assert f in rec, f"missing exclusion field {f}"
+    assert rec["dependent_role"] == "member"
+    assert rec["member_token"] == "BAD[D]" and rec["member_protocol"] == "D"
+
+
+def test_secondary_self_dependency_role(tmp_path, monkeypatch):
+    # When the unavailable ticker IS the secondary's own price ticker.
+    inc = [
+        _plan("KEEP", [("G1", "D"), ("G2", "I")]),
+        _plan("BADSEC", [("G1", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, a_by_ticker={"BADSEC": _NOT_CURRENT},
+        allow=True)
+    recs = [e for e in drv_.exclusions if e["secondary"] == "BADSEC"]
+    assert any(r["dependent_role"] == "secondary" for r in recs)
+    assert calls["aprime"] == [["KEEP"]]
+
+
+# --- new-flag CLI dry-run smoke ---
+
+
+def test_dry_run_reports_policy_flag(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+        "--allow-stage-a-exclusions",
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run" and rc == 0
+    assert j["stageA"]["allow_stage_a_exclusions"] is True
+    assert j["stageA"]["strict_default_fail_closed"] is False
+
+
+def test_classify_stage_a_outcome_precedence():
+    # Allowable + blocking issue together -> blocking wins.
+    mixed = {"classification": "failed",
+             "issue_codes": ["insufficient_history", "data_fetch_failed"]}
+    info = drv._classify_stage_a_outcome(mixed, target_as_of="2026-06-03")
+    assert info["is_unavailable"] and not info["allowable"]
+    assert info["kind"] == "blocking"
+    # retry_exhausted with empty codes -> blocking.
+    info2 = drv._classify_stage_a_outcome(
+        {"classification": "failed", "issue_codes": [], "retry_exhausted": True},
+        target_as_of="2026-06-03")
+    assert info2["kind"] == "blocking"
+    # optimizer_failed alone (no insufficient_history) -> blocking (conservative).
+    info3 = drv._classify_stage_a_outcome(
+        {"classification": "failed", "issue_codes": ["optimizer_failed"]},
+        target_as_of="2026-06-03")
+    assert info3["kind"] == "blocking"
+    # refreshed -> not unavailable.
+    info4 = drv._classify_stage_a_outcome(
+        {"classification": "refreshed", "issue_codes": []},
+        target_as_of="2026-06-03")
+    assert info4["is_unavailable"] is False

@@ -92,6 +92,29 @@ DEAD_NO_HISTORY_ISSUE_CODES = frozenset(
     {"data_empty", "data_no_close_column"}
 )
 
+# Stage A issue codes that are network / provider / systemic and must ALWAYS
+# halt Stage A, even under --allow-stage-a-exclusions. These are never
+# convertible into an allowable dependent-secondary exclusion. ``optimizer_failed``
+# is intentionally NOT here: it is allowable ONLY when paired with
+# ``insufficient_history`` (see _classify_stage_a_outcome); optimizer_failed in
+# any other combination falls through to the conservative blocking branch.
+STAGE_A_BLOCKING_ISSUE_CODES = frozenset(
+    {
+        "data_fetch_failed",
+        "invalid_ticker",
+        "invalid_max_sma_day",
+        "provenance_manifest_failed",
+        "data_only_write_blocked",
+        "worker_exception",
+    }
+)
+
+# Allowable Stage A unavailability kinds (only excludable under the explicit
+# --allow-stage-a-exclusions flag).
+STAGE_A_ALLOWABLE_KINDS = frozenset(
+    {"dead_no_history", "not_current", "insufficient_history"}
+)
+
 LOCK_FILENAME = ".recook.lock"
 DEFAULT_LOCK_TTL_SECONDS = 6 * 3600
 
@@ -691,6 +714,9 @@ def stage_a_process_ticker(
     )
     result["current_after"] = bool(getattr(rr, "current_after", False))
     result["refreshed"] = bool(getattr(rr, "refreshed", False))
+    # Provenance paths for exclusion evidence (additive; None when absent).
+    result["cache_path"] = getattr(rr, "cache_path", None)
+    result["status_path"] = getattr(rr, "status_path", None)
 
     if any(code in DEAD_NO_HISTORY_ISSUE_CODES for code in issue_codes):
         result["classification"] = "dead_no_history"
@@ -707,6 +733,106 @@ def stage_a_process_ticker(
         ok = current_after and fresh_enough
     result["classification"] = "refreshed" if ok else "failed"
     return result
+
+
+def _classify_stage_a_outcome(result: Any, *, target_as_of: str) -> dict:
+    """Classify one Stage A worker result for the unavailable-data policy.
+
+    Returns a dict with:
+      - is_unavailable: bool  (True for any non-ok, non-skipped outcome)
+      - allowable: bool       (True only for dead_no_history / not_current /
+                               insufficient_history with no blocking signal)
+      - kind: str             ("ok" | "skipped_fresh" | "dead_no_history" |
+                               "not_current" | "insufficient_history" |
+                               "blocking")
+      - reason: str
+      - issue_codes: list[str]
+
+    Precedence: any network/provider/systemic signal (retry exhaustion, a
+    blocking issue code, an unknown classification, or a missing/invalid
+    payload) wins and is classified ``blocking`` -- so it halts Stage A even
+    under --allow-stage-a-exclusions. data_fetch_failed and retry_exhausted
+    are never allowable. No freshness tolerance and no terminal/delisted
+    semantics are introduced.
+    """
+    if not isinstance(result, dict):
+        return {
+            "is_unavailable": True, "allowable": False, "kind": "blocking",
+            "reason": "invalid_worker_payload", "issue_codes": [],
+        }
+    cls = result.get("classification")
+    codes = list(result.get("issue_codes") or [])
+    code_set = set(codes)
+
+    if cls in ("refreshed", "skipped_fresh"):
+        return {
+            "is_unavailable": False, "allowable": False, "kind": cls,
+            "reason": "", "issue_codes": codes,
+        }
+
+    # --- Blocking precedence (always halt) ---
+    if cls not in ("dead_no_history", "failed"):
+        return {
+            "is_unavailable": True, "allowable": False, "kind": "blocking",
+            "reason": f"unknown_classification:{cls!r}", "issue_codes": codes,
+        }
+    if bool(result.get("retry_exhausted")):
+        return {
+            "is_unavailable": True, "allowable": False, "kind": "blocking",
+            "reason": "retry_exhausted", "issue_codes": codes,
+        }
+    if "worker_exception" in code_set or result.get("error"):
+        return {
+            "is_unavailable": True, "allowable": False, "kind": "blocking",
+            "reason": "systemic_worker_error", "issue_codes": codes,
+        }
+    blocking_hit = code_set & STAGE_A_BLOCKING_ISSUE_CODES
+    if blocking_hit:
+        return {
+            "is_unavailable": True, "allowable": False, "kind": "blocking",
+            "reason": f"blocking_issue_codes:{sorted(blocking_hit)}",
+            "issue_codes": codes,
+        }
+
+    # --- Allowable kinds (no blocking signal present) ---
+    if cls == "dead_no_history":
+        return {
+            "is_unavailable": True, "allowable": True, "kind": "dead_no_history",
+            "reason": "dead_no_history", "issue_codes": codes,
+        }
+    # cls == "failed" with no blocking codes:
+    if "optimizer_failed" in code_set and "insufficient_history" in code_set:
+        return {
+            "is_unavailable": True, "allowable": True,
+            "kind": "insufficient_history",
+            "reason": "optimizer_insufficient_history", "issue_codes": codes,
+        }
+    if not code_set:
+        new_end = result.get("new_cache_date_range_end")
+        current_after = bool(result.get("current_after"))
+        not_current = (
+            (not current_after)
+            or (not new_end)
+            or (str(new_end) < str(target_as_of))
+        )
+        if not_current:
+            return {
+                "is_unavailable": True, "allowable": True, "kind": "not_current",
+                "reason": "not_current", "issue_codes": codes,
+            }
+        # Empty codes but reportedly current+fresh yet classified failed:
+        # unexpected -> conservative blocking.
+        return {
+            "is_unavailable": True, "allowable": False, "kind": "blocking",
+            "reason": "failed_without_issue_codes_unexpected", "issue_codes": codes,
+        }
+    # Any other non-empty issue-code combination on a failed result (e.g.
+    # optimizer_failed alone) -> conservative blocking.
+    return {
+        "is_unavailable": True, "allowable": False, "kind": "blocking",
+        "reason": f"unrecognized_issue_codes:{sorted(code_set)}",
+        "issue_codes": codes,
+    }
 
 
 def _stage_a_worker(payload: dict) -> dict:
@@ -1142,6 +1268,10 @@ class Driver:
     failures: List[dict] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
+    # Set True when allowed Stage A exclusions were tolerated under
+    # --allow-stage-a-exclusions; drives partial status/exit code.
+    partial: bool = False
+    partial_reasons: List[str] = field(default_factory=list)
 
 
 def emit_envelope(envelope: dict) -> None:
@@ -1168,6 +1298,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--execute", action="store_true", default=False)
     p.add_argument("--allow-network-fetch", action="store_true", default=False)
+    p.add_argument(
+        "--allow-stage-a-exclusions", action="store_true", default=False,
+        help=(
+            "Operator policy: allow the chain to continue past NON-NETWORK "
+            "Stage A ticker unavailability (dead_no_history / not_current / "
+            "optimizer insufficient_history) by excluding the dependent "
+            "secondaries and producing a PARTIAL private candidate. Default "
+            "false = fail-closed (any Stage A failure or dependent-secondary "
+            "exclusion halts at Stage A). Network/provider/systemic failures "
+            "(data_fetch_failed, retry exhaustion, etc.) ALWAYS halt, even "
+            "with this flag. Never enables public promotion."
+        ),
+    )
     p.add_argument("--target-as-of", default=DEFAULT_TARGET_AS_OF)
     p.add_argument("--driver-run-id", default=None)
     p.add_argument("--stackbuilder-root", default="output/stackbuilder")
@@ -1485,6 +1628,10 @@ def _plan_stage_counts(
         "skipped_fresh": 0,
         "note": "freshness gate runs offline at execute time, not in dry-run",
         "workers": driver.args.a_workers,
+        "allow_stage_a_exclusions": bool(driver.args.allow_stage_a_exclusions),
+        "strict_default_fail_closed": not bool(
+            driver.args.allow_stage_a_exclusions
+        ),
         "fetch_retry_config": {
             "retries": driver.args.fetch_retries,
             "base_seconds": driver.args.fetch_backoff_base_seconds,
@@ -1754,64 +1901,108 @@ def _run_execute_chain(
         for res in a_results:
             if res.get("_captured"):
                 log(res["_captured"].rstrip())
-        dead = {
-            r["ticker"].upper()
-            for r in a_results
-            if r.get("classification") == "dead_no_history"
-        }
-        failed_a = [
-            r for r in a_results if r.get("classification") == "failed"
-        ]
+        import collections as _collections
+
         refreshed = [
             r for r in a_results if r.get("classification") == "refreshed"
         ]
         skipped = [
             r for r in a_results if r.get("classification") == "skipped_fresh"
         ]
-        # Exclude dependent secondaries needing a dead member or dead self.
-        for sec, plan in list(rankable.items()):
-            needed = {sec.upper()} | {
-                t.upper() for (t, _p, _r) in (plan.members or [])
-            }
-            if needed & dead:
-                del rankable[sec]
-                driver.exclusions.append(
-                    {"secondary": sec, "stage": "A", "reason": "dead_no_history_member"}
-                )
-        for r in failed_a:
-            driver.failures.append(
-                {"ticker": r.get("ticker"), "stage": "A", "reason": "refresh_not_current", "issue_codes": r.get("issue_codes")}
-            )
+
+        # Classify every outcome under the unavailable-data policy.
+        classified = [
+            (r, _classify_stage_a_outcome(r, target_as_of=driver.target_as_of))
+            for r in a_results
+        ]
+        unavailable = [(r, i) for (r, i) in classified if i["is_unavailable"]]
+        blocking = [(r, i) for (r, i) in unavailable if not i["allowable"]]
+        allowed = [(r, i) for (r, i) in unavailable if i["allowable"]]
+
+        kind_counts = _collections.Counter(i["kind"] for (_r, i) in unavailable)
+        issue_dist = _collections.Counter(
+            ",".join(sorted(set(r.get("issue_codes") or []))) or "<none>"
+            for (r, _i) in unavailable
+        )
+        data_fetch_failed_count = sum(
+            1 for (r, _i) in classified
+            if "data_fetch_failed" in set(r.get("issue_codes") or [])
+        )
+        retry_exhausted_count = sum(
+            1 for r in a_results if r.get("retry_exhausted")
+        )
+
+        def _depends_roles(plan, plan_sec, tkr_upper):
+            roles = []
+            if str(plan_sec).strip().upper() == tkr_upper:
+                roles.append(("secondary", None, None))
+            for (mt, mp, mraw) in (plan.members or []):
+                if str(mt).strip().upper() == tkr_upper:
+                    roles.append(("member", mraw, mp))
+            return roles
+
+        unavailable_keys = {
+            str(r.get("ticker")).strip().upper() for (r, _i) in unavailable
+        }
+        dependency_map = {}
+        for key in sorted(unavailable_keys):
+            deps = [
+                sec for sec, plan in rankable.items()
+                if _depends_roles(plan, sec, key)
+            ]
+            dependency_map[key] = sorted(deps)
+
         fetch_retries_attempted = sum(
             int(r.get("fetch_retries", 0) or 0) for r in a_results
-        )
-        fetch_retry_exhausted = sum(
-            1 for r in a_results if r.get("retry_exhausted")
         )
         fetch_retry_successes = sum(
             1 for r in a_results
             if int(r.get("fetch_retries", 0) or 0) > 0
             and not r.get("retry_exhausted")
-            and r.get("classification") != "failed"
+            and r.get("classification") == "refreshed"
         )
+
         envelope["stageA"] = {
             "ran": True,
             "submitted": len(payloads),
             "refreshed": len(refreshed),
             "skipped_fresh": len(skipped),
-            "dead_no_history": sorted(dead),
-            "failed": len(failed_a),
+            "failed": len([
+                r for r in a_results if r.get("classification") == "failed"
+            ]),
             "workers": args.a_workers,
+            "allow_stage_a_exclusions": bool(args.allow_stage_a_exclusions),
+            "strict_default_fail_closed": not bool(args.allow_stage_a_exclusions),
+            "unavailable_ticker_count": len(unavailable),
+            "allowed_unavailable_ticker_count": len(allowed),
+            "blocked_unavailable_ticker_count": len(blocking),
+            "data_fetch_failed": data_fetch_failed_count,
+            "retry_exhausted": retry_exhausted_count,
+            "not_current": kind_counts.get("not_current", 0),
+            "insufficient_history": kind_counts.get("insufficient_history", 0),
+            "dead_no_history": kind_counts.get("dead_no_history", 0),
+            "issue_code_distribution": dict(issue_dist),
+            "unavailable_tickers": [
+                {
+                    "ticker": r.get("ticker"),
+                    "ticker_classification": i["kind"],
+                    "allowable": i["allowable"],
+                    "reason": i["reason"],
+                    "issue_codes": r.get("issue_codes") or [],
+                    "current_after": r.get("current_after"),
+                    "new_cache_date_range_end": r.get("new_cache_date_range_end"),
+                }
+                for (r, i) in unavailable
+            ],
+            "dependency_map_by_ticker": dependency_map,
             "fetch_retries_attempted": fetch_retries_attempted,
             "fetch_retry_successes": fetch_retry_successes,
-            "fetch_retry_exhausted": fetch_retry_exhausted,
+            "fetch_retry_exhausted": retry_exhausted_count,
             "fetch_retry_config": {
                 "retries": args.fetch_retries,
                 "base_seconds": args.fetch_backoff_base_seconds,
                 "max_seconds": args.fetch_backoff_max_seconds,
             },
-            # Bounded per-ticker audit: only tickers that actually retried
-            # or exhausted are listed (empty on a clean run).
             "retry_details": [
                 {
                     "ticker": r.get("ticker"),
@@ -1824,16 +2015,114 @@ def _run_execute_chain(
                 if int(r.get("fetch_retries", 0) or 0) > 0
                 or r.get("retry_exhausted")
             ],
+            # Filled by the decision logic below.
+            "excluded_secondary_count": 0,
+            "remaining_rankable_secondary_count": len(rankable),
+            "excluded_secondaries": [],
         }
-        if failed_a:
+
+        def _record_unavail_failure(r, i, reason):
+            key = str(r.get("ticker")).strip().upper()
+            driver.failures.append({
+                "ticker": r.get("ticker"), "stage": "A", "reason": reason,
+                "ticker_classification": i["kind"],
+                "issue_codes": r.get("issue_codes") or [],
+                "current_after": r.get("current_after"),
+                "new_cache_date_range_end": r.get("new_cache_date_range_end"),
+                "target_as_of": driver.target_as_of,
+                "dependent_secondaries": dependency_map.get(key, []),
+            })
+
+        def _halt_stage_a():
             envelope["halted_at"] = "A"
             envelope["status"] = "failed"
             envelope["exit_code"] = 1
+
+        # --- Decision: blocking (network/provider/systemic) ALWAYS halts ---
+        if blocking:
+            for (r, i) in blocking:
+                _record_unavail_failure(r, i, f"stage_a_blocking:{i['reason']}")
+            _halt_stage_a()
             return 1
+
+        # --- Allowable-only unavailability ---
+        if allowed:
+            if not args.allow_stage_a_exclusions:
+                # Strict default fail-closed: do not exclude, halt at A.
+                for (r, i) in allowed:
+                    _record_unavail_failure(
+                        r, i, "stage_a_unavailable_strict_fail_closed"
+                    )
+                _halt_stage_a()
+                return 1
+
+            # Operator-authorized: exclude dependent secondaries (dedup),
+            # preserving every cause in evidence.
+            excluded_secs: Dict[str, List[dict]] = {}
+            for (r, i) in allowed:
+                tkr = r.get("ticker")
+                key = str(tkr).strip().upper()
+                for sec in list(rankable.keys()):
+                    plan = rankable[sec]
+                    for (role, member_token, member_protocol) in _depends_roles(
+                        plan, sec, key
+                    ):
+                        rec = {
+                            "secondary": sec,
+                            "stage": "A",
+                            "reason": f"stage_a_unavailable:{i['kind']}",
+                            "ticker": tkr,
+                            "ticker_classification": i["kind"],
+                            "issue_codes": r.get("issue_codes") or [],
+                            "current_after": r.get("current_after"),
+                            "new_cache_date_range_end": r.get(
+                                "new_cache_date_range_end"
+                            ),
+                            "target_as_of": driver.target_as_of,
+                            "dependent_role": role,
+                            "cache_path": r.get("cache_path"),
+                            "status_path": r.get("status_path"),
+                            "message": (
+                                f"{tkr} unavailable ({i['kind']}: {i['reason']}); "
+                                f"excludes secondary {sec} as {role}."
+                            ),
+                            "action": (
+                                "Refresh/repair the ticker source or remove it "
+                                "from the K=6 stack, then rerun."
+                            ),
+                        }
+                        if role == "member":
+                            rec["member_token"] = member_token
+                            rec["member_protocol"] = member_protocol
+                        excluded_secs.setdefault(sec, []).append(rec)
+
+            for sec, recs in excluded_secs.items():
+                if sec in rankable:
+                    del rankable[sec]
+                for rec in recs:
+                    driver.exclusions.append(rec)
+
+            driver.partial = True
+            driver.partial_reasons.append("stage_a_allowed_exclusions")
+            envelope["stageA"]["excluded_secondary_count"] = len(excluded_secs)
+            envelope["stageA"]["remaining_rankable_secondary_count"] = len(rankable)
+            envelope["stageA"]["excluded_secondaries"] = [
+                {
+                    "secondary": s,
+                    "causes": [
+                        {
+                            "ticker": c["ticker"],
+                            "ticker_classification": c["ticker_classification"],
+                            "dependent_role": c["dependent_role"],
+                        }
+                        for c in recs
+                    ],
+                }
+                for s, recs in excluded_secs.items()
+            ]
+
         if not rankable:
-            envelope["halted_at"] = "A"
-            envelope["status"] = "failed"
-            envelope["exit_code"] = 1
+            _halt_stage_a()
             return 1
 
     # ---- Stage Aprime barrier ----
@@ -1982,13 +2271,24 @@ def _run_execute_chain(
             driver, ranking_path, blocked
         )
 
-    # Final status: partial if anything dropped.
+    # Final status: partial (nonzero) if anything was excluded/dropped after
+    # the chain otherwise completed through F/H. halted_at stays null because
+    # the chain did complete; the partial_reasons field records why this is
+    # not a clean publish candidate. Partial is for operator review, never a
+    # public-automation success.
     if driver.exclusions or driver.failures:
         envelope["status"] = "partial"
         envelope["exit_code"] = 3
+        reasons = list(driver.partial_reasons)
+        if driver.exclusions and "stage_a_allowed_exclusions" not in reasons:
+            reasons.append("excluded_secondaries_present")
+        if driver.failures:
+            reasons.append("failures_present")
+        envelope["partial_reasons"] = reasons
         return 3
     envelope["status"] = "ok"
     envelope["exit_code"] = 0
+    envelope["partial_reasons"] = []
     return 0
 
 
