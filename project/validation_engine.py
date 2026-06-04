@@ -969,6 +969,10 @@ def validate_strategy_set(
         "n_bootstrap_samples": int(n_bootstrap_samples),
         "bootstrap_ci_level": float(bootstrap_ci_level),
         "borderline_tolerance_multiplier": float(borderline_tolerance_multiplier),
+        # Nullable RNG seed for empirical-layer reproducibility. Persisted
+        # when the caller supplies one; legacy sidecars without this key
+        # remain valid (not a _REQUIRED_CONTRACT_KEYS member).
+        "rng_seed": (int(rng_seed) if rng_seed is not None else None),
         "survivorship_summary": {
             "total_tested": 0,
             "total_reported_bh": 0,

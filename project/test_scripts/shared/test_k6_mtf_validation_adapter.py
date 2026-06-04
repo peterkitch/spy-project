@@ -893,6 +893,37 @@ class TestEndToEndContract:
         )
         validate_validation_contract_v1(result["contract"])
 
+    def test_run_validation_threads_rng_seed_into_sidecar(self, tmp_path):
+        """PR-1: the adapter's run_validation threads rng_seed through
+        validate_strategy_set into the persisted sidecar contract."""
+        roots = _build_synthetic_universe(tmp_path, n_bars=120)
+        inputs = build_adapter_inputs(
+            ("AAPL",),
+            stackbuilder_root=str(roots["stackbuilder_root"]),
+            stable_dir=str(roots["stable_dir"]),
+            price_cache_dir=str(roots["price_cache_dir"]),
+            cache_dir=str(roots["cache_dir"]),
+        )
+        adapter = K6MtfValidationAdapter(
+            secondaries=("AAPL",), secondary_inputs=inputs,
+        )
+        result = run_validation(
+            adapter,
+            run_id="test-rng-seed-1",
+            output_dir=tmp_path / "out" / "test-rng-seed-1",
+            initial_train_days=30,
+            test_window_days=20,
+            step_days=20,
+            n_permutations=0,
+            n_bootstrap_samples=0,
+            rng_seed=20260604,
+        )
+        assert result["contract"]["rng_seed"] == 20260604
+        sidecar = json.loads(
+            Path(result["sidecar_path"]).read_text(encoding="utf-8")
+        )
+        assert sidecar["rng_seed"] == 20260604
+
 
 class TestSidecarDiscovery:
     def test_honest_validation_ledger_can_discover_and_load(self, tmp_path):

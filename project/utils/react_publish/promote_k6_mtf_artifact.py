@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -290,6 +291,294 @@ def _validate_payload(payload: Any) -> dict:
             "secondaries_ranked must equal the rank-ordered ranked-record "
             "tickers (status=='ranked' and integer rank, ascending by rank); "
             f"expected {expected_ranked_tickers!r}, got {list(ranked_list)!r}"
+        )
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# v2 schema validation (k6_mtf_ranking_v2 = ranking + validation join)
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION_V2 = "k6_mtf_ranking_v2"
+VALIDATION_OUTCOME_BOARD = "board_validated"
+VALIDATION_OUTCOME_NOT = "not_validated"
+ALLOWED_VALIDATION_OUTCOMES = frozenset(
+    {VALIDATION_OUTCOME_BOARD, VALIDATION_OUTCOME_NOT}
+)
+
+# v2 keeps every v1 top-level field and adds these.
+V2_TOP_LEVEL_REQUIRED = (
+    "schema_version",
+    "generated_at_utc",
+    "run_id",
+    "secondaries_requested",
+    "secondaries_ranked",
+    "per_secondary",
+    "issues",
+    "validation_metadata",
+    "validation_summary",
+    "stage_a_excluded_secondaries",
+)
+V2_VALIDATION_METADATA_REQUIRED = (
+    "run_id",
+    "artifact_sha256",
+    "validation_status",
+    "validated_as_of_utc",
+    "n_strategies_tested",
+    "n_strategies_reported",
+    "n_permutations",
+    "n_bootstrap_samples",
+    "walk_forward_n_folds",
+    "multiple_comparisons_control_alpha",
+    "multiple_comparisons_control_method",
+    "validation_contract_version",
+    "validation_methodology_version",
+    "rng_seed",
+)
+V2_VALIDATION_SUMMARY_REQUIRED = (
+    "board_validated_count",
+    "not_validated_count",
+    "empirical_status_counts",
+    "stage_a_excluded_count",
+    "displayed_ranked_count",
+    "validation_non_reported_count",
+)
+# Per-row v2 validation fields (added on top of PER_SECONDARY_REQUIRED).
+PER_SECONDARY_V2_VALIDATION_REQUIRED = (
+    "validation_outcome",
+    "empirical_validation_status",
+    "empirical_p_value",
+    "parametric_p_value",
+    "bh_q_value",
+    "bonferroni_p_value",
+    "bootstrap_sharpe_ci_lower",
+    "bootstrap_sharpe_ci_upper",
+    "empirical_not_run_reason",
+    "validation_trigger_days",
+    "validation_strategy_id",
+    "validation_run_id",
+    "validation_artifact_sha256",
+)
+# Project-relative metadata path fields that, when non-null, must pass
+# the same privacy check as per-row paths.
+V2_METADATA_PATH_FIELDS = ("source_sidecar_path", "source_ranking_path")
+
+
+def _validate_metadata_path_field(field: str, value: Any) -> None:
+    """Like ``_validate_path_field`` but allows ``None`` (these source
+    paths are nullable) and accepts the ``output/`` prefix only."""
+    if value is None:
+        return
+    _validate_path_field("validation_metadata", field, value)
+
+
+def _is_finite_number(value: Any) -> bool:
+    """True iff ``value`` is a real finite number (not bool, not None,
+    not NaN, not +/-inf)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def validate_k6_mtf_ranking_v2_payload(
+    payload: Any,
+    *,
+    validation_sidecar_path: Path | None = None,
+    expected_sidecar_sha256: str | None = None,
+    for_public_promotion: bool = False,
+) -> dict:
+    """Validate a joined ``k6_mtf_ranking_v2`` payload.
+
+    Fail-closed. Preserves v1 path-privacy checks, verifies the
+    operator-locked two-outcome validation model, the sidecar SHA (when
+    a sidecar path or expected hash is supplied), and the count
+    invariants. Does NOT perform any write or promotion.
+
+    When ``for_public_promotion`` is True, a validation sidecar path or
+    expected hash is REQUIRED (future public promotion must verify the
+    sidecar). This PR does not wire this into ``promote()``; the public
+    path remains closed.
+    """
+    if not isinstance(payload, dict):
+        raise PromotionError("v2 artifact root is not a JSON object")
+    schema = payload.get("schema_version")
+    if schema != SCHEMA_VERSION_V2:
+        raise PromotionError(
+            f"schema_version must equal {SCHEMA_VERSION_V2!r}; got: {schema!r}"
+        )
+    missing_top = [k for k in V2_TOP_LEVEL_REQUIRED if k not in payload]
+    if missing_top:
+        raise PromotionError(f"v2 missing top-level fields: {missing_top!r}")
+
+    meta = payload.get("validation_metadata")
+    if not isinstance(meta, dict):
+        raise PromotionError("validation_metadata must be a JSON object")
+    missing_meta = [k for k in V2_VALIDATION_METADATA_REQUIRED if k not in meta]
+    if missing_meta:
+        raise PromotionError(f"validation_metadata missing fields: {missing_meta!r}")
+    for f in V2_METADATA_PATH_FIELDS:
+        _validate_metadata_path_field(f, meta.get(f))
+
+    summary = payload.get("validation_summary")
+    if not isinstance(summary, dict):
+        raise PromotionError("validation_summary must be a JSON object")
+    missing_summary = [k for k in V2_VALIDATION_SUMMARY_REQUIRED if k not in summary]
+    if missing_summary:
+        raise PromotionError(f"validation_summary missing fields: {missing_summary!r}")
+
+    alpha = meta.get("multiple_comparisons_control_alpha")
+    if not isinstance(alpha, (int, float)):
+        raise PromotionError(
+            "validation_metadata.multiple_comparisons_control_alpha must be numeric"
+        )
+    alpha = float(alpha)
+
+    # --- sidecar SHA verification ---------------------------------------
+    declared_hash = meta.get("artifact_sha256")
+    if not isinstance(declared_hash, str) or not declared_hash:
+        raise PromotionError("validation_metadata.artifact_sha256 must be a string")
+    if validation_sidecar_path is not None:
+        actual = _compute_sha256(Path(validation_sidecar_path))
+        if actual != declared_hash:
+            raise PromotionError(
+                "validation sidecar SHA-256 mismatch vs validation_metadata."
+                f"artifact_sha256: file {actual}, metadata {declared_hash}"
+            )
+    if expected_sidecar_sha256 is not None:
+        exp = str(expected_sidecar_sha256).strip().lower()
+        if exp != declared_hash:
+            raise PromotionError(
+                "expected sidecar SHA-256 does not match validation_metadata."
+                f"artifact_sha256: expected {exp}, metadata {declared_hash}"
+            )
+    if for_public_promotion and validation_sidecar_path is None and (
+        expected_sidecar_sha256 is None
+    ):
+        raise PromotionError(
+            "public promotion of a v2 artifact requires a validation sidecar "
+            "path or expected SHA-256; refusing"
+        )
+
+    # --- per-row validation ---------------------------------------------
+    rows = payload.get("per_secondary")
+    if not isinstance(rows, list) or not rows:
+        raise PromotionError("per_secondary must be a non-empty list")
+    board_count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            raise PromotionError("per_secondary entry is not a JSON object")
+        sec = row.get("secondary") or "?"
+        missing_row = [k for k in PER_SECONDARY_REQUIRED if k not in row]
+        if missing_row:
+            raise PromotionError(
+                f"per_secondary {sec!r} missing v1 fields: {missing_row!r}"
+            )
+        missing_v2 = [
+            k for k in PER_SECONDARY_V2_VALIDATION_REQUIRED if k not in row
+        ]
+        if missing_v2:
+            raise PromotionError(
+                f"per_secondary {sec!r} missing v2 validation fields: {missing_v2!r}"
+            )
+        if row.get("status") not in ALLOWED_STATUS_VALUES:
+            raise PromotionError(
+                f"per_secondary {sec!r} status not in "
+                f"{sorted(ALLOWED_STATUS_VALUES)!r}: {row.get('status')!r}"
+            )
+        outcome = row.get("validation_outcome")
+        if outcome not in ALLOWED_VALIDATION_OUTCOMES:
+            raise PromotionError(
+                f"per_secondary {sec!r} validation_outcome not in "
+                f"{sorted(ALLOWED_VALIDATION_OUTCOMES)!r}: {outcome!r}"
+            )
+        emp_status = row.get("empirical_validation_status")
+        bh_q = row.get("bh_q_value")
+        # Fail closed: a validated row MUST carry a real finite row-level
+        # q-value (not missing/null/non-numeric/NaN/non-finite),
+        # regardless of validation_outcome -- otherwise board_validated
+        # vs not_validated cannot be honestly derived/verified.
+        if emp_status == "validated" and not _is_finite_number(bh_q):
+            raise PromotionError(
+                f"per_secondary {sec!r} is empirical_validation_status=="
+                f"'validated' but bh_q_value is not a finite number: {bh_q!r}"
+            )
+        q_le_alpha = _is_finite_number(bh_q) and float(bh_q) <= alpha
+        if outcome == VALIDATION_OUTCOME_BOARD:
+            board_count += 1
+            if emp_status != "validated":
+                raise PromotionError(
+                    f"per_secondary {sec!r} board_validated requires "
+                    f"empirical_validation_status=='validated'; got {emp_status!r}"
+                )
+            if not q_le_alpha:
+                raise PromotionError(
+                    f"per_secondary {sec!r} board_validated requires "
+                    f"bh_q_value<=alpha ({alpha}); got {bh_q!r}"
+                )
+        else:
+            # not_validated must not silently hide a board-eligible row.
+            if emp_status == "validated" and q_le_alpha:
+                raise PromotionError(
+                    f"per_secondary {sec!r} is not_validated but satisfies "
+                    "board_validated (validated and bh_q<=alpha); inconsistent"
+                )
+        # path-privacy (v1 parity)
+        stack = row.get("k6_stack")
+        if not isinstance(stack, dict):
+            raise PromotionError(
+                f"per_secondary {sec!r}.k6_stack must be a JSON object"
+            )
+        for f in PATH_FIELDS_PER_ROW:
+            _validate_path_field(sec, f, row.get(f))
+        for f in PATH_FIELDS_K6_STACK:
+            _validate_path_field(sec, f"k6_stack.{f}", stack.get(f))
+
+    # --- count invariants ------------------------------------------------
+    displayed = len(rows)
+    not_validated_count = displayed - board_count
+    if summary.get("displayed_ranked_count") != displayed:
+        raise PromotionError(
+            "validation_summary.displayed_ranked_count "
+            f"{summary.get('displayed_ranked_count')!r} != per_secondary "
+            f"count {displayed}"
+        )
+    if summary.get("board_validated_count") != board_count:
+        raise PromotionError(
+            "validation_summary.board_validated_count "
+            f"{summary.get('board_validated_count')!r} != derived {board_count}"
+        )
+    if summary.get("not_validated_count") != not_validated_count:
+        raise PromotionError(
+            "validation_summary.not_validated_count "
+            f"{summary.get('not_validated_count')!r} != derived "
+            f"{not_validated_count}"
+        )
+    if board_count + not_validated_count != displayed:
+        raise PromotionError(
+            "board_validated_count + not_validated_count != displayed_ranked_count"
+        )
+    if meta.get("n_strategies_tested") != displayed:
+        raise PromotionError(
+            "validation_metadata.n_strategies_tested "
+            f"{meta.get('n_strategies_tested')!r} != per_secondary count {displayed}"
+        )
+    if meta.get("n_strategies_reported") != board_count:
+        raise PromotionError(
+            "validation_metadata.n_strategies_reported "
+            f"{meta.get('n_strategies_reported')!r} != derived board_validated "
+            f"count {board_count} (row-level bh_q<=alpha derivation)"
+        )
+    excl = payload.get("stage_a_excluded_secondaries")
+    if not isinstance(excl, list):
+        raise PromotionError("stage_a_excluded_secondaries must be a list")
+    if summary.get("stage_a_excluded_count") != len(excl):
+        raise PromotionError(
+            "validation_summary.stage_a_excluded_count "
+            f"{summary.get('stage_a_excluded_count')!r} != "
+            f"len(stage_a_excluded_secondaries) {len(excl)}"
         )
     return payload
 

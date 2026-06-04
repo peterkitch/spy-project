@@ -1540,3 +1540,57 @@ def test_validate_strategy_set_baseline_in_sample_only():
     assert agg["mean_baseline_sharpe"] is None
     assert agg["mean_baseline_return"] is None
     assert agg["total_baseline_observations"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR-1 (sprint500): rng_seed persistence in the validation contract.
+# Nullable; legacy sidecars without the key remain valid.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_strategy_set_persists_rng_seed():
+    history = _bdate_index(2520)
+    adapter = _RecordingAdapter(history, n_strategies=2)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="rng-persist",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+        rng_seed=20260604,
+    )
+    assert contract["rng_seed"] == 20260604
+
+
+def test_validate_strategy_set_rng_seed_null_when_absent():
+    history = _bdate_index(2520)
+    adapter = _RecordingAdapter(history, n_strategies=2)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="rng-absent",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+    )
+    assert contract["rng_seed"] is None
+
+
+def test_validate_validation_contract_v1_accepts_legacy_without_rng_seed():
+    # A legacy sidecar predating the rng_seed field must still validate:
+    # rng_seed is intentionally NOT a required contract key.
+    history = _bdate_index(2520)
+    adapter = _RecordingAdapter(history, n_strategies=2)
+    contract = ve.validate_strategy_set(
+        adapter, history,
+        run_id="legacy-compat",
+        producer_engine="test_engine",
+        app_surface="test_surface",
+        n_permutations=0,
+        n_bootstrap_samples=0,
+        rng_seed=7,
+    )
+    legacy = dict(contract)
+    legacy.pop("rng_seed", None)
+    ve.validate_validation_contract_v1(legacy)  # no raise

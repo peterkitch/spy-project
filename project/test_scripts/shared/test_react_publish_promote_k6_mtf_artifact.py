@@ -783,3 +783,516 @@ def test_public_manifest_contains_no_absolute_local_path(tmp_path: Path) -> None
     assert str(tmp_path) not in text
     import re as _re
     assert _re.search(r"[A-Za-z]:/", text) is None
+
+
+# ===========================================================================
+# PR-1 (sprint500): k6_mtf_ranking_v2 join helper + v2 validator gate
+# ===========================================================================
+
+from utils.react_publish import k6_mtf_validation_join as joinmod  # noqa: E402
+from utils.react_publish.k6_mtf_validation_join import (  # noqa: E402
+    ValidationJoinError,
+    build_k6_mtf_ranking_v2_fixture,
+    compute_file_sha256,
+    load_and_build_k6_mtf_ranking_v2,
+)
+from utils.react_publish.promote_k6_mtf_artifact import (  # noqa: E402
+    validate_k6_mtf_ranking_v2_payload,
+)
+
+
+def _make_strategy(
+    sec: str,
+    *,
+    status: str = "validated",
+    bh_q: float | None = 0.01,
+    emp_p: float | None = 0.004,
+    parametric_p: float | None = 0.003,
+    bonferroni: float | None = 0.5,
+    boot_lo: float | None = 0.2,
+    boot_hi: float | None = 2.0,
+    trigger_days: int | None = 120,
+) -> dict:
+    return {
+        "strategy_id": f"k6_mtf:{sec}",
+        "strategy_label": f"K=6 MTF {sec}",
+        "empirical_validation_status": status,
+        "empirical_p_value": emp_p,
+        "parametric_p_value": parametric_p,
+        "bonferroni_p_value": bonferroni,
+        "bh_q_value": bh_q,
+        "bootstrap_sharpe_ci_lower": boot_lo,
+        "bootstrap_sharpe_ci_upper": boot_hi,
+        "sharpe": 1.5,
+        "total_capture": 12.5,
+        "trigger_days": trigger_days,
+    }
+
+
+def _make_sidecar(
+    strategies: list[dict],
+    *,
+    alpha: float = 0.05,
+    rng_seed: int | None = None,
+    validation_status: str = "valid",
+) -> dict:
+    reported = sum(
+        1 for s in strategies
+        if s.get("empirical_validation_status") == "validated"
+        and isinstance(s.get("bh_q_value"), (int, float))
+        and float(s["bh_q_value"]) <= alpha
+    )
+    out = {
+        "validation_contract_version": "v1",
+        "validation_methodology_version": "v1",
+        "validation_status": validation_status,
+        "run_id": "20260604T120000Z_validation_test",
+        "producer_engine": "k6_mtf",
+        "app_surface": "run_directory",
+        "evaluation_time": "2026-06-04T11:14:17+00:00",
+        "data_available_through": "2026-06-04",
+        "walk_forward_n_folds": 99,
+        "n_strategies_tested": len(strategies),
+        "n_strategies_reported": reported,
+        "n_strategies_survived_empirical": reported,
+        "multiple_comparisons_control_method": "benjamini_hochberg",
+        "multiple_comparisons_control_alpha": alpha,
+        "multiple_comparisons_supplementary": "bonferroni",
+        "n_permutations": 10000,
+        "n_bootstrap_samples": 10000,
+        "bootstrap_ci_level": 0.95,
+        "strategies": strategies,
+    }
+    if rng_seed is not None:
+        out["rng_seed"] = rng_seed
+    return out
+
+
+def _ranking_and_sidecar(secs: list[str], strategies: list[dict]) -> tuple[dict, dict]:
+    rows = [_make_secondary(s, rank=i + 1) for i, s in enumerate(secs)]
+    ranking = _make_artifact(rows)
+    sidecar = _make_sidecar(strategies)
+    return ranking, sidecar
+
+
+def _build_v2(secs, strategies, **kwargs) -> dict:
+    ranking, sidecar = _ranking_and_sidecar(secs, strategies)
+    return build_k6_mtf_ranking_v2_fixture(
+        ranking, sidecar, validation_sidecar_sha256="deadbeef" * 8, **kwargs,
+    )
+
+
+# --- A. join helper --------------------------------------------------------
+
+
+def test_v2_join_basic_returns_dict():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    assert isinstance(payload, dict)
+    assert len(payload["per_secondary"]) == 1
+
+
+def test_v2_join_schema_version():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    assert payload["schema_version"] == "k6_mtf_ranking_v2"
+
+
+def test_v2_join_preserves_v1_fields():
+    payload = _build_v2(["AAA", "BBB"], [_make_strategy("AAA"), _make_strategy("BBB")])
+    assert payload["run_id"] == "RUN"
+    assert payload["secondaries_ranked"] == ["AAA", "BBB"]
+    row = payload["per_secondary"][0]
+    assert row["sharpe_k6_mtf"] == 1.5
+    assert row["total_capture_pct"] == 12.5
+    assert "ccc_series" in row and "k6_stack" in row
+
+
+def test_v2_join_computes_sha_from_raw_bytes(tmp_path: Path):
+    ranking, sidecar = _ranking_and_sidecar(["AAA"], [_make_strategy("AAA")])
+    rpath = tmp_path / "ranking.json"
+    spath = tmp_path / "sidecar.json"
+    rpath.write_text(json.dumps(ranking), encoding="utf-8")
+    spath.write_text(json.dumps(sidecar), encoding="utf-8")
+    payload = load_and_build_k6_mtf_ranking_v2(rpath, spath)
+    assert payload["validation_metadata"]["artifact_sha256"] == compute_file_sha256(spath)
+
+
+def test_v2_join_rejects_sha_mismatch(tmp_path: Path):
+    ranking, sidecar = _ranking_and_sidecar(["AAA"], [_make_strategy("AAA")])
+    rpath = tmp_path / "ranking.json"
+    spath = tmp_path / "sidecar.json"
+    rpath.write_text(json.dumps(ranking), encoding="utf-8")
+    spath.write_text(json.dumps(sidecar), encoding="utf-8")
+    with pytest.raises(ValidationJoinError):
+        load_and_build_k6_mtf_ranking_v2(
+            rpath, spath, expected_validation_sidecar_sha256="00" * 32,
+        )
+
+
+def test_v2_outcome_board_validated_when_validated_and_q_le_alpha():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q=0.01)])
+    assert payload["per_secondary"][0]["validation_outcome"] == "board_validated"
+
+
+def test_v2_outcome_not_validated_when_q_gt_alpha():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q=0.20)])
+    assert payload["per_secondary"][0]["validation_outcome"] == "not_validated"
+
+
+def test_v2_outcome_not_validated_when_empirical_not_run():
+    payload = _build_v2(["AAA"], [_make_strategy(
+        "AAA", status="empirical_not_run", emp_p=None, boot_lo=None, boot_hi=None,
+    )])
+    assert payload["per_secondary"][0]["validation_outcome"] == "not_validated"
+
+
+def test_v2_outcome_not_validated_when_empirical_failed():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", status="empirical_failed")])
+    assert payload["per_secondary"][0]["validation_outcome"] == "not_validated"
+
+
+def test_v2_rejects_unknown_empirical_status():
+    with pytest.raises(ValidationJoinError):
+        _build_v2(["AAA"], [_make_strategy("AAA", status="bananas")])
+
+
+def test_v2_preserves_q_and_bonferroni_for_not_run():
+    payload = _build_v2(["AAA"], [_make_strategy(
+        "AAA", status="empirical_not_run",
+        emp_p=None, boot_lo=None, boot_hi=None, bh_q=0.59, bonferroni=1.0,
+    )])
+    row = payload["per_secondary"][0]
+    assert row["bh_q_value"] == 0.59
+    assert row["bonferroni_p_value"] == 1.0
+
+
+def test_v2_keeps_p_and_bootstrap_null_for_not_run():
+    payload = _build_v2(["AAA"], [_make_strategy(
+        "AAA", status="empirical_not_run", emp_p=None, boot_lo=None, boot_hi=None,
+    )])
+    row = payload["per_secondary"][0]
+    assert row["empirical_p_value"] is None
+    assert row["bootstrap_sharpe_ci_lower"] is None
+    assert row["bootstrap_sharpe_ci_upper"] is None
+
+
+def test_v2_synthesizes_not_run_reason():
+    payload = _build_v2(["AAA"], [_make_strategy(
+        "AAA", status="empirical_not_run", emp_p=None, boot_lo=None, boot_hi=None,
+    )])
+    assert payload["per_secondary"][0]["empirical_not_run_reason"] == (
+        "sparse directional triggers"
+    )
+    # validated rows carry a null reason.
+    payload2 = _build_v2(["BBB"], [_make_strategy("BBB")])
+    assert payload2["per_secondary"][0]["empirical_not_run_reason"] is None
+
+
+def test_v2_rejects_ranking_row_missing_sidecar_entry():
+    # ranking has BBB but sidecar only has AAA.
+    ranking = _make_artifact([_make_secondary("AAA", rank=1), _make_secondary("BBB", rank=2)])
+    sidecar = _make_sidecar([_make_strategy("AAA")])
+    with pytest.raises(ValidationJoinError):
+        build_k6_mtf_ranking_v2_fixture(ranking, sidecar, validation_sidecar_sha256="x")
+
+
+def test_v2_rejects_duplicate_ranking_secondaries():
+    rows = [_make_secondary("AAA", rank=1), _make_secondary("AAA", rank=2)]
+    ranking = _make_artifact(rows)
+    sidecar = _make_sidecar([_make_strategy("AAA")])
+    with pytest.raises(ValidationJoinError):
+        build_k6_mtf_ranking_v2_fixture(ranking, sidecar, validation_sidecar_sha256="x")
+
+
+def test_v2_rejects_duplicate_sidecar_secondary():
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    sidecar = _make_sidecar([_make_strategy("AAA"), _make_strategy("AAA")])
+    with pytest.raises(ValidationJoinError):
+        build_k6_mtf_ranking_v2_fixture(ranking, sidecar, validation_sidecar_sha256="x")
+
+
+def test_v2_rejects_extra_sidecar_strategy():
+    # sidecar has BBB with no matching ranking row.
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    sidecar = _make_sidecar([_make_strategy("AAA"), _make_strategy("BBB")])
+    with pytest.raises(ValidationJoinError):
+        build_k6_mtf_ranking_v2_fixture(ranking, sidecar, validation_sidecar_sha256="x")
+
+
+def test_v2_rejects_malformed_strategy_id():
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    strat = _make_strategy("AAA")
+    strat["strategy_id"] = "AAA"  # missing k6_mtf: prefix
+    sidecar = _make_sidecar([strat])
+    with pytest.raises(ValidationJoinError):
+        build_k6_mtf_ranking_v2_fixture(ranking, sidecar, validation_sidecar_sha256="x")
+
+
+def test_v2_stage_a_from_supplied_list():
+    payload = _build_v2(
+        ["AAA"], [_make_strategy("AAA")],
+        stage_a_excluded_secondaries=["^DJT", "AAPB"],
+    )
+    excl = payload["stage_a_excluded_secondaries"]
+    assert {e["secondary"] for e in excl} == {"^DJT", "AAPB"}
+    assert payload["validation_summary"]["stage_a_excluded_count"] == 2
+    assert all(e["evidence_source"] == "supplied_context" for e in excl)
+
+
+def test_v2_stage_a_from_execute_summary(tmp_path: Path):
+    ranking, sidecar = _ranking_and_sidecar(["AAA"], [_make_strategy("AAA")])
+    rpath = tmp_path / "ranking.json"
+    spath = tmp_path / "sidecar.json"
+    epath = tmp_path / "execute_summary.json"
+    rpath.write_text(json.dumps(ranking), encoding="utf-8")
+    spath.write_text(json.dumps(sidecar), encoding="utf-8")
+    summary = {
+        "stageA": {
+            "excluded_secondaries": [
+                {"secondary": "^DJT", "causes": [
+                    {"ticker": "PCH", "ticker_classification": "dead_no_history",
+                     "dependent_role": "member"},
+                ]},
+            ],
+        },
+        "exclusions": [
+            {"secondary": "^DJT", "ticker": "PCH", "member_token": "PCH[D]",
+             "member_protocol": "D"},
+        ],
+    }
+    epath.write_text(json.dumps(summary), encoding="utf-8")
+    payload = load_and_build_k6_mtf_ranking_v2(rpath, spath, execute_summary_path=epath)
+    excl = payload["stage_a_excluded_secondaries"]
+    assert len(excl) == 1
+    assert excl[0]["secondary"] == "^DJT"
+    assert excl[0]["evidence_source"] == "execute_summary"
+    assert excl[0]["causes"][0]["ticker"] == "PCH"
+    assert excl[0]["causes"][0]["member_token"] == "PCH[D]"
+
+
+def test_v2_refuses_public_fixture_write(tmp_path: Path):
+    ranking, sidecar = _ranking_and_sidecar(["AAA"], [_make_strategy("AAA")])
+    rpath = tmp_path / "ranking.json"
+    spath = tmp_path / "sidecar.json"
+    rpath.write_text(json.dumps(ranking), encoding="utf-8")
+    spath.write_text(json.dumps(sidecar), encoding="utf-8")
+    bad_out = tmp_path / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.json"
+    with pytest.raises(ValidationJoinError):
+        load_and_build_k6_mtf_ranking_v2(rpath, spath, output_path=bad_out)
+    assert not bad_out.exists()
+
+
+def test_v2_no_local_absolute_paths_in_output(tmp_path: Path):
+    ranking, sidecar = _ranking_and_sidecar(["AAA"], [_make_strategy("AAA")])
+    rpath = tmp_path / "ranking.json"
+    spath = tmp_path / "sidecar.json"
+    rpath.write_text(json.dumps(ranking), encoding="utf-8")
+    spath.write_text(json.dumps(sidecar), encoding="utf-8")
+    payload = load_and_build_k6_mtf_ranking_v2(rpath, spath)
+    blob = json.dumps(payload)
+    import re as _re
+    assert _re.search(r"[A-Za-z]:[\\/]", blob) is None
+    assert chr(92) not in blob
+    assert "/Users/" not in blob and "/home/" not in blob and "/mnt/" not in blob
+    # source_* metadata resolved outside the project root -> None (no leak).
+    meta = payload["validation_metadata"]
+    assert meta["source_sidecar_path"] is None or meta["source_sidecar_path"].startswith(
+        ("output/", "md_library/", "frontend/")
+    )
+
+
+# --- B. v2 validator gate --------------------------------------------------
+
+
+def test_v1_validate_payload_still_accepts_v1():
+    artifact = _make_artifact([_make_secondary("AAA", rank=1)])
+    helper._validate_payload(artifact)  # no raise
+
+
+def test_v2_validator_accepts_joined_fixture():
+    payload = _build_v2(
+        ["AAA", "BBB"],
+        [_make_strategy("AAA", bh_q=0.01), _make_strategy("BBB", bh_q=0.20)],
+    )
+    validate_k6_mtf_ranking_v2_payload(payload)  # no raise
+
+
+def test_v2_validator_rejects_missing_validation_metadata():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    del payload["validation_metadata"]
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_rejects_board_with_q_gt_alpha():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", bh_q=0.01)])
+    # Tamper: flip the row to claim board while q>alpha.
+    payload["per_secondary"][0]["bh_q_value"] = 0.30
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_rejects_board_with_non_validated_status():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", bh_q=0.01)])
+    payload["per_secondary"][0]["empirical_validation_status"] = "empirical_not_run"
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_rejects_missing_outcome():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    del payload["per_secondary"][0]["validation_outcome"]
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_rejects_unknown_outcome():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    payload["per_secondary"][0]["validation_outcome"] = "near_threshold"
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_rejects_sidecar_hash_mismatch(tmp_path: Path):
+    ranking, sidecar = _ranking_and_sidecar(["AAA"], [_make_strategy("AAA")])
+    spath = tmp_path / "sidecar.json"
+    spath.write_text(json.dumps(sidecar), encoding="utf-8")
+    # Build with a deliberately wrong stamped hash, then validate against
+    # the real file -> mismatch.
+    payload = build_k6_mtf_ranking_v2_fixture(
+        ranking, sidecar, validation_sidecar_sha256="00" * 32,
+    )
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload, validation_sidecar_path=spath)
+
+
+def test_v2_validator_rejects_local_absolute_path():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    # Construct a Windows-form backslash path at runtime so no local-path
+    # literal is committed. Starts with output/ but carries a backslash,
+    # which _validate_path_field rejects as a non-project-relative path.
+    bad = "output/k6_mtf/RUN" + chr(92) + "AAA" + chr(92) + "out.json"
+    payload["per_secondary"][0]["history_artifact_path"] = bad
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_rejects_count_drift():
+    payload = _build_v2(["AAA", "BBB"], [_make_strategy("AAA"), _make_strategy("BBB")])
+    payload["validation_summary"]["displayed_ranked_count"] = 99
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_public_promotion_requires_sidecar():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload, for_public_promotion=True)
+
+
+# --- C/35. rng_seed copy in join -------------------------------------------
+
+
+def test_v2_join_copies_rng_seed_present():
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    sidecar = _make_sidecar([_make_strategy("AAA")], rng_seed=20260604)
+    payload = build_k6_mtf_ranking_v2_fixture(
+        ranking, sidecar, validation_sidecar_sha256="x",
+    )
+    assert payload["validation_metadata"]["rng_seed"] == 20260604
+
+
+def test_v2_join_rng_seed_null_when_absent():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA")])
+    assert payload["validation_metadata"]["rng_seed"] is None
+
+
+# --- D. fail-closed on validated rows with no real q-value -----------------
+
+
+def test_v2_join_rejects_validated_missing_bh_q():
+    strat = _make_strategy("AAA", status="validated")
+    del strat["bh_q_value"]
+    ranking = _make_artifact([_make_secondary("AAA", rank=1)])
+    sidecar = _make_sidecar([strat])
+    with pytest.raises(ValidationJoinError):
+        build_k6_mtf_ranking_v2_fixture(ranking, sidecar, validation_sidecar_sha256="x")
+
+
+def test_v2_join_rejects_validated_null_bh_q():
+    with pytest.raises(ValidationJoinError):
+        _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q=None)])
+
+
+def test_v2_join_rejects_validated_non_numeric_bh_q():
+    with pytest.raises(ValidationJoinError):
+        _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q="abc")])
+
+
+def test_v2_join_rejects_validated_nan_bh_q():
+    with pytest.raises(ValidationJoinError):
+        _build_v2(["AAA"], [_make_strategy(
+            "AAA", status="validated", bh_q=float("nan"),
+        )])
+
+
+def test_v2_join_rejects_validated_inf_bh_q():
+    with pytest.raises(ValidationJoinError):
+        _build_v2(["AAA"], [_make_strategy(
+            "AAA", status="validated", bh_q=float("inf"),
+        )])
+
+
+def test_v2_join_validated_q_gt_alpha_still_not_validated():
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q=0.20)])
+    assert payload["per_secondary"][0]["validation_outcome"] == "not_validated"
+
+
+def test_v2_join_empirical_not_run_null_q_still_ok():
+    # empirical_not_run does NOT require a validated-row q-value: a null
+    # bh_q is accepted and the row is not_validated.
+    payload = _build_v2(["AAA"], [_make_strategy(
+        "AAA", status="empirical_not_run",
+        emp_p=None, boot_lo=None, boot_hi=None, bh_q=None, bonferroni=None,
+    )])
+    row = payload["per_secondary"][0]
+    assert row["validation_outcome"] == "not_validated"
+    assert row["bh_q_value"] is None
+
+
+def _tamper_validated_bad_q(bad_q) -> dict:
+    """Build a valid payload, then force a 'validated' row to carry a bad
+    q-value while leaving validation_outcome=not_validated (the bug
+    scenario the validator must still reject)."""
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q=0.20)])
+    row = payload["per_secondary"][0]
+    assert row["validation_outcome"] == "not_validated"
+    assert row["empirical_validation_status"] == "validated"
+    if bad_q is _MISSING:
+        del row["bh_q_value"]
+    else:
+        row["bh_q_value"] = bad_q
+    return payload
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize("bad_q", [_MISSING, None, "abc", float("nan"), float("inf")])
+def test_v2_validator_rejects_validated_without_finite_q(bad_q):
+    payload = _tamper_validated_bad_q(bad_q)
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(payload)
+
+
+def test_v2_validator_accepts_validated_not_validated_with_q_gt_alpha():
+    # validated + bh_q > alpha is a legitimate not_validated row.
+    payload = _build_v2(["AAA"], [_make_strategy("AAA", status="validated", bh_q=0.20)])
+    validate_k6_mtf_ranking_v2_payload(payload)  # no raise
+
+
+def test_v2_validator_empirical_not_run_null_q_accepted():
+    payload = _build_v2(["AAA"], [_make_strategy(
+        "AAA", status="empirical_not_run",
+        emp_p=None, boot_lo=None, boot_hi=None, bh_q=None, bonferroni=None,
+    )])
+    validate_k6_mtf_ranking_v2_payload(payload)  # no raise
