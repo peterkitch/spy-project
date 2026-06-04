@@ -677,6 +677,7 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
         allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
+        allow_aprime_caret_cache_alias=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1089,6 +1090,7 @@ def test_execute_chain_halts_on_stage_a_failure(tmp_path, monkeypatch):
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
         allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
+        allow_aprime_caret_cache_alias=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1380,6 +1382,7 @@ def test_stage_a_summary_has_retry_fields_and_halts(tmp_path, monkeypatch):
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
         allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
+        allow_aprime_caret_cache_alias=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1487,6 +1490,7 @@ def _mk_args(tmp_path, **over):
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
         allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
+        allow_aprime_caret_cache_alias=False,
     )
     base.update(over)
     return types.SimpleNamespace(**base)
@@ -1494,8 +1498,9 @@ def _mk_args(tmp_path, **over):
 
 def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
                allow=False, target="2026-06-03", b_fail_members=None,
-               repair=False):
-    calls = {"aprime": [], "b_members": [], "e_secs": [], "f_secs": [], "h": []}
+               repair=False, caret_exclude=None, caret_alias=False):
+    calls = {"aprime": [], "b_members": [], "e_secs": [], "f_secs": [], "h": [],
+             "caret": []}
     monkeypatch.setattr(
         drv, "_parallel_map",
         lambda worker, payloads, workers: [worker(p) for p in payloads],
@@ -1517,6 +1522,29 @@ def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
                  "format": fmt}, list(secs), [])
 
     monkeypatch.setattr(drv, "stage_aprime_rebuild", fake_aprime)
+
+    cexcl = set(caret_exclude or set())
+
+    def fake_caret_bridge(caret_secs, *, cache_dir, price_cache_dir,
+                          target_as_of, alias_enabled):
+        calls["caret"].append(list(caret_secs))
+        kept = [s for s in caret_secs if s not in cexcl]
+        excl = [
+            {"secondary": s, "stage": "Aprime",
+             "reason": "caret_source_unavailable_or_stale", "ticker": s,
+             "dependent_role": "secondary"}
+            for s in caret_secs if s in cexcl
+        ]
+        summary = {
+            "caret_secondary_count": len(caret_secs),
+            "caret_alias_bridge_enabled": bool(alias_enabled),
+            "caret_secondaries_built_from_raw": len(kept),
+            "caret_secondaries_built_from_alias": 0,
+            "caret_secondaries_excluded": len(excl),
+        }
+        return kept, excl, summary
+
+    monkeypatch.setattr(drv, "stage_aprime_caret_bridge", fake_caret_bridge)
 
     bfm = {m.upper() for m in (b_fail_members or set())}
 
@@ -1561,7 +1589,8 @@ def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
     monkeypatch.setattr(drv, "_stage_h_dry_run", fake_h)
 
     args = _mk_args(tmp_path, allow_stage_a_exclusions=allow,
-                    repair_invalid_daily_stable=repair)
+                    repair_invalid_daily_stable=repair,
+                    allow_aprime_caret_cache_alias=caret_alias)
     driver = drv.Driver(args=args, stages=list(drv.STAGE_ORDER), executed=True,
                         target_as_of=target, driver_run_id="rid",
                         project_root=tmp_path)
@@ -2004,3 +2033,244 @@ def test_redact_local_paths_helper(tmp_path):
     # Relative project paths are NOT redacted.
     rel = "signal_library/data/stable/MHRIL.BO_stable_v1_0_0.pkl"
     assert drv._redact_local_paths(rel) == rel
+
+
+# ---------------------------------------------------------------------------
+# Amendment: Stage Aprime caret cache-alias bridge
+# ---------------------------------------------------------------------------
+
+
+CARET_ALL = [
+    "^DJI", "^DJT", "^FTSE", "^FVX", "^GDAXI", "^GSPC", "^IRX", "^IXIC",
+    "^MID", "^NDX", "^NYA", "^RUA", "^RUI", "^RUT", "^STOXX50E", "^TNX",
+    "^VIX", "^W5000", "^XAU",
+]
+
+
+class _FakeSeries:
+    def __init__(self, last):
+        self.last = last
+
+
+def _bridge(caret_secs, *, alias_enabled, sources, target="2026-06-03",
+            malformed=None, verify_override=None):
+    """Run stage_aprime_caret_bridge with injected pure callables.
+
+    ``sources`` maps a cache name (raw '^X' or alias '_X') -> last_date_str.
+    Absent key => missing. ``malformed`` names read as unusable.
+    """
+    malformed = set(malformed or set())
+    reads = []
+    written = {}
+
+    def read_source(name, cache_dir):
+        reads.append(name)
+        if name in malformed:
+            return None, None, "malformed"
+        last = sources.get(name)
+        if last is None:
+            return None, None, "missing"
+        return last, _FakeSeries(last), "ok"
+
+    def write_csv(secondary, series, price_cache_dir):
+        written[secondary] = series.last
+        return f"price_cache/daily/{secondary}.csv"
+
+    def verify(secondary, price_cache_dir, cache_dir):
+        if verify_override is not None and secondary in verify_override:
+            return verify_override[secondary]
+        if secondary not in written:
+            return False, None, "not_written"
+        return True, written[secondary], "csv"
+
+    kept, excluded, summary = drv.stage_aprime_caret_bridge(
+        caret_secs, cache_dir="cache/results",
+        price_cache_dir="price_cache/daily", target_as_of=target,
+        alias_enabled=alias_enabled, read_source_fn=read_source,
+        write_csv_fn=write_csv, verify_fn=verify,
+    )
+    return kept, excluded, summary, written, reads
+
+
+def test_caret_detection_and_alias_name():
+    for s in CARET_ALL:
+        assert drv.is_caret_secondary(s) is True
+    assert drv.is_caret_secondary("DX-Y.NYB") is False
+    assert drv.is_caret_secondary("AAPL") is False
+    assert drv._caret_alias_name("^GSPC") == "_GSPC"
+    assert drv._caret_alias_name("^STOXX50E") == "_STOXX50E"
+
+
+def test_caret_all_viable_built_from_raw():
+    sources = {s: "2026-06-03" for s in CARET_ALL}  # all raw current
+    kept, excl, summ, written, _ = _bridge(
+        CARET_ALL, alias_enabled=True, sources=sources)
+    assert set(kept) == set(CARET_ALL) and excl == []
+    assert summ["caret_secondaries_built_from_raw"] == len(CARET_ALL)
+    assert all(summ["caret_source_by_secondary"][s] == "raw" for s in CARET_ALL)
+    # Output written under the RAW caret spelling.
+    assert set(written) == set(CARET_ALL)
+    assert summ["caret_price_cache_path_by_secondary"]["^GSPC"].endswith(
+        "/^GSPC.csv")
+
+
+def test_caret_raw_missing_alias_current_uses_alias():
+    kept, excl, summ, written, _ = _bridge(
+        ["^DJI"], alias_enabled=True, sources={"_DJI": "2026-06-03"})
+    assert kept == ["^DJI"] and excl == []
+    assert summ["caret_source_by_secondary"]["^DJI"] == "alias"
+    assert summ["caret_secondaries_built_from_alias"] == 1
+    assert "^DJI" in written  # raw-spelled output path
+
+
+def test_caret_raw_stale_alias_current_selects_alias():
+    kept, excl, summ, written, _ = _bridge(
+        ["^GSPC"], alias_enabled=True,
+        sources={"^GSPC": "2026-05-04", "_GSPC": "2026-06-03"})
+    assert kept == ["^GSPC"] and excl == []
+    assert summ["caret_source_by_secondary"]["^GSPC"] == "alias"
+    assert summ["caret_source_last_date_by_secondary"]["^GSPC"] == "2026-06-03"
+    assert written["^GSPC"] == "2026-06-03"  # never the stale raw
+
+
+def test_caret_vix_stale_raw_current_alias():
+    kept, excl, summ, _w, _r = _bridge(
+        ["^VIX"], alias_enabled=True,
+        sources={"^VIX": "2026-05-04", "_VIX": "2026-06-03"})
+    assert kept == ["^VIX"] and summ["caret_source_by_secondary"]["^VIX"] == "alias"
+
+
+def test_caret_djt_raw_missing_alias_current():
+    kept, excl, summ, _w, _r = _bridge(
+        ["^DJT"], alias_enabled=True, sources={"_DJT": "2026-06-03"})
+    assert kept == ["^DJT"] and summ["caret_source_by_secondary"]["^DJT"] == "alias"
+
+
+def test_caret_raw_current_preferred_over_alias():
+    kept, excl, summ, _w, reads = _bridge(
+        ["^GSPC"], alias_enabled=True,
+        sources={"^GSPC": "2026-06-03", "_GSPC": "2026-06-03"})
+    assert kept == ["^GSPC"] and summ["caret_source_by_secondary"]["^GSPC"] == "raw"
+    assert "_GSPC" not in reads  # alias not read when raw is current
+
+
+def test_caret_all_stale_excluded():
+    kept, excl, summ, _w, _r = _bridge(
+        ["^GSPC"], alias_enabled=True,
+        sources={"^GSPC": "2026-05-04", "_GSPC": "2026-05-01"})
+    assert kept == [] and len(excl) == 1
+    assert excl[0]["stage"] == "Aprime"
+    assert excl[0]["reason"] == "caret_source_unavailable_or_stale"
+    assert summ["caret_source_by_secondary"]["^GSPC"] == "excluded"
+
+
+def test_caret_all_missing_excluded():
+    kept, excl, summ, _w, _r = _bridge(
+        ["^XAU"], alias_enabled=True, sources={})
+    assert kept == [] and len(excl) == 1
+    assert excl[0]["reason"] == "caret_source_unavailable_or_stale"
+
+
+def test_caret_flag_off_no_alias_read():
+    # Raw missing, alias current, but flag OFF -> excluded; alias never read.
+    kept, excl, summ, _w, reads = _bridge(
+        ["^DJI"], alias_enabled=False, sources={"_DJI": "2026-06-03"})
+    assert kept == [] and len(excl) == 1
+    assert "_DJI" not in reads
+    assert summ["caret_alias_bridge_enabled"] is False
+    # Raw current, flag OFF -> built from raw.
+    kept2, _e, summ2, _w2, _r2 = _bridge(
+        ["^DJI"], alias_enabled=False, sources={"^DJI": "2026-06-03"})
+    assert kept2 == ["^DJI"] and summ2["caret_source_by_secondary"]["^DJI"] == "raw"
+
+
+def test_caret_malformed_alias_excluded():
+    kept, excl, summ, _w, _r = _bridge(
+        ["^GSPC"], alias_enabled=True, sources={}, malformed={"_GSPC"})
+    assert kept == [] and len(excl) == 1
+    assert excl[0]["reason"] == "caret_source_unavailable_or_stale"
+
+
+def test_caret_verification_gate_excludes_unreadable_output():
+    # Source current, but the written CSV fails producer verification.
+    kept, excl, summ, _w, _r = _bridge(
+        ["^GSPC"], alias_enabled=True, sources={"^GSPC": "2026-06-03"},
+        verify_override={"^GSPC": (False, None, "unreadable")})
+    assert kept == [] and len(excl) == 1
+    assert excl[0]["reason"] == "caret_output_unverified_or_stale"
+    assert summ["caret_output_verified_by_producer_loader"]["^GSPC"] is False
+
+
+def test_caret_verification_gate_excludes_stale_output():
+    # Source reads current, but the verified output is stale (e.g. shadow).
+    kept, excl, summ, _w, _r = _bridge(
+        ["^GSPC"], alias_enabled=True, sources={"^GSPC": "2026-06-03"},
+        verify_override={"^GSPC": (True, "2026-05-04", "csv")})
+    assert kept == [] and len(excl) == 1
+    assert excl[0]["reason"] == "caret_output_unverified_or_stale"
+
+
+def test_caret_exclusion_bucketed_as_aprime_distinct():
+    P = drv.SecondaryPlan
+    driver = drv.Driver(
+        args=types.SimpleNamespace(), stages=[], executed=True,
+        target_as_of="2026-06-03", driver_run_id="r", project_root=Path("."))
+    driver.exclusions = [
+        {"secondary": "X", "stage": "A"},
+        {"secondary": "Y", "stage": "B"},
+        {"secondary": "^GSPC", "stage": "Aprime",
+         "reason": "caret_source_unavailable_or_stale"},
+    ]
+    es = drv._exclusion_summary(driver)
+    assert es["stage_aprime_price_cache_exclusions"] == 1
+    assert es["stage_a_allowed_exclusions"] == 1
+    assert es["stage_b_member_library_exclusions"] == 1
+    assert es["stage_e_failures"] == 0
+
+
+def test_caret_exclusion_chain_partial_and_h_blocked(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("K1", "D"), ("K2", "I")]),
+        _plan("^GSPC", [("G1", "D"), ("G2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, allow=True, caret_alias=True,
+        caret_exclude={"^GSPC"})
+    assert env["status"] == "partial" and rc != 0 and env["halted_at"] is None
+    # caret bridge was invoked with the caret secondary only.
+    assert calls["caret"] == [["^GSPC"]]
+    # KEEP continues; ^GSPC excluded.
+    assert calls["e_secs"] == [["KEEP"]] and calls["f_secs"] == [["KEEP"]]
+    ap = [e for e in drv_.exclusions if e.get("stage") == "Aprime"]
+    assert any(e["secondary"] == "^GSPC" for e in ap)
+    assert env["exclusion_summary"]["stage_aprime_price_cache_exclusions"] >= 1
+    assert env["stageH"]["promotion_blocked_by_failures"] is True
+    assert env["stageAprime"]["caret_alias_bridge_enabled"] is True
+
+
+def test_dry_run_caret_bridge_flag_fields(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "^GSPC")
+    _make_secondary(root, "FOO")
+    # default: bridge disabled
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run" and rc == 0
+    assert j["stageAprime"]["caret_alias_bridge_enabled"] is False
+    assert j["stageAprime"]["caret_secondary_count"] >= 1
+    # policy: bridge enabled
+    rc2, out2 = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+        "--allow-stage-a-exclusions", "--repair-invalid-daily-stable",
+        "--allow-aprime-caret-cache-alias",
+    ])
+    j2 = json.loads(out2)
+    assert j2["status"] == "dry_run" and rc2 == 0
+    assert j2["stageAprime"]["caret_alias_bridge_enabled"] is True
+    assert j2["stageA"]["ran"] is False and j2["lock"]["acquired"] is False

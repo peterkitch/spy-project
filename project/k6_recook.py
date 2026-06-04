@@ -1245,6 +1245,227 @@ def stage_aprime_rebuild(
 
 
 # ---------------------------------------------------------------------------
+# Stage Aprime caret cache-alias bridge (local-only source routing)
+# ---------------------------------------------------------------------------
+
+
+def is_caret_secondary(secondary: str) -> bool:
+    """A secondary is a caret secondary iff its raw spelling starts with '^'.
+    Non-caret tickers (including DX-Y.NYB) are never aliased."""
+    return str(secondary).startswith("^")
+
+
+def _caret_alias_name(secondary: str) -> str:
+    """Underscore-alias cache spelling for a caret secondary: '^GSPC' -> '_GSPC'.
+    Only the leading '^' is replaced; the rest is preserved verbatim."""
+    return "_" + secondary[1:]
+
+
+def _caret_read_source(name: str, cache_dir: Optional[str]) -> Tuple[
+    Optional[str], Any, str,
+]:
+    """Read a name's daily Close from its cache/results PKL ONLY (no network),
+    returning (last_date_str, series, reason). Uses the producer's
+    load_secondary_close against an empty scratch price-cache dir so a stale
+    on-disk price_cache CSV cannot shadow the PKL. Never raises."""
+    import tempfile
+    import shutil
+    from k6_mtf_history_producer import load_secondary_close
+
+    scratch = tempfile.mkdtemp(prefix="k6recook_caret_src_")
+    try:
+        series, _path, _kind = load_secondary_close(
+            name, price_cache_dir=scratch, cache_dir=cache_dir,
+        )
+        if series is None or len(series) == 0:
+            return None, None, "empty_source"
+        last = series.index.max()
+        last_str = last.strftime("%Y-%m-%d") if last is not None else None
+        return last_str, series, "ok"
+    except Exception as exc:
+        return None, None, _redact_local_paths(f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            shutil.rmtree(scratch, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _caret_write_close_csv(
+    secondary: str, series: Any, price_cache_dir: Optional[str],
+) -> str:
+    """Atomically write a Date,Close CSV to the RAW producer-readable path
+    price_cache/daily/<secondary>.csv (temp + os.replace). Returns the
+    project-relative output path."""
+    import pandas as pd
+
+    pcd = Path(price_cache_dir)
+    pcd.mkdir(parents=True, exist_ok=True)
+    out = pcd / f"{secondary}.csv"
+    df = pd.DataFrame({"Date": series.index, "Close": series.to_numpy()})
+    tmp = out.with_name(out.name + ".tmp")
+    df.to_csv(tmp, index=False, date_format="%Y-%m-%d")
+    os.replace(str(tmp), str(out))
+    return to_posix(str(out))
+
+
+def _caret_verify_output(
+    secondary: str, price_cache_dir: Optional[str], cache_dir: Optional[str],
+) -> Tuple[bool, Optional[str], str]:
+    """Confirm the just-written raw CSV is readable through the producer's
+    load_secondary_close and report its last date. Never raises."""
+    from k6_mtf_history_producer import load_secondary_close
+
+    try:
+        series, _path, kind = load_secondary_close(
+            secondary, price_cache_dir=price_cache_dir, cache_dir=cache_dir,
+        )
+        if series is None or len(series) == 0:
+            return False, None, "empty_after_write"
+        last = series.index.max()
+        return True, (last.strftime("%Y-%m-%d") if last is not None else None), kind
+    except Exception as exc:
+        return False, None, _redact_local_paths(f"{type(exc).__name__}: {exc}")
+
+
+def stage_aprime_caret_bridge(
+    caret_secs: Sequence[str],
+    *,
+    cache_dir: Optional[str],
+    price_cache_dir: Optional[str],
+    target_as_of: str,
+    alias_enabled: bool,
+    read_source_fn: Optional[Callable[..., Tuple]] = None,
+    write_csv_fn: Optional[Callable[..., str]] = None,
+    verify_fn: Optional[Callable[..., Tuple]] = None,
+) -> Tuple[List[str], List[dict], dict]:
+    """Build producer-readable raw-spelled price_cache CSVs for caret
+    secondaries from the freshest usable LOCAL source.
+
+    Selection per caret secondary S (raw spelling kept for the output path):
+      - raw '^S' source current to target_as_of -> use raw;
+      - else (only if ``alias_enabled``) '_S' alias source current -> use alias;
+      - else exclude (never accept a stale source).
+    The written CSV is re-verified through the producer loader and must be
+    current; otherwise the secondary is excluded. Local-only; no network.
+
+    Returns (kept_secondaries, exclusion_records, summary).
+    """
+    read_source_fn = read_source_fn or _caret_read_source
+    write_csv_fn = write_csv_fn or _caret_write_close_csv
+    verify_fn = verify_fn or _caret_verify_output
+
+    kept: List[str] = []
+    excluded: List[dict] = []
+    source_by: Dict[str, str] = {}
+    out_path_by: Dict[str, str] = {}
+    src_path_by: Dict[str, str] = {}
+    src_last_by: Dict[str, Optional[str]] = {}
+    out_last_by: Dict[str, Optional[str]] = {}
+    verified_by: Dict[str, bool] = {}
+    built_raw = 0
+    built_alias = 0
+
+    for sec in caret_secs:
+        alias = _caret_alias_name(sec)
+        raw_last, raw_series, raw_reason = read_source_fn(sec, cache_dir)
+        raw_current = (raw_series is not None and raw_last is not None
+                       and str(raw_last) >= str(target_as_of))
+        chosen_series = None
+        chosen_kind = None
+        chosen_src_name = None
+        chosen_last = None
+        alias_last = None
+        if raw_current:
+            chosen_series, chosen_kind = raw_series, "raw"
+            chosen_src_name = f"{sec}_precomputed_results.pkl"
+            chosen_last = raw_last
+        elif alias_enabled:
+            alias_last, alias_series, alias_reason = read_source_fn(alias, cache_dir)
+            if (alias_series is not None and alias_last is not None
+                    and str(alias_last) >= str(target_as_of)):
+                chosen_series, chosen_kind = alias_series, "alias"
+                chosen_src_name = f"{alias}_precomputed_results.pkl"
+                chosen_last = alias_last
+
+        if chosen_series is None:
+            source_by[sec] = "excluded"
+            src_last_by[sec] = raw_last
+            excluded.append({
+                "secondary": sec, "stage": "Aprime",
+                "reason": "caret_source_unavailable_or_stale",
+                "ticker": sec, "dependent_role": "secondary",
+                "caret_alias_bridge_enabled": bool(alias_enabled),
+                "raw_source_last_date": raw_last,
+                "alias_source_last_date": alias_last,
+                "target_as_of": target_as_of,
+                "source_pkl_basename_raw": f"{sec}_precomputed_results.pkl",
+                "source_pkl_basename_alias": f"{alias}_precomputed_results.pkl",
+                "message": (
+                    f"caret secondary {sec}: no LOCAL source current to "
+                    f"{target_as_of} (raw_last={raw_last}, "
+                    f"alias_last={alias_last}, alias_enabled={alias_enabled})."
+                ),
+                "action": (
+                    "Refresh the local cache for this caret secondary, or "
+                    "enable --allow-aprime-caret-cache-alias if a current "
+                    "underscore-alias source exists; no network fetch is added."
+                ),
+            })
+            continue
+
+        # Write the raw-spelled producer-readable CSV, then verify.
+        out_path = write_csv_fn(sec, chosen_series, price_cache_dir)
+        ok, out_last, vreason = verify_fn(sec, price_cache_dir, cache_dir)
+        out_current = ok and out_last is not None and str(out_last) >= str(target_as_of)
+        out_path_by[sec] = out_path
+        src_path_by[sec] = f"{cache_dir}/{chosen_src_name}" if cache_dir else chosen_src_name
+        src_last_by[sec] = chosen_last
+        out_last_by[sec] = out_last
+        verified_by[sec] = bool(out_current)
+        if not out_current:
+            source_by[sec] = "excluded"
+            excluded.append({
+                "secondary": sec, "stage": "Aprime",
+                "reason": "caret_output_unverified_or_stale",
+                "ticker": sec, "dependent_role": "secondary",
+                "source_kind_attempted": chosen_kind,
+                "output_last_date": out_last,
+                "target_as_of": target_as_of,
+                "verify_reason": vreason,
+                "message": (
+                    f"caret secondary {sec}: written CSV failed producer "
+                    f"verification/currentness (out_last={out_last}, "
+                    f"target={target_as_of}, reason={vreason})."
+                ),
+                "action": "Inspect the caret source PKL; no network fetch is added.",
+            })
+            continue
+
+        kept.append(sec)
+        source_by[sec] = chosen_kind
+        if chosen_kind == "raw":
+            built_raw += 1
+        else:
+            built_alias += 1
+
+    summary = {
+        "caret_secondary_count": len(caret_secs),
+        "caret_alias_bridge_enabled": bool(alias_enabled),
+        "caret_secondaries_built_from_raw": built_raw,
+        "caret_secondaries_built_from_alias": built_alias,
+        "caret_secondaries_excluded": len(excluded),
+        "caret_source_by_secondary": source_by,
+        "caret_price_cache_path_by_secondary": out_path_by,
+        "caret_source_path_by_secondary": src_path_by,
+        "caret_source_last_date_by_secondary": src_last_by,
+        "caret_output_last_date_by_secondary": out_last_by,
+        "caret_output_verified_by_producer_loader": verified_by,
+    }
+    return kept, excluded, summary
+
+
+# ---------------------------------------------------------------------------
 # Single-instance lock
 # ---------------------------------------------------------------------------
 
@@ -1475,6 +1696,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Default false = a producer-invalid existing 1d library fails the "
             "member in Stage B and excludes its dependent secondaries before "
             "Stage E. Producer-valid 1d libraries are never overwritten."
+        ),
+    )
+    p.add_argument(
+        "--allow-aprime-caret-cache-alias", action="store_true", default=False,
+        help=(
+            "Stage Aprime policy: for CARET secondaries only (names starting "
+            "with '^'), build the producer-readable raw-spelled "
+            "price_cache/daily/<^SEC>.csv from the freshest usable LOCAL "
+            "source -- the raw '^SEC' cache PKL or the underscore-alias "
+            "'_SEC' cache PKL -- preferring raw when current, else a current "
+            "alias. Local-only (no provider fetch). Default false = no alias "
+            "read; caret CSVs are still currentness-verified so a stale output "
+            "is not silently accepted. Non-caret tickers are never aliased."
         ),
     )
     p.add_argument(
@@ -1782,6 +2016,12 @@ def _plan_stage_counts(
         "mode": "rebuild",
         "format": driver.args.price_cache_format,
         "planned_writes": len(rankable),
+        "caret_alias_bridge_enabled": bool(
+            driver.args.allow_aprime_caret_cache_alias
+        ),
+        "caret_secondary_count": sum(
+            1 for p in included if is_caret_secondary(p.secondary)
+        ),
         "note": "price_cache rebuilt from fresh PKLs at execute time",
     }
     envelope["stageB"] = {
@@ -2275,9 +2515,13 @@ def _run_execute_chain(
     if "Aprime" in driver.stages:
         if lock_handle:
             update_lock_stage(lock_handle, "Aprime")
-        secs = list(rankable.keys())
+        all_secs = list(rankable.keys())
+        noncaret_secs = [s for s in all_secs if not is_caret_secondary(s)]
+        caret_secs = [s for s in all_secs if is_caret_secondary(s)]
+
+        # Non-caret: existing writer path (unchanged).
         report, kept, excluded = stage_aprime_rebuild(
-            secs,
+            noncaret_secs,
             cache_dir=args.cache_dir,
             price_cache_dir=args.price_cache_dir,
             write=True,
@@ -2289,6 +2533,28 @@ def _run_execute_chain(
             driver.exclusions.append(
                 {"secondary": sec, "stage": "Aprime", "reason": "price_cache_unbuildable"}
             )
+
+        # Caret: local-only alias bridge (always currentness-verified;
+        # underscore-alias source read only under the flag).
+        caret_summary = {
+            "caret_secondary_count": len(caret_secs),
+            "caret_alias_bridge_enabled": bool(args.allow_aprime_caret_cache_alias),
+        }
+        if caret_secs:
+            _ckept, cexcluded, caret_summary = stage_aprime_caret_bridge(
+                caret_secs,
+                cache_dir=args.cache_dir,
+                price_cache_dir=args.price_cache_dir,
+                target_as_of=driver.target_as_of,
+                alias_enabled=bool(args.allow_aprime_caret_cache_alias),
+            )
+            cexcluded_secs = {r.get("secondary") for r in cexcluded}
+            for sec in cexcluded_secs:
+                if sec in rankable:
+                    del rankable[sec]
+            for rec in cexcluded:
+                driver.exclusions.append(rec)
+
         envelope["stageAprime"] = {
             "ran": True,
             "mode": "rebuild",
@@ -2296,6 +2562,10 @@ def _run_execute_chain(
             "write_count": report.get("write_count"),
             "verification_pass_count": report.get("verification_pass_count"),
             "excluded": excluded,
+            "stage_aprime_price_cache_exclusions": sum(
+                1 for e in driver.exclusions if e.get("stage") == "Aprime"
+            ),
+            **caret_summary,
         }
         if not rankable:
             envelope["halted_at"] = "Aprime"
