@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -133,6 +134,21 @@ def log(message: str) -> None:
     """Emit one diagnostic line to stderr (never stdout)."""
     sys.stderr.write(str(message) + "\n")
     sys.stderr.flush()
+
+
+# Absolute local-path token matcher (Windows drive-letter paths and POSIX
+# /Users|/home|/mnt paths). Used to redact any local filesystem detail out of
+# exception text before it enters the JSON envelope or logs.
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/(?:Users|home|mnt)/)[^\s'\"]*")
+
+
+def _redact_local_paths(text: Any) -> Any:
+    """Replace any absolute local-path token in ``text`` with
+    ``<redacted-path>``. Relative project paths (cache/results,
+    signal_library/data/stable, ...) are left intact."""
+    if text is None:
+        return None
+    return _ABS_PATH_RE.sub("<redacted-path>", str(text))
 
 
 @contextmanager
@@ -912,22 +928,37 @@ def stage_b_process_member(
     cache_dir: Optional[str],
     generate_fn: Callable[..., Any],
     save_fn: Callable[..., Any],
-    daily_exists_fn: Callable[[str, str], bool],
+    validate_fn: Callable[[str, str], dict],
     set_library_dir_fn: Callable[[str], None],
+    repair: bool = False,
 ) -> dict:
     """Build offline MTF libraries for one member.
 
-    Always (re)builds the non-daily intervals; builds 1d only when the
-    member's 1d stable library is missing, and never overwrites an existing
-    one (existence is re-checked immediately before the save).
+    Always (re)builds the non-daily intervals. For 1d, the existing stable
+    library is validated with the PRODUCER loader (not a bare file-existence
+    check) so a malformed-but-present 1d library cannot pass Stage B and
+    then fail Stage E:
 
-    All callables are injected so the unit tests can run without the real
-    builder and assert no vendor fetch occurs.
+      - missing 1d            -> build it (force_overwrite required by the
+                                 builder's daily guard);
+      - existing + producer-valid 1d  -> skip;
+      - existing + producer-INVALID 1d:
+          * default (repair=False)  -> record an error (member fails Stage B
+            so dependent secondaries are excluded before Stage E);
+          * repair=True             -> rebuild it offline from the local
+            cache Close source, then RE-VALIDATE with the producer loader;
+            a producer-valid existing 1d is never overwritten.
+
+    All callables are injected so the unit tests run without the real
+    builder/producer and assert no vendor fetch occurs. ``repair`` is
+    offline-only (no network).
     """
     set_library_dir_fn(stable_dir)
     built: List[str] = []
     skipped: List[str] = []
     errors: List[dict] = []
+    repaired = False
+    daily_status: Optional[dict] = None
 
     plan_intervals = list(intervals)
     want_daily = DAILY_TIMEFRAME in plan_intervals
@@ -947,38 +978,50 @@ def stage_b_process_member(
             save_fn(lib, interval, force_overwrite=False)
             built.append(interval)
         except Exception as exc:
-            errors.append(
-                {"interval": interval, "reason": f"{type(exc).__name__}: {exc}"}
-            )
+            errors.append({
+                "interval": interval,
+                "reason": _redact_local_paths(f"{type(exc).__name__}: {exc}"),
+            })
 
     if want_daily:
-        if daily_exists_fn(member, stable_dir):
+        daily_status = validate_fn(member, stable_dir)
+        if not daily_status.get("exists"):
+            # Missing -> build (unchanged behavior).
+            built_ok = _build_daily(
+                member, stable_dir, cache_dir, generate_fn, save_fn,
+                validate_fn, errors, force=True, label="build",
+            )
+            if built_ok:
+                built.append(DAILY_TIMEFRAME)
+        elif daily_status.get("producer_valid"):
             skipped.append(DAILY_TIMEFRAME)
         else:
-            try:
-                lib = generate_fn(
-                    member,
-                    DAILY_TIMEFRAME,
-                    source_mode=LAUNCH_PATH_SOURCE_MODE,
-                    cache_dir=cache_dir,
+            # Exists but producer-invalid.
+            if not repair:
+                errors.append({
+                    "interval": DAILY_TIMEFRAME,
+                    "reason": "producer_invalid_daily_library",
+                    "error_class": daily_status.get("error_class"),
+                    "detail": daily_status.get("message"),
+                })
+            else:
+                rebuilt = _build_daily(
+                    member, stable_dir, cache_dir, generate_fn, save_fn,
+                    validate_fn, errors, force=True, label="repair",
                 )
-                if not lib:
-                    errors.append(
-                        {"interval": DAILY_TIMEFRAME, "reason": "no_library"}
-                    )
-                elif daily_exists_fn(member, stable_dir):
-                    # Re-check immediately before save: never overwrite.
-                    skipped.append(DAILY_TIMEFRAME)
-                else:
-                    save_fn(lib, DAILY_TIMEFRAME, force_overwrite=True)
-                    built.append(DAILY_TIMEFRAME)
-            except Exception as exc:
-                errors.append(
-                    {
-                        "interval": DAILY_TIMEFRAME,
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+                if rebuilt:
+                    revalid = validate_fn(member, stable_dir)
+                    daily_status = revalid
+                    if revalid.get("producer_valid"):
+                        built.append(DAILY_TIMEFRAME)
+                        repaired = True
+                    else:
+                        errors.append({
+                            "interval": DAILY_TIMEFRAME,
+                            "reason": "repair_revalidation_failed",
+                            "error_class": revalid.get("error_class"),
+                            "detail": revalid.get("message"),
+                        })
 
     return {
         "member": member,
@@ -986,12 +1029,95 @@ def stage_b_process_member(
         "skipped": skipped,
         "errors": errors,
         "ok": not errors,
+        "repaired": repaired,
+        "daily_status": daily_status,
     }
+
+
+def _build_daily(member, stable_dir, cache_dir, generate_fn, save_fn,
+                 validate_fn, errors, *, force, label) -> bool:
+    """Build (or repair) the member's 1d library offline. Returns True when a
+    save was performed. Never overwrites a producer-valid existing 1d: a
+    last-moment re-validation guards the save. Appends a redacted error on
+    failure."""
+    try:
+        lib = generate_fn(
+            member, DAILY_TIMEFRAME,
+            source_mode=LAUNCH_PATH_SOURCE_MODE, cache_dir=cache_dir,
+        )
+        if not lib:
+            errors.append({
+                "interval": DAILY_TIMEFRAME,
+                "reason": f"no_library:{label}",
+            })
+            return False
+        # Guard: never clobber a now-producer-valid 1d (race / repaired
+        # elsewhere). For 'build' a present-and-valid 1d means skip.
+        recheck = validate_fn(member, stable_dir)
+        if recheck.get("exists") and recheck.get("producer_valid") and label == "build":
+            return False
+        save_fn(lib, DAILY_TIMEFRAME, force_overwrite=force)
+        return True
+    except Exception as exc:
+        errors.append({
+            "interval": DAILY_TIMEFRAME,
+            "reason": _redact_local_paths(f"{label}:{type(exc).__name__}: {exc}"),
+        })
+        return False
 
 
 def daily_stable_exists(member: str, stable_dir: str) -> bool:
     name = f"{member}_stable_v{STABLE_ENGINE_VERSION_TAG}.pkl"
     return (Path(stable_dir) / name).is_file()
+
+
+def daily_stable_is_producer_valid(
+    member: str, stable_dir: str, *, loader_fn: Optional[Callable[..., Any]] = None,
+) -> dict:
+    """Producer-compatible validation of a member's existing 1d stable
+    library. Calls k6_mtf_history_producer.load_member_library(member, '1d',
+    stable_dir=...) and returns a structured status dict (never raises).
+
+    Any path-bearing exception text is redacted before it enters the status,
+    and ``path`` is reported as the bare library basename so no absolute
+    local path can leak into JSON/logs.
+    """
+    name = f"{member}_stable_v{STABLE_ENGINE_VERSION_TAG}.pkl"
+    status: dict = {
+        "member": member, "interval": DAILY_TIMEFRAME,
+        "exists": (Path(stable_dir) / name).is_file(),
+        "producer_valid": False, "reason": None, "error_class": None,
+        "message": None, "path": name, "dates_count": None,
+        "signals_count": None, "can_repair": False, "action": None,
+    }
+    if not status["exists"]:
+        status["reason"] = "missing"
+        status["action"] = "build"
+        return status
+    if loader_fn is None:
+        from k6_mtf_history_producer import load_member_library as loader_fn
+    try:
+        lib = loader_fn(member, DAILY_TIMEFRAME, stable_dir=stable_dir)
+        dates = lib.get("dates") if hasattr(lib, "get") else None
+        signals = lib.get("signals") if hasattr(lib, "get") else None
+        status["producer_valid"] = True
+        status["reason"] = "ok"
+        status["action"] = "skip"
+        try:
+            status["dates_count"] = len(dates) if dates is not None else None
+            status["signals_count"] = len(signals) if signals is not None else None
+        except Exception:
+            pass
+        return status
+    except Exception as exc:
+        status["producer_valid"] = False
+        status["reason"] = "producer_invalid"
+        status["error_class"] = type(exc).__name__
+        status["message"] = _redact_local_paths(str(exc))
+        # Repairable from the local cache/results Close source (offline).
+        status["can_repair"] = True
+        status["action"] = "repair_or_exclude"
+        return status
 
 
 def _set_builder_library_dir(stable_dir: str) -> None:
@@ -1018,8 +1144,9 @@ def _stage_b_worker(payload: dict) -> dict:
                 cache_dir=payload.get("cache_dir"),
                 generate_fn=mtb.generate_signals_for_interval,
                 save_fn=mtb.save_signal_library,
-                daily_exists_fn=daily_stable_exists,
+                validate_fn=daily_stable_is_producer_valid,
                 set_library_dir_fn=_set_builder_library_dir,
+                repair=bool(payload.get("repair")),
             )
     except Exception as exc:  # pragma: no cover - defensive
         out = {
@@ -1340,6 +1467,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stage A backoff ceiling seconds (nonnegative). Default 8.0.",
     )
     p.add_argument(
+        "--repair-invalid-daily-stable", action="store_true", default=False,
+        help=(
+            "Stage B policy: when an existing 1d stable library exists but "
+            "FAILS producer validation, rebuild it OFFLINE from the local "
+            "cache Close source (no network) and re-validate before use. "
+            "Default false = a producer-invalid existing 1d library fails the "
+            "member in Stage B and excludes its dependent secondaries before "
+            "Stage E. Producer-valid 1d libraries are never overwritten."
+        ),
+    )
+    p.add_argument(
         "--price-cache-format",
         choices=list(PRICE_CACHE_FORMATS),
         default=DEFAULT_PRICE_CACHE_FORMAT,
@@ -1652,6 +1790,14 @@ def _plan_stage_counts(
         "unique_members": len(member_keys),
         "non_daily_jobs": len(member_keys) * len(NON_DAILY_TIMEFRAMES),
         "planned_daily_creates": members_missing_daily,
+        "repair_invalid_daily_stable": bool(
+            driver.args.repair_invalid_daily_stable
+        ),
+        "note": (
+            "1d libraries are producer-validated at execute time; invalid "
+            "ones fail the member (or are repaired with "
+            "--repair-invalid-daily-stable)"
+        ),
         "workers": driver.args.b_workers,
     }
     envelope["stageE"] = {
@@ -2172,6 +2318,7 @@ def _run_execute_chain(
                 "intervals": intervals,
                 "stable_dir": args.stable_dir,
                 "cache_dir": args.cache_dir,
+                "repair": bool(args.repair_invalid_daily_stable),
             }
             for disp in member_keys.values()
         ]
@@ -2179,20 +2326,54 @@ def _run_execute_chain(
         for res in b_results:
             if res.get("_captured"):
                 log(res["_captured"].rstrip())
-        b_failed_members = {
-            r["member"].upper() for r in b_results if not r.get("ok")
+        b_failed = {
+            r["member"].upper(): r for r in b_results if not r.get("ok")
         }
+        b_repaired = [r["member"] for r in b_results if r.get("repaired")]
         for sec, plan in list(rankable.items()):
-            needed = {t.upper() for (t, _p, _r) in (plan.members or [])}
-            if needed & b_failed_members:
+            needed = {
+                t.strip().upper(): (t, p, raw)
+                for (t, p, raw) in (plan.members or [])
+            }
+            hits = [k for k in needed if k in b_failed]
+            if hits:
                 del rankable[sec]
-                driver.exclusions.append(
-                    {"secondary": sec, "stage": "B", "reason": "member_library_unavailable"}
-                )
+                for k in hits:
+                    r = b_failed[k]
+                    t, p, raw = needed[k]
+                    driver.exclusions.append({
+                        "secondary": sec,
+                        "stage": "B",
+                        "reason": "member_library_unavailable",
+                        "ticker": t,
+                        "member_token": raw,
+                        "member_protocol": p,
+                        "dependent_role": "member",
+                        "member_errors": r.get("errors"),
+                        "daily_status": r.get("daily_status"),
+                        "message": (
+                            f"member {t} 1d stable library invalid/unbuildable; "
+                            f"excludes secondary {sec}."
+                        ),
+                        "action": (
+                            "Rerun with --repair-invalid-daily-stable to rebuild "
+                            "the 1d library offline, or drop the affected stack."
+                        ),
+                    })
+                driver.partial = True
+                if "stage_b_member_library_exclusions" not in driver.partial_reasons:
+                    driver.partial_reasons.append(
+                        "stage_b_member_library_exclusions"
+                    )
         envelope["stageB"] = {
             "ran": True,
             "members": len(payloads),
-            "failed_members": sorted(b_failed_members),
+            "repair_invalid_daily_stable": bool(args.repair_invalid_daily_stable),
+            "repaired_members": sorted(b_repaired),
+            "failed_members": sorted(b_failed.keys()),
+            "excluded_secondary_count": sum(
+                1 for e in driver.exclusions if e.get("stage") == "B"
+            ),
             "workers": args.b_workers,
         }
         if not rankable:
@@ -2276,6 +2457,7 @@ def _run_execute_chain(
     # the chain did complete; the partial_reasons field records why this is
     # not a clean publish candidate. Partial is for operator review, never a
     # public-automation success.
+    envelope["exclusion_summary"] = _exclusion_summary(driver)
     if driver.exclusions or driver.failures:
         envelope["status"] = "partial"
         envelope["exit_code"] = 3
@@ -2290,6 +2472,20 @@ def _run_execute_chain(
     envelope["exit_code"] = 0
     envelope["partial_reasons"] = []
     return 0
+
+
+def _exclusion_summary(driver: Driver) -> dict:
+    """Distinct top-level breakdown of why secondaries were dropped, keyed by
+    stage so the four causes are never conflated."""
+    by_stage: Dict[str, int] = {}
+    for e in driver.exclusions:
+        by_stage[e.get("stage")] = by_stage.get(e.get("stage"), 0) + 1
+    return {
+        "stage_a_allowed_exclusions": by_stage.get("A", 0),
+        "stage_aprime_price_cache_exclusions": by_stage.get("Aprime", 0),
+        "stage_b_member_library_exclusions": by_stage.get("B", 0),
+        "stage_e_failures": by_stage.get("E", 0),
+    }
 
 
 def _stage_h_dry_run(

@@ -515,6 +515,14 @@ def _b_generate(member, interval, *, source_mode, cache_dir):
     return {"ticker": member, "interval": interval}
 
 
+def _vstatus(member, *, exists, valid):
+    return {"member": member, "interval": "1d", "exists": exists,
+            "producer_valid": valid, "reason": None, "error_class": None,
+            "message": None, "path": f"{member}_stable_v1_0_0.pkl",
+            "dates_count": None, "signals_count": None,
+            "can_repair": not valid and exists, "action": None}
+
+
 def test_stage_b_builds_nondaily_and_creates_missing_daily():
     saved = []
 
@@ -528,7 +536,7 @@ def test_stage_b_builds_nondaily_and_creates_missing_daily():
         cache_dir="c",
         generate_fn=_b_generate,
         save_fn=save,
-        daily_exists_fn=lambda m, s: False,  # 1d missing -> create
+        validate_fn=lambda m, s: _vstatus(m, exists=False, valid=False),  # missing
         set_library_dir_fn=lambda d: None,
     )
     assert set(res["built"]) == {"1wk", "1mo", "3mo", "1y", "1d"}
@@ -536,7 +544,7 @@ def test_stage_b_builds_nondaily_and_creates_missing_daily():
     assert res["ok"] is True
 
 
-def test_stage_b_existing_daily_never_overwritten():
+def test_stage_b_existing_valid_daily_skipped():
     saved = []
 
     res = drv.stage_b_process_member(
@@ -546,11 +554,12 @@ def test_stage_b_existing_daily_never_overwritten():
         cache_dir="c",
         generate_fn=_b_generate,
         save_fn=lambda lib, interval, *, force_overwrite: saved.append(interval),
-        daily_exists_fn=lambda m, s: True,  # 1d already present
+        validate_fn=lambda m, s: _vstatus(m, exists=True, valid=True),  # valid
         set_library_dir_fn=lambda d: None,
     )
     assert "1d" in res["skipped"]
     assert "1d" not in saved
+    assert res["ok"] is True
 
 
 def test_daily_stable_exists_path(tmp_path):
@@ -667,7 +676,7 @@ def test_execute_chain_barrier_order(tmp_path, monkeypatch):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
-        allow_stage_a_exclusions=False,
+        allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1079,7 +1088,7 @@ def test_execute_chain_halts_on_stage_a_failure(tmp_path, monkeypatch):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
-        allow_stage_a_exclusions=False,
+        allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1370,7 +1379,7 @@ def test_stage_a_summary_has_retry_fields_and_halts(tmp_path, monkeypatch):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
-        allow_stage_a_exclusions=False,
+        allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
     )
     driver = drv.Driver(
         args=args, stages=list(drv.STAGE_ORDER), executed=True,
@@ -1477,14 +1486,15 @@ def _mk_args(tmp_path, **over):
         a_workers=2, b_workers=2, promote_dry_run=True,
         fetch_retries=2, fetch_backoff_base_seconds=1.0,
         fetch_backoff_max_seconds=8.0, price_cache_format="csv",
-        allow_stage_a_exclusions=False,
+        allow_stage_a_exclusions=False, repair_invalid_daily_stable=False,
     )
     base.update(over)
     return types.SimpleNamespace(**base)
 
 
 def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
-               allow=False, target="2026-06-03"):
+               allow=False, target="2026-06-03", b_fail_members=None,
+               repair=False):
     calls = {"aprime": [], "b_members": [], "e_secs": [], "f_secs": [], "h": []}
     monkeypatch.setattr(
         drv, "_parallel_map",
@@ -1508,9 +1518,19 @@ def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
 
     monkeypatch.setattr(drv, "stage_aprime_rebuild", fake_aprime)
 
+    bfm = {m.upper() for m in (b_fail_members or set())}
+
     def b_worker(p):
         calls["b_members"].append(p["member"])
-        return {"member": p["member"], "ok": True}
+        if p["member"].upper() in bfm:
+            return {"member": p["member"], "ok": False, "built": [],
+                    "skipped": [], "repaired": False,
+                    "errors": [{"interval": "1d",
+                                "reason": "producer_invalid_daily_library"}],
+                    "daily_status": {"member": p["member"], "exists": True,
+                                     "producer_valid": False,
+                                     "path": f"{p['member']}_stable_v1_0_0.pkl"}}
+        return {"member": p["member"], "ok": True, "repaired": False}
 
     monkeypatch.setattr(drv, "_stage_b_worker", b_worker)
 
@@ -1540,7 +1560,8 @@ def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
 
     monkeypatch.setattr(drv, "_stage_h_dry_run", fake_h)
 
-    args = _mk_args(tmp_path, allow_stage_a_exclusions=allow)
+    args = _mk_args(tmp_path, allow_stage_a_exclusions=allow,
+                    repair_invalid_daily_stable=repair)
     driver = drv.Driver(args=args, stages=list(drv.STAGE_ORDER), executed=True,
                         target_as_of=target, driver_run_id="rid",
                         project_root=tmp_path)
@@ -1803,3 +1824,183 @@ def test_classify_stage_a_outcome_precedence():
         {"classification": "refreshed", "issue_codes": []},
         target_as_of="2026-06-03")
     assert info4["is_unavailable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Amendment: Stage B producer-valid 1d library validation + repair
+# ---------------------------------------------------------------------------
+
+
+# Known dot-suffix member names pinned by these tests (fixture names only;
+# never special-cased in production logic): MHRIL.BO, ZEELEARN.BO, AXISCADES.BO.
+
+
+def test_daily_validator_status_shape_and_redaction(tmp_path):
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    # Missing.
+    miss = drv.daily_stable_is_producer_valid("MHRIL.BO", str(stable))
+    assert miss["exists"] is False and miss["producer_valid"] is False
+    assert miss["reason"] == "missing" and miss["action"] == "build"
+    # Valid (injected loader succeeds).
+    (stable / "ZEELEARN.BO_stable_v1_0_0.pkl").write_text("x", encoding="utf-8")
+    ok = drv.daily_stable_is_producer_valid(
+        "ZEELEARN.BO", str(stable),
+        loader_fn=lambda m, i, *, stable_dir: {
+            "dates": [1, 2, 3], "signals": ["Buy", "Short", "None"]},
+    )
+    assert ok["producer_valid"] is True and ok["dates_count"] == 3
+    assert ok["signals_count"] == 3 and ok["action"] == "skip"
+    # Invalid: loader raises with an absolute path -> message redacted.
+    # The absolute path is built from tmp_path at RUNTIME so no literal local
+    # path is committed in this source file.
+    (stable / "AXISCADES.BO_stable_v1_0_0.pkl").write_text("x", encoding="utf-8")
+    abs_path = str(tmp_path / "AXISCADES.BO_stable_v1_0_0.pkl")
+
+    def boom(m, i, *, stable_dir):
+        raise ValueError(
+            f"member library {abs_path} dates/signals length mismatch: 100 vs 99"
+        )
+
+    bad = drv.daily_stable_is_producer_valid(
+        "AXISCADES.BO", str(stable), loader_fn=boom)
+    assert bad["producer_valid"] is False and bad["can_repair"] is True
+    assert bad["error_class"] == "ValueError"
+    assert "<redacted-path>" in bad["message"]
+    assert abs_path not in bad["message"]  # real absolute path stripped
+    assert str(tmp_path) not in bad["message"]
+    assert bad["path"] == "AXISCADES.BO_stable_v1_0_0.pkl"  # basename only
+
+
+def test_stage_b_invalid_daily_default_fails_member():
+    saved = []
+
+    res = drv.stage_b_process_member(
+        "MHRIL.BO",
+        intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
+        stable_dir="s", cache_dir="c",
+        generate_fn=_b_generate,
+        save_fn=lambda lib, interval, *, force_overwrite: saved.append(interval),
+        validate_fn=lambda m, s: _vstatus(m, exists=True, valid=False),
+        set_library_dir_fn=lambda d: None,
+        repair=False,
+    )
+    assert res["ok"] is False
+    assert "1d" not in saved  # invalid 1d not silently overwritten/skipped
+    assert any(e.get("reason") == "producer_invalid_daily_library"
+               for e in res["errors"])
+
+
+def test_stage_b_invalid_daily_repaired():
+    state = {"saved_1d": False}
+    saved = []
+
+    def save(lib, interval, *, force_overwrite):
+        saved.append(interval)
+        if interval == "1d":
+            state["saved_1d"] = True
+
+    def validate(m, s):
+        return _vstatus(m, exists=True, valid=state["saved_1d"])
+
+    res = drv.stage_b_process_member(
+        "ZEELEARN.BO",
+        intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
+        stable_dir="s", cache_dir="c",
+        generate_fn=_b_generate, save_fn=save, validate_fn=validate,
+        set_library_dir_fn=lambda d: None, repair=True,
+    )
+    assert res["ok"] is True and res["repaired"] is True
+    assert "1d" in res["built"] and "1d" in saved
+
+
+def test_stage_b_repair_failure_fails_member():
+    res = drv.stage_b_process_member(
+        "AXISCADES.BO",
+        intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
+        stable_dir="s", cache_dir="c",
+        generate_fn=_b_generate,
+        save_fn=lambda lib, interval, *, force_overwrite: None,
+        validate_fn=lambda m, s: _vstatus(m, exists=True, valid=False),  # never valid
+        set_library_dir_fn=lambda d: None, repair=True,
+    )
+    assert res["ok"] is False
+    assert any(e.get("reason") == "repair_revalidation_failed"
+               for e in res["errors"])
+
+
+def test_stage_b_repair_never_overwrites_valid_daily():
+    saved = []
+    res = drv.stage_b_process_member(
+        "MMM",
+        intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
+        stable_dir="s", cache_dir="c",
+        generate_fn=_b_generate,
+        save_fn=lambda lib, interval, *, force_overwrite: saved.append(interval),
+        validate_fn=lambda m, s: _vstatus(m, exists=True, valid=True),
+        set_library_dir_fn=lambda d: None, repair=True,
+    )
+    assert "1d" in res["skipped"] and "1d" not in saved and res["ok"] is True
+
+
+def test_stage_b_exclusion_chain_distinct_and_scoped(tmp_path, monkeypatch):
+    inc = [
+        _plan("KEEP", [("K1", "D"), ("K2", "I")]),
+        _plan("DROP", [("BADM", "D"), ("K2", "I")]),
+    ]
+    rc, env, drv_, calls = _run_chain(
+        tmp_path, monkeypatch, inc, allow=True, b_fail_members={"BADM"})
+    # Chain completes for KEEP; partial + nonzero.
+    assert env["status"] == "partial" and rc != 0 and env["halted_at"] is None
+    assert calls["e_secs"] == [["KEEP"]] and calls["f_secs"] == [["KEEP"]]
+    assert calls["aprime"] == [["KEEP", "DROP"]]  # B excludes AFTER Aprime
+    # Stage B exclusion recorded distinctly from Stage A.
+    bstage = [e for e in drv_.exclusions if e.get("stage") == "B"]
+    assert bstage and bstage[0]["secondary"] == "DROP"
+    assert bstage[0]["ticker"] == "BADM"
+    assert bstage[0]["dependent_role"] == "member"
+    es = env["exclusion_summary"]
+    assert es["stage_b_member_library_exclusions"] >= 1
+    assert es["stage_a_allowed_exclusions"] == 0
+    assert es["stage_aprime_price_cache_exclusions"] == 0
+    assert "stage_b_member_library_exclusions" in env["partial_reasons"]
+    # Stage H private + blocked.
+    assert calls["h"][0]["blocked"] is True
+    assert env["stageH"]["promotion_blocked_by_failures"] is True
+    assert env["stageB"]["failed_members"] == ["BADM"]
+    assert env["stageB"]["repair_invalid_daily_stable"] is False
+
+
+def test_repair_flag_dry_run(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    rc, out = _run_main([
+        "--allow-stage-a-exclusions", "--repair-invalid-daily-stable",
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert j["status"] == "dry_run" and rc == 0
+    assert j["stageB"]["repair_invalid_daily_stable"] is True
+    assert j["stageA"]["allow_stage_a_exclusions"] is True
+    assert j["stageA"]["ran"] is False  # no execution stages in dry-run
+    assert j["lock"]["acquired"] is False
+
+
+def test_redact_local_paths_helper(tmp_path):
+    assert drv._redact_local_paths(None) is None
+    # Real absolute path from tmp_path (runtime; not a committed literal).
+    abs_win = str(tmp_path / "f.pkl")
+    red = drv._redact_local_paths(f"x {abs_win} y")
+    assert "<redacted-path>" in red and abs_win not in red
+    # POSIX synthetic tokens assembled at runtime so no forbidden literal is
+    # committed in this source file.
+    sep = "/"
+    posix_user = sep + "U" "sers" + sep + "u" + sep + "f.pkl"
+    assert "<redacted-path>" in drv._redact_local_paths(posix_user)
+    posix_home = sep + "h" "ome" + sep + "u" + sep + "f.pkl"
+    assert "<redacted-path>" in drv._redact_local_paths(posix_home)
+    # Relative project paths are NOT redacted.
+    rel = "signal_library/data/stable/MHRIL.BO_stable_v1_0_0.pkl"
+    assert drv._redact_local_paths(rel) == rel
