@@ -1,134 +1,131 @@
-# React MVP fixtures
+# React MVP Fixtures
 
-This directory holds the committed JSON artifact the React MVP
-consumes at runtime. The fixture is the public-promoted K=6 MTF
-ranking artifact; the live `output/` artifact path is gitignored
-and is NOT wired to the React app.
+This directory holds the committed JSON artifact the React MVP consumes at
+runtime. The React app reads `fixtures/k6_mtf_ranking.json` as a static
+asset; `output/` remains gitignored and is not a runtime dependency.
 
 ## k6_mtf_ranking.json
 
-- **Schema:** `k6_mtf_ranking_v1`
-- **Provenance:** byte-identical copy of the operator-authorized
-  K=6 MTF ranking artifact at
-  `output/k6_mtf/20260528T083411Z_post_fix/k6_mtf_ranking.json`.
-- **Generated at (per artifact `generated_at_utc`):**
-  `2026-05-28T21:16:41Z`.
-- **Run id (per artifact `run_id`):** `20260528T083411Z`.
-- **Secondaries:** AAPL, AMZN, GOOGL, META, MSFT, NVDA, SPY,
-  TSLA (the 8 Tier 1 K=6 MTF MVP secondaries).
-- **Source artifact SHA-256:**
-  `cf716b0d1e5ea1d92afb30b6ebe85845a4e19ed276f5fe9f27c58be44f9a5dfa`.
-  This fixture must match byte-for-byte; the fixture-schema
-  smoke test at
-  `project/test_scripts/shared/test_k6_mtf_fixture_schema.py`
-  asserts shape; future PRs that refresh this fixture must
-  also re-record the SHA in this README.
+- **Schema:** `k6_mtf_ranking_v2`
+- **Run id:** `20260604T110400Z_recook_full248_clean_csv`
+- **Generated at:** `2026-06-04T11:14:17Z`
+- **Secondaries:** 205
+- **Validation summary:** 88 board-validated, 117 not validated, 43 Stage-A
+  excluded.
+- **Public fixture SHA-256 / promotion source_sha256:**
+  `b19a829794031be0e2674fb1c039aed8cdc95ffa063c9739bcdd2e631f6cb587`
+- **Public fixture size:** 710,160 bytes in the working tree, well below the
+  GitHub 100 MB per-file limit.
 
-## Status
+The committed fixture is slim. It keeps ranking metrics, K6 stack fields,
+validation disclosure, and per-row Blob sidecar metadata. Inline
+`ccc_series` is intentionally empty for every row.
 
-This fixture is the public-promoted K=6 MTF MVP board artifact
-under Phase 5G-2 Mode B accepted-risk controls. The publish
-step that points the React app at this artifact is the static
-fixture URL at `fixtures/k6_mtf_ranking.json` resolved through
-the configured Vite base; `loadArtifact.ts` is the single point
-of swap if a future publish step substitutes a CDN-served
-artifact URL.
+## Full-Resolution CCC Sidecars
 
-## Public-promotion provenance
+Full-resolution CCC series are stored off-repo as immutable public Vercel
+Blob sidecars, one sidecar per secondary. The sidecars are not decimated,
+truncated, sampled, or compressed in Git. Each fixture row embeds:
+
+- `ccc_series_source="vercel_blob"`
+- `ccc_series_sidecar_schema_version="k6_mtf_ccc_series_sidecar_v1"`
+- `ccc_series_url`
+- `ccc_series_pathname`
+- `ccc_series_sha256`
+- `ccc_series_byte_size`
+- `ccc_series_points`
+- first/last CCC dates
+
+The live sidecar namespace is:
+
+`k6-mtf/20260604T110400Z_recook_full248_clean_csv/ccc-series/`
+
+Promotion recorded 205 GET-verified sidecars:
+
+- **Total sidecar bytes:** 122,207,922
+- **Largest sidecar bytes:** 2,857,925
+- **Total CCC points:** 996,395
+- **Allowed Blob URL host pattern:** `*.public.blob.vercel-storage.com`
+- **Verification manifest:**
+  `output/k6_mtf/20260604T110400Z_recook_full248_clean_csv/k6_mtf_ccc_sidecar_verification.json`
+- **Verification manifest SHA-256:**
+  `ed7651073e811a05caff4b5826729ddbdbfd93fff2e3c8cd0b8f5a8fe9979948`
+
+The sidecars contain derived CCC fields only:
+`date_utc`, `cumulative_capture_pct`, `per_bar_capture_pct`, and
+`trade_direction`. They do not contain raw OHLCV, provider price series,
+or credentials.
+
+## Public-Promotion Provenance
 
 - **Promotion manifest:**
   `frontend/public/fixtures/k6_mtf_ranking.promotion_manifest.json`
-  (operator_approval_marker=true; per_secondary_count=8;
-  schema_version=k6_mtf_ranking_v1).
-- **promoted_at_utc (per promotion manifest):**
-  `2026-06-01T06:43:56Z`.
-- **promoted_by (per promotion manifest):** `the operator`.
-- **source_artifact_path (per promotion manifest):**
-  `output/k6_mtf/20260528T083411Z_post_fix/k6_mtf_ranking.json`.
-- **source_sha256 (per promotion manifest):**
-  `cf716b0d1e5ea1d92afb30b6ebe85845a4e19ed276f5fe9f27c58be44f9a5dfa`.
-- **Phase 5 honest-validation report (linked):**
-  `md_library/shared/2026-06-01_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT.md`.
-- **Phase 5 report SHA-256 (verified by promotion helper at
-  write time):**
-  `48efeb072c11a2abfe10eebfccde01604b74fd25f22392e414c8ab30a422e4bd`.
-- **Phase 5G-2 operator accepted-risk decision record:**
-  `md_library/shared/2026-06-01_PHASE_5G_2_OPERATOR_ACCEPTED_RISK_DECISION_RECORD.md`.
-  Phase 5G-2 records the operator-authorized accepted-risk
-  decision for the narrow Mode B derived-only non-commercial
-  public surface. It is NOT legal clearance; counsel review
-  remains pending.
+- **Manifest schema:** `k6_mtf_promotion_manifest_v1`
+- **Promoted fixture schema recorded by manifest:** `k6_mtf_ranking_v2`
+- **promoted_at_utc:** `2026-06-05T03:53:18Z`
+- **promoted_by:** `the operator`
+- **source_artifact_path:**
+  `output/k6_mtf/20260604T110400Z_recook_full248_clean_csv/k6_mtf_ranking_v2_blob_sidecar_public_candidate.json`
+- **operator_approval_marker:** `true`
 
-## Mode B derived-only public surface
+The promotion helper verified the Phase 5 report, report manifest,
+validation sidecar, CCC verification manifest, and slim v2 fixture before
+writing the committed public fixture.
 
-This fixture is part of the Phase 5G-2 Mode B derived-only
-non-commercial public surface. The public surface controls are
-binding:
+## Validation Binding
+
+- **Phase 5 report:**
+  `md_library/shared/2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.md`
+- **Phase 5 report SHA-256:**
+  `1f6e166c7f27dd09b430b4210a885ccebf997865bd3e921bb23e5579516d9c12`
+- **Phase 5 report manifest:**
+  `md_library/shared/2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.manifest.json`
+- **Validation sidecar:**
+  `output/validation/20260604T120000Z_validation_full205/validation.json`
+- **Validation sidecar SHA-256:**
+  `8e48fd56dc2c9f4f16598c2c01b71f2b87e691caf855b53c97fc704baf3871ef`
+- **Validation run id:** `20260604T120000Z_validation_full205`
+- **Methodology:** 10,000 permutations, 10,000 bootstrap samples,
+  99 walk-forward folds, BH primary alpha 0.05, Bonferroni supplementary,
+  bootstrap CI 0.95, validation/methodology contract v1, `rng_seed=null`.
+
+Leaderboard ordering reflects K=6 MTF ranking metrics. Phase 5 validation
+survivorship is disclosed per row and in the validation report; ranking
+position is not a claim that a row cleared the validation gate.
+
+## Phase 5G / Mode B Controls
+
+Phase 5G is SATISFIED-BY-ACCEPTED-RISK under:
+
+`md_library/shared/2026-06-01_PHASE_5G_2_OPERATOR_ACCEPTED_RISK_DECISION_RECORD.md`
+
+This is operator accepted-risk documentation for the narrow Mode B
+derived-only, non-commercial public surface. It is not legal clearance, and
+this fixture does not claim legal clearance.
+
+The binding Mode B controls remain:
 
 - No raw OHLCV.
-- No price charts.
-- No price tables.
-- No downloadable price series.
+- No provider price charts.
+- No provider price tables.
+- No downloadable provider price series.
 - No public raw-data API.
 - No monetization while yfinance remains in the data pipeline.
 
-Any change that breaches these controls reopens Phase 5G and
-requires a dated amendment to the Phase 5G-2 record before the
-change reaches the public surface.
+Any change that breaches these controls reopens Phase 5G.
 
-## Validation disclosure
+## How To Refresh
 
-The K=6 MTF MVP board is a leaderboard ordered by K=6 MTF
-performance metrics (Sharpe and total capture over the
-per-secondary history window). Leaderboard position does NOT
-reflect Phase 5 multiple-comparisons survivorship.
+A future public refresh should use the gated promotion helper. The normal
+flow is:
 
-Of the 8 candidates tested in the Phase 5 honest-validation
-empirical campaign, 4 cleared the Phase 5 Benjamini-Hochberg
-plus empirical-permutation validation gate: AMZN, GOOGL, NVDA,
-TSLA. AAPL, META, MSFT, SPY did not clear the BH gate; META
-was outside the empirical subset (empirical_not_run). The
-Phase 5 honest-validation report carries the per-strategy
-verdicts; the leaderboard ordering reflects K=6 MTF ranking
-metrics rather than per-row validation survivorship.
+1. Produce or validate the candidate K=6 MTF v2 fixture.
+2. Move full-resolution CCC into immutable per-secondary sidecars and write a
+   CCC verification manifest.
+3. Promote the slim fixture with
+   `utils/react_publish/promote_k6_mtf_artifact.py --public --write --operator-approved`.
+4. Re-run the fixture-schema smoke test and frontend validation.
+5. Update this README with the new run id, SHA, sidecar totals, and
+   promotion provenance.
 
-## Why this lives here and not in output/
-
-- `output/` is gitignored at `<PROJECT_DIR>/.gitignore` and is
-  local-only. A clean checkout, a CI deploy, or a fresh dev
-  environment will not have the live artifact on disk.
-- The React Migration Declaration's "artifact is the stable
-  boundary" rule is satisfied: this fixture is a JSON-only,
-  schema-stamped, read-only artifact identical in shape to the
-  upstream K=6 MTF ranking artifact.
-- The React app reads this file via static-asset URL, never via
-  a Python call, never via a `output/` filesystem walk, never
-  via raw signal-library / cache / PKL reads.
-
-## How to refresh
-
-When the operator authorizes a fresh K=6 MTF ranking artifact
-(e.g., after a future K=6 MTF run is verified), a refresh PR
-will:
-
-1. Copy the new live artifact verbatim over this file.
-2. Re-record the SHA-256 above.
-3. Re-run the fixture-schema smoke test.
-4. Update `generated_at_utc` / `run_id` notes here.
-5. Re-run the promotion helper in public mode against the new
-   Phase 5 honest-validation report path/SHA and re-record the
-   public-promotion provenance above.
-
-That PR does NOT change React app code unless the schema
-itself changes; if the schema changes, the contract at
-`project/md_library/shared/2026-05-27_K6_MTF_LAUNCH_PATH_CONTRACT.md`
-must be amended in the same chain.
-
-The operator-run, stdlib-only helper at
-`project/utils/react_publish/promote_k6_mtf_artifact.py`
-implements steps 1-3 plus the PR #367 promotion-manifest
-write under the React Publish / Deploy Contract Option A.
-Dry-run by default. Fail-closed. Public mode hard-refuses
-without a verified Phase 5 honest-validation report. The
-helper does NOT deploy, does NOT mutate `output/`, and does
-NOT change React runtime behavior.
+The helper does not deploy and does not change React runtime behavior.
