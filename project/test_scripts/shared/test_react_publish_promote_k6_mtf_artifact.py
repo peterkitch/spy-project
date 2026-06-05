@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import urllib.request
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,65 @@ from utils.react_publish.promote_k6_mtf_artifact import (  # noqa: E402
     main,
     promote,
 )
+
+
+# ---------------------------------------------------------------------------
+# Network / SDK / token hermeticity guard (autouse, whole module)
+# ---------------------------------------------------------------------------
+
+# Captured as a BOOLEAN ONLY (never the value) at import time -- before any
+# fixture runs -- so the hermeticity regression test can assert that the
+# autouse guard masks a REAL outer-shell token when one is present.
+_OUTER_BLOB_TOKEN_PRESENT_AT_IMPORT = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
+
+
+def _blocked_urlopen(*_args, **_kwargs):
+    """Stand-in for ``urllib.request.urlopen`` that refuses to make a real
+    network call during tests. The only real Blob GET egress in the helper
+    is ``urllib.request.urlopen``; tests must use a mocked client /
+    ``get_callable`` or re-patch ``urlopen`` themselves."""
+    raise AssertionError(
+        "network blocked in tests: urllib.request.urlopen must not be called; "
+        "use a mocked client / get_callable, or re-patch urlopen in-test"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_blob_guard(monkeypatch):
+    """Make every test in this module hermetic against the real Vercel Blob
+    SDK, the real ``BLOB_READ_WRITE_TOKEN``, and the real network -- even when
+    the operator's shell has a live token and the official SDK is installed.
+
+    By default each test runs as if BUILD-ONLY and offline:
+
+    - the real ``BLOB_READ_WRITE_TOKEN`` is removed from the test process;
+    - the real ``vercel.blob`` SDK is made un-importable, so the adapter's
+      lazy ``from vercel.blob import BlobClient`` fails closed;
+    - ``urllib.request.urlopen`` (the only real Blob GET egress) is blocked.
+
+    Because ``monkeypatch`` is the same function-scoped instance shared with
+    the test, per-test opt-ins applied in the test body run AFTER this setup
+    and therefore win:
+
+    - ``_install_fake_vercel(...)`` re-binds ``sys.modules['vercel.blob']`` to
+      a fake module (overriding the poison);
+    - ``monkeypatch.setenv('BLOB_READ_WRITE_TOKEN', <sentinel>)`` supplies a
+      synthetic token;
+    - an injected ``put_callable`` / ``get_callable`` or a mock client avoids
+      the real SDK / urllib entirely;
+    - a test may re-patch ``urllib.request.urlopen`` for a fake GET.
+
+    Teardown is LIFO, so the real token / SDK / urlopen are restored after
+    each test; the production promotion path outside tests is untouched and
+    still uses the real token and SDK.
+    """
+    # 1) Mask any real token (a per-test sentinel can be set afterwards).
+    monkeypatch.delenv("BLOB_READ_WRITE_TOKEN", raising=False)
+    # 2) Block the real SDK import (a fake module can be installed afterwards).
+    monkeypatch.setitem(sys.modules, "vercel.blob", None)
+    # 3) Block the real Blob GET egress (a test can re-patch urlopen).
+    monkeypatch.setattr(urllib.request, "urlopen", _blocked_urlopen)
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -2615,6 +2676,90 @@ def test_extract_blob_put_url_rejects_bad_object_url(bad_url):
 def test_extract_blob_put_url_rejects_unsupported_shape():
     with pytest.raises(helper.BlobClientError):
         helper._extract_blob_put_url(object(), "p")
+
+
+# ===========================================================================
+# amendment: network/SDK/token hermeticity guard (regression)
+# ===========================================================================
+
+
+def test_hermetic_guard_masks_real_outer_blob_token():
+    """The autouse guard removes BLOB_READ_WRITE_TOKEN for the test process.
+    On a machine whose shell had a real token at import (captured as a bool
+    only), this is a direct proof the REAL outer token is masked; on a machine
+    without one it holds trivially."""
+    assert os.environ.get("BLOB_READ_WRITE_TOKEN") is None
+
+
+def test_hermetic_guard_outer_token_was_actually_present_is_masked():
+    """If the outer shell really did carry a token at import, assert it was a
+    real (non-empty) value that the guard then masked -- without ever exposing
+    the value (only the captured boolean is referenced)."""
+    if not _OUTER_BLOB_TOKEN_PRESENT_AT_IMPORT:
+        pytest.skip("no real outer BLOB_READ_WRITE_TOKEN present at import")
+    assert os.environ.get("BLOB_READ_WRITE_TOKEN") is None
+
+
+def test_hermetic_guard_allows_sentinel_optin(monkeypatch):
+    """A test may opt back in to a synthetic sentinel token on top of the
+    masked default."""
+    assert os.environ.get("BLOB_READ_WRITE_TOKEN") is None
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+    assert os.environ["BLOB_READ_WRITE_TOKEN"] == _SENTINEL_TOKEN
+
+
+def test_hermetic_guard_blocks_real_sdk_by_default():
+    """The real ``vercel.blob`` SDK is poisoned to un-importable by default."""
+    assert "vercel.blob" in sys.modules
+    assert sys.modules["vercel.blob"] is None
+
+
+def test_hermetic_guard_fake_sdk_optin_overrides_poison(monkeypatch):
+    """A test can still install a fake ``vercel.blob`` module, overriding the
+    default poison (so SDK call-shape tests keep working without the real
+    SDK)."""
+    rec: dict = {}
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+    _install_fake_vercel(monkeypatch, _recording_blobclient(rec))
+    assert sys.modules["vercel.blob"] is not None
+    pathname = "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json"
+    res = helper.VercelBlobClient().put(pathname, b"{}")
+    assert res == {"url": _BLOB_HOST + pathname, "reused": False}
+    # token still bound only via the constructor; never on put().
+    assert rec["ctor_kwargs"] == {"token": _SENTINEL_TOKEN}
+    assert "token" not in rec["put_kwargs"]
+
+
+def test_hermetic_guard_blocks_urlopen_by_default():
+    """``urllib.request.urlopen`` is blocked, so no test can reach the network
+    even by calling it directly."""
+    with pytest.raises(AssertionError):
+        urllib.request.urlopen(
+            "https://x.public.blob.vercel-storage.com/k6-mtf/RUN/ccc-series/"
+            "AAA." + ("0" * 64) + ".json"
+        )
+
+
+def test_hermetic_guard_unmocked_put_fails_closed_even_with_token(monkeypatch):
+    """Even with a (sentinel) token set, an unmocked ``VercelBlobClient.put``
+    cannot reach the real SDK/network -- it fails closed because the SDK is
+    poisoned. This is the regression for the stray-upload incident."""
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+    with pytest.raises(helper.BlobClientError):
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+
+
+def test_hermetic_guard_real_get_path_cannot_reach_network():
+    """The real ``VercelBlobClient.get`` (urllib) path is blocked by the
+    urlopen guard and fails closed with a token-safe BlobClientError rather
+    than performing a live GET."""
+    with pytest.raises(helper.BlobClientError):
+        helper.VercelBlobClient().get(
+            "https://x.public.blob.vercel-storage.com/k6-mtf/RUN/ccc-series/"
+            "AAA." + ("0" * 64) + ".json"
+        )
 
 
 def test_put_and_verify_put_exception_token_safe():
