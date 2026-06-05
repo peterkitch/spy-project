@@ -1812,3 +1812,400 @@ def test_committed_205_report_no_stale_5g_wording():
     assert _STALE_5G_PHRASE not in text
     assert "separately cleared" not in text
     assert "does not claim legal clearance" in text
+
+
+# ===========================================================================
+# sprint500: CCC full-resolution Vercel Blob sidecars + slim fixture
+# ===========================================================================
+#
+# Mocked Blob client only -- no network, no token, no live upload. Verifies
+# CCC extraction/sidecarization, the immutable-pathname + GET-verify client
+# boundary, slim-fixture validator acceptance/rejection, the manifest
+# provenance/CCC-storage summary, and that no token leaks into any output.
+
+_CCC_POINT = {
+    "date_utc": "2024-01-01",
+    "cumulative_capture_pct": 1.0,
+    "per_bar_capture_pct": 1.0,
+    "trade_direction": "BUY",
+}
+
+
+def _series(n: int) -> list[dict]:
+    return [
+        {
+            "date_utc": f"2024-01-{i + 1:02d}",
+            "cumulative_capture_pct": float(i),
+            "per_bar_capture_pct": 1.0,
+            "trade_direction": "BUY" if i % 2 else "NONE",
+        }
+        for i in range(n)
+    ]
+
+
+class _MockBlobClient:
+    """In-memory Blob client for tests. No network, no token. Enforces
+    no-overwrite; reuses an existing same-content object after GET-verify;
+    raises when an overwrite is required (same pathname, different bytes).
+    Generates allowlisted public Vercel Blob URLs."""
+
+    HOST = "https://faketest123.public.blob.vercel-storage.com/"
+
+    def __init__(self, *, corrupt_get: bool = False) -> None:
+        self.store: dict[str, bytes] = {}
+        self.url_to_path: dict[str, str] = {}
+        self.put_calls: list[dict] = []
+        self.corrupt_get = corrupt_get
+
+    def _url(self, pathname: str) -> str:
+        return self.HOST + pathname
+
+    def put(self, pathname, data, *, overwrite=False):
+        self.put_calls.append({"pathname": pathname, "overwrite": overwrite})
+        url = self._url(pathname)
+        self.url_to_path[url] = pathname
+        if pathname in self.store:
+            if self.store[pathname] == bytes(data):
+                return {"url": url, "reused": True}
+            if not overwrite:
+                raise helper.BlobClientError(
+                    f"object exists and overwrite disabled: {pathname}"
+                )
+        self.store[pathname] = bytes(data)
+        return {"url": url, "reused": False}
+
+    def get(self, url):
+        path = self.url_to_path.get(url)
+        if path is None:
+            raise helper.BlobClientError(f"missing object for url {url}")
+        data = self.store[path]
+        return data + b"X" if self.corrupt_get else data
+
+
+def _v2_two() -> dict:
+    return _build_v2(
+        ["AAA", "BBB"],
+        [_make_strategy("AAA", bh_q=0.01), _make_strategy("BBB", bh_q=0.20)],
+    )
+
+
+def _slim(payload: dict | None = None) -> dict:
+    slim, _ = helper.extract_ccc_to_blob_sidecars(
+        payload or _v2_two(), client=_MockBlobClient(),
+    )
+    return slim
+
+
+# --- sidecar builder -------------------------------------------------------
+
+
+def test_build_ccc_sidecar_metadata_and_canonical_sha():
+    series = _series(3)
+    built = helper.build_ccc_sidecar("RUN", "^GSPC", series)
+    assert built["points"] == 3
+    assert built["first_date"] == "2024-01-01"
+    assert built["last_date"] == "2024-01-03"
+    assert built["sha256"] == hashlib.sha256(built["sidecar_bytes"]).hexdigest()
+    assert built["byte_size"] == len(built["sidecar_bytes"])
+    # immutable pathname embeds the sha and a URL-safe slug ('^' sanitized).
+    assert built["pathname"].startswith("k6-mtf/RUN/ccc-series/")
+    assert built["sha256"] in built["pathname"]
+    assert "^" not in built["pathname"]
+    # canonical bytes are stable -> identical sha on rebuild.
+    assert helper.build_ccc_sidecar("RUN", "^GSPC", series)["sha256"] == built["sha256"]
+
+
+def test_build_ccc_sidecar_full_resolution_not_decimated():
+    series = _series(5000)
+    built = helper.build_ccc_sidecar("RUN", "AAA", series)
+    assert built["points"] == 5000
+    assert built["sidecar_obj"]["ccc_series"] == series
+
+
+def test_build_ccc_sidecar_rejects_raw_ohlcv():
+    bad = [dict(_CCC_POINT, close=123.45)]
+    with pytest.raises(PromotionError):
+        helper.build_ccc_sidecar("RUN", "AAA", bad)
+
+
+def test_build_ccc_sidecar_rejects_unknown_point_key():
+    bad = [dict(_CCC_POINT, mystery_field=1)]
+    with pytest.raises(PromotionError):
+        helper.build_ccc_sidecar("RUN", "AAA", bad)
+
+
+# --- extraction / slimming -------------------------------------------------
+
+
+def test_extract_one_sidecar_per_secondary_and_slim_rows():
+    payload = _v2_two()
+    client = _MockBlobClient()
+    slim, records = helper.extract_ccc_to_blob_sidecars(payload, client=client)
+    assert len(records) == 2
+    assert len(client.store) == 2
+    for row in slim["per_secondary"]:
+        assert row["ccc_series"] == []
+        assert row["ccc_series_source"] == "vercel_blob"
+        assert row["ccc_series_sidecar_schema_version"] == "k6_mtf_ccc_series_sidecar_v1"
+        assert row["ccc_series_url"].startswith(_MockBlobClient.HOST)
+        assert row["ccc_series_sha256"] in row["ccc_series_pathname"]
+        assert isinstance(row["ccc_series_points"], int)
+        assert isinstance(row["ccc_series_byte_size"], int)
+    # slim payload passes the v2 validator.
+    validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_extract_does_not_mutate_input_payload():
+    payload = _v2_two()
+    helper.extract_ccc_to_blob_sidecars(payload, client=_MockBlobClient())
+    # original inline ccc_series is preserved on the input.
+    assert payload["per_secondary"][0]["ccc_series"]
+    assert "ccc_series_source" not in payload["per_secondary"][0]
+
+
+def test_extract_uses_overwrite_disabled():
+    client = _MockBlobClient()
+    helper.extract_ccc_to_blob_sidecars(_v2_two(), client=client)
+    assert client.put_calls
+    assert all(c["overwrite"] is False for c in client.put_calls)
+
+
+def test_extract_reuses_existing_same_hash_object():
+    client = _MockBlobClient()
+    helper.extract_ccc_to_blob_sidecars(_v2_two(), client=client)
+    _, records2 = helper.extract_ccc_to_blob_sidecars(_v2_two(), client=client)
+    assert all(r["reused"] for r in records2)
+    assert all(r["get_verified"] for r in records2)
+
+
+def test_slim_fixture_is_well_under_100mb():
+    slim = _slim()
+    assert len(json.dumps(slim).encode("utf-8")) < 100 * 1024 * 1024
+
+
+# --- client boundary (put + GET-verify) ------------------------------------
+
+
+def _built_one():
+    return helper.build_ccc_sidecar("RUN", "AAA", _series(2))
+
+
+def test_put_and_verify_returns_url_on_success():
+    built = _built_one()
+    res = helper.put_and_verify_sidecar(
+        _MockBlobClient(), built["pathname"], built["sidecar_bytes"], built["sha256"],
+    )
+    assert res["url"].startswith(_MockBlobClient.HOST)
+    assert res["reused"] is False
+
+
+def test_put_and_verify_get_hash_mismatch_fails_closed():
+    built = _built_one()
+    with pytest.raises(helper.BlobClientError):
+        helper.put_and_verify_sidecar(
+            _MockBlobClient(corrupt_get=True),
+            built["pathname"], built["sidecar_bytes"], built["sha256"],
+        )
+
+
+def test_put_and_verify_overwrite_required_fails_closed():
+    built = _built_one()
+    client = _MockBlobClient()
+    client.store[built["pathname"]] = b"different-bytes"
+    client.url_to_path[client._url(built["pathname"])] = built["pathname"]
+    with pytest.raises(helper.BlobClientError):
+        helper.put_and_verify_sidecar(
+            client, built["pathname"], built["sidecar_bytes"], built["sha256"],
+        )
+
+
+def test_put_and_verify_rejects_non_allowlisted_host():
+    class _BadHost(_MockBlobClient):
+        def put(self, pathname, data, *, overwrite=False):
+            return {"url": "https://evil.example.com/" + pathname, "reused": False}
+
+    built = _built_one()
+    with pytest.raises(helper.BlobClientError):
+        helper.put_and_verify_sidecar(
+            _BadHost(), built["pathname"], built["sidecar_bytes"], built["sha256"],
+        )
+
+
+def test_vercel_blob_client_put_without_callable_fails_closed():
+    with pytest.raises(helper.BlobClientError):
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+
+
+# --- v2 validator: slim-row acceptance + rejection -------------------------
+
+
+def test_validator_accepts_slim_blob_rows():
+    validate_k6_mtf_ranking_v2_payload(_slim())  # no raise
+
+
+def test_validator_rejects_nonempty_ccc_on_blob_row():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series"] = [_CCC_POINT]
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_unknown_ccc_source():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_source"] = "s3_bucket"
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_missing_url():
+    slim = _slim()
+    del slim["per_secondary"][0]["ccc_series_url"]
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_bad_url_host():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_url"] = "https://evil.example.com/x.json"
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_non_https_url():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_url"] = (
+        "http://faketest123.public.blob.vercel-storage.com/x.json"
+    )
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_bad_sha():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_sha256"] = "not-a-sha"
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_bad_pathname_scheme():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_pathname"] = "wherever/x.json"
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_bad_points_type():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_points"] = -1
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_zero_byte_size():
+    slim = _slim()
+    slim["per_secondary"][0]["ccc_series_byte_size"] = 0
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_rejects_inconsistent_sha_not_in_pathname():
+    slim = _slim()
+    # a 64-hex sha that does not appear in the pathname.
+    slim["per_secondary"][0]["ccc_series_sha256"] = "a" * 64
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+# --- binding still accepts a slim fixture ----------------------------------
+
+
+def test_v2_binding_accepts_slim_fixture(tmp_path):
+    w = _phase5_world(tmp_path)
+    slim, _ = helper.extract_ccc_to_blob_sidecars(w["fixture"], client=_MockBlobClient())
+    w["fixture"] = slim
+    _bind(w)  # no raise -- counts/metadata preserved by slimming
+
+
+# --- promotion manifest: schema provenance + CCC storage summary -----------
+
+
+def test_promote_v2_slim_manifest_provenance_and_storage(tmp_path):
+    w = _phase5_world(tmp_path)
+    slim, _ = helper.extract_ccc_to_blob_sidecars(w["fixture"], client=_MockBlobClient())
+    w["fixture"] = slim
+    inputs = _v2_promote_inputs(w, tmp_path, write=True, operator_approved=True)
+    promote(inputs)
+    m = json.loads(inputs.manifest_destination_path.read_text(encoding="utf-8"))
+    assert m["schema_version"] == "k6_mtf_ranking_v2"
+    assert m["promotion_manifest_schema_version"] == "k6_mtf_promotion_manifest_v1"
+    assert m["source_sha256"] == helper._compute_sha256(inputs.source_path)
+    storage = m["ccc_series_storage"]
+    assert storage["mode"] == "vercel_blob_sidecars"
+    assert storage["sidecar_schema_version"] == "k6_mtf_ccc_series_sidecar_v1"
+    assert storage["sidecar_count"] == 2
+    assert storage["all_sidecars_get_verified"] is True
+    assert storage["url_host_allowlist"] == ["*.public.blob.vercel-storage.com"]
+    # written public fixture rows are slim.
+    fx = json.loads(inputs.destination_path.read_text(encoding="utf-8"))
+    assert all(r["ccc_series"] == [] for r in fx["per_secondary"])
+    assert all(r.get("ccc_series_source") == "vercel_blob" for r in fx["per_secondary"])
+
+
+def test_v1_promote_manifest_records_v1_schema_and_marker(tmp_path):
+    # The schema-provenance fix must keep v1 promotions recording v1.
+    payload = _make_artifact([_make_secondary("AAA", rank=1)])
+    source, root = _write_source(tmp_path, payload)
+    inputs = PromotionInputs(
+        source_path=source,
+        destination_path=root / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.json",
+        manifest_destination_path=(
+            root / "frontend" / "public" / "fixtures"
+            / "k6_mtf_ranking.promotion_manifest.json"
+        ),
+        project_root=root,
+        public_mode=False,
+        phase5_report_path=None,
+        phase5_report_sha256=None,
+        write=True,
+        operator_approved=True,
+    )
+    promote(inputs)
+    m = json.loads(inputs.manifest_destination_path.read_text(encoding="utf-8"))
+    assert m["schema_version"] == "k6_mtf_ranking_v1"
+    assert m["promotion_manifest_schema_version"] == "k6_mtf_promotion_manifest_v1"
+    assert "ccc_series_storage" not in m
+
+
+# --- no token leakage ------------------------------------------------------
+
+
+def test_no_blob_token_leaks_into_outputs(monkeypatch, tmp_path):
+    sentinel = "vercel_blob_rw_SENTINELTOKEN_DO_NOT_LEAK"
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", sentinel)
+    w = _phase5_world(tmp_path)
+    client = _MockBlobClient()
+    slim, records = helper.extract_ccc_to_blob_sidecars(w["fixture"], client=client)
+    blob = json.dumps(slim) + json.dumps(records)
+    for data in client.store.values():
+        blob += data.decode("utf-8")
+    assert sentinel not in blob
+    # put without callable raises before touching the token; message clean.
+    with pytest.raises(helper.BlobClientError) as ei:
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+    assert sentinel not in str(ei.value)
+    # with an injected callable the token is passed in-process but never
+    # stored on the client instance.
+    seen: dict = {}
+
+    def _cb(pathname, data, *, overwrite, token):
+        seen["token"] = token
+        return {"url": _MockBlobClient.HOST + pathname, "reused": False}
+
+    vc = helper.VercelBlobClient(put_callable=_cb)
+    vc.put("k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}")
+    assert seen["token"] == sentinel
+    assert all(sentinel not in str(v) for v in vars(vc).values())

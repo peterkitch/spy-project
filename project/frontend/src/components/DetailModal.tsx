@@ -1,5 +1,10 @@
-import { useEffect, useRef } from "react";
-import type { PerSecondary, PerSecondaryIssue } from "../types";
+import { useEffect, useRef, useState } from "react";
+import type { CccPoint, PerSecondary, PerSecondaryIssue } from "../types";
+import {
+  type CccLoadResult,
+  loadCccSeries,
+  rowUsesBlobSidecar,
+} from "../cccSidecar";
 import {
   DISCLAIMER,
   K6_MTF_RANKING_VS_VALIDATION_NOTE,
@@ -97,7 +102,7 @@ export function DetailModal({
         </section>
         {renderSnapshot(row)}
         {renderStack(row)}
-        {renderCcc(row)}
+        <CccSection row={row} />
         {renderMetrics(row)}
         {renderValidation(row)}
         {renderCounts(row)}
@@ -152,17 +157,67 @@ function renderStack(row: PerSecondary): JSX.Element {
   );
 }
 
-function renderCcc(row: PerSecondary): JSX.Element {
-  const series = Array.isArray(row.ccc_series) ? row.ccc_series : [];
+// CCC chart section. For a Blob-sourced slim row the full-resolution series
+// is lazy-loaded from the immutable sidecar URL when the modal opens; the
+// board render never blocks on it. Legacy / test / v1 fixtures that carry
+// ccc_series inline keep rendering synchronously (no fetch).
+function CccSection({ row }: { row: PerSecondary }): JSX.Element {
+  const usesBlob = rowUsesBlobSidecar(row);
+  const [loaded, setLoaded] = useState<CccLoadResult | null>(null);
+
+  useEffect(() => {
+    if (!usesBlob) {
+      return;
+    }
+    let cancelled = false;
+    setLoaded(null);
+    void loadCccSeries(row).then((result) => {
+      if (!cancelled) {
+        setLoaded(result);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [usesBlob, row]);
+
+  let series: CccPoint[] = [];
+  let errorNote: string | null = null;
+  let loading = false;
+  if (!usesBlob) {
+    series = Array.isArray(row.ccc_series) ? row.ccc_series : [];
+  } else if (loaded === null) {
+    loading = true;
+  } else if (loaded.kind === "ok") {
+    series = loaded.series;
+  } else if (loaded.kind === "error") {
+    errorNote = `CCC chart unavailable: ${loaded.message}`;
+  }
+  // loaded.kind === "empty" falls through with an empty series, which the
+  // chart renders as its standard "no matching bars" empty state.
+
   const first = series[0];
   const last = series[series.length - 1];
   const summary = series.length > 0 && first && last
     ? `CCC summary: first ${first.date_utc} = ${formatNumber(first.cumulative_capture_pct)}, last ${last.date_utc} = ${formatNumber(last.cumulative_capture_pct)}, len = ${series.length}`
     : null;
+
   return (
     <section id="k6mtf-modal-ccc" className="modal-section">
       <strong>{"Cumulative Capture Chart (K=6 MTF)"}</strong>
-      <CccStepChart series={series} secondary={row.secondary || ""} />
+      {loading && (
+        <div id="k6mtf-modal-ccc-loading" className="modal-ccc-summary">
+          {"Loading cumulative-capture chart..."}
+        </div>
+      )}
+      {errorNote && (
+        <div id="k6mtf-modal-ccc-error" className="ccc-empty">
+          {errorNote}
+        </div>
+      )}
+      {!loading && !errorNote && (
+        <CccStepChart series={series} secondary={row.secondary || ""} />
+      )}
       {summary && (
         <div id="k6mtf-modal-ccc-summary" className="modal-ccc-summary">
           {summary}

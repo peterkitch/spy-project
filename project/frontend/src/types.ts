@@ -91,6 +91,35 @@ export interface PerSecondary {
   validation_strategy_id?: string;
   validation_run_id?: string | null;
   validation_artifact_sha256?: string | null;
+  // --- CCC Blob-sidecar metadata (present only when the full-resolution
+  // CCC series was moved off-repo into an immutable Vercel Blob sidecar).
+  // When ccc_series_source === "vercel_blob", ccc_series is [] inline and
+  // the chart lazy-loads the full series from ccc_series_url. ---
+  ccc_series_source?: typeof CCC_SERIES_SOURCE_BLOB;
+  ccc_series_sidecar_schema_version?: typeof CCC_SIDECAR_SCHEMA_VERSION;
+  ccc_series_url?: string;
+  ccc_series_pathname?: string;
+  ccc_series_sha256?: string;
+  ccc_series_byte_size?: number;
+  ccc_series_points?: number;
+  ccc_series_first_date?: string | null;
+  ccc_series_last_date?: string | null;
+}
+
+// CCC Blob sidecar marker constants (mirror the promotion helper).
+export const CCC_SERIES_SOURCE_BLOB = "vercel_blob" as const;
+export const CCC_SIDECAR_SCHEMA_VERSION = "k6_mtf_ccc_series_sidecar_v1" as const;
+
+// Canonical sidecar object shape fetched from ccc_series_url. The full
+// (never-decimated) CCC series lives here, off-repo.
+export interface CccSidecar {
+  schema_version: typeof CCC_SIDECAR_SCHEMA_VERSION;
+  ranking_run_id: string;
+  secondary: string;
+  ccc_series_points: number;
+  ccc_series_first_date: string | null;
+  ccc_series_last_date: string | null;
+  ccc_series: CccPoint[];
 }
 
 // --- v2 top-level validation blocks (optional on the artifact) ---
