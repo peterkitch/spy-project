@@ -125,3 +125,19 @@ webdriver-manager==4.0.2
 
 # Testing
 pytest==8.3.5
+
+# Vercel Blob SDK -- off-repo CCC sidecar uploads (LIVE K=6 MTF promotion
+# path only; NOT used by the audit/test runtime). Strict pins kept in
+# lockstep with environment.yml per the dependency-spec guard.
+vercel==0.5.9
+vercel-workers==0.0.24
+httpx==0.28.1
+httpcore==1.0.9
+anyio==4.13.0
+cbor2==5.9.0
+pydantic==2.11.7
+pydantic-core==2.33.2
+annotated-types==0.7.0
+typing-inspection==0.4.1
+python-dotenv==1.1.1
+h11==0.16.0
