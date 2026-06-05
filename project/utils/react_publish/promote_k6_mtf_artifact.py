@@ -1372,10 +1372,10 @@ def put_and_verify_sidecar(
         result = client.put(pathname, data, overwrite=False)
     except BlobClientError:
         raise
-    except Exception as exc:  # ambiguous client behavior -> fail closed
+    except Exception as exc:  # token-safe: type name only, no str(exc)
         raise BlobClientError(
-            f"Blob put failed for {pathname!r}: {type(exc).__name__}: {exc}"
-        ) from exc
+            f"Blob put failed for {pathname!r}: {type(exc).__name__}"
+        ) from None
     if not isinstance(result, dict):
         raise BlobClientError(f"Blob put returned non-dict for {pathname!r}")
     url = result.get("url")
@@ -1401,10 +1401,10 @@ def put_and_verify_sidecar(
         fetched = client.get(url)
     except BlobClientError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # token-safe: type name only, no str(exc)
         raise BlobClientError(
-            f"Blob GET-verify failed for {url!r}: {type(exc).__name__}: {exc}"
-        ) from exc
+            f"Blob GET-verify failed for {url!r}: {type(exc).__name__}"
+        ) from None
     if not isinstance(fetched, (bytes, bytearray)):
         raise BlobClientError(f"Blob GET returned non-bytes for {url!r}")
     actual = _sha256_bytes(bytes(fetched))
@@ -1740,12 +1740,15 @@ class VercelBlobClient:
         """Lazy official Vercel Blob SDK adapter. The SDK is imported ONLY
         here (never at module import) and is NOT required for tests. Per the
         official docs the package is ``vercel`` (``pip install vercel``) with
-        ``from vercel.blob import BlobClient``. Immutable upload:
-        ``add_random_suffix=False`` so the returned URL path equals the
-        requested pathname (put_and_verify re-checks this)."""
+        ``from vercel.blob import BlobClient``; the client is constructed
+        WITHOUT a token and the token is passed to ``client.put(...,
+        token=token)``. Immutable upload: ``add_random_suffix=False`` so the
+        returned URL path equals the requested pathname (put_and_verify
+        re-checks this)."""
         try:
             from vercel.blob import BlobClient  # noqa: PLC0415  (lazy by design)
         except Exception as exc:  # SDK absent / import error -> fail closed
+            # ImportError carries no token; keep the cause for debuggability.
             raise BlobClientError(
                 "official Vercel Blob SDK is unavailable "
                 "(pip install vercel; from vercel.blob import BlobClient); "
@@ -1753,16 +1756,21 @@ class VercelBlobClient:
             ) from exc
         token = self._token()
         try:
-            client = BlobClient(token=token)
+            client = BlobClient()
             result = client.put(
-                pathname, data,
-                access="public", add_random_suffix=False, overwrite=overwrite,
+                pathname,
+                data,
+                access="public",
+                add_random_suffix=False,
+                overwrite=overwrite,
+                content_type="application/json",
+                token=token,
             )
-        except Exception as exc:  # never surface token-bearing detail
+        except Exception as exc:  # token-safe: type name only, suppress cause
             raise BlobClientError(
                 f"Vercel Blob SDK put failed for {pathname!r}: "
                 f"{type(exc).__name__}"
-            ) from exc
+            ) from None
         url = getattr(result, "url", None)
         if url is None and isinstance(result, dict):
             url = result.get("url")
@@ -1780,10 +1788,10 @@ class VercelBlobClient:
         try:
             with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
                 return resp.read()
-        except Exception as exc:
+        except Exception as exc:  # token-safe: type name only, no str(exc)
             raise BlobClientError(
-                f"HTTPS GET failed for {url!r}: {type(exc).__name__}: {exc}"
-            ) from exc
+                f"HTTPS GET failed for {url!r}: {type(exc).__name__}"
+            ) from None
 
 
 # ---------------------------------------------------------------------------

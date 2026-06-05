@@ -2420,3 +2420,110 @@ def test_no_token_in_verification_manifest(monkeypatch):
     slim, records = _extract_with_records()
     vman = helper.build_ccc_verification_manifest(slim, records)
     assert "SENTINELTOKEN" not in json.dumps(vman)
+
+
+# ===========================================================================
+# amendment: Vercel Blob SDK adapter call shape + token-safe exceptions
+# ===========================================================================
+
+_SENTINEL_TOKEN = "vercel_blob_rw_SENTINELTOKEN_DO_NOT_LEAK"
+_BLOB_HOST = "https://faketest123.public.blob.vercel-storage.com/"
+
+
+def _install_fake_vercel(monkeypatch, blobclient_cls):
+    """Inject a mock ``vercel.blob`` module so the lazy ``from vercel.blob
+    import BlobClient`` in _sdk_put resolves without the real SDK."""
+    import types as _types
+
+    pkg = _types.ModuleType("vercel")
+    sub = _types.ModuleType("vercel.blob")
+    sub.BlobClient = blobclient_cls
+    pkg.blob = sub
+    monkeypatch.setitem(sys.modules, "vercel", pkg)
+    monkeypatch.setitem(sys.modules, "vercel.blob", sub)
+
+
+def _recording_blobclient(record: dict):
+    class _RecordingBlobClient:
+        def __init__(self, *args, **kwargs):
+            record["ctor_args"] = args
+            record["ctor_kwargs"] = kwargs
+
+        def put(self, pathname, data, **kwargs):
+            record["put_pathname"] = pathname
+            record["put_kwargs"] = kwargs
+            return {"url": _BLOB_HOST + pathname}
+
+    return _RecordingBlobClient
+
+
+def test_sdk_adapter_call_shape(monkeypatch):
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+    rec: dict = {}
+    _install_fake_vercel(monkeypatch, _recording_blobclient(rec))
+    pathname = "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json"
+    res = helper.VercelBlobClient().put(pathname, b"{}")
+    # BlobClient constructed WITHOUT token (no constructor args).
+    assert rec["ctor_args"] == ()
+    assert rec["ctor_kwargs"] == {}
+    # token + documented kwargs passed to client.put(...).
+    assert rec["put_pathname"] == pathname
+    pk = rec["put_kwargs"]
+    assert pk["token"] == _SENTINEL_TOKEN
+    assert pk["access"] == "public"
+    assert pk["add_random_suffix"] is False
+    assert pk["overwrite"] is False
+    assert pk["content_type"] == "application/json"
+    assert res == {"url": _BLOB_HOST + pathname, "reused": False}
+
+
+def test_sdk_adapter_error_message_token_safe(monkeypatch):
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+
+    class _BoomClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def put(self, pathname, data, **kwargs):
+            # SDK exception text that embeds the token.
+            raise RuntimeError("upstream failure token=" + kwargs.get("token", ""))
+
+    _install_fake_vercel(monkeypatch, _BoomClient)
+    with pytest.raises(helper.BlobClientError) as ei:
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+    assert _SENTINEL_TOKEN not in str(ei.value)
+    assert "RuntimeError" in str(ei.value)
+
+
+def test_put_and_verify_put_exception_token_safe():
+    class _PutBoom:
+        def put(self, pathname, data, *, overwrite=False):
+            raise RuntimeError("boom " + _SENTINEL_TOKEN)
+
+        def get(self, url):  # pragma: no cover - must not be reached
+            raise AssertionError("GET must not run after put failure")
+
+    built = _built_one()
+    with pytest.raises(helper.BlobClientError) as ei:
+        helper.put_and_verify_sidecar(
+            _PutBoom(), built["pathname"], built["sidecar_bytes"], built["sha256"],
+        )
+    assert _SENTINEL_TOKEN not in str(ei.value)
+
+
+def test_put_and_verify_get_exception_token_safe():
+    class _GetBoom:
+        def put(self, pathname, data, *, overwrite=False):
+            return {"url": _BLOB_HOST + pathname, "reused": False}
+
+        def get(self, url):
+            raise RuntimeError("boom " + _SENTINEL_TOKEN)
+
+    built = _built_one()
+    with pytest.raises(helper.BlobClientError) as ei:
+        helper.put_and_verify_sidecar(
+            _GetBoom(), built["pathname"], built["sidecar_bytes"], built["sha256"],
+        )
+    assert _SENTINEL_TOKEN not in str(ei.value)
