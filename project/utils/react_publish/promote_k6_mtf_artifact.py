@@ -61,6 +61,7 @@ import re
 import shutil
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -147,6 +148,10 @@ class PromotionInputs:
     phase5_report_manifest_path: Path | None = None
     validation_sidecar_path: Path | None = None
     validation_sidecar_sha256: str | None = None
+    # CCC Blob-sidecar GET-verification proof (required only for a
+    # Blob-sourced slim v2 public promotion). Default None keeps existing
+    # v1 / inline-v2 promotions backward-compatible.
+    ccc_sidecar_verification_manifest_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +201,26 @@ def _resolve_project_relative_source(
     if not rel_str.startswith("output/"):
         raise PromotionError(
             f"source artifact must live under <PROJECT_DIR>/output/; got: {rel_str}"
+        )
+    return rel_str
+
+
+def _project_relative_output_path(
+    path: Path, project_root: Path, *, label: str,
+) -> str:
+    """Project-relative POSIX path for an ``output/`` artifact, refusing any
+    path outside ``<PROJECT_DIR>/output/`` (privacy: no machine paths leak
+    into the public manifest)."""
+    try:
+        rel = Path(path).resolve().relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise PromotionError(
+            f"{label} must live under <PROJECT_DIR>/output/; got: {path!s}"
+        ) from exc
+    rel_str = rel.as_posix()
+    if not rel_str.startswith("output/"):
+        raise PromotionError(
+            f"{label} must live under <PROJECT_DIR>/output/; got: {rel_str}"
         )
     return rel_str
 
@@ -424,6 +449,30 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _CCC_SIDECAR_PATHNAME_RE = re.compile(
     r"^k6-mtf/[A-Za-z0-9._-]+/ccc-series/[A-Za-z0-9._-]+\.[0-9a-f]{64}\.json$"
 )
+# Host-only allowlist (used with urlsplit to bind ccc_series_url to the
+# row's ccc_series_pathname).
+_VERCEL_BLOB_HOST_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9.-]*\.public\.blob\.vercel-storage\.com$"
+)
+
+# Off-repo CCC sidecar verification-record artifact (LIVE-time proof that
+# every sidecar was uploaded/reused and GET-verified). Produced by the
+# extraction/upload path; consumed by the gated public promotion. It is the
+# ONLY thing that may set ccc_series_storage.all_sidecars_get_verified=true.
+CCC_VERIFICATION_SCHEMA_VERSION = "k6_mtf_ccc_sidecar_verification_v1"
+# Fields a verification record must carry and bind to a slim fixture row.
+CCC_VERIFICATION_RECORD_FIELDS = (
+    "secondary",
+    "pathname",
+    "url",
+    "sha256",
+    "byte_size",
+    "points",
+    "first_date",
+    "last_date",
+    "reused",
+    "get_verified",
+)
 
 
 def _validate_metadata_path_field(field: str, value: Any) -> None:
@@ -432,6 +481,30 @@ def _validate_metadata_path_field(field: str, value: Any) -> None:
     if value is None:
         return
     _validate_path_field("validation_metadata", field, value)
+
+
+def _parse_blob_url_path(url: Any) -> tuple[str | None, str | None]:
+    """Parse a public Vercel Blob URL and return ``(object_pathname, None)``
+    on success, or ``(None, reason)`` on any failure. The object pathname is
+    the URL path with the leading slash removed -- it must equal the row's
+    ``ccc_series_pathname``. Uses real URL parsing (not string slicing) and
+    enforces HTTPS + the host allowlist."""
+    if not isinstance(url, str) or not url:
+        return None, "url is not a non-empty string"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError as exc:
+        return None, f"url unparseable: {exc}"
+    if parsed.scheme != "https":
+        return None, "url scheme is not https"
+    if not _VERCEL_BLOB_HOST_RE.match(parsed.netloc):
+        return None, "url host is not an allowlisted Vercel Blob public host"
+    if parsed.query or parsed.fragment:
+        return None, "url must not carry a query or fragment"
+    path = parsed.path.lstrip("/")
+    if not path:
+        return None, "url has no object path"
+    return path, None
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -515,6 +588,20 @@ def _validate_ccc_blob_sidecar_metadata(sec: str, row: dict) -> None:
     if sha not in pathname:
         raise PromotionError(
             f"per_secondary {sec!r} ccc_series_pathname must embed its sha256"
+        )
+    # Bind url <-> pathname <-> sha: the URL's object path (parsed, not
+    # string-sliced) must equal the pathname exactly, so the URL carries the
+    # same sha through the pathname. This rejects a row whose URL points at a
+    # different object than its declared pathname/sha.
+    url_path, reason = _parse_blob_url_path(url)
+    if url_path is None:
+        raise PromotionError(
+            f"per_secondary {sec!r} ccc_series_url is invalid: {reason}"
+        )
+    if url_path != pathname:
+        raise PromotionError(
+            f"per_secondary {sec!r} ccc_series_url path {url_path!r} does not "
+            f"match ccc_series_pathname {pathname!r}"
         )
     if not _validate_int(row.get("ccc_series_points"), positive=False):
         raise PromotionError(
@@ -1193,27 +1280,36 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _assert_sidecar_no_raw_price(secondary: str, ccc_series: list) -> None:
-    """Mode B: a CCC sidecar may carry derived capture fields only. Reject
-    any raw-OHLCV key and any non-derived/unknown key in a point."""
+def _validate_ccc_points(secondary: str, ccc_series: list) -> None:
+    """Mode B + shape: every CCC point must be a JSON object carrying
+    EXACTLY the four derived capture fields -- no missing required field, no
+    unexpected/non-derived field, and no raw-OHLCV key. Full-resolution
+    fidelity is preserved; this only validates, never transforms."""
     if not isinstance(ccc_series, list):
         raise PromotionError(
             f"ccc sidecar for {secondary!r}: ccc_series must be a list"
         )
-    allowed = set(CCC_POINT_REQUIRED_FIELDS)
+    required = set(CCC_POINT_REQUIRED_FIELDS)
     for i, point in enumerate(ccc_series):
         if not isinstance(point, dict):
             raise PromotionError(
                 f"ccc sidecar for {secondary!r}: point {i} is not an object"
             )
-        keys_lower = {str(k).lower() for k in point.keys()}
+        keys = set(point.keys())
+        keys_lower = {str(k).lower() for k in keys}
         bad = keys_lower & CCC_OHLCV_FORBIDDEN_KEYS
         if bad:
             raise PromotionError(
                 f"ccc sidecar for {secondary!r}: forbidden raw-price key(s) "
                 f"{sorted(bad)!r} in point {i}"
             )
-        extra = set(point.keys()) - allowed
+        missing = required - keys
+        if missing:
+            raise PromotionError(
+                f"ccc sidecar for {secondary!r}: point {i} missing required "
+                f"derived field(s) {sorted(missing)!r}"
+            )
+        extra = keys - required
         if extra:
             raise PromotionError(
                 f"ccc sidecar for {secondary!r}: unexpected non-derived key(s) "
@@ -1228,7 +1324,7 @@ def build_ccc_sidecar(
     secondary. Does NOT upload. Full-resolution: the entire ``ccc_series``
     is carried verbatim (never decimated/truncated)."""
     series = list(ccc_series or [])
-    _assert_sidecar_no_raw_price(secondary, series)
+    _validate_ccc_points(secondary, series)
     points = len(series)
     first_date = series[0].get("date_utc") if points else None
     last_date = series[-1].get("date_utc") if points else None
@@ -1287,6 +1383,19 @@ def put_and_verify_sidecar(
         raise BlobClientError(
             f"Blob put returned a non-allowlisted public URL for {pathname!r}: "
             f"{url!r}"
+        )
+    # Bind the returned URL to the requested pathname BEFORE trusting/GETting
+    # it: the URL's object path must equal the pathname we asked to upload.
+    url_path, reason = _parse_blob_url_path(url)
+    if url_path is None:
+        raise BlobClientError(
+            f"Blob put returned an unparseable/invalid URL for {pathname!r}: "
+            f"{reason}"
+        )
+    if url_path != pathname:
+        raise BlobClientError(
+            f"Blob put returned a URL for a different object: requested "
+            f"{pathname!r}, URL path {url_path!r}"
         )
     try:
         fetched = client.get(url)
@@ -1358,16 +1467,203 @@ def extract_ccc_to_blob_sidecars(
             "sha256": built["sha256"],
             "byte_size": built["byte_size"],
             "points": built["points"],
+            "first_date": built["first_date"],
+            "last_date": built["last_date"],
             "reused": put["reused"],
             "get_verified": True,
         })
     return slim, records
 
 
-def _derive_ccc_storage_summary(payload: dict) -> dict | None:
+def _payload_has_blob_sidecars(payload: Any) -> bool:
+    rows = payload.get("per_secondary") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return False
+    return any(
+        isinstance(r, dict) and r.get("ccc_series_source") == CCC_SERIES_SOURCE_BLOB
+        for r in rows
+    )
+
+
+def build_ccc_verification_manifest(
+    payload: dict, records: list, *, ranking_run_id: str | None = None,
+) -> dict:
+    """Build the off-repo CCC sidecar verification manifest from extraction
+    records. This is the LIVE-time PROOF object that every sidecar was
+    uploaded/reused and GET-verified. Does NOT write a file."""
+    run_id = ranking_run_id or payload.get("run_id")
+    recs = [dict(r) for r in records]
+    return {
+        "schema_version": CCC_VERIFICATION_SCHEMA_VERSION,
+        "ranking_run_id": run_id,
+        "sidecar_schema_version": CCC_SIDECAR_SCHEMA_VERSION,
+        "sidecar_count": len(recs),
+        "total_sidecar_bytes": sum(int(r.get("byte_size") or 0) for r in recs),
+        "total_sidecar_points": sum(int(r.get("points") or 0) for r in recs),
+        "largest_sidecar_bytes": max(
+            (int(r.get("byte_size") or 0) for r in recs), default=0,
+        ),
+        "records": recs,
+    }
+
+
+def _load_ccc_verification_manifest(path: Path) -> dict:
+    p = Path(path)
+    if not p.is_file():
+        raise PromotionError(f"CCC verification manifest does not exist: {p!s}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PromotionError(
+            f"CCC verification manifest unreadable/invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise PromotionError("CCC verification manifest root is not a JSON object")
+    return data
+
+
+def validate_ccc_verification_against_fixture(
+    payload: dict, manifest: dict,
+) -> dict:
+    """Validate a CCC sidecar verification manifest against a slim v2
+    fixture. Fail-closed (PromotionError) on schema/run-id mismatch, missing
+    record fields, ``get_verified`` not true, duplicate
+    secondary/pathname/url/sha256 records, count mismatch, an unmatched
+    record, or ANY per-field disagreement with the slim fixture rows.
+    Returns a proof summary dict on success."""
+    if not isinstance(manifest, dict):
+        raise PromotionError("CCC verification manifest is not a JSON object")
+    if manifest.get("schema_version") != CCC_VERIFICATION_SCHEMA_VERSION:
+        raise PromotionError(
+            "CCC verification manifest schema_version must be "
+            f"{CCC_VERIFICATION_SCHEMA_VERSION!r}; got "
+            f"{manifest.get('schema_version')!r}"
+        )
+    if manifest.get("sidecar_schema_version") != CCC_SIDECAR_SCHEMA_VERSION:
+        raise PromotionError(
+            "CCC verification manifest sidecar_schema_version must be "
+            f"{CCC_SIDECAR_SCHEMA_VERSION!r}; got "
+            f"{manifest.get('sidecar_schema_version')!r}"
+        )
+    if manifest.get("ranking_run_id") != payload.get("run_id"):
+        raise PromotionError(
+            "CCC verification manifest ranking_run_id does not match the "
+            f"fixture run_id: manifest {manifest.get('ranking_run_id')!r}, "
+            f"fixture {payload.get('run_id')!r}"
+        )
+    records = manifest.get("records")
+    if not isinstance(records, list) or not records:
+        raise PromotionError(
+            "CCC verification manifest 'records' must be a non-empty list"
+        )
+    by_sec: dict = {}
+    seen_path: set = set()
+    seen_url: set = set()
+    seen_sha: set = set()
+    for r in records:
+        if not isinstance(r, dict):
+            raise PromotionError("CCC verification record is not a JSON object")
+        missing = [k for k in CCC_VERIFICATION_RECORD_FIELDS if k not in r]
+        if missing:
+            raise PromotionError(
+                f"CCC verification record missing fields: {missing!r}"
+            )
+        if r.get("get_verified") is not True:
+            raise PromotionError(
+                "CCC verification record get_verified must be true for "
+                f"{r.get('secondary')!r}; got {r.get('get_verified')!r}"
+            )
+        sec = r.get("secondary")
+        if sec in by_sec:
+            raise PromotionError(
+                f"duplicate CCC verification record for secondary {sec!r}"
+            )
+        for val, seen, label in (
+            (r.get("pathname"), seen_path, "pathname"),
+            (r.get("url"), seen_url, "url"),
+            (r.get("sha256"), seen_sha, "sha256"),
+        ):
+            if val in seen:
+                raise PromotionError(
+                    f"duplicate CCC verification record {label}: {val!r}"
+                )
+            seen.add(val)
+        by_sec[sec] = r
+    blob_rows = [
+        row for row in (payload.get("per_secondary") or [])
+        if isinstance(row, dict)
+        and row.get("ccc_series_source") == CCC_SERIES_SOURCE_BLOB
+    ]
+    if not blob_rows:
+        raise PromotionError(
+            "CCC verification requested but the fixture has no Blob-sourced rows"
+        )
+    if len(records) != len(blob_rows):
+        raise PromotionError(
+            f"CCC verification record count {len(records)} != Blob-sourced "
+            f"row count {len(blob_rows)}"
+        )
+    field_map = {
+        "pathname": "ccc_series_pathname",
+        "url": "ccc_series_url",
+        "sha256": "ccc_series_sha256",
+        "byte_size": "ccc_series_byte_size",
+        "points": "ccc_series_points",
+        "first_date": "ccc_series_first_date",
+        "last_date": "ccc_series_last_date",
+    }
+    matched: set = set()
+    for row in blob_rows:
+        sec = row.get("secondary")
+        rec = by_sec.get(sec)
+        if rec is None:
+            raise PromotionError(
+                f"no CCC verification record for Blob-sourced row {sec!r}"
+            )
+        for rkey, fkey in field_map.items():
+            if rec.get(rkey) != row.get(fkey):
+                raise PromotionError(
+                    f"CCC verification record {rkey} for {sec!r} "
+                    f"({rec.get(rkey)!r}) does not match fixture {fkey} "
+                    f"({row.get(fkey)!r})"
+                )
+        matched.add(sec)
+    extra = set(by_sec) - matched
+    if extra:
+        raise PromotionError(
+            f"CCC verification records with no matching Blob row: {sorted(extra)!r}"
+        )
+    return {
+        "all_verified": True,
+        "sidecar_count": len(blob_rows),
+        "total_sidecar_bytes": sum(
+            int(r.get("ccc_series_byte_size") or 0) for r in blob_rows
+        ),
+        "total_sidecar_points": sum(
+            int(r.get("ccc_series_points") or 0) for r in blob_rows
+        ),
+        "largest_sidecar_bytes": max(
+            (int(r.get("ccc_series_byte_size") or 0) for r in blob_rows),
+            default=0,
+        ),
+    }
+
+
+def _derive_ccc_storage_summary(
+    payload: dict,
+    *,
+    verification: dict | None = None,
+    verification_manifest_rel_path: str | None = None,
+    verification_manifest_sha256: str | None = None,
+) -> dict | None:
     """Derive the manifest's ``ccc_series_storage`` summary from a slim
     payload. Returns ``None`` when no row uses a Blob sidecar (v1 / inline
-    promotions carry no CCC-storage block)."""
+    promotions carry no CCC-storage block).
+
+    ``all_sidecars_get_verified`` is NEVER inferred from row-metadata
+    completeness -- it is true ONLY when a validated verification result is
+    supplied (i.e. a verification manifest that bound 1:1 to every
+    Blob-sourced row). Without that proof it is recorded as ``false``."""
     rows = payload.get("per_secondary") or []
     blob_rows = [
         r for r in rows
@@ -1375,23 +1671,30 @@ def _derive_ccc_storage_summary(payload: dict) -> dict | None:
     ]
     if not blob_rows:
         return None
-    total_bytes = sum(int(r.get("ccc_series_byte_size") or 0) for r in blob_rows)
-    total_points = sum(int(r.get("ccc_series_points") or 0) for r in blob_rows)
-    largest = max(int(r.get("ccc_series_byte_size") or 0) for r in blob_rows)
-    complete = all(
-        all(k in r for k in CCC_SIDECAR_METADATA_REQUIRED) for r in blob_rows
-    )
-    return {
+    summary = {
         "mode": CCC_STORAGE_MODE_BLOB,
         "sidecar_schema_version": CCC_SIDECAR_SCHEMA_VERSION,
         "sidecar_count": len(blob_rows),
-        "total_sidecar_bytes": total_bytes,
-        "total_sidecar_points": total_points,
-        "largest_sidecar_bytes": largest,
+        "total_sidecar_bytes": sum(
+            int(r.get("ccc_series_byte_size") or 0) for r in blob_rows
+        ),
+        "total_sidecar_points": sum(
+            int(r.get("ccc_series_points") or 0) for r in blob_rows
+        ),
+        "largest_sidecar_bytes": max(
+            (int(r.get("ccc_series_byte_size") or 0) for r in blob_rows),
+            default=0,
+        ),
         "sidecar_prefix": f"k6-mtf/{payload.get('run_id')}/ccc-series/",
         "url_host_allowlist": ["*.public.blob.vercel-storage.com"],
-        "all_sidecars_get_verified": bool(complete),
+        "all_sidecars_get_verified": bool(
+            verification and verification.get("all_verified")
+        ),
     }
+    if verification_manifest_rel_path is not None:
+        summary["verification_manifest_path"] = verification_manifest_rel_path
+        summary["verification_manifest_sha256"] = verification_manifest_sha256
+    return summary
 
 
 class VercelBlobClient:
@@ -1425,17 +1728,49 @@ class VercelBlobClient:
         return tok
 
     def put(self, pathname: str, data: bytes, *, overwrite: bool = False) -> dict:
-        if self._put_callable is None:
-            raise BlobClientError(
-                "no approved Vercel Blob put client is wired; inject "
-                "put_callable backed by the official vercel_blob SDK "
-                "(BUILD-ONLY environments have no upload client)"
+        # Token is resolved here and handed in-process only; it is never
+        # echoed, logged, placed in argv/URL, or stored on the instance.
+        if self._put_callable is not None:
+            return self._put_callable(
+                pathname, data, overwrite=overwrite, token=self._token(),
             )
-        # Token is resolved here and handed in-process to the injected
-        # callable; it is never echoed, logged, or placed in argv/URL.
-        return self._put_callable(
-            pathname, data, overwrite=overwrite, token=self._token(),
-        )
+        return self._sdk_put(pathname, data, overwrite=overwrite)
+
+    def _sdk_put(self, pathname: str, data: bytes, *, overwrite: bool) -> dict:
+        """Lazy official Vercel Blob SDK adapter. The SDK is imported ONLY
+        here (never at module import) and is NOT required for tests. Per the
+        official docs the package is ``vercel`` (``pip install vercel``) with
+        ``from vercel.blob import BlobClient``. Immutable upload:
+        ``add_random_suffix=False`` so the returned URL path equals the
+        requested pathname (put_and_verify re-checks this)."""
+        try:
+            from vercel.blob import BlobClient  # noqa: PLC0415  (lazy by design)
+        except Exception as exc:  # SDK absent / import error -> fail closed
+            raise BlobClientError(
+                "official Vercel Blob SDK is unavailable "
+                "(pip install vercel; from vercel.blob import BlobClient); "
+                f"cannot upload {pathname!r}: {type(exc).__name__}"
+            ) from exc
+        token = self._token()
+        try:
+            client = BlobClient(token=token)
+            result = client.put(
+                pathname, data,
+                access="public", add_random_suffix=False, overwrite=overwrite,
+            )
+        except Exception as exc:  # never surface token-bearing detail
+            raise BlobClientError(
+                f"Vercel Blob SDK put failed for {pathname!r}: "
+                f"{type(exc).__name__}"
+            ) from exc
+        url = getattr(result, "url", None)
+        if url is None and isinstance(result, dict):
+            url = result.get("url")
+        if not isinstance(url, str):
+            raise BlobClientError(
+                f"Vercel Blob SDK put returned no url for {pathname!r}"
+            )
+        return {"url": url, "reused": False}
 
     def get(self, url: str) -> bytes:
         if self._get_callable is not None:
@@ -1461,6 +1796,10 @@ def _build_manifest(
     outcome: ValidationOutcome,
     promoted_at_utc: str,
     phase5_report_relative_path: str | None,
+    *,
+    ccc_verification: dict | None = None,
+    ccc_verification_manifest_rel_path: str | None = None,
+    ccc_verification_manifest_sha256: str | None = None,
 ) -> dict:
     payload = outcome.payload
     if inputs.public_mode:
@@ -1498,7 +1837,14 @@ def _build_manifest(
     }
     # Summarize the off-repo CCC Blob sidecars when the promoted fixture is
     # slim (Blob-sourced). v1 / inline promotions get no CCC-storage block.
-    ccc_storage = _derive_ccc_storage_summary(payload)
+    # all_sidecars_get_verified is true ONLY with a validated verification
+    # proof -- never inferred from row-metadata completeness.
+    ccc_storage = _derive_ccc_storage_summary(
+        payload,
+        verification=ccc_verification,
+        verification_manifest_rel_path=ccc_verification_manifest_rel_path,
+        verification_manifest_sha256=ccc_verification_manifest_sha256,
+    )
     if ccc_storage is not None:
         manifest["ccc_series_storage"] = ccc_storage
     return manifest
@@ -1653,11 +1999,41 @@ def promote(
         source_relative_path=source_relative,
         per_secondary_count=len(payload.get("per_secondary") or []),
     )
+    # 3b. Blob-sourced slim fixtures REQUIRE explicit GET-verification proof.
+    #     A validated verification manifest is the ONLY thing that lets the
+    #     promotion manifest claim all_sidecars_get_verified. Same predicate
+    #     in dry-run. Inline v2 / v1 fixtures skip this entirely.
+    ccc_verification: dict | None = None
+    ccc_verif_rel: str | None = None
+    ccc_verif_sha: str | None = None
+    if _payload_has_blob_sidecars(payload):
+        if not inputs.public_mode:
+            raise PromotionError(
+                "Blob-sourced slim k6_mtf_ranking_v2 fixtures promote only via "
+                "the v2 public path; supply --public with the binding inputs"
+            )
+        if inputs.ccc_sidecar_verification_manifest_path is None:
+            raise PromotionError(
+                "Blob-sourced public v2 promotion requires "
+                "--ccc-sidecar-verification-manifest (proof that every sidecar "
+                "was uploaded/reused and GET-verified); refusing"
+            )
+        vpath = Path(inputs.ccc_sidecar_verification_manifest_path)
+        vman = _load_ccc_verification_manifest(vpath)
+        ccc_verification = validate_ccc_verification_against_fixture(payload, vman)
+        ccc_verif_sha = _compute_sha256(vpath)
+        ccc_verif_rel = _project_relative_output_path(
+            vpath, inputs.project_root,
+            label="CCC sidecar verification manifest",
+        )
     # 4. Build the manifest. Always built (validates the path
     #    even on dry-run) so dry-run output is meaningful.
     promoted_at_utc = now_provider()
     manifest = _build_manifest(
         inputs, outcome, promoted_at_utc, phase5_report_relative_path,
+        ccc_verification=ccc_verification,
+        ccc_verification_manifest_rel_path=ccc_verif_rel,
+        ccc_verification_manifest_sha256=ccc_verif_sha,
     )
     # 5. Write (or report dry-run).
     summary: dict[str, Any] = {
@@ -1787,6 +2163,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--ccc-sidecar-verification-manifest", default=None,
+        help=(
+            "Path to the CCC sidecar verification manifest (required for a "
+            "Blob-sourced k6_mtf_ranking_v2 public promotion): proof that "
+            "every per-secondary sidecar was uploaded/reused and "
+            "GET-verified. Dry-run by default; this helper never uploads."
+        ),
+    )
+    p.add_argument(
         "--write", action="store_true",
         help=(
             "Perform the real write. Default is dry-run. Requires "
@@ -1831,6 +2216,10 @@ def _inputs_from_args(args: argparse.Namespace) -> PromotionInputs:
         Path(args.validation_sidecar).resolve()
         if getattr(args, "validation_sidecar", None) else None
     )
+    ccc_sidecar_verification_manifest = (
+        Path(args.ccc_sidecar_verification_manifest).resolve()
+        if getattr(args, "ccc_sidecar_verification_manifest", None) else None
+    )
     return PromotionInputs(
         source_path=source,
         destination_path=destination,
@@ -1844,6 +2233,7 @@ def _inputs_from_args(args: argparse.Namespace) -> PromotionInputs:
         phase5_report_manifest_path=phase5_report_manifest,
         validation_sidecar_path=validation_sidecar,
         validation_sidecar_sha256=getattr(args, "validation_sidecar_sha256", None),
+        ccc_sidecar_verification_manifest_path=ccc_sidecar_verification_manifest,
     )
 
 

@@ -2131,11 +2131,28 @@ def test_v2_binding_accepts_slim_fixture(tmp_path):
 # --- promotion manifest: schema provenance + CCC storage summary -----------
 
 
+def _write_verification_manifest(tmp_path: Path, slim: dict, records: list) -> Path:
+    """Build + write the CCC sidecar verification manifest under
+    output/ (gitignored) and return its path."""
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    vdir = tmp_path / "output" / "k6_mtf" / "RUN"
+    vdir.mkdir(parents=True, exist_ok=True)
+    vpath = vdir / "ccc_sidecar_verification.json"
+    vpath.write_text(json.dumps(vman), encoding="utf-8")
+    return vpath
+
+
 def test_promote_v2_slim_manifest_provenance_and_storage(tmp_path):
     w = _phase5_world(tmp_path)
-    slim, _ = helper.extract_ccc_to_blob_sidecars(w["fixture"], client=_MockBlobClient())
+    slim, records = helper.extract_ccc_to_blob_sidecars(
+        w["fixture"], client=_MockBlobClient(),
+    )
     w["fixture"] = slim
-    inputs = _v2_promote_inputs(w, tmp_path, write=True, operator_approved=True)
+    vpath = _write_verification_manifest(tmp_path, slim, records)
+    inputs = _v2_promote_inputs(
+        w, tmp_path, write=True, operator_approved=True,
+        ccc_sidecar_verification_manifest_path=vpath,
+    )
     promote(inputs)
     m = json.loads(inputs.manifest_destination_path.read_text(encoding="utf-8"))
     assert m["schema_version"] == "k6_mtf_ranking_v2"
@@ -2147,10 +2164,42 @@ def test_promote_v2_slim_manifest_provenance_and_storage(tmp_path):
     assert storage["sidecar_count"] == 2
     assert storage["all_sidecars_get_verified"] is True
     assert storage["url_host_allowlist"] == ["*.public.blob.vercel-storage.com"]
+    assert storage["verification_manifest_path"] == (
+        "output/k6_mtf/RUN/ccc_sidecar_verification.json"
+    )
+    assert storage["verification_manifest_sha256"] == helper._compute_sha256(vpath)
     # written public fixture rows are slim.
     fx = json.loads(inputs.destination_path.read_text(encoding="utf-8"))
     assert all(r["ccc_series"] == [] for r in fx["per_secondary"])
     assert all(r.get("ccc_series_source") == "vercel_blob" for r in fx["per_secondary"])
+
+
+def test_promote_v2_blob_without_verification_fails_closed(tmp_path):
+    w = _phase5_world(tmp_path)
+    slim, _ = helper.extract_ccc_to_blob_sidecars(
+        w["fixture"], client=_MockBlobClient(),
+    )
+    w["fixture"] = slim
+    inputs = _v2_promote_inputs(w, tmp_path, write=True, operator_approved=True)
+    with pytest.raises(PromotionError):
+        promote(inputs)  # no --ccc-sidecar-verification-manifest
+
+
+def test_promote_v2_blob_rejects_tampered_verification(tmp_path):
+    w = _phase5_world(tmp_path)
+    slim, records = helper.extract_ccc_to_blob_sidecars(
+        w["fixture"], client=_MockBlobClient(),
+    )
+    w["fixture"] = slim
+    # flip one record's sha so it no longer matches the slim row -> refuse.
+    records[0]["sha256"] = "a" * 64
+    vpath = _write_verification_manifest(tmp_path, slim, records)
+    inputs = _v2_promote_inputs(
+        w, tmp_path, write=True, operator_approved=True,
+        ccc_sidecar_verification_manifest_path=vpath,
+    )
+    with pytest.raises(PromotionError):
+        promote(inputs)
 
 
 def test_v1_promote_manifest_records_v1_schema_and_marker(tmp_path):
@@ -2209,3 +2258,165 @@ def test_no_blob_token_leaks_into_outputs(monkeypatch, tmp_path):
     vc.put("k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}")
     assert seen["token"] == sentinel
     assert all(sentinel not in str(v) for v in vars(vc).values())
+
+
+# ===========================================================================
+# amendment: verification proof, URL/pathname/SHA binding, CCC point shape
+# ===========================================================================
+
+
+def _extract_with_records():
+    return helper.extract_ccc_to_blob_sidecars(_v2_two(), client=_MockBlobClient())
+
+
+# --- CCC point shape (missing required field now fails closed) -------------
+
+
+def test_build_ccc_sidecar_rejects_missing_point_field():
+    bad = [{
+        "date_utc": "d",
+        "cumulative_capture_pct": 1.0,
+        "per_bar_capture_pct": 1.0,
+    }]  # missing trade_direction
+    with pytest.raises(PromotionError):
+        helper.build_ccc_sidecar("RUN", "AAA", bad)
+
+
+# --- put_and_verify URL<->pathname binding ---------------------------------
+
+
+def test_put_and_verify_rejects_url_for_different_pathname():
+    class _WrongPath(_MockBlobClient):
+        def put(self, pathname, data, *, overwrite=False):
+            return {
+                "url": self.HOST + "k6-mtf/RUN/ccc-series/OTHER." + ("0" * 64) + ".json",
+                "reused": False,
+            }
+
+    built = _built_one()
+    with pytest.raises(helper.BlobClientError):
+        helper.put_and_verify_sidecar(
+            _WrongPath(), built["pathname"], built["sidecar_bytes"], built["sha256"],
+        )
+
+
+# --- validator URL<->pathname<->SHA binding --------------------------------
+
+
+def test_validator_rejects_url_pathname_mismatch():
+    slim = _slim()
+    row = slim["per_secondary"][0]
+    row["ccc_series_url"] = (
+        _MockBlobClient.HOST
+        + "k6-mtf/RUN/ccc-series/OTHER." + row["ccc_series_sha256"] + ".json"
+    )
+    with pytest.raises(PromotionError):
+        validate_k6_mtf_ranking_v2_payload(slim)
+
+
+def test_validator_accepts_bound_url_pathname_sha():
+    # a clean slim fixture binds url/pathname/sha and validates.
+    validate_k6_mtf_ranking_v2_payload(_slim())
+
+
+# --- verification manifest contract ----------------------------------------
+
+
+def test_build_verification_manifest_from_records():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    assert vman["schema_version"] == "k6_mtf_ccc_sidecar_verification_v1"
+    assert vman["sidecar_schema_version"] == "k6_mtf_ccc_series_sidecar_v1"
+    assert vman["sidecar_count"] == 2
+    assert len(vman["records"]) == 2
+
+
+def test_verification_validates_against_slim_fixture():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    res = helper.validate_ccc_verification_against_fixture(slim, vman)
+    assert res["all_verified"] is True
+    assert res["sidecar_count"] == 2
+
+
+def test_verification_field_mismatch_fails_closed():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    vman["records"][0]["byte_size"] = vman["records"][0]["byte_size"] + 1
+    with pytest.raises(PromotionError):
+        helper.validate_ccc_verification_against_fixture(slim, vman)
+
+
+def test_verification_wrong_run_id_fails_closed():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    vman["ranking_run_id"] = "OTHER_RUN"
+    with pytest.raises(PromotionError):
+        helper.validate_ccc_verification_against_fixture(slim, vman)
+
+
+def test_verification_duplicate_records_fail_closed():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    vman["records"][1] = dict(vman["records"][0])  # duplicate secondary
+    with pytest.raises(PromotionError):
+        helper.validate_ccc_verification_against_fixture(slim, vman)
+
+
+def test_verification_get_verified_false_fails_closed():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    vman["records"][0]["get_verified"] = False
+    with pytest.raises(PromotionError):
+        helper.validate_ccc_verification_against_fixture(slim, vman)
+
+
+def test_verification_missing_record_field_fails_closed():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    del vman["records"][0]["url"]
+    with pytest.raises(PromotionError):
+        helper.validate_ccc_verification_against_fixture(slim, vman)
+
+
+def test_verification_count_mismatch_fails_closed():
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    vman["records"].pop()  # one fewer record than Blob rows
+    with pytest.raises(PromotionError):
+        helper.validate_ccc_verification_against_fixture(slim, vman)
+
+
+# --- all_sidecars_get_verified is never inferred from metadata --------------
+
+
+def test_storage_summary_not_verified_without_proof():
+    slim = _slim()  # complete sidecar metadata, but NO verification proof
+    summary = helper._derive_ccc_storage_summary(slim)
+    assert summary is not None
+    assert summary["all_sidecars_get_verified"] is False
+    assert "verification_manifest_path" not in summary
+
+
+# --- lazy official SDK adapter (BUILD-ONLY: SDK absent -> fail closed) ------
+
+
+def test_vercel_blob_client_sdk_unavailable_fails_closed(monkeypatch):
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_SENTINELTOKEN_DO_NOT_LEAK")
+    with pytest.raises(helper.BlobClientError) as ei:
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+    msg = str(ei.value)
+    assert "Vercel Blob SDK" in msg
+    assert "SENTINELTOKEN" not in msg
+
+
+# --- no token leaks into the verification manifest -------------------------
+
+
+def test_no_token_in_verification_manifest(monkeypatch):
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_SENTINELTOKEN_DO_NOT_LEAK")
+    slim, records = _extract_with_records()
+    vman = helper.build_ccc_verification_manifest(slim, records)
+    assert "SENTINELTOKEN" not in json.dumps(vman)

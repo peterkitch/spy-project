@@ -25,8 +25,16 @@ import {
 // stored SHA remains available for a future opt-in browser check.
 
 // Only public Vercel Blob hosts are fetchable.
-const VERCEL_BLOB_URL_RE =
-  /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*\.public\.blob\.vercel-storage\.com\/[A-Za-z0-9._~%/+-]+$/;
+const VERCEL_BLOB_HOST_RE =
+  /^[A-Za-z0-9][A-Za-z0-9.-]*\.public\.blob\.vercel-storage\.com$/;
+
+// Derived CCC point fields (Mode B): a point must carry exactly these.
+const CCC_POINT_REQUIRED_FIELDS = [
+  "cumulative_capture_pct",
+  "date_utc",
+  "per_bar_capture_pct",
+  "trade_direction",
+] as const;
 
 // Defense in depth: a CCC point must never carry raw-price keys (Mode B).
 const OHLCV_FORBIDDEN_KEYS = new Set([
@@ -39,6 +47,23 @@ const OHLCV_FORBIDDEN_KEYS = new Set([
   "adjusted_close",
   "volume",
 ]);
+
+// Parse a public Vercel Blob URL and return its object path (pathname minus
+// the leading slash), or null if not an allowlisted HTTPS Blob URL. Uses
+// real URL parsing, not string slicing.
+function blobUrlPath(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+  if (!VERCEL_BLOB_HOST_RE.test(parsed.hostname)) return null;
+  if (parsed.search || parsed.hash) return null;
+  const path = parsed.pathname.replace(/^\/+/, "");
+  return path.length > 0 ? path : null;
+}
 
 export type CccLoadResult =
   | { kind: "ok"; series: CccPoint[] }
@@ -87,16 +112,34 @@ function validateSidecar(
       message: `sidecar point count ${series.length} != expected ${row.ccc_series_points}`,
     };
   }
-  // Mode B defense: reject any raw-price key in a point.
+  // Per-point validation: object, exactly the derived fields, no raw-price
+  // key, no unexpected key (Mode B + shape). Fail safely on any violation.
   for (const point of series) {
     if (typeof point !== "object" || point === null) {
       return { kind: "error", message: "sidecar point is not an object" };
     }
-    for (const key of Object.keys(point as unknown as Record<string, unknown>)) {
+    const keys = Object.keys(point as unknown as Record<string, unknown>);
+    for (const key of keys) {
       if (OHLCV_FORBIDDEN_KEYS.has(key.toLowerCase())) {
         return {
           kind: "error",
           message: `sidecar point carries a forbidden raw-price key: ${key}`,
+        };
+      }
+    }
+    for (const req of CCC_POINT_REQUIRED_FIELDS) {
+      if (!(req in (point as object))) {
+        return {
+          kind: "error",
+          message: `sidecar point missing required field: ${req}`,
+        };
+      }
+    }
+    for (const key of keys) {
+      if (!(CCC_POINT_REQUIRED_FIELDS as readonly string[]).includes(key)) {
+        return {
+          kind: "error",
+          message: `sidecar point carries an unexpected field: ${key}`,
         };
       }
     }
@@ -114,10 +157,27 @@ export async function loadCccSeries(row: PerSecondary): Promise<CccLoadResult> {
     return inline.length > 0 ? { kind: "ok", series: inline } : { kind: "empty" };
   }
   const url = row.ccc_series_url;
-  if (typeof url !== "string" || !VERCEL_BLOB_URL_RE.test(url)) {
+  const pathname = row.ccc_series_pathname;
+  const sha = row.ccc_series_sha256;
+  if (typeof url !== "string") {
     return {
       kind: "error",
-      message: "Blob-sourced row has no allowlisted ccc_series_url",
+      message: "Blob-sourced row has no ccc_series_url",
+    };
+  }
+  // Bind url <-> pathname <-> sha BEFORE fetching: the URL's object path
+  // must equal the row pathname, and the pathname must embed the sha.
+  const urlPath = blobUrlPath(url);
+  if (
+    urlPath === null ||
+    typeof pathname !== "string" ||
+    urlPath !== pathname ||
+    typeof sha !== "string" ||
+    !pathname.includes(sha)
+  ) {
+    return {
+      kind: "error",
+      message: "Blob row ccc_series_url/pathname/sha256 do not bind",
     };
   }
   const cached = sessionCache.get(url);
