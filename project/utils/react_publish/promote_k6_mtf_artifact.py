@@ -58,7 +58,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 import tempfile
 import urllib.parse
@@ -186,6 +185,22 @@ def _compute_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _canonical_lf_bytes(data: bytes) -> bytes:
+    """Return text bytes with platform line endings normalized to LF."""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _read_lf_bytes(path: Path) -> bytes:
+    try:
+        return _canonical_lf_bytes(path.read_bytes())
+    except OSError as exc:
+        raise PromotionError(f"source artifact unreadable: {exc}") from exc
+
+
+def _compute_sha256_lf(path: Path) -> str:
+    return hashlib.sha256(_read_lf_bytes(path)).hexdigest()
 
 
 def _resolve_project_relative_source(
@@ -1899,7 +1914,7 @@ def _safe_copy(source: Path, destination: Path, expected_sha256: str) -> None:
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        shutil.copyfile(str(source), str(tmp_path))
+        tmp_path.write_bytes(_read_lf_bytes(source))
         tmp_sha = _compute_sha256(tmp_path)
         if tmp_sha != expected_sha256:
             raise PromotionError(
@@ -1923,7 +1938,7 @@ def _safe_copy(source: Path, destination: Path, expected_sha256: str) -> None:
 
 def _write_manifest(manifest: dict, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
     fd, tmp_name = tempfile.mkstemp(
         prefix=destination.name + ".",
         suffix=".part",
@@ -1932,7 +1947,7 @@ def _write_manifest(manifest: dict, destination: Path) -> None:
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.write_bytes(data)
         os.replace(str(tmp_path), str(destination))
     finally:
         try:
@@ -2023,7 +2038,7 @@ def promote(
         payload = raw_payload
     else:
         payload = _validate_payload(raw_payload)
-    source_sha = _compute_sha256(inputs.source_path)
+    source_sha = _compute_sha256_lf(inputs.source_path)
     source_relative = _resolve_project_relative_source(
         inputs.source_path, inputs.project_root,
     )

@@ -13,8 +13,8 @@ asset; `output/` remains gitignored and is not a runtime dependency.
 - **Validation summary:** 88 board-validated, 117 not validated, 43 Stage-A
   excluded.
 - **Public fixture SHA-256 / promotion source_sha256:**
-  `b19a829794031be0e2674fb1c039aed8cdc95ffa063c9739bcdd2e631f6cb587`
-- **Public fixture size:** 710,160 bytes in the working tree, well below the
+  `4b6736da150ade118d6cbd0fb8ab974f954ed4fef3c8af9acc8dda6a8c569d97`
+- **Public fixture size:** 692,240 LF bytes, well below the
   GitHub 100 MB per-file limit.
 
 The committed fixture is slim. It keeps ranking metrics, K6 stack fields,
@@ -62,7 +62,7 @@ or credentials.
   `frontend/public/fixtures/k6_mtf_ranking.promotion_manifest.json`
 - **Manifest schema:** `k6_mtf_promotion_manifest_v1`
 - **Promoted fixture schema recorded by manifest:** `k6_mtf_ranking_v2`
-- **promoted_at_utc:** `2026-06-05T03:53:18Z`
+- **promoted_at_utc:** `2026-06-05T23:12:40Z`
 - **promoted_by:** `the operator`
 - **source_artifact_path:**
   `output/k6_mtf/20260604T110400Z_recook_full248_clean_csv/k6_mtf_ranking_v2_blob_sidecar_public_candidate.json`

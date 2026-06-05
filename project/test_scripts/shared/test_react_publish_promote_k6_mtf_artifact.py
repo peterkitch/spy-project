@@ -210,6 +210,11 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _sha256_lf_file(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # 1. schema_version != k6_mtf_ranking_v1 is rejected
 # ---------------------------------------------------------------------------
@@ -332,6 +337,29 @@ def test_real_copy_is_byte_identical_and_sha_match(tmp_path: Path) -> None:
     dst_sha = _sha256_file(dest)
     assert src_sha == dst_sha
     assert summary["source_sha256"] == src_sha
+
+
+def test_real_copy_normalizes_crlf_source_to_lf_sha(tmp_path: Path) -> None:
+    payload = _make_artifact([_make_secondary("TSLA")])
+    source, root = _write_source(tmp_path, payload)
+    crlf_text = json.dumps(payload, indent=2, sort_keys=True).replace("\n", "\r\n")
+    source.write_bytes((crlf_text + "\r\n").encode("utf-8"))
+    expected_lf_sha = _sha256_lf_file(source)
+    inputs = _default_inputs(
+        root, source, write=True, operator_approved=True,
+    )
+    summary = promote(inputs)
+    dest = root / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.json"
+    manifest_path = (
+        root / "frontend" / "public" / "fixtures"
+        / "k6_mtf_ranking.promotion_manifest.json"
+    )
+    assert b"\r\n" not in dest.read_bytes()
+    assert b"\r\n" not in manifest_path.read_bytes()
+    assert _sha256_file(dest) == expected_lf_sha
+    assert summary["source_sha256"] == expected_lf_sha
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_sha256"] == expected_lf_sha
 
 
 # ---------------------------------------------------------------------------
@@ -2223,7 +2251,7 @@ def test_promote_v2_slim_manifest_provenance_and_storage(tmp_path):
     m = json.loads(inputs.manifest_destination_path.read_text(encoding="utf-8"))
     assert m["schema_version"] == "k6_mtf_ranking_v2"
     assert m["promotion_manifest_schema_version"] == "k6_mtf_promotion_manifest_v1"
-    assert m["source_sha256"] == helper._compute_sha256(inputs.source_path)
+    assert m["source_sha256"] == helper._compute_sha256_lf(inputs.source_path)
     storage = m["ccc_series_storage"]
     assert storage["mode"] == "vercel_blob_sidecars"
     assert storage["sidecar_schema_version"] == "k6_mtf_ccc_series_sidecar_v1"

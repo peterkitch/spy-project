@@ -21,3 +21,10 @@ md_library/shared/2026-06-01_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT.md text eol
 # otherwise produce CRLF on Windows checkout and break the binding.
 md_library/shared/*K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_*.md text eol=lf
 md_library/shared/*K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_*.manifest.json text eol=lf
+
+# Pin the committed public K=6 MTF fixture family to LF so promotion
+# provenance hashes reproduce against the canonical Git blob bytes on
+# every checkout platform.
+frontend/public/fixtures/k6_mtf_ranking.json text eol=lf
+frontend/public/fixtures/k6_mtf_ranking.promotion_manifest.json text eol=lf
+frontend/public/fixtures/README.md text eol=lf
