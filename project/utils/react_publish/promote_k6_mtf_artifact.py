@@ -1697,6 +1697,30 @@ def _derive_ccc_storage_summary(
     return summary
 
 
+def _extract_blob_put_url(result: Any, pathname: str) -> str:
+    """Extract the public URL from an official Vercel Blob ``put`` result,
+    fail-closed.
+
+    Supports both common official return shapes:
+
+    - the installed SDK's ``PutBlobResult`` object (a ``.url`` attribute;
+      ``vercel==0.5.9`` returns this dataclass), and
+    - a mapping result with a ``"url"`` key.
+
+    Rejects a missing, non-string, or empty URL, and any other
+    unsupported/ambiguous result shape, with a token-safe ``BlobClientError``
+    -- the message never includes the result's contents (only the requested
+    pathname, which carries no token)."""
+    url = getattr(result, "url", None)
+    if url is None and isinstance(result, dict):
+        url = result.get("url")
+    if not isinstance(url, str) or not url:
+        raise BlobClientError(
+            f"Vercel Blob SDK put returned no usable url for {pathname!r}"
+        )
+    return url
+
+
 class VercelBlobClient:
     """Thin Blob client boundary. ``get`` is stdlib HTTPS (urllib) and needs
     no SDK; ``put`` requires an injected ``put_callable`` (the official
@@ -1738,13 +1762,17 @@ class VercelBlobClient:
 
     def _sdk_put(self, pathname: str, data: bytes, *, overwrite: bool) -> dict:
         """Lazy official Vercel Blob SDK adapter. The SDK is imported ONLY
-        here (never at module import) and is NOT required for tests. Per the
-        official docs the package is ``vercel`` (``pip install vercel``) with
-        ``from vercel.blob import BlobClient``; the client is constructed
-        WITHOUT a token and the token is passed to ``client.put(...,
-        token=token)``. Immutable upload: ``add_random_suffix=False`` so the
+        here (never at module import) and is NOT required for tests. The
+        package is ``vercel`` (``pip install vercel``) with ``from
+        vercel.blob import BlobClient``. Per the installed official SDK
+        (``vercel==0.5.9``) the token is bound in the CONSTRUCTOR
+        (``BlobClient(token=token)``) and ``put()`` takes NO ``token``
+        argument. Immutable upload: ``add_random_suffix=False`` so the
         returned URL path equals the requested pathname (put_and_verify
-        re-checks this)."""
+        re-checks this). The returned public URL is extracted via
+        ``_extract_blob_put_url`` (supports the SDK's ``PutBlobResult``
+        object with a ``.url`` attribute or a mapping with a ``"url"`` key;
+        fail-closed on a missing/empty/non-string/ambiguous result)."""
         try:
             from vercel.blob import BlobClient  # noqa: PLC0415  (lazy by design)
         except Exception as exc:  # SDK absent / import error -> fail closed
@@ -1756,7 +1784,12 @@ class VercelBlobClient:
             ) from exc
         token = self._token()
         try:
-            client = BlobClient()
+            # Token is bound in the constructor (installed vercel==0.5.9);
+            # put() takes no token kwarg. Both the construction and the put
+            # run inside this token-safe block, so a token-bearing exception
+            # from EITHER is reduced to its exception type name only and its
+            # cause is suppressed.
+            client = BlobClient(token=token)
             result = client.put(
                 pathname,
                 data,
@@ -1764,20 +1797,13 @@ class VercelBlobClient:
                 add_random_suffix=False,
                 overwrite=overwrite,
                 content_type="application/json",
-                token=token,
             )
         except Exception as exc:  # token-safe: type name only, suppress cause
             raise BlobClientError(
                 f"Vercel Blob SDK put failed for {pathname!r}: "
                 f"{type(exc).__name__}"
             ) from None
-        url = getattr(result, "url", None)
-        if url is None and isinstance(result, dict):
-            url = result.get("url")
-        if not isinstance(url, str):
-            raise BlobClientError(
-                f"Vercel Blob SDK put returned no url for {pathname!r}"
-            )
+        url = _extract_blob_put_url(result, pathname)
         return {"url": url, "reused": False}
 
     def get(self, url: str) -> bytes:

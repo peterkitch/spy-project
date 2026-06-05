@@ -2031,7 +2031,12 @@ def test_put_and_verify_rejects_non_allowlisted_host():
         )
 
 
-def test_vercel_blob_client_put_without_callable_fails_closed():
+def test_vercel_blob_client_put_without_callable_fails_closed(monkeypatch):
+    # No injected put_callable -> the SDK path is used. Force the lazy SDK
+    # import to fail (BUILD-ONLY simulation) so the adapter fails closed
+    # WITHOUT any network call, regardless of whether a real SDK/token is
+    # present in the running environment.
+    monkeypatch.setitem(sys.modules, "vercel.blob", None)
     with pytest.raises(helper.BlobClientError):
         helper.VercelBlobClient().put(
             "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
@@ -2240,7 +2245,10 @@ def test_no_blob_token_leaks_into_outputs(monkeypatch, tmp_path):
     for data in client.store.values():
         blob += data.decode("utf-8")
     assert sentinel not in blob
-    # put without callable raises before touching the token; message clean.
+    # put without callable fails closed with a token-clean message. Force the
+    # lazy SDK import to fail so this never reaches the network even when a
+    # real SDK/token is present in the environment.
+    monkeypatch.setitem(sys.modules, "vercel.blob", None)
     with pytest.raises(helper.BlobClientError) as ei:
         helper.VercelBlobClient().put(
             "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
@@ -2403,12 +2411,17 @@ def test_storage_summary_not_verified_without_proof():
 
 def test_vercel_blob_client_sdk_unavailable_fails_closed(monkeypatch):
     monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_SENTINELTOKEN_DO_NOT_LEAK")
+    # Force the lazy ``from vercel.blob import BlobClient`` to fail so this
+    # exercises the genuine BUILD-ONLY "SDK unavailable" branch with no
+    # network call, even on a machine where the real SDK is installed.
+    monkeypatch.setitem(sys.modules, "vercel.blob", None)
     with pytest.raises(helper.BlobClientError) as ei:
         helper.VercelBlobClient().put(
             "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
         )
     msg = str(ei.value)
     assert "Vercel Blob SDK" in msg
+    assert "unavailable" in msg
     assert "SENTINELTOKEN" not in msg
 
 
@@ -2463,17 +2476,19 @@ def test_sdk_adapter_call_shape(monkeypatch):
     _install_fake_vercel(monkeypatch, _recording_blobclient(rec))
     pathname = "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json"
     res = helper.VercelBlobClient().put(pathname, b"{}")
-    # BlobClient constructed WITHOUT token (no constructor args).
+    # BlobClient constructed WITH the token (installed vercel==0.5.9 binds the
+    # token in the constructor).
     assert rec["ctor_args"] == ()
-    assert rec["ctor_kwargs"] == {}
-    # token + documented kwargs passed to client.put(...).
+    assert rec["ctor_kwargs"] == {"token": _SENTINEL_TOKEN}
+    # documented kwargs passed to client.put(...); NO token kwarg on put().
     assert rec["put_pathname"] == pathname
     pk = rec["put_kwargs"]
-    assert pk["token"] == _SENTINEL_TOKEN
+    assert "token" not in pk
     assert pk["access"] == "public"
     assert pk["add_random_suffix"] is False
     assert pk["overwrite"] is False
     assert pk["content_type"] == "application/json"
+    # mapping return shape ({"url": ...}) is accepted and normalized.
     assert res == {"url": _BLOB_HOST + pathname, "reused": False}
 
 
@@ -2495,6 +2510,111 @@ def test_sdk_adapter_error_message_token_safe(monkeypatch):
         )
     assert _SENTINEL_TOKEN not in str(ei.value)
     assert "RuntimeError" in str(ei.value)
+
+
+def _obj_result(url):
+    """A minimal stand-in for the installed SDK's ``PutBlobResult`` dataclass:
+    an object exposing the URL only through a ``.url`` attribute (no mapping
+    interface)."""
+    class _PutResult:
+        pass
+
+    r = _PutResult()
+    r.url = url
+    return r
+
+
+def test_sdk_adapter_accepts_object_url_return_shape(monkeypatch):
+    """Installed vercel==0.5.9 returns a PutBlobResult OBJECT with a ``.url``
+    attribute (not a mapping); the adapter must extract it and normalize."""
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+
+    class _ObjReturningClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def put(self, pathname, data, **kwargs):
+            return _obj_result(_BLOB_HOST + pathname)
+
+    _install_fake_vercel(monkeypatch, _ObjReturningClient)
+    pathname = "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json"
+    res = helper.VercelBlobClient().put(pathname, b"{}")
+    assert res == {"url": _BLOB_HOST + pathname, "reused": False}
+
+
+def test_sdk_adapter_rejects_missing_url_return_shape(monkeypatch):
+    """A put result with no usable URL fails closed (no silent success)."""
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+
+    class _NoUrlClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def put(self, pathname, data, **kwargs):
+            return {"not_url": "x"}
+
+    _install_fake_vercel(monkeypatch, _NoUrlClient)
+    with pytest.raises(helper.BlobClientError):
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+
+
+def test_sdk_adapter_constructor_exception_token_safe(monkeypatch):
+    """A token-bearing exception raised by the CONSTRUCTOR (where the token is
+    now bound) must be reduced to its type name -- the token must not leak."""
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", _SENTINEL_TOKEN)
+
+    class _CtorBoom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("ctor failure token=" + kwargs.get("token", ""))
+
+        def put(self, pathname, data, **kwargs):  # pragma: no cover
+            raise AssertionError("put must not run if the constructor raised")
+
+    _install_fake_vercel(monkeypatch, _CtorBoom)
+    with pytest.raises(helper.BlobClientError) as ei:
+        helper.VercelBlobClient().put(
+            "k6-mtf/RUN/ccc-series/AAA." + ("0" * 64) + ".json", b"{}",
+        )
+    assert _SENTINEL_TOKEN not in str(ei.value)
+    assert "RuntimeError" in str(ei.value)
+
+
+def test_extract_blob_put_url_accepts_mapping():
+    assert (
+        helper._extract_blob_put_url({"url": _BLOB_HOST + "p"}, "p")
+        == _BLOB_HOST + "p"
+    )
+
+
+def test_extract_blob_put_url_accepts_object():
+    assert (
+        helper._extract_blob_put_url(_obj_result(_BLOB_HOST + "p"), "p")
+        == _BLOB_HOST + "p"
+    )
+
+
+@pytest.mark.parametrize("bad_url", [None, "", 123, b"x", ["u"]])
+def test_extract_blob_put_url_rejects_bad_mapping_url(bad_url):
+    with pytest.raises(helper.BlobClientError):
+        helper._extract_blob_put_url({"url": bad_url}, "p")
+
+
+def test_extract_blob_put_url_rejects_empty_mapping():
+    with pytest.raises(helper.BlobClientError):
+        helper._extract_blob_put_url({}, "p")
+
+
+@pytest.mark.parametrize("bad_url", ["", 123, None])
+def test_extract_blob_put_url_rejects_bad_object_url(bad_url):
+    with pytest.raises(helper.BlobClientError):
+        helper._extract_blob_put_url(_obj_result(bad_url), "p")
+
+
+def test_extract_blob_put_url_rejects_unsupported_shape():
+    with pytest.raises(helper.BlobClientError):
+        helper._extract_blob_put_url(object(), "p")
 
 
 def test_put_and_verify_put_exception_token_safe():
