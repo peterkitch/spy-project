@@ -1,0 +1,1107 @@
+"""Run-once crunch rebuild orchestrator (thin shell; no auto-publish).
+
+Chains the existing per-engine runners to rebuild a fixed set of broken K=6
+secondary stacks while excluding a fixed set of broken tickers, verifying
+exclusion at every artifact boundary, and STOPPING before any publication.
+
+It is a thin shell over the existing CLIs -- it does NOT reimplement engine
+logic and does NOT import the engines. Stages are invoked through an
+injectable invoker boundary so tests can stub every stage:
+
+  Stage 1  onepass_workbook_runner.py      (refresh allowed universe)
+  Stage 2  impactsearch_workbook_runner.py (rebuild-secondary workbooks)
+  Stage 3  stackbuilder_workbook_runner.py (re-select K=6 stacks)
+  Stage 4  k6_recook.py --execute          (recook rebuilt stacks)
+
+Modes:
+  * Dry-run (default): Stage 0 preflight + plan only. No engines, no
+    subprocess stage invocations, no network. Writes 00_preflight.json and
+    run_plan.json and stops with status "dry_run_planned".
+  * --execute (operator-run ONLY): runs Stages 1-4 with per-stage boundary
+    checks, quarantine of the rebuild secondaries' prior canonical artifacts
+    (move, never delete), and checkpoints. Fail-closed at every gate.
+
+Stage-connection design: CANONICAL roots. The rebuilt stacks must REPLACE
+the broken canonical output/stackbuilder/<SEC> stacks so the downstream
+board picks them up; the prior broken artifacts are quarantined (moved) into
+the run dir for rollback. The full-universe signal_library refresh in
+Stage 1 is intended and operator-approved. Exclusion is guaranteed at the
+selection boundaries (ImpactSearch primaries, StackBuilder candidacy, K6
+member union), each proven by a boundary check that fails the run if any
+excluded ticker is present.
+
+After Stage 4 the orchestrator writes candidate artifacts to the canonical
+roots / run dir but does NOT publish: no Blob, no promotion, no commit, no
+push, no deploy. It records the exclusion + UNREBUILDABLE set for a later
+operator manual master_tickers.txt edit (it never edits master_tickers.txt).
+
+ASCII-only. Stdlib only (openpyxl used lazily only for the ImpactSearch
+workbook boundary check during a real execute). Project-relative defaults.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+
+SCHEMA_VERSION = "crunch_rebuild_run_v1"
+
+DEFAULT_BLOCKED_FILE = "operator_inputs/crunch_blocked_tickers.txt"
+DEFAULT_REBUILD_FILE = "operator_inputs/crunch_rebuild_secondaries.txt"
+DEFAULT_RUN_BASE = "output/crunch_runs"
+DEFAULT_STACKBUILDER_ROOT = "output/stackbuilder"
+DEFAULT_IMPACTSEARCH_ROOT = "output/impactsearch"
+DEFAULT_ONEPASS_ROOT = "output/onepass"
+DEFAULT_K6_OUTPUT_ROOT = "output/k6_mtf"
+DEFAULT_MASTER_TICKERS = "global_ticker_library/data/master_tickers.txt"
+LOCK_NAME = ".crunch.lock"
+
+SELECTED_BUILD = "selected_build.json"
+SELECTED_BUILD_PINNED = "selected_build.pinned.json"
+COMBO_FILENAME = "combo_k=6.json"
+
+# Engine scripts this orchestrator launches; the process-conflict check MUST
+# cover all of them (fail-closed if coverage is insufficient).
+ENGINE_SCRIPTS = (
+    "onepass.py", "onepass_workbook_runner.py",
+    "impactsearch.py", "impactsearch_workbook_runner.py",
+    "stackbuilder.py", "stackbuilder_workbook_runner.py",
+    "k6_recook.py", "k6_mtf_history_producer.py", "k6_mtf_ranking_engine.py",
+)
+
+# A ticker token: optional leading caret, then symbol chars (letters, digits,
+# dot, hyphen, caret, underscore, equals, colon) -- covers ^DJT, RPI-UN.TO,
+# 011810.KS, DX-Y.NYB, BRK-A, BTC-USD.
+_TICKER_RE = re.compile(r"^[\^A-Za-z0-9][A-Za-z0-9.\^_=:-]*$")
+_PROTOCOL_RE = re.compile(r"\[[DI]\]$")
+
+
+class CrunchError(Exception):
+    """Fail-closed halt/refusal."""
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _run_id(now: datetime) -> str:
+    return now.strftime("%Y%m%dT%H%M%SZ")
+
+
+def normalize_ticker(raw: Any) -> str:
+    return str(raw).strip().upper()
+
+
+def strip_protocol(token: str) -> str:
+    return _PROTOCOL_RE.sub("", str(token).strip()).strip()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".part",
+                              dir=str(path.parent))
+    os.close(fd)
+    tp = Path(tmp)
+    try:
+        tp.write_text(text, encoding="utf-8")
+        os.replace(str(tp), str(path))
+    finally:
+        try:
+            if tp.exists():
+                tp.unlink()
+        except OSError:
+            pass
+
+
+def _dump(obj: Any) -> str:
+    return json.dumps(obj, indent=2, sort_keys=True) + "\n"
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    _atomic_write_text(path, _dump(obj))
+
+
+# ---------------------------------------------------------------------------
+# Input loading + validation
+# ---------------------------------------------------------------------------
+
+
+def load_symbol_file(path: Path, *, label: str) -> list[str]:
+    """Load a one-symbol-per-line file. Skips blank lines and '#' comments.
+    Also accepts comma-separated tokens on a line. Validates each token is a
+    recognizable symbol; raises CrunchError on any malformed token or an
+    empty resulting list. Preserves first-seen order, de-duplicates."""
+    if not path.is_file():
+        raise CrunchError(f"{label} file not found: {path.as_posix()}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CrunchError(f"{label} file unreadable: {exc}") from exc
+    if any(ord(ch) > 127 for ch in raw):
+        raise CrunchError(f"{label} file contains non-ASCII bytes")
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        for tok in stripped.split(","):
+            t = tok.strip()
+            if not t:
+                continue
+            if not _TICKER_RE.match(t):
+                raise CrunchError(
+                    f"{label} file has a malformed symbol: {t!r}")
+            norm = normalize_ticker(t)
+            if norm not in seen:
+                seen.add(norm)
+                out.append(norm)
+    if not out:
+        raise CrunchError(f"{label} file is empty after parsing")
+    return out
+
+
+def discover_current_secondaries(stackbuilder_root: Path) -> set[str]:
+    """Current secondaries = subdirs of the stackbuilder root that carry a
+    selected_build.json (matches how k6_recook discovers them). The
+    '_progress' dir and any non-selected dir are ignored."""
+    out: set[str] = set()
+    if not stackbuilder_root.is_dir():
+        return out
+    for d in stackbuilder_root.iterdir():
+        if d.is_dir() and (d / SELECTED_BUILD).is_file():
+            out.add(normalize_ticker(d.name))
+    return out
+
+
+def load_master_universe(master_file: Path) -> list[str]:
+    """Read the master ticker list (the OnePass default universe source).
+    Raw-string parse (newline + comma), preserving literal NA / NAN."""
+    if not master_file.is_file():
+        return []
+    raw = master_file.read_text(encoding="utf-8")
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.replace("\n", ",").split(","):
+        t = chunk.strip()
+        if not t or t.startswith("#"):
+            continue
+        norm = normalize_ticker(t)
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Lock
+# ---------------------------------------------------------------------------
+
+
+def _pid_alive(pid: int) -> bool | None:
+    try:
+        import psutil  # noqa: PLC0415
+        return psutil.pid_exists(pid)
+    except Exception:
+        return None  # unknown -> caller treats conservatively
+
+
+def acquire_lock(lock_path: Path, *, run_id: str, stage: str,
+                 reclaim_stale: bool, now: datetime) -> None:
+    payload = _dump({
+        "pid": os.getpid(), "run_id": run_id, "stage": stage,
+        "started_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return
+    except FileExistsError:
+        pass
+    # Lock exists -- inspect holder.
+    try:
+        existing = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    holder_pid = existing.get("pid")
+    alive = _pid_alive(holder_pid) if isinstance(holder_pid, int) else None
+    if alive is True:
+        raise CrunchError(
+            f"crunch lock held by live pid {holder_pid}; refusing")
+    if alive is None:
+        # Cannot prove dead -> conservative: treat as held unless reclaim.
+        if not reclaim_stale:
+            raise CrunchError(
+                "crunch lock present and holder liveness unknown; rerun with "
+                "--reclaim-stale-lock if it is stale")
+    else:
+        # Proven dead.
+        if not reclaim_stale:
+            raise CrunchError(
+                f"crunch lock is stale (dead pid {holder_pid}); rerun with "
+                "--reclaim-stale-lock to reclaim")
+    # Reclaim.
+    _atomic_write_text(lock_path, payload)
+
+
+def release_lock(lock_path: Path) -> None:
+    try:
+        if lock_path.is_file():
+            lock_path.unlink()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Process-conflict check (injectable)
+# ---------------------------------------------------------------------------
+
+
+def default_process_conflict_check(required_patterns: tuple) -> dict:
+    """Read-only process enumeration mirroring the runners' approach. Returns
+    {"status": "ok"|"blocked"|"insufficient", "conflicts": [...]}. "blocked"
+    if a matching engine process is running; "insufficient" if processes
+    cannot be enumerated (fail-closed for execute)."""
+    own = os.getpid()
+    cmdlines: list[str] = []
+    try:
+        import psutil  # noqa: PLC0415
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            if proc.info.get("pid") == own:
+                continue
+            cl = proc.info.get("cmdline") or []
+            if cl:
+                cmdlines.append(" ".join(str(x) for x in cl))
+    except Exception:
+        return {"status": "insufficient", "conflicts": [],
+                "reason": "process enumeration unavailable"}
+    low_patterns = [p.lower() for p in required_patterns]
+    hits = []
+    for cl in cmdlines:
+        cll = cl.lower()
+        for p in low_patterns:
+            if p in cll:
+                hits.append(p)
+                break
+    if hits:
+        return {"status": "blocked", "conflicts": sorted(set(hits))}
+    return {"status": "ok", "conflicts": []}
+
+
+# ---------------------------------------------------------------------------
+# Boundary checks: scan an artifact for any excluded ticker
+# ---------------------------------------------------------------------------
+
+
+_SEED_PROTOCOL_SUFFIX_RE = re.compile(r"-[DI]$")
+
+
+def _member_tokens(token: str) -> set[str]:
+    """Normalized ticker candidates from a scanned string. Handles plain
+    symbols, bracket protocol forms (TICKER[D]/[I]), and embedded seed-name
+    member forms (seedTC__AAA-D_DR8A.F-I), which join members with '_' and
+    suffix each with -D/-I. Splits ONLY on '_' (no real ticker contains '_'),
+    so it never substring-false-positives (e.g. FORD is not matched inside
+    FORWARD; DX-Y.NYB is not split on its hyphens)."""
+    out: set[str] = set()
+    s = str(token).strip()
+    if not s:
+        return out
+    # Whole-string variants (covers plain symbols and TICKER[D]/[I]).
+    out.add(normalize_ticker(s))
+    out.add(normalize_ticker(strip_protocol(s)))
+    # Member-form variants: split on '_' and strip a trailing protocol.
+    for piece in s.split("_"):
+        p = piece.strip()
+        if not p:
+            continue
+        out.add(normalize_ticker(p))
+        no_bracket = strip_protocol(p)
+        out.add(normalize_ticker(no_bracket))
+        out.add(normalize_ticker(_SEED_PROTOCOL_SUFFIX_RE.sub("", no_bracket)))
+    out.discard("")
+    return out
+
+
+def _collect_json_strings(obj: Any, out: list[str]) -> None:
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            out.append(str(k))
+            _collect_json_strings(v, out)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _collect_json_strings(v, out)
+
+
+def scan_artifact_for_excluded(path: Path, excluded: set[str]) -> set[str]:
+    """Return the set of excluded tickers found in an artifact. Handles
+    .json / .txt (leaf/token scan) and .xlsx (every cell, via openpyxl).
+    A missing file returns empty (callers decide if absence is itself an
+    error)."""
+    found: set[str] = set()
+    if not path.is_file():
+        return found
+    suffix = path.suffix.lower()
+    tokens: list[str] = []
+    if suffix == ".json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # Fall back to raw token scan.
+            tokens = re.split(r"[^A-Za-z0-9.\^_=:\[\]-]+",
+                              path.read_text(encoding="utf-8", errors="replace"))
+        else:
+            _collect_json_strings(data, tokens)
+    elif suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook  # noqa: PLC0415
+        except Exception as exc:
+            raise CrunchError(
+                f"cannot read xlsx boundary artifact (openpyxl missing): "
+                f"{type(exc).__name__}") from exc
+        wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+        try:
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    for cell in row:
+                        if isinstance(cell, str):
+                            tokens.append(cell)
+        finally:
+            wb.close()
+    else:
+        tokens = re.split(r"[^A-Za-z0-9.\^_=:\[\]-]+",
+                          path.read_text(encoding="utf-8", errors="replace"))
+    for tok in tokens:
+        for variant in _member_tokens(tok):
+            if variant in excluded:
+                found.add(variant)
+    return found
+
+
+def assert_no_excluded_in_obj(obj: Any, excluded: set[str], *, stage: str) -> None:
+    """Hard-STOP if any excluded ticker appears in an in-memory result object
+    (e.g. a runner's per_ticker_results), using the same member-aware token
+    normalization as the artifact scanner."""
+    strings: list[str] = []
+    _collect_json_strings(obj, strings)
+    found: set[str] = set()
+    for s in strings:
+        for variant in _member_tokens(s):
+            if variant in excluded:
+                found.add(variant)
+    if found:
+        raise CrunchError(
+            f"boundary check failed at {stage}: excluded tickers present in "
+            f"runner result: {sorted(found)}")
+
+
+def assert_no_excluded(paths: Iterable[Path], excluded: set[str],
+                       *, stage: str) -> None:
+    """Hard-STOP if any excluded ticker appears in any listed artifact."""
+    offenders: dict[str, list[str]] = {}
+    for p in paths:
+        hits = scan_artifact_for_excluded(p, excluded)
+        if hits:
+            offenders[p.as_posix()] = sorted(hits)
+    if offenders:
+        raise CrunchError(
+            f"boundary check failed at {stage}: excluded tickers present in "
+            f"{json.dumps(offenders, sort_keys=True)}")
+
+
+# ---------------------------------------------------------------------------
+# Quarantine (move, never delete) -- rebuild secondaries only
+# ---------------------------------------------------------------------------
+
+
+def quarantine_paths(items: list[Path], dest_dir: Path) -> list[str]:
+    """Move each existing path into dest_dir, preserving the basename.
+    Returns the list of moved destinations (project-irrelevant absolute).
+    Never deletes."""
+    moved: list[str] = []
+    if not items:
+        return moved
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    import shutil  # noqa: PLC0415
+    for src in items:
+        if not src.exists():
+            continue
+        target = dest_dir / src.name
+        shutil.move(str(src), str(target))
+        moved.append(target.as_posix())
+    return moved
+
+
+# ---------------------------------------------------------------------------
+# Plan construction
+# ---------------------------------------------------------------------------
+
+
+def _csv(tickers: list[str]) -> str:
+    return ",".join(tickers)
+
+
+def build_stage_commands(
+    *, effective_rebuild: list[str], allowed_universe_file: Path,
+    onepass_root: Path, impactsearch_root: Path, stackbuilder_root: Path,
+    k6_output_root: Path, target_as_of: str | None,
+    duration_budget_minutes: int | None, operator_budget_label: str | None,
+    driver_run_id: str,
+) -> list[dict]:
+    """Resolve the exact argv for each stage from the verified runner
+    contracts. Recorded in run_plan.json and used by the real invoker."""
+    sec_csv = _csv(effective_rebuild)
+    budget = ([] if duration_budget_minutes is None else
+              ["--duration-budget-minutes", str(duration_budget_minutes)])
+    label = ([] if not operator_budget_label else
+             ["--operator-budget-label", operator_budget_label])
+    target = [] if not target_as_of else ["--target-as-of", target_as_of]
+    return [
+        {
+            "stage": "onepass",
+            "script": "onepass_workbook_runner.py",
+            "argv": [
+                "--tickers-file", allowed_universe_file.as_posix(),
+                "--output-dir", onepass_root.as_posix(),
+                "--write", "--allow-network-fetch",
+            ],
+            "success_status": "ok",
+        },
+        {
+            "stage": "impactsearch",
+            "script": "impactsearch_workbook_runner.py",
+            "argv": [
+                "--secondaries", sec_csv,
+                "--primary-source", "master_tickers_file",
+                "--primary-tickers-file", allowed_universe_file.as_posix(),
+                "--output-dir", impactsearch_root.as_posix(),
+                "--write", "--allow-network-fetch",
+            ],
+            "success_status": "ok",
+        },
+        {
+            "stage": "stackbuilder",
+            "script": "stackbuilder_workbook_runner.py",
+            "argv": [
+                "--secondaries", sec_csv,
+                "--primary-source", "impact_xlsx",
+                "--impact-xlsx-dir", impactsearch_root.as_posix(),
+                "--outdir", stackbuilder_root.as_posix(),
+                "--write", "--allow-network-fetch", "--update-selected",
+                *budget, *label,
+            ],
+            "success_status": "ok",
+        },
+        {
+            "stage": "k6_recook",
+            "script": "k6_recook.py",
+            "argv": [
+                "--execute", "--allow-network-fetch",
+                "--secondaries", sec_csv,
+                "--driver-run-id", driver_run_id,
+                "--stackbuilder-root", stackbuilder_root.as_posix(),
+                "--output-root", k6_output_root.as_posix(),
+                "--restage-all",
+                *target,
+            ],
+            "success_status": "ok",
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+
+class CrunchOrchestrator:
+    def __init__(
+        self,
+        *,
+        project_root: Path,
+        run_dir: Path,
+        blocked_file: Path,
+        rebuild_file: Path,
+        stackbuilder_root: Path,
+        impactsearch_root: Path,
+        onepass_root: Path,
+        k6_output_root: Path,
+        master_tickers_file: Path,
+        target_as_of: str | None,
+        duration_budget_minutes: int | None,
+        operator_budget_label: str | None,
+        allow_network_fetch: bool,
+        execute: bool,
+        reclaim_stale_lock: bool,
+        now: datetime,
+        invoker: Callable[[str, list[str]], dict] | None = None,
+        conflict_check: Callable[[tuple], dict] | None = None,
+    ) -> None:
+        self.project_root = project_root
+        self.run_dir = run_dir
+        self.blocked_file = blocked_file
+        self.rebuild_file = rebuild_file
+        self.stackbuilder_root = stackbuilder_root
+        self.impactsearch_root = impactsearch_root
+        self.onepass_root = onepass_root
+        self.k6_output_root = k6_output_root
+        self.master_tickers_file = master_tickers_file
+        self.target_as_of = target_as_of
+        self.duration_budget_minutes = duration_budget_minutes
+        self.operator_budget_label = operator_budget_label
+        self.allow_network_fetch = allow_network_fetch
+        self.execute = execute
+        self.reclaim_stale_lock = reclaim_stale_lock
+        self.now = now
+        self.invoker = invoker or self._default_invoker
+        self.conflict_check = conflict_check or default_process_conflict_check
+        self.run_id = run_dir.name
+        self.lock_path = (run_dir.parent / LOCK_NAME)
+
+    # --- real subprocess invoker (never used by tests) -------------------
+    def _default_invoker(self, script: str, argv: list[str]) -> dict:
+        cmd = [sys.executable, str(self.project_root / script), *argv]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        out = proc.stdout.strip()
+        try:
+            # The runners emit one JSON object on stdout; tolerate trailing
+            # text by taking the last JSON object.
+            start = out.rfind("\n{")
+            blob = out[start + 1:] if start != -1 else out
+            return json.loads(blob)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise CrunchError(
+                f"stage {script} produced unparseable stdout "
+                f"(exit {proc.returncode}): {type(exc).__name__}") from exc
+
+    # --- envelope helpers -------------------------------------------------
+    def _base_envelope(self, status: str, halted_at: str | None) -> dict:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "generated_at_utc": self.now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "mode": "execute" if self.execute else "dry_run",
+            "status": status,
+            "halted_at": halted_at,
+            "publish_attempted": False,
+            "blob_attempted": False,
+            "promotion_attempted": False,
+        }
+
+    def _halt(self, halted_at: str, reason: str, preflight: dict | None) -> dict:
+        env = self._base_envelope("halted", halted_at)
+        env["reason"] = reason
+        if preflight is not None:
+            env["preflight"] = preflight
+        _write_json(self.run_dir / "RUN_SUMMARY.json", env)
+        return env
+
+    # --- Stage 0 ----------------------------------------------------------
+    def preflight(self) -> dict:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        blocked = load_symbol_file(self.blocked_file, label="blocked-tickers")
+        rebuild = load_symbol_file(self.rebuild_file,
+                                   label="rebuild-secondaries")
+        exclusion = sorted(set(blocked))
+        excl_set = set(exclusion)
+        current_secs = discover_current_secondaries(self.stackbuilder_root)
+        # UNREBUILDABLE = exclusion tickers that are current secondaries.
+        unrebuildable = sorted(s for s in exclusion if s in current_secs)
+        requested = sorted(set(rebuild))
+        effective = sorted(s for s in requested if s not in excl_set)
+        master = load_master_universe(self.master_tickers_file)
+        allowed_universe = [t for t in master if t not in excl_set]
+
+        # Write the run-scoped allowed-universe file (never master_tickers).
+        allowed_file = self.run_dir / "allowed_universe.txt"
+        _atomic_write_text(allowed_file,
+                           "".join(t + "\n" for t in allowed_universe))
+
+        commands = build_stage_commands(
+            effective_rebuild=effective,
+            allowed_universe_file=allowed_file,
+            onepass_root=self.onepass_root,
+            impactsearch_root=self.impactsearch_root,
+            stackbuilder_root=self.stackbuilder_root,
+            k6_output_root=self.k6_output_root,
+            target_as_of=self.target_as_of,
+            duration_budget_minutes=self.duration_budget_minutes,
+            operator_budget_label=self.operator_budget_label,
+            driver_run_id=self.run_id,
+        )
+
+        gates = {
+            "execute": self.execute,
+            "allow_network_fetch": self.allow_network_fetch,
+            "duration_budget_minutes": self.duration_budget_minutes,
+            "operator_budget_label": self.operator_budget_label,
+            "target_as_of": self.target_as_of,
+        }
+        missing_gates = []
+        if self.execute:
+            if not self.allow_network_fetch:
+                missing_gates.append("--allow-network-fetch")
+            if not self.duration_budget_minutes:
+                missing_gates.append("--duration-budget-minutes")
+            if not self.operator_budget_label:
+                missing_gates.append("--operator-budget-label")
+            if not self.target_as_of:
+                missing_gates.append("--target-as-of")
+
+        conflict = self.conflict_check(ENGINE_SCRIPTS)
+
+        warnings = []
+        if not self.target_as_of:
+            warnings.append("target-as-of not set (required for --execute)")
+        if not allowed_universe:
+            warnings.append(
+                "allowed universe is empty (master_tickers not found?)")
+        if not effective:
+            warnings.append("effective rebuild set is empty")
+
+        preflight = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "exclusion_set": exclusion,
+            "exclusion_count": len(exclusion),
+            "requested_rebuild_set": requested,
+            "effective_rebuild_set": effective,
+            "unrebuildable_set": unrebuildable,
+            "allowed_universe_size": len(allowed_universe),
+            "allowed_universe_file": allowed_file.as_posix(),
+            "current_secondary_count": len(current_secs),
+            "stage_commands": commands,
+            "execution_gates": gates,
+            "missing_execute_gates": missing_gates,
+            "process_conflict": conflict,
+            "stage_connection": {
+                "design": "canonical_roots_with_quarantine",
+                "rationale": (
+                    "rebuilt stacks must replace broken canonical "
+                    "output/stackbuilder/<SEC>; prior artifacts are moved to "
+                    "the run dir quarantine (never deleted). Stage 1 "
+                    "full-universe signal_library refresh is operator-approved."
+                ),
+                "canonical_mutation_under_execute": [
+                    "signal_library/data/stable (Stage 1, full allowed universe)",
+                    "output/impactsearch/<rebuild SEC> (Stage 2)",
+                    "output/stackbuilder/<rebuild SEC> (Stage 3)",
+                    "cache/results, price_cache/daily, signal_library "
+                    "(Stage 4 k6_recook A/Aprime/B)",
+                    "output/k6_mtf/<run> (Stage 4, run-scoped)",
+                ],
+            },
+            "runner_contract_notes": [
+                "No engine honors a ban/exclude flag; exclusion is by "
+                "input-withholding (allowed-universe file = master minus "
+                "exclusion; ImpactSearch primaries from that file; StackBuilder "
+                "primaries from the freshly rebuilt impact xlsx).",
+                "ImpactSearch keep-last carry-forward defeated by quarantining "
+                "each rebuild secondary's prior workbook before Stage 2.",
+                "k6_recook --restage-all prevents a stale selected_build.json "
+                "from carrying a broken member through Stage 0.",
+                "k6_recook run WITHOUT --allow-stage-a-exclusions so any Stage "
+                "A unavailability is a hard STOP (no silent member shrink).",
+            ],
+            "warnings": warnings,
+        }
+        _write_json(self.run_dir / "00_preflight.json", preflight)
+        _write_json(self.run_dir / "run_plan.json", {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "mode": "execute" if self.execute else "dry_run",
+            "stage_commands": commands,
+            "exclusion_set": exclusion,
+            "effective_rebuild_set": effective,
+            "unrebuildable_set": unrebuildable,
+            "execution_gates": gates,
+        })
+        # Stash for stages.
+        self._excl_set = excl_set
+        self._exclusion = exclusion
+        self._requested = requested
+        self._effective = effective
+        self._unrebuildable = unrebuildable
+        self._commands = commands
+        self._conflict = conflict
+        self._missing_gates = missing_gates
+        return preflight
+
+    def _write_manual_edit_outputs(self) -> None:
+        manual = sorted(set(self._exclusion) | set(self._unrebuildable))
+        _atomic_write_text(
+            self.run_dir / "broken_tickers_for_manual_master_ticker_edit.txt",
+            "".join(t + "\n" for t in manual))
+        _write_json(
+            self.run_dir / "broken_tickers_for_manual_master_ticker_edit.json",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "note": ("operator manually edits master_tickers.txt; the "
+                         "orchestrator never edits it"),
+                "exclusion_set": sorted(self._exclusion),
+                "unrebuildable_secondaries": sorted(self._unrebuildable),
+                "manual_master_ticker_removal_candidates": manual,
+            })
+
+    # --- top-level run ----------------------------------------------------
+    def run(self) -> dict:
+        # Stage 0 (both modes).
+        try:
+            preflight = self.preflight()
+        except CrunchError as exc:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            return self._halt("preflight", str(exc), None)
+
+        # Lock (both modes); released at the end / on halt.
+        try:
+            acquire_lock(self.lock_path, run_id=self.run_id, stage="stage0",
+                         reclaim_stale=self.reclaim_stale_lock, now=self.now)
+        except CrunchError as exc:
+            return self._halt("lock", str(exc), preflight)
+
+        try:
+            # Conflict gate: blocked -> STOP (both modes); insufficient ->
+            # STOP for execute, warning for dry-run.
+            cstat = self._conflict.get("status")
+            if cstat == "blocked":
+                return self._halt("process_conflict",
+                                  "conflicting engine process detected",
+                                  preflight)
+            if cstat == "insufficient" and self.execute:
+                return self._halt(
+                    "process_conflict",
+                    "process-conflict coverage insufficient (cannot enumerate "
+                    "processes); refusing execute", preflight)
+
+            if not self.execute:
+                env = self._base_envelope("dry_run_planned", None)
+                env["preflight"] = preflight
+                env["note"] = ("dry-run: no stages invoked, no network, no "
+                               "engine runs")
+                self._write_manual_edit_outputs()
+                _write_json(self.run_dir / "RUN_SUMMARY.json", env)
+                return env
+
+            # ----- execute path (operator-run only) -----
+            if self._missing_gates:
+                return self._halt(
+                    "execute_gates",
+                    "missing required execute gates: "
+                    + ", ".join(self._missing_gates), preflight)
+            return self._run_execute(preflight)
+        finally:
+            release_lock(self.lock_path)
+
+    # --- execute stages ---------------------------------------------------
+    def _stage_cmd(self, stage: str) -> dict:
+        for c in self._commands:
+            if c["stage"] == stage:
+                return c
+        raise CrunchError(f"no command for stage {stage}")
+
+    def _require_ok(self, stage: str, result: dict) -> None:
+        status = result.get("status")
+        if status != "ok":
+            raise CrunchError(
+                f"stage {stage} non-ok status: {status!r} "
+                f"(halted_at={result.get('halted_at')})")
+
+    def _run_execute(self, preflight: dict) -> dict:
+        excl = self._excl_set
+        rebuild = self._effective
+        checkpoints: dict[str, Any] = {}
+        try:
+            # Stage 1 -- OnePass (allowed universe; exclusion omitted).
+            r1 = self.invoker("onepass_workbook_runner.py",
+                              self._stage_cmd("onepass")["argv"])
+            self._require_ok("onepass", r1)
+            # Boundary: the runner result itself (per_ticker_results) must
+            # carry no excluded ticker, even if the canonical manifest is
+            # clean; plus the result-reported workbook/manifest files and the
+            # canonical manifest.
+            assert_no_excluded_in_obj(
+                r1.get("per_ticker_results"), excl, stage="onepass")
+            op_paths = [self.onepass_root / "onepass.xlsx.manifest.json"]
+            for key in ("workbook_path", "manifest_path"):
+                val = r1.get(key)
+                if val:
+                    op_paths.append(self._abspath(val))
+            assert_no_excluded(op_paths, excl, stage="onepass")
+            _write_json(self.run_dir / "01_onepass.json", r1)
+            checkpoints["onepass"] = r1.get("status")
+
+            # Stage 2 -- ImpactSearch (quarantine first, primaries exclude set).
+            q_imp = self._quarantine_impactsearch(rebuild)
+            r2 = self.invoker("impactsearch_workbook_runner.py",
+                              self._stage_cmd("impactsearch")["argv"])
+            self._require_ok("impactsearch", r2)
+            assert_no_excluded(self._impactsearch_artifacts(rebuild),
+                               excl, stage="impactsearch")
+            _write_json(self.run_dir / "02_impactsearch.json",
+                        {"result": r2, "quarantined": q_imp})
+            checkpoints["impactsearch"] = r2.get("status")
+
+            # Stage 3 -- StackBuilder (quarantine first, re-select members).
+            self._assert_no_blocking_pins(rebuild)
+            q_sb = self._quarantine_stackbuilder(rebuild)
+            r3 = self.invoker("stackbuilder_workbook_runner.py",
+                              self._stage_cmd("stackbuilder")["argv"])
+            self._require_ok("stackbuilder", r3)
+            assert_no_excluded(self._stackbuilder_artifacts(rebuild),
+                               excl, stage="stackbuilder")
+            _write_json(self.run_dir / "03_stackbuilder.json",
+                        {"result": r3, "quarantined": q_sb})
+            checkpoints["stackbuilder"] = r3.get("status")
+
+            # Stage 4 -- k6_recook (restage; Stage A authoritative).
+            r4 = self.invoker("k6_recook.py", self._stage_cmd("k6_recook")["argv"])
+            self._require_ok("k6_recook", r4)
+            stagea = r4.get("stageA") or {}
+            if stagea.get("excluded_secondaries"):
+                raise CrunchError(
+                    "k6_recook Stage A excluded secondaries; refusing silent "
+                    "member shrink: "
+                    + json.dumps(stagea.get("excluded_secondaries"),
+                                 sort_keys=True))
+            assert_no_excluded(self._k6_artifacts(r4), excl, stage="k6_recook")
+            _write_json(self.run_dir / "04_k6_recook.json", r4)
+            checkpoints["k6_recook"] = r4.get("status")
+        except CrunchError as exc:
+            self._write_manual_edit_outputs()
+            env = self._halt("execute", str(exc), preflight)
+            env["checkpoints"] = checkpoints
+            _write_json(self.run_dir / "RUN_SUMMARY.json", env)
+            return env
+
+        self._write_manual_edit_outputs()
+        env = self._base_envelope("completed_no_publish", None)
+        env["preflight"] = preflight
+        env["checkpoints"] = checkpoints
+        env["candidate_artifacts_root"] = self.k6_output_root.as_posix()
+        _write_json(self.run_dir / "RUN_SUMMARY.json", env)
+        return env
+
+    # --- artifact path helpers + quarantine -------------------------------
+    def _sec_dir_name(self, secondary: str) -> str:
+        return secondary  # secondaries are literal dir names (incl carets)
+
+    def _impactsearch_artifacts(self, rebuild: list[str]) -> list[Path]:
+        out: list[Path] = []
+        for sec in rebuild:
+            out.extend(sorted(self.impactsearch_root.glob(f"{sec}_*.xlsx")))
+            out.extend(sorted(self.impactsearch_root.glob(f"{sec}_*.json")))
+        return out
+
+    def _quarantine_impactsearch(self, rebuild: list[str]) -> dict:
+        moved: dict[str, list[str]] = {}
+        for sec in rebuild:
+            items = sorted(self.impactsearch_root.glob(f"{sec}_*.xlsx"))
+            items += sorted(self.impactsearch_root.glob(f"{sec}_*.json"))
+            dest = self.run_dir / "quarantine" / "impactsearch" / sec
+            m = quarantine_paths(items, dest)
+            if m:
+                moved[sec] = m
+        return moved
+
+    def _stackbuilder_artifacts(self, rebuild: list[str]) -> list[Path]:
+        out: list[Path] = []
+        for sec in rebuild:
+            d = self.stackbuilder_root / self._sec_dir_name(sec)
+            out.append(d / SELECTED_BUILD)
+            out.append(d / SELECTED_BUILD_PINNED)
+            out.extend(sorted(d.rglob(COMBO_FILENAME)))
+        return out
+
+    def _quarantine_stackbuilder(self, rebuild: list[str]) -> dict:
+        moved: dict[str, list[str]] = {}
+        for sec in rebuild:
+            d = self.stackbuilder_root / self._sec_dir_name(sec)
+            if d.exists():
+                dest = self.run_dir / "quarantine" / "stackbuilder"
+                m = quarantine_paths([d], dest)
+                if m:
+                    moved[sec] = m
+        return moved
+
+    def _assert_no_blocking_pins(self, rebuild: list[str]) -> None:
+        pinned = []
+        for sec in rebuild:
+            p = self.stackbuilder_root / self._sec_dir_name(sec) / SELECTED_BUILD_PINNED
+            if p.is_file():
+                pinned.append(sec)
+            sb = self.stackbuilder_root / self._sec_dir_name(sec) / SELECTED_BUILD
+            if sb.is_file():
+                try:
+                    data = json.loads(sb.read_text(encoding="utf-8"))
+                    if data.get("operator_pinned") is True:
+                        pinned.append(sec)
+                except (OSError, json.JSONDecodeError):
+                    pass
+        if pinned:
+            raise CrunchError(
+                "pinned selected_build blocks rebuild for "
+                + json.dumps(sorted(set(pinned)), sort_keys=True)
+                + "; --unpin not used without explicit operator approval")
+
+    def _abspath(self, value: str) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() else (self.project_root / p)
+
+    def _resolve_k6_ranking_path(self, r4: dict) -> Path:
+        """Resolve the EXACT current-run k6 ranking artifact, fail-closed and
+        BOUND to the orchestrator run id. Because the orchestrator pins
+        --driver-run-id <self.run_id>, the only acceptable artifact is
+        ``<k6_output_root>/<self.run_id>/k6_mtf_ranking.json``. Every path or
+        id the result returns must point exactly there; anything else (a
+        stale/different run, even if its file exists) is a hard STOP. There is
+        NO 'under the output root' acceptance and NO latest-run fallback."""
+        stagef = r4.get("stageF") or {}
+        expected_run_dir = self.k6_output_root / self.run_id
+        expected_ranking = expected_run_dir / "k6_mtf_ranking.json"
+        exp_dir = expected_run_dir.resolve()
+        exp_rank = expected_ranking.resolve()
+
+        # 1) driver_run_id, if returned, must equal the pinned run id.
+        drid = r4.get("driver_run_id")
+        if drid is not None and str(drid) != self.run_id:
+            raise CrunchError(
+                f"k6_recook driver_run_id {str(drid)!r} does not match the "
+                f"orchestrator run id {self.run_id!r}")
+
+        # 2) stageF.ranking_artifact_path, if present, must be the exact file.
+        rp = stagef.get("ranking_artifact_path")
+        if rp and self._abspath(str(rp)).resolve() != exp_rank:
+            raise CrunchError(
+                "k6_recook stageF.ranking_artifact_path points to a different "
+                f"run than expected: {str(rp)!r} != {expected_ranking.as_posix()}")
+
+        # 3) any returned run dir must be the exact expected run dir.
+        for key, val in (("output_run_dir", r4.get("output_run_dir")),
+                         ("run_dir", r4.get("run_dir")),
+                         ("stageF.run_dir", stagef.get("run_dir"))):
+            if val and self._abspath(str(val)).resolve() != exp_dir:
+                raise CrunchError(
+                    f"k6_recook {key} points to a different run than expected: "
+                    f"{str(val)!r} != {expected_run_dir.as_posix()}")
+
+        # 4) Fall back only to the expected (run-id-bound) artifact; require it.
+        if not expected_ranking.is_file():
+            raise CrunchError(
+                "k6_recook ok but the current-run ranking artifact is missing "
+                f"at {expected_ranking.as_posix()}")
+        return expected_ranking
+
+    def _k6_artifacts(self, r4: dict) -> list[Path]:
+        ranking = self._resolve_k6_ranking_path(r4)
+        out = [ranking]
+        out.extend(sorted(ranking.parent.glob("*/k6_mtf_history.json")))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="crunch_rebuild_orchestrator",
+        description=(
+            "Run-once crunch rebuild orchestrator. Dry-run by default "
+            "(Stage 0 preflight + plan only; no engines, no network). "
+            "--execute (operator-run only) chains onepass -> impactsearch -> "
+            "stackbuilder -> k6_recook with exclusion boundary checks and "
+            "quarantine, and STOPS before any publication."
+        ),
+    )
+    p.add_argument("--blocked-tickers-file", default=DEFAULT_BLOCKED_FILE)
+    p.add_argument("--rebuild-secondaries-file", default=DEFAULT_REBUILD_FILE)
+    p.add_argument("--run-dir", default=None)
+    p.add_argument("--target-as-of", default=None)
+    p.add_argument("--duration-budget-minutes", type=int, default=None)
+    p.add_argument("--operator-budget-label", default=None)
+    p.add_argument("--allow-network-fetch", action="store_true")
+    p.add_argument("--execute", action="store_true")
+    p.add_argument("--reclaim-stale-lock", action="store_true")
+    p.add_argument("--stackbuilder-root", default=DEFAULT_STACKBUILDER_ROOT)
+    p.add_argument("--impactsearch-root", default=DEFAULT_IMPACTSEARCH_ROOT)
+    p.add_argument("--onepass-root", default=DEFAULT_ONEPASS_ROOT)
+    p.add_argument("--k6-output-root", default=DEFAULT_K6_OUTPUT_ROOT)
+    p.add_argument("--master-tickers-file", default=DEFAULT_MASTER_TICKERS)
+    p.add_argument("--project-root", default=None)
+    return p
+
+
+def _resolve(project_root: Path, opt: str, default_rel: str) -> Path:
+    q = Path(opt) if opt else Path(default_rel)
+    return q if q.is_absolute() else (project_root / q)
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    project_root = (Path(args.project_root).resolve() if args.project_root
+                    else Path(__file__).resolve().parent)
+    now = _utcnow()
+    run_dir = (Path(args.run_dir) if args.run_dir else
+               project_root / DEFAULT_RUN_BASE / _run_id(now))
+    if not run_dir.is_absolute():
+        run_dir = project_root / run_dir
+
+    orch = CrunchOrchestrator(
+        project_root=project_root,
+        run_dir=run_dir,
+        blocked_file=_resolve(project_root, args.blocked_tickers_file,
+                              DEFAULT_BLOCKED_FILE),
+        rebuild_file=_resolve(project_root, args.rebuild_secondaries_file,
+                              DEFAULT_REBUILD_FILE),
+        stackbuilder_root=_resolve(project_root, args.stackbuilder_root,
+                                   DEFAULT_STACKBUILDER_ROOT),
+        impactsearch_root=_resolve(project_root, args.impactsearch_root,
+                                   DEFAULT_IMPACTSEARCH_ROOT),
+        onepass_root=_resolve(project_root, args.onepass_root,
+                              DEFAULT_ONEPASS_ROOT),
+        k6_output_root=_resolve(project_root, args.k6_output_root,
+                                DEFAULT_K6_OUTPUT_ROOT),
+        master_tickers_file=_resolve(project_root, args.master_tickers_file,
+                                     DEFAULT_MASTER_TICKERS),
+        target_as_of=args.target_as_of,
+        duration_budget_minutes=args.duration_budget_minutes,
+        operator_budget_label=args.operator_budget_label,
+        allow_network_fetch=args.allow_network_fetch,
+        execute=args.execute,
+        reclaim_stale_lock=args.reclaim_stale_lock,
+        now=now,
+    )
+    env = orch.run()
+    print(json.dumps({
+        "status": env.get("status"),
+        "halted_at": env.get("halted_at"),
+        "run_dir": run_dir.as_posix(),
+        "mode": env.get("mode"),
+    }, indent=2, sort_keys=True))
+    return 0 if env.get("status") in ("dry_run_planned",
+                                      "completed_no_publish") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
