@@ -1258,6 +1258,79 @@ class CrunchOrchestrator:
                         f"field {k!r} missing")
             _check(f"secondary {sec!r}", rec)
 
+    def _assert_stackbuilder_parity(self, result: dict) -> None:
+        """Fail closed unless the executed StackBuilder result envelope proves
+        the intended Phase 6I-79 optimized build shape. Result-envelope ONLY:
+        the top-level effective_config records the build profile, summary
+        records the run outcome, and per_secondary_results records each
+        secondary's status. A missing/wrong field is a hard STOP -- we never
+        accept an executed StackBuilder run we cannot prove ran the optimized
+        shape. This guards executed build shape; it does NOT read per-secondary
+        run_manifest.json and is not a publish-time durable-validation check."""
+        cfg = result.get("effective_config")
+        if not isinstance(cfg, dict):
+            raise CrunchError(
+                "stackbuilder parity: effective_config missing or not a "
+                f"mapping (got {type(cfg).__name__})")
+        # (key, expected). Booleans are matched by identity so 1/0 cannot
+        # masquerade as True/False; ints/strs by equality.
+        expected = (
+            ("skip_durable_validation", True),
+            ("k_max", 12),
+            ("exhaustive_k", 4),
+            ("search", "beam"),
+            ("beam_width", 12),
+            ("top_n", 20),
+            ("bottom_n", 20),
+            ("k_patience", 1),
+            ("allow_decreasing", True),
+            ("jobs", 1),
+        )
+        for key, want in expected:
+            if key not in cfg:
+                raise CrunchError(
+                    f"stackbuilder parity: effective_config missing {key!r}")
+            got = cfg.get(key)
+            if isinstance(want, bool):
+                if got is not want:
+                    raise CrunchError(
+                        f"stackbuilder parity: effective_config {key}={got!r} "
+                        f"is not {want!r}")
+            elif got != want:
+                raise CrunchError(
+                    f"stackbuilder parity: effective_config {key}={got!r} "
+                    f"!= {want!r}")
+
+        summary = result.get("summary")
+        if not isinstance(summary, dict):
+            raise CrunchError(
+                "stackbuilder parity: summary missing or not a mapping")
+        if "error" not in summary:
+            raise CrunchError("stackbuilder parity: summary.error missing")
+        if summary.get("error") != 0:
+            raise CrunchError(
+                f"stackbuilder parity: summary.error="
+                f"{summary.get('error')!r} != 0")
+
+        per = result.get("per_secondary_results")
+        if not isinstance(per, list) or not per:
+            raise CrunchError(
+                "stackbuilder parity: per_secondary_results missing or not a "
+                "non-empty list")
+        for idx, rec in enumerate(per):
+            if not isinstance(rec, dict):
+                raise CrunchError(
+                    f"stackbuilder parity: per_secondary_results[{idx}] is "
+                    "not an object")
+            sec = rec.get("secondary", f"#{idx}")
+            if "status" not in rec:
+                raise CrunchError(
+                    f"stackbuilder parity (secondary {sec!r}): status missing")
+            if rec.get("status") != "ok":
+                raise CrunchError(
+                    f"stackbuilder parity (secondary {sec!r}): status "
+                    f"{rec.get('status')!r} != 'ok'")
+
     def _run_execute(self, preflight: dict) -> dict:
         excl = self._excl_set
         rebuild = self._effective
@@ -1328,6 +1401,10 @@ class CrunchOrchestrator:
             r3 = self.invoker("stackbuilder_workbook_runner.py",
                               c3["argv"], c3.get("stage_env") or {})
             self._require_ok("stackbuilder", r3)
+            # Optimized-runner parity boundary: prove the executed result
+            # envelope confirms the Phase 6I-79 build shape (K1-K12 beam,
+            # durable validation skipped, all secondaries ok).
+            self._assert_stackbuilder_parity(r3)
             assert_no_excluded(self._stackbuilder_artifacts(rebuild),
                                excl, stage="stackbuilder")
             _write_json(self.run_dir / "03_stackbuilder.json",

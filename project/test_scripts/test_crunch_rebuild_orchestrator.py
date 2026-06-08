@@ -111,6 +111,39 @@ def _impactsearch_ok(rebuild):
     }
 
 
+def _stackbuilder_cfg(**over):
+    """The full optimized (Phase 6I-79) effective_config; override individual
+    keys via kwargs (use a sentinel to drop a key in tests)."""
+    cfg = {
+        "skip_durable_validation": True,
+        "k_max": 12,
+        "exhaustive_k": 4,
+        "search": "beam",
+        "beam_width": 12,
+        "top_n": 20,
+        "bottom_n": 20,
+        "k_patience": 1,
+        "allow_decreasing": True,
+        "jobs": 1,
+    }
+    cfg.update(over)
+    return cfg
+
+
+def _stackbuilder_ok(rebuild, *, cfg=None, summary=None, per=None):
+    """A parity-clean StackBuilder result envelope: full optimized
+    effective_config, summary.error == 0, every per-secondary status 'ok'."""
+    return {
+        "status": "ok",
+        "effective_config": _stackbuilder_cfg() if cfg is None else cfg,
+        "summary": ({"ok": len(rebuild), "error": 0, "total": len(rebuild)}
+                    if summary is None else summary),
+        "per_secondary_results": ([{"secondary": sec, "status": "ok"}
+                                   for sec in rebuild]
+                                  if per is None else per),
+    }
+
+
 def _ok_conflict(_patterns):
     return {"status": "ok", "conflicts": []}
 
@@ -401,7 +434,7 @@ def _execute_setup(tmp_path, *, rebuild, blocked, members_clean,
         writers.update(writers_override)
     results = {"onepass": {"status": "ok"},
                "impactsearch": _impactsearch_ok(rebuild),
-               "stackbuilder": {"status": "ok"},
+               "stackbuilder": _stackbuilder_ok(rebuild),
                "k6_recook": {
                    "status": "ok", "driver_run_id": rid,
                    "stageF": {"ranking_artifact_path":
@@ -1352,6 +1385,173 @@ def test_non_reuse_default_still_invokes_onepass(tmp_path):
     plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
     assert "onepass_reuse" not in plan
     assert "stage1_onepass" not in plan
+
+
+# ---------------------------------------------------------------------------
+# StackBuilder runtime parity assertion (build-shape, result-envelope only)
+# ---------------------------------------------------------------------------
+
+
+def test_stackbuilder_parity_pass(tmp_path):
+    o = _make_orch(tmp_path)
+    # Full optimized envelope, multiple secondaries -> must NOT raise.
+    o._assert_stackbuilder_parity(_stackbuilder_ok(["AAPB", "AAPU"]))
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("skip_durable_validation", False),
+    ("k_max", 6),
+    ("exhaustive_k", 3),
+    ("search", "exhaustive"),
+    ("beam_width", 8),
+    ("top_n", 10),
+    ("bottom_n", 10),
+    ("k_patience", 2),
+    ("allow_decreasing", False),
+    ("jobs", 4),
+])
+def test_stackbuilder_parity_wrong_config_value_stops(tmp_path, key, bad):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], cfg=_stackbuilder_cfg(**{key: bad}))
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+@pytest.mark.parametrize("key", [
+    "skip_durable_validation", "k_max", "exhaustive_k", "search",
+    "beam_width", "top_n", "bottom_n", "k_patience", "allow_decreasing", "jobs",
+])
+def test_stackbuilder_parity_missing_config_key_stops(tmp_path, key):
+    o = _make_orch(tmp_path)
+    cfg = _stackbuilder_cfg()
+    del cfg[key]
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(_stackbuilder_ok(["AAPB"], cfg=cfg))
+
+
+def test_stackbuilder_parity_missing_effective_config_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"])
+    del r["effective_config"]
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_non_mapping_effective_config_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"])
+    r["effective_config"] = ["not", "a", "dict"]
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_missing_summary_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"])
+    del r["summary"]
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_non_mapping_summary_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], summary=["error", 0])
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_missing_summary_error_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], summary={"ok": 1, "total": 1})
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_summary_error_positive_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], summary={"ok": 0, "error": 1, "total": 1})
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_missing_per_results_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"])
+    del r["per_secondary_results"]
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_non_list_per_results_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], per={"secondary": "AAPB", "status": "ok"})
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_empty_per_results_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], per=[])
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_non_object_per_result_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], per=["AAPB"])
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_per_result_missing_status_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    r = _stackbuilder_ok(["AAPB"], per=[{"secondary": "AAPB"}])
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(r)
+
+
+def test_stackbuilder_parity_per_result_non_ok_stops(tmp_path):
+    o = _make_orch(tmp_path)
+    per = [{"secondary": "AAPB", "status": "ok"},
+           {"secondary": "AAPU", "status": "error"}]
+    with pytest.raises(cro.CrunchError):
+        o._assert_stackbuilder_parity(_stackbuilder_ok(["AAPB", "AAPU"],
+                                                       per=per))
+
+
+def test_execute_stops_on_stackbuilder_parity_before_k6(tmp_path):
+    # status == "ok" passes _require_ok, but bad parity must halt the run at
+    # the execute stage, before StackBuilder is checkpointed and before k6 runs.
+    bad_sb = _stackbuilder_ok(["AAPB"], cfg=_stackbuilder_cfg(k_max=6))
+    o, inv = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                            members_clean=["AAA[D]"] * 6,
+                            results_override={"stackbuilder": bad_sb})
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    stages = [s for s, *_ in inv.calls]
+    assert "stackbuilder" in stages       # _require_ok passed (status ok)
+    assert "k6_recook" not in stages      # halted before Stage 4
+    assert env.get("checkpoints", {}).get("stackbuilder") is None
+    assert not (o.run_dir / "03_stackbuilder.json").is_file()
+
+
+def test_execute_stackbuilder_parity_runs_before_exclusion_scan(tmp_path):
+    # Both a parity violation AND an excluded ticker in the StackBuilder
+    # artifact: parity is asserted BEFORE the exclusion scan, so the halt
+    # reason is the parity failure, not the exclusion failure.
+    sb_root = tmp_path / "output" / "stackbuilder"
+    bad_sb = _stackbuilder_ok(["AAPB"], cfg=_stackbuilder_cfg(jobs=4))
+
+    def bad_artifact():
+        _make_secondary_dir(sb_root, "AAPB", members=["DR8A.F[D]"] * 6)
+
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          results_override={"stackbuilder": bad_sb},
+                          writers_override={"stackbuilder": bad_artifact})
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert "stackbuilder parity" in env["reason"]   # parity fired first
 
 
 def test_no_absolute_paths_in_tracked_source():
