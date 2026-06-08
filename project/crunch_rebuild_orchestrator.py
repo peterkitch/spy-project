@@ -460,6 +460,31 @@ def _csv(tickers: list[str]) -> str:
     return ",".join(tickers)
 
 
+# Phase 6I-57 ImpactSearch optimized-runner env (non-secret config). All six
+# are consumed by the engine/fast-path: IMPACT_REQUIRE_ZERO_PRIMARY_YF
+# (impactsearch.py:644), IMPACT_INSTRUMENT_YF_CALLS (:722), IMPACT_TRUST_LIBRARY
+# (:591), IMPACT_CALENDAR_GRACE_DAYS (:2983), IMPACT_MAX_WORKERS (:3724),
+# IMPACT_TRUST_MAX_AGE_HOURS (signal_library/impact_fastpath.py:39). Injected
+# ONLY into the ImpactSearch stage subprocess; other stages inherit os.environ
+# unchanged (empty stage_env).
+IMPACTSEARCH_STAGE_ENV = {
+    "IMPACT_REQUIRE_ZERO_PRIMARY_YF": "1",
+    "IMPACT_INSTRUMENT_YF_CALLS": "1",
+    "IMPACT_TRUST_LIBRARY": "1",
+    "IMPACT_TRUST_MAX_AGE_HOURS": "720",
+    "IMPACT_CALENDAR_GRACE_DAYS": "30",
+    "IMPACT_MAX_WORKERS": "8",
+}
+
+# Phase 6I-79 StackBuilder full K1-K12 build parity rationale (recorded in the
+# plan for operator review).
+STACKBUILDER_PARITY_RATIONALE = (
+    "Full K1-K12 build parity with Phase 6I-79. The MTF site consumes the K6 "
+    "slice downstream. --k-max 12 is full production-runner parity, not a "
+    "narrowing."
+)
+
+
 def build_stage_commands(
     *, effective_rebuild: list[str], allowed_universe_file: Path,
     onepass_root: Path, impactsearch_root: Path, stackbuilder_root: Path,
@@ -484,31 +509,56 @@ def build_stage_commands(
                 "--output-dir", onepass_root.as_posix(),
                 "--write", "--allow-network-fetch",
             ],
+            "stage_env": {},
             "success_status": "ok",
         },
         {
             "stage": "impactsearch",
             "script": "impactsearch_workbook_runner.py",
+            # ONE batch subprocess for all rebuild secondaries (the optimized
+            # path relies on the warm in-process fast-path LRU across the
+            # batch). Full-master primary universe unchanged; exclusion stays
+            # input-withholding (the allowed-universe file = master minus the
+            # exclusion set). Phase 6I-57 optimized flags: --use-multiprocessing
+            # (parallel primary scoring) and --validation-mode legacy_fast
+            # (skip durable validation).
             "argv": [
                 "--secondaries", sec_csv,
                 "--primary-source", "master_tickers_file",
                 "--primary-tickers-file", allowed_universe_file.as_posix(),
                 "--output-dir", impactsearch_root.as_posix(),
+                "--use-multiprocessing",
+                "--validation-mode", "legacy_fast",
                 "--write", "--allow-network-fetch",
             ],
+            "stage_env": dict(IMPACTSEARCH_STAGE_ENV),
             "success_status": "ok",
         },
         {
             "stage": "stackbuilder",
             "script": "stackbuilder_workbook_runner.py",
+            # Phase 6I-79 full K1-K12 build parity.
             "argv": [
                 "--secondaries", sec_csv,
                 "--primary-source", "impact_xlsx",
                 "--impact-xlsx-dir", impactsearch_root.as_posix(),
                 "--outdir", stackbuilder_root.as_posix(),
+                "--skip-durable-validation",
+                "--jobs", "1",
+                "--k-max", "12",
+                "--exhaustive-k", "4",
+                "--search", "beam",
+                "--beam-width", "12",
+                "--top-n", "20",
+                "--bottom-n", "20",
+                "--allow-decreasing",
+                "--k-patience", "1",
+                "--no-progress",
                 "--write", "--allow-network-fetch", "--update-selected",
                 *budget, *label,
             ],
+            "stage_env": {},
+            "parity_rationale": STACKBUILDER_PARITY_RATIONALE,
             "success_status": "ok",
         },
         {
@@ -523,6 +573,7 @@ def build_stage_commands(
                 "--restage-all",
                 *target,
             ],
+            "stage_env": {},
             "success_status": "ok",
         },
     ]
@@ -553,7 +604,7 @@ class CrunchOrchestrator:
         execute: bool,
         reclaim_stale_lock: bool,
         now: datetime,
-        invoker: Callable[[str, list[str]], dict] | None = None,
+        invoker: Callable[[str, list[str], dict], dict] | None = None,
         conflict_check: Callable[[tuple], dict] | None = None,
     ) -> None:
         self.project_root = project_root
@@ -578,9 +629,15 @@ class CrunchOrchestrator:
         self.lock_path = (run_dir.parent / LOCK_NAME)
 
     # --- real subprocess invoker (never used by tests) -------------------
-    def _default_invoker(self, script: str, argv: list[str]) -> dict:
+    def _default_invoker(
+        self, script: str, argv: list[str], stage_env: dict | None = None
+    ) -> dict:
         cmd = [sys.executable, str(self.project_root / script), *argv]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        # Per-stage env injection: os.environ inherited verbatim, then the
+        # stage's own keys layered on top. Empty/None stage_env => exact
+        # os.environ (unchanged behavior for non-ImpactSearch stages).
+        env = {**os.environ, **(stage_env or {})}
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         out = proc.stdout.strip()
         try:
             # The runners emit one JSON object on stdout; tolerate trailing
@@ -826,14 +883,73 @@ class CrunchOrchestrator:
                 f"stage {stage} non-ok status: {status!r} "
                 f"(halted_at={result.get('halted_at')})")
 
+    def _assert_impactsearch_parity(self, result: dict) -> None:
+        """Fail closed unless the ImpactSearch run matched the optimized-runner
+        profile: validation_mode == 'legacy_fast', durable_validation_ran is
+        False, and primary_yfinance_fetch_count == 0. The runner reports these
+        three fields PER SECONDARY (no top-level aggregate); enforce every
+        per-secondary entry and also enforce any aggregate field that happens
+        to be present. A missing required field is a hard STOP -- we never pass
+        a run we cannot prove matched the profile."""
+
+        def _check(scope: str, holder: dict) -> None:
+            mode = holder.get("validation_mode")
+            if mode != "legacy_fast":
+                raise CrunchError(
+                    f"impactsearch parity ({scope}): validation_mode "
+                    f"{mode!r} != 'legacy_fast'")
+            ran = holder.get("durable_validation_ran")
+            if ran is not False:
+                raise CrunchError(
+                    f"impactsearch parity ({scope}): durable_validation_ran "
+                    f"{ran!r} != False")
+            fetched = holder.get("primary_yfinance_fetch_count")
+            if fetched != 0:
+                raise CrunchError(
+                    f"impactsearch parity ({scope}): "
+                    f"primary_yfinance_fetch_count {fetched!r} != 0")
+
+        # Aggregate fields, enforced only where present (the runner currently
+        # exposes none at the top level; this future-proofs if it adds them).
+        agg_keys = ("validation_mode", "durable_validation_ran",
+                    "primary_yfinance_fetch_count")
+        if any(k in result for k in agg_keys):
+            for k in agg_keys:
+                if k not in result:
+                    raise CrunchError(
+                        f"impactsearch parity (aggregate): partial aggregate "
+                        f"fields present but {k!r} missing")
+            _check("aggregate", result)
+
+        per = result.get("per_ticker_results")
+        if not isinstance(per, list) or not per:
+            raise CrunchError(
+                "impactsearch parity: executed result is missing a non-empty "
+                "per_ticker_results list")
+        required = ("validation_mode", "durable_validation_ran",
+                    "primary_yfinance_fetch_count")
+        for idx, rec in enumerate(per):
+            if not isinstance(rec, dict):
+                raise CrunchError(
+                    f"impactsearch parity: per_ticker_results[{idx}] is not "
+                    "an object")
+            sec = rec.get("secondary", f"#{idx}")
+            for k in required:
+                if k not in rec:
+                    raise CrunchError(
+                        f"impactsearch parity (secondary {sec!r}): required "
+                        f"field {k!r} missing")
+            _check(f"secondary {sec!r}", rec)
+
     def _run_execute(self, preflight: dict) -> dict:
         excl = self._excl_set
         rebuild = self._effective
         checkpoints: dict[str, Any] = {}
         try:
             # Stage 1 -- OnePass (allowed universe; exclusion omitted).
+            c1 = self._stage_cmd("onepass")
             r1 = self.invoker("onepass_workbook_runner.py",
-                              self._stage_cmd("onepass")["argv"])
+                              c1["argv"], c1.get("stage_env") or {})
             self._require_ok("onepass", r1)
             # Boundary: the runner result itself (per_ticker_results) must
             # carry no excluded ticker, even if the canonical manifest is
@@ -852,9 +968,13 @@ class CrunchOrchestrator:
 
             # Stage 2 -- ImpactSearch (quarantine first, primaries exclude set).
             q_imp = self._quarantine_impactsearch(rebuild)
+            c2 = self._stage_cmd("impactsearch")
             r2 = self.invoker("impactsearch_workbook_runner.py",
-                              self._stage_cmd("impactsearch")["argv"])
+                              c2["argv"], c2.get("stage_env") or {})
             self._require_ok("impactsearch", r2)
+            # Optimized-runner parity boundary: legacy_fast, no durable
+            # validation, zero primary yfinance fetches (per secondary).
+            self._assert_impactsearch_parity(r2)
             assert_no_excluded(self._impactsearch_artifacts(rebuild),
                                excl, stage="impactsearch")
             _write_json(self.run_dir / "02_impactsearch.json",
@@ -864,8 +984,9 @@ class CrunchOrchestrator:
             # Stage 3 -- StackBuilder (quarantine first, re-select members).
             self._assert_no_blocking_pins(rebuild)
             q_sb = self._quarantine_stackbuilder(rebuild)
+            c3 = self._stage_cmd("stackbuilder")
             r3 = self.invoker("stackbuilder_workbook_runner.py",
-                              self._stage_cmd("stackbuilder")["argv"])
+                              c3["argv"], c3.get("stage_env") or {})
             self._require_ok("stackbuilder", r3)
             assert_no_excluded(self._stackbuilder_artifacts(rebuild),
                                excl, stage="stackbuilder")
@@ -874,7 +995,9 @@ class CrunchOrchestrator:
             checkpoints["stackbuilder"] = r3.get("status")
 
             # Stage 4 -- k6_recook (restage; Stage A authoritative).
-            r4 = self.invoker("k6_recook.py", self._stage_cmd("k6_recook")["argv"])
+            c4 = self._stage_cmd("k6_recook")
+            r4 = self.invoker("k6_recook.py",
+                              c4["argv"], c4.get("stage_env") or {})
             self._require_ok("k6_recook", r4)
             stagea = r4.get("stageA") or {}
             if stagea.get("excluded_secondaries"):

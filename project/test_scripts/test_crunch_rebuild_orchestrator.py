@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,17 +77,37 @@ def _xlsx(path: Path, primaries) -> None:
 def _make_invoker(results, writers=None):
     writers = writers or {}
     calls = []
+    env_by_stage = {}
 
-    def inv(script, argv):
+    def inv(script, argv, stage_env=None):
         stage = SCRIPT_TO_STAGE[script]
-        calls.append((stage, list(argv)))
+        env = dict(stage_env or {})
+        calls.append((stage, list(argv), env))
+        env_by_stage[stage] = env
         w = writers.get(stage)
         if w:
             w()
         return results.get(stage, {"status": "ok"})
 
     inv.calls = calls
+    inv.env_by_stage = env_by_stage
     return inv
+
+
+def _impactsearch_ok(rebuild):
+    """A parity-clean ImpactSearch result: every rebuild secondary reports the
+    optimized-runner profile (legacy_fast, no durable validation, zero primary
+    yfinance fetches)."""
+    return {
+        "status": "ok",
+        "per_ticker_results": [
+            {"secondary": sec, "status": "ok",
+             "validation_mode": "legacy_fast",
+             "durable_validation_ran": False,
+             "primary_yfinance_fetch_count": 0}
+            for sec in rebuild
+        ],
+    }
 
 
 def _ok_conflict(_patterns):
@@ -376,7 +397,8 @@ def _execute_setup(tmp_path, *, rebuild, blocked, members_clean,
                "stackbuilder": w_stackbuilder, "k6_recook": w_k6}
     if writers_override:
         writers.update(writers_override)
-    results = {"onepass": {"status": "ok"}, "impactsearch": {"status": "ok"},
+    results = {"onepass": {"status": "ok"},
+               "impactsearch": _impactsearch_ok(rebuild),
                "stackbuilder": {"status": "ok"},
                "k6_recook": {
                    "status": "ok", "driver_run_id": rid,
@@ -401,8 +423,8 @@ def test_execute_happy_path(tmp_path):
                                            "BBB[I]", "AAA[D]", "BBB[I]"])
     env = o.run()
     assert env["status"] == "completed_no_publish"
-    assert [s for s, _ in inv.calls] == ["onepass", "impactsearch",
-                                         "stackbuilder", "k6_recook"]
+    assert [s for s, *_ in inv.calls] == ["onepass", "impactsearch",
+                                          "stackbuilder", "k6_recook"]
     assert env["publish_attempted"] is False
     assert env["blob_attempted"] is False
     assert env["promotion_attempted"] is False
@@ -688,7 +710,7 @@ def test_pin_blocked_rebuild_stops_before_quarantine(tmp_path):
     # the secondary dir is NOT moved and stackbuilder was never invoked.
     assert marker.is_file()
     assert not (o.run_dir / "quarantine" / "stackbuilder" / "AAPB").exists()
-    assert "stackbuilder" not in [s for s, _ in inv.calls]
+    assert "stackbuilder" not in [s for s, *_ in inv.calls]
 
 
 def test_pin_via_selected_build_flag_stops(tmp_path):
@@ -749,6 +771,246 @@ def test_scanner_no_substring_false_positive(tmp_path):
     # DX-Y.NYB matched whole, not its hyphen fragments
     assert cro.scan_artifact_for_excluded(p, {"DX"}) == set()
     assert "DX-Y.NYB" in cro.scan_artifact_for_excluded(p, {"DX-Y.NYB"})
+
+
+# ---------------------------------------------------------------------------
+# Optimized-runner parity: stage argv, per-stage env, boundary checks
+# ---------------------------------------------------------------------------
+
+
+def test_impactsearch_stage_argv_and_env_optimized(tmp_path):
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    o = _make_orch(tmp_path)
+    o.preflight()
+    cmd = o._stage_cmd("impactsearch")
+    argv = cmd["argv"]
+    # One batch (single --secondaries), full-master primary universe, exclusion
+    # by input-withholding -- unchanged.
+    assert argv.count("--secondaries") == 1
+    assert "master_tickers_file" in argv
+    assert argv[argv.index("--primary-source") + 1] == "master_tickers_file"
+    # New optimized flags.
+    assert "--use-multiprocessing" in argv
+    assert argv[argv.index("--validation-mode") + 1] == "legacy_fast"
+    # Exact injected env (the six non-secret IMPACT_* config values).
+    assert cmd["stage_env"] == {
+        "IMPACT_REQUIRE_ZERO_PRIMARY_YF": "1",
+        "IMPACT_INSTRUMENT_YF_CALLS": "1",
+        "IMPACT_TRUST_LIBRARY": "1",
+        "IMPACT_TRUST_MAX_AGE_HOURS": "720",
+        "IMPACT_CALENDAR_GRACE_DAYS": "30",
+        "IMPACT_MAX_WORKERS": "8",
+    }
+    assert cmd["stage_env"] == cro.IMPACTSEARCH_STAGE_ENV
+
+
+def test_non_impactsearch_stages_have_empty_env(tmp_path):
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    o = _make_orch(tmp_path)
+    o.preflight()
+    for stage in ("onepass", "stackbuilder", "k6_recook"):
+        assert o._stage_cmd(stage)["stage_env"] == {}
+
+
+def test_stackbuilder_stage_argv_k12_parity(tmp_path):
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    o = _make_orch(tmp_path)
+    o.preflight()
+    cmd = o._stage_cmd("stackbuilder")
+    argv = cmd["argv"]
+    assert "--skip-durable-validation" in argv
+    assert argv[argv.index("--jobs") + 1] == "1"
+    assert argv[argv.index("--k-max") + 1] == "12"
+    assert argv[argv.index("--exhaustive-k") + 1] == "4"
+    assert argv[argv.index("--search") + 1] == "beam"
+    assert argv[argv.index("--beam-width") + 1] == "12"
+    assert argv[argv.index("--top-n") + 1] == "20"
+    assert argv[argv.index("--bottom-n") + 1] == "20"
+    assert "--allow-decreasing" in argv
+    assert argv[argv.index("--k-patience") + 1] == "1"
+    assert "--no-progress" in argv
+    # Rationale recorded for operator review.
+    assert "K1-K12" in cmd["parity_rationale"]
+    assert cmd["parity_rationale"] == cro.STACKBUILDER_PARITY_RATIONALE
+
+
+def test_run_plan_records_env_and_rationale(tmp_path):
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    o = _make_orch(tmp_path)
+    o.run()  # dry-run (execute defaults False) -> writes run_plan.json
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    by_stage = {c["stage"]: c for c in plan["stage_commands"]}
+    assert by_stage["impactsearch"]["stage_env"]["IMPACT_MAX_WORKERS"] == "8"
+    assert "--use-multiprocessing" in by_stage["impactsearch"]["argv"]
+    assert "--k-max" in by_stage["stackbuilder"]["argv"]
+    assert by_stage["stackbuilder"]["parity_rationale"] == \
+        cro.STACKBUILDER_PARITY_RATIONALE
+    # No publication / promotion / commit / push / deploy path in the plan.
+    blob = json.dumps(plan).lower()
+    for word in ("publish", "promot", "blob", "commit", "push", "deploy"):
+        assert word not in blob
+
+
+def test_impactsearch_env_injected_at_execute(tmp_path):
+    o, inv = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                            members_clean=["AAA[D]"] * 6)
+    env = o.run()
+    assert env["status"] == "completed_no_publish"
+    # The injected env reached the invoker for ImpactSearch only.
+    assert inv.env_by_stage["impactsearch"] == cro.IMPACTSEARCH_STAGE_ENV
+    assert inv.env_by_stage["onepass"] == {}
+    assert inv.env_by_stage["stackbuilder"] == {}
+    assert inv.env_by_stage["k6_recook"] == {}
+
+
+def test_default_invoker_merges_stage_env_over_parent(tmp_path, monkeypatch):
+    """Direct hermetic regression for the real _default_invoker env merge:
+    env = {**os.environ, **stage_env}. subprocess.run is stubbed so NO real
+    subprocess/engine is launched; os.environ is a controlled fixture and must
+    not be mutated by the merge."""
+    o = _make_orch(tmp_path)  # project_root == tmp_path
+
+    # Controlled parent environment (a plain dict standing in for os.environ).
+    parent_env = {"PARENT_ONLY": "parent", "OVERRIDE_ME": "parent_value"}
+    monkeypatch.setattr(cro.os, "environ", parent_env)
+
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return types.SimpleNamespace(
+            stdout='noise\n{"status": "ok", "echo": 7}\n', returncode=0)
+
+    monkeypatch.setattr(cro.subprocess, "run", fake_run)
+
+    stage_env = {"OVERRIDE_ME": "stage_value", "STAGE_ONLY": "stage"}
+    result = o._default_invoker("some_runner.py", ["--flag", "val"], stage_env)
+
+    # --- subprocess.run was the stub; no real process launched ---------------
+    assert "kwargs" in captured  # fake_run ran exactly via our stub
+    kwargs = captured["kwargs"]
+
+    # --- env= mapping present and correctly merged ---------------------------
+    env = kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["PARENT_ONLY"] == "parent"        # parent key preserved
+    assert env["OVERRIDE_ME"] == "stage_value"   # stage overrides parent
+    assert env["STAGE_ONLY"] == "stage"          # stage adds a new key
+
+    # --- os.environ (the parent fixture) is NOT mutated ----------------------
+    assert env is not parent_env
+    assert parent_env["OVERRIDE_ME"] == "parent_value"
+    assert "STAGE_ONLY" not in parent_env
+    assert cro.os.environ is parent_env  # same object, untouched
+
+    # --- argv/script plumbing remains correct --------------------------------
+    cmd = captured["args"][0]
+    assert cmd[0] == cro.sys.executable
+    assert cmd[1] == str(tmp_path / "some_runner.py")
+    assert cmd[2:] == ["--flag", "val"]
+
+    # --- capture_output/text contract preserved ------------------------------
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+
+    # --- stdout JSON parsing contract preserved (last JSON object) -----------
+    assert result == {"status": "ok", "echo": 7}
+
+
+def test_default_invoker_empty_stage_env_is_plain_parent(tmp_path, monkeypatch):
+    """An empty/None stage_env yields exactly os.environ (a copy, not a
+    mutation) -- the unchanged path for non-ImpactSearch stages."""
+    o = _make_orch(tmp_path)
+    parent_env = {"PARENT_ONLY": "parent", "OVERRIDE_ME": "parent_value"}
+    monkeypatch.setattr(cro.os, "environ", parent_env)
+
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return types.SimpleNamespace(stdout='{"status": "ok"}', returncode=0)
+
+    monkeypatch.setattr(cro.subprocess, "run", fake_run)
+
+    result = o._default_invoker("runner.py", [], {})
+    env = captured["kwargs"]["env"]
+    assert env == parent_env       # same contents
+    assert env is not parent_env   # but a fresh dict (no aliasing)
+    assert result == {"status": "ok"}
+
+
+def _impact_bad(rebuild, **bad):
+    res = _impactsearch_ok(rebuild)
+    res["per_ticker_results"][0].update(bad)
+    return res
+
+
+@pytest.mark.parametrize("bad", [
+    {"validation_mode": "durable"},
+    {"durable_validation_ran": True},
+    {"primary_yfinance_fetch_count": 3},
+])
+def test_impactsearch_parity_boundary_stops(tmp_path, bad):
+    o, _ = _execute_setup(
+        tmp_path, rebuild=["AAPB", "AAPU"], blocked=["DR8A.F"],
+        members_clean=["AAA[D]"] * 6,
+        results_override={"impactsearch": _impact_bad(["AAPB", "AAPU"], **bad)})
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+
+
+def test_impactsearch_parity_missing_field_stops(tmp_path):
+    res = _impactsearch_ok(["AAPB"])
+    del res["per_ticker_results"][0]["primary_yfinance_fetch_count"]
+    o, _ = _execute_setup(
+        tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+        members_clean=["AAA[D]"] * 6,
+        results_override={"impactsearch": res})
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+
+
+def test_impactsearch_parity_empty_results_stops(tmp_path):
+    o, _ = _execute_setup(
+        tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+        members_clean=["AAA[D]"] * 6,
+        results_override={"impactsearch": {"status": "ok",
+                                           "per_ticker_results": []}})
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+
+
+def test_impactsearch_parity_bad_aggregate_stops(tmp_path):
+    # A top-level aggregate field present but inconsistent -> STOP, even when
+    # the per-secondary entries are clean.
+    res = _impactsearch_ok(["AAPB"])
+    res["validation_mode"] = "durable"
+    res["durable_validation_ran"] = True
+    res["primary_yfinance_fetch_count"] = 1
+    o, _ = _execute_setup(
+        tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+        members_clean=["AAA[D]"] * 6,
+        results_override={"impactsearch": res})
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+
+
+def test_k6_recook_stage_argv_unchanged(tmp_path):
+    # Change 4: k6_recook still uses --secondaries / --driver-run-id /
+    # --restage-all and is unaffected by the StackBuilder K12 build.
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    o = _make_orch(tmp_path)
+    o.preflight()
+    argv = o._stage_cmd("k6_recook")["argv"]
+    assert "--secondaries" in argv
+    assert "--driver-run-id" in argv
+    assert "--restage-all" in argv
 
 
 def test_no_absolute_paths_in_tracked_source():
