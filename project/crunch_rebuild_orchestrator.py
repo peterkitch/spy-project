@@ -64,6 +64,13 @@ DEFAULT_K6_OUTPUT_ROOT = "output/k6_mtf"
 DEFAULT_MASTER_TICKERS = "global_ticker_library/data/master_tickers.txt"
 LOCK_NAME = ".crunch.lock"
 
+# OnePass-reuse: default freshness window (hours) for reusing a prior crunch
+# run's completed, validated OnePass evidence instead of re-running Stage 1.
+# 168h (7 days) is a conservative weekly window and matches the pipeline's
+# IMPACT_TRUST_MAX_AGE_HOURS staleness default (168h) used elsewhere for
+# offline library reuse.
+DEFAULT_REUSE_ONEPASS_MAX_AGE_HOURS = 168
+
 SELECTED_BUILD = "selected_build.json"
 SELECTED_BUILD_PINNED = "selected_build.pinned.json"
 COMBO_FILENAME = "combo_k=6.json"
@@ -95,6 +102,23 @@ class CrunchError(Exception):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp like '2026-06-06T19:10:16Z' (also
+    tolerates an explicit +00:00 offset or a naive timestamp, which is assumed
+    UTC). Returns a tz-aware UTC datetime, or None if unparseable."""
+    s = str(value).strip()
+    if not s:
+        return None
+    candidate = (s[:-1] + "+00:00") if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _run_id(now: datetime) -> str:
@@ -604,6 +628,8 @@ class CrunchOrchestrator:
         execute: bool,
         reclaim_stale_lock: bool,
         now: datetime,
+        reuse_onepass_run_dir: Path | None = None,
+        reuse_onepass_max_age_hours: int = DEFAULT_REUSE_ONEPASS_MAX_AGE_HOURS,
         invoker: Callable[[str, list[str], dict], dict] | None = None,
         conflict_check: Callable[[tuple], dict] | None = None,
     ) -> None:
@@ -623,6 +649,9 @@ class CrunchOrchestrator:
         self.execute = execute
         self.reclaim_stale_lock = reclaim_stale_lock
         self.now = now
+        self.reuse_onepass_run_dir = reuse_onepass_run_dir
+        self.reuse_onepass_max_age_hours = reuse_onepass_max_age_hours
+        self._reuse: dict | None = None
         self.invoker = invoker or self._default_invoker
         self.conflict_check = conflict_check or default_process_conflict_check
         self.run_id = run_dir.name
@@ -672,6 +701,245 @@ class CrunchOrchestrator:
         _write_json(self.run_dir / "RUN_SUMMARY.json", env)
         return env
 
+    # --- OnePass reuse (opt-in) -------------------------------------------
+    def _rel_or_redact(self, p: Path) -> str:
+        """Render a path project-relative when it lives under project_root,
+        else redact to a non-absolute, non-leaking basename form. Never emits a
+        local absolute path into proof output."""
+        try:
+            return p.resolve().relative_to(self.project_root.resolve()).as_posix()
+        except (ValueError, OSError):
+            return "<redacted>/" + p.name
+
+    def _build_reuse_proof(self, allowed_universe: list[str],
+                           excl_set: set[str]) -> dict:
+        """Fail-closed validation of a prior crunch run's OnePass evidence.
+        Returns a proof dict; proof['valid'] is True only if EVERY check
+        passes. On the first failure it stops and records proof['reason'].
+        Never raises; never mutates the prior run dir; all paths emitted are
+        project-relative or redacted."""
+        proof: dict = {
+            "requested": True,
+            "valid": False,
+            "reason": None,
+            "freshness_window_hours": self.reuse_onepass_max_age_hours,
+            "no_onepass_subprocess": True,
+        }
+        prior = self.reuse_onepass_run_dir
+        assert prior is not None  # only called when reuse requested
+
+        # 1) prior dir exists.
+        if not prior.is_dir():
+            proof["source_run_dir"] = self._rel_or_redact(prior)
+            proof["reason"] = (
+                "prior reuse run dir not found: "
+                + proof["source_run_dir"])
+            return proof
+        proof["source_run_dir"] = self._rel_or_redact(prior)
+
+        # 2) prior dir is not the current run dir.
+        try:
+            is_same = prior.resolve() == self.run_dir.resolve()
+        except OSError:
+            is_same = False
+        if is_same:
+            proof["reason"] = "prior reuse run dir is the current run dir"
+            return proof
+
+        au_path = prior / "allowed_universe.txt"
+        op_path = prior / "01_onepass.json"
+        proof["source_allowed_universe"] = self._rel_or_redact(au_path)
+        proof["source_onepass_json"] = self._rel_or_redact(op_path)
+
+        # 3) prior allowed_universe.txt exists.
+        if not au_path.is_file():
+            proof["reason"] = "prior allowed_universe.txt is missing"
+            return proof
+        # 4) prior 01_onepass.json exists.
+        if not op_path.is_file():
+            proof["reason"] = "prior 01_onepass.json is missing"
+            return proof
+
+        try:
+            data = json.loads(op_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            proof["reason"] = (
+                "prior 01_onepass.json unreadable/unparseable: "
+                + type(exc).__name__)
+            return proof
+        if not isinstance(data, dict):
+            proof["reason"] = "prior 01_onepass.json is not a JSON object"
+            return proof
+
+        # 5) reused OnePass status is ok.
+        status = data.get("status")
+        proof["status"] = status
+        if status != "ok":
+            proof["reason"] = f"reused OnePass status is not ok: {status!r}"
+            return proof
+
+        # 6) reused OnePass has zero per-ticker errors (summary AND per-ticker).
+        summary = data.get("summary")
+        if not isinstance(summary, dict) or "error" not in summary:
+            proof["reason"] = (
+                "reused OnePass summary missing or has no 'error' count")
+            return proof
+        proof["summary"] = {k: summary.get(k) for k in ("error", "ok", "total")}
+        if summary.get("error") != 0:
+            proof["reason"] = (
+                f"reused OnePass summary.error is not 0: "
+                f"{summary.get('error')!r}")
+            return proof
+        per = data.get("per_ticker_results")
+        if not isinstance(per, list) or not per:
+            proof["reason"] = (
+                "reused OnePass per_ticker_results missing or empty")
+            return proof
+        non_ok = [r.get("ticker") if isinstance(r, dict) else None
+                  for r in per
+                  if not isinstance(r, dict) or r.get("status") != "ok"]
+        if non_ok:
+            proof["reason"] = (
+                f"reused OnePass has {len(non_ok)} per-ticker non-ok "
+                f"result(s); first ticker: {non_ok[0]!r}")
+            return proof
+
+        # FIX 3: a read failure after the existence check fails closed instead
+        # of leaking an uncaught OSError.
+        try:
+            au_raw = au_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            proof["reason"] = (
+                "prior allowed_universe.txt unreadable: " + type(exc).__name__)
+            return proof
+        prior_lines = [normalize_ticker(x) for x in au_raw.splitlines()
+                       if x.strip()]
+
+        # 7) no current blocked ticker in prior allowed_universe.txt, and none
+        #    anywhere in the reused OnePass result (member-aware scan). Checked
+        #    before the universe match so a blocked-ticker leak is reported as
+        #    such (a blocked member would also fail the match, but the
+        #    blocked-ticker reason is the more actionable refusal).
+        in_au = sorted(t for t in prior_lines if t in excl_set)
+        strings: list[str] = []
+        _collect_json_strings(data, strings)
+        found: set[str] = set()
+        for s in strings:
+            for variant in _member_tokens(s):
+                if variant in excl_set:
+                    found.add(variant)
+        in_op = sorted(found)
+        proof["blocked_ticker_scan"] = {
+            "in_allowed_universe": in_au,
+            "in_onepass_result": in_op,
+        }
+        if in_au or in_op:
+            proof["blocked_scan_result"] = "blocked_ticker_present"
+            proof["reason"] = (
+                f"blocked ticker present (allowed_universe={in_au}, "
+                f"onepass_result={in_op})")
+            return proof
+        proof["blocked_scan_result"] = "clean"
+
+        # 8) prior allowed_universe.txt exactly matches the current recomputed
+        #    allowed universe (normalized ordered lines).
+        if prior_lines != allowed_universe:
+            ps, cs = set(prior_lines), set(allowed_universe)
+            proof["universe_match"] = False
+            proof["universe_delta"] = {
+                "prior_count": len(prior_lines),
+                "current_count": len(allowed_universe),
+                "in_prior_not_current": sorted(ps - cs)[:50],
+                "in_current_not_prior": sorted(cs - ps)[:50],
+                "same_set_order_differs": (ps == cs and prior_lines !=
+                                           allowed_universe),
+            }
+            proof["reason"] = (
+                "prior allowed_universe.txt does not match the current "
+                "recomputed allowed universe")
+            return proof
+        proof["universe_match"] = True
+
+        # 8b) FIX 2: the reused OnePass must prove FULL coverage of the current
+        #     allowed universe -- not merely "zero errors". Summary counts and
+        #     the ordered per-ticker list must each equal the current allowed
+        #     universe exactly.
+        n = len(allowed_universe)
+        reused_tickers = [normalize_ticker(r.get("ticker")) for r in per]
+        cov_problems: list[str] = []
+        if summary.get("total") != n:
+            cov_problems.append(f"summary.total={summary.get('total')!r} != {n}")
+        if summary.get("ok") != n:
+            cov_problems.append(f"summary.ok={summary.get('ok')!r} != {n}")
+        if len(per) != n:
+            cov_problems.append(f"len(per_ticker_results)={len(per)} != {n}")
+        if reused_tickers != allowed_universe:
+            cov_problems.append(
+                "per_ticker_results tickers (ordered) do not equal the current "
+                "allowed_universe")
+        if cov_problems:
+            rs, cs = set(reused_tickers), set(allowed_universe)
+            proof["coverage_match"] = False
+            proof["coverage_delta"] = {
+                "expected_count": n,
+                "summary_total": summary.get("total"),
+                "summary_ok": summary.get("ok"),
+                "per_ticker_count": len(per),
+                "missing_from_result": sorted(cs - rs)[:50],
+                "extra_in_result": sorted(rs - cs)[:50],
+                "same_set_order_differs": (rs == cs and reused_tickers !=
+                                           allowed_universe),
+            }
+            proof["reason"] = (
+                "reused OnePass does not cover the current allowed universe: "
+                + "; ".join(cov_problems))
+            return proof
+        proof["coverage_match"] = True
+
+        # 9) freshness: prefer explicit completion timestamp, else mtime.
+        parsed = _parse_utc_timestamp(data.get("end_timestamp_utc"))
+        ts_source = "end_timestamp_utc" if parsed is not None else None
+        if parsed is None:
+            try:
+                parsed = datetime.fromtimestamp(op_path.stat().st_mtime,
+                                                tz=timezone.utc)
+                ts_source = "file_mtime"
+            except OSError:
+                parsed = None
+        if parsed is None:
+            proof["reason"] = (
+                "reused OnePass has no parseable completion timestamp and "
+                "file mtime is unavailable")
+            return proof
+        proof["timestamp_source"] = ts_source
+        proof["parsed_timestamp_utc"] = parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+        age_hours = (self.now - parsed).total_seconds() / 3600.0
+        proof["age_hours"] = round(age_hours, 3)
+        if age_hours < 0:
+            proof["reason"] = (
+                f"reused OnePass timestamp is in the future "
+                f"(age {age_hours:.3f}h, source {ts_source})")
+            return proof
+        if age_hours > self.reuse_onepass_max_age_hours:
+            proof["fresh"] = False
+            proof["reason"] = (
+                f"reused OnePass is stale: age {age_hours:.2f}h > window "
+                f"{self.reuse_onepass_max_age_hours}h (timestamp source "
+                f"{ts_source})")
+            return proof
+        proof["fresh"] = True
+
+        # All checks passed.
+        proof["valid"] = True
+        proof["summary_text"] = (
+            f"Stage 1 reused from prior run {proof['source_run_dir']}: "
+            f"status=ok, {summary.get('ok')}/{summary.get('total')} tickers "
+            f"ok, allowed-universe match, blocked-ticker scan clean, age "
+            f"{proof['age_hours']}h <= {self.reuse_onepass_max_age_hours}h "
+            f"(timestamp source: {ts_source}). No OnePass subprocess will be "
+            f"invoked.")
+        return proof
+
     # --- Stage 0 ----------------------------------------------------------
     def preflight(self) -> dict:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -692,6 +960,12 @@ class CrunchOrchestrator:
         allowed_file = self.run_dir / "allowed_universe.txt"
         _atomic_write_text(allowed_file,
                            "".join(t + "\n" for t in allowed_universe))
+
+        # OnePass reuse (opt-in): validate prior evidence against the CURRENT
+        # recomputed universe/exclusion. Never bypasses the recomputation above.
+        reuse = None
+        if self.reuse_onepass_run_dir is not None:
+            reuse = self._build_reuse_proof(allowed_universe, excl_set)
 
         commands = build_stage_commands(
             effective_rebuild=effective,
@@ -781,8 +1055,7 @@ class CrunchOrchestrator:
             ],
             "warnings": warnings,
         }
-        _write_json(self.run_dir / "00_preflight.json", preflight)
-        _write_json(self.run_dir / "run_plan.json", {
+        run_plan = {
             "schema_version": SCHEMA_VERSION,
             "run_id": self.run_id,
             "mode": "execute" if self.execute else "dry_run",
@@ -791,7 +1064,21 @@ class CrunchOrchestrator:
             "effective_rebuild_set": effective,
             "unrebuildable_set": unrebuildable,
             "execution_gates": gates,
-        })
+        }
+        # Reuse metadata only when reuse is requested (otherwise the preflight
+        # and run_plan shapes are exactly as today).
+        if reuse is not None:
+            stage1_view = {
+                "stage": "onepass",
+                "action": "reused" if reuse.get("valid") else "refused",
+                "onepass_subprocess_invoked": False,
+                "proof": reuse,
+            }
+            preflight["onepass_reuse"] = reuse
+            run_plan["onepass_reuse"] = reuse
+            run_plan["stage1_onepass"] = stage1_view
+        _write_json(self.run_dir / "00_preflight.json", preflight)
+        _write_json(self.run_dir / "run_plan.json", run_plan)
         # Stash for stages.
         self._excl_set = excl_set
         self._exclusion = exclusion
@@ -801,6 +1088,7 @@ class CrunchOrchestrator:
         self._commands = commands
         self._conflict = conflict
         self._missing_gates = missing_gates
+        self._reuse = reuse
         return preflight
 
     def _write_manual_edit_outputs(self) -> None:
@@ -820,8 +1108,28 @@ class CrunchOrchestrator:
                 "manual_master_ticker_removal_candidates": manual,
             })
 
+    def _same_as_run_dir(self, other: Path) -> bool:
+        try:
+            return other.resolve() == self.run_dir.resolve()
+        except OSError:
+            return False
+
     # --- top-level run ----------------------------------------------------
     def run(self) -> dict:
+        # FIX 1: refuse a reuse source dir equal to the current run dir BEFORE
+        # touching it. preflight() would otherwise mkdir the run dir and write
+        # allowed_universe.txt / 00_preflight.json / run_plan.json into it --
+        # mutating the prior evidence dir before the refusal fires. Return a
+        # halted envelope directly (NOT via _halt, which would write
+        # RUN_SUMMARY.json into that same dir). No mkdir, no lock, no invoker.
+        if self.reuse_onepass_run_dir is not None and self._same_as_run_dir(
+                self.reuse_onepass_run_dir):
+            env = self._base_envelope("halted", "reuse_onepass")
+            env["reason"] = (
+                "OnePass reuse refused: the reuse source dir cannot equal the "
+                "current run dir (refused before any run-dir write)")
+            return env
+
         # Stage 0 (both modes).
         try:
             preflight = self.preflight()
@@ -849,6 +1157,15 @@ class CrunchOrchestrator:
                     "process_conflict",
                     "process-conflict coverage insufficient (cannot enumerate "
                     "processes); refusing execute", preflight)
+
+            # OnePass-reuse gate (both modes): if reuse was requested it must
+            # validate, or the whole run STOPs fail-closed.
+            if self.reuse_onepass_run_dir is not None and not (
+                    self._reuse and self._reuse.get("valid")):
+                reason = ((self._reuse or {}).get("reason")
+                          or "reuse validation failed")
+                return self._halt("reuse_onepass",
+                                  "OnePass reuse refused: " + reason, preflight)
 
             if not self.execute:
                 env = self._base_envelope("dry_run_planned", None)
@@ -946,25 +1263,48 @@ class CrunchOrchestrator:
         rebuild = self._effective
         checkpoints: dict[str, Any] = {}
         try:
-            # Stage 1 -- OnePass (allowed universe; exclusion omitted).
-            c1 = self._stage_cmd("onepass")
-            r1 = self.invoker("onepass_workbook_runner.py",
-                              c1["argv"], c1.get("stage_env") or {})
-            self._require_ok("onepass", r1)
-            # Boundary: the runner result itself (per_ticker_results) must
-            # carry no excluded ticker, even if the canonical manifest is
-            # clean; plus the result-reported workbook/manifest files and the
-            # canonical manifest.
-            assert_no_excluded_in_obj(
-                r1.get("per_ticker_results"), excl, stage="onepass")
-            op_paths = [self.onepass_root / "onepass.xlsx.manifest.json"]
-            for key in ("workbook_path", "manifest_path"):
-                val = r1.get(key)
-                if val:
-                    op_paths.append(self._abspath(val))
-            assert_no_excluded(op_paths, excl, stage="onepass")
-            _write_json(self.run_dir / "01_onepass.json", r1)
-            checkpoints["onepass"] = r1.get("status")
+            # Stage 1 -- OnePass (allowed universe; exclusion omitted), OR
+            # reuse of a prior run's already-validated OnePass evidence.
+            if self.reuse_onepass_run_dir is not None and self._reuse \
+                    and self._reuse.get("valid"):
+                # Reuse proof was validated in preflight (status ok, zero
+                # per-ticker errors, exact universe match, blocked-ticker scan
+                # clean, fresh). Write a reuse checkpoint + a reused
+                # 01_onepass.json in the NEW run dir; touch nothing in the
+                # prior run dir. No OnePass subprocess is invoked.
+                _write_json(self.run_dir / "00_onepass_reuse_proof.json",
+                            self._reuse)
+                r1 = {
+                    "status": "ok",
+                    "mode": "reused",
+                    "source_run_dir": self._reuse.get("source_run_dir"),
+                    "reused_onepass_json": self._reuse.get(
+                        "source_onepass_json"),
+                    "reused_allowed_universe": self._reuse.get(
+                        "source_allowed_universe"),
+                    "proof": self._reuse,
+                }
+                _write_json(self.run_dir / "01_onepass.json", r1)
+                checkpoints["onepass"] = "reused"
+            else:
+                c1 = self._stage_cmd("onepass")
+                r1 = self.invoker("onepass_workbook_runner.py",
+                                  c1["argv"], c1.get("stage_env") or {})
+                self._require_ok("onepass", r1)
+                # Boundary: the runner result itself (per_ticker_results) must
+                # carry no excluded ticker, even if the canonical manifest is
+                # clean; plus the result-reported workbook/manifest files and
+                # the canonical manifest.
+                assert_no_excluded_in_obj(
+                    r1.get("per_ticker_results"), excl, stage="onepass")
+                op_paths = [self.onepass_root / "onepass.xlsx.manifest.json"]
+                for key in ("workbook_path", "manifest_path"):
+                    val = r1.get(key)
+                    if val:
+                        op_paths.append(self._abspath(val))
+                assert_no_excluded(op_paths, excl, stage="onepass")
+                _write_json(self.run_dir / "01_onepass.json", r1)
+                checkpoints["onepass"] = r1.get("status")
 
             # Stage 2 -- ImpactSearch (quarantine first, primaries exclude set).
             q_imp = self._quarantine_impactsearch(rebuild)
@@ -1166,6 +1506,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-network-fetch", action="store_true")
     p.add_argument("--execute", action="store_true")
     p.add_argument("--reclaim-stale-lock", action="store_true")
+    p.add_argument("--reuse-onepass-run-dir", default=None,
+                   help="Reuse a prior crunch run dir's validated OnePass "
+                        "evidence instead of re-running Stage 1 (opt-in; "
+                        "fail-closed; absolute or project-relative path).")
+    p.add_argument("--reuse-onepass-max-age-hours", type=int,
+                   default=DEFAULT_REUSE_ONEPASS_MAX_AGE_HOURS,
+                   help="Freshness window (hours) for OnePass reuse "
+                        f"(default {DEFAULT_REUSE_ONEPASS_MAX_AGE_HOURS}).")
     p.add_argument("--stackbuilder-root", default=DEFAULT_STACKBUILDER_ROOT)
     p.add_argument("--impactsearch-root", default=DEFAULT_IMPACTSEARCH_ROOT)
     p.add_argument("--onepass-root", default=DEFAULT_ONEPASS_ROOT)
@@ -1189,6 +1537,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                project_root / DEFAULT_RUN_BASE / _run_id(now))
     if not run_dir.is_absolute():
         run_dir = project_root / run_dir
+
+    reuse_dir = (_resolve(project_root, args.reuse_onepass_run_dir, "")
+                 if args.reuse_onepass_run_dir else None)
 
     orch = CrunchOrchestrator(
         project_root=project_root,
@@ -1214,6 +1565,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         execute=args.execute,
         reclaim_stale_lock=args.reclaim_stale_lock,
         now=now,
+        reuse_onepass_run_dir=reuse_dir,
+        reuse_onepass_max_age_hours=args.reuse_onepass_max_age_hours,
     )
     env = orch.run()
     print(json.dumps({

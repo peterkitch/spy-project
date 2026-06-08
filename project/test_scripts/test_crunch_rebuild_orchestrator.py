@@ -6,6 +6,7 @@ no real registry/cache/output mutation, no network. All paths under tmp_path.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 from datetime import datetime, timezone
@@ -364,7 +365,8 @@ def test_process_conflict_insufficient_stops_execute(tmp_path):
 
 
 def _execute_setup(tmp_path, *, rebuild, blocked, members_clean,
-                   writers_override=None, results_override=None):
+                   writers_override=None, results_override=None,
+                   extra_orch=None):
     sb_root = tmp_path / "output" / "stackbuilder"
     imp_root = tmp_path / "output" / "impactsearch"
     op_root = tmp_path / "output" / "onepass"
@@ -413,6 +415,7 @@ def _execute_setup(tmp_path, *, rebuild, blocked, members_clean,
         impactsearch_root=imp_root, onepass_root=op_root, k6_output_root=k6_root,
         invoker=inv,
         master_tickers_file=_make_master(tmp_path, ["AAA", "BBB", "CCC"]),
+        **(extra_orch or {}),
     )
     return o, inv
 
@@ -1011,6 +1014,344 @@ def test_k6_recook_stage_argv_unchanged(tmp_path):
     assert "--secondaries" in argv
     assert "--driver-run-id" in argv
     assert "--restage-all" in argv
+
+
+# ---------------------------------------------------------------------------
+# OnePass reuse (opt-in, fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def _write_prior_run(prior_dir, *, allowed_lines=("AAA", "BBB", "CCC"),
+                     status="ok", summary="auto", per="auto",
+                     end_ts="2026-06-06T00:00:00Z", with_allowed=True,
+                     with_json=True, extra=None):
+    """Build a tmp prior crunch-run dir with a 01_onepass.json + matching
+    allowed_universe.txt, shaped to the real field contract."""
+    prior_dir.mkdir(parents=True, exist_ok=True)
+    if with_allowed:
+        _write(prior_dir / "allowed_universe.txt",
+               "".join(t + "\n" for t in allowed_lines))
+    if summary == "auto":
+        summary = {"error": 0, "ok": len(allowed_lines),
+                   "total": len(allowed_lines)}
+    if per == "auto":
+        per = [{"ticker": t, "status": "ok", "metrics_count": 1}
+               for t in allowed_lines]
+    doc = {"status": status, "summary": summary, "per_ticker_results": per,
+           "start_timestamp_utc": "2026-06-05T00:00:00Z"}
+    if end_ts is not None:
+        doc["end_timestamp_utc"] = end_ts
+    if extra:
+        doc.update(extra)
+    if with_json:
+        _write(prior_dir / "01_onepass.json", json.dumps(doc))
+    return prior_dir
+
+
+def _reuse_dry(tmp_path, prior, *, blocked=("DR8A.F",), rebuild=("AAPB",),
+               max_age=168, inv=None):
+    _write_lines(tmp_path / "blocked.txt", list(blocked))
+    _write_lines(tmp_path / "rebuild.txt", list(rebuild))
+    over = dict(reuse_onepass_run_dir=prior, reuse_onepass_max_age_hours=max_age)
+    if inv is not None:
+        over["invoker"] = inv
+    o = _make_orch(tmp_path, **over)
+    return o, o.run()
+
+
+def plan_reuse(o):
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    return plan["onepass_reuse"]
+
+
+def test_reuse_valid_dry_run_plan(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run")
+    inv = _make_invoker({})
+    o, env = _reuse_dry(tmp_path, prior, inv=inv)
+    assert env["status"] == "dry_run_planned"
+    assert inv.calls == []  # no stage invoked in dry-run
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    reuse = plan["onepass_reuse"]
+    assert reuse["valid"] is True
+    assert reuse["no_onepass_subprocess"] is True
+    assert reuse["universe_match"] is True
+    assert reuse["blocked_scan_result"] == "clean"
+    assert reuse["timestamp_source"] == "end_timestamp_utc"
+    assert reuse["age_hours"] >= 0
+    assert reuse["freshness_window_hours"] == 168
+    assert "summary_text" in reuse
+    assert plan["stage1_onepass"]["action"] == "reused"
+    assert plan["stage1_onepass"]["onepass_subprocess_invoked"] is False
+    # Stage 2/3/4 optimized commands unchanged.
+    by_stage = {c["stage"]: c for c in plan["stage_commands"]}
+    imp = by_stage["impactsearch"]["argv"]
+    assert "--use-multiprocessing" in imp
+    assert imp[imp.index("--validation-mode") + 1] == "legacy_fast"
+    assert by_stage["impactsearch"]["stage_env"]["IMPACT_MAX_WORKERS"] == "8"
+    sb = by_stage["stackbuilder"]["argv"]
+    assert sb[sb.index("--k-max") + 1] == "12"
+    assert "--skip-durable-validation" in sb
+    k6 = by_stage["k6_recook"]["argv"]
+    assert "--restage-all" in k6
+    assert "--driver-run-id" in k6
+
+
+def test_reuse_valid_execute_skips_onepass(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run")
+    o, inv = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                            members_clean=["AAA[D]"] * 6,
+                            extra_orch={"reuse_onepass_run_dir": prior})
+    env = o.run()
+    assert env["status"] == "completed_no_publish"
+    stages = [s for s, *_ in inv.calls]
+    assert "onepass" not in stages
+    assert stages == ["impactsearch", "stackbuilder", "k6_recook"]
+    assert (o.run_dir / "00_onepass_reuse_proof.json").is_file()
+    r1 = json.loads((o.run_dir / "01_onepass.json").read_text("utf-8"))
+    assert r1["mode"] == "reused"
+    assert r1["status"] == "ok"
+    assert r1["proof"]["valid"] is True
+    # The prior run dir was not mutated (only the two seed files exist).
+    assert sorted(p.name for p in prior.iterdir()) == [
+        "01_onepass.json", "allowed_universe.txt"]
+
+
+def test_reuse_missing_dir_stops(tmp_path):
+    _, env = _reuse_dry(tmp_path, tmp_path / "does_not_exist")
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+
+
+def test_reuse_dir_equals_current_run_dir_refuses_before_any_write(tmp_path):
+    # FIX 1: prior dir == current run dir must refuse BEFORE any run-dir write,
+    # leaving the prior evidence byte-identical and writing nothing.
+    rd = tmp_path / "output" / "crunch_runs" / "RID"
+    _write_prior_run(rd)
+    marker = rd / "OPERATOR_MARKER.txt"
+    _write(marker, "do-not-touch")
+    au_bytes = (rd / "allowed_universe.txt").read_bytes()
+    op_bytes = (rd / "01_onepass.json").read_bytes()
+    marker_bytes = marker.read_bytes()
+    before = sorted(p.name for p in rd.iterdir())
+
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    inv = _make_invoker({})
+    o = _make_orch(tmp_path, run_dir=rd, reuse_onepass_run_dir=rd, invoker=inv)
+    env = o.run()
+
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    assert "current run dir" in env["reason"]
+    # Sentinel files byte-identical.
+    assert (rd / "allowed_universe.txt").read_bytes() == au_bytes
+    assert (rd / "01_onepass.json").read_bytes() == op_bytes
+    assert marker.read_bytes() == marker_bytes
+    # Nothing new written into the dir.
+    assert sorted(p.name for p in rd.iterdir()) == before
+    for generated in ("00_preflight.json", "run_plan.json", "RUN_SUMMARY.json",
+                      "broken_tickers_for_manual_master_ticker_edit.txt",
+                      "broken_tickers_for_manual_master_ticker_edit.json"):
+        assert not (rd / generated).exists()
+    # No lock file (lock lives at run_dir.parent / .crunch.lock).
+    assert not (rd.parent / ".crunch.lock").exists()
+    # No stage invoker call.
+    assert inv.calls == []
+
+
+def test_reuse_missing_onepass_json_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run", with_json=False)
+    _, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+
+
+def test_reuse_missing_allowed_universe_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run", with_allowed=False)
+    _, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+
+
+def test_reuse_status_not_ok_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run", status="partial")
+    _, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+
+
+def test_reuse_summary_error_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             summary={"error": 2, "ok": 1, "total": 3})
+    _, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+
+
+def test_reuse_per_ticker_error_stops(tmp_path):
+    # summary.error == 0 but a per-ticker result is non-ok -> STOP.
+    per = [{"ticker": "AAA", "status": "ok"},
+           {"ticker": "BBB", "status": "error"},
+           {"ticker": "CCC", "status": "ok"}]
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             summary={"error": 0, "ok": 3, "total": 3},
+                             per=per)
+    _, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+
+
+def test_reuse_coverage_summary_total_too_small_stops(tmp_path):
+    # FIX 2: prior allowed_universe matches, error==0, but summary.total < N.
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             summary={"error": 0, "ok": 3, "total": 2})
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    assert plan["onepass_reuse"]["coverage_match"] is False
+
+
+def test_reuse_coverage_summary_ok_too_small_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             summary={"error": 0, "ok": 2, "total": 3})
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    assert plan_reuse(o)["coverage_match"] is False
+
+
+def test_reuse_coverage_per_ticker_missing_stops_with_delta(tmp_path):
+    # per_ticker_results omits an allowed ticker (BBB) -> STOP with delta.
+    per = [{"ticker": "AAA", "status": "ok"},
+           {"ticker": "CCC", "status": "ok"}]
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             summary={"error": 0, "ok": 3, "total": 3},
+                             per=per)
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    delta = plan_reuse(o)["coverage_delta"]
+    assert delta["missing_from_result"] == ["BBB"]
+    assert delta["per_ticker_count"] == 2
+
+
+def test_reuse_coverage_per_ticker_wrong_order_stops(tmp_path):
+    # Right set, wrong order -> STOP (ordered allowed_universe contract).
+    per = [{"ticker": "BBB", "status": "ok"},
+           {"ticker": "AAA", "status": "ok"},
+           {"ticker": "CCC", "status": "ok"}]
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             summary={"error": 0, "ok": 3, "total": 3},
+                             per=per)
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    delta = plan_reuse(o)["coverage_delta"]
+    assert delta["same_set_order_differs"] is True
+    assert delta["missing_from_result"] == []
+    assert delta["extra_in_result"] == []
+
+
+def test_reuse_allowed_universe_read_error_stops(tmp_path, monkeypatch):
+    # FIX 3: an OSError reading prior allowed_universe.txt (after the existence
+    # check) fails closed rather than leaking an uncaught exception.
+    prior = _write_prior_run(tmp_path / "prior_run")
+    orig_read_text = cro.Path.read_text
+
+    def fake_read_text(self, *a, **k):
+        if self.name == "allowed_universe.txt":
+            raise OSError("simulated read failure")
+        return orig_read_text(self, *a, **k)
+
+    monkeypatch.setattr(cro.Path, "read_text", fake_read_text)
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    assert "unreadable" in env["reason"]
+
+
+def test_reuse_universe_mismatch_stops_with_delta(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             allowed_lines=("AAA", "BBB"))  # missing CCC
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    delta = plan["onepass_reuse"]["universe_delta"]
+    assert delta["in_current_not_prior"] == ["CCC"]
+    assert plan["onepass_reuse"]["universe_match"] is False
+
+
+def test_reuse_blocked_in_prior_allowed_universe_stops(tmp_path):
+    # Block BBB (a real master member); the prior allowed_universe still lists
+    # BBB -> blocked-ticker leak -> STOP.
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             allowed_lines=("AAA", "BBB", "CCC"))
+    o, env = _reuse_dry(tmp_path, prior, blocked=("BBB",))
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    scan = plan["onepass_reuse"]["blocked_ticker_scan"]
+    assert "BBB" in scan["in_allowed_universe"]
+
+
+def test_reuse_blocked_in_onepass_result_stops(tmp_path):
+    # Block BBB; prior allowed_universe excludes BBB (matches current), but the
+    # reused OnePass per_ticker_results still mentions BBB -> STOP.
+    per = [{"ticker": "AAA", "status": "ok"},
+           {"ticker": "CCC", "status": "ok"},
+           {"ticker": "BBB", "status": "ok"}]
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             allowed_lines=("AAA", "CCC"),
+                             summary={"error": 0, "ok": 3, "total": 3},
+                             per=per)
+    o, env = _reuse_dry(tmp_path, prior, blocked=("BBB",))
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    scan = plan["onepass_reuse"]["blocked_ticker_scan"]
+    assert "BBB" in scan["in_onepass_result"]
+
+
+def test_reuse_stale_explicit_timestamp_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run",
+                             end_ts="2026-04-01T00:00:00Z")  # > 168h before NOW
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    assert plan["onepass_reuse"]["fresh"] is False
+    assert plan["onepass_reuse"]["timestamp_source"] == "end_timestamp_utc"
+
+
+def _set_mtime(path, dt):
+    ts = dt.timestamp()
+    os.utime(path, (ts, ts))
+
+
+def test_reuse_unparseable_timestamp_falls_back_to_fresh_mtime(tmp_path):
+    # No parseable explicit timestamp -> mtime fallback; fresh mtime PASSES.
+    prior = _write_prior_run(tmp_path / "prior_run", end_ts="not-a-timestamp")
+    _set_mtime(prior / "01_onepass.json",
+               datetime(2026, 6, 6, 9, 0, 0, tzinfo=timezone.utc))  # 3h old
+    inv = _make_invoker({})
+    o, env = _reuse_dry(tmp_path, prior, inv=inv)
+    assert env["status"] == "dry_run_planned"
+    assert inv.calls == []
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    reuse = plan["onepass_reuse"]
+    assert reuse["valid"] is True
+    assert reuse["timestamp_source"] == "file_mtime"
+
+
+def test_reuse_stale_mtime_fallback_stops(tmp_path):
+    prior = _write_prior_run(tmp_path / "prior_run", end_ts=None)  # no explicit
+    _set_mtime(prior / "01_onepass.json",
+               datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc))  # >168h
+    o, env = _reuse_dry(tmp_path, prior)
+    assert env["status"] == "halted" and env["halted_at"] == "reuse_onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    assert plan["onepass_reuse"]["timestamp_source"] == "file_mtime"
+    assert plan["onepass_reuse"]["fresh"] is False
+
+
+def test_non_reuse_default_still_invokes_onepass(tmp_path):
+    # Regression: without --reuse-onepass-run-dir, OnePass runs as today and is
+    # the first invoked stage; no reuse metadata is emitted.
+    o, inv = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                            members_clean=["AAA[D]"] * 6)
+    env = o.run()
+    assert env["status"] == "completed_no_publish"
+    stages = [s for s, *_ in inv.calls]
+    assert stages[0] == "onepass"
+    plan = json.loads((o.run_dir / "run_plan.json").read_text("utf-8"))
+    assert "onepass_reuse" not in plan
+    assert "stage1_onepass" not in plan
 
 
 def test_no_absolute_paths_in_tracked_source():
