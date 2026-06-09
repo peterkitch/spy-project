@@ -41,6 +41,7 @@ workbook boundary check during a real execute). Project-relative defaults.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -630,8 +631,17 @@ class CrunchOrchestrator:
         now: datetime,
         reuse_onepass_run_dir: Path | None = None,
         reuse_onepass_max_age_hours: int = DEFAULT_REUSE_ONEPASS_MAX_AGE_HOURS,
+        publish_dry_run: bool = False,
+        publish_fresh_ccc_records_file: Path | None = None,
+        publish_prior_fixture: Path | None = None,
+        publish_prior_promotion_manifest: Path | None = None,
+        publish_prior_validation_sidecar: Path | None = None,
+        publish_prior_ccc_verification_manifest: Path | None = None,
         invoker: Callable[[str, list[str], dict], dict] | None = None,
         conflict_check: Callable[[tuple], dict] | None = None,
+        validator: Callable | None = None,
+        joiner: Callable | None = None,
+        combiner: Callable | None = None,
     ) -> None:
         self.project_root = project_root
         self.run_dir = run_dir
@@ -652,8 +662,22 @@ class CrunchOrchestrator:
         self.reuse_onepass_run_dir = reuse_onepass_run_dir
         self.reuse_onepass_max_age_hours = reuse_onepass_max_age_hours
         self._reuse: dict | None = None
+        # Publish-dry-run tail (Stages 5-8). Publication boundary stays CLOSED.
+        self.publish_dry_run = publish_dry_run
+        self.publish_fresh_ccc_records_file = publish_fresh_ccc_records_file
+        self.publish_prior_fixture = publish_prior_fixture
+        self.publish_prior_promotion_manifest = publish_prior_promotion_manifest
+        self.publish_prior_validation_sidecar = publish_prior_validation_sidecar
+        self.publish_prior_ccc_verification_manifest = (
+            publish_prior_ccc_verification_manifest)
+        self._publish_gate: dict | None = None
         self.invoker = invoker or self._default_invoker
         self.conflict_check = conflict_check or default_process_conflict_check
+        # Injectable seams for the publish-dry-run tail (stubbed in tests; the
+        # defaults are operator-only and never run during this dry-run task).
+        self.validator = validator or self._default_validator
+        self.joiner = joiner or self._default_joiner
+        self.combiner = combiner or self._default_combiner
         self.run_id = run_dir.name
         self.lock_path = (run_dir.parent / LOCK_NAME)
 
@@ -1426,6 +1450,14 @@ class CrunchOrchestrator:
             assert_no_excluded(self._k6_artifacts(r4), excl, stage="k6_recook")
             _write_json(self.run_dir / "04_k6_recook.json", r4)
             checkpoints["k6_recook"] = r4.get("status")
+
+            # Stages 5-8 -- gated publish-dry-run tail. The publication boundary
+            # stays CLOSED: no Blob upload/GET, no promote CLI/--write, no
+            # public fixture write, no commit/push/deploy. Runs ONLY with
+            # --publish-dry-run; any failure routes through the except below.
+            if self.publish_dry_run:
+                self._publish_gate = self._run_publish_dry_run_tail(r4, rebuild)
+                checkpoints["publish_dry_run"] = "ok"
         except CrunchError as exc:
             self._write_manual_edit_outputs()
             env = self._halt("execute", str(exc), preflight)
@@ -1434,12 +1466,292 @@ class CrunchOrchestrator:
             return env
 
         self._write_manual_edit_outputs()
-        env = self._base_envelope("completed_no_publish", None)
+        status = ("completed_publish_dry_run" if self.publish_dry_run
+                  else "completed_no_publish")
+        env = self._base_envelope(status, None)
         env["preflight"] = preflight
         env["checkpoints"] = checkpoints
         env["candidate_artifacts_root"] = self.k6_output_root.as_posix()
+        if self.publish_dry_run and self._publish_gate is not None:
+            env["publish_dry_run"] = self._publish_gate
         _write_json(self.run_dir / "RUN_SUMMARY.json", env)
         return env
+
+    # --- publish-dry-run tail (Stages 5-8; publication boundary CLOSED) ----
+    def _rel(self, p: Path) -> str:
+        try:
+            return p.resolve().relative_to(self.project_root.resolve()).as_posix()
+        except (ValueError, OSError):
+            return "<redacted>/" + p.name
+
+    def _prior_fixture_path(self) -> Path:
+        return (self.publish_prior_fixture if self.publish_prior_fixture is not None
+                else self.project_root / "frontend" / "public" / "fixtures"
+                / "k6_mtf_ranking.json")
+
+    def _prior_promotion_manifest_path(self) -> Path:
+        return (self.publish_prior_promotion_manifest
+                if self.publish_prior_promotion_manifest is not None
+                else self.project_root / "frontend" / "public" / "fixtures"
+                / "k6_mtf_ranking.promotion_manifest.json")
+
+    def _assert_validation_sidecar(self, sidecar: Any,
+                                   effective: list[str]) -> None:
+        """Fail closed unless the Stage-5 sidecar covers EXACTLY the built
+        secondaries with strict k6_mtf:<SEC> strategy ids and binds to this
+        run id."""
+        if not isinstance(sidecar, dict):
+            raise CrunchError("validation sidecar is not a JSON object")
+        if sidecar.get("validation_status") != "valid":
+            raise CrunchError(
+                "validation sidecar validation_status != 'valid': "
+                f"{sidecar.get('validation_status')!r}")
+        if sidecar.get("run_id") != self.run_id:
+            raise CrunchError(
+                "validation sidecar run_id "
+                f"{sidecar.get('run_id')!r} != current run id {self.run_id!r}")
+        strategies = sidecar.get("strategies")
+        if not isinstance(strategies, list) or not strategies:
+            raise CrunchError("validation sidecar 'strategies' must be a "
+                              "non-empty list")
+        seen: set[str] = set()
+        for s in strategies:
+            if not isinstance(s, dict):
+                raise CrunchError("validation sidecar strategy is not an object")
+            sid = s.get("strategy_id")
+            if not isinstance(sid, str) or not sid.startswith("k6_mtf:"):
+                raise CrunchError(
+                    f"validation sidecar strategy_id malformed: {sid!r}")
+            sec = normalize_ticker(sid[len("k6_mtf:"):])
+            if not sec or sid != f"k6_mtf:{sec}":
+                raise CrunchError(
+                    f"validation sidecar strategy_id secondary mismatch: {sid!r}")
+            if sec in seen:
+                raise CrunchError(
+                    f"validation sidecar duplicate strategy secondary: {sec!r}")
+            seen.add(sec)
+        want = {normalize_ticker(s) for s in effective}
+        if seen != want:
+            missing = sorted(want - seen)
+            extra = sorted(seen - want)
+            raise CrunchError(
+                "validation sidecar does not cover exactly the built "
+                f"secondaries; missing {missing!r}, extra {extra!r}")
+
+    def _publish_gate_report(self, *, status: str, reason: str | None,
+                             candidate: dict | None,
+                             join_meta: dict | None) -> dict:
+        counts = None
+        if isinstance(candidate, dict):
+            counts = {k: candidate.get(k) for k in (
+                "merged_row_count", "board_validated_count", "not_validated_count",
+                "carried_count", "fresh_count", "net_new_count",
+                "stage_a_excluded_count", "ccc_record_count")}
+        return {
+            "stage": "publish_gate",
+            "mode": "publish_dry_run",
+            "status": status,
+            "reason": reason,
+            "join": join_meta,
+            "candidate_artifacts": (candidate.get("paths")
+                                    if isinstance(candidate, dict) else None),
+            "candidate_counts": counts,
+            "would_be_publish_plan": [
+                "build slim fixture + CCC manifest (NOT written to "
+                "frontend/public)",
+                "upload + GET-verify CCC sidecars for built rows (NOT executed)",
+                "promote_k6_mtf_artifact.py --public --write --operator-approved "
+                "(NOT executed)",
+                "git commit + push of the public fixture (NOT executed)",
+            ],
+            # Explicit closed-boundary flags (this stage performs none of these).
+            "no_blob_upload": True,
+            "no_blob_get": True,
+            "no_promote_cli_invoked": True,
+            "no_promote_write": True,
+            "no_operator_approved": True,
+            "no_public_fixture_write": True,
+            "no_commit": True,
+            "no_push": True,
+            "no_deploy": True,
+        }
+
+    def _load_fresh_ccc_records(self, path: Path) -> list:
+        if not Path(path).is_file():
+            raise CrunchError(
+                f"fresh CCC records file not found: {self._rel(Path(path))}")
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CrunchError(
+                f"fresh CCC records file unreadable/invalid JSON: "
+                f"{type(exc).__name__}") from exc
+        records = data.get("records") if isinstance(data, dict) else data
+        if not isinstance(records, list) or not records:
+            raise CrunchError(
+                "fresh CCC records file must be a non-empty list (or an object "
+                "with a non-empty 'records' list)")
+        return records
+
+    def _run_publish_dry_run_tail(self, r4: dict, rebuild: list[str]) -> dict:
+        """Stages 5-8: validation -> join -> combine/proof -> publish-gate
+        dry-run. Writes numbered checkpoints under the run dir and a would-be
+        publish plan, then returns the gate report. Performs NO network, Blob,
+        promote, fixture write, commit, push, or deploy. Any failure raises
+        CrunchError (routed to the existing halt path)."""
+        from crunch_combine_proof import CombineError  # noqa: PLC0415
+        from utils.react_publish.k6_mtf_validation_join import (  # noqa: PLC0415
+            ValidationJoinError as _ValidationJoinError)
+        effective = list(rebuild)
+
+        # ----- Stage 5: validation (injectable seam) -----
+        sidecar = self.validator(effective, self.run_id)
+        self._assert_validation_sidecar(sidecar, effective)
+        sidecar_path = self.run_dir / "05_validation_sidecar.json"
+        _write_json(sidecar_path, sidecar)
+        sidecar_sha = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+        _write_json(self.run_dir / "05_validation.json", {
+            "stage": "validation",
+            "status": "ok",
+            "run_id": sidecar.get("run_id"),
+            "sidecar_path": self._rel(sidecar_path),
+            "sidecar_sha256": sidecar_sha,
+            "n_strategies": len(sidecar.get("strategies") or []),
+            "secondaries": sorted(normalize_ticker(s) for s in effective),
+            "no_network": True,
+            "no_validation_subprocess_in_dry_run": True,
+        })
+
+        # ----- Stage 6: join (run-id-bound k6 ranking; injectable seam) -----
+        # The default joiner raises ValidationJoinError on any sidecar
+        # SHA/run/row refusal; wrap it so the failure routes through the
+        # existing _halt("execute", ...) envelope instead of escaping.
+        ranking_path = self._resolve_k6_ranking_path(r4)
+        try:
+            v2 = self.joiner(ranking_path, sidecar_path, sidecar_sha)
+        except _ValidationJoinError as exc:
+            raise CrunchError("validation join failed: " + str(exc)) from exc
+        if not isinstance(v2, dict):
+            raise CrunchError("join did not return a v2 object")
+        fresh_rows = v2.get("per_secondary")
+        if not isinstance(fresh_rows, list) or not fresh_rows:
+            raise CrunchError("join produced no built-only per_secondary rows")
+        join_meta = {
+            "stage": "join",
+            "status": "ok",
+            "ranking_artifact_path": self._rel(ranking_path),
+            "expected_validation_sidecar_sha256": sidecar_sha,
+            "built_row_count": len(fresh_rows),
+            "secondaries": sorted(
+                normalize_ticker(r.get("secondary")) for r in fresh_rows
+                if isinstance(r, dict)),
+            "no_public_fixture_write": True,
+        }
+        _write_json(self.run_dir / "06_join.json", join_meta)
+
+        # ----- Stage 7: combine/proof -----
+        if self.publish_fresh_ccc_records_file is None:
+            reason = (
+                "verified fresh CCC records are required for "
+                "combine_and_assemble, but Blob upload/GET is disabled in "
+                "publish dry-run; supply "
+                "--publish-dry-run-fresh-ccc-records-file with already-verified "
+                "records (get_verified=true) to exercise combine")
+            _write_json(self.run_dir / "07_combine.json", {
+                "stage": "combine",
+                "status": "blocked",
+                "combine_called": False,
+                "reason": reason,
+                "no_blob_upload": True,
+                "no_blob_get": True,
+                "no_synthesized_get_verified": True,
+            })
+            # Write the gate report (blocked) before halting, when practical.
+            _write_json(self.run_dir / "08_publish_gate.json",
+                        self._publish_gate_report(status="blocked", reason=reason,
+                                                  candidate=None,
+                                                  join_meta=join_meta))
+            raise CrunchError("publish dry-run blocked at Stage 7: " + reason)
+
+        fresh_ccc = self._load_fresh_ccc_records(
+            self.publish_fresh_ccc_records_file)
+        pub_dir = self.run_dir / "publish_candidate"
+        try:
+            summary = self.combiner(
+                prior_fixture_path=self._prior_fixture_path(),
+                prior_promotion_manifest_path=self._prior_promotion_manifest_path(),
+                prior_ccc_verification_manifest_path=(
+                    self.publish_prior_ccc_verification_manifest),
+                fresh_rows=fresh_rows,
+                fresh_validation_sidecar=sidecar,
+                fresh_ccc_records=fresh_ccc,
+                assembly_run_id=self.run_id,
+                assembled_at_utc=self.now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                output_dir=pub_dir,
+                excluded_tickers=tuple(sorted(self._excl_set)),
+                prior_validation_sidecar_path=(
+                    self.publish_prior_validation_sidecar),
+                project_root=self.project_root,
+                run_self_check=True,
+                reverify_carried_ccc=False,
+            )
+        except CombineError as exc:
+            raise CrunchError(
+                "combine/proof assembly failed: " + str(exc)) from exc
+        if not isinstance(summary, dict):
+            raise CrunchError("combine_and_assemble did not return a summary")
+        _write_json(self.run_dir / "07_combine.json", {
+            "stage": "combine",
+            "status": "ok",
+            "combine_called": True,
+            "output_dir": self._rel(pub_dir),
+            "summary": summary,
+        })
+
+        # ----- Stage 8: publish-gate dry-run -----
+        gate = self._publish_gate_report(status="ok", reason=None,
+                                         candidate=summary, join_meta=join_meta)
+        _write_json(self.run_dir / "08_publish_gate.json", gate)
+        return gate
+
+    # --- default publish-tail seams (operator-only; never run by tests) ---
+    def _default_validator(self, secondaries: list[str], run_id: str) -> dict:
+        """Real Stage-5 validation over the rebuilt secondaries -> sidecar
+        contract. Operator execution only; never invoked during the dry-run
+        task or in tests (which inject a stub). Follows the adapter's real
+        contract: build_adapter_inputs -> K6MtfValidationAdapter(secondaries,
+        secondary_inputs) -> run_validation. Fail-closed on a non-mapping
+        result/contract."""
+        from utils.k6_mtf_validation.adapter import (  # noqa: PLC0415
+            build_adapter_inputs, K6MtfValidationAdapter, run_validation)
+        secs = list(secondaries)
+        inputs = build_adapter_inputs(
+            secs, stackbuilder_root=self.stackbuilder_root.as_posix())
+        adapter = K6MtfValidationAdapter(secondaries=secs,
+                                         secondary_inputs=inputs)
+        result = run_validation(
+            adapter, run_id=run_id,
+            output_dir=self.run_dir / "publish_candidate" / "validation")
+        if not isinstance(result, dict):
+            raise CrunchError(
+                "run_validation did not return a mapping result")
+        contract = result.get("contract")
+        if not isinstance(contract, dict):
+            raise CrunchError(
+                "run_validation result has no mapping 'contract'")
+        return contract
+
+    def _default_joiner(self, ranking_path: Path, sidecar_path: Path,
+                        sidecar_sha: str) -> dict:
+        from utils.react_publish.k6_mtf_validation_join import (  # noqa: PLC0415
+            load_and_build_k6_mtf_ranking_v2)
+        return load_and_build_k6_mtf_ranking_v2(
+            ranking_path, sidecar_path,
+            expected_validation_sidecar_sha256=sidecar_sha)
+
+    def _default_combiner(self, **kwargs) -> dict:
+        from crunch_combine_proof import combine_and_assemble  # noqa: PLC0415
+        return combine_and_assemble(**kwargs)
 
     # --- artifact path helpers + quarantine -------------------------------
     def _sec_dir_name(self, secondary: str) -> str:
@@ -1597,6 +1909,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k6-output-root", default=DEFAULT_K6_OUTPUT_ROOT)
     p.add_argument("--master-tickers-file", default=DEFAULT_MASTER_TICKERS)
     p.add_argument("--project-root", default=None)
+    # Publish-dry-run tail (Stages 5-8). Publication boundary stays CLOSED:
+    # no Blob, no promote write, no public fixture write, no commit/push/deploy.
+    p.add_argument("--publish-dry-run", action="store_true",
+                   help="After a clean Stage 4, run the gated publish-dry-run "
+                        "tail (validation -> join -> combine/proof -> publish "
+                        "gate). Writes candidate artifacts + a would-be publish "
+                        "plan under the run dir and STOPS before any "
+                        "publication. No Blob/promote/fixture/commit/push.")
+    p.add_argument("--publish-dry-run-fresh-ccc-records-file", default=None,
+                   help="Read-only JSON file of ALREADY-verified fresh CCC "
+                        "records (get_verified=true) used only to exercise "
+                        "combine/proof without Blob upload/GET. If absent, the "
+                        "tail fails closed at Stage 7.")
+    p.add_argument("--publish-prior-fixture", default=None)
+    p.add_argument("--publish-prior-promotion-manifest", default=None)
+    p.add_argument("--publish-prior-validation-sidecar", default=None)
+    p.add_argument("--publish-prior-ccc-verification-manifest", default=None)
     return p
 
 
@@ -1617,6 +1946,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     reuse_dir = (_resolve(project_root, args.reuse_onepass_run_dir, "")
                  if args.reuse_onepass_run_dir else None)
+
+    def _opt_path(opt):
+        return _resolve(project_root, opt, "") if opt else None
 
     orch = CrunchOrchestrator(
         project_root=project_root,
@@ -1644,6 +1976,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         now=now,
         reuse_onepass_run_dir=reuse_dir,
         reuse_onepass_max_age_hours=args.reuse_onepass_max_age_hours,
+        publish_dry_run=args.publish_dry_run,
+        publish_fresh_ccc_records_file=_opt_path(
+            args.publish_dry_run_fresh_ccc_records_file),
+        publish_prior_fixture=_opt_path(args.publish_prior_fixture),
+        publish_prior_promotion_manifest=_opt_path(
+            args.publish_prior_promotion_manifest),
+        publish_prior_validation_sidecar=_opt_path(
+            args.publish_prior_validation_sidecar),
+        publish_prior_ccc_verification_manifest=_opt_path(
+            args.publish_prior_ccc_verification_manifest),
     )
     env = orch.run()
     print(json.dumps({
@@ -1653,7 +1995,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         "mode": env.get("mode"),
     }, indent=2, sort_keys=True))
     return 0 if env.get("status") in ("dry_run_planned",
-                                      "completed_no_publish") else 1
+                                      "completed_no_publish",
+                                      "completed_publish_dry_run") else 1
 
 
 if __name__ == "__main__":

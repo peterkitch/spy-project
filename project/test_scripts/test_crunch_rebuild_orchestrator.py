@@ -1554,6 +1554,259 @@ def test_execute_stackbuilder_parity_runs_before_exclusion_scan(tmp_path):
     assert "stackbuilder parity" in env["reason"]   # parity fired first
 
 
+# ---------------------------------------------------------------------------
+# Publish-dry-run tail (Stages 5-8) -- publication boundary stays CLOSED
+# ---------------------------------------------------------------------------
+
+import crunch_combine_proof as ccp  # noqa: E402
+
+
+def _publish_stubs(rebuild, *, sidecar_over=None):
+    eff = sorted(rebuild)
+
+    def validator(secondaries, run_id):
+        validator.calls.append((list(secondaries), run_id))
+        sc = {"validation_status": "valid", "run_id": run_id,
+              "strategies": [{"strategy_id": f"k6_mtf:{s}"} for s in eff]}
+        if sidecar_over:
+            sc = sidecar_over(sc)
+        return sc
+    validator.calls = []
+
+    def joiner(ranking_path, sidecar_path, sidecar_sha):
+        joiner.calls.append((str(ranking_path), str(sidecar_path), sidecar_sha))
+        return {"per_secondary": [{"secondary": s} for s in eff]}
+    joiner.calls = []
+
+    def combiner(**kw):
+        combiner.calls.append(kw)
+        return {
+            "paths": {"merged_fixture": "output/run/publish/merged.json"},
+            "merged_row_count": len(eff) + 5,
+            "board_validated_count": 3, "not_validated_count": len(eff) + 2,
+            "carried_count": 5, "fresh_count": len(eff),
+            "net_new_count": len(eff), "stage_a_excluded_count": 0,
+            "ccc_record_count": len(eff) + 5,
+        }
+    combiner.calls = []
+    return validator, joiner, combiner
+
+
+def _ccc_file(tmp_path, rebuild):
+    p = tmp_path / "fresh_ccc_records.json"
+    _write(p, json.dumps([{"secondary": s, "get_verified": True} for s in rebuild]))
+    return p
+
+
+def _publish_extra(validator, joiner, combiner, *, ccc_file=None, prior=None):
+    extra = {"publish_dry_run": True, "validator": validator,
+             "joiner": joiner, "combiner": combiner}
+    if ccc_file is not None:
+        extra["publish_fresh_ccc_records_file"] = ccc_file
+    if prior:
+        extra.update(prior)
+    return extra
+
+
+def test_publish_dry_run_off_keeps_completed_no_publish(tmp_path):
+    val, joi, comb = _publish_stubs(["AAPB"])
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch={"validator": val, "joiner": joi,
+                                      "combiner": comb})
+    env = o.run()
+    assert env["status"] == "completed_no_publish"
+    for f in ("05_validation.json", "06_join.json", "07_combine.json",
+              "08_publish_gate.json"):
+        assert not (o.run_dir / f).exists()
+    assert val.calls == [] and joi.calls == [] and comb.calls == []
+
+
+def test_publish_dry_run_with_ccc_runs_stages_5_to_8(tmp_path):
+    ccc = _ccc_file(tmp_path, ["AAPB"])
+    val, joi, comb = _publish_stubs(["AAPB"])
+    prior = {
+        "publish_prior_fixture": tmp_path / "prior" / "fix.json",
+        "publish_prior_promotion_manifest": tmp_path / "prior" / "promo.json",
+        "publish_prior_validation_sidecar": tmp_path / "prior" / "sidecar.json",
+        "publish_prior_ccc_verification_manifest": tmp_path / "prior" / "ccc.json",
+    }
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb, ccc_file=ccc,
+                                                    prior=prior))
+    env = o.run()
+    assert env["status"] == "completed_publish_dry_run"
+    assert env["publish_attempted"] is False
+    assert env["blob_attempted"] is False
+    assert env["promotion_attempted"] is False
+    for f in ("05_validation.json", "06_join.json", "07_combine.json",
+              "08_publish_gate.json"):
+        assert (o.run_dir / f).is_file()
+    # seams invoked with the right inputs
+    assert val.calls == [(["AAPB"], "RID")]
+    assert len(comb.calls) == 1
+    kw = comb.calls[0]
+    assert kw["assembly_run_id"] == "RID"
+    assert [r["secondary"] for r in kw["fresh_rows"]] == ["AAPB"]
+    assert kw["fresh_validation_sidecar"]["run_id"] == "RID"
+    assert kw["fresh_ccc_records"] == [{"secondary": "AAPB", "get_verified": True}]
+    assert kw["prior_fixture_path"] == prior["publish_prior_fixture"]
+    assert kw["prior_validation_sidecar_path"] == prior[
+        "publish_prior_validation_sidecar"]
+    assert kw["excluded_tickers"] == ("DR8A.F",)
+    assert kw["project_root"] == tmp_path
+    assert Path(kw["output_dir"]) == o.run_dir / "publish_candidate"
+    # join used the run-id-bound k6 ranking artifact
+    ranking = (tmp_path / "output" / "k6_mtf" / "RID" / "k6_mtf_ranking.json")
+    assert joi.calls[0][0] == str(ranking)
+    # Stage 8 gate explicitly records the closed boundary.
+    gate = json.loads((o.run_dir / "08_publish_gate.json").read_text("utf-8"))
+    for flag in ("no_blob_upload", "no_blob_get", "no_promote_cli_invoked",
+                 "no_promote_write", "no_operator_approved",
+                 "no_public_fixture_write", "no_commit", "no_push", "no_deploy"):
+        assert gate[flag] is True
+    assert gate["status"] == "ok"
+    # nothing under frontend/public was created
+    assert not (tmp_path / "frontend" / "public").exists()
+
+
+def test_publish_dry_run_without_ccc_blocks_at_stage_7(tmp_path):
+    val, joi, comb = _publish_stubs(["AAPB"])
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb, ccc_file=None))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    # Stage 5/6 ran; Stage 7 blocked before combine; gate written.
+    assert (o.run_dir / "05_validation.json").is_file()
+    assert (o.run_dir / "06_join.json").is_file()
+    blocked = json.loads((o.run_dir / "07_combine.json").read_text("utf-8"))
+    assert blocked["status"] == "blocked" and blocked["combine_called"] is False
+    assert blocked["no_blob_upload"] is True and blocked["no_blob_get"] is True
+    gate = json.loads((o.run_dir / "08_publish_gate.json").read_text("utf-8"))
+    assert gate["status"] == "blocked"
+    assert comb.calls == []  # combine never called
+    assert not (tmp_path / "frontend" / "public").exists()
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda sc: {**sc, "strategies": []},                                  # empty
+    lambda sc: {**sc, "strategies": [{"strategy_id": "k6_mtf:OTHER"}]},   # wrong
+    lambda sc: {**sc, "strategies": sc["strategies"] + [{"strategy_id":
+              "k6_mtf:EXTRA"}]},                                         # extra
+    lambda sc: {**sc, "strategies": sc["strategies"] + sc["strategies"]},  # dup
+    lambda sc: {**sc, "strategies": [{"strategy_id": "bad_id"}]},         # malformed
+    lambda sc: {**sc, "run_id": "WRONG_RUN"},                            # run mismatch
+    lambda sc: {**sc, "validation_status": "partial"},                   # not valid
+])
+def test_publish_dry_run_stage5_sidecar_validation_stops(tmp_path, mutate):
+    val, joi, comb = _publish_stubs(["AAPB"], sidecar_over=mutate)
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert comb.calls == []  # never reached combine
+
+
+def test_publish_dry_run_stage6_empty_join_stops(tmp_path):
+    val, joi, comb = _publish_stubs(["AAPB"])
+
+    def empty_join(ranking_path, sidecar_path, sidecar_sha):
+        return {"per_secondary": []}
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, empty_join, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert comb.calls == []
+
+
+def test_publish_dry_run_combine_error_halts(tmp_path):
+    val, joi, comb = _publish_stubs(["AAPB"])
+
+    def boom(**kw):
+        raise ccp.CombineError("synthetic combine failure")
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, boom,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert "combine/proof assembly failed" in env["reason"]
+
+
+def test_publish_dry_run_stage6_validation_join_error_halts(tmp_path):
+    # The REAL ValidationJoinError (what the default joiner raises) must route
+    # through the existing CrunchError/_halt envelope, not escape.
+    from utils.react_publish.k6_mtf_validation_join import ValidationJoinError
+    val, joi, comb = _publish_stubs(["AAPB"])
+
+    def bad_join(ranking_path, sidecar_path, sidecar_sha):
+        raise ValidationJoinError("validation sidecar SHA-256 mismatch")
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, bad_join, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert (o.run_dir / "RUN_SUMMARY.json").is_file()
+    assert "validation join failed" in env["reason"]
+    assert comb.calls == []
+    assert not (o.run_dir / "07_combine.json").exists()
+    assert not (o.run_dir / "08_publish_gate.json").exists()
+
+
+def test_default_validator_uses_real_adapter_contract(tmp_path, monkeypatch):
+    # Prove _default_validator follows build_adapter_inputs ->
+    # K6MtfValidationAdapter(secondaries, secondary_inputs) -> run_validation,
+    # without loading real inputs or running validation (all monkeypatched).
+    import utils.k6_mtf_validation.adapter as adp
+    calls = {}
+    sentinel_inputs = {"AAPB": object()}
+
+    def fake_build(secs, *, stackbuilder_root):
+        calls["build"] = (list(secs), stackbuilder_root)
+        return sentinel_inputs
+
+    class FakeAdapter:
+        def __init__(self, *, secondaries, secondary_inputs):
+            calls["adapter"] = (list(secondaries), secondary_inputs)
+
+    def fake_run(adapter, *, run_id, output_dir, **kw):
+        calls["run"] = {"adapter": adapter, "run_id": run_id,
+                        "output_dir": output_dir}
+        return {"sidecar_path": "x", "artifact_hash": "y",
+                "contract": {"validation_status": "valid", "run_id": run_id,
+                             "strategies": [{"strategy_id": "k6_mtf:AAPB"}]}}
+
+    monkeypatch.setattr(adp, "build_adapter_inputs", fake_build)
+    monkeypatch.setattr(adp, "K6MtfValidationAdapter", FakeAdapter)
+    monkeypatch.setattr(adp, "run_validation", fake_run)
+
+    o = _make_orch(tmp_path)
+    contract = o._default_validator(["AAPB"], o.run_id)
+    assert calls["build"] == (["AAPB"], o.stackbuilder_root.as_posix())
+    assert calls["adapter"] == (["AAPB"], sentinel_inputs)
+    assert isinstance(calls["run"]["adapter"], FakeAdapter)
+    assert calls["run"]["run_id"] == o.run_id
+    assert calls["run"]["output_dir"] == (
+        o.run_dir / "publish_candidate" / "validation")
+    assert contract["run_id"] == o.run_id and contract["validation_status"] == "valid"
+
+    # Fail-closed: a result without a mapping contract -> CrunchError.
+    monkeypatch.setattr(adp, "run_validation", lambda *a, **k: {"no": "contract"})
+    with pytest.raises(cro.CrunchError):
+        o._default_validator(["AAPB"], o.run_id)
+
+
 def test_no_absolute_paths_in_tracked_source():
     bs = chr(92)
     bad_tokens = (
