@@ -1593,6 +1593,103 @@ class CrunchOrchestrator:
                 "with a non-empty 'records' list)")
         return records
 
+    # --- fresh-row path normalization (Stage 6 -> Stage 7) ----------------
+    _FRESH_ROW_PATH_FIELDS = (
+        "history_artifact_path",
+        "k6_stack.selected_build_path",
+        "k6_stack.selected_run_dir",
+        "k6_stack.combo_k6_path",
+    )
+
+    def _normalize_one_output_path(self, sec: str, field: str, value: Any) -> str:
+        """Return a clean project-relative POSIX path under ``output/`` for one
+        fresh-row path field, or raise CrunchError. Fail-closed: missing/empty/
+        non-string, absolute-outside-output, relative-not-under-output, and
+        traversal all hard-stop. Accepts absolute paths under
+        ``<project_root>/output`` (any drive casing / slash style) and already-
+        relative ``output/...`` paths (slashes normalized to POSIX)."""
+        if not isinstance(value, str) or not value.strip():
+            raise CrunchError(
+                f"publish normalize: secondary {sec!r} field {field} is "
+                f"missing/empty/non-string: {value!r}")
+        s = value.replace("\\", "/").strip()
+        is_abs = bool(re.match(r"^[A-Za-z]:", s)) or s.startswith("/") \
+            or Path(s).is_absolute()
+        if is_abs:
+            out_root = (self.project_root / "output")
+            try:
+                rel = Path(value).resolve().relative_to(out_root.resolve())
+            except (ValueError, OSError) as exc:
+                raise CrunchError(
+                    f"publish normalize: secondary {sec!r} field {field} is an "
+                    "absolute path outside <project_root>/output: "
+                    f"{value!r}") from exc
+            norm = "output/" + rel.as_posix()
+        else:
+            # Relative paths must be a concrete file under the output/ segment:
+            # exactly 'output/...'. Bare 'output' and non-segment prefixes such
+            # as 'outputx/...' or 'output_evil/...' are rejected (the trailing
+            # slash enforces the segment boundary).
+            if not s.startswith("output/"):
+                raise CrunchError(
+                    f"publish normalize: secondary {sec!r} field {field} is a "
+                    f"relative path not under output/: {value!r}")
+            norm = s
+        parts = norm.split("/")
+        if parts[0] != "output" or ".." in parts:
+            raise CrunchError(
+                f"publish normalize: secondary {sec!r} field {field} did not "
+                f"resolve to a clean output/ path (traversal/outside): {value!r}")
+        return norm
+
+    def _normalize_publish_fresh_row_paths(self, rows: list) -> tuple:
+        """Return (normalized_fresh_rows, summary). Normalizes ONLY the four
+        path fields on each fresh row to project-relative POSIX ``output/...``
+        form; every other field (validation, metrics, CCC) is preserved
+        exactly. Returns copies (the joiner return is not mutated in place).
+        Carried rows are NOT touched here -- combine handles them from the
+        prior fixture. Fail-closed via _normalize_one_output_path."""
+        out_rows: list = []
+        fields_normalized = 0
+        rows_changed = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                raise CrunchError("publish normalize: fresh row is not an object")
+            sec = normalize_ticker(r.get("secondary"))
+            ks = r.get("k6_stack")
+            if not isinstance(ks, dict):
+                raise CrunchError(
+                    f"publish normalize: secondary {sec!r} k6_stack is missing "
+                    "or not a mapping")
+            new_row = dict(r)
+            new_ks = dict(ks)
+            changed = False
+            orig = r.get("history_artifact_path")
+            norm = self._normalize_one_output_path(
+                sec, "history_artifact_path", orig)
+            if norm != orig:
+                changed = True
+                fields_normalized += 1
+            new_row["history_artifact_path"] = norm
+            for f in ("selected_build_path", "selected_run_dir", "combo_k6_path"):
+                o = ks.get(f)
+                n = self._normalize_one_output_path(sec, "k6_stack." + f, o)
+                if n != o:
+                    changed = True
+                    fields_normalized += 1
+                new_ks[f] = n
+            new_row["k6_stack"] = new_ks
+            if changed:
+                rows_changed += 1
+            out_rows.append(new_row)
+        summary = {
+            "fresh_rows_total": len(out_rows),
+            "fresh_rows_normalized_count": rows_changed,
+            "normalized_path_fields_count": fields_normalized,
+            "normalized_path_fields": list(self._FRESH_ROW_PATH_FIELDS),
+        }
+        return out_rows, summary
+
     def _run_publish_dry_run_tail(self, r4: dict, rebuild: list[str]) -> dict:
         """Stages 5-8: validation -> join -> combine/proof -> publish-gate
         dry-run. Writes numbered checkpoints under the run dir and a would-be
@@ -1636,6 +1733,12 @@ class CrunchOrchestrator:
         fresh_rows = v2.get("per_secondary")
         if not isinstance(fresh_rows, list) or not fresh_rows:
             raise CrunchError("join produced no built-only per_secondary rows")
+        # Fail-closed normalization: the k6 ranking (and therefore the joined
+        # fresh rows) may carry absolute path fields that promote's v2 validator
+        # (run by combine's self-check) rejects. Normalize ONLY the fresh rows'
+        # path fields to project-relative output/... BEFORE combine. The raw
+        # on-disk k6 ranking artifact is NOT rewritten.
+        fresh_rows, path_norm = self._normalize_publish_fresh_row_paths(fresh_rows)
         join_meta = {
             "stage": "join",
             "status": "ok",
@@ -1645,6 +1748,7 @@ class CrunchOrchestrator:
             "secondaries": sorted(
                 normalize_ticker(r.get("secondary")) for r in fresh_rows
                 if isinstance(r, dict)),
+            "path_normalization": path_norm,
             "no_public_fixture_write": True,
         }
         _write_json(self.run_dir / "06_join.json", join_meta)

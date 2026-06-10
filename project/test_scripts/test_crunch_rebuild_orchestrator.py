@@ -1561,8 +1561,24 @@ def test_execute_stackbuilder_parity_runs_before_exclusion_scan(tmp_path):
 import crunch_combine_proof as ccp  # noqa: E402
 
 
-def _publish_stubs(rebuild, *, sidecar_over=None):
+def _valid_fresh_row(sec):
+    """A built-only v2 join row with PROJECT-RELATIVE output/ path fields (the
+    promote-clean form)."""
+    return {
+        "secondary": sec,
+        "history_artifact_path": f"output/k6_mtf/RID/{sec}/k6_mtf_history.json",
+        "k6_stack": {
+            "selected_build_path": f"output/stackbuilder/{sec}/selected_build.json",
+            "selected_run_dir": f"output/stackbuilder/{sec}/seed_{sec}",
+            "combo_k6_path":
+                f"output/stackbuilder/{sec}/seed_{sec}/combo_k=6.json",
+        },
+    }
+
+
+def _publish_stubs(rebuild, *, sidecar_over=None, make_row=None, join_rows=None):
     eff = sorted(rebuild)
+    make_row = make_row or _valid_fresh_row
 
     def validator(secondaries, run_id):
         validator.calls.append((list(secondaries), run_id))
@@ -1575,7 +1591,8 @@ def _publish_stubs(rebuild, *, sidecar_over=None):
 
     def joiner(ranking_path, sidecar_path, sidecar_sha):
         joiner.calls.append((str(ranking_path), str(sidecar_path), sidecar_sha))
-        return {"per_secondary": [{"secondary": s} for s in eff]}
+        rows = join_rows if join_rows is not None else [make_row(s) for s in eff]
+        return {"per_secondary": rows}
     joiner.calls = []
 
     def combiner(**kw):
@@ -1805,6 +1822,193 @@ def test_default_validator_uses_real_adapter_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(adp, "run_validation", lambda *a, **k: {"no": "contract"})
     with pytest.raises(cro.CrunchError):
         o._default_validator(["AAPB"], o.run_id)
+
+
+# ---------------------------------------------------------------------------
+# Publish-dry-run fresh-row path normalization (Stage 6 -> Stage 7)
+# ---------------------------------------------------------------------------
+
+
+def _abs_fresh_row(tmp_path, sec):
+    base = (tmp_path / "output").as_posix()  # absolute, e.g. C:/.../output
+    return {
+        "secondary": sec,
+        "history_artifact_path": f"{base}/k6_mtf/RID/{sec}/k6_mtf_history.json",
+        "k6_stack": {
+            "selected_build_path": f"{base}/stackbuilder/{sec}/selected_build.json",
+            "selected_run_dir": f"{base}/stackbuilder/{sec}/seed_{sec}",
+            "combo_k6_path":
+                f"{base}/stackbuilder/{sec}/seed_{sec}/combo_k=6.json",
+        },
+    }
+
+
+def _is_abs_pathstr(s):
+    return isinstance(s, str) and (
+        (len(s) >= 2 and s[1] == ":") or s.startswith("/") or "\\" in s)
+
+
+def _row_paths(row):
+    ks = row.get("k6_stack") or {}
+    return [row.get("history_artifact_path"), ks.get("selected_build_path"),
+            ks.get("selected_run_dir"), ks.get("combo_k6_path")]
+
+
+_NORM_PATH_FIELDS = ["history_artifact_path", "k6_stack.selected_build_path",
+                     "k6_stack.selected_run_dir", "k6_stack.combo_k6_path"]
+
+
+def test_publish_norm_absolute_under_output_normalized(tmp_path):
+    val, joi, comb = _publish_stubs(["AAPB"],
+                                    make_row=lambda s: _abs_fresh_row(tmp_path, s))
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "completed_publish_dry_run"
+    assert len(comb.calls) == 1
+    rows = comb.calls[0]["fresh_rows"]
+    for r in rows:
+        for p in _row_paths(r):
+            assert p.startswith("output/"), p
+            assert not _is_abs_pathstr(p), p
+    # 06_join.json records the normalization summary
+    jm = json.loads((o.run_dir / "06_join.json").read_text("utf-8"))
+    pn = jm["path_normalization"]
+    assert pn["fresh_rows_normalized_count"] == 1
+    assert pn["normalized_path_fields_count"] == 4
+    assert pn["normalized_path_fields"] == _NORM_PATH_FIELDS
+
+
+def test_publish_norm_relative_passthrough_and_backslash(tmp_path):
+    def make(sec):
+        r = _valid_fresh_row(sec)
+        r["k6_stack"]["selected_build_path"] = (
+            "output" + chr(92) + "stackbuilder" + chr(92) + sec
+            + chr(92) + "selected_build.json")  # output\... backslash form
+        return r
+    val, joi, comb = _publish_stubs(["AAPB"], make_row=make)
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "completed_publish_dry_run"
+    r = comb.calls[0]["fresh_rows"][0]
+    assert r["k6_stack"]["selected_build_path"] == (
+        "output/stackbuilder/AAPB/selected_build.json")  # backslash -> POSIX
+    # already-relative top-level path unchanged
+    assert r["history_artifact_path"] == "output/k6_mtf/RID/AAPB/k6_mtf_history.json"
+
+
+@pytest.mark.parametrize("field", _NORM_PATH_FIELDS)
+def test_publish_norm_absolute_outside_output_stops(tmp_path, field):
+    outside = (tmp_path / "elsewhere" / "AAPB" / "x.json").as_posix()
+
+    def make(sec):
+        r = _abs_fresh_row(tmp_path, sec)
+        if field.startswith("k6_stack."):
+            r["k6_stack"][field.split(".", 1)[1]] = outside
+        else:
+            r[field] = outside
+        return r
+    val, joi, comb = _publish_stubs(["AAPB"], make_row=make)
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert comb.calls == []
+
+
+def test_publish_norm_valid_output_passes_through_after_tightening(tmp_path):
+    # Over-rejection guard: a normal output/... fresh row still normalizes
+    # clean and reaches combine after the bare-"output" tightening.
+    val, joi, comb = _publish_stubs(["AAPB"])  # _valid_fresh_row -> output/...
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "completed_publish_dry_run"
+    assert len(comb.calls) == 1  # combine reached
+    r = comb.calls[0]["fresh_rows"][0]
+    assert r["history_artifact_path"] == "output/k6_mtf/RID/AAPB/k6_mtf_history.json"
+    assert r["k6_stack"]["selected_build_path"] == (
+        "output/stackbuilder/AAPB/selected_build.json")
+
+
+@pytest.mark.parametrize("bad", ["tmp/foo.json", "../output/k6_mtf/foo.json",
+                                 "stackbuilder/AAPB/x.json",
+                                 "output",            # bare 'output' (no slash)
+                                 "outputx/foo.json",  # non-segment prefix
+                                 "output_evil/foo.json"])
+def test_publish_norm_relative_not_under_output_stops(tmp_path, bad):
+    def make(sec):
+        r = _valid_fresh_row(sec)
+        r["history_artifact_path"] = bad
+        return r
+    val, joi, comb = _publish_stubs(["AAPB"], make_row=make)
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert comb.calls == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("history_artifact_path", None),
+    ("history_artifact_path", ""),
+    ("history_artifact_path", 123),
+    ("k6_stack.combo_k6_path", None),
+    ("k6_stack.selected_run_dir", ""),
+])
+def test_publish_norm_missing_or_nonstring_field_stops(tmp_path, field, value):
+    def make(sec):
+        r = _valid_fresh_row(sec)
+        if field.startswith("k6_stack."):
+            r["k6_stack"][field.split(".", 1)[1]] = value
+        else:
+            r[field] = value
+        return r
+    val, joi, comb = _publish_stubs(["AAPB"], make_row=make)
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert comb.calls == []
+
+
+@pytest.mark.parametrize("ks", [None, [], "nope", 7])
+def test_publish_norm_k6_stack_missing_or_nonmapping_stops(tmp_path, ks):
+    def make(sec):
+        r = _valid_fresh_row(sec)
+        if ks is None:
+            r.pop("k6_stack", None)
+        else:
+            r["k6_stack"] = ks
+        return r
+    val, joi, comb = _publish_stubs(["AAPB"], make_row=make)
+    o, _ = _execute_setup(tmp_path, rebuild=["AAPB"], blocked=["DR8A.F"],
+                          members_clean=["AAA[D]"] * 6,
+                          extra_orch=_publish_extra(val, joi, comb,
+                                                    ccc_file=_ccc_file(tmp_path,
+                                                                       ["AAPB"])))
+    env = o.run()
+    assert env["status"] == "halted" and env["halted_at"] == "execute"
+    assert comb.calls == []
 
 
 def test_no_absolute_paths_in_tracked_source():
