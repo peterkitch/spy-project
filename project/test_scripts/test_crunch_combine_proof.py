@@ -588,18 +588,79 @@ def test_reverify_carried_ccc_refused(tmp_path):
         _call(w, reverify_carried_ccc=True)
 
 
-def test_excluded_ticker_leaked_in_member_stops(tmp_path):
-    # An excluded ticker hidden in a k6_stack member of a carried row -> STOP.
-    w = _world(tmp_path)
-    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
-    prior["per_secondary"][2]["k6_stack"]["members"] = ["CDTX[D]", "BBB[I]",
-        "AAA[D]", "BBB[I]", "AAA[D]", "BBB[I]"]
-    _write(w["prior_fixture_path"], prior)
+def _refresh_prior_promo_sha(w):
+    """Re-stamp the prior promotion manifest source_sha256 after mutating the
+    prior fixture bytes (mirrors the combine LF-SHA binding)."""
     promo = json.loads(w["prior_promotion_manifest_path"].read_text("utf-8"))
     promo["source_sha256"] = hashlib.sha256(
         w["prior_fixture_path"].read_bytes().replace(b"\r\n", b"\n")
     ).hexdigest()
     _write(w["prior_promotion_manifest_path"], promo)
+
+
+def test_excluded_ticker_leaked_in_member_stops(tmp_path):
+    # An excluded ticker hidden in a k6_stack member (STRING form) of a carried
+    # row -> STOP. (Dict form covered by the test below.)
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    prior["per_secondary"][2]["k6_stack"]["members"] = ["CDTX[D]", "BBB[I]",
+        "AAA[D]", "BBB[I]", "AAA[D]", "BBB[I]"]
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    with pytest.raises(ccp.CombineError):
+        _call(w, excluded_tickers=("CDTX",))
+
+
+def test_excluded_ticker_leaked_in_dict_member_stops(tmp_path):
+    # Production schema: members are dicts {"protocol","ticker"}. An excluded
+    # ticker as a DICT member of a carried row -> STOP.
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    row = next(r for r in prior["per_secondary"] if r["secondary"] == "CCC")
+    row["k6_stack"]["members"] = [
+        {"protocol": "D", "ticker": "CDTX"}, {"protocol": "I", "ticker": "BBB"},
+        {"protocol": "D", "ticker": "AAA"}, {"protocol": "I", "ticker": "BBB"},
+        {"protocol": "D", "ticker": "AAA"}, {"protocol": "I", "ticker": "BBB"}]
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    with pytest.raises(ccp.CombineError):
+        _call(w, excluded_tickers=("CDTX",))
+
+
+def test_excluded_secondary_stops(tmp_path):
+    # An excluded ticker that IS a board secondary -> STOP. The k6_stack path
+    # skip must not weaken secondary-field coverage. (BBB is a carried row.)
+    w = _world(tmp_path)
+    with pytest.raises(ccp.CombineError):
+        _call(w, excluded_tickers=("BBB",))
+
+
+def test_excluded_token_only_in_k6_stack_path_passes(tmp_path):
+    # The real-run case: an excluded token present ONLY inside a carried row's
+    # k6_stack provenance path (seed-combo dir name in selected_run_dir /
+    # combo_k6_path) is advisory provenance, NOT board content -> must NOT raise.
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    row = next(r for r in prior["per_secondary"] if r["secondary"] == "DDD")
+    seed = "output/stackbuilder/DDD/seedTC__DDD-D_CDTX-I_BBB-D"
+    row["k6_stack"]["selected_run_dir"] = seed
+    row["k6_stack"]["combo_k6_path"] = seed + "/combo_k=6.json"
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    res = _call(w, excluded_tickers=("CDTX",))
+    assert res["merged_row_count"] == 7  # path token skipped; board unchanged
+
+
+def test_exclusion_skip_is_k6_stack_path_aware(tmp_path):
+    # The skip is path-aware: a similarly named key OUTSIDE k6_stack must still
+    # be scanned. An excluded token in a ROW-LEVEL selected_run_dir (not under
+    # k6_stack) -> STOP.
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    row = next(r for r in prior["per_secondary"] if r["secondary"] == "EEE")
+    row["selected_run_dir"] = "output/x/seedTC__EEE-D_CDTX-I"  # NOT under k6_stack
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
     with pytest.raises(ccp.CombineError):
         _call(w, excluded_tickers=("CDTX",))
 

@@ -166,6 +166,17 @@ def _lf_sha256_file(path: Path) -> str:
 _PROTOCOL_RE = re.compile(r"\[[DI]\]$")
 _SEED_SUFFIX_RE = re.compile(r"-[DI]$")
 
+# k6_stack provenance PATH fields whose values are file paths. Their seed-combo
+# directory NAMES (output/stackbuilder/<SEC>/seedTC__<ticker>-<D/I>_...) embed
+# historical seed-CANDIDATE tickers that did NOT make the final stack -- they are
+# not board content (not a secondary, not a selected member). The exclusion scan
+# must not member-tokenize these path VALUES, or it false-positives on a banned
+# ticker that survives only as a discarded seed token in a folder name. Skipped
+# ONLY when they appear directly under a k6_stack mapping; an identically named
+# key elsewhere is still scanned.
+_K6_STACK_PROVENANCE_PATH_FIELDS = frozenset(
+    {"selected_build_path", "selected_run_dir", "combo_k6_path"})
+
 
 def _norm_ticker(raw: Any) -> str:
     return str(raw).strip().upper()
@@ -190,21 +201,33 @@ def _member_tokens(token: Any) -> set:
     return out
 
 
-def _collect_strings(obj: Any, out: list) -> None:
+def _collect_strings(obj: Any, out: list, *, parent_key: Any = None) -> None:
+    """Recursively collect every string (keys and values) in ``obj`` into
+    ``out``. Path-aware skip: a k6_stack provenance PATH value -- one of
+    _K6_STACK_PROVENANCE_PATH_FIELDS appearing DIRECTLY under a ``k6_stack``
+    mapping -- is not recursed into (its seed-combo directory NAME embeds
+    discarded seed-candidate tickers that are not board content). The field NAME
+    is still recorded, and an identically named key outside k6_stack is still
+    scanned (``parent_key`` carries the key under which the current mapping
+    sits)."""
     if isinstance(obj, str):
         out.append(obj)
     elif isinstance(obj, Mapping):
         for k, v in obj.items():
             out.append(str(k))
-            _collect_strings(v, out)
+            if (parent_key == "k6_stack"
+                    and k in _K6_STACK_PROVENANCE_PATH_FIELDS):
+                continue
+            _collect_strings(v, out, parent_key=k)
     elif isinstance(obj, (list, tuple)):
         for v in obj:
-            _collect_strings(v, out)
+            _collect_strings(v, out, parent_key=parent_key)
 
 
 def _scan_excluded(fixture: Mapping[str, Any], excluded: set) -> set:
     """Member-aware scan of the merged fixture for excluded tickers, skipping
-    the structured ``stage_a_excluded_secondaries`` disclosure block."""
+    the structured ``stage_a_excluded_secondaries`` disclosure block and the
+    k6_stack provenance PATH values (see _K6_STACK_PROVENANCE_PATH_FIELDS)."""
     if not excluded:
         return set()
     excl_norm = {_norm_ticker(t) for t in excluded}
