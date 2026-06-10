@@ -100,10 +100,18 @@ _CCC_FIELD_MAP = {
 # Full methodology lock set (honesty, not just promote-binding). Names are the
 # validation-sidecar field names. The first group is also present in the
 # fixture validation_metadata; the second group lives only in the sidecar.
+#
+# walk_forward_n_folds is intentionally NOT in this set: it is DERIVED from each
+# validation cohort's available history grid (more/deeper-history secondaries ->
+# more folds), not a regime parameter. A deep-history carried board (e.g. 99
+# folds) may legitimately merge freshly-built shorter-history rows (e.g. 15
+# folds) when the true methodology/regime fields below all match. The fold count
+# is therefore advisory (recorded, never gating); see the board_folds derivation
+# in combine_and_assemble.
 _METHODOLOGY_LOCK_FIXTURE = (
     "validation_contract_version", "validation_methodology_version",
     "multiple_comparisons_control_method", "multiple_comparisons_control_alpha",
-    "n_permutations", "n_bootstrap_samples", "walk_forward_n_folds",
+    "n_permutations", "n_bootstrap_samples",
 )
 _METHODOLOGY_LOCK_SIDECAR_ONLY = (
     "multiple_comparisons_supplementary", "bootstrap_ci_level",
@@ -410,6 +418,21 @@ def combine_and_assemble(
     locked = {f: fresh_sc.get(f) for f in _METHODOLOGY_LOCK_ALL}
     alpha = float(locked["multiple_comparisons_control_alpha"])
 
+    # walk_forward_n_folds is advisory/data-derived (see _METHODOLOGY_LOCK_*).
+    # Board-wide value: the fresh count when there are no carried rows; the
+    # shared integer when carried and fresh cohorts agree; None ("composite /
+    # mixed by validation cohort") when they differ. Prefer the prior sidecar's
+    # count as the carried-cohort source; fall back to prior fixture metadata
+    # only when no prior sidecar is supplied. Differing folds never raise.
+    fresh_folds = fresh_sc.get("walk_forward_n_folds")
+    if has_carried:
+        prior_folds = (prior_sc.get("walk_forward_n_folds")
+                       if prior_sc is not None
+                       else prior_meta.get("walk_forward_n_folds"))
+        board_folds = fresh_folds if prior_folds == fresh_folds else None
+    else:
+        board_folds = fresh_folds
+
     # --- Fix 3: bind the supplied prior sidecar to the prior fixture --------
     prior_strat_by_sec: dict = {}
     prior_sc_sha = None
@@ -566,7 +589,7 @@ def combine_and_assemble(
         "n_bootstrap_samples": locked["n_bootstrap_samples"],
         "bootstrap_ci_level": locked["bootstrap_ci_level"],
         "borderline_tolerance_multiplier": locked["borderline_tolerance_multiplier"],
-        "walk_forward_n_folds": locked["walk_forward_n_folds"],
+        "walk_forward_n_folds": board_folds,
         "outcome_windows": locked["outcome_windows"],
         "baseline_method": locked["baseline_method"],
         "n_strategies_tested": sidecar_counts["tested"],
@@ -629,7 +652,7 @@ def combine_and_assemble(
             "n_strategies_reported": board_validated,
             "n_permutations": locked["n_permutations"],
             "n_bootstrap_samples": locked["n_bootstrap_samples"],
-            "walk_forward_n_folds": locked["walk_forward_n_folds"],
+            "walk_forward_n_folds": board_folds,
             "bootstrap_ci_level": locked["bootstrap_ci_level"],
             "multiple_comparisons_control_alpha":
                 locked["multiple_comparisons_control_alpha"],
@@ -671,7 +694,7 @@ def combine_and_assemble(
         not_validated=not_validated,
         carried_count=sum(1 for p in provenance_rows.values() if p["role"] == "carried"),
         fresh_count=sum(1 for p in provenance_rows.values() if p["role"] == "fresh"),
-        locked=locked, source_runs=source_runs,
+        locked=locked, source_runs=source_runs, board_folds=board_folds,
         methodology_fully_locked=methodology_fully_locked)
     report_bytes = report_text.encode("utf-8")
     report_sha = _sha256_bytes(report_bytes)
@@ -690,7 +713,7 @@ def combine_and_assemble(
         "methodology": {
             "n_permutations": locked["n_permutations"],
             "n_bootstrap_samples": locked["n_bootstrap_samples"],
-            "walk_forward_n_folds": locked["walk_forward_n_folds"],
+            "walk_forward_n_folds": board_folds,
             "mc_method": locked["multiple_comparisons_control_method"],
             "alpha": locked["multiple_comparisons_control_alpha"],
             "contract_version": locked["validation_contract_version"],
@@ -1126,7 +1149,8 @@ def _ccc_record(rec: Mapping[str, Any], row: Mapping[str, Any], sec: str) -> dic
 
 def _compose_report(*, assembly_run_id, assembled_at_utc, merged_count,
                     board_validated, not_validated, carried_count, fresh_count,
-                    locked, source_runs, methodology_fully_locked) -> str:
+                    locked, source_runs, board_folds,
+                    methodology_fully_locked) -> str:
     lines = [
         "# K6 MTF Composite (Carry-Forward) Validation Proof",
         "",
@@ -1170,7 +1194,9 @@ def _compose_report(*, assembly_run_id, assembled_at_utc, merged_count,
         f"- n_bootstrap_samples: {locked['n_bootstrap_samples']}",
         f"- bootstrap_ci_level: {locked['bootstrap_ci_level']}",
         f"- borderline_tolerance_multiplier: {locked['borderline_tolerance_multiplier']}",
-        f"- walk_forward_n_folds: {locked['walk_forward_n_folds']}",
+        "- walk_forward_n_folds (advisory, data-derived): "
+        + ("composite (mixed by validation cohort)" if board_folds is None
+           else str(board_folds)),
         f"- baseline_method: {locked['baseline_method']}",
         "",
         "## Source validation runs",

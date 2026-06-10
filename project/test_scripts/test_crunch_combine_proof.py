@@ -457,15 +457,63 @@ def test_mixed_ccc_prefixes_pass(tmp_path):
     ("baseline_method", "risk_free"),
     ("validation_contract_version", "v2"),
     ("validation_methodology_version", "v2"),
-    ("walk_forward_n_folds", 13),
     ("bootstrap_ci_level", 0.9),
 ])
 def test_methodology_mismatch_stops(tmp_path, field, bad):
+    # walk_forward_n_folds is intentionally absent here: it is advisory/data-
+    # derived, not a hard methodology lock (see test_mixed_fold_*).
     w = _world(tmp_path)
     w["fresh_validation_sidecar"] = dict(w["fresh_validation_sidecar"])
     w["fresh_validation_sidecar"][field] = bad
     with pytest.raises(ccp.CombineError):
         _call(w)
+
+
+def test_mixed_fold_count_passes_advisory_null(tmp_path):
+    # Carried cohort (folds 12) merges a fresh cohort with a DIFFERENT fold
+    # count (15). This must NOT raise: walk_forward_n_folds is advisory. The
+    # board-wide value becomes None ("composite / mixed by cohort") and is
+    # written consistently to sidecar, fixture metadata, and report manifest;
+    # promote's self-check still passes (key present + null==null binding).
+    w = _world(tmp_path)
+    w["fresh_validation_sidecar"] = dict(w["fresh_validation_sidecar"])
+    w["fresh_validation_sidecar"]["walk_forward_n_folds"] = 15
+    res = _call(w)
+    assert res["carried_count"] > 0          # genuinely mixed (carried present)
+    sc_chk = res["promote_self_check"]
+    assert sc_chk["ran"] is True
+    assert sc_chk["validate_k6_mtf_ranking_v2_payload"] == "pass"
+    assert sc_chk["verify_v2_promotion_binding"] == "pass"
+    assert sc_chk["validate_ccc_verification_against_fixture"] == "pass"
+
+    merged = json.loads((w["output_dir"] / "merged_k6_mtf_ranking_v2.json").read_text("utf-8"))
+    assert merged["validation_metadata"]["walk_forward_n_folds"] is None
+    sidecar = json.loads((w["output_dir"] / "composite_validation_sidecar.json").read_text("utf-8"))
+    assert sidecar["walk_forward_n_folds"] is None
+    manifest = json.loads(
+        (w["output_dir"] / "composite_phase5_report.manifest.json").read_text("utf-8"))
+    assert manifest["methodology"]["walk_forward_n_folds"] is None
+    # report prose renders the composite marker, never a bare Python None.
+    report = (w["output_dir"] / "composite_phase5_report.md").read_text("utf-8")
+    assert "composite (mixed by validation cohort)" in report
+    # per-strategy fold detail is preserved independent of the board-wide summary.
+    assert all("strategy_id" in s for s in sidecar["strategies"])
+
+
+def test_shared_fold_count_carried_through(tmp_path):
+    # When carried and fresh cohorts share the fold count (baseline: both 12),
+    # the board-wide advisory value is the shared integer, written to all three
+    # JSON artifact sites.
+    w = _world(tmp_path)
+    res = _call(w)
+    assert res["carried_count"] > 0 and res["fresh_count"] > 0
+    merged = json.loads((w["output_dir"] / "merged_k6_mtf_ranking_v2.json").read_text("utf-8"))
+    assert merged["validation_metadata"]["walk_forward_n_folds"] == 12
+    sidecar = json.loads((w["output_dir"] / "composite_validation_sidecar.json").read_text("utf-8"))
+    assert sidecar["walk_forward_n_folds"] == 12
+    manifest = json.loads(
+        (w["output_dir"] / "composite_phase5_report.manifest.json").read_text("utf-8"))
+    assert manifest["methodology"]["walk_forward_n_folds"] == 12
 
 
 def test_prior_rng_seed_non_null_stops(tmp_path):
