@@ -28,26 +28,43 @@ MANIFEST_PATH = (
 
 EXPECTED_SCHEMA_VERSION = "k6_mtf_ranking_v2"
 EXPECTED_MANIFEST_SCHEMA_VERSION = "k6_mtf_promotion_manifest_v1"
-EXPECTED_RUN_ID = "20260604T110400Z_recook_full248_clean_csv"
-EXPECTED_VALIDATION_RUN_ID = "20260604T120000Z_validation_full205"
+EXPECTED_RUN_ID = "20260610T221108Z"
+EXPECTED_VALIDATION_RUN_ID = "20260610T221108Z"
 EXPECTED_SIDE_CAR_SHA = (
-    "8e48fd56dc2c9f4f16598c2c01b71f2b87e691caf855b53c97fc704baf3871ef"
+    "9ac6ac6349fa54994a50f894675bcb9bdc058538641ae0758b18e63e4574f499"
 )
 EXPECTED_REPORT_SHA = (
-    "1f6e166c7f27dd09b430b4210a885ccebf997865bd3e921bb23e5579516d9c12"
+    "9c975f4ebc3587d8bb72028d866d7ee9494d684ba1f449a491ad6eca12a9499c"
 )
 EXPECTED_FIXTURE_SHA = (
-    "4b6736da150ade118d6cbd0fb8ab974f954ed4fef3c8af9acc8dda6a8c569d97"
+    "6067d79b1c51a4d6dfef1b0673da3a0a728c130b5c7d09526b3fde6b6722e0cf"
 )
-EXPECTED_PER_SECONDARY_COUNT = 205
-EXPECTED_BOARD_VALIDATED_COUNT = 88
+EXPECTED_PER_SECONDARY_COUNT = 207
+EXPECTED_BOARD_VALIDATED_COUNT = 90
 EXPECTED_NOT_VALIDATED_COUNT = 117
 EXPECTED_STAGE_A_EXCLUDED_COUNT = 43
-EXPECTED_CCC_TOTAL_BYTES = 122207922
+EXPECTED_CCC_TOTAL_BYTES = 123328431
 EXPECTED_CCC_LARGEST_BYTES = 2857925
-EXPECTED_CCC_TOTAL_POINTS = 996395
-EXPECTED_CCC_PREFIX = (
+EXPECTED_CCC_TOTAL_POINTS = 1005575
+# Mixed-prefix carry-forward board: carried rows keep their original build-run
+# namespace, fresh rows use this run's namespace -> no single sidecar_prefix.
+EXPECTED_CCC_CARRIED_PREFIX = (
     "k6-mtf/20260604T110400Z_recook_full248_clean_csv/ccc-series/"
+)
+EXPECTED_CCC_FRESH_PREFIX = "k6-mtf/20260610T221108Z/ccc-series/"
+EXPECTED_CCC_ALLOWED_PREFIXES = (
+    EXPECTED_CCC_CARRIED_PREFIX, EXPECTED_CCC_FRESH_PREFIX,
+)
+EXPECTED_CCC_PREFIXES = [
+    {"prefix": EXPECTED_CCC_CARRIED_PREFIX, "sidecar_count": 205},
+    {"prefix": EXPECTED_CCC_FRESH_PREFIX, "sidecar_count": 2},
+]
+EXPECTED_REPORT_PATH = (
+    "md_library/shared/2026-06-11_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_207.md"
+)
+EXPECTED_VERIFICATION_MANIFEST_PATH = (
+    "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/"
+    "combined_ccc_sidecar_verification.json"
 )
 EXPECTED_CCC_SCHEMA = "k6_mtf_ccc_series_sidecar_v1"
 EXPECTED_CCC_STORAGE_MODE = "vercel_blob_sidecars"
@@ -226,7 +243,8 @@ def test_public_fixture_has_empty_inline_ccc_and_blob_metadata(
         assert isinstance(sha, str) and _SHA_RE.match(sha)
         pathname = row.get("ccc_series_pathname")
         assert isinstance(pathname, str)
-        assert pathname.startswith(EXPECTED_CCC_PREFIX)
+        # mixed-prefix carry-forward: each row is under one of the two namespaces
+        assert pathname.startswith(EXPECTED_CCC_ALLOWED_PREFIXES)
         assert "/RUN/" not in pathname
         assert sha in pathname
         url = row.get("ccc_series_url")
@@ -319,10 +337,7 @@ def test_promotion_manifest_validation_binding(manifest: dict[str, Any]) -> None
     validation = manifest.get("validation_results") or {}
     assert validation.get("phase_5_validation_report_sha256") == EXPECTED_REPORT_SHA
     assert validation.get("operator_acknowledgment_of_public_launch_gate") is True
-    assert (
-        validation.get("phase_5_validation_report_path")
-        == "md_library/shared/2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.md"
-    )
+    assert validation.get("phase_5_validation_report_path") == EXPECTED_REPORT_PATH
 
 
 def test_promotion_manifest_ccc_storage_summary(manifest: dict[str, Any]) -> None:
@@ -333,12 +348,14 @@ def test_promotion_manifest_ccc_storage_summary(manifest: dict[str, Any]) -> Non
     assert storage.get("total_sidecar_bytes") == EXPECTED_CCC_TOTAL_BYTES
     assert storage.get("largest_sidecar_bytes") == EXPECTED_CCC_LARGEST_BYTES
     assert storage.get("total_sidecar_points") == EXPECTED_CCC_TOTAL_POINTS
-    assert storage.get("sidecar_prefix") == EXPECTED_CCC_PREFIX
+    # mixed-prefix carry-forward: no single prefix; itemized per-prefix counts.
+    assert storage.get("sidecar_prefix") is None
+    assert storage.get("sidecar_prefixes") == EXPECTED_CCC_PREFIXES
     assert storage.get("all_sidecars_get_verified") is True
     assert storage.get("url_host_allowlist") == ["*.public.blob.vercel-storage.com"]
     assert (
         storage.get("verification_manifest_path")
-        == "output/k6_mtf/20260604T110400Z_recook_full248_clean_csv/k6_mtf_ccc_sidecar_verification.json"
+        == EXPECTED_VERIFICATION_MANIFEST_PATH
     )
     verification_sha = storage.get("verification_manifest_sha256")
     assert isinstance(verification_sha, str) and _SHA_RE.match(verification_sha)

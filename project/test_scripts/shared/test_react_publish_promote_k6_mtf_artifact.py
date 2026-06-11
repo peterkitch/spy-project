@@ -2268,6 +2268,86 @@ def test_promote_v2_slim_manifest_provenance_and_storage(tmp_path):
     assert all(r.get("ccc_series_source") == "vercel_blob" for r in fx["per_secondary"])
 
 
+def _blob_row_for_storage(sec, run, sha, byte_size, points):
+    """Minimal Blob-sourced slim row for _derive_ccc_storage_summary tests."""
+    pn = f"k6-mtf/{run}/ccc-series/{sec}.{sha}.json"
+    return {
+        "secondary": sec, "ccc_series": [], "ccc_series_source": "vercel_blob",
+        "ccc_series_sidecar_schema_version": "k6_mtf_ccc_series_sidecar_v1",
+        "ccc_series_pathname": pn,
+        "ccc_series_url": f"https://abc123.public.blob.vercel-storage.com/{pn}",
+        "ccc_series_sha256": sha, "ccc_series_byte_size": byte_size,
+        "ccc_series_points": points, "ccc_series_first_date": "2010-01-04",
+        "ccc_series_last_date": "2026-06-03",
+    }
+
+
+def test_ccc_storage_summary_single_prefix_preserved():
+    # All Blob rows share one prefix -> sidecar_prefix=<prefix>, no
+    # sidecar_prefixes key (existing behavior preserved).
+    payload = {
+        "schema_version": "k6_mtf_ranking_v2", "run_id": "RUNX",
+        "per_secondary": [
+            _blob_row_for_storage("AAA", "RUNX", "a" * 64, 100, 10),
+            _blob_row_for_storage("BBB", "RUNX", "b" * 64, 200, 20),
+        ],
+    }
+    s = helper._derive_ccc_storage_summary(
+        payload, verification={"all_verified": True})
+    assert s["sidecar_prefix"] == "k6-mtf/RUNX/ccc-series/"
+    assert "sidecar_prefixes" not in s
+    assert s["sidecar_count"] == 2
+    assert s["total_sidecar_bytes"] == 300
+    assert s["total_sidecar_points"] == 30
+    assert s["largest_sidecar_bytes"] == 200
+    assert s["all_sidecars_get_verified"] is True
+
+
+def test_ccc_storage_summary_mixed_prefix_honest():
+    # Carry-forward board: rows under two prefixes -> sidecar_prefix=null and an
+    # itemized sidecar_prefixes list (sorted by prefix) with per-prefix counts;
+    # aggregates remain correct.
+    payload = {
+        "schema_version": "k6_mtf_ranking_v2", "run_id": "RUNB",
+        "per_secondary": [
+            _blob_row_for_storage("AAA", "RUNA", "a" * 64, 100, 10),
+            _blob_row_for_storage("BBB", "RUNB", "b" * 64, 200, 20),
+            _blob_row_for_storage("CCC", "RUNB", "c" * 64, 300, 30),
+        ],
+    }
+    s = helper._derive_ccc_storage_summary(
+        payload, verification={"all_verified": True})
+    assert s["sidecar_prefix"] is None
+    assert s["sidecar_prefixes"] == [
+        {"prefix": "k6-mtf/RUNA/ccc-series/", "sidecar_count": 1},
+        {"prefix": "k6-mtf/RUNB/ccc-series/", "sidecar_count": 2},
+    ]
+    assert s["sidecar_count"] == 3
+    assert s["total_sidecar_bytes"] == 600
+    assert s["total_sidecar_points"] == 60
+    assert s["largest_sidecar_bytes"] == 300
+
+
+def test_ccc_storage_get_verified_requires_proof():
+    # all_sidecars_get_verified is true ONLY with a validated verification
+    # result; never inferred from row metadata completeness.
+    payload = {
+        "schema_version": "k6_mtf_ranking_v2", "run_id": "RUNB",
+        "per_secondary": [
+            _blob_row_for_storage("AAA", "RUNA", "a" * 64, 100, 10),
+            _blob_row_for_storage("BBB", "RUNB", "b" * 64, 200, 20),
+        ],
+    }
+    assert helper._derive_ccc_storage_summary(
+        payload, verification=None)["all_sidecars_get_verified"] is False
+    assert helper._derive_ccc_storage_summary(
+        payload, verification={"all_verified": False}
+    )["all_sidecars_get_verified"] is False
+    assert helper._derive_ccc_storage_summary(
+        payload, verification={"all_verified": True}
+    )["all_sidecars_get_verified"] is True
+
+
 def test_promote_v2_blob_without_verification_fails_closed(tmp_path):
     w = _phase5_world(tmp_path)
     slim, _ = helper.extract_ccc_to_blob_sidecars(

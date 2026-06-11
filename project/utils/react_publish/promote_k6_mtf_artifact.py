@@ -1686,6 +1686,21 @@ def _derive_ccc_storage_summary(
     ]
     if not blob_rows:
         return None
+    # Derive CCC sidecar prefixes from the ACTUAL Blob rows' pathnames, NOT the
+    # fixture run_id. A carry-forward board mixes carried rows (built under an
+    # earlier run's immutable prefix) with fresh rows (this run's prefix);
+    # claiming a single fixture-run_id prefix would overclaim. Honest behavior:
+    # exactly one prefix -> sidecar_prefix=<prefix>; multiple prefixes ->
+    # sidecar_prefix=null + sidecar_prefixes=[{prefix,sidecar_count},...] sorted
+    # deterministically by prefix.
+    prefix_counts: dict = {}
+    for r in blob_rows:
+        pn = str(r.get("ccc_series_pathname") or "")
+        parts = pn.split("/")
+        prefix = ("/".join(parts[:3]) + "/"
+                  if len(parts) >= 4 and parts[2] == "ccc-series" else pn)
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+    distinct_prefixes = sorted(prefix_counts)
     summary = {
         "mode": CCC_STORAGE_MODE_BLOB,
         "sidecar_schema_version": CCC_SIDECAR_SCHEMA_VERSION,
@@ -1700,12 +1715,18 @@ def _derive_ccc_storage_summary(
             (int(r.get("ccc_series_byte_size") or 0) for r in blob_rows),
             default=0,
         ),
-        "sidecar_prefix": f"k6-mtf/{payload.get('run_id')}/ccc-series/",
+        "sidecar_prefix": (distinct_prefixes[0]
+                           if len(distinct_prefixes) == 1 else None),
         "url_host_allowlist": ["*.public.blob.vercel-storage.com"],
         "all_sidecars_get_verified": bool(
             verification and verification.get("all_verified")
         ),
     }
+    if len(distinct_prefixes) > 1:
+        summary["sidecar_prefixes"] = [
+            {"prefix": p, "sidecar_count": prefix_counts[p]}
+            for p in distinct_prefixes
+        ]
     if verification_manifest_rel_path is not None:
         summary["verification_manifest_path"] = verification_manifest_rel_path
         summary["verification_manifest_sha256"] = verification_manifest_sha256
