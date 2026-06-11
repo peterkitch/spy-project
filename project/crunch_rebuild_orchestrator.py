@@ -637,11 +637,14 @@ class CrunchOrchestrator:
         publish_prior_promotion_manifest: Path | None = None,
         publish_prior_validation_sidecar: Path | None = None,
         publish_prior_ccc_verification_manifest: Path | None = None,
+        publish: bool = False,
+        operator_approved_publish: bool = False,
         invoker: Callable[[str, list[str], dict], dict] | None = None,
         conflict_check: Callable[[tuple], dict] | None = None,
         validator: Callable | None = None,
         joiner: Callable | None = None,
         combiner: Callable | None = None,
+        stage9_runner: Callable | None = None,
     ) -> None:
         self.project_root = project_root
         self.run_dir = run_dir
@@ -671,6 +674,13 @@ class CrunchOrchestrator:
         self.publish_prior_ccc_verification_manifest = (
             publish_prior_ccc_verification_manifest)
         self._publish_gate: dict | None = None
+        # Stage 9 operator-launched publish tail (real publication boundary;
+        # operator-approved only). Default OFF keeps the closed-boundary modes
+        # unchanged. The runner seam is stubbed in tests.
+        self.publish = publish
+        self.operator_approved_publish = operator_approved_publish
+        self._stage9_runner = stage9_runner or self._default_stage9_runner
+        self._stage9: dict | None = None
         self.invoker = invoker or self._default_invoker
         self.conflict_check = conflict_check or default_process_conflict_check
         # Injectable seams for the publish-dry-run tail (stubbed in tests; the
@@ -1206,6 +1216,18 @@ class CrunchOrchestrator:
                     "execute_gates",
                     "missing required execute gates: "
                     + ", ".join(self._missing_gates), preflight)
+            # Stage 9: refuse early (before Stage 1 compute) if publish is
+            # requested without approval or if the Stage 9 preflight fails.
+            if self.publish:
+                if not self.operator_approved_publish:
+                    return self._halt(
+                        "publish_gates",
+                        "--publish requires --operator-approved-publish",
+                        preflight)
+                try:
+                    self._stage9_preflight()
+                except Exception as exc:  # noqa: BLE001 - any preflight failure
+                    return self._halt("stage9_preflight", str(exc), preflight)
             return self._run_execute(preflight)
         finally:
             release_lock(self.lock_path)
@@ -1455,7 +1477,16 @@ class CrunchOrchestrator:
             # stays CLOSED: no Blob upload/GET, no promote CLI/--write, no
             # public fixture write, no commit/push/deploy. Runs ONLY with
             # --publish-dry-run; any failure routes through the except below.
-            if self.publish_dry_run:
+            if self.publish:
+                # Stage 9 -- operator-launched publish tail (real publication).
+                self._stage9 = self._run_stage9_publish_tail(r4, rebuild)
+                checkpoints["stage9_publish"] = self._stage9.get("status")
+                if self._stage9.get("status") == "refused":
+                    raise CrunchError(
+                        "stage 9 publish refused at "
+                        f"{self._stage9.get('stage')}: "
+                        f"{self._stage9.get('reason')}")
+            elif self.publish_dry_run:
                 self._publish_gate = self._run_publish_dry_run_tail(r4, rebuild)
                 checkpoints["publish_dry_run"] = "ok"
         except CrunchError as exc:
@@ -1466,14 +1497,20 @@ class CrunchOrchestrator:
             return env
 
         self._write_manual_edit_outputs()
-        status = ("completed_publish_dry_run" if self.publish_dry_run
-                  else "completed_no_publish")
+        if self.publish:
+            status = "completed_publish"
+        elif self.publish_dry_run:
+            status = "completed_publish_dry_run"
+        else:
+            status = "completed_no_publish"
         env = self._base_envelope(status, None)
         env["preflight"] = preflight
         env["checkpoints"] = checkpoints
         env["candidate_artifacts_root"] = self.k6_output_root.as_posix()
         if self.publish_dry_run and self._publish_gate is not None:
             env["publish_dry_run"] = self._publish_gate
+        if self.publish and self._stage9 is not None:
+            env["stage9_publish"] = self._stage9
         _write_json(self.run_dir / "RUN_SUMMARY.json", env)
         return env
 
@@ -1857,6 +1894,119 @@ class CrunchOrchestrator:
         from crunch_combine_proof import combine_and_assemble  # noqa: PLC0415
         return combine_and_assemble(**kwargs)
 
+    # --- Stage 9 publish tail (operator-launched; real publication) --------
+    def _default_stage9_runner(self, inputs) -> dict:
+        from stage9_publish import run_stage9_publish  # noqa: PLC0415
+        return run_stage9_publish(inputs)
+
+    def _git_toplevel(self) -> Path:
+        """Git repository top-level (the publication + report-pair files live
+        under it). Falls back to the project_root parent if git is unavailable."""
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(self.project_root), "rev-parse",
+                 "--show-toplevel"],
+                capture_output=True, text=True)
+            top = (out.stdout or "").strip()
+            if out.returncode == 0 and top:
+                return Path(top)
+        except Exception:  # noqa: BLE001
+            pass
+        return self.project_root.parent
+
+    def _stage9_inputs(self, *, fresh_secondaries, fresh_rows, sidecar,
+                       ranking_path):
+        from stage9_publish import Stage9PublishInputs  # noqa: PLC0415
+        fixtures_dir = self.project_root / "frontend" / "public" / "fixtures"
+        return Stage9PublishInputs(
+            repo_root=self._git_toplevel(),
+            run_dir=self.run_dir,
+            run_id=self.run_id,
+            fresh_secondaries=tuple(sorted(normalize_ticker(s)
+                                           for s in fresh_secondaries)),
+            fresh_rows=fresh_rows,
+            fresh_validation_sidecar=sidecar,
+            k6_ranking_path=ranking_path,
+            prior_fixture_path=self._prior_fixture_path(),
+            prior_promotion_manifest_path=self._prior_promotion_manifest_path(),
+            prior_validation_sidecar_path=self.publish_prior_validation_sidecar,
+            prior_ccc_verification_manifest_path=(
+                self.publish_prior_ccc_verification_manifest),
+            candidate_dir=self.run_dir / "publish_candidate",
+            fresh_ccc_records_path=self.run_dir / "fresh_ccc_records.json",
+            public_fixture_dest=fixtures_dir / "k6_mtf_ranking.json",
+            public_manifest_dest=(
+                fixtures_dir / "k6_mtf_ranking.promotion_manifest.json"),
+            md_library_shared_dir=self.project_root / "md_library" / "shared",
+            project_root=self.project_root,
+            excluded_tickers=tuple(sorted(self._excl_set)),
+            operator_approved=bool(self.operator_approved_publish),
+            dry_run=False,
+        )
+
+    def _stage9_preflight(self) -> None:
+        """Run the Stage 9 preflight BEFORE Stage 1 (no lock held through the
+        build). Builds a checks-only inputs with placeholder fresh artifacts."""
+        from stage9_publish import (  # noqa: PLC0415
+            verify_publish_preflight, Stage9PublishInputs)
+        fixtures_dir = self.project_root / "frontend" / "public" / "fixtures"
+        pin = Stage9PublishInputs(
+            repo_root=self._git_toplevel(),
+            run_dir=self.run_dir,
+            run_id=self.run_id,
+            fresh_secondaries=(),
+            fresh_rows=(),
+            fresh_validation_sidecar={},
+            k6_ranking_path=self.run_dir,
+            prior_fixture_path=self._prior_fixture_path(),
+            prior_promotion_manifest_path=self._prior_promotion_manifest_path(),
+            prior_validation_sidecar_path=self.publish_prior_validation_sidecar,
+            prior_ccc_verification_manifest_path=(
+                self.publish_prior_ccc_verification_manifest),
+            candidate_dir=self.run_dir / "publish_candidate",
+            fresh_ccc_records_path=self.run_dir / "fresh_ccc_records.json",
+            public_fixture_dest=fixtures_dir / "k6_mtf_ranking.json",
+            public_manifest_dest=(
+                fixtures_dir / "k6_mtf_ranking.promotion_manifest.json"),
+            md_library_shared_dir=self.project_root / "md_library" / "shared",
+            project_root=self.project_root,
+            operator_approved=bool(self.operator_approved_publish),
+            dry_run=False,
+        )
+        verify_publish_preflight(pin, acquire_lock=False)
+
+    def _run_stage9_publish_tail(self, r4: dict, rebuild: list[str]) -> dict:
+        """Stages 5-6 (validation + join + normalize) reuse the same seams as the
+        publish-dry-run tail, then Stage 9 performs the real publication."""
+        from crunch_combine_proof import CombineError  # noqa: PLC0415
+        from utils.react_publish.k6_mtf_validation_join import (  # noqa: PLC0415
+            ValidationJoinError as _ValidationJoinError)
+        effective = list(rebuild)
+        sidecar = self.validator(effective, self.run_id)
+        self._assert_validation_sidecar(sidecar, effective)
+        sidecar_path = self.run_dir / "05_validation_sidecar.json"
+        _write_json(sidecar_path, sidecar)
+        sidecar_sha = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+        ranking_path = self._resolve_k6_ranking_path(r4)
+        try:
+            v2 = self.joiner(ranking_path, sidecar_path, sidecar_sha)
+        except _ValidationJoinError as exc:
+            raise CrunchError("validation join failed: " + str(exc)) from exc
+        if not isinstance(v2, dict):
+            raise CrunchError("join did not return a v2 object")
+        fresh_rows = v2.get("per_secondary")
+        if not isinstance(fresh_rows, list) or not fresh_rows:
+            raise CrunchError("join produced no built-only per_secondary rows")
+        fresh_rows, _ = self._normalize_publish_fresh_row_paths(fresh_rows)
+        inputs = self._stage9_inputs(
+            fresh_secondaries=effective, fresh_rows=fresh_rows, sidecar=sidecar,
+            ranking_path=ranking_path)
+        result = self._stage9_runner(inputs)
+        if not isinstance(result, dict):
+            raise CrunchError("stage 9 runner did not return a summary")
+        _write_json(self.run_dir / "09_stage9_publish.json", result)
+        return result
+
     # --- artifact path helpers + quarantine -------------------------------
     def _sec_dir_name(self, secondary: str) -> str:
         return secondary  # secondaries are literal dir names (incl carets)
@@ -2030,6 +2180,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--publish-prior-promotion-manifest", default=None)
     p.add_argument("--publish-prior-validation-sidecar", default=None)
     p.add_argument("--publish-prior-ccc-verification-manifest", default=None)
+    p.add_argument("--publish", action="store_true",
+                   help="OPERATOR-LAUNCHED real publish: after a clean Stage 4, "
+                        "run the Stage 9 publish tail (same-run CCC upload -> "
+                        "combine -> promote dry-run -> promote write -> commit "
+                        "-> push -> live verify), fail-closed. Requires "
+                        "--execute and --operator-approved-publish. Crosses the "
+                        "publication boundary; do not run inside Claude Code.")
+    p.add_argument("--operator-approved-publish", action="store_true",
+                   help="Explicit operator approval gate REQUIRED for --publish "
+                        "to perform the real Blob upload, public fixture write, "
+                        "commit, and push.")
     return p
 
 
@@ -2039,7 +2200,14 @@ def _resolve(project_root: Path, opt: str, default_rel: str) -> Path:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.publish and args.publish_dry_run:
+        parser.error("--publish and --publish-dry-run are mutually exclusive")
+    if args.publish and not args.execute:
+        parser.error("--publish requires --execute")
+    if args.publish and not args.operator_approved_publish:
+        parser.error("--publish requires --operator-approved-publish")
     project_root = (Path(args.project_root).resolve() if args.project_root
                     else Path(__file__).resolve().parent)
     now = _utcnow()
@@ -2090,6 +2258,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.publish_prior_validation_sidecar),
         publish_prior_ccc_verification_manifest=_opt_path(
             args.publish_prior_ccc_verification_manifest),
+        publish=args.publish,
+        operator_approved_publish=args.operator_approved_publish,
     )
     env = orch.run()
     print(json.dumps({
@@ -2100,7 +2270,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     }, indent=2, sort_keys=True))
     return 0 if env.get("status") in ("dry_run_planned",
                                       "completed_no_publish",
-                                      "completed_publish_dry_run") else 1
+                                      "completed_publish_dry_run",
+                                      "completed_publish") else 1
 
 
 if __name__ == "__main__":

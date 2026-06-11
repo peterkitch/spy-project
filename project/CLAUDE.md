@@ -184,6 +184,12 @@ Operating rules that follow from this boundary:
   - Publication-class repository writes/commits are routed outside Claude Code
     (Codex or operator), with auditor independence preserved.
 
+B2/B3 restrict what Claude Code may execute inside its harness. They do not
+prohibit the repository from containing an operator-launched orchestrator mode
+that performs Blob upload, public fixture write, git commit, push, or
+deploy-adjacent publication steps, provided the operator explicitly launches it
+outside Claude Code and the program has fail-closed preflights.
+
 ## B3. Auditor independence
 
 The auditor must be a different voice than the implementer.
