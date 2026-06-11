@@ -48,6 +48,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1536,44 +1537,8 @@ class CrunchOrchestrator:
                                    effective: list[str]) -> None:
         """Fail closed unless the Stage-5 sidecar covers EXACTLY the built
         secondaries with strict k6_mtf:<SEC> strategy ids and binds to this
-        run id."""
-        if not isinstance(sidecar, dict):
-            raise CrunchError("validation sidecar is not a JSON object")
-        if sidecar.get("validation_status") != "valid":
-            raise CrunchError(
-                "validation sidecar validation_status != 'valid': "
-                f"{sidecar.get('validation_status')!r}")
-        if sidecar.get("run_id") != self.run_id:
-            raise CrunchError(
-                "validation sidecar run_id "
-                f"{sidecar.get('run_id')!r} != current run id {self.run_id!r}")
-        strategies = sidecar.get("strategies")
-        if not isinstance(strategies, list) or not strategies:
-            raise CrunchError("validation sidecar 'strategies' must be a "
-                              "non-empty list")
-        seen: set[str] = set()
-        for s in strategies:
-            if not isinstance(s, dict):
-                raise CrunchError("validation sidecar strategy is not an object")
-            sid = s.get("strategy_id")
-            if not isinstance(sid, str) or not sid.startswith("k6_mtf:"):
-                raise CrunchError(
-                    f"validation sidecar strategy_id malformed: {sid!r}")
-            sec = normalize_ticker(sid[len("k6_mtf:"):])
-            if not sec or sid != f"k6_mtf:{sec}":
-                raise CrunchError(
-                    f"validation sidecar strategy_id secondary mismatch: {sid!r}")
-            if sec in seen:
-                raise CrunchError(
-                    f"validation sidecar duplicate strategy secondary: {sec!r}")
-            seen.add(sec)
-        want = {normalize_ticker(s) for s in effective}
-        if seen != want:
-            missing = sorted(want - seen)
-            extra = sorted(seen - want)
-            raise CrunchError(
-                "validation sidecar does not cover exactly the built "
-                f"secondaries; missing {missing!r}, extra {extra!r}")
+        run id. Delegates to the shared module-level assertion."""
+        _assert_validation_sidecar_covers(sidecar, effective, run_id=self.run_id)
 
     def _publish_gate_report(self, *, status: str, reason: str | None,
                              candidate: dict | None,
@@ -1631,101 +1596,19 @@ class CrunchOrchestrator:
         return records
 
     # --- fresh-row path normalization (Stage 6 -> Stage 7) ----------------
-    _FRESH_ROW_PATH_FIELDS = (
-        "history_artifact_path",
-        "k6_stack.selected_build_path",
-        "k6_stack.selected_run_dir",
-        "k6_stack.combo_k6_path",
-    )
-
+    # Single source of truth lives at module scope (_RERANK_FRESH_ROW_PATH_FIELDS
+    # / _normalize_one_output_path / _normalize_fresh_row_paths); these methods
+    # delegate so the dry-run tail and the re-rank publish seam share behavior.
     def _normalize_one_output_path(self, sec: str, field: str, value: Any) -> str:
-        """Return a clean project-relative POSIX path under ``output/`` for one
-        fresh-row path field, or raise CrunchError. Fail-closed: missing/empty/
-        non-string, absolute-outside-output, relative-not-under-output, and
-        traversal all hard-stop. Accepts absolute paths under
-        ``<project_root>/output`` (any drive casing / slash style) and already-
-        relative ``output/...`` paths (slashes normalized to POSIX)."""
-        if not isinstance(value, str) or not value.strip():
-            raise CrunchError(
-                f"publish normalize: secondary {sec!r} field {field} is "
-                f"missing/empty/non-string: {value!r}")
-        s = value.replace("\\", "/").strip()
-        is_abs = bool(re.match(r"^[A-Za-z]:", s)) or s.startswith("/") \
-            or Path(s).is_absolute()
-        if is_abs:
-            out_root = (self.project_root / "output")
-            try:
-                rel = Path(value).resolve().relative_to(out_root.resolve())
-            except (ValueError, OSError) as exc:
-                raise CrunchError(
-                    f"publish normalize: secondary {sec!r} field {field} is an "
-                    "absolute path outside <project_root>/output: "
-                    f"{value!r}") from exc
-            norm = "output/" + rel.as_posix()
-        else:
-            # Relative paths must be a concrete file under the output/ segment:
-            # exactly 'output/...'. Bare 'output' and non-segment prefixes such
-            # as 'outputx/...' or 'output_evil/...' are rejected (the trailing
-            # slash enforces the segment boundary).
-            if not s.startswith("output/"):
-                raise CrunchError(
-                    f"publish normalize: secondary {sec!r} field {field} is a "
-                    f"relative path not under output/: {value!r}")
-            norm = s
-        parts = norm.split("/")
-        if parts[0] != "output" or ".." in parts:
-            raise CrunchError(
-                f"publish normalize: secondary {sec!r} field {field} did not "
-                f"resolve to a clean output/ path (traversal/outside): {value!r}")
-        return norm
+        """Delegate to the shared module-level normalizer (bound to
+        self.project_root)."""
+        return _normalize_one_output_path(
+            sec, field, value, project_root=self.project_root)
 
     def _normalize_publish_fresh_row_paths(self, rows: list) -> tuple:
-        """Return (normalized_fresh_rows, summary). Normalizes ONLY the four
-        path fields on each fresh row to project-relative POSIX ``output/...``
-        form; every other field (validation, metrics, CCC) is preserved
-        exactly. Returns copies (the joiner return is not mutated in place).
-        Carried rows are NOT touched here -- combine handles them from the
-        prior fixture. Fail-closed via _normalize_one_output_path."""
-        out_rows: list = []
-        fields_normalized = 0
-        rows_changed = 0
-        for r in rows:
-            if not isinstance(r, dict):
-                raise CrunchError("publish normalize: fresh row is not an object")
-            sec = normalize_ticker(r.get("secondary"))
-            ks = r.get("k6_stack")
-            if not isinstance(ks, dict):
-                raise CrunchError(
-                    f"publish normalize: secondary {sec!r} k6_stack is missing "
-                    "or not a mapping")
-            new_row = dict(r)
-            new_ks = dict(ks)
-            changed = False
-            orig = r.get("history_artifact_path")
-            norm = self._normalize_one_output_path(
-                sec, "history_artifact_path", orig)
-            if norm != orig:
-                changed = True
-                fields_normalized += 1
-            new_row["history_artifact_path"] = norm
-            for f in ("selected_build_path", "selected_run_dir", "combo_k6_path"):
-                o = ks.get(f)
-                n = self._normalize_one_output_path(sec, "k6_stack." + f, o)
-                if n != o:
-                    changed = True
-                    fields_normalized += 1
-                new_ks[f] = n
-            new_row["k6_stack"] = new_ks
-            if changed:
-                rows_changed += 1
-            out_rows.append(new_row)
-        summary = {
-            "fresh_rows_total": len(out_rows),
-            "fresh_rows_normalized_count": rows_changed,
-            "normalized_path_fields_count": fields_normalized,
-            "normalized_path_fields": list(self._FRESH_ROW_PATH_FIELDS),
-        }
-        return out_rows, summary
+        """Delegate to the shared module-level fresh-row normalizer (bound to
+        self.project_root)."""
+        return _normalize_fresh_row_paths(rows, project_root=self.project_root)
 
     def _run_publish_dry_run_tail(self, r4: dict, rebuild: list[str]) -> dict:
         """Stages 5-8: validation -> join -> combine/proof -> publish-gate
@@ -1914,35 +1797,10 @@ class CrunchOrchestrator:
             pass
         return self.project_root.parent
 
-    def _stage9_inputs(self, *, fresh_secondaries, fresh_rows, sidecar,
-                       ranking_path):
-        from stage9_publish import Stage9PublishInputs  # noqa: PLC0415
-        fixtures_dir = self.project_root / "frontend" / "public" / "fixtures"
-        return Stage9PublishInputs(
-            repo_root=self._git_toplevel(),
-            run_dir=self.run_dir,
-            run_id=self.run_id,
-            fresh_secondaries=tuple(sorted(normalize_ticker(s)
-                                           for s in fresh_secondaries)),
-            fresh_rows=fresh_rows,
-            fresh_validation_sidecar=sidecar,
-            k6_ranking_path=ranking_path,
-            prior_fixture_path=self._prior_fixture_path(),
-            prior_promotion_manifest_path=self._prior_promotion_manifest_path(),
-            prior_validation_sidecar_path=self.publish_prior_validation_sidecar,
-            prior_ccc_verification_manifest_path=(
-                self.publish_prior_ccc_verification_manifest),
-            candidate_dir=self.run_dir / "publish_candidate",
-            fresh_ccc_records_path=self.run_dir / "fresh_ccc_records.json",
-            public_fixture_dest=fixtures_dir / "k6_mtf_ranking.json",
-            public_manifest_dest=(
-                fixtures_dir / "k6_mtf_ranking.promotion_manifest.json"),
-            md_library_shared_dir=self.project_root / "md_library" / "shared",
-            project_root=self.project_root,
-            excluded_tickers=tuple(sorted(self._excl_set)),
-            operator_approved=bool(self.operator_approved_publish),
-            dry_run=False,
-        )
+    # NOTE: the historical _stage9_inputs(...) builder was unified into the
+    # module-level run_rerank_publish seam (single source for Stage9PublishInputs
+    # construction, with dry_run threaded). _run_stage9_publish_tail calls that
+    # seam with dry_run=False, preserving Build-and-Rank behavior exactly.
 
     def _stage9_preflight(self) -> None:
         """Run the Stage 9 preflight BEFORE Stage 1 (no lock held through the
@@ -1976,36 +1834,33 @@ class CrunchOrchestrator:
         verify_publish_preflight(pin, acquire_lock=False)
 
     def _run_stage9_publish_tail(self, r4: dict, rebuild: list[str]) -> dict:
-        """Stages 5-6 (validation + join + normalize) reuse the same seams as the
-        publish-dry-run tail, then Stage 9 performs the real publication."""
-        from crunch_combine_proof import CombineError  # noqa: PLC0415
-        from utils.react_publish.k6_mtf_validation_join import (  # noqa: PLC0415
-            ValidationJoinError as _ValidationJoinError)
-        effective = list(rebuild)
-        sidecar = self.validator(effective, self.run_id)
-        self._assert_validation_sidecar(sidecar, effective)
-        sidecar_path = self.run_dir / "05_validation_sidecar.json"
-        _write_json(sidecar_path, sidecar)
-        sidecar_sha = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
-        ranking_path = self._resolve_k6_ranking_path(r4)
-        try:
-            v2 = self.joiner(ranking_path, sidecar_path, sidecar_sha)
-        except _ValidationJoinError as exc:
-            raise CrunchError("validation join failed: " + str(exc)) from exc
-        if not isinstance(v2, dict):
-            raise CrunchError("join did not return a v2 object")
-        fresh_rows = v2.get("per_secondary")
-        if not isinstance(fresh_rows, list) or not fresh_rows:
-            raise CrunchError("join produced no built-only per_secondary rows")
-        fresh_rows, _ = self._normalize_publish_fresh_row_paths(fresh_rows)
-        inputs = self._stage9_inputs(
-            fresh_secondaries=effective, fresh_rows=fresh_rows, sidecar=sidecar,
-            ranking_path=ranking_path)
-        result = self._stage9_runner(inputs)
-        if not isinstance(result, dict):
-            raise CrunchError("stage 9 runner did not return a summary")
-        _write_json(self.run_dir / "09_stage9_publish.json", result)
-        return result
+        """Stages 5-6 (validation + join + normalize) then the real Stage 9
+        publication. Thin caller of the shared module-level run_rerank_publish
+        seam with dry_run=False (Build-and-Rank's historical behavior). The
+        ranking path is resolved from this run's Stage-4 result before the
+        seam, which takes an explicit k6_ranking_path."""
+        return run_rerank_publish(
+            survivors=list(rebuild),
+            k6_ranking_path=self._resolve_k6_ranking_path(r4),
+            prior_fixture_path=self._prior_fixture_path(),
+            prior_promotion_manifest_path=self._prior_promotion_manifest_path(),
+            prior_validation_sidecar_path=self.publish_prior_validation_sidecar,
+            prior_ccc_verification_manifest_path=(
+                self.publish_prior_ccc_verification_manifest),
+            run_dir=self.run_dir,
+            run_id=self.run_id,
+            target_as_of=self.target_as_of,
+            dry_run=False,
+            operator_approved=bool(self.operator_approved_publish),
+            seams=RerankPublishSeams(
+                validator=self.validator,
+                joiner=self.joiner,
+                stage9_runner=self._stage9_runner,
+                project_root=self.project_root,
+                repo_root=self._git_toplevel(),
+                excluded_tickers=tuple(sorted(self._excl_set)),
+            ),
+        )
 
     # --- artifact path helpers + quarantine -------------------------------
     def _sec_dir_name(self, secondary: str) -> str:
@@ -2122,6 +1977,265 @@ class CrunchOrchestrator:
         out = [ranking]
         out.extend(sorted(ranking.parent.glob("*/k6_mtf_history.json")))
         return out
+
+
+# ---------------------------------------------------------------------------
+# Re-rank publish seam (module-level; importable without side effects)
+#
+# This is the SHARED real-publish tail extracted verbatim from
+# CrunchOrchestrator._run_stage9_publish_tail so a thin re-rank driver can call
+# it directly. The chain is: validator -> sidecar coverage assertion -> joiner
+# -> fresh-row path normalization -> Stage9PublishInputs -> run_stage9_publish.
+# dry_run is threaded into Stage9PublishInputs (the orchestrator's previous tail
+# hardcoded dry_run=False; that is preserved at its call site below).
+#
+# The pure helpers (_normalize_one_output_path, _normalize_fresh_row_paths,
+# _assert_validation_sidecar_covers) are the single source of truth: the
+# matching CrunchOrchestrator methods now delegate to them, so the dry-run tail
+# and the real-publish tail share identical behavior. The engine seams
+# (validator/joiner/stage9_runner) are injected via RerankPublishSeams; the
+# heavy modules (combine, stage9_publish, the join) are imported lazily inside
+# the function so importing this module stays side-effect-free.
+# ---------------------------------------------------------------------------
+
+
+_RERANK_FRESH_ROW_PATH_FIELDS = (
+    "history_artifact_path",
+    "k6_stack.selected_build_path",
+    "k6_stack.selected_run_dir",
+    "k6_stack.combo_k6_path",
+)
+
+
+def _normalize_one_output_path(sec: str, field: str, value: Any, *,
+                               project_root: Path) -> str:
+    """Return a clean project-relative POSIX path under ``output/`` for one
+    fresh-row path field, or raise CrunchError. Fail-closed: missing/empty/
+    non-string, absolute-outside-output, relative-not-under-output, and
+    traversal all hard-stop. Accepts absolute paths under
+    ``<project_root>/output`` (any drive casing / slash style) and already-
+    relative ``output/...`` paths (slashes normalized to POSIX)."""
+    if not isinstance(value, str) or not value.strip():
+        raise CrunchError(
+            f"publish normalize: secondary {sec!r} field {field} is "
+            f"missing/empty/non-string: {value!r}")
+    s = value.replace("\\", "/").strip()
+    is_abs = bool(re.match(r"^[A-Za-z]:", s)) or s.startswith("/") \
+        or Path(s).is_absolute()
+    if is_abs:
+        out_root = (Path(project_root) / "output")
+        try:
+            rel = Path(value).resolve().relative_to(out_root.resolve())
+        except (ValueError, OSError) as exc:
+            raise CrunchError(
+                f"publish normalize: secondary {sec!r} field {field} is an "
+                "absolute path outside <project_root>/output: "
+                f"{value!r}") from exc
+        norm = "output/" + rel.as_posix()
+    else:
+        if not s.startswith("output/"):
+            raise CrunchError(
+                f"publish normalize: secondary {sec!r} field {field} is a "
+                f"relative path not under output/: {value!r}")
+        norm = s
+    parts = norm.split("/")
+    if parts[0] != "output" or ".." in parts:
+        raise CrunchError(
+            f"publish normalize: secondary {sec!r} field {field} did not "
+            f"resolve to a clean output/ path (traversal/outside): {value!r}")
+    return norm
+
+
+def _normalize_fresh_row_paths(rows: list, *, project_root: Path) -> tuple:
+    """Return (normalized_fresh_rows, summary). Normalizes ONLY the four path
+    fields on each fresh row to project-relative POSIX ``output/...`` form;
+    every other field (validation, metrics, CCC) is preserved exactly. Returns
+    copies (the joiner return is not mutated in place). Carried rows are NOT
+    touched here -- combine handles them from the prior fixture. Fail-closed via
+    _normalize_one_output_path."""
+    out_rows: list = []
+    fields_normalized = 0
+    rows_changed = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            raise CrunchError("publish normalize: fresh row is not an object")
+        sec = normalize_ticker(r.get("secondary"))
+        ks = r.get("k6_stack")
+        if not isinstance(ks, dict):
+            raise CrunchError(
+                f"publish normalize: secondary {sec!r} k6_stack is missing "
+                "or not a mapping")
+        new_row = dict(r)
+        new_ks = dict(ks)
+        changed = False
+        orig = r.get("history_artifact_path")
+        norm = _normalize_one_output_path(
+            sec, "history_artifact_path", orig, project_root=project_root)
+        if norm != orig:
+            changed = True
+            fields_normalized += 1
+        new_row["history_artifact_path"] = norm
+        for f in ("selected_build_path", "selected_run_dir", "combo_k6_path"):
+            o = ks.get(f)
+            n = _normalize_one_output_path(
+                sec, "k6_stack." + f, o, project_root=project_root)
+            if n != o:
+                changed = True
+                fields_normalized += 1
+            new_ks[f] = n
+        new_row["k6_stack"] = new_ks
+        if changed:
+            rows_changed += 1
+        out_rows.append(new_row)
+    summary = {
+        "fresh_rows_total": len(out_rows),
+        "fresh_rows_normalized_count": rows_changed,
+        "normalized_path_fields_count": fields_normalized,
+        "normalized_path_fields": list(_RERANK_FRESH_ROW_PATH_FIELDS),
+    }
+    return out_rows, summary
+
+
+def _assert_validation_sidecar_covers(sidecar: Any, effective: list[str], *,
+                                      run_id: str) -> None:
+    """Fail closed unless the Stage-5 sidecar covers EXACTLY the built
+    secondaries with strict k6_mtf:<SEC> strategy ids and binds to this run
+    id."""
+    if not isinstance(sidecar, dict):
+        raise CrunchError("validation sidecar is not a JSON object")
+    if sidecar.get("validation_status") != "valid":
+        raise CrunchError(
+            "validation sidecar validation_status != 'valid': "
+            f"{sidecar.get('validation_status')!r}")
+    if sidecar.get("run_id") != run_id:
+        raise CrunchError(
+            "validation sidecar run_id "
+            f"{sidecar.get('run_id')!r} != current run id {run_id!r}")
+    strategies = sidecar.get("strategies")
+    if not isinstance(strategies, list) or not strategies:
+        raise CrunchError("validation sidecar 'strategies' must be a "
+                          "non-empty list")
+    seen: set[str] = set()
+    for s in strategies:
+        if not isinstance(s, dict):
+            raise CrunchError("validation sidecar strategy is not an object")
+        sid = s.get("strategy_id")
+        if not isinstance(sid, str) or not sid.startswith("k6_mtf:"):
+            raise CrunchError(
+                f"validation sidecar strategy_id malformed: {sid!r}")
+        sec = normalize_ticker(sid[len("k6_mtf:"):])
+        if not sec or sid != f"k6_mtf:{sec}":
+            raise CrunchError(
+                f"validation sidecar strategy_id secondary mismatch: {sid!r}")
+        if sec in seen:
+            raise CrunchError(
+                f"validation sidecar duplicate strategy secondary: {sec!r}")
+        seen.add(sec)
+    want = {normalize_ticker(s) for s in effective}
+    if seen != want:
+        missing = sorted(want - seen)
+        extra = sorted(seen - want)
+        raise CrunchError(
+            "validation sidecar does not cover exactly the built "
+            f"secondaries; missing {missing!r}, extra {extra!r}")
+
+
+@dataclass
+class RerankPublishSeams:
+    """Injected engine seams + run-invariant config for run_rerank_publish.
+
+    validator/joiner/stage9_runner mirror the orchestrator's publish-tail seams
+    (CrunchOrchestrator.validator / .joiner / ._stage9_runner). project_root,
+    repo_root, and excluded_tickers supply the Stage9PublishInputs fields the
+    orchestrator otherwise reads from self."""
+    validator: Callable[[list, str], dict]
+    joiner: Callable[[Path, Path, str], dict]
+    stage9_runner: Callable[[Any], dict]
+    project_root: Path
+    repo_root: Path
+    excluded_tickers: Iterable[str] = ()
+
+
+def run_rerank_publish(*, survivors: Iterable[str], k6_ranking_path: Path,
+                       prior_fixture_path: Path,
+                       prior_promotion_manifest_path: Path,
+                       prior_validation_sidecar_path: Any,
+                       prior_ccc_verification_manifest_path: Any,
+                       run_dir: Path, run_id: str, target_as_of: Any,
+                       dry_run: bool, operator_approved: bool,
+                       seams: RerankPublishSeams) -> dict:
+    """Run the shared real-publish tail over a surviving fresh set and return
+    the Stage 9 summary dict. Behavior is identical to the orchestrator's
+    historical _run_stage9_publish_tail except that ``dry_run`` is threaded into
+    Stage9PublishInputs (previously hardcoded False).
+
+    ``target_as_of`` is accepted for caller-symmetry with the re-rank driver and
+    recorded by upstream stages; the publish chain itself derives all dates from
+    the joined artifacts, so it is not consumed here. No network/Blob/promote/
+    git happens in this function -- those live inside the injected
+    ``stage9_runner`` (the real one is stage9_publish.run_stage9_publish, which
+    is itself fail-closed and honors dry_run)."""
+    from stage9_publish import Stage9PublishInputs  # noqa: PLC0415
+    from utils.react_publish.k6_mtf_validation_join import (  # noqa: PLC0415
+        ValidationJoinError as _ValidationJoinError)
+
+    run_dir = Path(run_dir)
+    effective = list(survivors)
+
+    # ----- Stage 5: validation (injected seam) + strict coverage assertion ---
+    sidecar = seams.validator(effective, run_id)
+    _assert_validation_sidecar_covers(sidecar, effective, run_id=run_id)
+    sidecar_path = run_dir / "05_validation_sidecar.json"
+    _write_json(sidecar_path, sidecar)
+    sidecar_sha = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+
+    # ----- Stage 6: join (run-id-bound k6 ranking) + path normalization ------
+    ranking_path = Path(k6_ranking_path)
+    try:
+        v2 = seams.joiner(ranking_path, sidecar_path, sidecar_sha)
+    except _ValidationJoinError as exc:
+        raise CrunchError("validation join failed: " + str(exc)) from exc
+    if not isinstance(v2, dict):
+        raise CrunchError("join did not return a v2 object")
+    fresh_rows = v2.get("per_secondary")
+    if not isinstance(fresh_rows, list) or not fresh_rows:
+        raise CrunchError("join produced no built-only per_secondary rows")
+    fresh_rows, _ = _normalize_fresh_row_paths(
+        fresh_rows, project_root=seams.project_root)
+
+    # ----- Stage 9: real publication (combine happens inside the runner) -----
+    fixtures_dir = Path(seams.project_root) / "frontend" / "public" / "fixtures"
+    inputs = Stage9PublishInputs(
+        repo_root=seams.repo_root,
+        run_dir=run_dir,
+        run_id=run_id,
+        fresh_secondaries=tuple(sorted(normalize_ticker(s)
+                                       for s in effective)),
+        fresh_rows=fresh_rows,
+        fresh_validation_sidecar=sidecar,
+        k6_ranking_path=ranking_path,
+        prior_fixture_path=prior_fixture_path,
+        prior_promotion_manifest_path=prior_promotion_manifest_path,
+        prior_validation_sidecar_path=prior_validation_sidecar_path,
+        prior_ccc_verification_manifest_path=(
+            prior_ccc_verification_manifest_path),
+        candidate_dir=run_dir / "publish_candidate",
+        fresh_ccc_records_path=run_dir / "fresh_ccc_records.json",
+        public_fixture_dest=fixtures_dir / "k6_mtf_ranking.json",
+        public_manifest_dest=(
+            fixtures_dir / "k6_mtf_ranking.promotion_manifest.json"),
+        md_library_shared_dir=(
+            Path(seams.project_root) / "md_library" / "shared"),
+        project_root=seams.project_root,
+        excluded_tickers=tuple(sorted(seams.excluded_tickers)),
+        operator_approved=bool(operator_approved),
+        dry_run=bool(dry_run),
+    )
+    result = seams.stage9_runner(inputs)
+    if not isinstance(result, dict):
+        raise CrunchError("stage 9 runner did not return a summary")
+    _write_json(run_dir / "09_stage9_publish.json", result)
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -2022,3 +2022,189 @@ def test_no_absolute_paths_in_tracked_source():
         src = (PROJECT_ROOT / fname).read_text("utf-8").lower()
         for bad in bad_tokens:
             assert bad not in src, "machine path token in source"
+
+
+# ---------------------------------------------------------------------------
+# run_rerank_publish seam (extracted real-publish tail; importable, dry_run-aware)
+# ---------------------------------------------------------------------------
+
+
+def _rr_fake_validator(secs, run_id):
+    return {
+        "validation_status": "valid",
+        "run_id": run_id,
+        "strategies": [{"strategy_id": "k6_mtf:" + s} for s in secs],
+    }
+
+
+def _rr_fake_joiner_for(survivors):
+    def joiner(ranking_path, sidecar_path, sidecar_sha):
+        return {"per_secondary": [
+            {"secondary": s,
+             "history_artifact_path": "output/k6_mtf/RID/%s/h.json" % s,
+             "k6_stack": {
+                 "selected_build_path":
+                     "output/stackbuilder/%s/selected_build.json" % s,
+                 "selected_run_dir": "output/stackbuilder/%s/run" % s,
+                 "combo_k6_path": "output/k6_mtf/RID/%s/combo.json" % s,
+             }}
+            for s in survivors]}
+    return joiner
+
+
+class _RRStage9:
+    """A fake Stage 9 runner that records the Stage9PublishInputs it received."""
+
+    def __init__(self, result):
+        self.result = result
+        self.inputs = None
+        self.calls = 0
+
+    def __call__(self, inputs):
+        self.inputs = inputs
+        self.calls += 1
+        return self.result
+
+
+def _rr_call(root, survivors, *, dry_run=False, validator=None, joiner=None,
+             runner=None, operator_approved=True, excluded=()):
+    root = Path(root)
+    run_dir = root / "output" / "crunch_runs" / "RID"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if runner is None:
+        runner = _RRStage9(
+            {"status": "dry_run_complete" if dry_run else "published"})
+    seams = cro.RerankPublishSeams(
+        validator=validator or _rr_fake_validator,
+        joiner=joiner or _rr_fake_joiner_for(survivors),
+        stage9_runner=runner,
+        project_root=root,
+        repo_root=root,
+        excluded_tickers=excluded,
+    )
+    result = cro.run_rerank_publish(
+        survivors=survivors,
+        k6_ranking_path=root / "output" / "k6_mtf" / "RID" / "k6_mtf_ranking.json",
+        prior_fixture_path=root / "prior" / "fix.json",
+        prior_promotion_manifest_path=root / "prior" / "promo.json",
+        prior_validation_sidecar_path=root / "prior" / "sidecar.json",
+        prior_ccc_verification_manifest_path=root / "prior" / "ccc.json",
+        run_dir=run_dir,
+        run_id="RID",
+        target_as_of="2026-06-03",
+        dry_run=dry_run,
+        operator_approved=operator_approved,
+        seams=seams,
+    )
+    return result, run_dir, runner
+
+
+def test_run_rerank_publish_end_to_end_with_injected_seams(tmp_path):
+    result, run_dir, runner = _rr_call(tmp_path, ["AAA", "BBB"])
+    assert result == {"status": "published"}
+    assert (run_dir / "05_validation_sidecar.json").is_file()
+    assert (run_dir / "09_stage9_publish.json").is_file()
+    inp = runner.inputs
+    assert inp.run_id == "RID"
+    assert inp.fresh_secondaries == ("AAA", "BBB")
+    assert [r["secondary"] for r in inp.fresh_rows] == ["AAA", "BBB"]
+    assert inp.fresh_validation_sidecar["run_id"] == "RID"
+    assert inp.prior_fixture_path == tmp_path / "prior" / "fix.json"
+    assert inp.prior_ccc_verification_manifest_path == tmp_path / "prior" / "ccc.json"
+    assert inp.dry_run is False
+    # fresh-row path fields normalized to project-relative output/...
+    assert inp.fresh_rows[0]["history_artifact_path"].startswith("output/")
+    # the 09 artifact equals the stage9 result
+    written = json.loads((run_dir / "09_stage9_publish.json").read_text("utf-8"))
+    assert written == result
+
+
+def test_run_rerank_publish_dry_run_true_threads_into_inputs(tmp_path):
+    result, run_dir, runner = _rr_call(tmp_path, ["AAA"], dry_run=True)
+    assert runner.inputs.dry_run is True
+    assert result == {"status": "dry_run_complete"}
+
+
+def test_orchestrator_tail_calls_seam_with_dry_run_false(tmp_path, monkeypatch):
+    o = _make_orch(tmp_path)
+    # the tail resolves the run-id-bound ranking artifact (must exist on disk)
+    ranking_dir = o.k6_output_root / o.run_id
+    ranking_dir.mkdir(parents=True, exist_ok=True)
+    (ranking_dir / "k6_mtf_ranking.json").write_text("{}", "utf-8")
+    o._excl_set = set()  # normally populated by preflight() before the tail runs
+    cap = {}
+
+    def fake_seam(**kw):
+        cap.update(kw)
+        return {"status": "published"}
+    monkeypatch.setattr(cro, "run_rerank_publish", fake_seam)
+    res = o._run_stage9_publish_tail({}, ["AAA"])
+    assert res == {"status": "published"}
+    assert cap["dry_run"] is False                      # Build-and-Rank preserved
+    assert list(cap["survivors"]) == ["AAA"]
+    assert cap["run_id"] == o.run_id
+    assert isinstance(cap["seams"], cro.RerankPublishSeams)
+    assert cap["seams"].project_root == tmp_path
+
+
+def test_run_rerank_publish_all_fresh_and_carried_shapes_accepted(tmp_path):
+    # all-fresh: the whole board is the fresh set (carried set empty downstream)
+    _, _, run_af = _rr_call(tmp_path / "af", ["AAA", "BBB", "CCC"])
+    assert run_af.inputs.fresh_secondaries == ("AAA", "BBB", "CCC")
+    # carried-present: a subset is fresh (the rest carry inside combine)
+    _, _, run_cp = _rr_call(tmp_path / "cp", ["AAA"])
+    assert run_cp.inputs.fresh_secondaries == ("AAA",)
+
+
+def test_run_rerank_publish_join_error_wrapped(tmp_path):
+    from utils.react_publish.k6_mtf_validation_join import ValidationJoinError
+
+    def bad_join(ranking_path, sidecar_path, sidecar_sha):
+        raise ValidationJoinError("validation sidecar SHA-256 mismatch")
+    with pytest.raises(cro.CrunchError) as ei:
+        _rr_call(tmp_path, ["AAA"], joiner=bad_join)
+    assert "validation join failed" in str(ei.value)
+
+
+def test_run_rerank_publish_empty_join_stops(tmp_path):
+    def empty_join(ranking_path, sidecar_path, sidecar_sha):
+        return {"per_secondary": []}
+    with pytest.raises(cro.CrunchError):
+        _rr_call(tmp_path, ["AAA"], joiner=empty_join)
+
+
+def test_run_rerank_publish_bad_sidecar_stops(tmp_path):
+    def bad_validator(secs, run_id):
+        return {"validation_status": "partial", "run_id": run_id,
+                "strategies": []}
+    with pytest.raises(cro.CrunchError):
+        _rr_call(tmp_path, ["AAA"], validator=bad_validator)
+
+
+def test_run_rerank_publish_stage9_nonmapping_stops(tmp_path):
+    class _BadRunner:
+        def __init__(self):
+            self.inputs = None
+
+        def __call__(self, inputs):
+            self.inputs = inputs
+            return "not-a-dict"
+    with pytest.raises(cro.CrunchError):
+        _rr_call(tmp_path, ["AAA"], runner=_BadRunner())
+
+
+def test_run_rerank_publish_import_side_effect_free():
+    # Importing the orchestrator must NOT pull in the heavy publish modules
+    # (they are imported lazily inside run_rerank_publish), and the seam symbols
+    # must be present. Run in a clean subprocess under the pinned interpreter.
+    import subprocess
+    code = (
+        "import crunch_rebuild_orchestrator as c, sys; "
+        "assert hasattr(c, 'run_rerank_publish'); "
+        "assert hasattr(c, 'RerankPublishSeams'); "
+        "print('stage9_publish' in sys.modules, "
+        "'crunch_combine_proof' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(PROJECT_ROOT),
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False False"
