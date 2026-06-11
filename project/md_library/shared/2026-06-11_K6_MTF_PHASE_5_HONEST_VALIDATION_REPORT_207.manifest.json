@@ -5,7 +5,7 @@
     "empirical_not_run": 97,
     "empirical_validated": 110,
     "not_validated": 117,
-    "stage_a_excluded": 43,
+    "stage_a_excluded": 41,
     "tested": 207,
     "validated_but_not_bh": 20
   },
@@ -21,13 +21,13 @@
     "rng_seed": null,
     "walk_forward_n_folds": null
   },
-  "ranking_artifact_path": "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/merged_k6_mtf_ranking_v2.json",
-  "ranking_run_id": "20260610T221108Z",
+  "ranking_artifact_path": "output/crunch_runs/20260611T105546Z/publish_candidate/merged_k6_mtf_ranking_v2.json",
+  "ranking_run_id": "20260611T105546Z",
   "report_manifest_schema": "k6_mtf_phase5_report_manifest",
   "report_path": "md_library/shared/2026-06-11_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_207.md",
-  "report_sha256": "9c975f4ebc3587d8bb72028d866d7ee9494d684ba1f449a491ad6eca12a9499c",
-  "validation_run_id": "20260610T221108Z",
-  "validation_sidecar_path": "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/composite_validation_sidecar.json",
-  "validation_sidecar_sha256": "9ac6ac6349fa54994a50f894675bcb9bdc058538641ae0758b18e63e4574f499",
+  "report_sha256": "db6b077a92ef684a672193ecf0f1fc0ccfb2870be046419f2cba3c76ee958b5b",
+  "validation_run_id": "20260611T105546Z",
+  "validation_sidecar_path": "output/crunch_runs/20260611T105546Z/publish_candidate/composite_validation_sidecar.json",
+  "validation_sidecar_sha256": "628f9758374e2fdd6521530676e8c5308fe65a804d78bed577177aabb6143b16",
   "version": "v1"
 }

@@ -11,7 +11,7 @@
         "sidecar_count": 205
       },
       {
-        "prefix": "k6-mtf/20260610T221108Z/ccc-series/",
+        "prefix": "k6-mtf/20260611T105546Z/ccc-series/",
         "sidecar_count": 2
       }
     ],
@@ -21,12 +21,12 @@
     "url_host_allowlist": [
       "*.public.blob.vercel-storage.com"
     ],
-    "verification_manifest_path": "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/combined_ccc_sidecar_verification.json",
-    "verification_manifest_sha256": "dfa4edfc16b0356b519faea15a416c32f8e4be5b484760a74927d38deeee6bdd"
+    "verification_manifest_path": "output/crunch_runs/20260611T105546Z/publish_candidate/combined_ccc_sidecar_verification.json",
+    "verification_manifest_sha256": "658b2fd98fe2e2a969c6358161ab89f6205ce3ac0410fb22f169020b9e160814"
   },
   "operator_approval_marker": true,
   "per_secondary_count": 207,
-  "promoted_at_utc": "2026-06-11T02:24:26Z",
+  "promoted_at_utc": "2026-06-11T13:14:49Z",
   "promoted_by": "the operator",
   "promotion_manifest_schema_version": "k6_mtf_promotion_manifest_v1",
   "schema_version": "k6_mtf_ranking_v2",
@@ -239,13 +239,13 @@
     "VNQ",
     "TYO"
   ],
-  "source_artifact_path": "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/merged_k6_mtf_ranking_v2.json",
-  "source_generated_at_utc": "2026-06-11T01:00:00Z",
-  "source_run_id": "20260610T221108Z",
-  "source_sha256": "6067d79b1c51a4d6dfef1b0673da3a0a728c130b5c7d09526b3fde6b6722e0cf",
+  "source_artifact_path": "output/crunch_runs/20260611T105546Z/publish_candidate/merged_k6_mtf_ranking_v2.json",
+  "source_generated_at_utc": "20260611T105546Z",
+  "source_run_id": "20260611T105546Z",
+  "source_sha256": "1bc633863b1b7552c94440f86ee534a4db9c989127302a022e660eb9624f1b84",
   "validation_results": {
     "operator_acknowledgment_of_public_launch_gate": true,
     "phase_5_validation_report_path": "md_library/shared/2026-06-11_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_207.md",
-    "phase_5_validation_report_sha256": "9c975f4ebc3587d8bb72028d866d7ee9494d684ba1f449a491ad6eca12a9499c"
+    "phase_5_validation_report_sha256": "db6b077a92ef684a672193ecf0f1fc0ccfb2870be046419f2cba3c76ee958b5b"
   }
 }

@@ -2,8 +2,8 @@
 
 This is a COMPOSITE / carry-forward validation proof. It is NOT a single validation run of every row on the board.
 
-- Assembly run id: 20260610T221108Z
-- Assembled at (UTC): 2026-06-11T01:00:00Z
+- Assembly run id: 20260611T105546Z
+- Assembled at (UTC): 20260611T105546Z
 - Board rows (merged): 207
 - board_validated: 90; not_validated: 117
 - Carried rows (prior verdicts retained): 205
@@ -33,5 +33,5 @@ Methodology lock: fully verified against the prior validation sidecar.
 
 ## Source validation runs
 
-- [carried] run_id=20260604T120000Z_validation_full205 rows=205 source=prior_validation_sidecar
-- [fresh] run_id=20260610T221108Z rows=2 source=fresh_validation_run
+- [carried] run_id=20260610T221108Z rows=205 source=prior_validation_sidecar
+- [fresh] run_id=20260611T105546Z rows=2 source=fresh_validation_run

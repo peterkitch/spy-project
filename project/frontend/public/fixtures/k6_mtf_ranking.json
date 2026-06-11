@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-11T01:00:00Z",
+  "generated_at_utc": "20260611T105546Z",
   "issues": [],
   "per_secondary": [
     {
@@ -3492,19 +3492,19 @@
       "avg_capture_pct": 0.22807241580535215,
       "bh_q_value": 0.00302893569417479,
       "bonferroni_p_value": 0.00302893569417479,
-      "bootstrap_sharpe_ci_lower": 0.7881570097314827,
-      "bootstrap_sharpe_ci_upper": 3.95127130945845,
+      "bootstrap_sharpe_ci_lower": 0.8082697249570888,
+      "bootstrap_sharpe_ci_upper": 3.9371459709136976,
       "capture_count": 4129,
       "ccc_series": [],
       "ccc_series_byte_size": 502807,
       "ccc_series_first_date": "2010-01-04",
       "ccc_series_last_date": "2026-06-03",
-      "ccc_series_pathname": "k6-mtf/20260610T221108Z/ccc-series/SCHG.7dec71a62f6a3b570f1005b7776e145b2cd4ba468a3947cf17c02d60362ac7b8.json",
+      "ccc_series_pathname": "k6-mtf/20260611T105546Z/ccc-series/SCHG.c81017b90faed0ba3643b0477a34cef8f0377c129a487c5ccfb0b0bdb0948891.json",
       "ccc_series_points": 4129,
-      "ccc_series_sha256": "7dec71a62f6a3b570f1005b7776e145b2cd4ba468a3947cf17c02d60362ac7b8",
+      "ccc_series_sha256": "c81017b90faed0ba3643b0477a34cef8f0377c129a487c5ccfb0b0bdb0948891",
       "ccc_series_sidecar_schema_version": "k6_mtf_ccc_series_sidecar_v1",
       "ccc_series_source": "vercel_blob",
-      "ccc_series_url": "https://ge4hapntqv5aslfu.public.blob.vercel-storage.com/k6-mtf/20260610T221108Z/ccc-series/SCHG.7dec71a62f6a3b570f1005b7776e145b2cd4ba468a3947cf17c02d60362ac7b8.json",
+      "ccc_series_url": "https://ge4hapntqv5aslfu.public.blob.vercel-storage.com/k6-mtf/20260611T105546Z/ccc-series/SCHG.c81017b90faed0ba3643b0477a34cef8f0377c129a487c5ccfb0b0bdb0948891.json",
       "current_snapshot": {
         "1d": "NONE",
         "1mo": "NONE",
@@ -3513,9 +3513,9 @@
         "3mo": "NONE"
       },
       "empirical_not_run_reason": null,
-      "empirical_p_value": 0.0045995400459954,
+      "empirical_p_value": 0.003999600039996,
       "empirical_validation_status": "validated",
-      "history_artifact_path": "output/k6_mtf/20260610T221108Z/SCHG/k6_mtf_history.json",
+      "history_artifact_path": "output/k6_mtf/20260611T105546Z/SCHG/k6_mtf_history.json",
       "history_as_of_date": "2026-06-04",
       "issues": [],
       "k6_stack": {
@@ -3562,10 +3562,10 @@
       "stddev_pct": 1.3396833451971355,
       "total_capture_pct": 99.66764570693888,
       "trade_count": 437,
-      "validated_as_of_utc": "2026-06-11T00:39:14.181309+00:00",
-      "validation_artifact_sha256": "b35ce720904ecd4c8d347b184d5b64c3cc526b86c8e9cee0f5bc87bb5b32d8cb",
+      "validated_as_of_utc": "2026-06-11T13:14:16.613139+00:00",
+      "validation_artifact_sha256": "6d6ac5bc785ac79b4eacab434f00ce100f3885f22d574a335f9d1b084b6de9b0",
       "validation_outcome": "board_validated",
-      "validation_run_id": "20260610T221108Z",
+      "validation_run_id": "20260611T105546Z",
       "validation_strategy_id": "k6_mtf:SCHG",
       "validation_trigger_days": 382,
       "win_count": 257,
@@ -4986,19 +4986,19 @@
       "avg_capture_pct": 0.17706938675420558,
       "bh_q_value": 0.032855770699989705,
       "bonferroni_p_value": 0.06571154139997941,
-      "bootstrap_sharpe_ci_lower": -0.12689836516513353,
-      "bootstrap_sharpe_ci_upper": 2.751380925498744,
+      "bootstrap_sharpe_ci_lower": -0.13289503330846753,
+      "bootstrap_sharpe_ci_upper": 2.756097056849312,
       "capture_count": 5051,
       "ccc_series": [],
       "ccc_series_byte_size": 617702,
       "ccc_series_first_date": "2006-05-05",
       "ccc_series_last_date": "2026-06-03",
-      "ccc_series_pathname": "k6-mtf/20260610T221108Z/ccc-series/IHI.06ff5a0394a23147bc9bacc6111675f3526082d6ed1e0d5084f665b36a094400.json",
+      "ccc_series_pathname": "k6-mtf/20260611T105546Z/ccc-series/IHI.246b67aceb7d90afa0f31f68993ba11eb567fe1fcc2dd162c3cf14bb3cd2114b.json",
       "ccc_series_points": 5051,
-      "ccc_series_sha256": "06ff5a0394a23147bc9bacc6111675f3526082d6ed1e0d5084f665b36a094400",
+      "ccc_series_sha256": "246b67aceb7d90afa0f31f68993ba11eb567fe1fcc2dd162c3cf14bb3cd2114b",
       "ccc_series_sidecar_schema_version": "k6_mtf_ccc_series_sidecar_v1",
       "ccc_series_source": "vercel_blob",
-      "ccc_series_url": "https://ge4hapntqv5aslfu.public.blob.vercel-storage.com/k6-mtf/20260610T221108Z/ccc-series/IHI.06ff5a0394a23147bc9bacc6111675f3526082d6ed1e0d5084f665b36a094400.json",
+      "ccc_series_url": "https://ge4hapntqv5aslfu.public.blob.vercel-storage.com/k6-mtf/20260611T105546Z/ccc-series/IHI.246b67aceb7d90afa0f31f68993ba11eb567fe1fcc2dd162c3cf14bb3cd2114b.json",
       "current_snapshot": {
         "1d": "NONE",
         "1mo": "NONE",
@@ -5007,9 +5007,9 @@
         "3mo": "NONE"
       },
       "empirical_not_run_reason": null,
-      "empirical_p_value": 0.050994900509949,
+      "empirical_p_value": 0.04939506049395061,
       "empirical_validation_status": "validated",
-      "history_artifact_path": "output/k6_mtf/20260610T221108Z/IHI/k6_mtf_history.json",
+      "history_artifact_path": "output/k6_mtf/20260611T105546Z/IHI/k6_mtf_history.json",
       "history_as_of_date": "2026-06-04",
       "issues": [],
       "k6_stack": {
@@ -5056,10 +5056,10 @@
       "stddev_pct": 1.2932072565274777,
       "total_capture_pct": 111.1995748816411,
       "trade_count": 628,
-      "validated_as_of_utc": "2026-06-11T00:39:14.181309+00:00",
-      "validation_artifact_sha256": "b35ce720904ecd4c8d347b184d5b64c3cc526b86c8e9cee0f5bc87bb5b32d8cb",
+      "validated_as_of_utc": "2026-06-11T13:14:16.613139+00:00",
+      "validation_artifact_sha256": "6d6ac5bc785ac79b4eacab434f00ce100f3885f22d574a335f9d1b084b6de9b0",
       "validation_outcome": "board_validated",
-      "validation_run_id": "20260610T221108Z",
+      "validation_run_id": "20260611T105546Z",
       "validation_strategy_id": "k6_mtf:IHI",
       "validation_trigger_days": 470,
       "win_count": 346,
@@ -17205,7 +17205,7 @@
       "win_pct": 46.83257918552036
     }
   ],
-  "run_id": "20260610T221108Z",
+  "run_id": "20260611T105546Z",
   "schema_version": "k6_mtf_ranking_v2",
   "secondaries_ranked": [
     "SGOV",
@@ -17720,48 +17720,6 @@
       ],
       "evidence_source": "execute_summary",
       "reason": "stage_a_unavailable:not_current",
-      "secondary": "IHI"
-    },
-    {
-      "causes": [
-        {
-          "dependent_role": "member",
-          "member_protocol": "D",
-          "member_token": "CTRA[D]",
-          "ticker": "CTRA",
-          "ticker_classification": "not_current"
-        },
-        {
-          "dependent_role": "member",
-          "member_protocol": "D",
-          "member_token": "TIG.AX[D]",
-          "ticker": "TIG.AX",
-          "ticker_classification": "dead_no_history"
-        },
-        {
-          "dependent_role": "member",
-          "member_protocol": "D",
-          "member_token": "XCQ.F[D]",
-          "ticker": "XCQ.F",
-          "ticker_classification": "not_current"
-        }
-      ],
-      "evidence_source": "execute_summary",
-      "reason": "stage_a_unavailable:dead_no_history,not_current",
-      "secondary": "SCHG"
-    },
-    {
-      "causes": [
-        {
-          "dependent_role": "member",
-          "member_protocol": "D",
-          "member_token": "CTRA[D]",
-          "ticker": "CTRA",
-          "ticker_classification": "not_current"
-        }
-      ],
-      "evidence_source": "execute_summary",
-      "reason": "stage_a_unavailable:not_current",
       "secondary": "WEBL"
     },
     {
@@ -18261,7 +18219,7 @@
     }
   ],
   "validation_metadata": {
-    "artifact_sha256": "9ac6ac6349fa54994a50f894675bcb9bdc058538641ae0758b18e63e4574f499",
+    "artifact_sha256": "628f9758374e2fdd6521530676e8c5308fe65a804d78bed577177aabb6143b16",
     "bootstrap_ci_level": 0.95,
     "data_available_through": "2026-06-08",
     "multiple_comparisons_control_alpha": 0.05,
@@ -18272,10 +18230,10 @@
     "n_strategies_reported": 90,
     "n_strategies_tested": 207,
     "rng_seed": null,
-    "run_id": "20260610T221108Z",
-    "source_ranking_path": "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/merged_k6_mtf_ranking_v2.json",
-    "source_sidecar_path": "output/crunch_runs/20260610T221108Z/publish_candidate_samerun_ccc/composite_validation_sidecar.json",
-    "validated_as_of_utc": "2026-06-11T01:00:00Z",
+    "run_id": "20260611T105546Z",
+    "source_ranking_path": "output/crunch_runs/20260611T105546Z/publish_candidate/merged_k6_mtf_ranking_v2.json",
+    "source_sidecar_path": "output/crunch_runs/20260611T105546Z/publish_candidate/composite_validation_sidecar.json",
+    "validated_as_of_utc": "20260611T105546Z",
     "validation_contract_version": "v1",
     "validation_methodology_version": "v1",
     "validation_status": "valid",
@@ -18289,7 +18247,7 @@
       "validated": 110
     },
     "not_validated_count": 117,
-    "stage_a_excluded_count": 43,
+    "stage_a_excluded_count": 41,
     "validation_non_reported_count": 117
   }
 }
