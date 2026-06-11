@@ -1921,6 +1921,136 @@ def _build_manifest(
 
 
 # ---------------------------------------------------------------------------
+# Public fixtures README generation (deterministic from manifest + fixture)
+# ---------------------------------------------------------------------------
+
+
+def _lf_byte_len(path: Path) -> int:
+    """Byte length of a file with line endings normalized to LF (the canonical
+    public-fixture form)."""
+    data = Path(path).read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return len(data)
+
+
+def _project_relative_or_name(path: Any, project_root: Path) -> str:
+    """Project-relative POSIX path when ``path`` is under ``project_root``,
+    else just the file name. Never returns a local-absolute path."""
+    if path is None:
+        return ""
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(Path(project_root).resolve()).as_posix()
+    except (ValueError, OSError):
+        return p.name
+
+
+def _write_text_lf(path: Path, text: str) -> None:
+    """Write ASCII text with LF newlines (the fixtures dir is pinned eol=lf)."""
+    data = text.replace("\r\n", "\n").replace("\r", "\n").encode("ascii")
+    Path(path).write_bytes(data)
+
+
+def _render_public_readme(
+    payload: dict,
+    manifest: dict,
+    *,
+    fixture_lf_byte_len: int,
+    validation_sidecar_rel: str,
+    validation_sidecar_sha256: str,
+) -> str:
+    """Render the public fixtures README deterministically from the promotion
+    manifest + fixture just written. ASCII only. Single-prefix and mixed-prefix
+    CCC storage are rendered exactly as the manifest represents them; the
+    methodology line prints walk_forward_n_folds as-is (number or null)."""
+    meta = payload.get("validation_metadata") or {}
+    summary = payload.get("validation_summary") or {}
+    storage = manifest.get("ccc_series_storage") or {}
+    vr = manifest.get("validation_results") or {}
+    wf = meta.get("walk_forward_n_folds")
+    wf_disp = "composite/advisory (null)" if wf is None else str(wf)
+    host = ", ".join(storage.get("url_host_allowlist") or [])
+    out: list[str] = []
+    a = out.append
+    a("# React MVP Fixtures")
+    a("")
+    a("GENERATED FILE -- do not hand-edit. promote_k6_mtf_artifact.py rewrites")
+    a("this README from the committed promotion manifest + fixture at --write")
+    a("time, so it can never go stale. The React app reads")
+    a("`fixtures/k6_mtf_ranking.json` as a static asset; `output/` is gitignored.")
+    a("")
+    a("## k6_mtf_ranking.json")
+    a("")
+    a("- **Schema:** `%s`" % payload.get("schema_version"))
+    a("- **Run id:** `%s`" % manifest.get("source_run_id"))
+    a("- **Generated at:** `%s`" % payload.get("generated_at_utc"))
+    a("- **Promoted at:** `%s`" % manifest.get("promoted_at_utc"))
+    a("- **Secondaries:** %s" % manifest.get("per_secondary_count"))
+    a("- **Validation summary:** %s board-validated, %s not validated, %s Stage-A"
+      % (summary.get("board_validated_count"), summary.get("not_validated_count"),
+         summary.get("stage_a_excluded_count")))
+    a("  excluded.")
+    a("- **Public fixture SHA-256 / promotion source_sha256:**")
+    a("  `%s`" % manifest.get("source_sha256"))
+    a("- **Public fixture size:** %s LF bytes." % fixture_lf_byte_len)
+    a("")
+    a("The committed fixture is slim: ranking metrics, K6 stack fields, validation")
+    a("disclosure, and per-row Blob sidecar metadata. Inline `ccc_series` is empty")
+    a("for every row.")
+    a("")
+    a("## Full-Resolution CCC Sidecars")
+    a("")
+    a("- **Storage mode:** `%s`" % storage.get("mode"))
+    a("- **Sidecar count:** %s" % storage.get("sidecar_count"))
+    if storage.get("sidecar_prefix") is None:
+        a("- **Sidecar prefixes (mixed-prefix carry-forward; no single prefix):**")
+        for p in storage.get("sidecar_prefixes") or []:
+            a("  - %s under `%s`" % (p.get("sidecar_count"), p.get("prefix")))
+    else:
+        a("- **Sidecar prefix:** `%s`" % storage.get("sidecar_prefix"))
+    a("- **Total sidecar bytes:** %s" % storage.get("total_sidecar_bytes"))
+    a("- **Largest sidecar bytes:** %s" % storage.get("largest_sidecar_bytes"))
+    a("- **Total CCC points:** %s" % storage.get("total_sidecar_points"))
+    a("- **All sidecars GET-verified:** %s" % storage.get("all_sidecars_get_verified"))
+    a("- **Allowed Blob URL host pattern:** `%s`" % host)
+    a("- **Verification manifest:** `%s`" % storage.get("verification_manifest_path"))
+    a("- **Verification manifest SHA-256:** `%s`"
+      % storage.get("verification_manifest_sha256"))
+    a("")
+    a("The sidecars carry derived CCC fields only (`date_utc`,")
+    a("`cumulative_capture_pct`, `per_bar_capture_pct`, `trade_direction`); no raw")
+    a("OHLCV, no provider price series, no credentials.")
+    a("")
+    a("## Validation Binding")
+    a("")
+    a("- **Phase 5 report:** `%s`" % vr.get("phase_5_validation_report_path"))
+    a("- **Phase 5 report SHA-256:** `%s`"
+      % vr.get("phase_5_validation_report_sha256"))
+    a("- **Validation sidecar:** `%s`" % validation_sidecar_rel)
+    a("- **Validation sidecar SHA-256:** `%s`" % validation_sidecar_sha256)
+    a("- **Validation run id:** `%s`" % meta.get("run_id"))
+    a("- **Methodology:** %s permutations, %s bootstrap samples,"
+      % (meta.get("n_permutations"), meta.get("n_bootstrap_samples")))
+    a("  BH alpha %s, %s supplementary, bootstrap CI %s, contract %s,"
+      % (meta.get("multiple_comparisons_control_alpha"),
+         meta.get("multiple_comparisons_supplementary"),
+         meta.get("bootstrap_ci_level"), meta.get("validation_contract_version")))
+    a("  methodology %s, rng_seed %s, walk_forward_n_folds %s."
+      % (meta.get("validation_methodology_version"), meta.get("rng_seed"), wf_disp))
+    a("")
+    a("Leaderboard ordering reflects K=6 MTF ranking metrics. Phase 5 validation")
+    a("survivorship is disclosed per row; ranking position is not a validation")
+    a("claim.")
+    a("")
+    a("## Mode B Controls")
+    a("")
+    a("No raw OHLCV; no provider price charts or tables; no downloadable provider")
+    a("price series; no public raw-data API; no monetization while yfinance remains")
+    a("in the data pipeline.")
+    a("")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Safe-copy write
 # ---------------------------------------------------------------------------
 
@@ -2120,6 +2250,8 @@ def promote(
         "promoted_at_utc": promoted_at_utc,
         "wrote_destination": False,
         "wrote_manifest": False,
+        "wrote_readme": False,
+        "readme_path": None,
     }
     if inputs.write:
         _safe_copy(
@@ -2130,6 +2262,23 @@ def promote(
         summary["wrote_destination"] = True
         _write_manifest(manifest, inputs.manifest_destination_path)
         summary["wrote_manifest"] = True
+        # Generate the public fixtures README from the manifest + fixture just
+        # written, into the fixture's own directory, so it can never go stale.
+        # v2 public path only; v1/inline promotions get no generated README.
+        if is_v2 and inputs.public_mode:
+            readme_path = inputs.destination_path.parent / "README.md"
+            sidecar_rel = _project_relative_or_name(
+                inputs.validation_sidecar_path, inputs.project_root)
+            readme_text = _render_public_readme(
+                payload, manifest,
+                fixture_lf_byte_len=_lf_byte_len(inputs.destination_path),
+                validation_sidecar_rel=sidecar_rel,
+                validation_sidecar_sha256=(
+                    str(inputs.validation_sidecar_sha256 or "").strip().lower()),
+            )
+            _write_text_lf(readme_path, readme_text)
+            summary["wrote_readme"] = True
+            summary["readme_path"] = str(readme_path)
     return summary
 
 

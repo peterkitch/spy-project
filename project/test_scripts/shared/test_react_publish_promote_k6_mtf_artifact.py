@@ -2268,6 +2268,157 @@ def test_promote_v2_slim_manifest_provenance_and_storage(tmp_path):
     assert all(r.get("ccc_series_source") == "vercel_blob" for r in fx["per_secondary"])
 
 
+def test_promote_v2_write_generates_readme(tmp_path):
+    # --write on the v2 public path generates the fixtures README, into the
+    # fixture's destination directory, consistent with the manifest. Single
+    # prefix here (extract uses one run id).
+    w = _phase5_world(tmp_path)
+    slim, records = helper.extract_ccc_to_blob_sidecars(
+        w["fixture"], client=_MockBlobClient(),
+    )
+    w["fixture"] = slim
+    vpath = _write_verification_manifest(tmp_path, slim, records)
+    inputs = _v2_promote_inputs(
+        w, tmp_path, write=True, operator_approved=True,
+        ccc_sidecar_verification_manifest_path=vpath,
+    )
+    summary = promote(inputs)
+    assert summary["wrote_readme"] is True
+    readme_path = Path(summary["readme_path"])
+    assert readme_path == inputs.destination_path.parent / "README.md"
+    assert readme_path.is_file()
+    text = readme_path.read_text(encoding="utf-8")
+    # ASCII only
+    text.encode("ascii")
+    # manifest-consistent content
+    manifest = json.loads(inputs.manifest_destination_path.read_text(encoding="utf-8"))
+    storage = manifest["ccc_series_storage"]
+    assert "GENERATED FILE" in text
+    assert manifest["source_run_id"] in text
+    assert manifest["source_sha256"] in text
+    assert str(manifest["per_secondary_count"]) in text
+    assert ("Sidecar prefix:** `%s`" % storage["sidecar_prefix"]) in text
+    assert str(storage["total_sidecar_points"]) in text
+    assert manifest["validation_results"]["phase_5_validation_report_path"] in text
+    assert manifest["validation_results"]["phase_5_validation_report_sha256"] in text
+
+
+def test_promote_v2_dry_run_writes_no_readme(tmp_path):
+    w = _phase5_world(tmp_path)
+    slim, records = helper.extract_ccc_to_blob_sidecars(
+        w["fixture"], client=_MockBlobClient(),
+    )
+    w["fixture"] = slim
+    vpath = _write_verification_manifest(tmp_path, slim, records)
+    inputs = _v2_promote_inputs(
+        w, tmp_path, write=False,  # dry-run
+        ccc_sidecar_verification_manifest_path=vpath,
+    )
+    summary = promote(inputs)
+    assert summary["dry_run"] is True
+    assert summary["wrote_readme"] is False
+    assert summary["readme_path"] is None
+    assert not (inputs.destination_path.parent / "README.md").exists()
+
+
+def test_render_readme_mixed_prefix_breakdown():
+    # Unit-level render: a mixed-prefix manifest must list each prefix + count;
+    # ASCII; walk_forward_n_folds rendered as-is (null -> composite/advisory).
+    payload = {
+        "schema_version": "k6_mtf_ranking_v2",
+        "generated_at_utc": "2026-06-11T01:00:00Z",
+        "validation_summary": {
+            "board_validated_count": 90, "not_validated_count": 117,
+            "stage_a_excluded_count": 43,
+        },
+        "validation_metadata": {
+            "run_id": "RUNZ", "n_permutations": 10000, "n_bootstrap_samples": 10000,
+            "multiple_comparisons_control_alpha": 0.05,
+            "multiple_comparisons_supplementary": "bonferroni",
+            "bootstrap_ci_level": 0.95, "validation_contract_version": "v1",
+            "validation_methodology_version": "v1", "rng_seed": None,
+            "walk_forward_n_folds": None,
+        },
+    }
+    manifest = {
+        "source_run_id": "RUNZ", "promoted_at_utc": "2026-06-11T02:00:00Z",
+        "per_secondary_count": 207, "source_sha256": "a" * 64,
+        "validation_results": {
+            "phase_5_validation_report_path": "md_library/shared/r.md",
+            "phase_5_validation_report_sha256": "b" * 64,
+        },
+        "ccc_series_storage": {
+            "mode": "vercel_blob_sidecars", "sidecar_count": 207,
+            "sidecar_prefix": None,
+            "sidecar_prefixes": [
+                {"prefix": "k6-mtf/RUNA/ccc-series/", "sidecar_count": 205},
+                {"prefix": "k6-mtf/RUNZ/ccc-series/", "sidecar_count": 2},
+            ],
+            "total_sidecar_bytes": 600, "total_sidecar_points": 1005575,
+            "largest_sidecar_bytes": 300, "all_sidecars_get_verified": True,
+            "url_host_allowlist": ["*.public.blob.vercel-storage.com"],
+            "verification_manifest_path": "output/x/v.json",
+            "verification_manifest_sha256": "c" * 64,
+        },
+    }
+    text = helper._render_public_readme(
+        payload, manifest, fixture_lf_byte_len=712254,
+        validation_sidecar_rel="output/x/sidecar.json",
+        validation_sidecar_sha256="d" * 64,
+    )
+    text.encode("ascii")  # ASCII only
+    assert "mixed-prefix" in text
+    assert "205 under `k6-mtf/RUNA/ccc-series/`" in text
+    assert "2 under `k6-mtf/RUNZ/ccc-series/`" in text
+    assert "Sidecar prefix:**" not in text  # not a single-prefix render
+    assert "walk_forward_n_folds composite/advisory (null)" in text
+    assert "1005575" in text
+
+
+def test_render_readme_single_prefix_and_numeric_folds():
+    payload = {
+        "schema_version": "k6_mtf_ranking_v2", "generated_at_utc": "t",
+        "validation_summary": {
+            "board_validated_count": 6, "not_validated_count": 0,
+            "stage_a_excluded_count": 0,
+        },
+        "validation_metadata": {
+            "run_id": "RUNX", "n_permutations": 10000, "n_bootstrap_samples": 10000,
+            "multiple_comparisons_control_alpha": 0.05,
+            "multiple_comparisons_supplementary": "bonferroni",
+            "bootstrap_ci_level": 0.95, "validation_contract_version": "v1",
+            "validation_methodology_version": "v1", "rng_seed": None,
+            "walk_forward_n_folds": 99,
+        },
+    }
+    manifest = {
+        "source_run_id": "RUNX", "promoted_at_utc": "t2", "per_secondary_count": 6,
+        "source_sha256": "a" * 64,
+        "validation_results": {
+            "phase_5_validation_report_path": "md_library/shared/r.md",
+            "phase_5_validation_report_sha256": "b" * 64,
+        },
+        "ccc_series_storage": {
+            "mode": "vercel_blob_sidecars", "sidecar_count": 6,
+            "sidecar_prefix": "k6-mtf/RUNX/ccc-series/",
+            "total_sidecar_bytes": 60, "total_sidecar_points": 600,
+            "largest_sidecar_bytes": 20, "all_sidecars_get_verified": True,
+            "url_host_allowlist": ["*.public.blob.vercel-storage.com"],
+            "verification_manifest_path": "output/x/v.json",
+            "verification_manifest_sha256": "c" * 64,
+        },
+    }
+    text = helper._render_public_readme(
+        payload, manifest, fixture_lf_byte_len=100,
+        validation_sidecar_rel="output/x/sidecar.json",
+        validation_sidecar_sha256="d" * 64,
+    )
+    text.encode("ascii")
+    assert "Sidecar prefix:** `k6-mtf/RUNX/ccc-series/`" in text
+    assert "mixed-prefix" not in text
+    assert "walk_forward_n_folds 99." in text
+
+
 def _blob_row_for_storage(sec, run, sha, byte_size, points):
     """Minimal Blob-sourced slim row for _derive_ccc_storage_summary tests."""
     pn = f"k6-mtf/{run}/ccc-series/{sec}.{sha}.json"
