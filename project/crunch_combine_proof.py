@@ -182,6 +182,17 @@ def _norm_ticker(raw: Any) -> str:
     return str(raw).strip().upper()
 
 
+def _stage_a_secondary(entry: Any) -> str:
+    """Normalized secondary name carried by a stage_a_excluded_secondaries
+    entry. Production entries are dicts keyed ``secondary`` (with causes /
+    evidence); some tests use a bare string. Bare-string normalization of a
+    dict would stringify the whole mapping (never matching a ticker), so the
+    two forms are handled explicitly here."""
+    if isinstance(entry, Mapping):
+        return _norm_ticker(entry.get("secondary"))
+    return _norm_ticker(entry)
+
+
 def _member_tokens(token: Any) -> set:
     out: set = set()
     s = str(token).strip()
@@ -650,9 +661,19 @@ def combine_and_assemble(
     for r in merged_rows:
         st = r.get("empirical_validation_status")
         emp_counts[st] = emp_counts.get(st, 0) + 1
+    # A ranked per_secondary row and a stage_a_excluded_secondaries entry for the
+    # SAME secondary are mutually exclusive: a secondary that is now a ranked row
+    # (whether freshly rebuilt OR carried from the prior board) must NOT remain in
+    # the carried Stage-A disclosure. Drop any disclosure entry whose secondary is
+    # in the merged ranked set; non-ranked entries pass through unchanged and keep
+    # their order. This restores the pre-bug intent (compare against the merged
+    # ranked secondaries) -- the bug was only that _norm_ticker stringified dict
+    # entries; the dict/string-aware extractor fixes that. It also self-heals an
+    # already-published board that carried this blemish forward.
+    merged_ranked = set(merged_secs)
     merged_stage_a = [s for s in (prior_fixture.get("stage_a_excluded_secondaries")
                                   or [])
-                      if _norm_ticker(s) not in set(merged_secs)]
+                      if _stage_a_secondary(s) not in merged_ranked]
 
     sidecar_rel = (rel_out / "composite_validation_sidecar.json").as_posix()
     fixture_rel = (rel_out / "merged_k6_mtf_ranking_v2.json").as_posix()

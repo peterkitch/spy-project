@@ -428,6 +428,103 @@ def test_stage_a_disclosure_excluded_symbol_passes(tmp_path):
     assert res["merged_row_count"] == 7  # passes; disclosure exempt
 
 
+def _read_merged(w):
+    return json.loads(
+        (w["output_dir"] / "merged_k6_mtf_ranking_v2.json").read_text("utf-8"))
+
+
+def _stage_a_sec(entry):
+    return entry.get("secondary") if isinstance(entry, dict) else entry
+
+
+def test_stage_a_fresh_dict_superseded_dropped(tmp_path):
+    # GGG is a fresh (net-new) secondary AND a prior Stage-A DICT-form exclusion.
+    # After merge it is a ranked row, so it must be removed from the disclosure;
+    # a non-fresh entry (ZZZ) is kept; the count decrements.
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    prior["stage_a_excluded_secondaries"] = [
+        {"secondary": "GGG", "reason": "stage_a_unavailable:dead_no_history",
+         "causes": [{"ticker": "PCH", "ticker_classification": "dead_no_history"}]},
+        {"secondary": "ZZZ", "reason": "stage_a_unavailable:dead_no_history",
+         "causes": [{"ticker": "QQQ9", "ticker_classification": "dead_no_history"}]},
+    ]
+    prior["validation_summary"]["stage_a_excluded_count"] = 2
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    res = _call(w)
+    merged = _read_merged(w)
+    secs = [_stage_a_sec(e) for e in merged["stage_a_excluded_secondaries"]]
+    assert "GGG" not in secs                                  # freshly ranked -> dropped
+    assert "ZZZ" in secs                                      # non-fresh -> kept
+    assert merged["validation_summary"]["stage_a_excluded_count"] == 1
+    assert res["stage_a_excluded_count"] == 1
+    assert "GGG" in [r["secondary"] for r in merged["per_secondary"]]
+
+
+def test_stage_a_fresh_string_superseded_dropped(tmp_path):
+    # Bare-STRING disclosure form: a fresh secondary string is also dropped.
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    prior["stage_a_excluded_secondaries"] = ["GGG", "ZZZ"]
+    prior["validation_summary"]["stage_a_excluded_count"] = 2
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    res = _call(w)
+    merged = _read_merged(w)
+    secs = merged["stage_a_excluded_secondaries"]
+    assert "GGG" not in secs and "ZZZ" in secs
+    assert res["stage_a_excluded_count"] == 1
+    assert "GGG" in [r["secondary"] for r in merged["per_secondary"]]
+
+
+def test_stage_a_non_fresh_entries_pass_through_in_order(tmp_path):
+    # No fresh secondary in the disclosure -> every entry passes through
+    # untouched, in original order, with the count unchanged. Mixed dict+string.
+    w = _world(tmp_path)
+    disclosure = [
+        {"secondary": "ZZZ", "reason": "r1", "causes": []},
+        "YYY",
+        {"secondary": "WWW", "reason": "r3", "causes": []},
+    ]
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    prior["stage_a_excluded_secondaries"] = disclosure
+    prior["validation_summary"]["stage_a_excluded_count"] = 3
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    res = _call(w)
+    merged = _read_merged(w)
+    assert merged["stage_a_excluded_secondaries"] == disclosure   # unchanged + order
+    assert res["stage_a_excluded_count"] == 3
+
+
+def test_stage_a_carried_ranked_secondary_dropped(tmp_path):
+    # Ranked-vs-StageA mutual exclusivity for a CARRIED row (no fresh involvement):
+    # BBB is a carried ranked board row AND erroneously in the prior disclosure ->
+    # it must be dropped from the merged disclosure (self-heals a published board
+    # that carried the blemish forward). A non-ranked entry (ZZZ) is kept.
+    w = _world(tmp_path)
+    prior = json.loads(w["prior_fixture_path"].read_text("utf-8"))
+    assert "BBB" in [r["secondary"] for r in prior["per_secondary"]]   # carried row
+    assert "BBB" not in [r["secondary"] for r in w["fresh_rows"]]      # not fresh
+    prior["stage_a_excluded_secondaries"] = [
+        {"secondary": "BBB", "reason": "stage_a_unavailable:dead_no_history",
+         "causes": [{"ticker": "PCH", "ticker_classification": "dead_no_history"}]},
+        {"secondary": "ZZZ", "reason": "stage_a_unavailable:dead_no_history",
+         "causes": [{"ticker": "QQQ9", "ticker_classification": "dead_no_history"}]},
+    ]
+    prior["validation_summary"]["stage_a_excluded_count"] = 2
+    _write(w["prior_fixture_path"], prior)
+    _refresh_prior_promo_sha(w)
+    res = _call(w)
+    merged = _read_merged(w)
+    secs = [_stage_a_sec(e) for e in merged["stage_a_excluded_secondaries"]]
+    assert "BBB" not in secs                                  # carried ranked -> dropped
+    assert "ZZZ" in secs                                      # non-ranked -> kept
+    assert res["stage_a_excluded_count"] == 1
+    assert "BBB" in [r["secondary"] for r in merged["per_secondary"]]
+
+
 def test_mixed_ccc_prefixes_pass(tmp_path):
     # Carried rows keep the older immutable Blob prefix; fresh use a new prefix;
     # combined manifest ranking_run_id == merged fixture run_id; promote passes.
