@@ -223,18 +223,19 @@ def parse_recook_outcome(envelope: Any, board: Sequence[str], *,
       1. CLEAN full board: status == 'ok' AND exit_code == 0 AND no failures AND
          no exclusions AND halted_at is None (k6_recook.py:2741-2744).
       2. ALLOWABLE partial: status == 'partial' AND exit_code == 3 AND failures
-         empty AND halted_at is None AND partial_reasons is limited to the
-         allowable Stage-A reason {'stage_a_allowed_exclusions'}
+         empty AND halted_at is None AND at least one exclusion
          (k6_recook.py:2492,:2731-2744). The cumulative exclusions
          (envelope['exclusions'] == driver.exclusions, k6_recook.py:1766) are NOT
          a halt authority here -- they are the QUARANTINE LIST. They may include
-         Stage-Aprime caret_source_unavailable_or_stale (:1396) and other allowable
-         per-secondary drops that the engine folded under this partial; those
-         quarantine, they do not halt.
+         Stage-Aprime caret_source_unavailable_or_stale (:1396), Stage-B
+         member-library, and other allowable per-secondary drops the engine
+         folded under this partial; those quarantine, they do not halt.
+         partial_reasons does NOT gate acceptance (it is open-ended and
+         descriptive); it is recorded verbatim downstream for disclosure.
 
     Everything else HALTS (no publish): non-empty failures, status='failed'/
-    exit_code=1, halted_at set, partial_reasons beyond the allowable Stage-A
-    reason, or any unknown status/exit combination. Unknown means halt.
+    exit_code=1, halted_at set, partial/3 with zero exclusions, or any unknown
+    status/exit combination. Unknown means halt.
 
     Survivors come from the engine's kept set when ``kept_secondaries`` is
     supplied (the written ranking rows), cross-checked against board-minus-
@@ -270,10 +271,22 @@ def parse_recook_outcome(envelope: Any, board: Sequence[str], *,
     clean_full_board = (
         status == "ok" and exit_code == 0 and not failures
         and not exclusions and halted_at is None)
+    # Acceptance gates the BLOCKING INVARIANT, not the reason words. The
+    # complete-vocabulary census (k6_recook source) proved partial_reasons is
+    # descriptive and open-ended -- emitters at k6_recook.py:2612 (Stage-A
+    # allowed), :2755-2757 (Stage-B member-library), :2857 (excluded-secondaries
+    # finalization), :2859 (failures-present) -- and that every DANGEROUS outcome
+    # routes to status='failed'/exit_code=1/halted_at set OR a non-empty failures
+    # list, while every benign per-secondary drop yields partial/3/halted_at
+    # None/failures empty through the exclusions (quarantine) list. So accept on
+    # the triple + at least one exclusion; partial/3 with zero exclusions stays
+    # unknown-shape and halts. Do NOT reintroduce a partial_reasons whitelist --
+    # a new engine stage can mint a new reason string, and three pilots halted on
+    # exactly that. partial_reasons is still recorded verbatim downstream for
+    # disclosure; it just no longer gates.
     allowable_partial = (
         status == "partial" and exit_code == 3 and not failures
-        and halted_at is None and bool(exclusions)
-        and set(partial_reasons) <= {"stage_a_allowed_exclusions"})
+        and halted_at is None and bool(exclusions))
     ok = clean_full_board or allowable_partial
 
     halt_reason = None
@@ -306,6 +319,11 @@ def parse_recook_outcome(envelope: Any, board: Sequence[str], *,
         "halt_reason": halt_reason,
         "status": status,
         "exit_code": exit_code,
+        # Recorded verbatim for disclosure (the engine's run-level partial
+        # reasons); no longer an acceptance gate. The driver writes this into
+        # the status pointer so an operator sees WHY the run was partial even
+        # though the reason words do not control publishability.
+        "partial_reasons": list(partial_reasons),
         "recook_reported_total_seconds": (
             (env.get("timings") or {}).get("total_seconds")),
         # k6_recook's batch envelope exposes no clean per-secondary recook
@@ -640,6 +658,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 target_as_of=target, target_source=target_source,
                 fresh_secondaries_count=0,
                 quarantined=outcome["quarantined"],
+                partial_reasons=outcome["partial_reasons"],
                 recook_seconds=recook_seconds,
                 recook_reported_total_seconds=outcome["recook_reported_total_seconds"],
                 per_secondary_recook_timing_available=outcome[
@@ -664,7 +683,9 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 fresh_secondaries_count=len(survivors),
                 quarantine_fraction=qfraction,
                 max_quarantine_fraction=args.max_quarantine_fraction,
-                quarantined=quarantined, recook_seconds=recook_seconds,
+                quarantined=quarantined,
+                partial_reasons=outcome["partial_reasons"],
+                recook_seconds=recook_seconds,
                 recook_reported_total_seconds=outcome[
                     "recook_reported_total_seconds"])
 
@@ -674,7 +695,9 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 4, status="halted_no_survivors", halted_at="recook",
                 target_as_of=target, target_source=target_source,
                 fresh_secondaries_count=0,
-                quarantined=quarantined, recook_seconds=recook_seconds)
+                quarantined=quarantined,
+                partial_reasons=outcome["partial_reasons"],
+                recook_seconds=recook_seconds)
         emit("survivors: %d | quarantined: %d" % (len(survivors), len(quarantined)))
 
         # 6. PRIOR INPUTS bound to the CURRENT live board (never tonight's run).
@@ -725,6 +748,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
             fresh_secondaries_count=len(survivors),
             fresh_secondaries=survivors,
             quarantined=quarantined,
+            partial_reasons=outcome["partial_reasons"],
             refusal_path=(str(run_dir / "publish_refusal.json")
                           if not ok_status else None),
             artifacts={

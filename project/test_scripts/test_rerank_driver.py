@@ -87,6 +87,15 @@ def _aprime_exclusion(secondary):
             "reason": "caret_source_unavailable_or_stale"}
 
 
+def _stage_b_exclusion(secondary, member="ZEG.DE"):
+    # Mirrors a k6_recook Stage-B member-library exclusion record
+    # (k6_recook.py:2735-2753): stage 'B', no ticker_classification. A per-
+    # secondary quarantine the engine folds under the allowable partial.
+    return {"secondary": secondary, "stage": "B",
+            "reason": "member_library_unavailable",
+            "ticker": member, "dependent_role": "member"}
+
+
 def _ok_envelope(exclusions=(), failures=(), status="ok", exit_code=0,
                  board=DEFAULT_BOARD, kept=None, halted_at=None):
     ex = list(exclusions)
@@ -341,15 +350,21 @@ def test_partial_with_failures_halts(tmp_path):
     assert rc != 0 and publish.calls == 0
 
 
-def test_partial_unexpected_reason_halts(tmp_path):
-    # partial_reasons beyond the allowable Stage-A reason -> halt (unknown=halt).
+def test_partial_novel_reason_publishes_whitelist_gone(tmp_path):
+    # WHITELIST REMOVED: a novel/unknown partial reason under the clean triple
+    # (partial/3, failures empty, halted_at None, >=1 exclusion) now PUBLISHES.
+    # Acceptance gates the blocking invariant, not the open-ended reason words.
     repo = _make_repo(tmp_path)
     env = _partial_envelope(
         [_stage_a_exclusion("BBB")],
-        partial_reasons=["stage_a_allowed_exclusions", "mystery_reason"])
+        partial_reasons=["some_future_stage_z_exclusions", "mystery_reason"])
     rc, out, err, status, recook, publish, locks = _run(
         repo, _permissive(), recook=_Recook(env))
-    assert rc != 0 and publish.calls == 0
+    assert rc == 0 and publish.calls == 1
+    assert [q["secondary"] for q in status["quarantined"]] == ["BBB"]
+    # Recorded verbatim for disclosure even though it did not gate.
+    assert status["partial_reasons"] == [
+        "some_future_stage_z_exclusions", "mystery_reason"]
 
 
 def test_partial_halted_at_set_halts(tmp_path):
@@ -403,6 +418,91 @@ def test_engine_kept_mismatch_halts_unknown_shape(tmp_path):
         repo, _permissive(), recook=_Recook(env))
     assert rc != 0 and publish.calls == 0
     assert status["status"] == "halted_recook"
+
+
+# ---------------------------------------------------------------------------
+# Blocking-triple acceptance (partial-reason whitelist removed)
+# ---------------------------------------------------------------------------
+
+
+def test_pilot3_exact_shape_publishes_one_quarantined(tmp_path):
+    # THE pilot-3 shape that tripped the old whitelist: partial/3, failures
+    # empty, halted_at None, ONE Stage-B exclusion, partial_reasons=
+    # ['stage_b_member_library_exclusions','excluded_secondaries_present'].
+    # Under the blocking-triple rule it PUBLISHES with the one stack quarantined.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope(
+        [_stage_b_exclusion("BBB")],
+        partial_reasons=["stage_b_member_library_exclusions",
+                         "excluded_secondaries_present"])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc == 0 and publish.calls == 1
+    assert publish.kwargs["survivors"] == ["AAA", "CCC"]
+    qsecs = [q["secondary"] for q in status["quarantined"]]
+    assert qsecs == ["BBB"]
+    assert status["quarantined"][0]["causes"][0]["stage"] == "B"
+    assert (status["quarantined"][0]["causes"][0]["reason"]
+            == "member_library_unavailable")
+
+
+def test_partial_stage_a_allowed_reason_still_publishes(tmp_path):
+    # No regression: the original allowable Stage-A reason still publishes.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope(
+        [_stage_a_exclusion("BBB", "not_current")],
+        partial_reasons=["stage_a_allowed_exclusions"])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc == 0 and publish.calls == 1
+    assert publish.kwargs["survivors"] == ["AAA", "CCC"]
+
+
+def test_partial_excluded_secondaries_present_alone_publishes(tmp_path):
+    # Pilot-2 Aprime/E-only shape: partial_reasons=['excluded_secondaries_present']
+    # (no stage_a_allowed_exclusions) -> publishes.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope(
+        [_aprime_exclusion("BBB")],
+        partial_reasons=["excluded_secondaries_present"])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc == 0 and publish.calls == 1
+    assert publish.kwargs["survivors"] == ["AAA", "CCC"]
+
+
+def test_partial_empty_reasons_with_exclusion_publishes(tmp_path):
+    # Even an EMPTY partial_reasons list publishes when the triple holds and at
+    # least one exclusion is present -- reasons are disclosure, not a gate.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_b_exclusion("CCC")], partial_reasons=[])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc == 0 and publish.calls == 1
+    assert publish.kwargs["survivors"] == ["AAA", "BBB"]
+
+
+def test_partial_zero_exclusions_halts_unknown_shape(tmp_path):
+    # partial/3 with ZERO exclusions is an unknown shape -> halt (the triple
+    # requires bool(exclusions); a partial with nothing quarantined is wrong).
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([], partial_reasons=["stage_a_allowed_exclusions"])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+    assert status["status"] == "halted_recook"
+
+
+def test_status_pointer_records_partial_reasons_verbatim(tmp_path):
+    # partial_reasons is recorded verbatim in the status pointer for disclosure,
+    # preserving order and content even when it does not gate.
+    repo = _make_repo(tmp_path)
+    reasons = ["stage_b_member_library_exclusions", "excluded_secondaries_present"]
+    env = _partial_envelope([_stage_b_exclusion("BBB")], partial_reasons=reasons)
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc == 0
+    assert status["partial_reasons"] == reasons  # verbatim, order preserved
 
 
 # ---------------------------------------------------------------------------
