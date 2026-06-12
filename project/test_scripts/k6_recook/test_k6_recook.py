@@ -30,6 +30,7 @@ import os
 import pickle
 import sys
 import types
+from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -1526,7 +1527,7 @@ def _run_chain(tmp_path, monkeypatch, included, *, a_by_ticker=None,
     cexcl = set(caret_exclude or set())
 
     def fake_caret_bridge(caret_secs, *, cache_dir, price_cache_dir,
-                          target_as_of, alias_enabled):
+                          target_as_of, alias_enabled, currentness_cutoff=None):
         calls["caret"].append(list(caret_secs))
         kept = [s for s in caret_secs if s not in cexcl]
         excl = [
@@ -2274,3 +2275,254 @@ def test_dry_run_caret_bridge_flag_fields(tmp_path):
     assert j2["status"] == "dry_run" and rc2 == 0
     assert j2["stageAprime"]["caret_alias_bridge_enabled"] is True
     assert j2["stageA"]["ran"] is False and j2["lock"]["acquired"] is False
+
+
+# ---------------------------------------------------------------------------
+# Amendment: bounded T-1 currentness acceptance (--currency-grace-sessions)
+#
+# Policy basis (code + tests): the provider serves NaN/placeholder latest rows
+# (no usable Close) for thin foreign EOD bars whose latest close stays
+# undisseminated for many hours and is unrecoverable by any client call shape.
+# v1 keeps fetching the newest bar but accepts a bounded one-trading-session
+# usable-cache lag as CURRENT after a refresh attempt. NOT trafficflow
+# ok_tminus1 semantics; the justification is the provider-placeholder evidence.
+# ---------------------------------------------------------------------------
+
+
+# --- Session-arithmetic helper ---
+
+
+def test_currentness_cutoff_grace_zero_is_target():
+    # N=0 reproduces strict same-day-only behavior.
+    assert drv.acceptable_currentness_cutoff("2026-06-03", 0) == "2026-06-03"
+
+
+def test_currentness_cutoff_one_session_midweek():
+    # A midweek target (Tue-Fri) steps back exactly one calendar weekday.
+    wed = date(2026, 6, 1)
+    while wed.weekday() != 2:  # roll forward to a real Wednesday
+        wed += timedelta(days=1)
+    cut = date.fromisoformat(
+        drv.acceptable_currentness_cutoff(wed.isoformat(), 1))
+    assert cut.weekday() == 1 and (wed - cut).days == 1  # prior Tuesday
+
+
+def test_currentness_cutoff_monday_weekend_boundary():
+    # Target Monday, grace 1 -> the previous Friday counts as one session.
+    monday = date(2026, 6, 1)
+    while monday.weekday() != 0:  # roll forward to a real Monday
+        monday += timedelta(days=1)
+    cut = drv.acceptable_currentness_cutoff(monday.isoformat(), 1)
+    cutd = date.fromisoformat(cut)
+    assert cutd.weekday() == 4  # Friday
+    assert (monday - cutd).days == 3  # Mon -> prior Fri skips Sat+Sun
+    # grace 2 from the same Monday lands on the prior Thursday.
+    cut2 = date.fromisoformat(
+        drv.acceptable_currentness_cutoff(monday.isoformat(), 2))
+    assert cut2.weekday() == 3 and (monday - cut2).days == 4
+
+
+def test_currentness_cutoff_negative_raises():
+    with pytest.raises(ValueError):
+        drv.acceptable_currentness_cutoff("2026-06-03", -1)
+
+
+# --- Stage A post-refresh acceptance ---
+
+
+_GT = "2026-06-03"  # grace-test target
+
+
+def _grace_stage_a(*, new_end, grace, target=_GT, issue_codes=(),
+                   current_after=False):
+    """Run stage_a_process_ticker on a stale cache that refreshes to
+    ``new_end``, applying the bounded cutoff for ``grace`` sessions."""
+    cutoff = drv.acceptable_currentness_cutoff(target, grace)
+    return drv.stage_a_process_ticker(
+        "FORGN.DE", cache_dir=None, status_dir=None, write=True,
+        target_as_of=target,
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(end="2026-05-20"),
+        refresh_fn=lambda ticker, **k: _FakeRefreshResult(
+            issue_codes=issue_codes, new_end=new_end,
+            current_after=current_after, refreshed=True),
+        currentness_cutoff=cutoff,
+    )
+
+
+def test_grace_usable_end_equal_target_is_current():
+    res = _grace_stage_a(new_end=_GT, grace=1, current_after=True)
+    assert res["classification"] == "refreshed"
+
+
+def test_grace_usable_end_target_minus_one_current_by_default():
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    res = _grace_stage_a(new_end=t1, grace=1, current_after=False)
+    assert res["classification"] == "refreshed"
+
+
+def test_grace_zero_usable_end_target_minus_one_not_current():
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    res = _grace_stage_a(new_end=t1, grace=0, current_after=False)
+    assert res["classification"] == "failed"
+
+
+def test_grace_usable_end_target_minus_two_not_current_default():
+    t2 = drv.acceptable_currentness_cutoff(_GT, 2)
+    res = _grace_stage_a(new_end=t2, grace=1, current_after=False)
+    assert res["classification"] == "failed"
+
+
+def test_offline_skip_gate_remains_ungraced_target_minus_one():
+    # A cache at target-1 is NOT fresh to the strict gate: the refresher is
+    # still called. Grace applies only to the post-refresh verdict.
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    calls = {"n": 0}
+
+    def refresh_fn(ticker, **k):
+        calls["n"] += 1
+        return _FakeRefreshResult(new_end=t1, current_after=False,
+                                  refreshed=True)
+
+    res = drv.stage_a_process_ticker(
+        "FORGN.DE", cache_dir=None, status_dir=None, write=True,
+        target_as_of=_GT,
+        # ahead/equal both False -> a target-1 cache is not strictly fresh.
+        evaluate_fn=lambda *a, **k: _FakeCutoffState(
+            ahead=False, equal=False, end=t1),
+        refresh_fn=refresh_fn,
+        currentness_cutoff=t1,
+    )
+    assert res["refresh_called"] is True and calls["n"] == 1
+    assert res["classification"] == "refreshed"  # accepted only post-refresh
+
+
+def test_grace_placeholder_shape_preserves_honesty_dates():
+    # Provider placeholder: refresh attempt lands the usable end at target-1
+    # with the strict current_after flag False. Grace accepts currency but the
+    # recorded data-end date and strict flag stay actual (no backfill/relabel).
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    res = _grace_stage_a(new_end=t1, grace=1, current_after=False)
+    assert res["classification"] == "refreshed"
+    assert res["new_cache_date_range_end"] == t1  # actual usable end, not _GT
+    assert res["current_after"] is False           # strict flag untouched
+
+
+# --- Classifier ---
+
+
+def test_classify_not_current_respects_grace_cutoff():
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    t2 = drv.acceptable_currentness_cutoff(_GT, 2)
+    # Under grace 0 a target-1 usable end is not_current (allowable).
+    info0 = drv._classify_stage_a_outcome(
+        {"classification": "failed", "issue_codes": [],
+         "current_after": False, "new_cache_date_range_end": t1},
+        target_as_of=_GT, currentness_cutoff=_GT)
+    assert info0["kind"] == "not_current" and info0["allowable"] is True
+    # Under grace 1 a target-2 usable end is still not_current (allowable).
+    info1 = drv._classify_stage_a_outcome(
+        {"classification": "failed", "issue_codes": [],
+         "current_after": False, "new_cache_date_range_end": t2},
+        target_as_of=_GT, currentness_cutoff=t1)
+    assert info1["kind"] == "not_current" and info1["allowable"] is True
+
+
+def test_classify_grace_does_not_mask_blocking():
+    # A generous cutoff must never turn a network/systemic failure current.
+    lenient = drv.acceptable_currentness_cutoff(_GT, 5)
+    dff = drv._classify_stage_a_outcome(
+        {"classification": "failed", "issue_codes": ["data_fetch_failed"],
+         "current_after": False, "new_cache_date_range_end": None},
+        target_as_of=_GT, currentness_cutoff=lenient)
+    assert dff["kind"] == "blocking" and dff["allowable"] is False
+    rex = drv._classify_stage_a_outcome(
+        {"classification": "failed", "issue_codes": [],
+         "retry_exhausted": True, "new_cache_date_range_end": None},
+        target_as_of=_GT, currentness_cutoff=lenient)
+    assert rex["kind"] == "blocking" and rex["allowable"] is False
+
+
+# --- Aprime caret bridge ---
+
+
+def _grace_caret(sec, *, source_date, currentness_cutoff, target=_GT):
+    written = {}
+
+    def read_source(name, cache_dir):
+        return source_date, _FakeSeries(source_date), "ok"
+
+    def write_csv(secondary, series, price_cache_dir):
+        written[secondary] = series.last
+        return f"price_cache/daily/{secondary}.csv"
+
+    def verify(secondary, price_cache_dir, cache_dir):
+        return True, written.get(secondary), "csv"
+
+    return drv.stage_aprime_caret_bridge(
+        [sec], cache_dir="c", price_cache_dir="p", target_as_of=target,
+        alias_enabled=False, read_source_fn=read_source,
+        write_csv_fn=write_csv, verify_fn=verify,
+        currentness_cutoff=currentness_cutoff)
+
+
+def test_caret_bridge_target_minus_one_passes_by_default():
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    kept, excl, _summ = _grace_caret("^GSPC", source_date=t1,
+                                     currentness_cutoff=t1)
+    assert kept == ["^GSPC"] and excl == []
+
+
+def test_caret_bridge_target_minus_one_fails_with_grace_zero():
+    t1 = drv.acceptable_currentness_cutoff(_GT, 1)
+    # grace 0 -> cutoff is the strict target; a target-1 source is stale.
+    kept, excl, _summ = _grace_caret("^GSPC", source_date=t1,
+                                     currentness_cutoff=_GT)
+    assert kept == [] and len(excl) == 1
+    assert excl[0]["reason"] == "caret_source_unavailable_or_stale"
+    # Honesty: the record discloses the actual source date and target.
+    assert excl[0]["raw_source_last_date"] == t1
+    assert excl[0]["target_as_of"] == _GT
+
+
+# --- CLI / envelope plumbing ---
+
+
+def test_negative_currency_grace_rejected(tmp_path):
+    rc, out = _run_main([
+        "--stackbuilder-root", str(tmp_path / "sb"),
+        "--currency-grace-sessions=-1",
+    ])
+    j = json.loads(out)
+    assert rc == 2 and j["status"] == "refused"
+    assert j["halted_at"] == "preflight"
+    assert any("currency-grace-sessions" in w for w in j["warnings"])
+
+
+def test_envelope_records_currency_grace_sessions(tmp_path):
+    root = tmp_path / "stackbuilder"
+    _make_secondary(root, "FOO")
+    # Default grace 1: top-level + stageA planning disclose the policy.
+    rc, out = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+    ])
+    j = json.loads(out)
+    assert rc == 0 and j["status"] == "dry_run"
+    assert j["currency_grace_sessions"] == 1
+    assert j["acceptable_currentness_cutoff"] == \
+        drv.acceptable_currentness_cutoff(j["target_as_of"], 1)
+    assert j["stageA"]["currency_grace_sessions"] == 1
+    assert j["stageA"]["acceptable_currentness_cutoff"] == \
+        j["acceptable_currentness_cutoff"]
+    # Strict mode: grace 0 -> cutoff equals the target exactly.
+    rc0, out0 = _run_main([
+        "--stackbuilder-root", str(root),
+        "--output-root", str(tmp_path / "out"),
+        "--stable-dir", str(tmp_path / "stable"),
+        "--currency-grace-sessions", "0",
+    ])
+    j0 = json.loads(out0)
+    assert rc0 == 0 and j0["currency_grace_sessions"] == 0
+    assert j0["acceptable_currentness_cutoff"] == j0["target_as_of"]
+    assert j0["stageA"]["acceptable_currentness_cutoff"] == j0["target_as_of"]

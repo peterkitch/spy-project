@@ -40,6 +40,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -184,6 +185,38 @@ def parse_target_date(value: str) -> str:
     if not (1 <= im <= 12 and 1 <= idd <= 31):
         raise ValueError(f"target-as-of out of range: {value!r}")
     return f"{iy:04d}-{im:02d}-{idd:02d}"
+
+
+def acceptable_currentness_cutoff(target_as_of: str, grace_sessions: int) -> str:
+    """Earliest usable cache date-range-end that counts as CURRENT for
+    ``target_as_of`` under a bounded ``grace_sessions`` allowance.
+
+    The cutoff is ``target_as_of`` minus ``grace_sessions`` US trading
+    sessions, where a trading session is any weekday (Mon-Fri); weekends are
+    stepped over. A Monday target with grace 1 therefore yields the previous
+    Friday; grace 0 returns ``target_as_of`` unchanged (strict behavior).
+
+    This is a deliberately small Mon-Fri stepper. It does NOT model exchange
+    holidays and intentionally adds no calendar subsystem or dependency -- a
+    holiday merely makes the real cutoff one slightly-too-strict session, which
+    is the safe direction (it never accepts something older than intended).
+
+    Justification for any tolerance is the documented provider-placeholder
+    evidence (thin foreign EOD bars served with NaN/placeholder closes that
+    remain undisseminated for many hours), NOT OnePass/Impact persistence
+    semantics.
+    """
+    n = int(grace_sessions)
+    if n < 0:
+        raise ValueError(f"grace_sessions must be >= 0: {grace_sessions!r}")
+    iy, im, idd = (int(part) for part in str(target_as_of).split("-"))
+    cur = date(iy, im, idd)
+    stepped = 0
+    while stepped < n:
+        cur -= timedelta(days=1)
+        if cur.weekday() < 5:  # Mon-Fri counts as a trading session
+            stepped += 1
+    return cur.isoformat()
 
 
 def parse_lock_ttl(value: str) -> int:
@@ -679,6 +712,7 @@ def stage_a_process_ticker(
     refresh_fn: Callable[..., Any],
     fetcher: Optional["RetryingFetcher"] = None,
     provider_name: Optional[str] = None,
+    currentness_cutoff: Optional[str] = None,
 ) -> dict:
     """Process one ticker for Stage A. Offline freshness gate first; the
     refresher is called ONLY when the ticker is not already fresh.
@@ -687,6 +721,12 @@ def stage_a_process_ticker(
     ``refresh_fn`` is the cache refresher. Both are injected so the unit
     tests can substitute fakes and assert the refresher is never called on
     a fresh ticker.
+
+    ``currentness_cutoff`` is the bounded acceptable usable-end date applied
+    ONLY to the post-refresh currentness verdict (a usable new cache end
+    >= cutoff is accepted as current). It defaults to ``target_as_of`` (strict).
+    The offline skip gate above is intentionally NOT graced: a cache that is
+    not strictly fresh to ``target_as_of`` still calls the refresher.
 
     When ``fetcher`` is supplied it is threaded into the refresher via
     ``data_fetcher=`` (with ``provider_name``) and its audit metadata is
@@ -739,19 +779,27 @@ def stage_a_process_ticker(
         return result
 
     new_end = getattr(rr, "new_cache_date_range_end", None)
+    # ``current_after`` is the refresher's STRICT currency flag (new_end >=
+    # target_as_of). It is recorded for honesty/telemetry but the verdict below
+    # uses the bounded cutoff instead: at grace 0 the cutoff equals target and
+    # ``fresh_enough`` is identical to ``current_after``, so strict behavior is
+    # preserved; at grace >= 1 a usable end within N sessions is accepted.
     current_after = bool(getattr(rr, "current_after", False))
-    fresh_enough = bool(new_end) and str(new_end) >= str(target_as_of)
+    cutoff = currentness_cutoff or target_as_of
+    fresh_enough = bool(new_end) and str(new_end) >= str(cutoff)
     if write:
-        ok = (not issue_codes) and current_after and fresh_enough
+        ok = (not issue_codes) and fresh_enough
     else:
         # write=False path still returns dry_run_only issue code; treat a
         # would-be-current result as success-equivalent for planning.
-        ok = current_after and fresh_enough
+        ok = fresh_enough
     result["classification"] = "refreshed" if ok else "failed"
     return result
 
 
-def _classify_stage_a_outcome(result: Any, *, target_as_of: str) -> dict:
+def _classify_stage_a_outcome(
+    result: Any, *, target_as_of: str, currentness_cutoff: Optional[str] = None
+) -> dict:
     """Classify one Stage A worker result for the unavailable-data policy.
 
     Returns a dict with:
@@ -768,8 +816,12 @@ def _classify_stage_a_outcome(result: Any, *, target_as_of: str) -> dict:
     blocking issue code, an unknown classification, or a missing/invalid
     payload) wins and is classified ``blocking`` -- so it halts Stage A even
     under --allow-stage-a-exclusions. data_fetch_failed and retry_exhausted
-    are never allowable. No freshness tolerance and no terminal/delisted
-    semantics are introduced.
+    are never allowable. No terminal/delisted semantics are introduced.
+
+    ``currentness_cutoff`` is the bounded acceptable usable-end date (defaults
+    to ``target_as_of``, i.e. strict). It is applied ONLY to the not_current
+    determination on an otherwise-clean ``failed`` result; it never converts a
+    blocking/network/systemic signal into current.
     """
     if not isinstance(result, dict):
         return {
@@ -825,12 +877,12 @@ def _classify_stage_a_outcome(result: Any, *, target_as_of: str) -> dict:
         }
     if not code_set:
         new_end = result.get("new_cache_date_range_end")
-        current_after = bool(result.get("current_after"))
-        not_current = (
-            (not current_after)
-            or (not new_end)
-            or (str(new_end) < str(target_as_of))
-        )
+        # Judge currency by the bounded cutoff (new_end >= cutoff). At grace 0
+        # the cutoff equals target_as_of, so this is identical to the prior
+        # strict ``not current_after`` test (current_after == new_end >=
+        # target). The strict flag stays on the result dict for disclosure.
+        cutoff = currentness_cutoff or target_as_of
+        not_current = (not new_end) or (str(new_end) < str(cutoff))
         if not_current:
             return {
                 "is_unavailable": True, "allowable": True, "kind": "not_current",
@@ -903,6 +955,7 @@ def _stage_a_worker(payload: dict) -> dict:
                 refresh_fn=refresh_signal_engine_cache,
                 fetcher=fetcher,
                 provider_name="yfinance_retry",
+                currentness_cutoff=payload.get("currentness_cutoff"),
             )
     except Exception as exc:  # pragma: no cover - defensive
         out = {
@@ -1338,22 +1391,30 @@ def stage_aprime_caret_bridge(
     read_source_fn: Optional[Callable[..., Tuple]] = None,
     write_csv_fn: Optional[Callable[..., str]] = None,
     verify_fn: Optional[Callable[..., Tuple]] = None,
+    currentness_cutoff: Optional[str] = None,
 ) -> Tuple[List[str], List[dict], dict]:
     """Build producer-readable raw-spelled price_cache CSVs for caret
     secondaries from the freshest usable LOCAL source.
 
     Selection per caret secondary S (raw spelling kept for the output path):
-      - raw '^S' source current to target_as_of -> use raw;
+      - raw '^S' source current to the cutoff -> use raw;
       - else (only if ``alias_enabled``) '_S' alias source current -> use alias;
       - else exclude (never accept a stale source).
     The written CSV is re-verified through the producer loader and must be
     current; otherwise the secondary is excluded. Local-only; no network.
+
+    ``currentness_cutoff`` is the bounded acceptable usable-end date and
+    defaults to ``target_as_of`` (strict). At grace 0 it equals ``target_as_of``
+    so a target-1 source still fails; at grace >= 1 a source/output whose usable
+    end is within N sessions of target is accepted. The exclusion records keep
+    the actual source/output dates and ``target_as_of`` untouched for honesty.
 
     Returns (kept_secondaries, exclusion_records, summary).
     """
     read_source_fn = read_source_fn or _caret_read_source
     write_csv_fn = write_csv_fn or _caret_write_close_csv
     verify_fn = verify_fn or _caret_verify_output
+    cutoff = currentness_cutoff or target_as_of
 
     kept: List[str] = []
     excluded: List[dict] = []
@@ -1370,7 +1431,7 @@ def stage_aprime_caret_bridge(
         alias = _caret_alias_name(sec)
         raw_last, raw_series, raw_reason = read_source_fn(sec, cache_dir)
         raw_current = (raw_series is not None and raw_last is not None
-                       and str(raw_last) >= str(target_as_of))
+                       and str(raw_last) >= str(cutoff))
         chosen_series = None
         chosen_kind = None
         chosen_src_name = None
@@ -1383,7 +1444,7 @@ def stage_aprime_caret_bridge(
         elif alias_enabled:
             alias_last, alias_series, alias_reason = read_source_fn(alias, cache_dir)
             if (alias_series is not None and alias_last is not None
-                    and str(alias_last) >= str(target_as_of)):
+                    and str(alias_last) >= str(cutoff)):
                 chosen_series, chosen_kind = alias_series, "alias"
                 chosen_src_name = f"{alias}_precomputed_results.pkl"
                 chosen_last = alias_last
@@ -1417,7 +1478,7 @@ def stage_aprime_caret_bridge(
         # Write the raw-spelled producer-readable CSV, then verify.
         out_path = write_csv_fn(sec, chosen_series, price_cache_dir)
         ok, out_last, vreason = verify_fn(sec, price_cache_dir, cache_dir)
-        out_current = ok and out_last is not None and str(out_last) >= str(target_as_of)
+        out_current = ok and out_last is not None and str(out_last) >= str(cutoff)
         out_path_by[sec] = out_path
         src_path_by[sec] = f"{cache_dir}/{chosen_src_name}" if cache_dir else chosen_src_name
         src_last_by[sec] = chosen_last
@@ -1660,6 +1721,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--target-as-of", default=DEFAULT_TARGET_AS_OF)
+    p.add_argument(
+        "--currency-grace-sessions", type=int, default=1,
+        help=(
+            "Bounded post-refresh currentness acceptance: a usable cache "
+            "date-range-end within this many US trading sessions (weekdays) of "
+            "--target-as-of counts as CURRENT after a refresh attempt. Default "
+            "1 (accept target-1). 0 reproduces strict same-day-only behavior. "
+            "Motivated by provider-served NaN/placeholder closes for thin "
+            "foreign EOD bars that stay undisseminated for many hours; the "
+            "offline skip gate is NOT graced (a not-strictly-fresh cache still "
+            "refreshes) and network/provider/systemic failures still halt."
+        ),
+    )
     p.add_argument("--driver-run-id", default=None)
     p.add_argument("--stackbuilder-root", default="output/stackbuilder")
     p.add_argument("--cache-dir", default="cache/results")
@@ -1746,11 +1820,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _new_envelope(driver: Driver) -> dict:
+    grace = int(getattr(driver.args, "currency_grace_sessions", 1))
     return {
         "schema_version": SCHEMA_VERSION,
         "driver_run_id": driver.driver_run_id,
         "executed": driver.executed,
         "target_as_of": driver.target_as_of,
+        # Bounded post-refresh currentness policy disclosure (downstream
+        # artifacts read these). The cutoff is None only for an invalid
+        # negative grace, which the preflight refuses before any stage runs.
+        "currency_grace_sessions": grace,
+        "acceptable_currentness_cutoff": (
+            acceptable_currentness_cutoff(driver.target_as_of, grace)
+            if grace >= 0 else None
+        ),
         "exit_code": 0,
         "status": "dry_run",
         "halted_at": None,
@@ -2004,6 +2087,13 @@ def _plan_stage_counts(
         "strict_default_fail_closed": not bool(
             driver.args.allow_stage_a_exclusions
         ),
+        "currency_grace_sessions": int(
+            getattr(driver.args, "currency_grace_sessions", 1)
+        ),
+        "acceptable_currentness_cutoff": acceptable_currentness_cutoff(
+            driver.target_as_of,
+            int(getattr(driver.args, "currency_grace_sessions", 1)),
+        ),
         "fetch_retry_config": {
             "retries": driver.args.fetch_retries,
             "base_seconds": driver.args.fetch_backoff_base_seconds,
@@ -2073,6 +2163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "driver_run_id": args.driver_run_id or "unset",
             "executed": bool(args.execute),
             "target_as_of": args.target_as_of,
+            "currency_grace_sessions": int(args.currency_grace_sessions),
+            "acceptable_currentness_cutoff": None,
             "exit_code": 2,
             "status": "refused",
             "halted_at": "preflight",
@@ -2123,6 +2215,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 halted_at="preflight",
             )
         )
+        return envelope["exit_code"]
+
+    # Bounded currentness grace must be a nonnegative integer (both modes).
+    if args.currency_grace_sessions < 0:
+        emit_envelope(_refuse(
+            envelope,
+            "--currency-grace-sessions must be >= 0; got "
+            f"{args.currency_grace_sessions}",
+            halted_at="preflight",
+        ))
         return envelope["exit_code"]
 
     # Retry/backoff config must be nonnegative (both modes).
@@ -2265,6 +2367,12 @@ def _run_execute_chain(
     args = driver.args
     union = resolve_union(included)
     rankable = {p.secondary: p for p in included}
+    # Bounded acceptable usable-end date applied to post-refresh currentness in
+    # Stage A and the Aprime caret bridge. grace 0 -> equals target_as_of
+    # (strict). The negative case is already refused in main() preflight.
+    currentness_cutoff = acceptable_currentness_cutoff(
+        driver.target_as_of, int(getattr(args, "currency_grace_sessions", 1))
+    )
 
     # ---- Stage A barrier ----
     if "A" in driver.stages:
@@ -2277,6 +2385,7 @@ def _run_execute_chain(
                 "status_dir": args.status_dir,
                 "write": True,
                 "target_as_of": driver.target_as_of,
+                "currentness_cutoff": currentness_cutoff,
                 "fetch_retries": args.fetch_retries,
                 "fetch_backoff_base": args.fetch_backoff_base_seconds,
                 "fetch_backoff_max": args.fetch_backoff_max_seconds,
@@ -2298,7 +2407,14 @@ def _run_execute_chain(
 
         # Classify every outcome under the unavailable-data policy.
         classified = [
-            (r, _classify_stage_a_outcome(r, target_as_of=driver.target_as_of))
+            (
+                r,
+                _classify_stage_a_outcome(
+                    r,
+                    target_as_of=driver.target_as_of,
+                    currentness_cutoff=currentness_cutoff,
+                ),
+            )
             for r in a_results
         ]
         unavailable = [(r, i) for (r, i) in classified if i["is_unavailable"]]
@@ -2359,6 +2475,10 @@ def _run_execute_chain(
             "workers": args.a_workers,
             "allow_stage_a_exclusions": bool(args.allow_stage_a_exclusions),
             "strict_default_fail_closed": not bool(args.allow_stage_a_exclusions),
+            "currency_grace_sessions": int(
+                getattr(args, "currency_grace_sessions", 1)
+            ),
+            "acceptable_currentness_cutoff": currentness_cutoff,
             "unavailable_ticker_count": len(unavailable),
             "allowed_unavailable_ticker_count": len(allowed),
             "blocked_unavailable_ticker_count": len(blocking),
@@ -2547,6 +2667,7 @@ def _run_execute_chain(
                 price_cache_dir=args.price_cache_dir,
                 target_as_of=driver.target_as_of,
                 alias_enabled=bool(args.allow_aprime_caret_cache_alias),
+                currentness_cutoff=currentness_cutoff,
             )
             cexcluded_secs = {r.get("secondary") for r in cexcluded}
             for sec in cexcluded_secs:
