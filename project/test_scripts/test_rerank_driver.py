@@ -1,0 +1,490 @@
+"""Hermetic tests for rerank_driver.
+
+No real engines, recook, validation, Blob/network, promote write, push, or
+token value. Recook, publish seam, lock, clock, env, and filesystem roots are
+injected. The board is the selection -- there is no input().
+"""
+from __future__ import annotations
+
+import ast
+import io
+import json
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import rerank_driver as R  # noqa: E402
+
+
+SENTINEL_TOKEN = "blob_SENTINEL_TOKEN_VALUE_zzz999"
+# 2026-06-09 21:00 UTC == Tue 17:00 ET (after the 16:00 close) -> target 2026-06-09
+FIXED_NOW = datetime(2026, 6, 9, 21, 0, 0, tzinfo=timezone.utc)
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_json(path: Path, obj) -> None:
+    _write(path, json.dumps(obj, indent=2) + "\n")
+
+
+def _make_repo(tmp_path: Path, board=("AAA", "BBB", "CCC")) -> Path:
+    repo = tmp_path / "repo"
+    _write_json(repo / R.DEFAULT_FIXTURE, {
+        "per_secondary": [{"secondary": s} for s in board],
+        "validation_metadata": {
+            "source_sidecar_path":
+                "output/crunch_runs/PRIOR/publish_candidate/"
+                "composite_validation_sidecar.json"},
+    })
+    _write_json(repo / R.DEFAULT_PROMOTION_MANIFEST, {
+        "source_run_id": "PRIOR",
+        "ccc_series_storage": {
+            "verification_manifest_path":
+                "output/crunch_runs/PRIOR/publish_candidate/"
+                "combined_ccc_sidecar_verification.json"},
+    })
+    # the prior-board artifacts the metadata points at (live board, run PRIOR)
+    _write(repo / "output/crunch_runs/PRIOR/publish_candidate/"
+           "composite_validation_sidecar.json", "{}")
+    _write(repo / "output/crunch_runs/PRIOR/publish_candidate/"
+           "combined_ccc_sidecar_verification.json", "{}")
+    return repo
+
+
+def _ok_envelope(exclusions=(), failures=(), status="ok", exit_code=0):
+    return {"status": status, "exit_code": exit_code,
+            "exclusions": list(exclusions), "failures": list(failures),
+            "partial_reasons": [],
+            "timings": {"total_seconds": 12.3}}
+
+
+def _stage_a_exclusion(secondary, kind="dead_no_history"):
+    # Mirrors a k6_recook Stage-A ALLOWABLE exclusion record
+    # (k6_recook.py:2456-2489): stage 'A' + ticker_classification = the kind,
+    # appended to driver.exclusions -> envelope['exclusions'] (k6_recook.py:1766).
+    return {"secondary": secondary, "stage": "A",
+            "reason": "stage_a_unavailable:%s" % kind,
+            "ticker": "DEP", "ticker_classification": kind}
+
+
+def _partial_envelope(exclusions, *, partial_reasons=("stage_a_allowed_exclusions",),
+                      failures=()):
+    # REAL contract: k6_recook returns status='partial', exit_code=3 whenever
+    # anything is excluded/dropped after the chain completes (k6_recook.py:2731-2740).
+    return {"status": "partial", "exit_code": 3,
+            "exclusions": list(exclusions), "failures": list(failures),
+            "partial_reasons": list(partial_reasons),
+            "timings": {"total_seconds": 14.0}}
+
+
+class _Recook:
+    def __init__(self, envelope):
+        self.envelope = envelope
+        self.calls = []
+
+    def __call__(self, argv, *, cwd):
+        self.calls.append((list(argv), cwd))
+        return self.envelope
+
+
+class _Publish:
+    def __init__(self, result):
+        self.result = result
+        self.kwargs = None
+        self.calls = 0
+
+    def __call__(self, **kw):
+        self.kwargs = kw
+        self.calls += 1
+        return self.result
+
+
+def _run(repo, argv, *, token=SENTINEL_TOKEN, recook=None, publish=None,
+         lock_raise=False, now=FIXED_NOW, holidays=(), run_id="RID"):
+    out, err = io.StringIO(), io.StringIO()
+    env = {} if token is None else {R.TOKEN_ENV: token}
+    recook = recook or _Recook(_ok_envelope())
+    publish = publish or _Publish({"status": "published"})
+    locks = {"acquired": [], "released": []}
+
+    def lock_acq(lock_path, rid, when):
+        if lock_raise:
+            raise R._cro.CrunchError("crunch lock held by live pid 999")
+        locks["acquired"].append((lock_path, rid))
+
+    def lock_rel(lock_path):
+        locks["released"].append(lock_path)
+
+    seams = R.RerankPublishSeams(
+        validator=lambda secs, rid: {}, joiner=lambda *a: {},
+        stage9_runner=lambda inp: {}, project_root=repo, repo_root=repo)
+    rc = R.main(argv, env=env, repo_root=repo, clock=lambda: now,
+                holidays=holidays, stdout=out, stderr=err, run_id=run_id,
+                recook_runner=recook, lock_acquire=lock_acq,
+                lock_release=lock_rel, publish_seams=seams, publish_func=publish)
+    status_path = repo / R.STATUS_REL
+    status = (json.loads(status_path.read_text("utf-8"))
+              if status_path.is_file() else None)
+    return rc, out.getvalue(), err.getvalue(), status, recook, publish, locks
+
+
+def _ok_argv(extra=()):
+    return ["--publish", "--operator-approved-publish",
+            "--duration-budget-minutes", "240", *extra]
+
+
+# ---------------------------------------------------------------------------
+# Zero-question + token preflight
+# ---------------------------------------------------------------------------
+
+
+def test_zero_question_no_input_call_anywhere():
+    tree = ast.parse(Path(R.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id != "input", "rerank_driver must never call input()"
+
+
+def test_token_absent_guidance_nonzero_before_work(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), token=None)
+    assert rc != 0
+    assert recook.calls == []        # no heavy work
+    assert publish.calls == 0
+    assert locks["acquired"] == []   # lock not even acquired
+    guidance = out + err
+    assert R.TOKEN_ENV in guidance and "setx" in guidance and "NEW terminal" in guidance
+    assert status["status"] == "refused_no_token"
+
+
+# ---------------------------------------------------------------------------
+# Board enumeration
+# ---------------------------------------------------------------------------
+
+
+def test_board_enumeration_from_fixture(tmp_path):
+    repo = _make_repo(tmp_path, board=("ccc", "AAA", "bbb", "AAA"))
+    board = R.enumerate_board(repo / R.DEFAULT_FIXTURE)
+    assert board == ["AAA", "BBB", "CCC"]  # normalized + de-duped + sorted
+
+
+# ---------------------------------------------------------------------------
+# Target derivation
+# ---------------------------------------------------------------------------
+
+
+def test_target_weekday_after_close():
+    # Tue 17:00 ET
+    assert R.derive_target_as_of(
+        now=datetime(2026, 6, 9, 21, 0, tzinfo=timezone.utc)) == "2026-06-09"
+
+
+def test_target_weekday_before_close():
+    # Tue 14:00 ET -> prior trading day (Mon)
+    assert R.derive_target_as_of(
+        now=datetime(2026, 6, 9, 18, 0, tzinfo=timezone.utc)) == "2026-06-08"
+
+
+def test_target_saturday_and_sunday_roll_back_to_friday():
+    sat = R.derive_target_as_of(now=datetime(2026, 6, 13, 18, 0, tzinfo=timezone.utc))
+    sun = R.derive_target_as_of(now=datetime(2026, 6, 14, 18, 0, tzinfo=timezone.utc))
+    assert sat == "2026-06-12" and sun == "2026-06-12"
+
+
+def test_target_skips_holiday():
+    # Tue 14:00 ET (before close); Mon 2026-06-08 injected as a holiday ->
+    # walk back past Mon/Sun/Sat to Fri 2026-06-05.
+    got = R.derive_target_as_of(
+        now=datetime(2026, 6, 9, 18, 0, tzinfo=timezone.utc),
+        holidays={date(2026, 6, 8)})
+    assert got == "2026-06-05"
+
+
+def test_target_timezone_utc_maps_to_prior_et_day():
+    # 2026-06-09 02:00 UTC == Mon 2026-06-08 22:00 ET (after close) -> Mon
+    assert R.derive_target_as_of(
+        now=datetime(2026, 6, 9, 2, 0, tzinfo=timezone.utc)) == "2026-06-08"
+
+
+# ---------------------------------------------------------------------------
+# Gate composition + recook argv
+# ---------------------------------------------------------------------------
+
+
+def test_duration_budget_required(tmp_path):
+    repo = _make_repo(tmp_path)
+    with pytest.raises(SystemExit):
+        _run(repo, ["--publish", "--operator-approved-publish"])
+
+
+def test_operator_budget_label_default_and_recorded(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, *_ = _run(repo, _ok_argv())
+    assert status["operator_budget_label"] == "rerank-nightly"
+    assert status["duration_budget_minutes"] == 240
+
+
+def test_recook_argv_gates_and_no_discovery_stages(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    argv = recook.calls[0][0]
+    assert "k6_recook.py" in argv
+    assert "--allow-stage-a-exclusions" in argv
+    assert "--allow-network-fetch" in argv
+    assert "--restage-all" in argv
+    assert "--target-as-of" in argv and "2026-06-09" in argv
+    i = argv.index("--secondaries")
+    assert argv[i + 1] == "AAA,BBB,CCC"
+    # explicitly NO discovery / selection stages
+    for forbidden in ("onepass_workbook_runner.py",
+                      "impactsearch_workbook_runner.py",
+                      "stackbuilder_workbook_runner.py"):
+        assert forbidden not in argv
+
+
+# ---------------------------------------------------------------------------
+# Quarantine + halt
+# ---------------------------------------------------------------------------
+
+
+def test_partial_allowable_stage_a_quarantines_and_publishes(tmp_path):
+    # REAL contract: an allowable Stage-A exclusion -> status 'partial',
+    # exit_code 3. The secondary is quarantined; the survivors publish.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_a_exclusion("BBB", "dead_no_history")])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc == 0
+    assert publish.calls == 1
+    assert publish.kwargs["survivors"] == ["AAA", "CCC"]  # BBB quarantined
+    qsecs = [q["secondary"] for q in status["quarantined"]]
+    assert qsecs == ["BBB"]
+    assert status["quarantined"][0]["causes"][0]["kind"] == "dead_no_history"
+    assert status["fresh_secondaries"] == ["AAA", "CCC"]
+
+
+def test_clean_ok_full_board_publishes(tmp_path):
+    # status 'ok', exit_code 0, NO exclusions -> full-board publish.
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    assert rc == 0 and publish.calls == 1
+    assert publish.kwargs["survivors"] == ["AAA", "BBB", "CCC"]
+
+
+def test_partial_non_allowable_kind_halts(tmp_path):
+    # Stage-A but the kind is NOT in STAGE_A_ALLOWABLE_KINDS -> halt.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_a_exclusion("BBB", "optimizer_failed")])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+    assert status["status"] == "halted_recook"
+
+
+def test_partial_non_stage_a_exclusion_halts(tmp_path):
+    # Stage-Aprime price_cache_unbuildable (k6_recook.py:2533-2535) is NOT a
+    # publishable quarantine -> halt.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope(
+        [{"secondary": "BBB", "stage": "Aprime",
+          "reason": "price_cache_unbuildable"}],
+        partial_reasons=["excluded_secondaries_present"])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+
+
+def test_partial_with_failures_halts(tmp_path):
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope(
+        [_stage_a_exclusion("BBB")],
+        partial_reasons=["stage_a_allowed_exclusions", "failures_present"],
+        failures=[{"ticker": "ZZZ", "reason": "retry_exhausted"}])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+
+
+def test_partial_unexpected_reason_halts(tmp_path):
+    # partial_reasons beyond the allowable Stage-A reason -> halt (unknown=halt).
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope(
+        [_stage_a_exclusion("BBB")],
+        partial_reasons=["stage_a_allowed_exclusions", "mystery_reason"])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+
+
+def test_systemic_failed_exit_halts_no_publish(tmp_path):
+    # status 'failed', exit_code 1 (the _halt_stage_a blocking path) -> halt.
+    repo = _make_repo(tmp_path)
+    env = _ok_envelope(status="failed", exit_code=1,
+                       failures=[{"ticker": "ZZZ", "reason": "retry_exhausted"}])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc != 0
+    assert publish.calls == 0
+    assert status["status"] == "halted_recook"
+    assert status["halted_at"] == "recook"
+
+
+def test_full_validation_runs_over_surviving_set(tmp_path):
+    # The seam runs full validation over `survivors`; with a faked seam we
+    # assert the surviving fresh set (board minus the allowable Stage-A
+    # quarantine) is what gets handed to the publish chain.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_a_exclusion("AAA", "not_current")])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))
+    assert rc == 0
+    assert publish.kwargs["survivors"] == ["BBB", "CCC"]
+
+
+def test_allowable_kinds_parity_with_engine():
+    import k6_recook
+    # The driver classifies against the engine's OWN allowable-kinds set.
+    assert R.STAGE_A_ALLOWABLE_KINDS == k6_recook.STAGE_A_ALLOWABLE_KINDS
+    assert R.STAGE_A_ALLOWABLE_KINDS == frozenset(
+        {"dead_no_history", "not_current", "insufficient_history"})
+
+
+# ---------------------------------------------------------------------------
+# Publish seam wiring + CCC chain
+# ---------------------------------------------------------------------------
+
+
+def test_seam_invocation_kwargs_exact(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    kw = publish.kwargs
+    assert kw["survivors"] == ["AAA", "BBB", "CCC"]
+    assert kw["run_id"] == "RID"
+    assert kw["target_as_of"] == "2026-06-09"
+    assert kw["dry_run"] is False
+    assert kw["operator_approved"] is True
+    assert kw["k6_ranking_path"] == repo / "output/k6_mtf/RID/k6_mtf_ranking.json"
+    assert kw["run_dir"] == repo / "output/crunch_runs/RID"
+    assert kw["prior_fixture_path"] == repo / R.DEFAULT_FIXTURE
+    assert kw["prior_promotion_manifest_path"] == repo / R.DEFAULT_PROMOTION_MANIFEST
+    assert isinstance(kw["seams"], R.RerankPublishSeams)
+
+
+def test_ccc_chain_prior_manifest_is_live_board_never_tonight(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    kw = publish.kwargs
+    prior_ccc = str(kw["prior_ccc_verification_manifest_path"])
+    prior_sidecar = str(kw["prior_validation_sidecar_path"])
+    # bound to the live board's source run ("PRIOR"), never tonight's run "RID"
+    assert "PRIOR" in prior_ccc and "RID" not in prior_ccc
+    assert "PRIOR" in prior_sidecar and "RID" not in prior_sidecar
+    assert prior_ccc.endswith("combined_ccc_sidecar_verification.json")
+
+
+# ---------------------------------------------------------------------------
+# Modes + mutual exclusivity + disclosure
+# ---------------------------------------------------------------------------
+
+
+def test_publish_dry_run_threads_dry_run_true_and_prints_disclosure(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, ["--publish-dry-run", "--duration-budget-minutes", "240"],
+        publish=_Publish({"status": "dry_run_complete"}))
+    assert rc == 0
+    assert publish.kwargs["dry_run"] is True
+    assert publish.kwargs["operator_approved"] is False
+    assert "NOT" in out and "Blob" in out  # the accepted disclosure
+    assert status["status"] == "dry_run_complete"
+    assert status["dry_run"] is True
+
+
+def test_publish_threads_dry_run_false(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    assert publish.kwargs["dry_run"] is False
+    assert publish.kwargs["operator_approved"] is True
+
+
+def test_publish_and_publish_dry_run_mutually_exclusive(tmp_path):
+    repo = _make_repo(tmp_path)
+    with pytest.raises(SystemExit):
+        _run(repo, ["--publish", "--publish-dry-run",
+                    "--operator-approved-publish",
+                    "--duration-budget-minutes", "240"])
+
+
+def test_neither_mode_is_rejected(tmp_path):
+    repo = _make_repo(tmp_path)
+    with pytest.raises(SystemExit):
+        _run(repo, ["--duration-budget-minutes", "240"])
+
+
+def test_publish_requires_operator_approval(tmp_path):
+    repo = _make_repo(tmp_path)
+    with pytest.raises(SystemExit):
+        _run(repo, ["--publish", "--duration-budget-minutes", "240"])
+
+
+# ---------------------------------------------------------------------------
+# Lock-busy + status pointer + timing + sentinel safety
+# ---------------------------------------------------------------------------
+
+
+def test_lock_busy_writes_status_and_exits_clean(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), lock_raise=True)
+    assert rc != 0
+    assert recook.calls == []   # no work past the lock
+    assert publish.calls == 0
+    assert status["status"] == "lock_busy"
+    assert status["halted_at"] == "lock"
+
+
+def test_status_pointer_on_success_has_timing_and_artifacts(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    assert status["status"] == "published"
+    assert "timing" in status
+    for k in ("recook_seconds", "publish_seconds", "total_seconds"):
+        assert k in status["timing"]
+    assert status["timing"]["per_secondary_recook_timing_available"] is False
+    assert "artifacts" in status and "run_dir" in status["artifacts"]
+    assert status["status_gitignore_rule"] == "output/ (project .gitignore)"
+
+
+def test_status_written_under_gitignored_output(tmp_path):
+    repo = _make_repo(tmp_path)
+    _run(repo, _ok_argv())
+    sp = repo / R.STATUS_REL
+    assert sp.is_file()
+    assert sp.parent == repo / "output" / "rerank"
+
+
+def test_sentinel_token_never_appears_anywhere(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    blob = out + err + json.dumps(status)
+    for p in (repo / "output" / "rerank").rglob("*"):
+        if p.is_file():
+            blob += p.read_text(encoding="utf-8", errors="replace")
+    assert SENTINEL_TOKEN not in blob
+
+
+def test_lock_released_on_success(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    assert len(locks["acquired"]) == 1
+    assert len(locks["released"]) == 1
