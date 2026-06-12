@@ -60,29 +60,52 @@ def _make_repo(tmp_path: Path, board=("AAA", "BBB", "CCC")) -> Path:
     return repo
 
 
-def _ok_envelope(exclusions=(), failures=(), status="ok", exit_code=0):
-    return {"status": status, "exit_code": exit_code,
-            "exclusions": list(exclusions), "failures": list(failures),
-            "partial_reasons": [],
-            "timings": {"total_seconds": 12.3}}
+DEFAULT_BOARD = ("AAA", "BBB", "CCC")
 
 
-def _stage_a_exclusion(secondary, kind="dead_no_history"):
+def _kept_from(exclusions, board=DEFAULT_BOARD):
+    # The engine's kept set = board minus the excluded secondaries (used to
+    # exercise parse_recook_outcome's kept-vs-board-minus-quarantine cross-check).
+    excl = {str(e.get("secondary")).strip().upper()
+            for e in exclusions if isinstance(e, dict) and e.get("secondary")}
+    return [s for s in board if s not in excl]
+
+
+def _stage_a_exclusion(secondary, kind="not_current"):
     # Mirrors a k6_recook Stage-A ALLOWABLE exclusion record
-    # (k6_recook.py:2456-2489): stage 'A' + ticker_classification = the kind,
-    # appended to driver.exclusions -> envelope['exclusions'] (k6_recook.py:1766).
+    # (k6_recook.py:2456-2489): stage 'A' + ticker_classification = the kind.
     return {"secondary": secondary, "stage": "A",
             "reason": "stage_a_unavailable:%s" % kind,
             "ticker": "DEP", "ticker_classification": kind}
 
 
+def _aprime_exclusion(secondary):
+    # Mirrors a k6_recook Stage-Aprime caret exclusion record (k6_recook.py:1396):
+    # stage 'Aprime', no ticker_classification. Under the engine's authority this
+    # is folded into the same allowable partial -- it quarantines, it does not halt.
+    return {"secondary": secondary, "stage": "Aprime",
+            "reason": "caret_source_unavailable_or_stale"}
+
+
+def _ok_envelope(exclusions=(), failures=(), status="ok", exit_code=0,
+                 board=DEFAULT_BOARD, kept=None, halted_at=None):
+    ex = list(exclusions)
+    return {"status": status, "exit_code": exit_code,
+            "exclusions": ex, "failures": list(failures),
+            "partial_reasons": [], "halted_at": halted_at,
+            "kept_secondaries": kept if kept is not None else _kept_from(ex, board),
+            "timings": {"total_seconds": 12.3}}
+
+
 def _partial_envelope(exclusions, *, partial_reasons=("stage_a_allowed_exclusions",),
-                      failures=()):
+                      failures=(), board=DEFAULT_BOARD, kept=None, halted_at=None):
     # REAL contract: k6_recook returns status='partial', exit_code=3 whenever
-    # anything is excluded/dropped after the chain completes (k6_recook.py:2731-2740).
+    # anything is excluded/dropped after the chain completes (k6_recook.py:2731-2744).
+    ex = list(exclusions)
     return {"status": "partial", "exit_code": 3,
-            "exclusions": list(exclusions), "failures": list(failures),
-            "partial_reasons": list(partial_reasons),
+            "exclusions": ex, "failures": list(failures),
+            "partial_reasons": list(partial_reasons), "halted_at": halted_at,
+            "kept_secondaries": kept if kept is not None else _kept_from(ex, board),
             "timings": {"total_seconds": 14.0}}
 
 
@@ -257,19 +280,25 @@ def test_recook_argv_gates_and_no_discovery_stages(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _permissive(extra=()):
+    # publish-path argv with the quarantine guard relaxed (so a small test board
+    # with one quarantine does not trip the 0.25 default ceiling).
+    return _ok_argv(["--max-quarantine-fraction", "1.0", *extra])
+
+
 def test_partial_allowable_stage_a_quarantines_and_publishes(tmp_path):
-    # REAL contract: an allowable Stage-A exclusion -> status 'partial',
-    # exit_code 3. The secondary is quarantined; the survivors publish.
+    # status 'partial', exit_code 3, allowable partial_reasons -> publish the
+    # survivors; the secondary quarantines. Survivors come from the engine kept.
     repo = _make_repo(tmp_path)
-    env = _partial_envelope([_stage_a_exclusion("BBB", "dead_no_history")])
+    env = _partial_envelope([_stage_a_exclusion("BBB", "not_current")])
     rc, out, err, status, recook, publish, locks = _run(
-        repo, _ok_argv(), recook=_Recook(env))
+        repo, _permissive(), recook=_Recook(env))
     assert rc == 0
     assert publish.calls == 1
-    assert publish.kwargs["survivors"] == ["AAA", "CCC"]  # BBB quarantined
+    assert publish.kwargs["survivors"] == ["AAA", "CCC"]      # from engine kept
     qsecs = [q["secondary"] for q in status["quarantined"]]
     assert qsecs == ["BBB"]
-    assert status["quarantined"][0]["causes"][0]["kind"] == "dead_no_history"
+    assert status["quarantined"][0]["causes"][0]["kind"] == "not_current"
     assert status["fresh_secondaries"] == ["AAA", "CCC"]
 
 
@@ -281,27 +310,24 @@ def test_clean_ok_full_board_publishes(tmp_path):
     assert publish.kwargs["survivors"] == ["AAA", "BBB", "CCC"]
 
 
-def test_partial_non_allowable_kind_halts(tmp_path):
-    # Stage-A but the kind is NOT in STAGE_A_ALLOWABLE_KINDS -> halt.
-    repo = _make_repo(tmp_path)
-    env = _partial_envelope([_stage_a_exclusion("BBB", "optimizer_failed")])
-    rc, out, err, status, recook, publish, locks = _run(
-        repo, _ok_argv(), recook=_Recook(env))
-    assert rc != 0 and publish.calls == 0
-    assert status["status"] == "halted_recook"
-
-
-def test_partial_non_stage_a_exclusion_halts(tmp_path):
-    # Stage-Aprime price_cache_unbuildable (k6_recook.py:2533-2535) is NOT a
-    # publishable quarantine -> halt.
-    repo = _make_repo(tmp_path)
+def test_real_tonight_shape_aprime_quarantines_without_halting(tmp_path):
+    # THE forensics fix: the pilot's real shape -- a partial/3 with Stage-A
+    # not_current AND Stage-Aprime caret records, failures empty,
+    # partial_reasons=['stage_a_allowed_exclusions'] -- must PUBLISH survivors;
+    # the Aprime caret records quarantine, they no longer halt (small fraction).
+    board = tuple("S%02d" % i for i in range(12))
+    repo = _make_repo(tmp_path, board=board)
     env = _partial_envelope(
-        [{"secondary": "BBB", "stage": "Aprime",
-          "reason": "price_cache_unbuildable"}],
-        partial_reasons=["excluded_secondaries_present"])
+        [_stage_a_exclusion("S00", "not_current"),  # Stage-A allowable
+         _aprime_exclusion("S01")],                  # Stage-Aprime caret
+        board=board)
     rc, out, err, status, recook, publish, locks = _run(
-        repo, _ok_argv(), recook=_Recook(env))
-    assert rc != 0 and publish.calls == 0
+        repo, _ok_argv(), recook=_Recook(env))      # default ceiling; 2/12=0.167
+    assert rc == 0
+    assert publish.calls == 1
+    qsecs = sorted(q["secondary"] for q in status["quarantined"])
+    assert qsecs == ["S00", "S01"]                   # Aprime quarantined, no halt
+    assert set(publish.kwargs["survivors"]) == set(board) - {"S00", "S01"}
 
 
 def test_partial_with_failures_halts(tmp_path):
@@ -311,7 +337,7 @@ def test_partial_with_failures_halts(tmp_path):
         partial_reasons=["stage_a_allowed_exclusions", "failures_present"],
         failures=[{"ticker": "ZZZ", "reason": "retry_exhausted"}])
     rc, out, err, status, recook, publish, locks = _run(
-        repo, _ok_argv(), recook=_Recook(env))
+        repo, _permissive(), recook=_Recook(env))
     assert rc != 0 and publish.calls == 0
 
 
@@ -322,8 +348,18 @@ def test_partial_unexpected_reason_halts(tmp_path):
         [_stage_a_exclusion("BBB")],
         partial_reasons=["stage_a_allowed_exclusions", "mystery_reason"])
     rc, out, err, status, recook, publish, locks = _run(
-        repo, _ok_argv(), recook=_Recook(env))
+        repo, _permissive(), recook=_Recook(env))
     assert rc != 0 and publish.calls == 0
+
+
+def test_partial_halted_at_set_halts(tmp_path):
+    # halted_at set -> halt, regardless of an otherwise-allowable partial.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_a_exclusion("BBB")], halted_at="A")
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+    assert status["status"] == "halted_recook"
 
 
 def test_systemic_failed_exit_halts_no_publish(tmp_path):
@@ -340,23 +376,123 @@ def test_systemic_failed_exit_halts_no_publish(tmp_path):
 
 
 def test_full_validation_runs_over_surviving_set(tmp_path):
-    # The seam runs full validation over `survivors`; with a faked seam we
-    # assert the surviving fresh set (board minus the allowable Stage-A
-    # quarantine) is what gets handed to the publish chain.
+    # The seam runs full validation over `survivors` (board minus quarantine).
     repo = _make_repo(tmp_path)
     env = _partial_envelope([_stage_a_exclusion("AAA", "not_current")])
     rc, out, err, status, recook, publish, locks = _run(
-        repo, _ok_argv(), recook=_Recook(env))
+        repo, _permissive(), recook=_Recook(env))
     assert rc == 0
     assert publish.kwargs["survivors"] == ["BBB", "CCC"]
 
 
-def test_allowable_kinds_parity_with_engine():
-    import k6_recook
-    # The driver classifies against the engine's OWN allowable-kinds set.
-    assert R.STAGE_A_ALLOWABLE_KINDS == k6_recook.STAGE_A_ALLOWABLE_KINDS
-    assert R.STAGE_A_ALLOWABLE_KINDS == frozenset(
-        {"dead_no_history", "not_current", "insufficient_history"})
+def test_survivors_come_from_engine_kept_set(tmp_path):
+    # Survivors are the engine's kept set, not just board-minus-quarantined.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_a_exclusion("CCC", "not_current")])
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc == 0
+    assert publish.kwargs["survivors"] == ["AAA", "BBB"]
+
+
+def test_engine_kept_mismatch_halts_unknown_shape(tmp_path):
+    # kept set disagrees with board-minus-quarantined -> halt fail-closed.
+    repo = _make_repo(tmp_path)
+    env = _partial_envelope([_stage_a_exclusion("BBB")], kept=["AAA"])  # expect AAA,CCC
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _permissive(), recook=_Recook(env))
+    assert rc != 0 and publish.calls == 0
+    assert status["status"] == "halted_recook"
+
+
+# ---------------------------------------------------------------------------
+# Quarantine-fraction guard (F2)
+# ---------------------------------------------------------------------------
+
+
+def test_mass_quarantine_trips_default_guard(tmp_path):
+    # Tonight's real shape (146/207 = 0.705) MUST trip the default 0.25 ceiling.
+    board = tuple("S%03d" % i for i in range(207))
+    repo = _make_repo(tmp_path, board=board)
+    excl = [_stage_a_exclusion(board[i], "not_current") for i in range(146)]
+    env = _partial_envelope(excl, board=board)
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(), recook=_Recook(env))   # default ceiling 0.25
+    assert rc != 0
+    assert publish.calls == 0
+    assert status["status"] == "halted_quarantine_guard"
+    assert status["halted_at"] == "quarantine_guard"
+    assert abs(status["quarantine_fraction"] - 146 / 207) < 1e-9
+    assert status["max_quarantine_fraction"] == 0.25
+    assert len(status["quarantined"]) == 146
+    assert status["quarantined"][0]["causes"][0]["reason"].startswith(
+        "stage_a_unavailable")
+
+
+def test_quarantine_guard_boundary_at_ceiling_passes_just_above_halts(tmp_path):
+    board = ("A", "B", "C", "D")
+    # 1/4 == 0.25 ceiling -> passes (publishes)
+    repo1 = _make_repo(tmp_path / "at", board=board)
+    env1 = _partial_envelope([_stage_a_exclusion("A")], board=board)
+    rc1, *_rest1 = _run(repo1, _ok_argv(), recook=_Recook(env1))
+    assert rc1 == 0
+    # 2/4 == 0.5 > 0.25 -> halts
+    repo2 = _make_repo(tmp_path / "above", board=board)
+    env2 = _partial_envelope(
+        [_stage_a_exclusion("A"), _stage_a_exclusion("B")], board=board)
+    rc2, out2, err2, status2, recook2, publish2, locks2 = _run(
+        repo2, _ok_argv(), recook=_Recook(env2))
+    assert rc2 != 0 and publish2.calls == 0
+    assert status2["status"] == "halted_quarantine_guard"
+
+
+def test_quarantine_guard_override_respected(tmp_path):
+    # A high quarantine fraction publishes when the operator raises the ceiling.
+    board = ("A", "B", "C", "D")
+    repo = _make_repo(tmp_path, board=board)
+    env = _partial_envelope(
+        [_stage_a_exclusion("A"), _stage_a_exclusion("B")], board=board)  # 0.5
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(["--max-quarantine-fraction", "0.75"]),
+        recook=_Recook(env))
+    assert rc == 0 and publish.calls == 1
+
+
+def test_invalid_max_quarantine_fraction_rejected(tmp_path):
+    repo = _make_repo(tmp_path)
+    for bad in ("0", "1.5", "-0.1"):
+        with pytest.raises(SystemExit):
+            _run(repo, _ok_argv(["--max-quarantine-fraction", bad]))
+
+
+# ---------------------------------------------------------------------------
+# Target override (F3)
+# ---------------------------------------------------------------------------
+
+
+def test_target_override_plumbs_to_argv_and_status(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(
+        repo, _ok_argv(["--target-as-of", "2026-06-05"]))
+    assert rc == 0
+    argv = recook.calls[0][0]
+    i = argv.index("--target-as-of")
+    assert argv[i + 1] == "2026-06-05"
+    assert status["target_as_of"] == "2026-06-05"
+    assert status["target_source"] == "overridden"
+
+
+def test_derived_target_records_source(tmp_path):
+    repo = _make_repo(tmp_path)
+    rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
+    assert status["target_as_of"] == "2026-06-09"   # derived from FIXED_NOW
+    assert status["target_source"] == "derived"
+
+
+def test_bad_target_format_rejected(tmp_path):
+    repo = _make_repo(tmp_path)
+    with pytest.raises(SystemExit):
+        _run(repo, _ok_argv(["--target-as-of", "06/05/2026"]))
 
 
 # ---------------------------------------------------------------------------

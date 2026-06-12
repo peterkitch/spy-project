@@ -47,12 +47,15 @@ except ImportError:  # pragma: no cover - defensive
 import crunch_rebuild_orchestrator as _cro
 from crunch_rebuild_orchestrator import (  # noqa: F401 - re-exported for callers
     run_rerank_publish, RerankPublishSeams)
-# Parity by reuse: the recook-outcome classifier reads the engine's OWN allowable
-# Stage-A unavailability kinds. Verified side-effect-free: k6_recook guards all
-# execution behind ``if __name__ == "__main__"`` and runs no top-level code
-# (import completes in ~0.05s), so importing this constant pulls in no engine
-# side effects. STAGE_A_ALLOWABLE_KINDS is re-exported for the parity test.
-from k6_recook import STAGE_A_ALLOWABLE_KINDS  # noqa: F401
+# AUTHORITY SHIFT (pilot 20260612T002302Z forensics): the recook-outcome
+# classifier no longer re-derives per-record allowability from k6_recook's
+# STAGE_A_ALLOWABLE_KINDS. The engine itself decides blocking-vs-allowable at the
+# RUN level (blocking => status='failed'/exit_code=1/non-empty failures; an
+# allowable partial => status='partial'/exit_code=3/failures empty/
+# partial_reasons=['stage_a_allowed_exclusions'], k6_recook.py:2492,:2731-2744).
+# The per-record gate wrongly halted on legitimate Stage-Aprime caret exclusions
+# that the engine folds under the same allowable partial, so it is removed and
+# the constant is no longer imported.
 
 
 # --- fixed surface ----------------------------------------------------------
@@ -181,34 +184,57 @@ def build_recook_argv(*, secondaries: Sequence[str], target_as_of: str,
     ]
 
 
-def parse_recook_outcome(envelope: Any, board: Sequence[str]) -> dict:
-    """Classify a k6_recook batch envelope (its stdout JSON) against the engine's
-    REAL contract. Two -- and only two -- publishable shapes:
+def read_ranking_kept_secondaries(ranking_path: Path) -> Optional[list]:
+    """The engine's AUTHORITATIVE final kept set: the secondaries written to the
+    k6 ranking artifact (post Stage A/Aprime/B/E). Returns a normalized list, or
+    None if the artifact is absent/unreadable (e.g. a blocking halt wrote none).
+    The envelope exposes no top-level kept list -- only counts -- so the written
+    ranking is the source of truth for what survived."""
+    p = Path(ranking_path)
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    rows = data.get("per_secondary")
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        sec = r.get("secondary") if isinstance(r, dict) else r
+        if sec:
+            out.append(_norm(sec))
+    return out
 
+
+def parse_recook_outcome(envelope: Any, board: Sequence[str], *,
+                         kept_secondaries: Optional[Sequence[str]] = None) -> dict:
+    """Classify a k6_recook batch envelope by the ENGINE's own run-level
+    authority -- the engine already decides blocking-vs-allowable, so the driver
+    trusts that verdict instead of re-deriving allowability per exclusion record.
+
+    Two publishable shapes:
       1. CLEAN full board: status == 'ok' AND exit_code == 0 AND no failures AND
-         no exclusions (k6_recook.py:2741-2744).
-      2. ALLOWABLE quarantine: status == 'partial' AND exit_code == 3 AND no
-         blocking failures AND EVERY exclusion is a Stage-A exclusion
-         (stage == 'A') whose ticker_classification is an allowable kind
-         (STAGE_A_ALLOWABLE_KINDS) AND partial_reasons is limited to the
-         allowable Stage-A reason 'stage_a_allowed_exclusions'
-         (k6_recook.py:2731-2740 emits partial/exit_code=3; the Stage-A
-         allowable rec carries stage='A' + ticker_classification at :2456-2489).
-         Those secondaries are quarantined: removed from the fresh set so their
-         prior board row carries through combine; the survivors publish.
+         no exclusions AND halted_at is None (k6_recook.py:2741-2744).
+      2. ALLOWABLE partial: status == 'partial' AND exit_code == 3 AND failures
+         empty AND halted_at is None AND partial_reasons is limited to the
+         allowable Stage-A reason {'stage_a_allowed_exclusions'}
+         (k6_recook.py:2492,:2731-2744). The cumulative exclusions
+         (envelope['exclusions'] == driver.exclusions, k6_recook.py:1766) are NOT
+         a halt authority here -- they are the QUARANTINE LIST. They may include
+         Stage-Aprime caret_source_unavailable_or_stale (:1396) and other allowable
+         per-secondary drops that the engine folded under this partial; those
+         quarantine, they do not halt.
 
-    Everything else HALTS (no publish, no partial board): non-empty failures,
-    network/provider/systemic outcomes, a halted status/exit, any non-Stage-A
-    or non-allowable exclusion kind (e.g. Stage-Aprime price_cache_unbuildable),
-    any unexpected partial reason, or an unknown status/exit combination.
-    Unknown means halt -- stricter, never looser.
+    Everything else HALTS (no publish): non-empty failures, status='failed'/
+    exit_code=1, halted_at set, partial_reasons beyond the allowable Stage-A
+    reason, or any unknown status/exit combination. Unknown means halt.
 
-    Authoritative exclusion source: envelope['exclusions'] == driver.exclusions
-    (k6_recook.py:1766), the CUMULATIVE per-cause list across stages A / Aprime /
-    B / E (each entry carries 'stage' and 'reason'; Stage-A entries also carry
-    'ticker_classification'). We classify against this union -- stricter than the
-    Stage-A-only stageA.excluded_secondaries (:2495-2508) -- so any non-Stage-A
-    exclusion forces a halt."""
+    Survivors come from the engine's kept set when ``kept_secondaries`` is
+    supplied (the written ranking rows), cross-checked against board-minus-
+    quarantined; a mismatch is an unknown shape and HALTS fail-closed. Without
+    a kept set the survivors fall back to board-minus-quarantined."""
     env = envelope if isinstance(envelope, dict) else {}
     status = env.get("status")
     exit_code = env.get("exit_code")
@@ -217,34 +243,33 @@ def parse_recook_outcome(envelope: Any, board: Sequence[str]) -> dict:
     exclusions = env.get("exclusions") or []
     partial_reasons = env.get("partial_reasons") or []
 
+    # Quarantine list = the cumulative exclusions, deduped by secondary with ALL
+    # {stage, kind, reason} causes preserved. No longer a halt authority.
     qmap: dict[str, list] = {}
     excluded: set[str] = set()
-    all_exclusions_stage_a_allowable = True
     for e in exclusions:
         if not isinstance(e, dict):
-            all_exclusions_stage_a_allowable = False
             continue
         sec = _norm(e.get("secondary"))
-        stage = e.get("stage")
-        kind = e.get("ticker_classification")
         if not sec:
-            all_exclusions_stage_a_allowable = False
             continue
         excluded.add(sec)
         qmap.setdefault(sec, []).append(
-            {"stage": stage, "kind": kind, "reason": e.get("reason")})
-        if stage != "A" or kind not in STAGE_A_ALLOWABLE_KINDS:
-            all_exclusions_stage_a_allowable = False
+            {"stage": e.get("stage"), "kind": e.get("ticker_classification"),
+             "reason": e.get("reason")})
     quarantined = [{"secondary": s, "causes": c} for s, c in sorted(qmap.items())]
-    survivors = [s for s in board if s not in excluded]
+
+    board_set = {_norm(s) for s in board}
+    survivors = [s for s in board if _norm(s) not in excluded]
 
     clean_full_board = (
-        status == "ok" and exit_code == 0 and not failures and not exclusions)
-    allowable_quarantine = (
+        status == "ok" and exit_code == 0 and not failures
+        and not exclusions and halted_at is None)
+    allowable_partial = (
         status == "partial" and exit_code == 3 and not failures
-        and bool(exclusions) and all_exclusions_stage_a_allowable
+        and halted_at is None and bool(exclusions)
         and set(partial_reasons) <= {"stage_a_allowed_exclusions"})
-    ok = clean_full_board or allowable_quarantine
+    ok = clean_full_board or allowable_partial
 
     halt_reason = None
     if not ok:
@@ -253,6 +278,22 @@ def parse_recook_outcome(envelope: Any, board: Sequence[str]) -> dict:
             "blocking_failures=%d exclusions=%d partial_reasons=%r"
             % (status, exit_code, halted_at, len(failures), len(exclusions),
                list(partial_reasons)))
+    elif kept_secondaries is not None:
+        # Cross-check the engine's authoritative kept set against board-minus-
+        # quarantined. A mismatch is an unknown shape -> halt fail-closed.
+        kept_set = {_norm(k) for k in kept_secondaries}
+        expected_set = board_set - excluded
+        if kept_set != expected_set:
+            ok = False
+            halt_reason = (
+                "engine kept set != board minus quarantined (unknown shape): "
+                "kept=%d expected=%d only_in_kept=%r only_in_expected=%r"
+                % (len(kept_set), len(expected_set),
+                   sorted(kept_set - expected_set)[:8],
+                   sorted(expected_set - kept_set)[:8]))
+        else:
+            survivors = [s for s in board if _norm(s) in kept_set]
+
     return {
         "ok": ok,
         "survivors": survivors,
@@ -433,7 +474,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--operator-budget-label", default=DEFAULT_OPERATOR_BUDGET_LABEL,
                    help="operator budget label (default %(default)s)")
     p.add_argument("--target-as-of", default=None,
-                   help="override the derived latest-close target (YYYY-MM-DD)")
+                   help="override the derived latest-close target (YYYY-MM-DD); "
+                        "default is the derived latest completed US close")
+    p.add_argument("--max-quarantine-fraction", type=float, default=0.25,
+                   help="halt for operator review if the quarantined fraction of "
+                        "the board exceeds this ceiling, range (0,1]; "
+                        "default %(default)s. A mass quarantine is a data/target "
+                        "problem to review, never an auto-publish.")
     p.add_argument("--fixture", default=None,
                    help="override the live fixture path (repo-relative or abs)")
     p.add_argument("--prior-promotion-manifest", default=None)
@@ -447,6 +494,13 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.publish and not args.operator_approved_publish:
         parser.error("--publish requires --operator-approved-publish")
+    if not (0.0 < args.max_quarantine_fraction <= 1.0):
+        parser.error("--max-quarantine-fraction must be in the range (0, 1]")
+    if args.target_as_of is not None:
+        try:
+            datetime.strptime(args.target_as_of, "%Y-%m-%d")
+        except ValueError:
+            parser.error("--target-as-of must be a valid YYYY-MM-DD date")
     return args
 
 
@@ -544,7 +598,8 @@ def main(argv: Optional[Sequence[str]] = None, *,
         # 4. TARGET-AS-OF (latest completed US close, or explicit override).
         target = (args.target_as_of if args.target_as_of
                   else derive_target_as_of(now=started, holidays=holidays))
-        emit("target-as-of: " + target)
+        target_source = "overridden" if args.target_as_of else "derived"
+        emit("target-as-of: " + target + " (" + target_source + ")")
         if dry_run:
             emit(DRY_RUN_DISCLOSURE)
 
@@ -552,6 +607,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
         run_dir.mkdir(parents=True, exist_ok=True)
         stackbuilder_root = repo / DEFAULT_STACKBUILDER_ROOT
         k6_output_root = repo / DEFAULT_K6_OUTPUT_ROOT
+        k6_ranking_path = k6_output_root / rid / "k6_mtf_ranking.json"
 
         # 5. RECOOK (batch restage) + quarantine.
         recook_argv = build_recook_argv(
@@ -563,14 +619,21 @@ def main(argv: Optional[Sequence[str]] = None, *,
         t0 = clock()
         envelope = recook_runner(recook_argv, cwd=str(repo))
         recook_seconds = (clock() - t0).total_seconds()
-        outcome = parse_recook_outcome(envelope, board)
+        # Engine kept-set authority: prefer a kept list carried on the envelope
+        # (tests inject it), else read the written ranking rows.
+        kept = (envelope.get("kept_secondaries")
+                if isinstance(envelope, dict) else None)
+        if kept is None:
+            kept = read_ranking_kept_secondaries(k6_ranking_path)
+        outcome = parse_recook_outcome(envelope, board, kept_secondaries=kept)
 
         if not outcome["ok"]:
-            emit_err("[FAIL] recook halted (systemic/blocking): "
+            emit_err("[FAIL] recook halted (systemic/blocking/unknown-shape): "
                      + str(outcome["halt_reason"]))
             return finalize(
                 4, status="halted_recook", halted_at="recook",
-                target_as_of=target, fresh_secondaries_count=0,
+                target_as_of=target, target_source=target_source,
+                fresh_secondaries_count=0,
                 quarantined=outcome["quarantined"],
                 recook_seconds=recook_seconds,
                 recook_reported_total_seconds=outcome["recook_reported_total_seconds"],
@@ -579,11 +642,33 @@ def main(argv: Optional[Sequence[str]] = None, *,
 
         survivors = outcome["survivors"]
         quarantined = outcome["quarantined"]
+
+        # F2: QUARANTINE-FRACTION GUARD. A mass quarantine is a data/target
+        # problem for operator review -- never an auto-publish -- even when the
+        # engine's partial is fully allowable.
+        qfraction = (len(quarantined) / len(board)) if board else 0.0
+        if qfraction > args.max_quarantine_fraction:
+            emit_err("[FAIL] quarantine fraction %.4f exceeds ceiling %.4f; "
+                     "halting for operator review (data/target problem, not an "
+                     "auto-publish)."
+                     % (qfraction, args.max_quarantine_fraction))
+            return finalize(
+                7, status="halted_quarantine_guard",
+                halted_at="quarantine_guard", target_as_of=target,
+                target_source=target_source,
+                fresh_secondaries_count=len(survivors),
+                quarantine_fraction=qfraction,
+                max_quarantine_fraction=args.max_quarantine_fraction,
+                quarantined=quarantined, recook_seconds=recook_seconds,
+                recook_reported_total_seconds=outcome[
+                    "recook_reported_total_seconds"])
+
         if not survivors:
             emit_err("[FAIL] no surviving secondaries after quarantine; refusing")
             return finalize(
                 4, status="halted_no_survivors", halted_at="recook",
-                target_as_of=target, fresh_secondaries_count=0,
+                target_as_of=target, target_source=target_source,
+                fresh_secondaries_count=0,
                 quarantined=quarantined, recook_seconds=recook_seconds)
         emit("survivors: %d | quarantined: %d" % (len(survivors), len(quarantined)))
 
@@ -601,7 +686,6 @@ def main(argv: Optional[Sequence[str]] = None, *,
                           if args.prior_ccc_verification_manifest else None))
 
         # 7. PUBLISH via the run_rerank_publish seam (full validation inside).
-        k6_ranking_path = k6_output_root / rid / "k6_mtf_ranking.json"
         seams = publish_seams if publish_seams is not None else make_publish_seams(
             repo_root=repo, project_root=repo, run_dir=run_dir,
             stackbuilder_root=stackbuilder_root)
@@ -632,6 +716,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
                        else (result.get("stage") if isinstance(result, dict)
                              else "publish")),
             target_as_of=target,
+            target_source=target_source,
             fresh_secondaries_count=len(survivors),
             fresh_secondaries=survivors,
             quarantined=quarantined,
