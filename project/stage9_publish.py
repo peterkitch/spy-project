@@ -428,6 +428,26 @@ def _seam(stage: str, fn, *args, token_sensitive: bool = False, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def verify_publish_preflight_fast(*, operator_approved: bool,
+                                  env: Mapping[str, str]) -> None:
+    """Mutation-free, network-free subset of ``verify_publish_preflight``: the
+    two cheap gates only -- operator approval, then Blob-token PRESENCE. Touches
+    no git, no network, no lock, no filesystem; reads only a boolean from the
+    environment (never the token value). Used as a fail-fast guard BEFORE the
+    multi-hour validation in the rerank publish seam so a missing approval/token
+    refuses in seconds rather than after compute. Raises the same
+    ``Stage9Error("preflight", ...)`` shapes as the full preflight, so callers
+    and the refusal schema are unchanged."""
+    if not operator_approved:
+        raise Stage9Error("preflight",
+                          "publish mode requires operator_approved=true")
+    token_present = bool(str((env or {}).get(TOKEN_ENV, "")).strip())
+    if not token_present:
+        raise Stage9Error("preflight",
+                          f"{TOKEN_ENV} is not present in the environment",
+                          token_present=False)
+
+
 def verify_publish_preflight(inputs: Stage9PublishInputs, *,
                              acquire_lock: bool = True) -> dict:
     """Fail-closed preflight. When ``acquire_lock`` is True, acquires the run
@@ -436,15 +456,10 @@ def verify_publish_preflight(inputs: Stage9PublishInputs, *,
     Stage 1 so a doomed run halts before compute without holding the publish lock
     through the multi-hour build. Records only token_present (boolean) -- never
     the token value."""
-    if not inputs.operator_approved:
-        raise Stage9Error("preflight",
-                          "publish mode requires operator_approved=true")
-
-    token_present = bool(str(inputs._env().get(TOKEN_ENV, "")).strip())
-    if not token_present:
-        raise Stage9Error("preflight",
-                          f"{TOKEN_ENV} is not present in the environment",
-                          token_present=False)
+    # Cheap, network-free gates first (single source of truth, shared with the
+    # rerank seam's fail-fast call).
+    verify_publish_preflight_fast(
+        operator_approved=inputs.operator_approved, env=inputs._env())
 
     # Non-interactive git probe (argv array; GIT_TERMINAL_PROMPT=0).
     probe = _run_git(inputs, ["ls-remote", "origin", "refs/heads/main"])
@@ -539,8 +554,11 @@ def _records_satisfy_contract(records: Any, fresh_secondaries: Sequence[str],
 
 def upload_or_reuse_fresh_ccc(inputs: Stage9PublishInputs) -> dict:
     """Validate-only first; reuse an existing satisfying records file; otherwise
-    upload (only when operator-approved and not dry-run). Then gate the records
-    before combine. The upload seam is injected in tests (no real Blob)."""
+    upload the fresh CCC sidecars when OPERATOR-APPROVED -- in BOTH dry-run and
+    real modes (honoring the disclosed contract that an approved dry-run performs
+    the real CCC Blob upload + GET round-trip). Only an UNAPPROVED run is held to
+    validate-only-then-refuse. Then gate the records before combine. The upload
+    seam is injected in tests (no real Blob)."""
     upload = inputs._upload()
     out_path = Path(inputs.fresh_ccc_records_path)
     secs = ",".join(str(s) for s in inputs.fresh_secondaries)
@@ -568,11 +586,17 @@ def upload_or_reuse_fresh_ccc(inputs: Stage9PublishInputs) -> dict:
             raise Stage9Error("ccc",
                               "fresh-CCC validate-only did not report "
                               "validate_only")
-        if inputs.dry_run or not inputs.operator_approved:
+        if not inputs.operator_approved:
+            # Unapproved (dry-run or otherwise): preserve the verbatim
+            # validate-only-then-refuse behavior -- no Blob egress without
+            # operator approval.
             raise Stage9Error(
                 "ccc", "fresh CCC records absent and Blob upload is disabled in "
                 "dry-run/unapproved mode; refusing")
-        # Real upload (token + Blob boundary -- operator-launched only).
+        # Real CCC Blob upload (token + Blob PUT/GET boundary). Performed when
+        # operator-approved, in BOTH dry-run and real modes -- the approved
+        # dry-run exercises the real CCC round-trip; the publication boundary
+        # downstream stays closed in dry-run (promote dry-run gate below).
         result = _seam("ccc", upload, token_sensitive=True,
                        k6_ranking_path=str(inputs.k6_ranking_path),
                        secondaries=secs, output_path=str(out_path),
@@ -590,7 +614,7 @@ def upload_or_reuse_fresh_ccc(inputs: Stage9PublishInputs) -> dict:
                           record_count=(len(records)
                                         if isinstance(records, list) else None))
     return {"records_path": str(out_path), "reused": reused,
-            "record_count": len(records)}
+            "uploaded": (not reused), "record_count": len(records)}
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1151,14 @@ def run_stage9_publish(inputs: Stage9PublishInputs) -> dict:
 
         summary["stage"] = "ccc"
         ccc = upload_or_reuse_fresh_ccc(inputs)
+        # Disclose exactly what egress happened: whether a FRESH Blob upload
+        # occurred (vs records reuse) and under which mode. An approved dry-run
+        # records ccc_fresh_upload=True with dry_run=True.
+        summary["ccc_fresh_upload"] = bool(ccc.get("uploaded"))
         _record_state(inputs, "ccc_uploaded", ccc_reused=ccc["reused"],
+                      ccc_fresh_upload=bool(ccc.get("uploaded")),
+                      dry_run=bool(inputs.dry_run),
+                      operator_approved=bool(inputs.operator_approved),
                       record_count=ccc["record_count"])
         summary["states"].append("ccc_uploaded")
 

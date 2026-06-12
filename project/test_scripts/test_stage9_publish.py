@@ -469,15 +469,119 @@ def test_happy_path_publishes_and_records_states_in_order(tmp_path):
 
 def test_dry_run_stops_after_promote_dry_run_gate(tmp_path):
     inp, repo, origin, _ = _real_world(tmp_path, dry_run=True)
-    # dry-run cannot upload; it reuses an existing valid same-run records file.
+    # This variant prewrites a valid same-run records file to exercise the REUSE
+    # path (the approved upload path is covered separately below).
     _write_json(inp.fresh_ccc_records_path, _records(inp.run_id, ["IHI", "SCHG"]))
     summary = s9.run_stage9_publish(inp)
     assert summary["status"] == "dry_run_complete"
     assert "promote_dry_run_ok" in summary["states"]
     assert "promote_write_ok" not in summary["states"]
+    assert summary["ccc_fresh_upload"] is False  # reused, no fresh upload
     # no commit beyond init
     n = _git(repo, "rev-list", "--count", "HEAD").stdout.strip()
     assert n == "1"
+
+
+# ---------------------------------------------------------------------------
+# F1: approved dry-run performs the real CCC round-trip (no records prewrite)
+# ---------------------------------------------------------------------------
+
+
+def test_approved_dry_run_uploads_fresh_ccc_then_completes(tmp_path):
+    # Approved dry-run with NO records file: the CCC step performs the real
+    # (injected) Blob upload + GET, proceeds through combine/proof, and stops at
+    # the promote dry-run gate -- publication stays CLOSED (no fixture/promote/
+    # commit/push).
+    inp, repo, origin, _ = _real_world(tmp_path, dry_run=True)
+    assert not Path(inp.fresh_ccc_records_path).is_file()  # nothing prewritten
+    # Capture the live fixture/manifest bytes (if present) to prove they are not
+    # modified by the dry-run.
+    fx_dest, mf_dest = Path(inp.public_fixture_dest), Path(inp.public_manifest_dest)
+    fx_before = fx_dest.read_bytes() if fx_dest.is_file() else None
+    mf_before = mf_dest.read_bytes() if mf_dest.is_file() else None
+    summary = s9.run_stage9_publish(inp)
+    assert summary["status"] == "dry_run_complete"
+    assert summary["dry_run"] is True and summary["operator_approved"] is True
+    # the fresh CCC upload happened (disclosure) and records were written
+    assert summary["ccc_fresh_upload"] is True
+    assert "ccc_uploaded" in summary["states"]
+    assert "promote_dry_run_ok" in summary["states"]
+    assert Path(inp.fresh_ccc_records_path).is_file()
+    # PUBLICATION CLOSED: no promote write/push state, fixture/manifest bytes
+    # unchanged, no new commit.
+    assert "promote_write_ok" not in summary["states"]
+    assert "push_ok" not in summary["states"]
+    assert (fx_dest.read_bytes() if fx_dest.is_file() else None) == fx_before
+    assert (mf_dest.read_bytes() if mf_dest.is_file() else None) == mf_before
+    # no commit beyond the init commit
+    n = _git(repo, "rev-list", "--count", "HEAD").stdout.strip()
+    assert n == "1"
+
+
+def test_upload_or_reuse_approved_dry_run_uploads(tmp_path):
+    # Unit-level: approved dry-run with no records -> fresh upload (confirm=True).
+    inp = _inputs(tmp_path, dry_run=True, operator_approved=True,
+                  upload_func=_upload_writing(
+                      _records("20260610T221108Z", ["IHI", "SCHG"])))
+    assert not Path(inp.fresh_ccc_records_path).is_file()
+    out = s9.upload_or_reuse_fresh_ccc(inp)
+    assert out["reused"] is False and out["uploaded"] is True
+    assert Path(inp.fresh_ccc_records_path).is_file()
+
+
+def test_upload_or_reuse_unapproved_dry_run_refuses_verbatim(tmp_path):
+    # Unapproved dry-run with no records -> today's validate-only-then-refuse,
+    # byte-for-byte (no upload, no records file written).
+    inp = _inputs(tmp_path, dry_run=True, operator_approved=False,
+                  upload_func=_upload_writing(
+                      _records("20260610T221108Z", ["IHI", "SCHG"])))
+    with pytest.raises(s9.Stage9Error) as ei:
+        s9.upload_or_reuse_fresh_ccc(inp)
+    assert ei.value.stage == "ccc"
+    assert ei.value.reason == (
+        "fresh CCC records absent and Blob upload is disabled in "
+        "dry-run/unapproved mode; refusing")
+    assert not Path(inp.fresh_ccc_records_path).is_file()  # validate-only, no write
+
+
+def test_upload_or_reuse_approved_dry_run_reuse_no_double_upload(tmp_path):
+    # Approved dry-run WITH a valid records file -> reuse; the upload seam must
+    # never be invoked (no double upload).
+    def _no_upload(*, confirm_blob_upload, **kw):
+        raise AssertionError("upload seam must not run when records are reusable")
+    inp = _inputs(tmp_path, dry_run=True, operator_approved=True,
+                  upload_func=_no_upload)
+    _write_json(Path(inp.fresh_ccc_records_path),
+                _records("20260610T221108Z", ["IHI", "SCHG"]))
+    out = s9.upload_or_reuse_fresh_ccc(inp)
+    assert out["reused"] is True and out["uploaded"] is False
+
+
+# ---------------------------------------------------------------------------
+# F2: verify_publish_preflight_fast (cheap subset: approval + token presence)
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_fast_missing_approval_raises():
+    with pytest.raises(s9.Stage9Error) as ei:
+        s9.verify_publish_preflight_fast(
+            operator_approved=False, env={"BLOB_READ_WRITE_TOKEN": TOKEN_VALUE})
+    assert ei.value.stage == "preflight"
+    assert ei.value.reason == "publish mode requires operator_approved=true"
+
+
+def test_preflight_fast_missing_token_raises():
+    with pytest.raises(s9.Stage9Error) as ei:
+        s9.verify_publish_preflight_fast(operator_approved=True, env={})
+    assert ei.value.stage == "preflight"
+    assert ei.value.diag.get("token_present") is False
+
+
+def test_preflight_fast_happy_passes():
+    # Approval + token present -> returns None, no raise, no side effects.
+    assert s9.verify_publish_preflight_fast(
+        operator_approved=True,
+        env={"BLOB_READ_WRITE_TOKEN": TOKEN_VALUE}) is None
 
 
 def test_allowlist_blocks_out_of_allowlist_change(tmp_path):

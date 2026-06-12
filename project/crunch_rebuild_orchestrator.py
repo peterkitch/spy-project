@@ -51,7 +51,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 
 SCHEMA_VERSION = "crunch_rebuild_run_v1"
@@ -2163,7 +2163,8 @@ def run_rerank_publish(*, survivors: Iterable[str], k6_ranking_path: Path,
                        prior_ccc_verification_manifest_path: Any,
                        run_dir: Path, run_id: str, target_as_of: Any,
                        dry_run: bool, operator_approved: bool,
-                       seams: RerankPublishSeams) -> dict:
+                       seams: RerankPublishSeams,
+                       env: Optional[Mapping[str, str]] = None) -> dict:
     """Run the shared real-publish tail over a surviving fresh set and return
     the Stage 9 summary dict. Behavior is identical to the orchestrator's
     historical _run_stage9_publish_tail except that ``dry_run`` is threaded into
@@ -2174,13 +2175,53 @@ def run_rerank_publish(*, survivors: Iterable[str], k6_ranking_path: Path,
     the joined artifacts, so it is not consumed here. No network/Blob/promote/
     git happens in this function -- those live inside the injected
     ``stage9_runner`` (the real one is stage9_publish.run_stage9_publish, which
-    is itself fail-closed and honors dry_run)."""
-    from stage9_publish import Stage9PublishInputs  # noqa: PLC0415
+    is itself fail-closed and honors dry_run).
+
+    A fail-fast publish preflight (operator approval + Blob-token presence; the
+    network-free, mutation-free subset of verify_publish_preflight) runs BEFORE
+    the expensive validation seam; on failure it writes the 09 refusal artifact
+    and returns it without invoking any seam. ``env`` is the mapping the token
+    presence is read from (defaults to ``os.environ``); it is injectable for
+    hermetic tests and never has its values logged."""
+    from stage9_publish import (  # noqa: PLC0415
+        Stage9PublishInputs, Stage9Error, verify_publish_preflight_fast)
     from utils.react_publish.k6_mtf_validation_join import (  # noqa: PLC0415
         ValidationJoinError as _ValidationJoinError)
 
     run_dir = Path(run_dir)
     effective = list(survivors)
+
+    # ----- Fail-fast publish preflight (BEFORE the multi-hour validation) -----
+    # Mirrors the crunch EXECUTE path's pre-compute preflight (it runs the full
+    # verify_publish_preflight before Stage 1). The rerank seam runs only the
+    # cheap, network-free, mutation-free subset -- operator approval + Blob-token
+    # presence -- so a missing approval/token (the pilot-4 shape) refuses in
+    # seconds with the existing refusal schema instead of after the full
+    # validation. A failure writes the 09 refusal artifact and returns it; the
+    # injected validator/joiner/stage9_runner seams are never invoked.
+    try:
+        verify_publish_preflight_fast(
+            operator_approved=bool(operator_approved),
+            env=env if env is not None else os.environ)
+    except Stage9Error as exc:
+        refusal = {
+            "run_id": run_id,
+            "dry_run": bool(dry_run),
+            "operator_approved": bool(operator_approved),
+            "status": "refused",
+            "stage": exc.stage,
+            "states": [],
+            "reason": exc.reason,
+            "refusal": {
+                "schema": "stage9_publish_refusal_v1",
+                "stage": exc.stage,
+                "reason": exc.reason,
+                "run_id": run_id,
+                "no_partial_publish": True,
+            },
+        }
+        _write_json(run_dir / "09_stage9_publish.json", refusal)
+        return refusal
 
     # ----- Stage 5: validation (injected seam) + strict coverage assertion ---
     sidecar = seams.validator(effective, run_id)

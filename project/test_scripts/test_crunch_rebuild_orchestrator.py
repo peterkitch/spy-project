@@ -2066,8 +2066,13 @@ class _RRStage9:
         return self.result
 
 
+# Fail-fast publish preflight reads Blob-token PRESENCE only (never the value);
+# a fake sentinel satisfies the boolean check hermetically (no real token).
+_RR_FAKE_TOKEN_ENV = {"BLOB_READ_WRITE_TOKEN": "rr_fake_token_presence_only"}
+
+
 def _rr_call(root, survivors, *, dry_run=False, validator=None, joiner=None,
-             runner=None, operator_approved=True, excluded=()):
+             runner=None, operator_approved=True, excluded=(), env="default"):
     root = Path(root)
     run_dir = root / "output" / "crunch_runs" / "RID"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2095,6 +2100,7 @@ def _rr_call(root, survivors, *, dry_run=False, validator=None, joiner=None,
         dry_run=dry_run,
         operator_approved=operator_approved,
         seams=seams,
+        env=(_RR_FAKE_TOKEN_ENV if env == "default" else env),
     )
     return result, run_dir, runner
 
@@ -2123,6 +2129,52 @@ def test_run_rerank_publish_dry_run_true_threads_into_inputs(tmp_path):
     result, run_dir, runner = _rr_call(tmp_path, ["AAA"], dry_run=True)
     assert runner.inputs.dry_run is True
     assert result == {"status": "dry_run_complete"}
+
+
+# --- F2: fail-fast publish preflight BEFORE the validation seam --------------
+
+
+def _recording_validator():
+    calls = {"n": 0}
+
+    def v(secs, run_id):
+        calls["n"] += 1
+        return _rr_fake_validator(secs, run_id)
+    return v, calls
+
+
+def test_rerank_seam_fail_fast_missing_approval_refuses_before_validation(tmp_path):
+    validator, calls = _recording_validator()
+    result, run_dir, runner = _rr_call(
+        tmp_path, ["AAA", "BBB"], operator_approved=False, validator=validator)
+    assert result["status"] == "refused" and result["stage"] == "preflight"
+    assert result["operator_approved"] is False
+    assert result["refusal"]["schema"] == "stage9_publish_refusal_v1"
+    # The expensive validation + the Stage 9 runner were NEVER invoked.
+    assert calls["n"] == 0 and runner.calls == 0
+    # No validation sidecar; the 09 refusal artifact IS written.
+    assert not (run_dir / "05_validation_sidecar.json").is_file()
+    assert (run_dir / "09_stage9_publish.json").is_file()
+    written = json.loads((run_dir / "09_stage9_publish.json").read_text("utf-8"))
+    assert written == result
+
+
+def test_rerank_seam_fail_fast_missing_token_refuses(tmp_path):
+    validator, calls = _recording_validator()
+    # token absent in the injected env -> fail-fast before validation
+    result, run_dir, runner = _rr_call(
+        tmp_path, ["AAA"], env={}, validator=validator)
+    assert result["status"] == "refused" and result["stage"] == "preflight"
+    assert calls["n"] == 0 and runner.calls == 0
+    assert not (run_dir / "05_validation_sidecar.json").is_file()
+
+
+def test_rerank_seam_happy_path_proceeds_to_validation(tmp_path):
+    validator, calls = _recording_validator()
+    result, run_dir, runner = _rr_call(tmp_path, ["AAA"], validator=validator)
+    assert calls["n"] == 1 and runner.calls == 1
+    assert result == {"status": "published"}
+    assert (run_dir / "05_validation_sidecar.json").is_file()
 
 
 def test_orchestrator_tail_calls_seam_with_dry_run_false(tmp_path, monkeypatch):
