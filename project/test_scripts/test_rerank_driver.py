@@ -624,3 +624,64 @@ def test_lock_released_on_success(tmp_path):
     rc, out, err, status, recook, publish, locks = _run(repo, _ok_argv())
     assert len(locks["acquired"]) == 1
     assert len(locks["released"]) == 1
+
+
+# --- build_recook_argv: Aprime caret alias bridge flag --------------------
+#
+# The re-rank batch recook must pass k6_recook's opt-in caret alias bridge so a
+# caret/index secondary whose raw '^SEC' cache PKL is missing/stale is built
+# from its current underscore-alias PKL ('_SEC') instead of being excluded.
+# Local-only; caret rows only; no extra fetch; non-caret rows unaffected.
+
+
+def _recook_argv(**over):
+    kwargs = dict(
+        secondaries=["^DJI", "^GSPC", "AAA"],
+        target_as_of="2026-06-11",
+        stackbuilder_root=Path("output/stackbuilder"),
+        output_root=Path("output/k6_mtf"),
+        driver_run_id="RID",
+        python="PY",
+        script="k6_recook.py",
+    )
+    kwargs.update(over)
+    return R.build_recook_argv(**kwargs)
+
+
+def test_recook_argv_includes_caret_alias_flag():
+    argv = _recook_argv()
+    assert argv.count("--allow-aprime-caret-cache-alias") == 1
+    # Grouped with the other allow flags, right after stage-a-exclusions.
+    assert (argv[argv.index("--allow-stage-a-exclusions") + 1]
+            == "--allow-aprime-caret-cache-alias")
+
+
+def test_recook_argv_retains_required_recook_flags():
+    argv = _recook_argv()
+    for flag in ("--execute", "--allow-network-fetch",
+                 "--allow-stage-a-exclusions", "--restage-all",
+                 "--secondaries", "--target-as-of"):
+        assert flag in argv
+    # Value plumbing unchanged.
+    assert argv[argv.index("--secondaries") + 1] == "^DJI,^GSPC,AAA"
+    assert argv[argv.index("--target-as-of") + 1] == "2026-06-11"
+
+
+def test_recook_argv_exact_shape_only_adds_caret_flag():
+    # The entire composed argv is pinned: the ONLY change vs the prior shape is
+    # the single inserted caret-alias flag. No other argv/shell behavior moves.
+    sb = str(Path("output/stackbuilder"))
+    out = str(Path("output/k6_mtf"))
+    assert _recook_argv() == [
+        "PY", "k6_recook.py",
+        "--execute",
+        "--allow-network-fetch",
+        "--allow-stage-a-exclusions",
+        "--allow-aprime-caret-cache-alias",
+        "--restage-all",
+        "--secondaries", "^DJI,^GSPC,AAA",
+        "--target-as-of", "2026-06-11",
+        "--driver-run-id", "RID",
+        "--stackbuilder-root", sb,
+        "--output-root", out,
+    ]

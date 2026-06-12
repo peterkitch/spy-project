@@ -168,13 +168,18 @@ def build_recook_argv(*, secondaries: Sequence[str], target_as_of: str,
     """Compose the ONE batch k6_recook restage command (argv array, no shell).
     Re-score existing selected stacks only -- explicitly NO OnePass /
     ImpactSearch / StackBuilder. --allow-stage-a-exclusions makes an allowable
-    per-secondary Stage-A unavailability a quarantine instead of a hard stop."""
+    per-secondary Stage-A unavailability a quarantine instead of a hard stop.
+    --allow-aprime-caret-cache-alias lets the Stage Aprime caret bridge build a
+    caret/index secondary from its current underscore-alias cache PKL (e.g.
+    '_GSPC') when the raw '^GSPC' source is missing/stale -- local-only, no
+    extra fetch, caret rows only, no effect on non-caret secondaries."""
     return [
         python,
         script,
         "--execute",
         "--allow-network-fetch",
         "--allow-stage-a-exclusions",
+        "--allow-aprime-caret-cache-alias",
         "--restage-all",
         "--secondaries", ",".join(secondaries),
         "--target-as-of", target_as_of,
