@@ -392,6 +392,44 @@ def _default_recook_runner(argv: Sequence[str], *, cwd: str) -> dict:
     return env
 
 
+def _resolve_git_toplevel(project_dir: Path) -> Path:
+    """Resolve the git repository toplevel for the publication seam's repo_root.
+
+    The Stage 9 publication allowlist compares against ``git status --porcelain``
+    output, which git ALWAYS renders relative to the repository toplevel. The
+    re-rank ``project_root`` is the ``project/`` SUBDIR, so the publish seam's
+    repo_root MUST be the toplevel; otherwise every legitimate publication path
+    is rejected as out-of-allowlist (the run-20260612T101155Z defect, where
+    ``frontend/...`` allowlist entries never matched ``project/frontend/...``
+    porcelain paths).
+
+    STRICT, fail-fast: on ANY failure -- git missing, not a repo, nonzero exit,
+    or empty output -- this RAISES RerankError with NO fallback. This is a
+    DELIBERATE divergence from crunch_rebuild_orchestrator._git_toplevel, which
+    falls back to ``project_dir.parent``: a git-less run cannot commit or push at
+    Stage 9 anyway, so guessing the toplevel would only defer the inevitable
+    refusal by a full recook + validation (~55 min) and silently guess the
+    publication paths -- the exact bug class this fix removes.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True)
+    except (OSError, ValueError) as exc:  # git binary absent / bad invocation
+        raise RerankError(
+            "git toplevel resolution could not launch git ("
+            + type(exc).__name__ + ")") from exc
+    if proc.returncode != 0:
+        raise RerankError(
+            "git rev-parse --show-toplevel exited %d (not a git repository?)"
+            % proc.returncode)
+    top = (proc.stdout or "").strip()
+    if not top:
+        raise RerankError(
+            "git rev-parse --show-toplevel returned empty output")
+    return Path(top).resolve()
+
+
 def make_publish_seams(*, repo_root: Path, project_root: Path, run_dir: Path,
                        stackbuilder_root: Path,
                        excluded_tickers: Iterable[str] = ()) -> RerankPublishSeams:
@@ -542,7 +580,8 @@ def main(argv: Optional[Sequence[str]] = None, *,
          lock_acquire: Optional[Callable[..., None]] = None,
          lock_release: Optional[Callable[..., None]] = None,
          publish_seams: Optional[RerankPublishSeams] = None,
-         publish_func: Optional[Callable[..., dict]] = None) -> int:
+         publish_func: Optional[Callable[..., dict]] = None,
+         toplevel_resolver: Optional[Callable[[Path], Path]] = None) -> int:
     """Run one re-rank. Returns a process exit code. There is NO input() call;
     the board is the selection."""
     env = os.environ if env is None else env
@@ -556,6 +595,8 @@ def main(argv: Optional[Sequence[str]] = None, *,
     lock_acquire = lock_acquire if lock_acquire is not None else _default_lock_acquire
     lock_release = lock_release if lock_release is not None else _default_lock_release
     publish_func = publish_func if publish_func is not None else run_rerank_publish
+    toplevel_resolver = (toplevel_resolver if toplevel_resolver is not None
+                         else _resolve_git_toplevel)
 
     def emit(line: str = "") -> None:
         print(line, file=out)
@@ -591,6 +632,22 @@ def main(argv: Optional[Sequence[str]] = None, *,
             emit_err("[WARNING] could not write status pointer: "
                      + type(exc).__name__)
         return rc
+
+    # 0. GIT TOPLEVEL for the publication seam -- fail-fast BEFORE any recook /
+    # validation / publish. The Stage 9 allowlist matches `git status
+    # --porcelain` paths, which git roots at the repository toplevel; ``repo``
+    # is the project/ SUBDIR, so the seam's repo_root must be the toplevel or
+    # every legitimate publication file is rejected as stray (run
+    # 20260612T101155Z). Resolved ONCE here so a git-less environment refuses in
+    # seconds, never after a ~55 min recook + validation. project_root stays the
+    # project/ dir; only the seam's repo_root changes (see step 7).
+    try:
+        repo_toplevel = toplevel_resolver(repo)
+    except RerankError as exc:
+        emit_err("[FAIL] cannot resolve git toplevel for publication: "
+                 + str(exc))
+        return finalize(6, status="refused_no_git_toplevel",
+                        halted_at="git_toplevel_preflight", note=str(exc))
 
     # 1. TOKEN PREFLIGHT (presence only) -- before any heavy work.
     token = str(env.get(TOKEN_ENV, "") or "")
@@ -714,8 +771,12 @@ def main(argv: Optional[Sequence[str]] = None, *,
                           if args.prior_ccc_verification_manifest else None))
 
         # 7. PUBLISH via the run_rerank_publish seam (full validation inside).
+        # repo_root is the GIT TOPLEVEL (so the Stage 9 allowlist matches the
+        # toplevel-rooted porcelain paths); project_root stays the project/ dir
+        # (it locates frontend/public/fixtures, md_library/shared, and the
+        # fresh-row path normalization).
         seams = publish_seams if publish_seams is not None else make_publish_seams(
-            repo_root=repo, project_root=repo, run_dir=run_dir,
+            repo_root=repo_toplevel, project_root=repo, run_dir=run_dir,
             stackbuilder_root=stackbuilder_root)
         t1 = clock()
         result = publish_func(

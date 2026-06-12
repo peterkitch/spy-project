@@ -140,8 +140,15 @@ class _Publish:
         return self.result
 
 
+# Hermetic git-toplevel resolver: tests never touch real git. Default returns
+# the project dir's parent (the realistic toplevel for a project/ subdir).
+def _fake_toplevel(p):
+    return Path(p).parent
+
+
 def _run(repo, argv, *, token=SENTINEL_TOKEN, recook=None, publish=None,
-         lock_raise=False, now=FIXED_NOW, holidays=(), run_id="RID"):
+         lock_raise=False, now=FIXED_NOW, holidays=(), run_id="RID",
+         toplevel_resolver=_fake_toplevel):
     out, err = io.StringIO(), io.StringIO()
     env = {} if token is None else {R.TOKEN_ENV: token}
     recook = recook or _Recook(_ok_envelope())
@@ -162,7 +169,8 @@ def _run(repo, argv, *, token=SENTINEL_TOKEN, recook=None, publish=None,
     rc = R.main(argv, env=env, repo_root=repo, clock=lambda: now,
                 holidays=holidays, stdout=out, stderr=err, run_id=run_id,
                 recook_runner=recook, lock_acquire=lock_acq,
-                lock_release=lock_rel, publish_seams=seams, publish_func=publish)
+                lock_release=lock_rel, publish_seams=seams, publish_func=publish,
+                toplevel_resolver=toplevel_resolver)
     status_path = repo / R.STATUS_REL
     status = (json.loads(status_path.read_text("utf-8"))
               if status_path.is_file() else None)
@@ -785,3 +793,82 @@ def test_recook_argv_exact_shape_only_adds_caret_flag():
         "--stackbuilder-root", sb,
         "--output-root", out,
     ]
+
+
+# ---------------------------------------------------------------------------
+# Publish seam repo_root == git toplevel (run 20260612T101155Z commit-allowlist
+# defect: project/-rooted allowlist never matched toplevel-rooted porcelain)
+# ---------------------------------------------------------------------------
+
+
+def test_make_publish_seams_receives_git_toplevel_not_project_dir(
+        tmp_path, monkeypatch):
+    # The publish seam's repo_root MUST be the resolved git toplevel; project_root
+    # MUST remain the project/ dir. Don't inject publish_seams so the real
+    # make_publish_seams runs; capture its kwargs.
+    repo = _make_repo(tmp_path)               # the project/ dir
+    toplevel = tmp_path / "TOPLEVEL"          # a distinct, known toplevel
+    captured = {}
+
+    def fake_make_seams(**kw):
+        captured.update(kw)
+        return R.RerankPublishSeams(
+            validator=lambda s, r: {}, joiner=lambda *a: {},
+            stage9_runner=lambda i: {},
+            project_root=kw["project_root"], repo_root=kw["repo_root"])
+
+    monkeypatch.setattr(R, "make_publish_seams", fake_make_seams)
+    publish = _Publish({"status": "published"})
+    out, err = io.StringIO(), io.StringIO()
+    rc = R.main(
+        _permissive(), env={R.TOKEN_ENV: SENTINEL_TOKEN}, repo_root=repo,
+        clock=lambda: FIXED_NOW, holidays=(), stdout=out, stderr=err,
+        run_id="RID", recook_runner=_Recook(_ok_envelope()),
+        lock_acquire=lambda *a: None, lock_release=lambda *a: None,
+        publish_func=publish,                 # fake publish (no real Stage 9)
+        toplevel_resolver=lambda p: toplevel)  # known toplevel; no real git
+    assert rc == 0 and publish.calls == 1
+    assert captured["repo_root"] == toplevel        # THE FIX
+    assert captured["project_root"] == repo         # project dir preserved
+
+
+def test_allowlist_rooting_matches_project_prefixed_porcelain():
+    # Pin the exact run-20260612T101155Z mismatch. With repo_root = git toplevel,
+    # the stage9 allowlist (_repo_rel) yields the SAME project/-prefixed form that
+    # `git status --porcelain` reports; with the old project-dir repo_root it
+    # yields 'frontend/...', which never matches the porcelain 'project/...'.
+    import stage9_publish as s9
+    toplevel = Path("/repo")
+    project = toplevel / "project"
+    fixture = project / "frontend" / "public" / "fixtures" / "k6_mtf_ranking.json"
+    porcelain_form = "project/frontend/public/fixtures/k6_mtf_ranking.json"
+    assert s9._repo_rel(toplevel, fixture) == porcelain_form     # fixed: matches
+    assert s9._repo_rel(project, fixture) == (                   # buggy: mismatch
+        "frontend/public/fixtures/k6_mtf_ranking.json")
+    assert s9._repo_rel(project, fixture) != porcelain_form
+
+
+def test_toplevel_resolution_failure_fails_fast_before_recook(tmp_path):
+    # A toplevel-resolution failure must refuse BEFORE any recook/validation/
+    # publish: no recook, no seam calls, no validation sidecar, clear status.
+    repo = _make_repo(tmp_path)
+    recook = _Recook(_ok_envelope())
+    publish = _Publish({"status": "published"})
+
+    def boom(p):
+        raise R.RerankError("git rev-parse --show-toplevel exited 128 "
+                            "(not a git repository?)")
+
+    rc, out, err, status, recook_seen, publish_seen, locks = _run(
+        repo, _permissive(), recook=recook, publish=publish,
+        toplevel_resolver=boom)
+    assert rc == 6
+    assert status["status"] == "refused_no_git_toplevel"
+    assert status["halted_at"] == "git_toplevel_preflight"
+    assert recook.calls == []          # recook never invoked
+    assert publish.calls == 0          # validator/joiner/Stage 9 never invoked
+    assert locks["acquired"] == []     # refused before the lock, too
+    # no validation sidecar produced anywhere under the run tree
+    assert not list(repo.rglob("05_validation_sidecar.json"))
+    # operator-diagnosable
+    assert "git toplevel" in (out + err).lower()
