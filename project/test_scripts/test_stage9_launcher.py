@@ -370,6 +370,108 @@ def test_blocked_ticker_typed_is_rejected_and_labeled(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Caret-secondary validation bridge (existing-board carets like ^DJT)
+# ---------------------------------------------------------------------------
+
+
+def test_caret_secondary_on_board_accepted_reaches_runner(tmp_path):
+    # ^DJT is Stage-A-disclosed in the fixture and absent from master; it must
+    # now be ACCEPTED, launch exactly one run, and reach the generated
+    # secondaries file with the caret spelling preserved.
+    repo = _make_repo(tmp_path)
+    rec = _Recorder(0)
+    counter = []
+    rc, out, err = _run(repo, answer="^DJT", runner=rec, input_counter=counter)
+    assert rc == 0
+    assert len(counter) == 1            # exactly one question on the accept path
+    assert len(rec.calls) == 1          # launched once
+    assert "--rebuild-secondaries-file" in rec.calls[0]
+    written = list((repo / L.DEFAULT_OPERATOR_INPUTS_DIR).glob(
+        L.SECONDARIES_PREFIX + "*.txt"))
+    assert len(written) == 1
+    assert written[0].read_text(encoding="utf-8") == "^DJT\n"
+
+
+def test_caret_secondary_ranked_row_accepted(tmp_path):
+    # A caret known as a RANKED row (not just Stage-A-disclosed) is accepted.
+    repo = _make_repo(tmp_path)
+    fixture = json.loads((repo / L.DEFAULT_FIXTURE).read_text(encoding="utf-8"))
+    fixture["per_secondary"].append({"secondary": "^GSPC"})
+    _write(repo / L.DEFAULT_FIXTURE, json.dumps(fixture, indent=2) + "\n")
+    rec = _Recorder(0)
+    rc, out, err = _run(repo, answer="^GSPC", runner=rec)
+    assert rc == 0
+    assert len(rec.calls) == 1
+
+
+def test_blocked_caret_secondary_rejected(tmp_path):
+    # A caret on the board but ALSO in the blocked set is rejected, no launch.
+    repo = _make_repo(tmp_path)
+    _write(repo / L.DEFAULT_BLOCKED_TICKERS, "BLOCKEDX\n^DJT\n")
+    rec = _Recorder(0)
+    rc, out, err = _run(repo, answer="^DJT", runner=rec)
+    assert rc != 0
+    assert "^DJT (blocked)" in out
+    assert rec.calls == []
+
+
+def test_arbitrary_caret_not_on_board_rejected(tmp_path):
+    # A syntactically valid caret that is NOT ranked and NOT Stage-A-disclosed
+    # is rejected -- syntactic validity alone does not authorize it.
+    repo = _make_repo(tmp_path)
+    rec = _Recorder(0)
+    rc, out, err = _run(repo, answer="^FOO", runner=rec)
+    assert rc != 0
+    assert "^FOO (unknown)" in out
+    assert rec.calls == []
+    written = list((repo / L.DEFAULT_OPERATOR_INPUTS_DIR).glob(
+        L.SECONDARIES_PREFIX + "*.txt"))
+    assert written == []
+
+
+def test_malformed_caret_rejected(tmp_path):
+    # A caret token that fails the orchestrator's ticker regex is rejected as
+    # malformed (never silently treated as on-board).
+    repo = _make_repo(tmp_path)
+    rec = _Recorder(0)
+    rc, out, err = _run(repo, answer="^DJ@T", runner=rec)
+    assert rc != 0
+    assert "^DJ@T (malformed)" in out
+    assert rec.calls == []
+
+
+def test_bare_master_token_does_not_authorize_caret(tmp_path):
+    # Bare DJT in master must NOT by itself authorize ^DJT. Add bare DJT to
+    # master, REMOVE ^DJT from the board disclosure -> ^DJT is rejected.
+    repo = _make_repo(tmp_path)
+    master = ["IHI", "SCHG", "AAPL", "AAPB", "AAPU", "CURE", "DBA",
+              "ZZNEW", "NEWONE", "BLOCKEDX", "DJT"]
+    _write(repo / L.DEFAULT_MASTER_TICKERS, "\n".join(master) + "\n")
+    fixture = json.loads((repo / L.DEFAULT_FIXTURE).read_text(encoding="utf-8"))
+    fixture["stage_a_excluded_secondaries"] = [
+        e for e in fixture["stage_a_excluded_secondaries"]
+        if not (isinstance(e, dict) and e.get("secondary") == "^DJT")
+    ]
+    _write(repo / L.DEFAULT_FIXTURE, json.dumps(fixture, indent=2) + "\n")
+    rec = _Recorder(0)
+    rc, out, err = _run(repo, answer="^DJT", runner=rec)
+    assert rc != 0                       # bare DJT does NOT authorize ^DJT
+    assert "^DJT (unknown)" in out
+    assert rec.calls == []
+
+
+def test_noncaret_unknown_still_rejected_alongside_caret_accept(tmp_path):
+    # Mixing an accepted caret with a non-caret unknown still aborts the whole
+    # launch -- non-caret typo/unknown protection is unchanged.
+    repo = _make_repo(tmp_path)
+    rec = _Recorder(0)
+    rc, out, err = _run(repo, answer="^DJT, NOPE123", runner=rec)
+    assert rc != 0
+    assert "NOPE123 (unknown)" in out
+    assert rec.calls == []
+
+
+# ---------------------------------------------------------------------------
 # 7. Classification + bucket-source reporting
 # ---------------------------------------------------------------------------
 

@@ -357,15 +357,39 @@ def main(argv: Optional[Sequence[str]] = None, *,
     if collapsed:
         emit("Note: collapsed duplicate(s): " + ", ".join(sorted(set(collapsed))))
 
-    # 6. PER-TICKER VALIDATION against the already-loaded allowed set. A typed
-    # ticker that is not allowed is rejected under the fix-or-drop flow, labeled
-    # BLOCKED (present in the exclusion set) or UNKNOWN (not in the master
-    # universe) so the operator knows why. Blocked takes precedence in labeling.
-    rejected = [(t, "blocked" if t in blocked_set else "unknown")
-                for t in resolved if t not in allowed_set]
+    # 6. PER-TICKER VALIDATION.
+    #
+    # Non-caret tickers (the common case) are UNCHANGED: each must be in
+    # allowed_set = master - blocked, and is labeled BLOCKED (present in the
+    # exclusion set) or UNKNOWN (absent from master) on rejection.
+    #
+    # Caret tickers (raw spelling starts with "^") are never in the master list
+    # (master holds bare DJT-family tokens, never the caret), so the master gate
+    # would always reject them. They instead get a STRICTER board-membership
+    # bridge: a caret ticker is accepted ONLY when it is already a known
+    # existing-board secondary in the committed fixture -- a ranked row OR a
+    # stage_a_excluded_secondaries entry -- AND is not blocked AND is
+    # syntactically valid under the orchestrator's own ticker regex. A bare
+    # master token (e.g. DJT) never authorizes its caret form (^DJT), and an
+    # arbitrary syntactically-valid caret not on the board is rejected. This is
+    # intentionally tighter than the orchestrator's raw parser: it permits
+    # existing-board caret rebuilds like ^DJT while preserving the launcher's
+    # typo / unknown-symbol protection.
+    board_known = set(backlog["ranked"]) | set(backlog["stage_a"])
+    rejected: list = []
+    for t in resolved:
+        if t.startswith("^"):
+            if t in blocked_set:
+                rejected.append((t, "blocked"))
+            elif not _orch._TICKER_RE.match(t):
+                rejected.append((t, "malformed"))
+            elif t not in board_known:
+                rejected.append((t, "unknown"))
+        elif t not in allowed_set:
+            rejected.append((t, "blocked" if t in blocked_set else "unknown"))
     if rejected:
-        emit("Cannot start -- the following tickers are not in the allowed "
-             "universe (fix or drop):")
+        emit("Cannot start -- the following tickers are not accepted "
+             "(fix or drop):")
         for t, why in rejected:
             emit("  %s (%s)" % (t, why))
         return 3

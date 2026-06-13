@@ -597,6 +597,7 @@ def build_stage_commands(
                 "--stackbuilder-root", stackbuilder_root.as_posix(),
                 "--output-root", k6_output_root.as_posix(),
                 "--restage-all",
+                "--allow-aprime-caret-cache-alias",
                 *target,
             ],
             "stage_env": {},

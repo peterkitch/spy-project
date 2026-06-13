@@ -1049,6 +1049,30 @@ def test_k6_recook_stage_argv_unchanged(tmp_path):
     assert "--restage-all" in argv
 
 
+def test_k6_recook_argv_has_caret_alias_not_stage_a_exclusions(tmp_path):
+    # Caret-secondary parity: Build & Rank recook passes the LOCAL Aprime
+    # caret-cache-alias bridge flag (matching the re-rank driver) so an
+    # existing-board caret secondary (e.g. ^DJT) can build, while the
+    # orchestrator KEEPS its stricter Stage-A hard-stop -- it must NOT pass
+    # --allow-stage-a-exclusions. No other recook flags change.
+    _write_lines(tmp_path / "blocked.txt", ["DR8A.F"])
+    _write_lines(tmp_path / "rebuild.txt", ["AAPB"])
+    o = _make_orch(tmp_path)
+    o.preflight()
+    argv = o._stage_cmd("k6_recook")["argv"]
+    # the one added flag, placed adjacent to --restage-all
+    assert "--allow-aprime-caret-cache-alias" in argv
+    assert argv[argv.index("--restage-all") + 1] == \
+        "--allow-aprime-caret-cache-alias"
+    # the intentional omission is preserved (no silent member shrink)
+    assert "--allow-stage-a-exclusions" not in argv
+    # no unrelated argv changes: every prior recook flag still present, once
+    for flag in ("--execute", "--allow-network-fetch", "--secondaries",
+                 "--driver-run-id", "--stackbuilder-root", "--output-root",
+                 "--restage-all"):
+        assert argv.count(flag) == 1
+
+
 # ---------------------------------------------------------------------------
 # OnePass reuse (opt-in, fail-closed)
 # ---------------------------------------------------------------------------
