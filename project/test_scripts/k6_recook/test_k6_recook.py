@@ -545,21 +545,37 @@ def test_stage_b_builds_nondaily_and_creates_missing_daily():
     assert res["ok"] is True
 
 
-def test_stage_b_existing_valid_daily_skipped():
+def test_stage_b_existing_valid_daily_rebuilt():
+    # A producer-valid (but possibly stale) 1d library is now REBUILT from the
+    # refreshed cache every run, not skipped, so history_as_of_date advances.
     saved = []
+    generated = []
+
+    def gen(member, interval, *, source_mode, cache_dir):
+        assert source_mode == drv.LAUNCH_PATH_SOURCE_MODE  # never vendor mode
+        assert cache_dir == "c"  # rebuild reads the cache Stage A refreshed
+        generated.append(interval)
+        return {"ticker": member, "interval": interval}
 
     res = drv.stage_b_process_member(
         "MMM",
         intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
         stable_dir="s",
         cache_dir="c",
-        generate_fn=_b_generate,
-        save_fn=lambda lib, interval, *, force_overwrite: saved.append(interval),
+        generate_fn=gen,
+        save_fn=lambda lib, interval, *, force_overwrite: saved.append(
+            (interval, force_overwrite)),
         validate_fn=lambda m, s: _vstatus(m, exists=True, valid=True),  # valid
         set_library_dir_fn=lambda d: None,
     )
-    assert "1d" in res["skipped"]
-    assert "1d" not in saved
+    # _build_daily ran for 1d (generated + forced-overwrite save from cache),
+    # rebuilt not skipped.
+    assert "1d" in generated                 # _build_daily called generate(1d)
+    assert ("1d", True) in saved             # forced overwrite of the present lib
+    assert "1d" in res["built"]
+    assert "1d" not in res["skipped"]
+    # non-daily intervals unchanged (all rebuilt as before)
+    assert set(res["built"]) == {"1wk", "1mo", "3mo", "1y", "1d"}
     assert res["ok"] is True
 
 
@@ -1959,18 +1975,28 @@ def test_stage_b_repair_failure_fails_member():
                for e in res["errors"])
 
 
-def test_stage_b_repair_never_overwrites_valid_daily():
+def test_stage_b_valid_daily_rebuilt_regardless_of_repair_flag():
+    # A producer-valid 1d is REBUILT from the refreshed cache on every run, and
+    # that rebuild is the normal path -- independent of the --repair flag (which
+    # gates only the producer-INVALID branch). Here repair=True and the library
+    # is valid, yet it is still rebuilt (force overwrite), not skipped.
     saved = []
     res = drv.stage_b_process_member(
         "MMM",
         intervals=list(drv.NON_DAILY_TIMEFRAMES) + [drv.DAILY_TIMEFRAME],
         stable_dir="s", cache_dir="c",
         generate_fn=_b_generate,
-        save_fn=lambda lib, interval, *, force_overwrite: saved.append(interval),
+        save_fn=lambda lib, interval, *, force_overwrite: saved.append(
+            (interval, force_overwrite)),
         validate_fn=lambda m, s: _vstatus(m, exists=True, valid=True),
         set_library_dir_fn=lambda d: None, repair=True,
     )
-    assert "1d" in res["skipped"] and "1d" not in saved and res["ok"] is True
+    assert "1d" in res["built"]
+    assert "1d" not in res["skipped"]
+    assert ("1d", True) in saved
+    assert res["ok"] is True
+    # rebuilt via the normal rebuild path, NOT the repair path
+    assert res["repaired"] is False
 
 
 def test_stage_b_exclusion_chain_distinct_and_scoped(tmp_path, monkeypatch):

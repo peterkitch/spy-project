@@ -987,20 +987,24 @@ def stage_b_process_member(
 ) -> dict:
     """Build offline MTF libraries for one member.
 
-    Always (re)builds the non-daily intervals. For 1d, the existing stable
-    library is validated with the PRODUCER loader (not a bare file-existence
-    check) so a malformed-but-present 1d library cannot pass Stage B and
-    then fail Stage E:
+    Always (re)builds the non-daily intervals AND the 1d library, so a re-rank
+    advances the daily data instead of being pinned to a once-built stale 1d.
+    For 1d the existing stable library is still validated with the PRODUCER
+    loader (not a bare file-existence check) so a malformed-but-present 1d
+    library is repaired/failed rather than silently reused:
 
       - missing 1d            -> build it (force_overwrite required by the
                                  builder's daily guard);
-      - existing + producer-valid 1d  -> skip;
+      - existing + producer-valid 1d  -> REBUILD it from the refreshed cache
+                                 (force_overwrite, label="rebuild"); the rebuilt
+                                 library's newest date follows the cache Stage A
+                                 just refreshed to target, so emitted
+                                 history_as_of_date advances;
       - existing + producer-INVALID 1d:
           * default (repair=False)  -> record an error (member fails Stage B
             so dependent secondaries are excluded before Stage E);
           * repair=True             -> rebuild it offline from the local
-            cache Close source, then RE-VALIDATE with the producer loader;
-            a producer-valid existing 1d is never overwritten.
+            cache Close source, then RE-VALIDATE with the producer loader.
 
     All callables are injected so the unit tests run without the real
     builder/producer and assert no vendor fetch occurs. ``repair`` is
@@ -1047,7 +1051,20 @@ def stage_b_process_member(
             if built_ok:
                 built.append(DAILY_TIMEFRAME)
         elif daily_status.get("producer_valid"):
-            skipped.append(DAILY_TIMEFRAME)
+            # Producer-valid but possibly STALE: a re-rank must REBUILD the 1d
+            # library from the cache Stage A has already refreshed to target, so
+            # the emitted history_as_of_date follows current data instead of
+            # being pinned to whenever the library was first built. We reuse the
+            # missing-path builder with force=True and label="rebuild"; the
+            # _build_daily build-guard is gated on label=="build", so a
+            # "rebuild" overwrites the present-and-valid library rather than
+            # skipping it.
+            rebuilt_ok = _build_daily(
+                member, stable_dir, cache_dir, generate_fn, save_fn,
+                validate_fn, errors, force=True, label="rebuild",
+            )
+            if rebuilt_ok:
+                built.append(DAILY_TIMEFRAME)
         else:
             # Exists but producer-invalid.
             if not repair:
@@ -1089,9 +1106,11 @@ def stage_b_process_member(
 
 def _build_daily(member, stable_dir, cache_dir, generate_fn, save_fn,
                  validate_fn, errors, *, force, label) -> bool:
-    """Build (or repair) the member's 1d library offline. Returns True when a
-    save was performed. Never overwrites a producer-valid existing 1d: a
-    last-moment re-validation guards the save. Appends a redacted error on
+    """Build / rebuild / repair the member's 1d library offline. Returns True
+    when a save was performed. A last-moment re-validation guards ONLY the
+    ``label=="build"`` (missing) path so a concurrently-created valid 1d is not
+    clobbered; ``label`` of ``"rebuild"`` or ``"repair"`` intentionally
+    overwrites a present library (force_overwrite). Appends a redacted error on
     failure."""
     try:
         lib = generate_fn(
