@@ -1,3 +1,5 @@
+STATUS: SUPERSEDED BY AS-BUILT - see md_library/shared/2026-06-12_RERANK_OPERATIONS.md (Re-Rank) and md_library/shared/2026-06-11_BUILD_AND_RANK_OPERATIONS.md (Build & Rank).
+
 # Stage 9 -- Autonomous Build-and-Rank Publish (Phase Scoping / Preflight / Operator Runbook)
 
 - **Status:** SCOPING (this doc is the Stage 9 preflight per project convention)

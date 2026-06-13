@@ -1,3 +1,5 @@
+STATUS: SUPERSEDED BY AS-BUILT - see md_library/shared/2026-06-12_RERANK_OPERATIONS.md (Re-Rank) and md_library/shared/2026-06-11_BUILD_AND_RANK_OPERATIONS.md (Build & Rank).
+
 # Re-rank -- Autonomous Nightly Whole-Board Re-score (Phase Scoping / Preflight)
 
 - **Status:** SCOPING (this doc IS the Re-rank phase preflight, per project

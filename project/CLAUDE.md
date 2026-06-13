@@ -33,9 +33,16 @@ Facts derived from that committed fixture and its promotion manifest
 `frontend/public/fixtures/README.md`:
 
   - Fixture schema: `k6_mtf_ranking_v2`.
-  - Ranking run id: `20260604T110400Z_recook_full248_clean_csv`.
-  - Board carries 205 secondaries: 88 board_validated, 117 not_validated,
-    43 Stage-A excluded.
+  - Ranking run id: `20260612T223250Z` (the first publish authored and pushed by
+    the pipeline itself -- see A3/A5 and PART B).
+  - Board carries 207 rows: 90 board_validated, 117 not_validated (206 freshly
+    re-scored + 1 carried `^TNX`, quarantined at Stage B; see the Re-Rank
+    operations runbook).
+  - The committed promotion manifest
+    (`frontend/public/fixtures/k6_mtf_ranking.promotion_manifest.json`,
+    `source_run_id` / `promoted_at_utc` / `source_sha256` /
+    `per_secondary_count`) is the LIVE SOURCE OF TRUTH for these point-in-time
+    facts; the values above are a snapshot and will advance with each publish.
   - The fixture is slim. Inline `ccc_series` is empty for every row; each row
     carries Blob sidecar metadata (`ccc_series_source="vercel_blob"`,
     `ccc_series_url`, `ccc_series_pathname`, `ccc_series_sha256`,
@@ -47,11 +54,12 @@ Facts derived from that committed fixture and its promotion manifest
     only (`date_utc`, `cumulative_capture_pct`, `per_bar_capture_pct`,
     `trade_direction`) -- no raw OHLCV, no provider price series, no
     credentials.
-  - The committed fixture / promotion-manifest `source_sha256` is the
-    canonical LF SHA `4b6736da150ade118d6cbd0fb8ab974f954ed4fef3c8af9acc8dda6a8c569d97`
-    (692,240 LF bytes). The fixture, promotion manifest, and fixtures README
-    are pinned `text eol=lf` in `project/.gitattributes` so the provenance SHA
-    reproduces on every checkout platform.
+  - The committed fixture / promotion-manifest `source_sha256` is a canonical LF
+    SHA (currently `5f159e8584d003c7d14239ab1ff7c0bdc4c6802a21a5ac9c803da2502ac44265`
+    for run `20260612T223250Z`; read the live value from the promotion manifest
+    rather than trusting this snapshot). The fixture, promotion manifest, and
+    fixtures README are pinned `text eol=lf` in `project/.gitattributes` so the
+    provenance SHA reproduces on every checkout platform.
 
 Deployment target (operator context, not asserted by a committed contract):
 the React app is served at prjct9.com via Vercel auto-deploy on push to
@@ -59,14 +67,19 @@ the React app is served at prjct9.com via Vercel auto-deploy on push to
 
 ## A2. Validation and publication gating
 
-  - The 205-scope Phase 5 honest-validation report is COMPLETE and bound into
-    the published fixture/manifest by the promotion gate:
-    `md_library/shared/2026-06-04_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_205.md`
-    plus its paired `.manifest.json`, with the validation sidecar
-    (`validation_run_id 20260604T120000Z_validation_full205`,
-    `artifact_sha256 8e48fd56...`). The promotion helper verifies the
-    report <-> report-manifest <-> validation-sidecar <-> CCC verification
-    manifest <-> slim fixture binding before any public fixture is written.
+  - Each publish binds a COMPOSITE carry-forward Phase 5 honest-validation
+    report (currently
+    `md_library/shared/2026-06-12_K6_MTF_PHASE_5_HONEST_VALIDATION_REPORT_207.md`
+    plus its paired `.manifest.json`), regenerated and SHA-bound by the promotion
+    gate. It is a composite, not one validation run of every row: each row carries
+    its own provenance (`validation_run_id`, `validation_artifact_sha256`,
+    `validated_as_of_utc`), the freshly re-scored rows bear the current run, and
+    carried rows retain their prior verdict. The carried `^TNX` row still bears
+    the original 205-scope lineage (`validation_run_id
+    20260604T120000Z_validation_full205`, `artifact_sha256 8e48fd56...`). The
+    promotion helper verifies the report <-> report-manifest <->
+    validation-sidecar <-> CCC verification manifest <-> slim fixture binding
+    before any public fixture is written.
   - Leaderboard ordering reflects K=6 MTF ranking metrics. Ranking position is
     NOT a claim that a row cleared Phase 5 validation; validation survivorship
     is disclosed per row.
@@ -83,7 +96,22 @@ the React app is served at prjct9.com via Vercel auto-deploy on push to
 
 ## A3. Promotion / publication machinery
 
-The gated, operator-run publication path lives in `project/utils/react_publish/`:
+The gated, operator-launched publication path is the Stage 9 publish tail
+(`stage9_publish.py`): same-run CCC Blob upload + GET, combine/proof, promote
+write, commit-allowlist gate, publication commit, push `origin main`, Vercel
+deploy, live-verify poll -- a single fail-closed transaction with a push-only
+resume and a non-rollback post-push path. Two operator-launched drivers feed it:
+
+  - **Re-Rank** -- `rerank_driver.py` re-scores the WHOLE board to one as-of date
+    and publishes. As-built runbook:
+    `md_library/shared/2026-06-12_RERANK_OPERATIONS.md`.
+  - **Build & Rank** -- `crunch_rebuild_orchestrator.py` (Stages 0-9) driven by
+    the one-question launcher `stage9_launcher.py` refreshes a few operator-chosen
+    secondaries and inserts them against the live board. As-built runbook:
+    `md_library/shared/2026-06-11_BUILD_AND_RANK_OPERATIONS.md`.
+
+The public-fixture writer in `project/utils/react_publish/` is a SUB-COMPONENT
+the Stage 9 promote step calls (it never deploys):
 
   - `promote_k6_mtf_artifact.py` -- validates a candidate v2 fixture, verifies
     all bindings, normalizes bytes to LF before hashing/writing, records the
@@ -128,18 +156,25 @@ React app consumes. It is NOT the live runtime and is NOT dead code.
     `primary_signal_engine.py`, etc.) are prototype / operator-cockpit
     substrate, not the live public product.
 
-## A5. Next phase and current data freshness
+## A5. Refresh path (shipped) and the remaining gap
 
-  - Next phase: headless daily-refresh automation to keep the published board
-    current. It MUST preserve: promotion gates; Blob sidecar integrity;
+  - The autonomous whole-board refresh-and-publish path EXISTS and shipped: the
+    Re-Rank driver (`rerank_driver.py`) carried the full board through recook ->
+    validation -> Stage 9 publish on 2026-06-12 (run `20260612T223250Z`,
+    publication commit `a1b0ae4`, the first commit the pipeline authored and
+    pushed itself). It preserves: promotion gates; Blob sidecar integrity;
     fixture / report / manifest / validation-sidecar binding integrity; Mode B
     controls; reproducible LF provenance SHA behavior; and no raw OHLCV /
     provider-price exposure.
-  - Until that headless refresh path exists, the data on the live site is
-    stale (the published fixture is a point-in-time promotion).
+  - Remaining gap: the SCHEDULER / CADENCE layer (and its approval-model design)
+    that would invoke the driver on a nightly cadence without an operator at the
+    keyboard. Today a publish is still an operator-launched run (see the Re-Rank
+    operations runbook). Between publishes the live board is a point-in-time
+    promotion.
   - Ordering of work: design and language/visual polish come AFTER, in order,
     (1) the operator trusts the metrics, (2) significant bugs are cleared, and
-    (3) daily / headless refresh is working.
+    (3) the refresh path is working (the publish path is done; the scheduler is
+    the open item).
 
 ---
 
@@ -158,7 +193,11 @@ React app consumes. It is NOT the live runtime and is NOT dead code.
   - Codex: independent auditor, and implementer for publication-class
     repository work when Claude Code is blocked by the classifier.
   - Operator: couriers prompts and reports between agents, owns external
-    egress, and owns the final push to `main`.
+    egress, and owns the final push to `main` for human-driven merges. The
+    operator also LAUNCHES the publication pipeline; the pipeline's own Stage 9
+    publication commit + push to `main` is a designed, fail-closed exception
+    (the operator launches it, the program commits and pushes -- see B4 and the
+    B2 clarification paragraph).
 
 ## B2. Sprint 500 publication boundary (harness-level safety)
 
@@ -208,8 +247,15 @@ The auditor must be a different voice than the implementer.
 
   - Squash-merge with branch preservation. Never `--delete-branch`; branches
     stay as a visual audit trail.
-  - Work on a new branch off `main`; do not commit directly to `main`. The
-    final push to `main` is operator-run.
+  - Work on a new branch off `main`; do not commit directly to `main`. For
+    human-driven merges the final push to `main` is operator-run.
+  - DESIGNED EXCEPTION (the pipeline's own publication): the Stage 9 publish tail
+    creates an allowlist-scoped publication commit directly on `main` and pushes
+    it to `origin/main` itself (the operator launches the run; the program
+    commits and pushes). This is fail-closed (commit-allowlist gate, push-only
+    resume, non-rollback post-push) and is licensed by the B2 clarification
+    paragraph; it does NOT relax the squash-merge/branch-preservation rule for
+    ordinary human-driven code merges.
   - Idle when told a preflight/audit is with another voice. A pasted
     implementation or amendment prompt is authorization to start that scope.
 
