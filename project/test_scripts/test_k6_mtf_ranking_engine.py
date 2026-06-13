@@ -635,11 +635,18 @@ def test_ccc_excludes_skipped_bars_includes_no_trade_zeros():
     art = _make_artifact("TGT", bars)
     record = engine.score_history_artifact(art)
     dates_in_ccc = [pt["date_utc"] for pt in record["ccc_series"]]
-    assert "2024-01-03" not in dates_in_ccc
-    assert "2024-01-04" not in dates_in_ccc
-    assert "2024-01-01" in dates_in_ccc
-    assert "2024-01-02" in dates_in_ccc
-    assert "2024-01-05" in dates_in_ccc
+    # REALIZATION-BAR dating: each captured candidate is stamped on its nxt bar.
+    # Captured candidates are bars[0], bars[1], bars[4]; their realization bars
+    # are bars[1]=01-02, bars[2]=01-03, bars[5]=01-06. The skipped candidates
+    # (bars[2], bars[3]) produce NO points, so 01-04 and 01-05 are absent -- this
+    # proves date movement tracks CAPTURED candidates, not a naive +1 index shift.
+    assert dates_in_ccc == ["2024-01-02", "2024-01-03", "2024-01-06"]
+    assert "2024-01-02" in dates_in_ccc   # realization of captured bars[0]
+    assert "2024-01-03" in dates_in_ccc   # realization of captured bars[1]
+    assert "2024-01-06" in dates_in_ccc   # realization of captured bars[4]
+    assert "2024-01-01" not in dates_in_ccc  # signal bar of bars[0], not its realization
+    assert "2024-01-04" not in dates_in_ccc  # skipped candidate; no captured realization here
+    assert "2024-01-05" not in dates_in_ccc  # signal bar of bars[4], not its realization
     # capture_count = 3 (bars 0, 1, 4). skipped_capture_count = 2.
     assert record["capture_count"] == 3
     assert record["skipped_capture_count"] == 2
@@ -670,6 +677,80 @@ def test_ccc_point_carries_all_required_fields():
         "date_utc", "cumulative_capture_pct",
         "per_bar_capture_pct", "trade_direction",
     }
+
+
+def test_ccc_realization_dating_economics_unchanged_with_skipped_and_nonmatching():
+    """Realization-bar dating regression. A deterministic history with a BUY
+    trade, a no-trade NONE bar, a NONMATCHING candidate (SHORT vs current BUY),
+    and a SKIPPED candidate (invalid next close). Proves: per-bar captures,
+    cumulatives, total/avg/sharpe/counts/wins are exactly the hand-computed
+    (date-independent) economics, AND each CCC point's date_utc is the captured
+    candidate's REALIZATION (nxt) bar -- never the signal bar, and never the
+    nonmatching/skipped candidates' bars (so the move tracks captured candidates,
+    not a naive index shift)."""
+    cur = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    buy = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_BUY)
+    short = _set_slot(_all_none_snapshot(), "1d", engine.SIGNAL_SHORT)
+    none = _all_none_snapshot()
+    bars = [
+        _make_bar("2024-02-03", 100.0, buy),    # 0 captured BUY  -> nxt bar1=110 -> +10.0
+        _make_bar("2024-02-04", 110.0, short),  # 1 SHORT vs current BUY -> NONMATCHING (no point)
+        _make_bar("2024-02-05", 105.0, none),   # 2 captured NONE -> nxt bar3=108 -> 0.0 no-trade
+        _make_bar("2024-02-06", 108.0, buy),    # 3 matched BUY but nxt bar4 close None -> SKIPPED
+        _make_bar("2024-02-07", None, buy),     # 4 matched BUY but cur close None -> SKIPPED
+        _make_bar("2024-02-10", 120.0, buy),    # 5 captured BUY  -> nxt bar6=126 -> +5.0
+        _make_bar("2024-02-11", 126.0, cur),    # 6 current_snapshot (never a candidate)
+    ]
+    record = engine.score_history_artifact(_make_artifact("TGT", bars))
+
+    # --- counts (date-independent) ---
+    assert record["match_count"] == 5          # bars 0,2,3,4,5 (bar1 nonmatch excluded)
+    assert record["capture_count"] == 3        # bars 0,2,5
+    assert record["skipped_capture_count"] == 2  # bars 3,4
+    assert record["trade_count"] == 2          # directional: bars 0,5
+    assert record["no_trade_count"] == 1       # bar 2 (NONE)
+
+    ccc = record["ccc_series"]
+    assert len(ccc) == 3
+
+    # --- per-bar captures + cumulatives (hand-computed; UNCHANGED by re-stamp) ---
+    per_bar = [pt["per_bar_capture_pct"] for pt in ccc]
+    assert per_bar[0] == pytest.approx((110.0 / 100.0 - 1.0) * 100.0)  # +10.0
+    assert per_bar[1] == 0.0                                            # NONE no-trade
+    assert per_bar[2] == pytest.approx((126.0 / 120.0 - 1.0) * 100.0)  # +5.0
+    cumulative = [pt["cumulative_capture_pct"] for pt in ccc]
+    assert cumulative[0] == pytest.approx(10.0)
+    assert cumulative[1] == pytest.approx(10.0)
+    assert cumulative[2] == pytest.approx(15.0)
+    assert [pt["trade_direction"] for pt in ccc] == ["BUY", "NONE", "BUY"]
+
+    # --- aggregate metrics (hand-computed; UNCHANGED by re-stamp) ---
+    assert record["total_capture_pct"] == pytest.approx(15.0)
+    assert record["avg_capture_pct"] == pytest.approx(7.5)   # mean of [10, 5]
+    assert record["win_count"] == 2
+    assert record["loss_count"] == 0
+    assert record["win_pct"] == pytest.approx(100.0)
+    std = (((10.0 - 7.5) ** 2 + (5.0 - 7.5) ** 2) / 1) ** 0.5  # ddof=1 over [10,5]
+    assert record["stddev_pct"] == pytest.approx(std)
+    expected_sharpe = (7.5 / std) * math.sqrt(engine.TRADING_DAYS_PER_YEAR)
+    assert record["sharpe_k6_mtf"] == pytest.approx(expected_sharpe)
+
+    # current_snapshot is still the LAST bar (unchanged by dating).
+    assert record["current_snapshot"] == engine._normalize_snapshot(cur)
+
+    # --- THE re-stamp: each point dated on its captured candidate's nxt bar ---
+    dates = [pt["date_utc"] for pt in ccc]
+    assert dates == ["2024-02-04", "2024-02-06", "2024-02-11"]
+    # point k <- captured candidate's realization (nxt) bar
+    assert dates[0] == bars[1]["date_utc"]   # captured bar0 realized at bar1
+    assert dates[1] == bars[3]["date_utc"]   # captured bar2 realized at bar3
+    assert dates[2] == bars[6]["date_utc"]   # captured bar5 realized at bar6 = bars[-1]
+    # last CCC date == history_as_of_date (last captured candidate is bars[-2]).
+    assert dates[-1] == record["history_as_of_date"] == bars[-1]["date_utc"]
+    # signal bars of captured candidates are NOT stamps; nonmatching/skipped bars
+    # produce no stamp -> proves tracking of CAPTURED candidates, not index +1.
+    for absent in ("2024-02-03", "2024-02-05", "2024-02-07", "2024-02-10"):
+        assert absent not in dates
 
 
 # ---------------------------------------------------------------------------

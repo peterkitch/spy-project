@@ -403,7 +403,14 @@ def score_history_artifact(
             no_trade_count += 1
         capture_count += 1
         captures_for_ccc.append(capture)
-        dates.append(str(cand.get("date_utc")))
+        # Stamp the CCC point on the REALIZATION bar (nxt), not the signal bar
+        # (cand): the capture is the return from cand's close into nxt's close,
+        # and the family's originating engines (spymaster.py, trafficflow.py)
+        # date the identical capture on the return bar. Economics are unchanged
+        # (same capture/direction/cumulative/metrics); only the point's date
+        # moves forward one bar. nxt.date_utc is guaranteed present by
+        # _validate_history_artifact (same guarantee cand.date_utc relied on).
+        dates.append(str(nxt.get("date_utc")))
         directions.append(direction)
 
     # Defensive count-invariant check; should always hold.
